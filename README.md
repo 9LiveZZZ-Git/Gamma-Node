@@ -1,8 +1,8 @@
 # Gamma Node Editor
 
-A visual patching environment for the [Gamma](https://github.com/AlloSphere-Research-Group/Gamma) DSP library. Patches authored in the node editor compile down to plain Gamma C++ that drops directly into an [AlloLib](https://github.com/AlloSphere-Research-Group/allolib) `AlloApp`.
+A visual patching environment for the [Gamma](https://github.com/AlloSphere-Research-Group/Gamma) DSP library. Patches authored in the node editor compile down to plain Gamma C++.
 
-Built for students in MAT201 and AlloSphere researchers using AlloLib Studio Online — beginners can patch interactively without writing a `gam::` declaration by hand, and advanced users can use the editor as scaffolding before taking the generated code over.
+Built for using AlloLib Studio Online — beginners can patch interactively without writing a `gam::` declaration by hand, and advanced users can use the editor as scaffolding before taking the generated code over.
 
 ## Quick start
 
