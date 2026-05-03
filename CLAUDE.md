@@ -10,11 +10,12 @@ This is a **single-file web application**, not a typical Node project. There is 
 
 **Design docs live locally in `docs/` and are gitignored** — they are not part of the public repo. Reference them when present:
 
-- `docs/SPEC.md` — canonical specification. Source of truth for *intended* behavior. §§4–10 cover the V1 prototype scope; §§11+ are deferred.
-- `docs/EXPANSION.md` — forward-looking roadmap of nodes/features, tagged by complexity (`[gamma]`, `[composite]`, `[multi-out]`, `[block]`, etc.).
-- `docs/OPTIONS.md` — decision menu for unresolved choices. Check the status box at top before assuming any "default" is still default.
+- `docs/ROADMAP.md` — **active roadmap and direction**. Read this first if it exists; it supersedes the older docs on direction questions. As of 2026-05-03 the editor is on a Stance-B trajectory: self-contained visual programming environment for audio + shaders + 3D + video + sequencing, with AlloLib export as a feature (not the canonical path). The README still says "visual patcher for Gamma DSP" — that's a deliberate lag until visual phases ship.
+- `docs/SPEC.md` — original specification, written when the editor was Stance A (AlloLib scaffolding). Still authoritative for §§4–10 (file format, codegen, basic UX). Sections that talk about "intended deliverable" are out of date — see ROADMAP for current direction.
+- `docs/EXPANSION.md` — original forward-looking node/feature list. Largely subsumed by ROADMAP phases 4+; still useful as a reference for which Gamma classes haven't been wrapped yet.
+- `docs/OPTIONS.md` — original decision menu. Check the status box at top.
 
-If `docs/` is missing, work from this CLAUDE.md plus the code; don't assume the docs exist on every machine. Active roadmap and milestone tracking happens through the user's planning artifacts, not these docs.
+If `docs/` is missing, work from this CLAUDE.md plus the code; don't assume the docs exist on every machine.
 
 When the spec and the prototype disagree, **the prototype is what users actually use**, but the spec is what they expect the prototype to *become*. Make changes that move the prototype toward the spec, not away from it.
 
