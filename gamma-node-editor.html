@@ -7,6 +7,17 @@
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Inter:wght@400;500&display=swap" rel="stylesheet" />
+
+<!-- CodeMirror 5 for the User DSP source editor. Loaded from CDN; the
+     editor falls back to a plain textarea if these fail. -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/lib/codemirror.min.css" />
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/theme/material-darker.min.css" />
+<script defer src="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/lib/codemirror.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/mode/clike/clike.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/addon/edit/matchbrackets.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/addon/edit/closebrackets.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/addon/comment/comment.min.js"></script>
+
 <style>
   :root {
     --bg: #0e0f12;
@@ -234,7 +245,15 @@
       var(--bg);
     background-size: 16px 16px;
   }
-  .canvas { position: absolute; inset: 0; overflow: hidden; }
+  .canvas {
+    position: absolute; inset: 0; overflow: hidden;
+    /* Suppress native pinch-zoom and scroll on the canvas — we handle
+     * them via wheel and pointer events. Falls back to default in
+     * browsers that don't support touch-action. */
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+  }
   #canvas-world {
     position: absolute;
     left: 0; top: 0;
@@ -618,6 +637,35 @@
   .udsp-source::-webkit-scrollbar { width: 8px; height: 8px; }
   .udsp-source::-webkit-scrollbar-track { background: transparent; }
   .udsp-source::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 4px; }
+
+  /* CodeMirror overrides — keep the dark editor visually consistent
+     with the rest of the surface palette and use our font stack. */
+  .udsp-editor .CodeMirror {
+    height: 100%;
+    width: 100%;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.55;
+    background: var(--bg);
+    color: var(--text);
+  }
+  .udsp-editor .CodeMirror-gutters {
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+  }
+  .udsp-editor .CodeMirror-linenumber { color: var(--text-3); }
+  .udsp-editor .CodeMirror-cursor { border-left-color: var(--accent); }
+  .udsp-editor .CodeMirror-selected,
+  .udsp-editor .CodeMirror-focused .CodeMirror-selected {
+    background: rgba(74, 143, 220, 0.22) !important;
+  }
+  .udsp-editor .CodeMirror-matchingbracket {
+    color: var(--accent) !important;
+    text-decoration: underline;
+  }
+  .udsp-editor .CodeMirror-scroll { padding-bottom: 0; }
+  .udsp-editor .CodeMirror-scrollbar-filler,
+  .udsp-editor .CodeMirror-gutter-filler { background: var(--surface); }
   .udsp-actions {
     display: flex;
     align-items: center;
@@ -2209,7 +2257,12 @@ function buildUserDspDef(source) {
     outs:       [],
     params:     {},
     methods:    {},
-    isUserDsp:  true
+    isUserDsp:  true,
+    // @gdsp-header directives become extra #include lines at codegen
+    // time. Bare values get angle brackets; values starting with " are
+    // emitted verbatim; values starting with < are stripped of brackets
+    // so we don't double-wrap.
+    extraHeaders: Array.isArray(d.header) ? d.header.map(h => h.trim()).filter(Boolean) : []
   };
 
   d.input.forEach(s => {
@@ -2487,6 +2540,48 @@ const copyBtn  = document.getElementById("btn-copy");
 const canvasWorld = document.getElementById("canvas-world");
 const marqueeEl = document.getElementById("marquee");
 const viewHud  = document.getElementById("view-hud");
+
+// CodeMirror-backed User DSP editor. Initialized after the deferred
+// CM scripts load (DOMContentLoaded). Falls back to the bare textarea
+// if CodeMirror fails to load (offline, CDN blocked, etc.). All
+// reads/writes of the DSP source MUST go through getUdspText /
+// setUdspText so both backends stay in sync.
+let udspEditor = null;
+function getUdspText() {
+  return udspEditor ? udspEditor.getValue() : udspSource.value;
+}
+function setUdspText(s) {
+  if (udspEditor) udspEditor.setValue(s);
+  else udspSource.value = s;
+}
+document.addEventListener("DOMContentLoaded", () => {
+  if (typeof CodeMirror === "undefined" || !udspSource) return;
+  try {
+    udspEditor = CodeMirror.fromTextArea(udspSource, {
+      mode: "text/x-c++src",
+      theme: "material-darker",
+      lineNumbers: true,
+      indentUnit: 2,
+      tabSize: 2,
+      smartIndent: true,
+      matchBrackets: true,
+      autoCloseBrackets: true,
+      lineWrapping: false,
+      extraKeys: {
+        Tab:           cm => cm.execCommand("indentMore"),
+        "Shift-Tab":   cm => cm.execCommand("indentLess"),
+        "Cmd-/":       "toggleComment",
+        "Ctrl-/":      "toggleComment"
+      }
+    });
+    udspEditor.setSize("100%", "100%");
+    // Keep the underlying <textarea> in sync so anything still reading
+    // .value (legacy code paths, AI provider, etc.) sees current text.
+    udspEditor.on("change", () => { udspSource.value = udspEditor.getValue(); });
+  } catch (e) {
+    console.warn("CodeMirror init failed; using textarea fallback.", e);
+  }
+});
 
 applyView();
 
@@ -3102,6 +3197,10 @@ function inputExpr(nodeId, portName, cgCtx) {
 function gatherHeaders() {
   const gammaHeaders = new Set();
   const stdHeaders = new Set();
+  // Free-form #include lines from User DSP @gdsp-header directives.
+  // Stored as the literal string that follows `#include `, including
+  // the brackets or quotes — so we never duplicate them.
+  const extraIncludes = new Set();
   let needsScl = false;
   const STDLIB = new Set(["cmath", "cstdint", "utility", "cstdlib", "algorithm", "cstring"]);
   state.nodes.forEach(n => {
@@ -3122,11 +3221,23 @@ function gatherHeaders() {
         stdHeaders.add("cmath");
       }
     }
+    // User DSP nodes may declare extra includes they need beyond what
+    // the editor figures out from registry headers.
+    if (def.extraHeaders && def.extraHeaders.length) {
+      def.extraHeaders.forEach(h => {
+        if (!h) return;
+        let inc;
+        if (h[0] === "<" || h[0] === '"') inc = h;
+        else inc = "<" + h + ">";
+        extraIncludes.add(inc);
+      });
+    }
   });
   if (needsScl) gammaHeaders.add("scl");
   return {
     gamma: Array.from(gammaHeaders).sort(),
-    std:   Array.from(stdHeaders).sort()
+    std:   Array.from(stdHeaders).sort(),
+    extra: Array.from(extraIncludes).sort()
   };
 }
 
@@ -3274,6 +3385,9 @@ function generateCode() {
   if (returnType === "std::pair<float,float>" && !headers.std.includes("utility")) {
     code += "#include <utility>\n";
   }
+  if (headers.extra && headers.extra.length) {
+    headers.extra.forEach(inc => { code += `#include ${inc}\n`; });
+  }
   code += "\n";
   if (userTypes.length) {
     code += "// ---- User DSP ----\n\n";
@@ -3336,7 +3450,10 @@ function renderJson() {
  * or Space+drag. Wire-drag and node-drag use world coords directly.
  * Marquee drag (on empty canvas, no Space) selects multiple nodes.
  * ======================================================================== */
-canvas.addEventListener("mousedown", e => {
+canvas.addEventListener("pointerdown", e => {
+  // Touch + pen come through the same event — only react to primary
+  // pointer, and ignore pen entirely (the ink layer handles that).
+  if (e.pointerType === "pen") return;
   // Pan: middle-click anywhere, or Space + left-click.
   if (e.button === 1 || (e.button === 0 && spaceHeld)) {
     e.preventDefault();
@@ -3423,7 +3540,7 @@ canvas.addEventListener("mousedown", e => {
   render();
 });
 
-document.addEventListener("mousemove", e => {
+document.addEventListener("pointermove", e => {
   if (panning) {
     view.panX = panning.startPanX + (e.clientX - panning.startX);
     view.panY = panning.startPanY + (e.clientY - panning.startY);
@@ -3457,7 +3574,7 @@ document.addEventListener("mousemove", e => {
   }
 });
 
-document.addEventListener("mouseup", e => {
+document.addEventListener("pointerup", e => {
   if (panning) {
     panning = null;
     canvas.classList.remove("panning");
@@ -3545,6 +3662,105 @@ function deleteSelection() {
   render();
 }
 
+/* ---------- Copy / paste / duplicate ----------
+ * Serializes the selected nodes plus any edges that connect TWO selected
+ * nodes (so external wires don't dangle). Exposed-setter entries for
+ * selected nodes are included. Pasting regenerates IDs and offsets
+ * positions so the paste lands visibly next to the original. */
+const CLIPBOARD_MIME = "application/x-gamma-patch-fragment";
+let inMemoryClipboard = null;
+
+function serializeSelection() {
+  if (selectedSet.size === 0) return null;
+  const ids = new Set(selectedSet);
+  const nodes = state.nodes
+    .filter(n => ids.has(n.id))
+    .map(n => ({ id: n.id, type: n.type, x: n.x, y: n.y, params: { ...n.params } }));
+  const edges = state.edges
+    .filter(ed => ids.has(ed.from.node) && ids.has(ed.to.node))
+    .map(ed => ({ from: { ...ed.from }, to: { ...ed.to } }));
+  const exposed = {};
+  Object.keys(state.exposed).forEach(k => {
+    const dot = k.indexOf(".");
+    const idPart = dot >= 0 ? k.slice(0, dot) : k;
+    if (ids.has(idPart)) exposed[k] = state.exposed[k];
+  });
+  return JSON.stringify({ kind: CLIPBOARD_MIME, nodes, edges, exposed });
+}
+
+function pasteFragment(json, offset) {
+  let frag;
+  try { frag = JSON.parse(json); } catch (e) { return false; }
+  if (!frag || frag.kind !== CLIPBOARD_MIME || !Array.isArray(frag.nodes)) return false;
+  pushHistory("paste");
+  const idMap = {};       // old id → new id
+  const dx = offset && offset.x || 24;
+  const dy = offset && offset.y || 24;
+  frag.nodes.forEach(n => {
+    const newId = uid();
+    idMap[n.id] = newId;
+    state.nodes.push({
+      id: newId,
+      type: n.type,
+      x: n.x + dx,
+      y: n.y + dy,
+      params: { ...n.params }
+    });
+  });
+  (frag.edges || []).forEach(ed => {
+    const fn = idMap[ed.from.node];
+    const tn = idMap[ed.to.node];
+    if (!fn || !tn) return;
+    state.edges.push({
+      from: { node: fn, port: ed.from.port },
+      to:   { node: tn, port: ed.to.port }
+    });
+  });
+  Object.keys(frag.exposed || {}).forEach(k => {
+    const dot = k.indexOf(".");
+    const oldId = dot >= 0 ? k.slice(0, dot) : k;
+    const rest = dot >= 0 ? k.slice(dot) : "";
+    const newId = idMap[oldId];
+    if (newId) state.exposed[newId + rest] = frag.exposed[k];
+  });
+  // Select the newly pasted nodes so subsequent moves operate on them.
+  selectedSet.clear();
+  Object.values(idMap).forEach(id => selectedSet.add(id));
+  selected = Object.values(idMap).pop() || null;
+  render();
+  return true;
+}
+
+function copySelectionToClipboard() {
+  const json = serializeSelection();
+  if (!json) return;
+  inMemoryClipboard = json;
+  // Best-effort write to the system clipboard so paste survives a tab
+  // refresh (the in-memory copy doesn't). Fails silently when the page
+  // isn't focused or the user hasn't granted permission.
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(json).catch(() => {});
+  }
+}
+
+function pasteFromClipboard() {
+  // Try the system clipboard first; fall back to the in-memory copy.
+  if (navigator.clipboard && navigator.clipboard.readText) {
+    navigator.clipboard.readText().then(text => {
+      if (!pasteFragment(text) && inMemoryClipboard) pasteFragment(inMemoryClipboard);
+    }).catch(() => {
+      if (inMemoryClipboard) pasteFragment(inMemoryClipboard);
+    });
+  } else if (inMemoryClipboard) {
+    pasteFragment(inMemoryClipboard);
+  }
+}
+
+function duplicateSelection() {
+  const json = serializeSelection();
+  if (json) pasteFragment(json, { x: 24, y: 24 });
+}
+
 document.addEventListener("keydown", e => {
   // Space: hold to pan. Suppress in text inputs so typing a space still
   // works in fields (palette filter, AI prompt, .gdsp source, etc.).
@@ -3608,6 +3824,24 @@ document.addEventListener("keydown", e => {
     if (e.key === "a" || e.key === "A") {
       e.preventDefault();
       selectAll();
+      return;
+    }
+    // Copy / paste / duplicate selected subgraph
+    if (e.key === "c" || e.key === "C") {
+      if (selectedSet.size === 0) return;
+      e.preventDefault();
+      copySelectionToClipboard();
+      return;
+    }
+    if (e.key === "v" || e.key === "V") {
+      e.preventDefault();
+      pasteFromClipboard();
+      return;
+    }
+    if (e.key === "d" || e.key === "D") {
+      if (selectedSet.size === 0) return;
+      e.preventDefault();
+      duplicateSelection();
       return;
     }
     // Reset view (Cmd+0 is OS-reserved on some browsers; we also bind
@@ -3800,7 +4034,7 @@ function renderUdspList() {
 
   document.getElementById("udsp-new").addEventListener("click", () => {
     editingUdsp = null;
-    udspSource.value = GDSP_TEMPLATE;
+    setUdspText(GDSP_TEMPLATE);
     udspStatus.textContent = "New .gdsp — edit and click Save & Add";
     udspStatus.className = "udsp-status";
     renderUdspList();
@@ -3810,7 +4044,7 @@ function renderUdspList() {
       if (e.target.dataset.del) return;
       const name = item.dataset.name;
       editingUdsp = name;
-      udspSource.value = USER_DSP_SOURCES[name] || "";
+      setUdspText(USER_DSP_SOURCES[name] || "");
       udspStatus.textContent = `Editing ${name}`;
       udspStatus.className = "udsp-status";
       renderUdspList();
@@ -3824,7 +4058,7 @@ function renderUdspList() {
       unregisterUserDsp(name);
       if (editingUdsp === name) {
         editingUdsp = null;
-        udspSource.value = GDSP_TEMPLATE;
+        setUdspText(GDSP_TEMPLATE);
       }
       renderUdspList();
       renderPalette(search.value);
@@ -3841,7 +4075,7 @@ function setUdspStatus(msg, kind) {
 
 document.getElementById("btn-udsp-validate").addEventListener("click", () => {
   try {
-    const { name, def } = buildUserDspDef(udspSource.value);
+    const { name, def } = buildUserDspDef(getUdspText());
     setUdspStatus(`OK — ${name}: ${def.ins.length} in, ${def.outs.length} out, ${Object.keys(def.params).length} params`, "ok");
   } catch (err) {
     setUdspStatus("Error — " + err.message, "err");
@@ -3851,12 +4085,12 @@ document.getElementById("btn-udsp-validate").addEventListener("click", () => {
 document.getElementById("btn-udsp-save").addEventListener("click", () => {
   try {
     // If renaming, drop the old entry first
-    const probe = parseGdsp(udspSource.value).directives;
+    const probe = parseGdsp(getUdspText()).directives;
     const newName = probe.name;
     if (editingUdsp && editingUdsp !== newName) {
       unregisterUserDsp(editingUdsp);
     }
-    const name = registerUserDsp(udspSource.value);
+    const name = registerUserDsp(getUdspText());
     editingUdsp = name;
     setUdspStatus(`Saved ${name} — added to palette`, "ok");
     renderUdspList();
@@ -3898,7 +4132,7 @@ function loadUserDspFromStorage() {
 }
 
 loadUserDspFromStorage();
-udspSource.value = GDSP_TEMPLATE;
+setUdspText(GDSP_TEMPLATE);
 renderUdspList();
 renderPalette();
 
@@ -4351,7 +4585,7 @@ document.getElementById("btn-ai-go").addEventListener("click", async () => {
     setGemmaProgressHook(null);
   }
 
-  const { system, user } = buildPrompt(mode, userText, udspSource.value);
+  const { system, user } = buildPrompt(mode, userText, getUdspText());
   setAiStatus("Thinking…", "thinking");
 
   // Show the result panel immediately and stream tokens into it.
@@ -4402,7 +4636,7 @@ document.getElementById("btn-ai-go").addEventListener("click", async () => {
 
 document.getElementById("btn-ai-apply").addEventListener("click", () => {
   if (aiPending == null) return;
-  udspSource.value = aiPending;
+  setUdspText(aiPending);
   setAiStatus("Applied to editor — click Validate or Save & Add to register.", "ok");
   aiPending = null;
   aiResult.style.display = "none";
@@ -4918,6 +5152,10 @@ document.querySelector(".palette").addEventListener("click", e => {
  * Tool keyboard shortcuts
  * ======================================================================== */
 document.addEventListener("keydown", e => {
+  // Skip when typing or when a Cmd/Ctrl shortcut is active (those are
+  // handled by the main keyboard handler — Cmd-V is paste, Cmd-D is
+  // duplicate, both shouldn't switch tools).
+  if (e.metaKey || e.ctrlKey) return;
   const tag = (e.target && e.target.tagName) || "";
   if (tag === "INPUT" || tag === "TEXTAREA") return;
   if (e.key === "v" || e.key === "V") setTool("select");
