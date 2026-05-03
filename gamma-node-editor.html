@@ -1168,6 +1168,24 @@
   .preview-status.error     { color: var(--danger); border-color: rgba(226, 75, 74, 0.4); background: rgba(226, 75, 74, 0.05); }
   .preview-status.error::before { background: var(--danger); }
 
+  .copy-status-btn {
+    width: 24px; height: 24px;
+    font-size: 12px;
+    color: var(--text-2);
+    border-color: rgba(226, 75, 74, 0.3);
+  }
+  .copy-status-btn:hover { color: var(--accent); border-color: var(--accent); }
+  .copy-status-btn.copied { color: var(--audio); border-color: var(--audio); }
+  .copy-build-btn {
+    margin-left: auto;
+    padding: 3px 9px;
+    font-size: 10px;
+    font-family: var(--font-mono);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+  .copy-build-btn.copied { color: var(--audio); border-color: var(--audio); }
+
   /* ---------- Build pane ---------- */
   .build-pane { padding: 0 !important; overflow: auto; }
   .build-summary {
@@ -1196,6 +1214,9 @@
     letter-spacing: 0.16em;
     color: var(--text-3);
     background: var(--surface);
+    display: flex;
+    align-items: center;
+    gap: 8px;
   }
   .build-meta { color: var(--text-2); text-transform: none; letter-spacing: 0.02em; margin-left: 8px; }
   .build-section pre.code { padding: 12px 18px 16px; }
@@ -1533,6 +1554,7 @@
         <button class="btn preview-btn" id="btn-preview-stop" title="Stop playback" disabled>■</button>
       </div>
       <span class="preview-status" id="preview-status" title="Real-time audio preview status">idle</span>
+      <button class="btn icon-btn copy-status-btn" id="btn-copy-status" title="Copy error message to clipboard" style="display:none;">⧉</button>
       <button class="btn primary" id="btn-gen" title="Open the Generated C++ tab">Generate C++</button>
       <button class="btn icon-btn" id="btn-help" title="Keyboard shortcuts">?</button>
     </div>
@@ -1608,7 +1630,10 @@
         <pre class="code" id="build-wrap-out"></pre>
       </div>
       <div class="build-section" id="build-stderr-section" style="display:none;">
-        <div class="build-section-head">Compile output</div>
+        <div class="build-section-head">
+          Compile output
+          <button class="btn copy-build-btn" id="btn-copy-stderr" title="Copy compile output to clipboard">⧉ Copy</button>
+        </div>
         <pre class="code" id="build-stderr"></pre>
       </div>
     </div>
@@ -5856,6 +5881,7 @@ const previewGroupEl = previewBtnPlay && previewBtnPlay.closest(".preview-group"
 
 function setPreviewStatus(state, msg) {
   previewState.state = state;
+  previewState.lastErrorMsg = (state === "error") ? (msg || state) : null;
   if (!previewStatusEl) return;
   previewStatusEl.className = "preview-status " + state;
   previewStatusEl.textContent = msg || state;
@@ -5874,7 +5900,67 @@ function setPreviewStatus(state, msg) {
         ? "Resume playback"
         : "Compile patch and start playback";
   }
+  const copyBtn = document.getElementById("btn-copy-status");
+  if (copyBtn) copyBtn.style.display = state === "error" ? "inline-flex" : "none";
 }
+
+/* Copy-error helpers — flash button green for 1s on success. */
+function flashCopied(btn, oldLabel) {
+  btn.classList.add("copied");
+  const prevText = btn.textContent;
+  if (oldLabel !== undefined) btn.textContent = oldLabel;
+  setTimeout(() => {
+    btn.classList.remove("copied");
+    if (oldLabel !== undefined) btn.textContent = prevText;
+  }, 1200);
+}
+
+(function setupCopyButtons() {
+  const copyStatusBtn = document.getElementById("btn-copy-status");
+  if (copyStatusBtn) copyStatusBtn.addEventListener("click", async () => {
+    // Bundle the error message with patch info so the paste is
+    // self-contained when sent back for diagnosis.
+    const lines = [];
+    lines.push("Gamma Node Editor v" + APP_VERSION + " — preview error");
+    lines.push("UA: " + navigator.userAgent);
+    lines.push("State: " + previewState.state);
+    lines.push("Error: " + (previewState.lastErrorMsg || "(none)"));
+    if (previewState.lastWrapped) {
+      lines.push("");
+      lines.push("--- last wrapped patch C++ ---");
+      lines.push(previewState.lastWrapped);
+    }
+    const text = lines.join("\n");
+    try {
+      await navigator.clipboard.writeText(text);
+      flashCopied(copyStatusBtn, "✓");
+    } catch (e) {
+      copyStatusBtn.title = "Copy failed: " + e.message;
+    }
+  });
+
+  const copyStderrBtn = document.getElementById("btn-copy-stderr");
+  if (copyStderrBtn) copyStderrBtn.addEventListener("click", async () => {
+    const out = document.getElementById("build-stderr");
+    if (!out) return;
+    const lines = [];
+    lines.push("Gamma Node Editor v" + APP_VERSION + " — build output");
+    lines.push("UA: " + navigator.userAgent);
+    lines.push("");
+    lines.push(out.textContent);
+    if (previewState.lastWrapped) {
+      lines.push("");
+      lines.push("--- last wrapped patch C++ ---");
+      lines.push(previewState.lastWrapped);
+    }
+    try {
+      await navigator.clipboard.writeText(lines.join("\n"));
+      flashCopied(copyStderrBtn, "✓ Copied");
+    } catch (e) {
+      copyStderrBtn.textContent = "✗ " + e.message;
+    }
+  });
+})();
 
 /* ------------- Adapter wrapper ------------- */
 /* Wraps the editor's emitted patch class in a C-linkage shim that the
@@ -5936,31 +6022,35 @@ function wrapForPreview(patchSource, className) {
   return `${patchSource}
 
 // ---- Preview adapter (auto-generated, do not edit) ----
-#include <emscripten.h>
+// Uses Clang's export_name attribute so the resulting WASM module
+// exports the right symbols for any wasm32 target (WASI / Emscripten /
+// freestanding) without depending on emscripten.h.
+#define PREVIEW_EXPORT(name) __attribute__((export_name(#name)))
+
 static ${className}* gPatch = nullptr;
 
 extern "C" {
 
-EMSCRIPTEN_KEEPALIVE void preview_init() {
+PREVIEW_EXPORT(preview_init) void preview_init() {
     if (gPatch) delete gPatch;
     gPatch = new ${className}();
 }
 
-EMSCRIPTEN_KEEPALIVE void preview_tick(float* outL, float* outR, int n) {
+PREVIEW_EXPORT(preview_tick) void preview_tick(float* outL, float* outR, int n) {
     if (!gPatch) return;
     for (int i = 0; i < n; ++i) {
 ${tickBody}
     }
 }
 
-EMSCRIPTEN_KEEPALIVE void preview_set(int setterIndex, float v) {
+PREVIEW_EXPORT(preview_set) void preview_set(int setterIndex, float v) {
     if (!gPatch) return;
     switch (setterIndex) {
 ${setterDispatch}        default: break;
     }
 }
 
-EMSCRIPTEN_KEEPALIVE int preview_setter_count() { return ${setters.length}; }
+PREVIEW_EXPORT(preview_setter_count) int preview_setter_count() { return ${setters.length}; }
 
 }  // extern "C"
 `;
@@ -5996,30 +6086,95 @@ function renderBuildPane() {
 
 /* ------------- Compile Worker ------------- */
 /* The worker is created from a Blob URL containing the compile-pipeline
- * code. This keeps the editor a single self-contained HTML file. */
+ * code. This keeps the editor a single self-contained HTML file.
+ *
+ * Pipeline inside the worker:
+ *   1. Dynamic-import @wasmer/sdk from esm.run (~few MB, cached by browser).
+ *   2. wasmer.init() initializes the WebAssembly runtime.
+ *   3. Wasmer.fromRegistry("clang/clang") downloads the clang/clang
+ *      package on first use (~100 MB, cached in IndexedDB).
+ *   4. Fetch the libgamma.a tarball, decompress (DecompressionStream),
+ *      parse the tar to a flat file map, write each entry into a
+ *      Wasmer Directory at /project/...
+ *   5. Write the wrapped patch C++ to /project/patch.cpp.
+ *   6. clang.entrypoint.run({ args: [...], mount: { "/project": dir } });
+ *      args invoke clang against patch.cpp + libgamma.a → patch.wasm.
+ *   7. dir.readFile("patch.wasm") → return bytes to main thread. */
 const COMPILE_WORKER_SRC = String.raw`
-let wasmer = null;
-let runtime = null;
-let archiveStaged = false;
+let wasmerMod = null;
+let clangPkg = null;
+let projectDir = null;
+let archiveStagedFor = null;   // archive URL we last staged from
 
 async function ensureWasmer(sdkUrl) {
-  if (runtime) return runtime;
-  const mod = await import(sdkUrl);
-  await mod.init();
-  runtime = new mod.Runtime();
-  wasmer = mod;
-  return runtime;
+  if (wasmerMod) return wasmerMod;
+  wasmerMod = await import(sdkUrl);
+  await wasmerMod.init();
+  return wasmerMod;
 }
 
-async function stageArchive(archiveBuffer) {
-  if (archiveStaged) return;
-  // The archive is a tar.gz containing libgamma.a plus headers under
-  // include/Gamma/. Wasmer's directory API would normally untar this,
-  // but for the MVP we extract on the main thread before send (or
-  // ship pre-extracted). Placeholder: assume archiveBuffer is already
-  // a flat object {path: Uint8Array}.
-  // TODO: wire in real tar extraction (or pre-extract on main thread).
-  archiveStaged = true;
+async function ensureClang() {
+  if (clangPkg) return clangPkg;
+  self.postMessage({ type: "progress", step: "loading clang/clang package…" });
+  clangPkg = await wasmerMod.Wasmer.fromRegistry("clang/clang");
+  return clangPkg;
+}
+
+/* Minimal tar parser for the gamma-wasm archive — handles the small set
+ * of header types our build script actually emits (regular files +
+ * directories). Each tar header is a 512-byte block; file content
+ * follows, padded up to the next 512-byte boundary. */
+function parseTar(buf) {
+  const out = [];
+  const view = new Uint8Array(buf);
+  const td = new TextDecoder();
+  let off = 0;
+  while (off + 512 <= view.length) {
+    const header = view.subarray(off, off + 512);
+    // Empty block = end of archive (tar marks end with two zero blocks).
+    if (header.every(b => b === 0)) break;
+    const name = td.decode(header.subarray(0, 100)).replace(/\0+$/, "");
+    if (!name) { off += 512; continue; }
+    const sizeStr = td.decode(header.subarray(124, 136)).replace(/[\s\0]+$/, "");
+    const size = parseInt(sizeStr, 8) || 0;
+    const typeflag = String.fromCharCode(header[156]);
+    off += 512;
+    if (typeflag === "0" || typeflag === "" || typeflag === "\0") {
+      out.push({ name, content: view.slice(off, off + size) });
+    }
+    off += size;
+    if (size % 512 !== 0) off += 512 - (size % 512);
+  }
+  return out;
+}
+
+async function fetchAndExtract(archiveUrl) {
+  self.postMessage({ type: "progress", step: "fetching libgamma.a archive…" });
+  const res = await fetch(archiveUrl);
+  if (!res.ok) throw new Error("Gamma archive fetch failed: " + res.status + " from " + archiveUrl);
+  // Decompress via the browser's DecompressionStream (gzip).
+  const stream = res.body.pipeThrough(new DecompressionStream("gzip"));
+  const tarBuf = await new Response(stream).arrayBuffer();
+  return parseTar(tarBuf);
+}
+
+async function stageArchive(archiveUrl) {
+  if (archiveStagedFor === archiveUrl && projectDir) return projectDir;
+  const entries = await fetchAndExtract(archiveUrl);
+  projectDir = new wasmerMod.Directory();
+  // Wasmer's Directory expects forward-slash paths. createDir is safe
+  // to call repeatedly; many implementations no-op on existing dirs.
+  for (const entry of entries) {
+    const dirParts = entry.name.split("/").slice(0, -1);
+    let cur = "";
+    for (const p of dirParts) {
+      cur = cur ? cur + "/" + p : p;
+      try { await projectDir.createDir(cur); } catch (_) { /* already exists */ }
+    }
+    await projectDir.writeFile(entry.name, entry.content);
+  }
+  archiveStagedFor = archiveUrl;
+  return projectDir;
 }
 
 self.onmessage = async (ev) => {
@@ -6027,7 +6182,8 @@ self.onmessage = async (ev) => {
   if (msg.type === "warmup") {
     try {
       await ensureWasmer(msg.sdkUrl);
-      if (msg.archive) await stageArchive(msg.archive);
+      // clang loads lazily on first compile (it's the biggest download,
+      // so only pay the cost when the user actually clicks Play).
       self.postMessage({ type: "ready" });
     } catch (e) {
       self.postMessage({ type: "error", error: String(e && e.message || e) });
@@ -6036,16 +6192,71 @@ self.onmessage = async (ev) => {
   }
   if (msg.type === "compile") {
     try {
-      // === Real implementation ===
-      // const result = await runtime.runCommand("clang/clang", {
-      //   args: ["-std=c++17", "-O1", "-I", "/sysroot/include",
-      //          "-L", "/sysroot/lib", "-lgamma", "-o", "/tmp/patch.wasm",
-      //          "/tmp/patch.cpp"],
-      //   stdin: msg.wrappedSrc,
-      //   files: { "/tmp/patch.cpp": msg.wrappedSrc, ... }
-      // });
-      // const wasmBytes = await runtime.fs.readFile("/tmp/patch.wasm");
-      throw new Error("Compile pipeline not yet wired (Phase 4 work-in-progress). Once libgamma.a is built and shipped at " + msg.archiveUrl + ", uncomment the runCommand block in COMPILE_WORKER_SRC.");
+      await ensureWasmer(msg.sdkUrl);
+      await ensureClang();
+      const dir = await stageArchive(msg.archiveUrl);
+
+      self.postMessage({ type: "progress", step: "writing patch.cpp…" });
+      await dir.writeFile("patch.cpp", new TextEncoder().encode(msg.wrappedSrc));
+
+      self.postMessage({ type: "progress", step: "invoking clang…" });
+      // Build clang argv:
+      //   - C++17, -O1 for speed (O2 is too slow per-keystroke for hot reload)
+      //   - target wasm32-wasi (matches what wasmer's clang sysroot expects)
+      //   - -nostartfiles + -Wl,--no-entry: no main() needed (we export
+      //     specific functions and the AudioWorklet drives them)
+      //   - --export=preview_* explicitly so the linker keeps them
+      //   - Headers from the staged archive
+      //   - libgamma.a as the only extra library
+      const args = [
+        "-std=c++17",
+        "-O1",
+        "-fno-exceptions", "-fno-rtti",
+        "-Wno-deprecated-declarations",
+        "-I", "/project/include",
+        "-Wl,--no-entry",
+        "-Wl,--export=preview_init",
+        "-Wl,--export=preview_tick",
+        "-Wl,--export=preview_set",
+        "-Wl,--export=preview_setter_count",
+        "-Wl,--export=malloc",
+        "-Wl,--export=free",
+        "-Wl,--export=memory",
+        "/project/patch.cpp",
+        "/project/lib/libgamma.a",
+        "-o", "/project/patch.wasm"
+      ];
+      const instance = await clangPkg.entrypoint.run({
+        args,
+        mount: { "/project": dir }
+      });
+      const result = await instance.wait();
+
+      let stderr = "";
+      try { stderr = result.stderr || ""; } catch (_) {}
+      let stdout = "";
+      try { stdout = result.stdout || ""; } catch (_) {}
+
+      // Try to read the output even if exit != 0; some warnings still
+      // produce a usable wasm.
+      let wasmBytes = null;
+      try {
+        wasmBytes = await dir.readFile("patch.wasm");
+      } catch (e) {
+        throw Object.assign(
+          new Error("clang produced no output. exit=" + (result.code !== undefined ? result.code : "?")),
+          { stderr: stderr + (stdout ? "\n--- stdout ---\n" + stdout : "") }
+        );
+      }
+      if (result.code !== undefined && result.code !== 0) {
+        // Non-zero exit but file exists — probably warnings. Surface stderr
+        // but still return the wasm.
+        self.postMessage({ type: "warnings", stderr });
+      }
+      self.postMessage(
+        { type: "compiled", wasmBytes: wasmBytes.buffer || wasmBytes, stderr },
+        [wasmBytes.buffer || wasmBytes]
+      );
     } catch (e) {
       self.postMessage({
         type: "compile-error",
@@ -6197,27 +6408,30 @@ async function previewCompileAndPlay() {
   previewState.lastWrapped = wrapped;
 
   try {
-    await fetchGammaArchive();
-  } catch (e) {
-    setPreviewStatus("error", e.message);
-    showCompileStderr("", e.message);
-    return;
-  }
-
-  try {
     await ensureCompileWorker();
   } catch (e) {
     setPreviewStatus("error", "worker init: " + e.message);
     return;
   }
 
-  // Send compile request and await reply.
+  // Send compile request. Worker streams `progress` updates while it
+  // works (loading clang, fetching archive, invoking compiler), then
+  // sends `compiled` or `compile-error` as the terminal message.
   const wasmBytes = await new Promise((resolve, reject) => {
     const onReply = (ev) => {
       const m = ev.data;
-      if (m.type === "compiled") {
+      if (m.type === "progress") {
+        setPreviewStatus("compiling", "compiling… " + m.step);
+      } else if (m.type === "warnings") {
+        // Non-fatal warnings — keep going, surface in build pane.
+        showCompileStderr(m.stderr || "", null);
+      } else if (m.type === "compiled") {
         previewState.worker.removeEventListener("message", onReply);
-        resolve(m.wasmBytes);
+        if (m.stderr) showCompileStderr(m.stderr, null);
+        else showCompileStderr("", null);
+        // wasmBytes may arrive as ArrayBuffer (transferred) or Uint8Array.
+        const bytes = m.wasmBytes instanceof ArrayBuffer ? m.wasmBytes : m.wasmBytes.buffer;
+        resolve(bytes);
       } else if (m.type === "compile-error") {
         previewState.worker.removeEventListener("message", onReply);
         reject(Object.assign(new Error(m.error), { stderr: m.stderr || "" }));
@@ -6227,7 +6441,8 @@ async function previewCompileAndPlay() {
     previewState.worker.postMessage({
       type: "compile",
       wrappedSrc: wrapped,
-      archiveUrl: PREVIEW.gammaArchiveUrl
+      archiveUrl: new URL(PREVIEW.gammaArchiveUrl, location.href).toString(),
+      sdkUrl: PREVIEW.wasmerSdkUrl
     });
   }).catch(e => {
     setPreviewStatus("error", "compile: " + e.message);
