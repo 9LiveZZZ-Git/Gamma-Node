@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write   # need write to push the version-bump commit
   pages: write
   id-token: write
 
@@ -22,6 +22,49 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 2
+
+      # Bump the patch version on every push, then commit it back. Skips
+      # the bump when the triggering commit IS already a version bump
+      # (which prevents an infinite loop of pushes).
+      - name: Bump version
+        id: bump
+        run: |
+          set -e
+          last_msg=$(git log -1 --pretty=%B)
+          if echo "$last_msg" | grep -q '^chore(version):'; then
+            echo "Last commit was a version bump; not bumping again."
+            echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+            echo "bumped=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          v=$(cat VERSION)
+          IFS='.' read -r maj min pat <<< "$v"
+          new="$maj.$min.$((pat + 1))"
+          echo "$new" > VERSION
+          # Update the editor's inline APP_VERSION so the version shown
+          # in the header matches what's in the VERSION file.
+          sed -i "s/const APP_VERSION = \"[^\"]*\";/const APP_VERSION = \"$new\";/" gamma-node-editor.html
+          echo "version=$new" >> "$GITHUB_OUTPUT"
+          echo "bumped=true" >> "$GITHUB_OUTPUT"
+          echo "Bumped to v$new"
+
+      - name: Commit version bump
+        if: steps.bump.outputs.bumped == 'true'
+        run: |
+          set -e
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add VERSION gamma-node-editor.html
+          if git diff --cached --quiet; then
+            echo "No diff to commit (sed match likely missed); skipping commit."
+            exit 0
+          fi
+          git commit -m "chore(version): bump to v${{ steps.bump.outputs.version }}"
+          git push
+
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
