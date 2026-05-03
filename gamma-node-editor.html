@@ -613,6 +613,37 @@
   }
   .udsp-new:hover { color: var(--accent); }
   .udsp-new::before { content: "+"; font-size: 14px; }
+
+  /* Community sub-list — shown above the user's local list when the
+     remote fetch succeeds. Each entry is a clickable item that pulls
+     the .gdsp source into the editor as a fresh draft. */
+  .udsp-section-head {
+    padding: 9px 14px 6px;
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--text-3);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .udsp-section-head .reload {
+    margin-left: auto;
+    cursor: pointer;
+    color: var(--text-3);
+    transition: color .12s;
+  }
+  .udsp-section-head .reload:hover { color: var(--accent); }
+  .udsp-comm-status {
+    padding: 2px 14px 8px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--text-3);
+    font-style: italic;
+  }
+  .udsp-comm-status.err { color: var(--danger); font-style: normal; }
+  .udsp-comm-list { border-bottom: 1px solid var(--border); padding-bottom: 6px; }
   .udsp-editor {
     display: grid;
     grid-template-rows: 1fr auto;
@@ -1494,6 +1525,7 @@
           <button class="btn primary" id="btn-udsp-save">Save & Add</button>
           <button class="btn" id="btn-udsp-validate">Validate</button>
           <button class="btn" id="btn-udsp-export">Export .gdsp</button>
+          <button class="btn" id="btn-udsp-submit" title="Open a PR to the community library">↗ Submit</button>
           <button class="btn" id="btn-udsp-ai" title="Ask AI to write/modify .gdsp">✨ AI</button>
           <button class="btn" id="btn-udsp-settings" title="API key settings">⚙</button>
           <span class="udsp-status" id="udsp-status"></span>
@@ -1535,6 +1567,21 @@
           <label id="settings-key-label">API key</label>
           <input id="settings-key" type="password" placeholder="sk-ant-…" />
         </div>
+
+        <!-- Local-model status panel: only shown when Provider == gemma -->
+        <div id="gemma-status-panel" style="display:none; margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border);">
+          <div class="settings-grid" style="grid-template-columns: 110px 1fr;">
+            <label>WebGPU</label>
+            <span id="gemma-webgpu-state" style="font-size: 11.5px; font-family: var(--font-mono);">checking…</span>
+            <label>Model</label>
+            <span id="gemma-model-state" style="font-size: 11.5px; font-family: var(--font-mono);">not loaded</span>
+          </div>
+          <div class="modal-actions" style="margin-top: 12px; justify-content: flex-start;">
+            <button class="btn" id="btn-gemma-preload">Preload model</button>
+          </div>
+          <p class="modal-note" id="gemma-preload-note" style="margin: 10px 0 0; min-height: 18px;"></p>
+        </div>
+
         <div class="modal-actions">
           <button class="btn primary" id="btn-settings-save">Save</button>
           <button class="btn danger" id="btn-settings-clear">Clear key</button>
@@ -3973,6 +4020,15 @@ tabs.forEach(t => {
     paneJson.style.display  = t.dataset.tab === "json"  ? "block" : "none";
     paneUdsp.style.display  = t.dataset.tab === "udsp"  ? "grid"  : "none";
     copyBtn.style.display   = (t.dataset.tab === "code" || t.dataset.tab === "json") ? "inline-block" : "none";
+    // Lazy-fetch the community library on first User DSP tab activation.
+    if (t.dataset.tab === "udsp" && !communityCache && !communityLoading) {
+      loadCommunityList(false);
+    }
+    // CodeMirror needs a refresh when its container becomes visible —
+    // otherwise gutters/cursor render misaligned until the user clicks.
+    if (t.dataset.tab === "udsp" && udspEditor) {
+      setTimeout(() => udspEditor.refresh(), 0);
+    }
   });
 });
 
@@ -4014,9 +4070,101 @@ public:
 
 let editingUdsp = null;  // null = new file; otherwise the type name being edited
 
+/* ---------- Community library cache ----------
+ * Fetched on first User DSP tab activation, then cached in localStorage
+ * for one hour so we don't burn rate-limit budget on every page load.
+ * The list shows above the user's local saves; clicking an entry pulls
+ * the source into the editor as a fresh draft (Save & Add to keep). */
+const COMMUNITY_CACHE_KEY = "gamma-editor-community-cache-v1";
+const COMMUNITY_TTL_MS = 60 * 60 * 1000;
+let communityCache = null;     // { fetchedAt, items: [{name, sha, html_url, source?, directives?}] }
+let communityLoading = false;
+let communityError = null;
+
+async function loadCommunityList(force) {
+  if (communityLoading) return;
+  if (!force) {
+    try {
+      const raw = localStorage.getItem(COMMUNITY_CACHE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && Date.now() - parsed.fetchedAt < COMMUNITY_TTL_MS) {
+          communityCache = parsed;
+          renderUdspList();
+          return;
+        }
+      }
+    } catch (_) {}
+  }
+  communityLoading = true;
+  communityError = null;
+  renderUdspList();
+  try {
+    const url = `https://api.github.com/repos/${COMMUNITY_REPO}/contents/gdsp`;
+    const res = await fetch(url, { headers: { Accept: "application/vnd.github+json" } });
+    if (!res.ok) throw new Error(`GitHub API ${res.status}`);
+    const data = await res.json();
+    const items = data
+      .filter(f => f.type === "file" && f.name.endsWith(".gdsp"))
+      .map(f => ({
+        name: f.name.replace(/\.gdsp$/, ""),
+        sha: f.sha,
+        html_url: f.html_url,
+        download_url: f.download_url
+      }));
+    communityCache = { fetchedAt: Date.now(), items };
+    try { localStorage.setItem(COMMUNITY_CACHE_KEY, JSON.stringify(communityCache)); } catch (_) {}
+  } catch (e) {
+    communityError = e.message;
+  } finally {
+    communityLoading = false;
+    renderUdspList();
+  }
+}
+
+async function loadCommunityItem(item) {
+  setUdspStatus(`Loading ${item.name}.gdsp…`, "");
+  try {
+    const res = await fetch(item.download_url);
+    if (!res.ok) throw new Error(`fetch ${res.status}`);
+    const text = await res.text();
+    editingUdsp = null;     // treat as a fresh draft, not editing the community file
+    setUdspText(text);
+    setUdspStatus(`Loaded ${item.name} from community — Save & Add to keep, or edit and Submit a PR.`, "ok");
+    renderUdspList();
+  } catch (e) {
+    setUdspStatus("Could not load community item: " + e.message, "err");
+  }
+}
+
 function renderUdspList() {
+  let html = "";
+
+  // ---- Community section ----
+  html += `<div class="udsp-section-head">Community
+    <span class="reload" id="udsp-comm-reload" title="Refresh from github.com">↻</span>
+  </div>`;
+  if (communityLoading) {
+    html += `<div class="udsp-comm-status">Fetching community library…</div>`;
+  } else if (communityError) {
+    html += `<div class="udsp-comm-status err">Couldn't reach github.com — ${escapeText(communityError)}</div>`;
+  } else if (!communityCache || !communityCache.items.length) {
+    html += `<div class="udsp-comm-status">No community library yet.</div>`;
+  } else {
+    html += `<div class="udsp-comm-list">`;
+    communityCache.items.forEach(it => {
+      html += `<div class="udsp-list-item" data-comm="${escapeAttr(it.name)}">
+        <span class="dot" style="background:#7f77dd"></span>
+        <span class="name">${escapeText(it.name)}</span>
+      </div>`;
+    });
+    html += `</div>`;
+  }
+
+  // ---- Local section ----
+  html += `<div class="udsp-section-head">Your library</div>`;
   const names = Object.keys(USER_DSP_SOURCES).sort();
-  let html = `<div class="udsp-new" id="udsp-new">New .gdsp</div>`;
+  html += `<div class="udsp-new" id="udsp-new">New .gdsp</div>`;
   if (!names.length) {
     html += `<div class="udsp-list-empty">No user DSP yet — click "New .gdsp" to start</div>`;
   } else {
@@ -4030,7 +4178,21 @@ function renderUdspList() {
       </div>`;
     });
   }
+
   udspList.innerHTML = html;
+
+  const reloadEl = document.getElementById("udsp-comm-reload");
+  if (reloadEl) reloadEl.addEventListener("click", e => {
+    e.stopPropagation();
+    loadCommunityList(true);
+  });
+  udspList.querySelectorAll("[data-comm]").forEach(item => {
+    item.addEventListener("click", () => {
+      const name = item.dataset.comm;
+      const cached = communityCache && communityCache.items.find(x => x.name === name);
+      if (cached) loadCommunityItem(cached);
+    });
+  });
 
   document.getElementById("udsp-new").addEventListener("click", () => {
     editingUdsp = null;
@@ -4039,7 +4201,7 @@ function renderUdspList() {
     udspStatus.className = "udsp-status";
     renderUdspList();
   });
-  udspList.querySelectorAll(".udsp-list-item").forEach(item => {
+  udspList.querySelectorAll(".udsp-list-item[data-name]").forEach(item => {
     item.addEventListener("click", e => {
       if (e.target.dataset.del) return;
       const name = item.dataset.name;
@@ -4100,6 +4262,57 @@ document.getElementById("btn-udsp-save").addEventListener("click", () => {
   } catch (err) {
     setUdspStatus("Error — " + err.message, "err");
   }
+});
+
+/* ---------- Submit to community library ----------
+ * Opens a GitHub PR-creation page pre-filled with the current .gdsp
+ * source. The user authenticates on github.com, sees the diff, and
+ * clicks "Create pull request". The community repo's CI then validates.
+ *
+ * GitHub limits the URL ?value= length around ~10–14 KB depending on
+ * browser. For oversized files we fall back to copying source to the
+ * clipboard and just opening the empty new-file page. */
+const COMMUNITY_REPO = "9LiveZZZ-Git/gamma-community-gdsp";
+const COMMUNITY_BRANCH = "main";
+
+document.getElementById("btn-udsp-submit").addEventListener("click", async () => {
+  const src = getUdspText();
+  let directives;
+  try {
+    directives = parseGdsp(src).directives;
+  } catch (e) {
+    setUdspStatus("Submit needs a parseable .gdsp — fix errors first.", "err");
+    return;
+  }
+  if (!directives.name) {
+    setUdspStatus("Submit needs @gdsp-name.", "err");
+    return;
+  }
+  const filename = `gdsp/${directives.name}.gdsp`;
+  const baseUrl = `https://github.com/${COMMUNITY_REPO}/new/${COMMUNITY_BRANCH}`;
+  const params = new URLSearchParams({
+    filename,
+    value: src,
+    message: `Add ${directives.name}`,
+    description: directives.description || ""
+  });
+  const fullUrl = baseUrl + "?" + params.toString();
+
+  // Some browsers cap URL length around 8K. If we'd exceed that, copy
+  // the source to clipboard and open the empty new-file page so the
+  // user can paste it themselves.
+  if (fullUrl.length > 7800) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      try { await navigator.clipboard.writeText(src); } catch (_) {}
+      setUdspStatus("File too large to prefill — source copied to clipboard. Paste in the new file.", "ok");
+    } else {
+      setUdspStatus("File too large to prefill the URL — copy the source manually after the page opens.", "err");
+    }
+    window.open(`${baseUrl}?filename=${encodeURIComponent(filename)}`, "_blank", "noopener");
+    return;
+  }
+  window.open(fullUrl, "_blank", "noopener");
+  setUdspStatus(`Opened submit page for ${directives.name}.gdsp on github.com`, "ok");
 });
 
 document.getElementById("btn-udsp-export").addEventListener("click", () => {
@@ -4669,6 +4882,10 @@ function applyProviderUi(p) {
   // Hide key field for Gemma (no key needed)
   sKey.style.display      = isLocal ? "none" : "block";
   sKeyLabel.style.display = isLocal ? "none" : "block";
+  // Show / refresh the local-model status panel
+  const panel = document.getElementById("gemma-status-panel");
+  if (panel) panel.style.display = isLocal ? "block" : "none";
+  if (isLocal) refreshGemmaStatus();
   // Warn if WebGPU isn't available
   if (isLocal && !setupGemmaAvailable()) {
     sNoteLocal.style.color = "var(--danger)";
@@ -4678,6 +4895,64 @@ function applyProviderUi(p) {
     sNoteLocal.textContent = "Local models run entirely in your browser via WebGPU. No data leaves your machine. The first time you Run, the model weights download (~1.5 GB for E4B, ~500 MB for E2B) and are cached in the browser; subsequent runs are offline. Requires a WebGPU-capable browser (Chrome, Edge, recent Safari) and a discrete GPU or unified-memory machine with at least 4 GB free.";
   }
 }
+
+/* Gemma status panel — shows WebGPU availability and current model load
+ * state in the settings modal. The "Preload model" button triggers
+ * ensureGemmaPipeline without running inference, so users can warm the
+ * model at their leisure rather than waiting at the first prompt. */
+function refreshGemmaStatus() {
+  const gpu = document.getElementById("gemma-webgpu-state");
+  const mod = document.getElementById("gemma-model-state");
+  if (!gpu || !mod) return;
+  if (setupGemmaAvailable()) {
+    gpu.textContent = "available";
+    gpu.style.color = "var(--audio)";
+  } else {
+    gpu.textContent = "not available";
+    gpu.style.color = "var(--danger)";
+  }
+  if (gemmaPipeline) {
+    mod.textContent = "loaded — " + (gemmaCurrentModel || "");
+    mod.style.color = "var(--audio)";
+  } else if (gemmaLoadPromise) {
+    mod.textContent = "loading…";
+    mod.style.color = "var(--accent)";
+  } else {
+    mod.textContent = "not loaded — first Run will download";
+    mod.style.color = "var(--text-3)";
+  }
+}
+
+document.getElementById("btn-gemma-preload").addEventListener("click", async () => {
+  const note = document.getElementById("gemma-preload-note");
+  if (!setupGemmaAvailable()) {
+    note.textContent = "WebGPU isn't available — preload would fail.";
+    note.style.color = "var(--danger)";
+    return;
+  }
+  const model = sModelLocal.value || PROVIDERS.gemma.defaultModel;
+  note.textContent = "Loading model… first run downloads ~1.5 GB. Watch the network tab if curious.";
+  note.style.color = "var(--text-2)";
+  setGemmaProgressHook((p) => {
+    if (p && typeof p.progress === "number") {
+      note.textContent = `Loading: ${(p.progress * 100).toFixed(0)}% (${p.file || ""})`;
+    } else if (p && p.status) {
+      note.textContent = `${p.status} — ${p.file || ""}`;
+    }
+    refreshGemmaStatus();
+  });
+  try {
+    await ensureGemmaPipeline(model);
+    note.textContent = "Loaded. Future Runs are instant until the page reloads.";
+    note.style.color = "var(--audio)";
+    refreshGemmaStatus();
+  } catch (e) {
+    note.textContent = "Preload failed: " + e.message;
+    note.style.color = "var(--danger)";
+  } finally {
+    setGemmaProgressHook(null);
+  }
+});
 
 function openSettings() {
   sProvider.value = aiSettings.provider;
