@@ -1199,6 +1199,54 @@
   }
   .copy-build-btn.copied { color: var(--audio); border-color: var(--audio); }
 
+  /* ---------- Compile progress bar (Phase 4) ---------- */
+  .preview-progress {
+    display: inline-flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 240px;
+    max-width: 360px;
+    padding: 2px 0;
+  }
+  .preview-progress-bar {
+    display: block;
+    height: 4px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    overflow: hidden;
+    position: relative;
+  }
+  .preview-progress-fill {
+    display: block;
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, var(--accent) 0%, #d8f570 100%);
+    box-shadow: 0 0 6px rgba(200, 232, 90, 0.6);
+    border-radius: 999px;
+    transition: width 0.3s ease;
+  }
+  .preview-progress-fill.indeterminate {
+    width: 30% !important;
+    animation: preview-progress-slide 1.6s ease-in-out infinite;
+  }
+  @keyframes preview-progress-slide {
+    0%   { transform: translateX(-100%); }
+    50%  { transform: translateX(180%); }
+    100% { transform: translateX(180%); }
+  }
+  .preview-progress-meta {
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    color: var(--text-3);
+    letter-spacing: 0.04em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .preview-progress-meta .stage-name { color: var(--text-2); }
+  .preview-progress-meta .eta { color: var(--accent); }
+
   /* ---------- Build pane ---------- */
   .build-pane { padding: 0 !important; overflow: auto; }
   .build-summary {
@@ -1568,6 +1616,10 @@
       </div>
       <span class="preview-status" id="preview-status" title="Real-time audio preview status">idle</span>
       <button class="btn icon-btn copy-status-btn" id="btn-copy-status" title="Copy error message to clipboard" style="display:none;">⧉</button>
+      <span class="preview-progress" id="preview-progress" style="display:none;">
+        <span class="preview-progress-bar"><span class="preview-progress-fill" id="preview-progress-fill"></span></span>
+        <span class="preview-progress-meta" id="preview-progress-meta"></span>
+      </span>
       <button class="btn primary" id="btn-gen" title="Open the Generated C++ tab">Generate C++</button>
       <button class="btn icon-btn" id="btn-help" title="Keyboard shortcuts">?</button>
     </div>
@@ -5896,6 +5948,163 @@ const previewBtnStop = document.getElementById("btn-preview-stop");
 const previewStatusEl = document.getElementById("preview-status");
 const previewGroupEl = previewBtnPlay && previewBtnPlay.closest(".preview-group");
 
+/* ------------- Compile progress tracker ------------- */
+/* Stage list ordered by execution. `baseline` is the first-run estimate
+ * in milliseconds; after a successful compile the actual measured time
+ * is cached to localStorage and overrides the baseline next session,
+ * so ETAs become honest (cached clang load is ~5 s, not 3 min). */
+const PREVIEW_STAGES = [
+  { id: "prepare",     label: "preparing",                    baseline: 200    },
+  { id: "import-sdk",  label: "loading Wasmer SDK",           baseline: 1500   },
+  { id: "init-sdk",    label: "initializing runtime",         baseline: 800    },
+  { id: "load-clang",  label: "loading clang/clang package",  baseline: 180000 },
+  { id: "fetch-gamma", label: "fetching Gamma archive",       baseline: 800    },
+  { id: "extract",     label: "extracting + staging",         baseline: 300    },
+  { id: "write-patch", label: "writing patch source",         baseline: 50     },
+  { id: "compile",     label: "invoking clang + linking",     baseline: 12000  },
+  { id: "load-wasm",   label: "loading audio worklet",        baseline: 200    }
+];
+const PREVIEW_BASELINE_KEY = "gamma-preview-stage-times-v1";
+
+(function loadCachedBaselines() {
+  try {
+    const raw = localStorage.getItem(PREVIEW_BASELINE_KEY);
+    if (!raw) return;
+    const cached = JSON.parse(raw);
+    PREVIEW_STAGES.forEach(s => {
+      if (typeof cached[s.id] === "number" && cached[s.id] > 0) {
+        s.baseline = cached[s.id];
+      }
+    });
+  } catch (_) {}
+})();
+
+const previewProgress = {
+  startTime: 0,
+  stageIdx: -1,
+  stageStart: 0,
+  subProgress: 0,    // 0..1, or 0 for "unknown / indeterminate"
+  tickerId: null
+};
+
+function fmtDuration(ms) {
+  if (ms < 950) return Math.max(0, Math.round(ms)) + "ms";
+  const s = Math.round(ms / 1000);
+  if (s < 60) return s + "s";
+  const m = Math.floor(s / 60);
+  const sr = s % 60;
+  return m + "m " + (sr < 10 ? "0" : "") + sr + "s";
+}
+
+function previewProgressShow() {
+  const el = document.getElementById("preview-progress");
+  if (el) el.style.display = "inline-flex";
+}
+function previewProgressHide() {
+  const el = document.getElementById("preview-progress");
+  if (el) el.style.display = "none";
+}
+
+function previewProgressStart() {
+  previewProgress.startTime = Date.now();
+  previewProgress.stageIdx = -1;
+  previewProgress.subProgress = 0;
+  previewProgressShow();
+  if (previewProgress.tickerId) clearInterval(previewProgress.tickerId);
+  previewProgress.tickerId = setInterval(previewProgressTick, 250);
+  previewProgressTick();
+}
+
+function previewProgressEnd(saveBaselines) {
+  if (previewProgress.tickerId) clearInterval(previewProgress.tickerId);
+  previewProgress.tickerId = null;
+  if (saveBaselines) {
+    // Mark the in-flight stage as completed too.
+    if (previewProgress.stageIdx >= 0) {
+      const cur = PREVIEW_STAGES[previewProgress.stageIdx];
+      cur.lastMeasured = Date.now() - previewProgress.stageStart;
+    }
+    try {
+      const out = {};
+      PREVIEW_STAGES.forEach(s => {
+        if (s.lastMeasured > 0) out[s.id] = s.lastMeasured;
+      });
+      localStorage.setItem(PREVIEW_BASELINE_KEY, JSON.stringify(out));
+    } catch (_) {}
+  }
+  previewProgressHide();
+}
+
+function previewProgressStage(stageId, sub) {
+  // Record actual time for the previously active stage.
+  if (previewProgress.stageIdx >= 0) {
+    const prev = PREVIEW_STAGES[previewProgress.stageIdx];
+    prev.lastMeasured = Date.now() - previewProgress.stageStart;
+  }
+  const idx = PREVIEW_STAGES.findIndex(s => s.id === stageId);
+  if (idx < 0) return;   // unknown stage id — ignore
+  previewProgress.stageIdx = idx;
+  previewProgress.stageStart = Date.now();
+  previewProgress.subProgress = (typeof sub === "number" && sub > 0) ? Math.min(1, sub) : 0;
+  previewProgressTick();
+}
+
+function previewProgressSub(sub) {
+  if (typeof sub !== "number") return;
+  previewProgress.subProgress = Math.max(0, Math.min(1, sub));
+  previewProgressTick();
+}
+
+function previewProgressTick() {
+  if (previewProgress.stageIdx < 0) return;
+  const fill = document.getElementById("preview-progress-fill");
+  const meta = document.getElementById("preview-progress-meta");
+  if (!fill || !meta) return;
+
+  const totalBaseline = PREVIEW_STAGES.reduce((s, x) => s + x.baseline, 0);
+  const completedBaseline = PREVIEW_STAGES
+    .slice(0, previewProgress.stageIdx)
+    .reduce((s, x) => s + x.baseline, 0);
+  const stage = PREVIEW_STAGES[previewProgress.stageIdx];
+  const stageElapsed = Date.now() - previewProgress.stageStart;
+
+  // Stage contribution: real fraction if known, else time-based estimate
+  // capped at 90% so an over-running stage doesn't wedge the bar at 100%.
+  let stageContribution;
+  let indeterminate = false;
+  if (previewProgress.subProgress > 0) {
+    stageContribution = stage.baseline * previewProgress.subProgress;
+  } else {
+    indeterminate = true;
+    stageContribution = Math.min(stage.baseline * 0.9, stageElapsed);
+  }
+  const totalContribution = completedBaseline + stageContribution;
+  const fraction = Math.min(0.99, totalContribution / totalBaseline);
+
+  fill.classList.toggle("indeterminate", indeterminate);
+  if (!indeterminate) {
+    fill.style.width = (fraction * 100).toFixed(1) + "%";
+  }
+
+  const elapsed = Date.now() - previewProgress.startTime;
+  const remaining = Math.max(0, totalBaseline - totalContribution);
+  meta.innerHTML =
+    `<span class="stage-name">${stage.label}</span> · ` +
+    `${previewProgress.stageIdx + 1}/${PREVIEW_STAGES.length} · ` +
+    `${fmtDuration(elapsed)} elapsed · ` +
+    `<span class="eta">~${fmtDuration(remaining)} left</span>`;
+}
+
+function previewProgressFinish() {
+  // Snap bar to 100% briefly before hiding.
+  const fill = document.getElementById("preview-progress-fill");
+  if (fill) {
+    fill.classList.remove("indeterminate");
+    fill.style.width = "100%";
+  }
+  setTimeout(() => previewProgressEnd(true), 450);
+}
+
 function setPreviewStatus(state, msg) {
   previewState.state = state;
   previewState.lastStatusMsg = msg || state;
@@ -6142,12 +6351,12 @@ let clangPkg = null;
 let projectDir = null;
 let archiveStagedFor = null;   // archive URL we last staged from
 
+function progress(stage, sub) {
+  self.postMessage({ type: "progress", stage, subProgress: sub });
+}
+
 async function ensureWasmer(sdkUrl) {
   if (wasmerMod) return wasmerMod;
-  // The SDK uses SharedArrayBuffer + threads via WASIX. Without
-  // cross-origin isolation, init() fails partway through with a
-  // confusing "oneshot canceled" error from internal Tokio plumbing.
-  // Catch it early with a clear message instead.
   if (typeof SharedArrayBuffer === "undefined" || !self.crossOriginIsolated) {
     throw new Error(
       "Cross-origin isolation is not active. The page needs to be served " +
@@ -6157,14 +6366,16 @@ async function ensureWasmer(sdkUrl) {
       "in a fresh tab. crossOriginIsolated=" + self.crossOriginIsolated
     );
   }
+  progress("import-sdk");
   wasmerMod = await import(sdkUrl);
+  progress("init-sdk");
   await wasmerMod.init();
   return wasmerMod;
 }
 
 async function ensureClang() {
   if (clangPkg) return clangPkg;
-  self.postMessage({ type: "progress", step: "loading clang/clang package…" });
+  progress("load-clang");
   clangPkg = await wasmerMod.Wasmer.fromRegistry("clang/clang");
   return clangPkg;
 }
@@ -6198,12 +6409,29 @@ function parseTar(buf) {
 }
 
 async function fetchAndExtract(archiveUrl) {
-  self.postMessage({ type: "progress", step: "fetching libgamma.a archive…" });
+  progress("fetch-gamma");
   const res = await fetch(archiveUrl);
   if (!res.ok) throw new Error("Gamma archive fetch failed: " + res.status + " from " + archiveUrl);
-  // Decompress via the browser's DecompressionStream (gzip).
-  const stream = res.body.pipeThrough(new DecompressionStream("gzip"));
+  // Read the body manually so we can emit byte-level progress. The
+  // Content-Length header is the compressed size from GitHub Pages.
+  const total = parseInt(res.headers.get("content-length") || "0", 10);
+  const reader = res.body.getReader();
+  const chunks = [];
+  let received = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.length;
+    if (total > 0) progress("fetch-gamma", received / total);
+  }
+  // Reassemble into a single Uint8Array, then decompress.
+  const compressed = new Uint8Array(received);
+  let off = 0;
+  for (const c of chunks) { compressed.set(c, off); off += c.length; }
+  const stream = new Blob([compressed]).stream().pipeThrough(new DecompressionStream("gzip"));
   const tarBuf = await new Response(stream).arrayBuffer();
+  progress("extract");
   return parseTar(tarBuf);
 }
 
@@ -6245,10 +6473,10 @@ self.onmessage = async (ev) => {
       await ensureClang();
       const dir = await stageArchive(msg.archiveUrl);
 
-      self.postMessage({ type: "progress", step: "writing patch.cpp…" });
+      progress("write-patch");
       await dir.writeFile("patch.cpp", new TextEncoder().encode(msg.wrappedSrc));
 
-      self.postMessage({ type: "progress", step: "invoking clang…" });
+      progress("compile");
       // Build clang argv:
       //   - C++17, -O1 for speed (O2 is too slow per-keystroke for hot reload)
       //   - target wasm32-wasi (matches what wasmer's clang sysroot expects)
@@ -6431,8 +6659,13 @@ async function ensureAudioWorklet() {
   });
   node.connect(previewState.audioCtx.destination);
   node.port.onmessage = (ev) => {
-    if (ev.data.type === "loaded") setPreviewStatus("playing", "playing");
-    else if (ev.data.type === "error") setPreviewStatus("error", "worklet: " + ev.data.error);
+    if (ev.data.type === "loaded") {
+      previewProgressFinish();
+      setPreviewStatus("playing", "playing");
+    } else if (ev.data.type === "error") {
+      previewProgressEnd(false);
+      setPreviewStatus("error", "worklet: " + ev.data.error);
+    }
   };
   previewState.workletNode = node;
   return node;
@@ -6441,14 +6674,19 @@ async function ensureAudioWorklet() {
 /* ------------- Compile + load + play orchestration ------------- */
 async function previewCompileAndPlay() {
   setPreviewStatus("compiling", "compiling…");
+  previewProgressStart();
+  previewProgressStage("prepare");
+
   let patchCpp;
   try {
     patchCpp = generateCode();
   } catch (e) {
+    previewProgressEnd(false);
     setPreviewStatus("error", "codegen: " + e.message);
     return;
   }
   if (patchCpp.startsWith("// ❌")) {
+    previewProgressEnd(false);
     setPreviewStatus("error", "patch has cycle without Delay1 — see canvas");
     return;
   }
@@ -6459,26 +6697,44 @@ async function previewCompileAndPlay() {
   try {
     await ensureCompileWorker();
   } catch (e) {
+    previewProgressEnd(false);
     setPreviewStatus("error", "worker init: " + e.message);
     return;
   }
 
-  // Send compile request. Worker streams `progress` updates while it
-  // works (loading clang, fetching archive, invoking compiler), then
-  // sends `compiled` or `compile-error` as the terminal message.
+  // Send compile request. Worker streams `progress` updates with
+  // stage IDs (and optional subProgress for byte-level fetch tracking)
+  // while it works, then sends `compiled` or `compile-error` as the
+  // terminal message.
   const wasmBytes = await new Promise((resolve, reject) => {
     const onReply = (ev) => {
       const m = ev.data;
       if (m.type === "progress") {
-        setPreviewStatus("compiling", "compiling… " + m.step);
+        if (m.stage) {
+          if (typeof m.subProgress === "number" && m.subProgress > 0) {
+            // Same stage as before but with an updated sub-progress.
+            const stageIdx = PREVIEW_STAGES.findIndex(s => s.id === m.stage);
+            if (stageIdx === previewProgress.stageIdx) {
+              previewProgressSub(m.subProgress);
+            } else {
+              previewProgressStage(m.stage, m.subProgress);
+            }
+          } else {
+            previewProgressStage(m.stage);
+          }
+          // Keep the pill text aligned for the copyable "current state".
+          const stage = PREVIEW_STAGES.find(s => s.id === m.stage);
+          if (stage) setPreviewStatus("compiling", "compiling… " + stage.label);
+        } else if (m.step) {
+          // Backwards-compat with old freeform step messages.
+          setPreviewStatus("compiling", "compiling… " + m.step);
+        }
       } else if (m.type === "warnings") {
-        // Non-fatal warnings — keep going, surface in build pane.
         showCompileStderr(m.stderr || "", null);
       } else if (m.type === "compiled") {
         previewState.worker.removeEventListener("message", onReply);
         if (m.stderr) showCompileStderr(m.stderr, null);
         else showCompileStderr("", null);
-        // wasmBytes may arrive as ArrayBuffer (transferred) or Uint8Array.
         const bytes = m.wasmBytes instanceof ArrayBuffer ? m.wasmBytes : m.wasmBytes.buffer;
         resolve(bytes);
       } else if (m.type === "compile-error") {
@@ -6494,6 +6750,7 @@ async function previewCompileAndPlay() {
       sdkUrl: PREVIEW.wasmerSdkUrl
     });
   }).catch(e => {
+    previewProgressEnd(false);
     setPreviewStatus("error", "compile: " + e.message);
     showCompileStderr(e.stderr || "", e.message);
     return null;
@@ -6502,11 +6759,14 @@ async function previewCompileAndPlay() {
   if (!wasmBytes) return;
 
   try {
+    previewProgressStage("load-wasm");
     const node = await ensureAudioWorklet();
     if (previewState.audioCtx.state === "suspended") await previewState.audioCtx.resume();
     node.port.postMessage({ type: "load", wasmBytes }, [wasmBytes]);
-    // status flips to "playing" when the worklet posts back "loaded"
+    // setPreviewStatus("playing") fires when worklet posts back "loaded";
+    // we finish the progress bar there too via the existing handler.
   } catch (e) {
+    previewProgressEnd(false);
     setPreviewStatus("error", "audio: " + e.message);
   }
 }
