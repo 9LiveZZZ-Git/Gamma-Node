@@ -1762,6 +1762,34 @@ const TYPES = {
     methods: { freq: "freq" },
     description: "Complex sine (rotates on unit circle)"
   },
+  Triangle: {
+    category: "Oscillator", color: COLOR.oscillator, header: "Oscillator",
+    cppType: "gam::LFO<>",
+    ins: [{n:"freq", t:"param"}],
+    outs: [{n:"out", t:"audio"}],
+    params: { freq: 220, amp: 1 },
+    methods: { freq: "freq", amp: "amp" },
+    extraCtor: ["{id}.mode(gam::LFO<>::TRI);"],
+    description: "Bandlimited triangle (LFO in TRI mode)"
+  },
+  TableSine: {
+    category: "Oscillator", color: COLOR.oscillator, header: "Oscillator",
+    cppType: "gam::TableSine<>",
+    ins: [{n:"freq", t:"param"}],
+    outs: [{n:"out", t:"audio"}],
+    params: { freq: 440 },
+    methods: { freq: "freq" },
+    description: "Pre-computed sine table — cheaper than Sine when freq is fixed"
+  },
+  Sweep: {
+    category: "Oscillator", color: COLOR.oscillator, header: "Oscillator",
+    cppType: "gam::Sweep<>",
+    ins: [{n:"freq", t:"param"}],
+    outs: [{n:"out", t:"audio"}],
+    params: { freq: 1 },
+    methods: { freq: "freq" },
+    description: "Linear ramp from 0 to 1, then wraps. Useful as a phase source."
+  },
 
   /* ---- Noise (Noise.h) ---- */
   NoiseWhite: {
@@ -1977,6 +2005,29 @@ const TYPES = {
     params: { time: 0.01, ffd: 0.5, fbk: 0.5 },
     methods: { time: "delay", ffd: "ffd", fbk: "fbk" },
     description: "Comb filter (feedforward + feedback)"
+  },
+
+  /* ---- Multi-output (codegen binds these to a temporary; consumers index into it) ---- */
+  Pan2: {
+    category: "Effect", color: COLOR.effect, header: "Effects",
+    cppType: "gam::Pan2<>",
+    ins: [{n:"in", t:"audio"}, {n:"pan", t:"param"}],
+    // outs[*].access is the suffix appended to the bound `_id` to read
+    // each port. For Gamma's Pan2 the call returns a Vec2-like with
+    // [0]=L, [1]=R. If your Gamma version uses .first/.second instead,
+    // change the access strings here — the codegen path is the same.
+    outs: [{n:"L", t:"audio", access: "[0]"}, {n:"R", t:"audio", access: "[1]"}],
+    params: { pan: 0 },
+    methods: { pan: "pos" },
+    description: "Equal-power stereo panner. pan ∈ [-1, 1]."
+  },
+  Hilbert: {
+    category: "Effect", color: COLOR.effect, header: "Effects",
+    cppType: "gam::Hilbert<>",
+    ins: [{n:"in", t:"audio"}],
+    outs: [{n:"real", t:"audio", access: "[0]"}, {n:"imag", t:"audio", access: "[1]"}],
+    params: {},
+    description: "Hilbert transformer — splits input into real and imaginary parts (analytic signal)"
   },
 
   /* ---- Effects (Effects.h) ---- */
@@ -2987,52 +3038,64 @@ function renderProps() {
  * return type and final return expression.
  * ======================================================================== */
 
-/* exprFor builds the C++ expression for a node's output. Pure: never
- * mutates anything except the shared cache. Binding (for fan-out) and
- * statement ordering (param hoists vs. binds) are handled by the
- * prepareSample walker below — when it binds a node, it writes the
- * bound name into cgCtx.cache, so subsequent exprFor calls reuse it.
+/* exprFor builds the C++ expression for one of a node's output ports.
+ * For single-output nodes the srcPortName is irrelevant (the node has
+ * one output and that's what's returned). For multi-output nodes
+ * (Pan2, Hilbert, StateVariableFilter, ...) each output port is read
+ * from the same call expression by appending the port's `access`
+ * string — `[0]`, `.first`, `.real()`, etc.
+ *
+ * Multi-output nodes are ALWAYS bound to a local by prepareSample, so
+ * by the time consumers call exprFor for them the cache holds the
+ * bound name. Each consumer then gets `_<id><port.access>`. This is
+ * what makes one-call-per-sample correct even when a Pan2 feeds both
+ * channels of OutputStereo.
  *
  * cgCtx fields:
- *   cache    — nodeId → expression string (or bound name like "_n3")
+ *   cache    — nodeId → base expression (or bound name like "_n3")
  *   visiting — nodeId → true while in-flight (cycle safety; real cycle
  *              detection runs separately and rejects upstream)
  *   fanout   — nodeId → outgoing edge count
  */
-function exprFor(nodeId, cgCtx) {
+function portAccess(def, srcPortName) {
+  if (!def || !def.outs || def.outs.length <= 1) return "";
+  const port = def.outs.find(p => p.n === srcPortName);
+  return (port && port.access) || "";
+}
+
+function exprFor(nodeId, srcPortName, cgCtx) {
   const { cache, visiting } = cgCtx;
-  if (cache[nodeId] !== undefined) return cache[nodeId];
-  if (visiting[nodeId]) return "0.f /* CYCLE without Delay1 */";
-  visiting[nodeId] = true;
   const node = nodeById(nodeId);
-  if (!node) {
-    cache[nodeId] = "0.f /* missing node */";
-    visiting[nodeId] = false;
-    return cache[nodeId];
-  }
+  if (!node) return "0.f /* missing node */";
   const def = defOf(node);
-  if (!def) {
-    cache[nodeId] = `0.f /* unknown type: ${node.type} */`;
-    visiting[nodeId] = false;
-    return cache[nodeId];
-  }
+  if (!def) return `0.f /* unknown type: ${node.type} */`;
 
   // Delay1 short-circuit: output is the value cached at the top of
   // operator() from last sample's stored state. Don't recurse into the
   // input — write-back is emitted separately by generateCode.
-  if (def.kind === "delay1") {
-    cache[nodeId] = `${nodeId}_out`;
-    visiting[nodeId] = false;
-    return cache[nodeId];
-  }
+  if (def.kind === "delay1") return `${nodeId}_out`;
 
-  let expr;
+  let base;
+  if (cache[nodeId] !== undefined) {
+    base = cache[nodeId];
+  } else if (visiting[nodeId]) {
+    return "0.f /* CYCLE without Delay1 */";
+  } else {
+    visiting[nodeId] = true;
+    base = computeBase(node, def, cgCtx);
+    cache[nodeId] = base;
+    visiting[nodeId] = false;
+  }
+  return base + portAccess(def, srcPortName);
+}
+
+function computeBase(node, def, cgCtx) {
   if (def.template) {
     const ctx = {};
     def.ins.forEach(p => {
       const e = state.edges.find(ed => ed.to.node === node.id && ed.to.port === p.n);
       if (e) {
-        ctx[p.n] = exprFor(e.from.node, cgCtx);
+        ctx[p.n] = exprFor(e.from.node, e.from.port, cgCtx);
       } else if (node.params[p.n] !== undefined) {
         ctx[p.n] = fmt(node.params[p.n]);
       } else {
@@ -3042,31 +3105,25 @@ function exprFor(nodeId, cgCtx) {
     Object.keys(node.params).forEach(k => {
       if (ctx[k] === undefined) ctx[k] = fmt(node.params[k]);
     });
-    expr = def.template.replace(/\{(\w+)\}/g, (m, k) => {
+    return def.template.replace(/\{(\w+)\}/g, (m, k) => {
       return ctx[k] !== undefined ? "(" + ctx[k] + ")" : m;
     });
   } else if (def.cppType) {
     const audioIn = def.ins.find(p => p.t === "audio");
     if (audioIn) {
       const e = state.edges.find(ed => ed.to.node === node.id && ed.to.port === audioIn.n);
-      const inExpr = e ? exprFor(e.from.node, cgCtx) : "0.f";
-      expr = `${node.id}(${inExpr})`;
-    } else {
-      expr = `${node.id}()`;
+      const inExpr = e ? exprFor(e.from.node, e.from.port, cgCtx) : "0.f";
+      return `${node.id}(${inExpr})`;
     }
+    return `${node.id}()`;
   } else {
     const audioIn = def.ins.find(p => p.t === "audio");
     if (audioIn) {
       const e = state.edges.find(ed => ed.to.node === node.id && ed.to.port === audioIn.n);
-      expr = e ? exprFor(e.from.node, cgCtx) : "0.f";
-    } else {
-      expr = "0.f";
+      return e ? exprFor(e.from.node, e.from.port, cgCtx) : "0.f";
     }
+    return "0.f";
   }
-
-  cache[nodeId] = expr;
-  visiting[nodeId] = false;
-  return expr;
 }
 
 /* Topological walker that emits per-sample setter calls (param hoists)
@@ -3111,20 +3168,23 @@ function prepareSample(cgCtx) {
       if (p.t !== "param") return;
       const e = state.edges.find(ed => ed.to.node === nodeId && ed.to.port === p.n);
       if (!e) return;
-      const upstream = exprFor(e.from.node, cgCtx);
+      const upstream = exprFor(e.from.node, e.from.port, cgCtx);
       const m = (def.methods && def.methods[p.n]) || p.n;
       lines.push(`        ${nodeId}.${m}(${upstream});`);
     });
 
-    // Fan-out bind: only for member nodes whose output is consumed by
-    // more than one downstream port. Single-use member calls stay
-    // inline at the consumer (the C++ compiler emits identical code).
-    if (cgCtx.fanout[nodeId] > 1) {
+    // Bind to a local when:
+    //   (a) the output fans out to >1 downstream port, OR
+    //   (b) the node has multi-output (>1 outs entry) — every consumer
+    //       indexes into the same call result, so we MUST evaluate it
+    //       once and share the local.
+    const multiOut = def.outs && def.outs.length > 1;
+    if (cgCtx.fanout[nodeId] > 1 || multiOut) {
       const audioIn = def.ins.find(p => p.t === "audio");
       let inExpr = "0.f";
       if (audioIn) {
         const e = state.edges.find(ed => ed.to.node === nodeId && ed.to.port === audioIn.n);
-        if (e) inExpr = exprFor(e.from.node, cgCtx);
+        if (e) inExpr = exprFor(e.from.node, e.from.port, cgCtx);
       }
       const callExpr = audioIn ? `${nodeId}(${inExpr})` : `${nodeId}()`;
       cgCtx.cache[nodeId] = `_${nodeId}`;
@@ -3238,7 +3298,7 @@ function fmt(v) {
 function inputExpr(nodeId, portName, cgCtx) {
   const e = state.edges.find(ed => ed.to.node === nodeId && ed.to.port === portName);
   if (!e) return "0.f";
-  return exprFor(e.from.node, cgCtx);
+  return exprFor(e.from.node, e.from.port, cgCtx);
 }
 
 function gatherHeaders() {
@@ -3398,7 +3458,7 @@ function generateCode() {
   const delay1Writes = [];
   delay1Nodes.forEach(n => {
     const e = state.edges.find(ed => ed.to.node === n.id && ed.to.port === "in");
-    const inExpr = e ? exprFor(e.from.node, cgCtx) : "0.f";
+    const inExpr = e ? exprFor(e.from.node, e.from.port, cgCtx) : "0.f";
     delay1Writes.push(`        ${n.id}_z = ${inExpr};`);
   });
 
