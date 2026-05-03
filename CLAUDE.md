@@ -8,11 +8,13 @@ This is a **single-file web application**, not a typical Node project. There is 
 
 **Running it:** open `gamma-node-editor.html` in a Chromium-based browser (Chrome/Edge for WebGPU). For local development, just double-click the file or serve the directory with any static server (`python -m http.server`, `npx serve`, etc.). No install step.
 
-The other three files at the root are **design docs**, not code:
+**Design docs live locally in `docs/` and are gitignored** — they are not part of the public repo. Reference them when present:
 
-- `SPEC.md` — canonical specification. The source of truth for *intended* behavior. Sections 4–10 describe what the V1 prototype actually implements; later sections (11+) describe deferred features.
-- `EXPANSION.md` — forward-looking roadmap of nodes/features to add, with complexity tags (`[gamma]`, `[composite]`, `[multi-out]`, `[block]`, etc.).
-- `OPTIONS.md` — decision menu of unresolved choices (HWR backends, roadmap ordering, infra). Reflects current decisions; check the status box at top before assuming any "default" is still default.
+- `docs/SPEC.md` — canonical specification. Source of truth for *intended* behavior. §§4–10 cover the V1 prototype scope; §§11+ are deferred.
+- `docs/EXPANSION.md` — forward-looking roadmap of nodes/features, tagged by complexity (`[gamma]`, `[composite]`, `[multi-out]`, `[block]`, etc.).
+- `docs/OPTIONS.md` — decision menu for unresolved choices. Check the status box at top before assuming any "default" is still default.
+
+If `docs/` is missing, work from this CLAUDE.md plus the code; don't assume the docs exist on every machine. Active roadmap and milestone tracking happens through the user's planning artifacts, not these docs.
 
 When the spec and the prototype disagree, **the prototype is what users actually use**, but the spec is what they expect the prototype to *become*. Make changes that move the prototype toward the spec, not away from it.
 
