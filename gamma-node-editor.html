@@ -1099,6 +1099,17 @@
     box-shadow: 0 0 6px rgba(200, 232, 90, 0.55);
     margin-left: 7px;
   }
+  .brand .file {
+    cursor: text;
+    padding: 2px 6px;
+    margin: -2px -6px;
+    border-radius: 3px;
+    border: 1px solid transparent;
+    transition: border-color .12s, background .12s;
+  }
+  .brand .file:hover { border-color: var(--border-strong); background: var(--surface-2); }
+  .brand .file:focus { outline: none; border-color: var(--accent); background: var(--bg); box-shadow: 0 0 0 3px rgba(200, 232, 90, 0.12); }
+  .brand .file.editing::after { display: none; }
   .brand .stats {
     padding: 3px 9px;
     background: var(--surface-2);
@@ -1598,7 +1609,7 @@
     <div class="brand">
       <span class="mark"><span class="mark-sq"></span>Gamma<span class="mark-sub">node editor</span></span>
       <a class="ver-pill" id="app-version" href="https://github.com/9LiveZZZ-Git/Gamma-Node/commits/main" target="_blank" rel="noopener" title="Auto-bumped on every push to main. Click to see commit history."></a>
-      <span class="file" id="filename">untitled.gpatch</span>
+      <span class="file" id="filename" title="Click to rename. Updates the .gpatch filename and the generated C++ class name." tabindex="0">untitled.gpatch</span>
       <span class="stats" id="stats">5 nodes · 4 connections</span>
     </div>
     <div class="toolbar">
@@ -1612,7 +1623,7 @@
       </div>
       <div class="btn-group preview-group" role="group" aria-label="Preview">
         <button class="btn preview-btn" id="btn-preview-play" title="Compile patch and start playback (Space)">▶</button>
-        <button class="btn preview-btn" id="btn-preview-stop" title="Stop playback" disabled>■</button>
+        <button class="btn preview-btn" id="btn-preview-stop" title="Stop playback / cancel compile" disabled>■</button>
       </div>
       <span class="preview-status" id="preview-status" title="Real-time audio preview status">idle</span>
       <button class="btn icon-btn copy-status-btn" id="btn-copy-status" title="Copy error message to clipboard" style="display:none;">⧉</button>
@@ -4391,6 +4402,75 @@ function switchTab(name) {
   }
 })();
 
+/* ---------- Editable patch filename ----------
+ * Click the filename in the header to rename. Updates state.filename
+ * (the .gpatch save name) and state.patchName (the C++ class name —
+ * sanitized to a valid C++ identifier). Pushes one undo entry per edit. */
+(function setupFilenameEdit() {
+  const el = document.getElementById("filename");
+  if (!el) return;
+  let originalText = "";
+
+  function startEdit() {
+    if (el.classList.contains("editing")) return;
+    el.classList.add("editing");
+    el.contentEditable = "true";
+    originalText = state.filename || "untitled.gpatch";
+    el.textContent = originalText;
+    // Select the stem (without .gpatch) so retyping is fast.
+    const sel = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const dotIdx = originalText.lastIndexOf(".");
+    if (dotIdx > 0) {
+      const tn = el.firstChild;
+      if (tn && tn.nodeType === 3) {
+        range.setStart(tn, 0);
+        range.setEnd(tn, dotIdx);
+      }
+    }
+    sel.removeAllRanges();
+    sel.addRange(range);
+    el.focus();
+  }
+
+  function commitEdit(save) {
+    if (!el.classList.contains("editing")) return;
+    el.classList.remove("editing");
+    el.contentEditable = "false";
+    if (!save) {
+      el.textContent = originalText;
+      return;
+    }
+    let raw = (el.textContent || "").trim();
+    if (!raw) raw = "untitled";
+    // Filename: keep only safe filesystem chars, ensure .gpatch suffix.
+    let filename = raw.replace(/[^A-Za-z0-9_\-.]/g, "_");
+    if (!/\.gpatch$/i.test(filename)) filename = filename.replace(/\.[^.]+$/, "") + ".gpatch";
+    // Class name: stem stripped to valid C++ identifier.
+    const stem = filename.replace(/\.gpatch$/i, "");
+    let className = stem.replace(/[^A-Za-z0-9_]/g, "_");
+    if (/^\d/.test(className)) className = "_" + className;
+    if (!className) className = "MyPatch";
+
+    if (filename !== originalText || className !== state.patchName) {
+      pushHistory("rename");
+      state.filename = filename;
+      state.patchName = className;
+    }
+    el.textContent = filename;
+    render();
+  }
+
+  el.addEventListener("click", startEdit);
+  el.addEventListener("focus", e => { if (!el.classList.contains("editing")) startEdit(); });
+  el.addEventListener("blur", () => commitEdit(true));
+  el.addEventListener("keydown", e => {
+    if (e.key === "Enter")  { e.preventDefault(); el.blur(); }
+    if (e.key === "Escape") { e.preventDefault(); commitEdit(false); el.blur(); }
+  });
+})();
+
 /* =========================================================================
  * Toolbar
  * ======================================================================== */
@@ -6781,6 +6861,19 @@ function showCompileStderr(stderr, errMsg) {
 }
 
 function previewStop() {
+  // If a compile is in-flight, kill the worker so user gets out of a
+  // long-running clang invocation. Next Play will respawn the worker;
+  // the @wasmer/sdk + clang package stay cached in IndexedDB so the
+  // restart is fast (the SDK init takes ~2 s; clang reload is ~5 s
+  // when cached vs the original ~3 min download).
+  if (previewState.state === "compiling" && previewState.worker) {
+    previewState.worker.terminate();
+    previewState.worker = null;
+    previewState.workerReady = null;
+    previewProgressEnd(false);
+    setPreviewStatus("idle", "compile canceled");
+    return;
+  }
   if (previewState.workletNode) {
     previewState.workletNode.port.postMessage({ type: "stop" });
     previewState.workletNode.disconnect();
@@ -6790,6 +6883,7 @@ function previewStop() {
     previewState.audioCtx.close().catch(() => {});
     previewState.audioCtx = null;
   }
+  previewProgressEnd(false);
   setPreviewStatus("idle", "idle");
 }
 
