@@ -1293,6 +1293,25 @@
     border-color: var(--accent);
     box-shadow: 0 0 0 3px rgba(200, 232, 90, 0.12);
   }
+  .prop-grid select.enum-select {
+    height: 28px;
+    font-size: 12px;
+    padding: 0 8px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    color: var(--text);
+    width: 100%;
+    font-family: var(--font-mono);
+    transition: border-color .12s, background .12s;
+  }
+  .prop-grid select.enum-select:hover { background: var(--surface-3); }
+  .prop-grid select.enum-select:focus {
+    outline: none;
+    background: var(--bg);
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(200, 232, 90, 0.12);
+  }
 
   /* Pill toggle replacing the bare checkbox */
   .expose {
@@ -1875,6 +1894,122 @@ const TYPES = {
   },
 
   /* ---- Filters (Filter.h) ---- */
+
+  /* Unified Biquad with mode dropdown — replaces the four BiquadLP/HP/BP/BR
+   * variants. Phase 3.6 enum-property UI: paramOptions populates the
+   * <select>; enumMap maps each option to the corresponding gam:: symbol. */
+  Biquad: {
+    category: "Filter", color: COLOR.filter, header: "Filter",
+    cppType: "gam::Biquad<>",
+    ins: [{n:"in", t:"audio"}, {n:"cutoff", t:"param"}, {n:"q", t:"param"}],
+    outs: [{n:"out", t:"audio"}],
+    params: { mode: "LOW_PASS", cutoff: 1200, q: 1.4 },
+    paramOptions: { mode: ["LOW_PASS", "HIGH_PASS", "BAND_PASS", "BAND_REJECT", "ALL_PASS"] },
+    enumMap: { mode: {
+      LOW_PASS:    "gam::LOW_PASS",
+      HIGH_PASS:   "gam::HIGH_PASS",
+      BAND_PASS:   "gam::BAND_PASS",
+      BAND_REJECT: "gam::BAND_REJECT",
+      ALL_PASS:    "gam::ALL_PASS"
+    } },
+    methods: { mode: "type", cutoff: "freq", q: "res" },
+    description: "Biquad filter — mode dropdown picks LP / HP / BP / BR / AP."
+  },
+
+  /* Phase 3.5 — multi-output state-variable filter via helperClass.
+   * Andy Simper TPT (topology-preserving) form: zero-delay-feedback,
+   * stable at high cutoffs. Returns LP/HP/BP/BR all from one struct,
+   * one operator() call per sample (codegen binds + indexes by access). */
+  StateVariableFilter: {
+    category: "Filter", color: COLOR.filter, header: null,
+    cppType: "GammaSVF",
+    helperClass:
+`class GammaSVF {
+    float ic1eq = 0.f, ic2eq = 0.f;
+    float g_ = 0.f, k_ = 1.f, a1_ = 0.f, a2_ = 0.f, a3_ = 0.f;
+    static constexpr float SR_ = 48000.f;
+    void recalc() {
+        a1_ = 1.f / (1.f + g_ * (g_ + k_));
+        a2_ = g_ * a1_;
+        a3_ = g_ * a2_;
+    }
+public:
+    struct Out { float lp, hp, bp, br; };
+    GammaSVF() { freq(1000.f); res(0.7f); }
+    void freq(float fc) { g_ = tanf(3.14159265f * fc / SR_); recalc(); }
+    void res(float r)   {
+        if (r < 0.f) r = 0.f; else if (r > 1.f) r = 1.f;
+        k_ = 2.f - 2.f * r;
+        recalc();
+    }
+    Out operator()(float v0) {
+        float v3 = v0 - ic2eq;
+        float v1 = a1_ * ic1eq + a2_ * v3;
+        float v2 = ic2eq + a2_ * ic1eq + a3_ * v3;
+        ic1eq = 2.f * v1 - ic1eq;
+        ic2eq = 2.f * v2 - ic2eq;
+        Out o;
+        o.lp = v2;
+        o.hp = v0 - k_ * v1 - v2;
+        o.bp = v1;
+        o.br = o.lp + o.hp;
+        return o;
+    }
+};`,
+    ins: [{n:"in", t:"audio"}, {n:"cutoff", t:"param"}, {n:"q", t:"param"}],
+    outs: [
+      {n:"LP", t:"audio", access: ".lp"},
+      {n:"HP", t:"audio", access: ".hp"},
+      {n:"BP", t:"audio", access: ".bp"},
+      {n:"BR", t:"audio", access: ".br"}
+    ],
+    params: { cutoff: 1000, q: 0.7 },
+    methods: { cutoff: "freq", q: "res" },
+    description: "TPT state-variable filter — LP, HP, BP, BR all from one struct (one call/sample)."
+  },
+
+  /* Phase 3.5 — naive Moog ladder. Stilson/Smith-style 4-pole LP with
+   * tanh-saturated stages. Self-resonance at res >= 4. Hardcoded SR
+   * (48 kHz) here; refactor to runtime SR when domain integration lands. */
+  MoogLadder: {
+    category: "Filter", color: COLOR.filter, header: null,
+    cppType: "GammaMoog",
+    helperClass:
+`class GammaMoog {
+    float p_[4] = {0.f, 0.f, 0.f, 0.f};
+    float fc_ = 0.5f;
+    float res_ = 0.f;
+    static constexpr float SR_ = 48000.f;
+public:
+    GammaMoog() { freq(1000.f); res(0.f); }
+    void freq(float hz) {
+        float f = hz * 2.f / SR_;
+        if (f > 0.95f) f = 0.95f; else if (f < 1e-4f) f = 1e-4f;
+        fc_ = f;
+    }
+    void res(float r) {
+        if (r < 0.f) r = 0.f; else if (r > 4.f) r = 4.f;
+        res_ = r;
+    }
+    float operator()(float in) {
+        float x = in - res_ * p_[3];
+        p_[0] += fc_ * (tanhf(x)     - tanhf(p_[0]));
+        p_[1] += fc_ * (tanhf(p_[0]) - tanhf(p_[1]));
+        p_[2] += fc_ * (tanhf(p_[1]) - tanhf(p_[2]));
+        p_[3] += fc_ * (tanhf(p_[2]) - tanhf(p_[3]));
+        return p_[3];
+    }
+};`,
+    ins: [{n:"in", t:"audio"}, {n:"cutoff", t:"param"}, {n:"q", t:"param"}],
+    outs: [{n:"out", t:"audio"}],
+    params: { cutoff: 1000, q: 1.5 },
+    methods: { cutoff: "freq", q: "res" },
+    description: "Naive Moog ladder — 4-pole LP with tanh saturation. Self-resonates at q≈4."
+  },
+
+  /* Legacy single-mode Biquad variants — kept for back-compat with .gpatch
+   * files saved before the unified Biquad shipped. New patches should use
+   * the Biquad node above with the mode dropdown. */
   BiquadLP: {
     category: "Filter", color: COLOR.filter, header: "Filter",
     cppType: "gam::Biquad<>",
@@ -1883,7 +2018,7 @@ const TYPES = {
     params: { cutoff: 1200, q: 1.4 },
     methods: { cutoff: "freq", q: "res" },
     extraCtor: ["{id}.type(gam::LOW_PASS);"],
-    description: "Biquad lowpass"
+    description: "Biquad lowpass (legacy — prefer Biquad with mode=LOW_PASS)"
   },
   BiquadHP: {
     category: "Filter", color: COLOR.filter, header: "Filter",
@@ -1893,7 +2028,7 @@ const TYPES = {
     params: { cutoff: 200, q: 1 },
     methods: { cutoff: "freq", q: "res" },
     extraCtor: ["{id}.type(gam::HIGH_PASS);"],
-    description: "Biquad highpass"
+    description: "Biquad highpass (legacy — prefer Biquad with mode=HIGH_PASS)"
   },
   BiquadBP: {
     category: "Filter", color: COLOR.filter, header: "Filter",
@@ -1903,7 +2038,7 @@ const TYPES = {
     params: { cutoff: 800, q: 4 },
     methods: { cutoff: "freq", q: "res" },
     extraCtor: ["{id}.type(gam::BAND_PASS);"],
-    description: "Biquad bandpass"
+    description: "Biquad bandpass (legacy — prefer Biquad with mode=BAND_PASS)"
   },
   BiquadBR: {
     category: "Filter", color: COLOR.filter, header: "Filter",
@@ -1913,7 +2048,7 @@ const TYPES = {
     params: { cutoff: 800, q: 8 },
     methods: { cutoff: "freq", q: "res" },
     extraCtor: ["{id}.type(gam::BAND_REJECT);"],
-    description: "Biquad notch / band-reject"
+    description: "Biquad notch / band-reject (legacy — prefer Biquad with mode=BAND_REJECT)"
   },
   OnePole: {
     category: "Filter", color: COLOR.filter, header: "Filter",
@@ -2969,13 +3104,29 @@ function renderProps() {
       html += `<div class="prop-grid">`;
       keys.forEach(k => {
         const ex = !!state.exposed[node.id + "." + k];
-        const exposable = !!def.cppType;
+        const enumOpts = def.paramOptions && def.paramOptions[k];
+        // Enum params can't be exposed as runtime float setters — they
+        // take a distinct C++ symbol type and are construction-only.
+        const exposable = !!def.cppType && !enumOpts;
+        let inputHtml;
+        if (enumOpts) {
+          const opts = enumOpts.map(o => {
+            const sel = node.params[k] === o ? " selected" : "";
+            return `<option value="${escapeAttr(o)}"${sel}>${escapeText(o)}</option>`;
+          }).join("");
+          inputHtml = `<select class="enum-select" data-key="${escapeAttr(k)}">${opts}</select>`;
+        } else {
+          inputHtml = `<input type="number" step="any" value="${node.params[k]}" data-key="${escapeAttr(k)}" />`;
+        }
+        const trailing = exposable
+          ? `<label class="expose" title="When checked, the generated class exposes a ${k}(float) setter."><input type="checkbox" data-expose="${escapeAttr(k)}" ${ex?"checked":""} /> expose</label>`
+          : enumOpts
+            ? `<span class="prop-inline">construction-time</span>`
+            : `<span class="prop-inline">inlined at compile</span>`;
         html += `
           <label class="k">${escapeText(k)}</label>
-          <input type="number" step="any" value="${node.params[k]}" data-key="${escapeAttr(k)}" />
-          ${exposable
-            ? `<label class="expose" title="When checked, the generated class exposes a ${k}(float) setter."><input type="checkbox" data-expose="${escapeAttr(k)}" ${ex?"checked":""} /> expose</label>`
-            : `<span class="prop-inline">inlined at compile</span>`}
+          ${inputHtml}
+          ${trailing}
         `;
       });
       html += `</div>`;
@@ -3003,6 +3154,13 @@ function renderProps() {
       pushHistory("param:" + node.id + ":" + inp.dataset.key);
       const v = parseFloat(inp.value);
       node.params[inp.dataset.key] = isNaN(v) ? 0 : v;
+      renderCode(); renderJson();
+    });
+  });
+  propsEl.querySelectorAll('select.enum-select').forEach(sel => {
+    sel.addEventListener("change", () => {
+      pushHistory("param:" + node.id + ":" + sel.dataset.key);
+      node.params[sel.dataset.key] = sel.value;   // string, not number
       renderCode(); renderJson();
     });
   });
@@ -3289,10 +3447,26 @@ function findInvalidCycles() {
 }
 
 function fmt(v) {
-  if (typeof v !== "number" || !isFinite(v)) return "0.f";
+  if (typeof v !== "number" || !isFinite(v)) {
+    // Strings (enum values) and other non-numerics fall through to fmtParam;
+    // bare fmt() should never receive them. If it does, emit 0.f as a safe
+    // fallback so generated code at least compiles.
+    if (typeof v === "string") return "0.f /* fmt got string '" + v + "' — missing fmtParam path? */";
+    return "0.f";
+  }
   const s = String(v);
   if (s.indexOf(".") >= 0 || s.indexOf("e") >= 0) return s + "f";
   return s + ".f";
+}
+
+/* fmtParam handles enum-typed params (Phase 3.6). When def.enumMap[k][v]
+ * exists, emits the mapped C++ symbol (e.g. "gam::LOW_PASS") instead of
+ * a numeric literal. Otherwise falls through to fmt() for normal floats. */
+function fmtParam(def, k, v) {
+  if (def && def.enumMap && def.enumMap[k] && def.enumMap[k][v] !== undefined) {
+    return def.enumMap[k][v];
+  }
+  return fmt(v);
 }
 
 function inputExpr(nodeId, portName, cgCtx) {
@@ -3394,7 +3568,7 @@ function generateCode() {
       Object.keys(node_methods(def)).forEach(k => {
         if (node_methods(def)[k] && n.params[k] !== undefined) {
           const m = node_methods(def)[k];
-          ctorBody.push(`        ${n.id}.${m}(${fmt(n.params[k])});`);
+          ctorBody.push(`        ${n.id}.${m}(${fmtParam(def, k, n.params[k])});`);
         }
       });
     }
@@ -3402,6 +3576,9 @@ function generateCode() {
     Object.keys(n.params).forEach(k => {
       if (!state.exposed[n.id + "." + k]) return;
       if (!def.cppType) return;
+      // Enum params can't be exposed as float setters — they take a
+      // distinct C++ enum/symbol type at construction time only.
+      if (def.paramOptions && def.paramOptions[k]) return;
       const m = (def.methods && def.methods[k]) || k;
       let name = k;
       if (used.has(name)) name = n.id + "_" + k;
@@ -3479,6 +3656,21 @@ function generateCode() {
     }
   });
 
+  // Built-in helper classes from registry entries (Phase 3.5).
+  // Multi-output filters like StateVariableFilter ship their full C++
+  // class string in `def.helperClass`; codegen emits it once before
+  // the patch class. Deduped by class-name extracted from the source.
+  const helperClasses = [];
+  const helperSeen = new Set();
+  state.nodes.forEach(n => {
+    const def = defOf(n);
+    if (!def || !def.helperClass) return;
+    const m = def.helperClass.match(/class\s+(\w+)/);
+    if (!m || helperSeen.has(m[1])) return;
+    helperSeen.add(m[1]);
+    helperClasses.push(def.helperClass);
+  });
+
   let code = "";
   code += "#pragma once\n";
   code += "#include <Gamma/Gamma.h>\n";
@@ -3496,11 +3688,17 @@ function generateCode() {
     headers.extra.forEach(inc => { code += `#include ${inc}\n`; });
   }
   code += "\n";
+  if (helperClasses.length) {
+    code += "// ---- Built-in helper classes ----\n\n";
+    helperClasses.forEach(c => { code += c + "\n\n"; });
+  }
   if (userTypes.length) {
     code += "// ---- User DSP ----\n\n";
     userTypes.forEach(name => {
       code += stripGdspHeader(USER_DSP_SOURCES[name]) + "\n\n";
     });
+  }
+  if (helperClasses.length || userTypes.length) {
     code += "// ---- Patch ----\n";
   }
   if (warnings.length) {
