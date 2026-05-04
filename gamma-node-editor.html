@@ -6568,14 +6568,29 @@ self.onmessage = async (ev) => {
       await dir.writeFile("patch.cpp", new TextEncoder().encode(msg.wrappedSrc));
 
       progress("compile");
-      // Build clang argv. **Compile Gamma sources inline** rather than
-      // linking the prebuilt libgamma.a — the precompiled archive is
-      // emcmake/Emscripten-ABI and Wasmer's clang targets WASI; the
-      // prior attempt at static-library link hung wasm-ld for 31+
-      // minutes trying to reconcile incompatible relocations.
-      // Compiling Gamma .cpp files in the same pass as the patch
-      // keeps full Gamma functionality available (FFT, Scheduler,
-      // scl, etc.) and the ABI is consistent end-to-end.
+      // Build clang argv. Two pieces are non-obvious for Wasmer's WASI
+      // clang and worth flagging for the next time someone reads this:
+      //
+      //   -mexec-model=reactor:  tells WASI clang we're producing a
+      //     library, not an executable. Without it, libc.a's
+      //     __main_void.o is pulled in and asks for a main() that
+      //     doesn't exist. -Wl,--no-entry alone isn't enough.
+      //
+      //   -Wl,--export-memory:   the WASM memory object needs its own
+      //     dedicated export flag. Trying -Wl,--export=memory does
+      //     NOT work — wasm-ld looks for a function symbol named
+      //     'memory' and errors out (no such function).
+      //
+      // Per-function exports (preview_*, smoke) are handled by
+      // __attribute__((export_name(...))) in the wrapped source, so
+      // we don't need explicit -Wl,--export flags for them. malloc/
+      // free are pulled from libc and exported explicitly so the
+      // worklet can allocate output buffers.
+      //
+      // Compile Gamma sources inline rather than linking the prebuilt
+      // libgamma.a — the precompiled archive is emcmake/Emscripten-ABI
+      // and Wasmer's clang targets WASI; cross-ABI link hangs wasm-ld
+      // indefinitely. Same Gamma functionality, fresh compile each time.
       const GAMMA_SRC = [
         "/project/src/Conversion.cpp",
         "/project/src/DFT.cpp",
@@ -6592,17 +6607,15 @@ self.onmessage = async (ev) => {
       const args = [
         "-std=c++17",
         "-O1",
-        "-fno-exceptions", "-fno-rtti",
         "-Wno-deprecated-declarations",
+        "-mexec-model=reactor",
         "-I", "/project/include",
         "-Wl,--no-entry",
-        "-Wl,--export=preview_init",
-        "-Wl,--export=preview_tick",
-        "-Wl,--export=preview_set",
-        "-Wl,--export=preview_setter_count",
-        "-Wl,--export=malloc",
-        "-Wl,--export=free",
-        "-Wl,--export=memory",
+        "-Wl,--export-memory",
+        ...(msg.smokeTest ? [] : [
+          "-Wl,--export=malloc",
+          "-Wl,--export=free"
+        ]),
         "/project/patch.cpp",
         ...(msg.smokeTest ? [] : GAMMA_SRC),
         "-o", "/project/patch.wasm"
