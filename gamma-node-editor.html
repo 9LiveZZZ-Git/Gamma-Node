@@ -5140,30 +5140,36 @@ const PROVIDERS = {
         { role: "user",   content: userContent }
       ];
 
-      // transformers.js streaming API: pass a streamer function.
-      // We keep the call simple and rely on the pipeline's built-in
-      // OpenAI-style streamer when onToken is provided.
+      // pipe is now { processor, model, tokenizer } — apply chat
+      // template manually, generate, decode. Same call shape as the
+      // Hugging Face Python example for AutoModelForImageTextToText.
+      const tx = await getTransformersJs();
+      const inputs = await pipe.processor.apply_chat_template(messages, {
+        add_generation_prompt: true,
+        tokenize: true,
+        return_dict: true
+      });
+
+      const generateOpts = {
+        ...inputs,
+        max_new_tokens: 2048,
+        do_sample: true,
+        temperature: 0.4
+      };
       if (onToken) {
-        const tx = await getTransformersJs();
-        const streamer = new tx.TextStreamer(pipe.tokenizer, {
+        generateOpts.streamer = new tx.TextStreamer(pipe.tokenizer, {
           skip_prompt: true,
           callback_function: (text) => onToken(text)
         });
-        const out = await pipe(messages, {
-          max_new_tokens: 2048,
-          do_sample: true,
-          temperature: 0.4,
-          streamer
-        });
-        return extractGemmaText(out);
-      } else {
-        const out = await pipe(messages, {
-          max_new_tokens: 2048,
-          do_sample: true,
-          temperature: 0.4
-        });
-        return extractGemmaText(out);
       }
+
+      const output = await pipe.model.generate(generateOpts);
+
+      // Slice off the prompt tokens — output includes them verbatim.
+      const promptLen = inputs.input_ids.dims[inputs.input_ids.dims.length - 1];
+      const newTokens = output.slice(null, [promptLen, null]);
+      const decoded = pipe.processor.batch_decode(newTokens, { skip_special_tokens: true });
+      return Array.isArray(decoded) ? decoded[0] : String(decoded);
     }
   }
 };
@@ -5224,23 +5230,28 @@ async function ensureGemmaPipeline(model) {
   gemmaCurrentModel = model;
   gemmaLoadPromise = (async () => {
     const tx = await getTransformersJs();
-    // transformers.js v3's pipeline taxonomy is text-only / image-only
-    // / audio-only — there's no multimodal task identifier in the
-    // supported list (any-to-any and image-text-to-text both rejected).
-    // Use "text-generation" so the model loads via AutoModelForCausalLM
-    // and the primary .gdsp code-generation path works. Image
-    // (handwriting recognition) needs a separate image-to-text or
-    // image-feature-extraction pipeline call; voice already routes
-    // through the Whisper-tiny fallback below.
-    const pipe = await tx.pipeline("text-generation", model, {
-      device: "webgpu",
-      dtype: "q4f16",
-      progress_callback: (p) => {
-        if (gemmaProgressHook) gemmaProgressHook(p);
-      }
-    });
-    gemmaPipeline = pipe;
-    return pipe;
+    // Use the lower-level AutoProcessor + AutoModelForImageTextToText
+    // pair instead of pipeline(). The pipeline() shorthand in
+    // transformers.js v3 doesn't expose multimodal tasks
+    // (image-text-to-text / any-to-any are rejected), but the
+    // AutoModelForImageTextToText class loads gemma-4 multimodal
+    // correctly and accepts {role: "user", content: [{type:"image",
+    // image: dataUrl}, {type:"text", text:"..."}]} message blocks.
+    // Same model weights as text-generation pipeline; this just
+    // exposes the vision input path that HWR needs.
+    const cb = (p) => { if (gemmaProgressHook) gemmaProgressHook(p); };
+    const opts = { device: "webgpu", dtype: "q4f16", progress_callback: cb };
+    const processor = await tx.AutoProcessor.from_pretrained(model, { progress_callback: cb });
+    const m = await tx.AutoModelForImageTextToText.from_pretrained(model, opts);
+    // Wrap into a "pipeline-like" object so the rest of the editor
+    // doesn't have to care which loader was used. .processor + .model
+    // are exposed for the lower-level call paths (HWR via images);
+    // .tokenizer matches what TextStreamer expects for streaming.
+    gemmaPipeline = {
+      processor, model: m,
+      tokenizer: processor.tokenizer || processor
+    };
+    return gemmaPipeline;
   })();
 
   try {
@@ -6038,6 +6049,14 @@ const PREVIEW = {
   // init()). Matches the canonical example in
   // https://wasmer.io/posts/clang-in-browser
   wasmerSdkUrl: "https://unpkg.com/@wasmer/sdk@0.10.0/dist/index.mjs",
+  // Local compile-server (the gamma-compile-server npm package, runs
+  // as a daemon on the user's machine). When detected via the health
+  // probe at first Play click, compile requests route there instead
+  // of the in-browser Wasmer path — full Emscripten, ~5–15 s per
+  // compile, sidesteps the in-browser OOM. See the package README:
+  //   github.com/9LiveZZZ-Git/gamma-compile-server
+  localServerUrl: "http://localhost:8765",
+  localServerProbeTimeoutMs: 250,
   // Compile debounce after a graph mutation.
   hotReloadDebounceMs: 250,
   // Audio quantum (Web Audio standard).
@@ -6871,6 +6890,44 @@ async function ensureAudioWorklet() {
   return node;
 }
 
+/* ------------- Local compile-server detection ------------- */
+/* Probe localhost:8765/health on first Play click. If the daemon is
+ * up, all compile requests route there (full Emscripten, ~5–15 s).
+ * If not, fall back to the in-browser Wasmer path (~OOM-prone). */
+let localServerStatus = null;   // null = unprobed, true = available, false = not running
+async function probeLocalServer() {
+  if (localServerStatus !== null) return localServerStatus;
+  try {
+    const res = await fetch(PREVIEW.localServerUrl + "/health", {
+      signal: AbortSignal.timeout(PREVIEW.localServerProbeTimeoutMs)
+    });
+    if (!res.ok) throw new Error("health " + res.status);
+    const j = await res.json();
+    localServerStatus = j && j.service === "gamma-compile-server";
+  } catch (_) {
+    localServerStatus = false;
+  }
+  console.log("[preview] local compile-server: " + (localServerStatus ? "detected" : "not running"));
+  return localServerStatus;
+}
+
+async function compileViaLocalServer(wrapped, smokeTest) {
+  const res = await fetch(PREVIEW.localServerUrl + "/compile", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ wrappedSrc: wrapped, optLevel: smokeTest ? "O0" : "O1" })
+  });
+  if (res.status === 200) {
+    const stderr = decodeURIComponent(res.headers.get("X-Compile-Stderr") || "");
+    const elapsed = res.headers.get("X-Compile-Elapsed-Ms") || "?";
+    const wasmBytes = await res.arrayBuffer();
+    return { wasmBytes, stderr: stderr + (stderr ? "\n\n" : "") + "[local-cli compile in " + elapsed + " ms]" };
+  }
+  // Error path: server returns JSON with { error, stderr }.
+  const body = await res.json().catch(() => ({}));
+  throw Object.assign(new Error(body.error || ("local-cli HTTP " + res.status)), { stderr: body.stderr || "" });
+}
+
 /* ------------- Compile + load + play orchestration ------------- */
 async function previewCompileAndPlay() {
   setPreviewStatus("compiling", "compiling…");
@@ -6893,6 +6950,35 @@ async function previewCompileAndPlay() {
   const className = (state.patchName || "MyPatch").replace(/[^A-Za-z0-9_]/g, "");
   const wrapped = wrapForPreview(patchCpp, className);
   previewState.lastWrapped = wrapped;
+
+  // Try the local compile-server FIRST. Fast, full-fidelity, no OOM.
+  // Falls through to the in-browser Wasmer path if the daemon isn't
+  // running.
+  const useLocal = await probeLocalServer();
+  if (useLocal) {
+    setPreviewStatus("compiling", "compiling via local-cli…");
+    previewProgressStage("compile");
+    let wasmBytes, stderr;
+    try {
+      ({ wasmBytes, stderr } = await compileViaLocalServer(wrapped, false));
+    } catch (e) {
+      previewProgressEnd(false);
+      setPreviewStatus("error", "local-cli: " + e.message);
+      showCompileStderr(e.stderr || "", e.message);
+      return;
+    }
+    showCompileStderr(stderr || "", null);
+    try {
+      previewProgressStage("load-wasm");
+      const node = await ensureAudioWorklet();
+      if (previewState.audioCtx.state === "suspended") await previewState.audioCtx.resume();
+      node.port.postMessage({ type: "load", wasmBytes }, [wasmBytes]);
+    } catch (e) {
+      previewProgressEnd(false);
+      setPreviewStatus("error", "audio: " + e.message);
+    }
+    return;
+  }
 
   try {
     await ensureCompileWorker();
@@ -7040,6 +7126,23 @@ if (previewBtnSmoke) previewBtnSmoke.addEventListener("click", async () => {
   setPreviewStatus("compiling", "smoke test compiling…");
   previewProgressStart();
   previewProgressStage("prepare");
+  // Local-server fast path for smoke too.
+  if (await probeLocalServer()) {
+    const t0 = Date.now();
+    try {
+      previewProgressStage("compile");
+      const { wasmBytes, stderr } = await compileViaLocalServer(SMOKE_TEST_SRC, true);
+      const ms = Date.now() - t0;
+      previewProgressFinish();
+      setPreviewStatus("idle", "smoke ✓ via local-cli — " + wasmBytes.byteLength + " byte wasm in " + fmtDuration(ms));
+      showCompileStderr(stderr || "", null);
+    } catch (e) {
+      previewProgressEnd(false);
+      setPreviewStatus("error", "smoke (local-cli): " + e.message);
+      showCompileStderr(e.stderr || "", e.message);
+    }
+    return;
+  }
   try {
     await ensureCompileWorker();
   } catch (e) {
