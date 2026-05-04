@@ -6637,56 +6637,97 @@ self.onmessage = async (ev) => {
       // signal.h / pthread issues building under WASI and need
       // build-time flags (TODO). Patches relying on header-only
       // template classes are unaffected.
-      const args = [
+      // Two-pass compile-then-link. Single-pass hit clang exit 45
+      // (frontend OOM) on the demo patch — Wasmer's clang/clang
+      // package has a fixed wasm memory pool (~4 GB), and "compile +
+      // link" in one process exceeded it during template work.
+      // Splitting into two clang invocations gives each step a fresh
+      // memory budget. Compile alone fits; link is small.
+      const compileArgs = [
         "-std=c++17",
         "-Wno-deprecated-declarations",
-        "-mexec-model=reactor",
-        "-I", "/project/include",
-        // Compile-speed flags (significant for in-browser clang):
-        //   -fno-exceptions / -fno-rtti: libc++ scatters try/catch +
-        //     typeid through every template; skipping their
-        //     instantiation often halves Gamma header parse time.
-        //   -fno-stack-protector / -f*-unwind-tables: skip metadata
-        //     for runtime stack walking we don't use anyway.
+        "-Wno-pragma-once-outside-header",
         "-fno-exceptions",
         "-fno-rtti",
         "-fno-stack-protector",
         "-fno-unwind-tables",
         "-fno-asynchronous-unwind-tables",
-        // Emit a Chrome-trace JSON of every compile phase so we can
-        // open it in chrome://tracing or speedscope.app to see exactly
-        // which template instantiations are eating the time. Lands at
-        // /project/patch.json after compile.
         "-ftime-trace=/project/patch.json",
+        "-I", "/project/include",
+        "-c",                               // <-- compile only, no link
+        "/project/patch.cpp",
+        "-o", "/project/patch.o"
+      ];
+      const linkArgs = [
+        "-mexec-model=reactor",
         "-Wl,--no-entry",
         "-Wl,--export-memory",
         ...(msg.smokeTest ? [] : [
           "-Wl,--export=malloc",
           "-Wl,--export=free"
         ]),
-        "/project/patch.cpp",
+        "/project/patch.o",
         ...(msg.smokeTest ? [] : ["/project/lib/libgamma.a"]),
         "-o", "/project/patch.wasm"
       ];
 
-      // Hard 5-minute compile timeout. Surfaces as an error instead
-      // of letting the tab grind forever (the actual clang process
-      // keeps running in the worker until the worker is terminated;
-      // the Stop button does that).
-      const instance = await clangPkg.entrypoint.run({
-        args,
+      // Pass 1: compile. This is where the heavy template work happens.
+      const compileInstance = await clangPkg.entrypoint.run({
+        args: compileArgs,
         mount: { "/project": dir }
       });
-      const result = await Promise.race([
-        instance.wait(),
+      const compileResult = await Promise.race([
+        compileInstance.wait(),
         new Promise((_, reject) => setTimeout(() =>
           reject(new Error(
-            "clang timed out after 30 minutes. Click ■ to cancel, then try " +
-            "the smoke-test (★) to verify the toolchain works on a trivial " +
-            "program (no Gamma sources)."
+            "clang compile timed out after 30 minutes. Click ■ to cancel."
           )), 1800000
         ))
       ]);
+
+      // If the compile failed (no .o file produced), surface the error
+      // immediately — no point trying to link a missing object.
+      let compileStderr = "";
+      try { compileStderr = compileResult.stderr || ""; } catch (_) {}
+      let objExists = false;
+      try { await dir.readFile("patch.o"); objExists = true; } catch (_) {}
+      if (!objExists) {
+        const code = compileResult.code !== undefined ? compileResult.code : "?";
+        throw Object.assign(
+          new Error("clang compile produced no .o file. exit=" + code +
+            (code === 45 ? " (likely out-of-memory in Wasmer's clang sandbox)" : "")),
+          { stderr: compileStderr }
+        );
+      }
+
+      // Pass 2: link. Fresh wasm instance, fresh memory pool, much
+      // smaller working set.
+      const linkInstance = await clangPkg.entrypoint.run({
+        args: linkArgs,
+        mount: { "/project": dir }
+      });
+      const linkResult = await Promise.race([
+        linkInstance.wait(),
+        new Promise((_, reject) => setTimeout(() =>
+          reject(new Error(
+            "wasm-ld link timed out after 5 minutes. Click ■ to cancel."
+          )), 300000
+        ))
+      ]);
+
+      // Treat the link-pass result as the final result for the rest of
+      // the worker code (stderr extraction, trace summary, output read).
+      const result = linkResult;
+      // Concatenate stderrs so the user sees both compile warnings and
+      // link errors / warnings in one block.
+      let linkStderr = "";
+      try { linkStderr = linkResult.stderr || ""; } catch (_) {}
+      const combinedStderr =
+        (compileStderr ? "--- compile ---\n" + compileStderr + "\n" : "") +
+        (linkStderr ? "--- link ---\n" + linkStderr : "");
+      // Override result.stderr below with the combined version so the
+      // existing stderr extraction picks up both passes.
+      Object.defineProperty(result, "stderr", { get: function() { return combinedStderr; }, configurable: true });
 
       let stderr = "";
       try { stderr = result.stderr || ""; } catch (_) {}
