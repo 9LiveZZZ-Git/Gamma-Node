@@ -7205,25 +7205,49 @@ async function ensureAudioWorklet() {
 /* Probe localhost:8765/health on first Play click. If the daemon is
  * up, all compile requests route there (full Emscripten, ~5–15 s).
  * If not, fall back to the in-browser Wasmer path (~OOM-prone). */
-let localServerStatus = null;   // null = unprobed, true = available, false = not running
+let localServerStatus = null;       // null = unprobed, true = available, false = not running
+let localServerEndpoint = null;     // base URL of whichever candidate responded
 async function probeLocalServer() {
   if (localServerStatus !== null) return localServerStatus;
-  try {
-    const res = await fetch(PREVIEW.localServerUrl + "/health", {
-      signal: AbortSignal.timeout(PREVIEW.localServerProbeTimeoutMs)
+  // Try BOTH 127.0.0.1 and localhost in parallel — on some Windows
+  // setups `localhost` resolves to IPv6 ::1 first, which adds a slow
+  // fallback to IPv4 and trips our short timeout. 127.0.0.1 is direct.
+  const candidates = [
+    "http://127.0.0.1:8765",
+    "http://localhost:8765"
+  ];
+  const timeoutMs = Math.max(1500, PREVIEW.localServerProbeTimeoutMs);
+  const results = await Promise.allSettled(candidates.map(async base => {
+    const res = await fetch(base + "/health", {
+      signal: AbortSignal.timeout(timeoutMs)
     });
-    if (!res.ok) throw new Error("health " + res.status);
+    if (!res.ok) throw new Error("HTTP " + res.status);
     const j = await res.json();
-    localServerStatus = j && j.service === "gamma-compile-server";
-  } catch (_) {
+    if (!j || j.service !== "gamma-compile-server") throw new Error("not gamma-compile-server");
+    return base;
+  }));
+  const ok = results.find(r => r.status === "fulfilled");
+  if (ok) {
+    localServerEndpoint = ok.value;
+    localServerStatus = true;
+    console.log("[preview] local compile-server: detected at " + localServerEndpoint);
+  } else {
     localServerStatus = false;
+    // Log every candidate's failure reason so we can see WHY.
+    const reasons = results.map((r, i) =>
+      "  " + candidates[i] + " — " +
+      (r.status === "rejected"
+        ? (r.reason && (r.reason.name + ": " + r.reason.message) || String(r.reason))
+        : "ok-but-bad-payload")
+    );
+    console.log("[preview] local compile-server: not detected\n" + reasons.join("\n"));
   }
-  console.log("[preview] local compile-server: " + (localServerStatus ? "detected" : "not running"));
   return localServerStatus;
 }
 
 async function compileViaLocalServer(wrapped, smokeTest) {
-  const res = await fetch(PREVIEW.localServerUrl + "/compile", {
+  const base = localServerEndpoint || PREVIEW.localServerUrl;
+  const res = await fetch(base + "/compile", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ wrappedSrc: wrapped, optLevel: smokeTest ? "O0" : "O1" })
