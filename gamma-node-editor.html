@@ -6653,6 +6653,11 @@ self.onmessage = async (ev) => {
         "-fno-stack-protector",
         "-fno-unwind-tables",
         "-fno-asynchronous-unwind-tables",
+        // Emit a Chrome-trace JSON of every compile phase so we can
+        // open it in chrome://tracing or speedscope.app to see exactly
+        // which template instantiations are eating the time. Lands at
+        // /project/patch.json after compile.
+        "-ftime-trace=/project/patch.json",
         "-Wl,--no-entry",
         "-Wl,--export-memory",
         ...(msg.smokeTest ? [] : [
@@ -6676,10 +6681,10 @@ self.onmessage = async (ev) => {
         instance.wait(),
         new Promise((_, reject) => setTimeout(() =>
           reject(new Error(
-            "clang timed out after 15 minutes. Click ■ to cancel, then try " +
+            "clang timed out after 30 minutes. Click ■ to cancel, then try " +
             "the smoke-test (★) to verify the toolchain works on a trivial " +
             "program (no Gamma sources)."
-          )), 900000
+          )), 1800000
         ))
       ]);
 
@@ -6687,6 +6692,33 @@ self.onmessage = async (ev) => {
       try { stderr = result.stderr || ""; } catch (_) {}
       let stdout = "";
       try { stdout = result.stdout || ""; } catch (_) {}
+
+      // Pull the time-trace JSON if clang wrote one (it does even on
+      // non-zero exit when -ftime-trace is set). Boil it down to a
+      // few "biggest costs" lines so the user can see exactly which
+      // template instantiations dominated the compile time.
+      let traceSummary = "";
+      try {
+        const traceBytes = await dir.readFile("patch.json");
+        const traceText = new TextDecoder().decode(traceBytes);
+        const trace = JSON.parse(traceText);
+        const events = (trace.traceEvents || []).filter(e => e.name && e.dur);
+        const byName = new Map();
+        for (const ev of events) {
+          const key = ev.name + (ev.args && ev.args.detail ? " " + ev.args.detail : "");
+          byName.set(key, (byName.get(key) || 0) + ev.dur);
+        }
+        const sorted = [...byName.entries()].sort((a, b) => b[1] - a[1]).slice(0, 25);
+        // Plain string concat — backticks here would close the outer
+        // String.raw worker template (recurring footgun, see header
+        // comment near COMPILE_WORKER_SRC).
+        traceSummary = "TOP COMPILE COSTS (microseconds):\n" +
+          sorted.map(function(entry) {
+            const ms = (entry[1] / 1000).toFixed(0);
+            const padded = ms.length < 8 ? " ".repeat(8 - ms.length) + ms : ms;
+            return "  " + padded + " ms  " + entry[0];
+          }).join("\n");
+      } catch (_) { /* trace file not present, fine */ }
 
       // Try to read the output even if exit != 0; some warnings still
       // produce a usable wasm.
@@ -6696,7 +6728,7 @@ self.onmessage = async (ev) => {
       } catch (e) {
         throw Object.assign(
           new Error("clang produced no output. exit=" + (result.code !== undefined ? result.code : "?")),
-          { stderr: stderr + (stdout ? "\n--- stdout ---\n" + stdout : "") }
+          { stderr: stderr + (stdout ? "\n--- stdout ---\n" + stdout : "") + (traceSummary ? "\n\n" + traceSummary : "") }
         );
       }
       if (result.code !== undefined && result.code !== 0) {
@@ -6704,8 +6736,9 @@ self.onmessage = async (ev) => {
         // but still return the wasm.
         self.postMessage({ type: "warnings", stderr });
       }
+      const stderrWithTrace = stderr + (traceSummary ? (stderr ? "\n\n" : "") + traceSummary : "");
       self.postMessage(
-        { type: "compiled", wasmBytes: wasmBytes.buffer || wasmBytes, stderr },
+        { type: "compiled", wasmBytes: wasmBytes.buffer || wasmBytes, stderr: stderrWithTrace },
         [wasmBytes.buffer || wasmBytes]
       );
     } catch (e) {
