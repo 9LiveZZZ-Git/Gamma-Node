@@ -1622,8 +1622,9 @@
         <button class="btn danger" id="btn-delete" disabled title="Delete selected node (⌫)">Delete</button>
       </div>
       <div class="btn-group preview-group" role="group" aria-label="Preview">
-        <button class="btn preview-btn" id="btn-preview-play" title="Compile patch and start playback (Space)">▶</button>
+        <button class="btn preview-btn" id="btn-preview-play" title="Compile patch and start playback">▶</button>
         <button class="btn preview-btn" id="btn-preview-stop" title="Stop playback / cancel compile" disabled>■</button>
+        <button class="btn preview-btn" id="btn-preview-smoke" title="Smoke-test the compile pipeline with a trivial program (no Gamma). Use this to verify the toolchain works end-to-end before debugging real patches.">★</button>
       </div>
       <span class="preview-status" id="preview-status" title="Real-time audio preview status">idle</span>
       <button class="btn icon-btn copy-status-btn" id="btn-copy-status" title="Copy error message to clipboard" style="display:none;">⧉</button>
@@ -5998,8 +5999,8 @@ const PREVIEW = {
   // URL of the pre-built Gamma static-library tarball. Produce locally
   // via wasm-build/build-gamma-wasm.sh and host it under /assets/ on the
   // same origin as the editor. See wasm-build/README.md.
-  gammaArchiveUrl: "assets/gamma-wasm-v1.tar.gz",
-  gammaArchiveCacheKey: "gamma-wasm-archive-v1",
+  gammaArchiveUrl: "assets/gamma-wasm-v2.tar.gz",
+  gammaArchiveCacheKey: "gamma-wasm-archive-v2",
   // Wasmer SDK — pinned via unpkg (NOT esm.run; the latter rebundles
   // and breaks the SDK's relative-URL lookup of its sibling WASM blob,
   // which surfaces as "WebAssembly: HTTP status code is not ok" on
@@ -6557,14 +6558,27 @@ self.onmessage = async (ev) => {
       await dir.writeFile("patch.cpp", new TextEncoder().encode(msg.wrappedSrc));
 
       progress("compile");
-      // Build clang argv:
-      //   - C++17, -O1 for speed (O2 is too slow per-keystroke for hot reload)
-      //   - target wasm32-wasi (matches what wasmer's clang sysroot expects)
-      //   - -nostartfiles + -Wl,--no-entry: no main() needed (we export
-      //     specific functions and the AudioWorklet drives them)
-      //   - --export=preview_* explicitly so the linker keeps them
-      //   - Headers from the staged archive
-      //   - libgamma.a as the only extra library
+      // Build clang argv. **Compile Gamma sources inline** rather than
+      // linking the prebuilt libgamma.a — the precompiled archive is
+      // emcmake/Emscripten-ABI and Wasmer's clang targets WASI; the
+      // prior attempt at static-library link hung wasm-ld for 31+
+      // minutes trying to reconcile incompatible relocations.
+      // Compiling Gamma .cpp files in the same pass as the patch
+      // keeps full Gamma functionality available (FFT, Scheduler,
+      // scl, etc.) and the ABI is consistent end-to-end.
+      const GAMMA_SRC = [
+        "/project/src/Conversion.cpp",
+        "/project/src/DFT.cpp",
+        "/project/src/Domain.cpp",
+        "/project/src/FFT_fftpack.cpp",
+        "/project/src/Print.cpp",
+        "/project/src/Scheduler.cpp",
+        "/project/src/Timer.cpp",
+        "/project/src/arr.cpp",
+        "/project/src/fftpack++1.cpp",
+        "/project/src/fftpack++2.cpp",
+        "/project/src/scl.cpp"
+      ];
       const args = [
         "-std=c++17",
         "-O1",
@@ -6580,14 +6594,28 @@ self.onmessage = async (ev) => {
         "-Wl,--export=free",
         "-Wl,--export=memory",
         "/project/patch.cpp",
-        "/project/lib/libgamma.a",
+        ...(msg.smokeTest ? [] : GAMMA_SRC),
         "-o", "/project/patch.wasm"
       ];
+
+      // Hard 5-minute compile timeout. Surfaces as an error instead
+      // of letting the tab grind forever (the actual clang process
+      // keeps running in the worker until the worker is terminated;
+      // the Stop button does that).
       const instance = await clangPkg.entrypoint.run({
         args,
         mount: { "/project": dir }
       });
-      const result = await instance.wait();
+      const result = await Promise.race([
+        instance.wait(),
+        new Promise((_, reject) => setTimeout(() =>
+          reject(new Error(
+            "clang timed out after 5 minutes. Click ■ to cancel, then try " +
+            "the smoke-test (★) to verify the toolchain works on a trivial " +
+            "program (no Gamma sources)."
+          )), 300000
+        ))
+      ]);
 
       let stderr = "";
       try { stderr = result.stderr || ""; } catch (_) {}
@@ -6902,6 +6930,71 @@ if (previewBtnPlay) {
   });
 }
 if (previewBtnStop) previewBtnStop.addEventListener("click", previewStop);
+
+/* ------------- Smoke test ----------------------------------------------
+ * Compiles a trivial 4-line C++ source (no Gamma) to verify the toolchain
+ * works end-to-end. Useful when a real patch fails — tells you whether
+ * the issue is with Gamma specifically or the entire SDK / clang path.
+ * Output isn't loaded into the AudioWorklet; just shows wasm size +
+ * timing in the status pill on success, or the actual error on failure. */
+const SMOKE_TEST_SRC = `
+__attribute__((export_name("smoke")))
+extern "C" int smoke() { return 42; }
+`;
+
+const previewBtnSmoke = document.getElementById("btn-preview-smoke");
+if (previewBtnSmoke) previewBtnSmoke.addEventListener("click", async () => {
+  if (previewState.state === "compiling") return;
+  setPreviewStatus("compiling", "smoke test compiling…");
+  previewProgressStart();
+  previewProgressStage("prepare");
+  try {
+    await ensureCompileWorker();
+  } catch (e) {
+    previewProgressEnd(false);
+    setPreviewStatus("error", "smoke worker init: " + e.message);
+    return;
+  }
+  const t0 = Date.now();
+  await new Promise((resolve, reject) => {
+    const onReply = (ev) => {
+      const m = ev.data;
+      if (m.type === "progress" && m.stage) {
+        if (typeof m.subProgress === "number" && m.subProgress > 0) {
+          const idx = PREVIEW_STAGES.findIndex(s => s.id === m.stage);
+          if (idx === previewProgress.stageIdx) previewProgressSub(m.subProgress);
+          else previewProgressStage(m.stage, m.subProgress);
+        } else {
+          previewProgressStage(m.stage);
+        }
+        const stage = PREVIEW_STAGES.find(s => s.id === m.stage);
+        if (stage) setPreviewStatus("compiling", "smoke: " + stage.label);
+      } else if (m.type === "compiled") {
+        previewState.worker.removeEventListener("message", onReply);
+        const ms = Date.now() - t0;
+        const bytes = m.wasmBytes instanceof ArrayBuffer ? m.wasmBytes : m.wasmBytes.buffer;
+        previewProgressFinish();
+        setPreviewStatus("idle", `smoke ✓ — ${bytes.byteLength} byte wasm in ${fmtDuration(ms)}`);
+        showCompileStderr(m.stderr || "", null);
+        resolve();
+      } else if (m.type === "compile-error") {
+        previewState.worker.removeEventListener("message", onReply);
+        previewProgressEnd(false);
+        setPreviewStatus("error", "smoke: " + m.error);
+        showCompileStderr(m.stderr || "", m.error);
+        reject(new Error(m.error));
+      }
+    };
+    previewState.worker.addEventListener("message", onReply);
+    previewState.worker.postMessage({
+      type: "compile",
+      smokeTest: true,
+      wrappedSrc: SMOKE_TEST_SRC,
+      archiveUrl: new URL(PREVIEW.gammaArchiveUrl, location.href).toString(),
+      sdkUrl: PREVIEW.wasmerSdkUrl
+    });
+  }).catch(() => { /* status already set */ });
+});
 
 /* ------------- Hot-reload trigger ------------- */
 /* Hook into render() so any graph mutation kicks a debounced recompile

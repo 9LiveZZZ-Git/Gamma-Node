@@ -24,7 +24,7 @@ if [[ ! -f "${GAMMA_DIR}/src/Conversion.cpp" ]]; then
 fi
 
 OUT_DIR="../assets"
-OUT="${OUT_DIR}/gamma-wasm-v1.tar.gz"
+OUT="${OUT_DIR}/gamma-wasm-v2.tar.gz"
 BUILD_DIR="build-wasm"
 
 mkdir -p "${OUT_DIR}"
@@ -41,15 +41,26 @@ if [[ ! -f "${BUILD_DIR}/libgamma.a" ]]; then
     exit 1
 fi
 
-echo ">> Staging headers…"
+echo ">> Staging headers + WASI-buildable sources…"
 STAGE=$(mktemp -d)
-mkdir -p "${STAGE}/lib" "${STAGE}/include"
+mkdir -p "${STAGE}/lib" "${STAGE}/include" "${STAGE}/src"
 cp "${BUILD_DIR}/libgamma.a" "${STAGE}/lib/"
 # Gamma's headers live at GAMMA_DIR/Gamma/*.h
 cp -r "${GAMMA_DIR}/Gamma" "${STAGE}/include/"
+# The 11 Gamma .cpp files that build cleanly under WASI (same set as
+# the CMakeLists exclusion-list policy: drop AudioIO / Recorder /
+# SoundFile which need PortAudio + libsndfile). The editor's preview
+# pipeline compiles these inline alongside the patch source — sidesteps
+# the Emscripten-vs-WASI ABI mismatch that hangs wasm-ld when linking
+# the prebuilt libgamma.a directly.
+for f in Conversion.cpp DFT.cpp Domain.cpp FFT_fftpack.cpp Print.cpp \
+         Scheduler.cpp Timer.cpp arr.cpp fftpack++1.cpp fftpack++2.cpp \
+         scl.cpp; do
+    cp "${GAMMA_DIR}/src/${f}" "${STAGE}/src/"
+done
 
 echo ">> Packing tarball…"
-( cd "${STAGE}" && tar czf "${OLDPWD}/${OUT}" lib include )
+( cd "${STAGE}" && tar czf "${OLDPWD}/${OUT}" lib include src )
 rm -rf "${STAGE}"
 
 SIZE=$(du -h "${OUT}" | cut -f1)
