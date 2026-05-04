@@ -6919,6 +6919,13 @@ self.onmessage = async (ev) => {
       const dir = await stageArchive(msg.archiveUrl);
 
       progress("write-patch");
+      // Wipe stale outputs from prior runs so a failing compile can't
+      // accidentally hand the AudioWorklet a leftover wasm from an
+      // earlier successful run (e.g. smoke output sticking around when
+      // a real patch compile fails). Best-effort; missing files OK.
+      try { await dir.removeFile("patch.wasm"); } catch (_) {}
+      try { await dir.removeFile("patch.json"); } catch (_) {}
+      try { await dir.removeFile("patch.o"); }    catch (_) {}
       await dir.writeFile("patch.cpp", new TextEncoder().encode(msg.wrappedSrc));
 
       progress("compile");
@@ -7120,10 +7127,20 @@ class PreviewProcessor extends AudioWorkletProcessor {
   }
   async loadModule(bytes) {
     const wasmModule = await WebAssembly.compile(bytes);
-    const imports = { env: {}, wasi_snapshot_preview1: {} };
-    // Stub WASI calls the patch class typically doesn't use; expand as needed.
-    ["proc_exit","fd_write","fd_close","fd_read","fd_seek","environ_get","environ_sizes_get"]
-      .forEach(k => imports.wasi_snapshot_preview1[k] = () => 0);
+    // Build a permissive imports object accepting any wasm output we
+    // might produce: WASI / WASIX (Wasmer clang) / Emscripten. The
+    // per-sample audio path shouldn't actually call any of these, so
+    // they all stub to no-ops. WebAssembly.instantiate demands every
+    // declared import resolve, so we use a Proxy per requested module
+    // to synthesize a no-op for any requested name.
+    const noop = () => 0;
+    const wasmImports = WebAssembly.Module.imports(wasmModule);
+    const imports = {};
+    for (const im of wasmImports) {
+      if (!imports[im.module]) {
+        imports[im.module] = new Proxy({}, { get: () => noop });
+      }
+    }
     const instance = await WebAssembly.instantiate(wasmModule, imports);
     const exp = instance.exports;
     this.memory = exp.memory;
