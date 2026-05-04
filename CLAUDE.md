@@ -14,6 +14,7 @@ This is a **single-file web application**, not a typical Node project. There is 
 - `docs/SPEC.md` — original specification, written when the editor was Stance A (AlloLib scaffolding). Still authoritative for §§4–10 (file format, codegen, basic UX). Sections that talk about "intended deliverable" are out of date — see ROADMAP for current direction.
 - `docs/EXPANSION.md` — original forward-looking node/feature list. Largely subsumed by ROADMAP phases 4+; still useful as a reference for which Gamma classes haven't been wrapped yet.
 - `docs/OPTIONS.md` — original decision menu. Check the status box at top.
+- `docs/UNSLOTH-WORKFLOW.md` — step-by-step recipe for fine-tuning Gemma 4 on a `.gdsp` corpus and deploying the result to the editor's AI panel via ONNX export + transformers.js. Not yet executed; the user expressed interest in Unsloth's models specifically — they're for fine-tuning workflows, not direct browser inference, so we'd convert them through `optimum`. Read this before doing any fine-tune work.
 
 If `docs/` is missing, work from this CLAUDE.md plus the code; don't assume the docs exist on every machine.
 
