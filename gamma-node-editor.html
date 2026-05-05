@@ -4629,6 +4629,10 @@ function gatherHeaders() {
     }
   });
   if (needsScl) gammaHeaders.add("scl");
+  // Domain is always needed — the preview wrapper calls
+  // gam::sampleRate() in preview_init / preview_set_sr to keep all
+  // Gamma units in sync with the AudioContext sample rate.
+  gammaHeaders.add("Domain");
   return {
     gamma: Array.from(gammaHeaders).sort(),
     std:   Array.from(stdHeaders).sort(),
@@ -7790,7 +7794,19 @@ static ${className}* gPatch = nullptr;
 
 extern "C" {
 
+// Gamma's units cache per-sample increments at construction time from
+// the global Domain. Without an explicit sample-rate set the Domain
+// defaults to 1.0, which makes Sine play at the wrong pitch and AD
+// complete its envelope in a single sample (audibly silent). The
+// worklet calls preview_set_sr with the AudioContext's real rate
+// BEFORE preview_init; preview_init also falls back to 48 kHz on
+// its own as a safety net.
+PREVIEW_EXPORT(preview_set_sr) void preview_set_sr(float sr) {
+    if (sr > 0.f) gam::sampleRate(sr);
+}
+
 PREVIEW_EXPORT(preview_init) void preview_init() {
+    if (gam::sampleRate() <= 1.0) gam::sampleRate(48000.0);
     if (gPatch) delete gPatch;
     gPatch = new ${className}();
 ${gateAutoFireBody}}
@@ -8214,6 +8230,12 @@ class PreviewProcessor extends AudioWorkletProcessor {
     const exp = instance.exports;
     this.memory = exp.memory;
     if (exp._start) try { exp._start(); } catch(e) {}
+    // Tell Gamma's master Domain about the actual sample rate BEFORE
+    // constructing the patch — every gam::Sine / gam::AD / gam::Biquad
+    // caches its per-sample increment from this. Without it the Domain
+    // defaults to 1.0 which makes envelopes finish in one sample
+    // (audibly silent) and oscillators play at the wrong pitch.
+    if (exp.preview_set_sr) try { exp.preview_set_sr(sampleRate); } catch(e) {}
     if (exp.preview_init) exp.preview_init();
     this.tickFn = exp.preview_tick;
     this.setFn  = exp.preview_set;
