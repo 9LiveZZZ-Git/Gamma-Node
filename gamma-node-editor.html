@@ -2377,6 +2377,41 @@
     width: fit-content;
   }
 
+  /* Step-grid editor for StepSeq16 / StepSeq32 — clickable cells that
+   * toggle node.params.steps[i]. 16-step layout uses 8 cols × 2 rows;
+   * 32-step uses 16 cols × 2 rows. Cells are small buttons with the
+   * step number for orientation. */
+  .step-grid {
+    display: grid;
+    gap: 3px;
+    margin-top: 4px;
+    margin-bottom: 12px;
+  }
+  .step-grid-16 { grid-template-columns: repeat(8, 1fr); }
+  .step-grid-32 { grid-template-columns: repeat(16, 1fr); }
+  .step-cell {
+    height: 28px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    color: var(--text-3);
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    cursor: pointer;
+    padding: 0;
+    transition: background 0.08s, color 0.08s, border-color 0.08s;
+  }
+  .step-cell:hover { border-color: var(--text-3); color: var(--text-2); }
+  .step-cell.on {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--accent-ink);
+  }
+  /* Visually mark every 4th cell so the user can read 4-on-the-floor
+   * patterns at a glance. */
+  .step-grid-16 .step-cell:nth-child(4n+1),
+  .step-grid-32 .step-cell:nth-child(4n+1) { border-left-width: 2px; border-left-color: var(--text-3); }
+
   .empty {
     line-height: 1.6;
   }
@@ -3356,6 +3391,299 @@ public:
     gateMethods: { trig: "reset" },
     autoExpose: ["bpm"],
     description: "Master clock. Outputs BPM (param), bar/beat/quarter/eighth/sixteenth gate ticks, and a 0..1 phase ramp per beat. trig resets the clock to bar 1. Wire any tick output into a gate input (AD.trig, sequencer step) for tempo-locked rhythms."
+  },
+
+  /* Phase 5.5 — tempo-locked LFO. Cheaper than MasterClock when you
+   * just want sub-audio-rate modulation in sync with a tempo and
+   * don't need the bar/beat/etc. gate-tick fan-out. divs gives
+   * cycles per beat (1 = once per beat, 2 = twice per beat, 0.5 =
+   * once per two beats). Shape picks sine / triangle / saw / ramp.
+   * Outputs are bipolar (-1..1) for sine/tri/saw, unipolar (0..1)
+   * for ramp — pair with Add+Mul if you need a different range. */
+  LFOClock: {
+    category: "Convert", color: COLOR.convert, header: null,
+    cppType: "GammaLFOClock",
+    helperClass:
+`class GammaLFOClock {
+    float bpm_ = 120.f;
+    float div_ = 1.f;
+    float sr_  = 48000.f;
+    int   shape_ = 0;
+    double phase_ = 0.0;
+public:
+    GammaLFOClock() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+    }
+    void setBpm(float v)   { bpm_   = v; }
+    void setDiv(float v)   { div_   = v; }
+    void setShape(float s) { shape_ = (int)s; }
+    void reset() { phase_ = 0.0; }
+    float operator()() {
+        const double inc = (double)bpm_ / 60.0 * (double)div_ / (double)sr_;
+        phase_ += inc;
+        if (phase_ >= 1.0) phase_ -= (int)phase_;
+        const float p = (float)phase_;
+        switch (shape_) {
+            case 1: return p < 0.5f ? (4.f * p - 1.f) : (3.f - 4.f * p);
+            case 2: return 1.f - 2.f * p;
+            case 3: return p;
+            default: return std::sin(p * 6.28318530718f);
+        }
+    }
+};`,
+    ins: [{ n: "trig", t: "gate" }],
+    outs: [{ n: "out", t: "audio" }],
+    params: { bpm: 120, div: 1, shape: "sine" },
+    methods: { bpm: "setBpm", div: "setDiv", shape: "setShape" },
+    paramOptions: { shape: ["sine", "triangle", "saw", "ramp"] },
+    enumMap:      { shape: { sine: "0", triangle: "1", saw: "2", ramp: "3" } },
+    gateMethods: { trig: "reset" },
+    extraHeaders: ["<cmath>"],
+    autoExpose: ["bpm", "div"],
+    description: "Tempo-locked LFO. div = cycles per beat. Wire trig from a clock to phase-lock with the patch. Bipolar output for sine/tri/saw, unipolar for ramp."
+  },
+
+  /* Phase 5.3 — Euclidean rhythm. Distributes `hits` evenly across
+   * `steps`, advancing one step per clock-edge on `clock` (wire
+   * MasterClock.eighth or .sixteenth in). Outputs a one-sample 1.f
+   * pulse on each hit, 0.f otherwise. rotation shifts the pattern
+   * around (e.g. rotation=2 turns "X--X--X--X--X--X" into
+   * "--X--X--X--X--X--X"). Pattern rebuilds whenever hits/steps
+   * change (constructor-time only — change + recompile to apply). */
+  EuclideanRhythm: {
+    category: "Convert", color: COLOR.convert, header: null,
+    cppType: "GammaEuclidean",
+    helperClass:
+`class GammaEuclidean {
+    static constexpr int MAX_STEPS = 64;
+    bool pattern_[MAX_STEPS];
+    int hits_     = 4;
+    int steps_    = 16;
+    int rotation_ = 0;
+    int curStep_  = -1;
+    int prev_     = 0;
+    void recalc() {
+        for (int i = 0; i < MAX_STEPS; i++) pattern_[i] = false;
+        if (steps_ <= 0) return;
+        const int H = (hits_ < 0) ? 0 : (hits_ > steps_ ? steps_ : hits_);
+        for (int i = 0; i < H; i++) {
+            const int idx = (i * steps_) / H;
+            if (idx < steps_) pattern_[idx] = true;
+        }
+    }
+public:
+    GammaEuclidean() { recalc(); }
+    void setHits(float v)     { hits_ = (int)v; recalc(); }
+    void setSteps(float v)    { int n = (int)v; if (n < 1) n = 1; if (n > MAX_STEPS) n = MAX_STEPS; steps_ = n; recalc(); }
+    void setRotation(float v) { rotation_ = (int)v; }
+    void reset()              { curStep_ = -1; prev_ = 0; }
+    float operator()(float clk) {
+        const int cur = (clk > 0.5f) ? 1 : 0;
+        const bool edge = cur && !prev_;
+        prev_ = cur;
+        if (edge) {
+            curStep_ = (curStep_ + 1) % steps_;
+            int idx = (curStep_ + rotation_) % steps_;
+            if (idx < 0) idx += steps_;
+            return pattern_[idx] ? 1.f : 0.f;
+        }
+        return 0.f;
+    }
+};`,
+    ins: [
+      { n: "clock", t: "audio" },
+      { n: "trig",  t: "gate" }
+    ],
+    outs: [{ n: "out", t: "clock" }],
+    params: { hits: 4, steps: 16, rotation: 0 },
+    methods: { hits: "setHits", steps: "setSteps", rotation: "setRotation" },
+    gateMethods: { trig: "reset" },
+    autoExpose: ["hits", "steps", "rotation"],
+    description: "Euclidean rhythm — distributes N hits evenly across M steps. Wire a clock signal (e.g. MasterClock.sixteenth) into clock; out fires a one-sample gate when the current step is a hit."
+  },
+
+  /* Phase 5.2 — 16-step gate sequencer. Pattern stored as a 16-bit
+   * boolean array in node.params.steps; the props pane renders an
+   * interactive grid for editing. Advances one step per clock-edge,
+   * wraps. trig resets to step 0. */
+  StepSeq16: {
+    category: "Convert", color: COLOR.convert, header: null,
+    cppType: "GammaStepSeq16",
+    helperClass:
+`class GammaStepSeq16 {
+    bool steps_[16];
+    int  cur_  = -1;
+    int  prev_ = 0;
+public:
+    GammaStepSeq16() { for (int i = 0; i < 16; i++) steps_[i] = false; }
+    void setStep(int i, float v) { if (i >= 0 && i < 16) steps_[i] = v > 0.5f; }
+    void reset() { cur_ = -1; prev_ = 0; }
+    float operator()(float clk) {
+        const int cur = (clk > 0.5f) ? 1 : 0;
+        const bool edge = cur && !prev_;
+        prev_ = cur;
+        if (edge) {
+            cur_ = (cur_ + 1) % 16;
+            return steps_[cur_] ? 1.f : 0.f;
+        }
+        return 0.f;
+    }
+};`,
+    ins: [
+      { n: "clock", t: "audio" },
+      { n: "trig",  t: "gate" }
+    ],
+    outs: [{ n: "out", t: "clock" }],
+    params: { steps: [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false] },
+    methods: {},
+    gateMethods: { trig: "reset" },
+    uiOnlyParams: ["steps"],
+    kind: "stepSeq",
+    stepCount: 16,
+    extraCtor: [
+      (n) => {
+        const steps = (n.params && Array.isArray(n.params.steps)) ? n.params.steps : [];
+        if (!steps.some(s => !!s)) return null;
+        const lines = ["        // pattern"];
+        for (let i = 0; i < 16; i++) {
+          if (steps[i]) lines.push(`        ${n.id}.setStep(${i}, 1.f);`);
+        }
+        return lines.join("\n");
+      }
+    ],
+    description: "16-step gate sequencer. Wire a clock signal (MasterClock.sixteenth) into clock. Edit the pattern with the step-grid in the properties pane. trig resets to step 0."
+  },
+
+  /* Phase 5.2 — 32-step variant of StepSeq16. Same machinery, longer
+   * pattern. Useful for two-bar rhythmic phrases at sixteenth-note
+   * resolution. */
+  StepSeq32: {
+    category: "Convert", color: COLOR.convert, header: null,
+    cppType: "GammaStepSeq32",
+    helperClass:
+`class GammaStepSeq32 {
+    bool steps_[32];
+    int  cur_  = -1;
+    int  prev_ = 0;
+public:
+    GammaStepSeq32() { for (int i = 0; i < 32; i++) steps_[i] = false; }
+    void setStep(int i, float v) { if (i >= 0 && i < 32) steps_[i] = v > 0.5f; }
+    void reset() { cur_ = -1; prev_ = 0; }
+    float operator()(float clk) {
+        const int cur = (clk > 0.5f) ? 1 : 0;
+        const bool edge = cur && !prev_;
+        prev_ = cur;
+        if (edge) {
+            cur_ = (cur_ + 1) % 32;
+            return steps_[cur_] ? 1.f : 0.f;
+        }
+        return 0.f;
+    }
+};`,
+    ins: [
+      { n: "clock", t: "audio" },
+      { n: "trig",  t: "gate" }
+    ],
+    outs: [{ n: "out", t: "clock" }],
+    params: { steps: new Array(32).fill(false) },
+    methods: {},
+    gateMethods: { trig: "reset" },
+    uiOnlyParams: ["steps"],
+    kind: "stepSeq",
+    stepCount: 32,
+    extraCtor: [
+      (n) => {
+        const steps = (n.params && Array.isArray(n.params.steps)) ? n.params.steps : [];
+        if (!steps.some(s => !!s)) return null;
+        const lines = ["        // pattern"];
+        for (let i = 0; i < 32; i++) {
+          if (steps[i]) lines.push(`        ${n.id}.setStep(${i}, 1.f);`);
+        }
+        return lines.join("\n");
+      }
+    ],
+    description: "32-step gate sequencer. Two bars of sixteenth-note rhythm. Same UI / wiring as StepSeq16."
+  },
+
+  /* Phase 5.4 — Arpeggiator. notes is a comma-separated list of
+   * semitone offsets (e.g. "0, 4, 7" = major triad, "0, 3, 7, 10" =
+   * minor 7). On each clock-edge, advances through the list per the
+   * mode (up / down / upDown / random) and outputs the resulting
+   * frequency relative to baseFreq. Wire freq into Sine.freq + the
+   * clock's gate output into Sine.trig (or AD.trig) for note-on
+   * articulation. */
+  Arp: {
+    category: "Convert", color: COLOR.convert, header: null,
+    cppType: "GammaArp",
+    helperClass:
+`class GammaArp {
+    static constexpr int MAX_NOTES = 16;
+    float notes_[MAX_NOTES];
+    int   nNotes_ = 0;
+    float baseFreq_ = 220.f;
+    int   mode_ = 0;
+    int   cur_  = -1;
+    int   dir_  = 1;
+    int   prev_ = 0;
+    unsigned rng_ = 0x12345u;
+    int randIdx() {
+        rng_ = rng_ * 1664525u + 1013904223u;
+        return (int)((rng_ >> 8) % (unsigned)nNotes_);
+    }
+public:
+    void setBaseFreq(float v) { baseFreq_ = v; }
+    void setMode(float m)     { mode_ = (int)m; }
+    void clearNotes()         { nNotes_ = 0; }
+    void addNote(float semi)  { if (nNotes_ < MAX_NOTES) notes_[nNotes_++] = semi; }
+    void reset()              { cur_ = -1; dir_ = 1; prev_ = 0; }
+    float operator()(float clk) {
+        const int cur = (clk > 0.5f) ? 1 : 0;
+        const bool edge = cur && !prev_;
+        prev_ = cur;
+        if (edge && nNotes_ > 0) {
+            switch (mode_) {
+                case 0: cur_ = (cur_ + 1) % nNotes_; break;
+                case 1: cur_--; if (cur_ < 0) cur_ = nNotes_ - 1; break;
+                case 2:
+                    cur_ += dir_;
+                    if (cur_ >= nNotes_) { cur_ = nNotes_ > 1 ? nNotes_ - 2 : 0; dir_ = -1; }
+                    if (cur_ < 0)        { cur_ = nNotes_ > 1 ? 1 : 0; dir_ = 1; }
+                    break;
+                case 3: cur_ = randIdx(); break;
+            }
+        }
+        if (cur_ < 0 || cur_ >= nNotes_) return baseFreq_;
+        return baseFreq_ * std::pow(2.f, notes_[cur_] / 12.f);
+    }
+};`,
+    ins: [
+      { n: "clock", t: "audio" },
+      { n: "freq",  t: "param" },
+      { n: "trig",  t: "gate" }
+    ],
+    outs: [{ n: "freq", t: "audio" }],
+    params: { freq: 220, mode: "up", notes: "0, 4, 7, 12" },
+    methods: { freq: "setBaseFreq", mode: "setMode" },
+    paramOptions: { mode: ["up", "down", "upDown", "random"] },
+    enumMap:      { mode: { up: "0", down: "1", upDown: "2", random: "3" } },
+    gateMethods: { trig: "reset" },
+    autoExpose: ["freq"],
+    uiOnlyParams: ["notes"],
+    extraHeaders: ["<cmath>"],
+    extraCtor: [
+      (n) => {
+        const raw = (n.params && typeof n.params.notes === "string") ? n.params.notes : "";
+        const list = raw.split(",").map(s => s.trim()).filter(s => s.length).map(Number).filter(v => isFinite(v));
+        if (!list.length) return null;
+        const lines = [`        ${n.id}.clearNotes();`];
+        list.slice(0, 16).forEach(v => {
+          lines.push(`        ${n.id}.addNote(${Number(v).toFixed(4)}f);`);
+        });
+        return lines.join("\n");
+      }
+    ],
+    description: "Arpeggiator. notes = comma-separated semitone offsets (e.g. \"0, 4, 7\" = major triad). On each clock-edge, advances per mode (up/down/upDown/random) + outputs baseFreq scaled by the offset. Wire freq into Sine.freq."
   },
 
   /* Phase 3.5 — multi-output state-variable filter via helperClass.
@@ -4632,8 +4960,37 @@ function renderProps() {
       });
       html += `</div>`;
     }
+    // Step-grid UI for sequencer nodes — N small clickable cells
+    // mirroring node.params.steps (boolean array). Click to toggle.
+    if (def.kind === "stepSeq") {
+      const N = def.stepCount || 16;
+      if (!Array.isArray(node.params.steps) || node.params.steps.length !== N) {
+        node.params.steps = new Array(N).fill(false);
+      }
+      const steps = node.params.steps;
+      html += `<div class="prop-section">Pattern · ${N} steps</div>`;
+      html += `<div class="step-grid step-grid-${N}">`;
+      for (let i = 0; i < N; i++) {
+        const on = !!steps[i];
+        html += `<button class="step-cell${on ? ' on' : ''}" data-step="${i}" title="step ${i+1}">${i+1}</button>`;
+      }
+      html += `</div>`;
+    }
   }
   propsEl.innerHTML = html;
+  // Wire step-grid clicks (after innerHTML so the buttons exist).
+  propsEl.querySelectorAll('.step-cell').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const i = parseInt(btn.dataset.step, 10);
+      if (!Array.isArray(node.params.steps)) {
+        node.params.steps = new Array(def.stepCount || 16).fill(false);
+      }
+      pushHistory("step:" + node.id + ":" + i);
+      node.params.steps[i] = !node.params.steps[i];
+      btn.classList.toggle('on', node.params.steps[i]);
+      renderCode(); renderJson();
+    });
+  });
 
   propsEl.querySelectorAll('input[type="number"]').forEach(inp => {
     inp.addEventListener("input", () => {
