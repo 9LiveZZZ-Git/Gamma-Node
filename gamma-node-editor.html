@@ -1863,6 +1863,65 @@
     color: var(--phosphor-mid);
   }
   .piano-key.octave-marker.inactive { color: var(--phosphor-dim); }
+  /* Custom-frequency override indicator: amber accent so it visually
+   * distinguishes from default phosphor + active states. */
+  .piano-key.overridden { box-shadow: inset 0 -3px 0 var(--warn); }
+  .piano-key.overridden.active { box-shadow: inset 0 -3px 0 var(--warn), 0 0 14px var(--phosphor-mid); }
+
+  /* ---------- Keymap modal grid ---------- */
+  .keymap-grid {
+    display: grid;
+    grid-template-columns: 32px 90px 1fr 28px;
+    gap: 6px 10px;
+    align-items: center;
+    max-height: 360px;
+    overflow-y: auto;
+    padding-right: 4px;
+  }
+  .keymap-grid .keymap-row {
+    display: contents;
+  }
+  .keymap-grid .keymap-letter {
+    font-family: var(--font-instr);
+    font-size: 13px;
+    color: var(--accent);
+    text-align: center;
+    text-transform: lowercase;
+    letter-spacing: 0.04em;
+  }
+  .keymap-grid .keymap-default {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-3);
+    font-variant-numeric: tabular-nums;
+  }
+  .keymap-grid .keymap-input {
+    width: 100%;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    padding: 5px 8px;
+    outline: none;
+  }
+  .keymap-grid .keymap-input:focus { border-color: var(--accent); }
+  .keymap-grid .keymap-input::placeholder { color: var(--text-3); }
+  .keymap-grid .keymap-input.set { border-color: var(--warn); color: var(--warn); }
+  .keymap-grid .keymap-clear {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-3);
+    border-radius: 3px;
+    width: 24px; height: 24px;
+    cursor: pointer;
+    line-height: 1;
+    padding: 0;
+    font-family: var(--font-mono);
+  }
+  .keymap-grid .keymap-clear:hover { color: var(--danger); border-color: var(--danger); }
+  .keymap-grid .keymap-clear:disabled { opacity: 0.3; cursor: default; }
   .piano-key {
     position: relative;
     width: 30px;
@@ -2460,6 +2519,7 @@
               <span id="piano-octave-readout" class="dim">octave 0</span>
               <span class="dim"> · </span>
               <span id="piano-readout"><span class="dim">no note</span></span>
+              <button class="panel-ctl-btn" id="btn-keymap-edit" title="Edit per-key frequencies" style="margin-left:8px;">edit</button>
             </span>
           </div>
           <div class="piano-keys" id="piano-keys"></div>
@@ -2523,6 +2583,29 @@
         <div class="modal-actions">
           <button class="btn primary" id="btn-settings-save">Save</button>
           <button class="btn danger" id="btn-settings-clear">Clear key</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Per-key custom frequency editor. Each QWERTY key can be assigned
+       a fixed Hz that overrides the default MIDI mapping (and ignores
+       octave shift while overridden). Stored in localStorage so it
+       persists across sessions. -->
+  <div class="modal-backdrop" id="keymap-modal" style="display:none;">
+    <div class="modal" style="width: 540px;">
+      <div class="modal-head">
+        <span>Edit key mapping</span>
+        <button class="btn modal-x" id="btn-keymap-close">×</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-note">
+          Override individual key frequencies. Type a number (Hz) into any row to pin that key to a fixed pitch — overrides the default MIDI mapping and ignores octave shift while set. Leave blank to fall back to default. Stored locally in this browser.
+        </p>
+        <div class="keymap-grid" id="keymap-grid"></div>
+        <div class="modal-actions" style="margin-top: 14px;">
+          <button class="btn primary" id="btn-keymap-done">Done</button>
+          <button class="btn danger" id="btn-keymap-reset">Reset all</button>
         </div>
       </div>
     </div>
@@ -8776,6 +8859,20 @@ const QWERTY_TO_MIDI = {
   "w": 61, "e": 63, "t": 66, "y": 68, "u": 70, "o": 73, "p": 75
 };
 const kbHeldKeys = new Set();
+// Per-key frequency overrides: { qwertyKey: hz }. Set rows ignore the
+// MIDI mapping and the octave shift — pinned to whatever Hz the user
+// typed in the keymap modal. Empty rows fall back to default behavior.
+let kbCustomFreqs = (function () {
+  try {
+    const raw = localStorage.getItem("gamma-kb-key-freqs");
+    if (!raw) return {};
+    const obj = JSON.parse(raw);
+    return (obj && typeof obj === "object") ? obj : {};
+  } catch (_) { return {}; }
+})();
+function saveCustomFreqs() {
+  try { localStorage.setItem("gamma-kb-key-freqs", JSON.stringify(kbCustomFreqs)); } catch (_) {}
+}
 // Octave-shift state. Z lowers, X raises, in 12-semitone steps.
 // Persists to localStorage so the shift survives reloads.
 let kbOctaveShift = (function () {
@@ -8823,8 +8920,15 @@ function playKeyboardNote(qwertyKey) {
   if (!previewState.workletNode || previewState.state !== "playing") return false;
   const kbIdx = findKeyboardSetterIndex();
   if (kbIdx < 0) return false;
-  const midi = QWERTY_TO_MIDI[qwertyKey] + kbOctaveShift;
-  const freq = midiToFreq(midi);
+  // Custom override wins; otherwise apply the octave-shifted default.
+  let midi, freq;
+  if (typeof kbCustomFreqs[qwertyKey] === "number" && isFinite(kbCustomFreqs[qwertyKey])) {
+    freq = kbCustomFreqs[qwertyKey];
+    midi = freqToMidi(freq);
+  } else {
+    midi = QWERTY_TO_MIDI[qwertyKey] + kbOctaveShift;
+    freq = midiToFreq(midi);
+  }
   previewState.workletNode.port.postMessage({ type: "set", index: kbIdx, value: freq });
   listGateSetterIndices().forEach(i => {
     previewState.workletNode.port.postMessage({ type: "set", index: i, value: 0 });
@@ -8832,6 +8936,12 @@ function playKeyboardNote(qwertyKey) {
   highlightPianoKey(qwertyKey, true);
   updatePianoReadout(midi, freq);
   return true;
+}
+// Reverse of midiToFreq — used to display a meaningful note name when
+// a key has been overridden to an arbitrary Hz value.
+function freqToMidi(hz) {
+  if (!hz || !isFinite(hz) || hz <= 0) return 0;
+  return Math.round(69 + 12 * Math.log2(hz / 440));
 }
 function releaseKeyboardNote(qwertyKey) {
   if (!(qwertyKey in QWERTY_TO_MIDI)) return;
@@ -8903,6 +9013,11 @@ function renderPiano() {
     el.className = "piano-key " + (black ? "black" : "white") + (inWindow ? "" : " inactive");
     el.dataset.midi = String(m);
     if (qwerty) el.dataset.qwerty = qwerty;
+    // Custom-frequency override mark — amber underline so the user can
+    // see at a glance which keys are pinned.
+    if (qwerty && typeof kbCustomFreqs[qwerty] === "number") {
+      el.classList.add("overridden");
+    }
     // Label: QWERTY letter if this MIDI is mapped, else the note name
     // for the C key of each octave (orientation marker).
     if (qwerty) {
@@ -8981,6 +9096,86 @@ function showPiano() {
   if (status) status.textContent = "live";
 }
 renderPiano();
+
+/* ------------- Per-key frequency override modal ------------- */
+/* Lists every QWERTY key bound by QWERTY_TO_MIDI; user types an Hz
+ * value to pin that key, leaves blank to fall back to the default
+ * MIDI mapping. Pinned keys ignore octave shift. */
+function openKeymapModal() {
+  const modal = document.getElementById("keymap-modal");
+  const grid  = document.getElementById("keymap-grid");
+  if (!modal || !grid) return;
+  // Build rows in MIDI ascending order to match the piano layout.
+  const ordered = Object.entries(QWERTY_TO_MIDI).sort((a, b) => a[1] - b[1]);
+  grid.innerHTML = "";
+  ordered.forEach(([k, midi]) => {
+    const defFreq = midiToFreq(midi);
+    const cur = kbCustomFreqs[k];
+    const isSet = typeof cur === "number" && isFinite(cur);
+    const row = document.createElement("div");
+    row.className = "keymap-row";
+    row.innerHTML =
+      '<div class="keymap-letter">' + (k === ";" ? ";" : k) + '</div>' +
+      '<div class="keymap-default">' + midiName(midi) + ' · ' + defFreq.toFixed(1) + 'hz</div>' +
+      '<input class="keymap-input' + (isSet ? ' set' : '') + '" type="number" step="any" min="1" placeholder="' + defFreq.toFixed(2) + '" value="' + (isSet ? cur : '') + '" data-key="' + k + '" />' +
+      '<button class="keymap-clear" data-key="' + k + '" title="Clear override"' + (isSet ? '' : ' disabled') + '>×</button>';
+    grid.appendChild(row);
+  });
+  // Wire input + clear handlers.
+  grid.querySelectorAll(".keymap-input").forEach(inp => {
+    inp.addEventListener("input", () => {
+      const k = inp.dataset.key;
+      const v = parseFloat(inp.value);
+      if (isFinite(v) && v > 0) {
+        kbCustomFreqs[k] = v;
+        inp.classList.add("set");
+        const btn = grid.querySelector('.keymap-clear[data-key="' + k.replace('"','\\"') + '"]');
+        if (btn) btn.disabled = false;
+      } else {
+        delete kbCustomFreqs[k];
+        inp.classList.remove("set");
+        const btn = grid.querySelector('.keymap-clear[data-key="' + k.replace('"','\\"') + '"]');
+        if (btn) btn.disabled = true;
+      }
+      saveCustomFreqs();
+      renderPiano();
+    });
+  });
+  grid.querySelectorAll(".keymap-clear").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const k = btn.dataset.key;
+      delete kbCustomFreqs[k];
+      saveCustomFreqs();
+      const inp = grid.querySelector('.keymap-input[data-key="' + k.replace('"','\\"') + '"]');
+      if (inp) { inp.value = ""; inp.classList.remove("set"); }
+      btn.disabled = true;
+      renderPiano();
+    });
+  });
+  modal.style.display = "flex";
+}
+function closeKeymapModal() {
+  const modal = document.getElementById("keymap-modal");
+  if (modal) modal.style.display = "none";
+}
+(function setupKeymapModal() {
+  const open = document.getElementById("btn-keymap-edit");
+  const close = document.getElementById("btn-keymap-close");
+  const done = document.getElementById("btn-keymap-done");
+  const reset = document.getElementById("btn-keymap-reset");
+  const modal = document.getElementById("keymap-modal");
+  if (!open || !modal) return;
+  open.addEventListener("click", openKeymapModal);
+  if (close) close.addEventListener("click", closeKeymapModal);
+  if (done)  done .addEventListener("click", closeKeymapModal);
+  if (reset) reset.addEventListener("click", () => {
+    kbCustomFreqs = {};
+    saveCustomFreqs();
+    renderPiano();
+    openKeymapModal();   // rebuild the rows with cleared values
+  });
+  modal.addEventListener("click", e => { if (e.target === modal) closeKeymapModal(); });
+})();
 
 /* ------------- Monitor controls (Button + Slider host nodes) ------------- */
 /* Renders one row per Button / Slider node in the patch. Buttons fire
