@@ -2504,7 +2504,7 @@
           </div>
           <div class="monitor-display" id="monitor-display">
             <span class="monitor-display-corner" id="meter-overlay-corner">−∞</span>
-            <canvas id="meter-canvas" width="640" height="200"></canvas>
+            <canvas id="meter-canvas" width="960" height="240"></canvas>
           </div>
           <div class="monitor-readouts">
             <div class="monitor-readout"><span class="k">peak L</span><span class="v" id="meter-db-l">−∞</span></div>
@@ -8308,8 +8308,14 @@ async function ensureAudioWorklet() {
   const splitter = previewState.audioCtx.createChannelSplitter(2);
   const analyserL = previewState.audioCtx.createAnalyser();
   const analyserR = previewState.audioCtx.createAnalyser();
-  analyserL.fftSize = 512; analyserL.smoothingTimeConstant = 0;
-  analyserR.fftSize = 512; analyserR.smoothingTimeConstant = 0;
+  // 2048-point FFT → 1024 bins, ~23 Hz/bin at 48 kHz. Wide enough to
+  // resolve adjacent semitones above ~600 Hz and gives a usable
+  // spectrogram below 100 Hz. smoothingTimeConstant left at 0 — we
+  // do attack/release in the render loop instead so the look is closer
+  // to professional analyzers (fast rise, slow fall) rather than the
+  // browser's symmetric one-pole.
+  analyserL.fftSize = 2048; analyserL.smoothingTimeConstant = 0;
+  analyserR.fftSize = 2048; analyserR.smoothingTimeConstant = 0;
   node.connect(splitter);
   splitter.connect(analyserL, 0);
   splitter.connect(analyserR, 1);
@@ -8359,10 +8365,23 @@ const METER = {
   peakDecayPerFrame: 0.985,
   fillDecayPerFrame: 0.92,
   smoothL: 0, smoothR: 0,
-  // FFT band smoothing (32 log-spaced bands → values 0..1).
-  fftBands: new Float32Array(32),
-  fftDecay: 0.78
+  // Per-bin smoothed dB values (sized to analyser.frequencyBinCount when
+  // the loop starts). Initialised to FFT_DB_FLOOR so first frames don't
+  // draw a misleading transient. Attack rises fast, release falls slow —
+  // standard pro-analyzer ballistics.
+  fftSmooth: null,
+  fftCursor: null,             // { x, y, freq, db } — mouse hover, null when off
+  fftLayout: null              // cached pixel→bin map; invalidated on resize
 };
+// FFT view configuration — pulled out so the render path isn't full of magic numbers.
+const FFT_DB_FLOOR  = -90;
+const FFT_DB_TOP    = 0;
+const FFT_F_MIN     = 30;       // Hz — bottom of log range
+const FFT_F_MAX     = 20000;    // Hz — top of log range (clamped to Nyquist)
+const FFT_ATTACK    = 0.50;     // 0=instant, 1=never; smaller = snappier rise
+const FFT_RELEASE   = 0.93;     // larger = slower fall
+const FFT_HZ_GRID   = [50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000];
+const FFT_DB_GRID   = [-80, -60, -40, -20, 0];
 function dbFromAmp(amp) { if (amp < 1e-5) return -Infinity; return 20 * Math.log10(amp); }
 function fmtDb(db) { if (!isFinite(db)) return "−∞"; return (db >= 0 ? "+" : "") + db.toFixed(1); }
 
@@ -8406,21 +8425,76 @@ function startMeterLoop() {
   const COL_AMB = "rgba(255,179,71,0.95)";    // warning band
   const COL_RED = "rgba(226,75,74,0.95)";     // clip band
 
-  // Pre-compute log-spaced FFT band edges. Sample rate is fixed by
-  // the audio context — ~48k. Frequency bins span 0..sr/2 so band
-  // edges from 30Hz..20kHz are derived once.
-  let fftBandEdges = null;
-  function ensureBandEdges() {
-    if (fftBandEdges) return;
+  // FFT spectrum analyzer — pro-tool style.
+  //
+  // Rendering strategy: for each x-pixel inside the plot area, find the
+  // bin range that maps to the log-frequency span [f, f_next]. Take the
+  // max-magnitude bin in that range so spectral peaks survive the
+  // downsampling (sum/avg would smear them). Convert to dB, smooth with
+  // attack/release ballistics, plot the resulting curve.
+  //
+  // Layout: dB scale runs FFT_DB_FLOOR..FFT_DB_TOP top-to-bottom on the
+  // right (labels inside the plot). Hz axis runs FFT_F_MIN..FFT_F_MAX
+  // log-spaced left-to-right (labels at the bottom). Filled curve has a
+  // vertical gradient from amber-at-top to phosphor-at-floor for
+  // magnitude-at-a-glance reading; outline trace on top has subtle
+  // phosphor glow for crisp peak resolution.
+  const N_BINS = previewState.analyserL.frequencyBinCount;
+  if (!METER.fftSmooth || METER.fftSmooth.length !== N_BINS) {
+    METER.fftSmooth = new Float32Array(N_BINS).fill(FFT_DB_FLOOR);
+  }
+
+  // Cache per-pixel bin ranges + grid positions whenever the canvas
+  // dimensions change. Cleared on canvas resize via stopMeterLoop.
+  function ensureFftLayout() {
+    if (METER.fftLayout && METER.fftLayout.W === W && METER.fftLayout.H === H) return METER.fftLayout;
     const sr = previewState.audioCtx ? previewState.audioCtx.sampleRate : 48000;
-    const nBins = previewState.analyserL.frequencyBinCount;
-    const fmin = 30, fmax = Math.min(20000, sr / 2);
-    fftBandEdges = new Int32Array(33);
-    for (let i = 0; i <= 32; i++) {
-      const f = fmin * Math.pow(fmax / fmin, i / 32);
-      const bin = Math.round(f / (sr / 2) * nBins);
-      fftBandEdges[i] = Math.max(0, Math.min(nBins - 1, bin));
+    const fmin = FFT_F_MIN;
+    const fmax = Math.min(FFT_F_MAX, sr / 2);
+    const ML = 0, MR = 38, MT = 6, MB = 18;
+    const plotX = ML, plotY = MT;
+    const plotW = W - ML - MR, plotH = H - MT - MB;
+    const logFmin = Math.log(fmin), logFspan = Math.log(fmax) - logFmin;
+    // Pixel → bin range (inclusive). Pre-compute so the render loop
+    // is a tight scan with no Math.log calls.
+    const binLo = new Int32Array(plotW + 1);
+    const binHi = new Int32Array(plotW + 1);
+    for (let px = 0; px <= plotW; px++) {
+      const f0 = Math.exp(logFmin + (px       / plotW) * logFspan);
+      const f1 = Math.exp(logFmin + ((px + 1) / plotW) * logFspan);
+      let lo = Math.floor(f0 * 2 * N_BINS / sr);
+      let hi = Math.ceil (f1 * 2 * N_BINS / sr);
+      if (lo < 0) lo = 0; if (hi >= N_BINS) hi = N_BINS - 1;
+      if (hi < lo) hi = lo;
+      binLo[px] = lo; binHi[px] = hi;
     }
+    METER.fftLayout = {
+      W, H, fmin, fmax, ML, MR, MT, MB, plotX, plotY, plotW, plotH,
+      logFmin, logFspan, binLo, binHi
+    };
+    return METER.fftLayout;
+  }
+  // Mouse readout — when the cursor hovers the plot, store {x, y, freq, db}
+  // for the renderer to draw a crosshair + tooltip.
+  function fftHandlePointer(ev) {
+    const r = canvas.getBoundingClientRect();
+    const cx = (ev.clientX - r.left) * (W / r.width);
+    const cy = (ev.clientY - r.top)  * (H / r.height);
+    const lo = METER.fftLayout;
+    if (!lo || cx < lo.plotX || cx > lo.plotX + lo.plotW || cy < lo.plotY || cy > lo.plotY + lo.plotH) {
+      METER.fftCursor = null;
+      return;
+    }
+    const tF = (cx - lo.plotX) / lo.plotW;
+    const freq = Math.exp(lo.logFmin + tF * lo.logFspan);
+    const tD = (cy - lo.plotY) / lo.plotH;
+    const db  = FFT_DB_TOP - tD * (FFT_DB_TOP - FFT_DB_FLOOR);
+    METER.fftCursor = { x: cx, y: cy, freq, db };
+  }
+  if (!canvas.dataset.fftWired) {
+    canvas.dataset.fftWired = "1";
+    canvas.addEventListener("mousemove", fftHandlePointer);
+    canvas.addEventListener("mouseleave", () => { METER.fftCursor = null; });
   }
 
   function drawVU(pL, pR) {
@@ -8510,38 +8584,143 @@ function startMeterLoop() {
   }
 
   function drawFFT() {
-    ensureBandEdges();
     previewState.analyserL.getFloatFrequencyData(fftL);
-    // Reduce to 32 log-spaced bands; smooth.
-    for (let i = 0; i < 32; i++) {
-      const a = fftBandEdges[i], b = fftBandEdges[i + 1];
-      let mx = -160;
-      for (let j = a; j <= b; j++) if (fftL[j] > mx) mx = fftL[j];
-      const v = Math.max(0, Math.min(1, (mx + 80) / 80));   // -80..0 dB → 0..1
-      METER.fftBands[i] = Math.max(v, METER.fftBands[i] * METER.fftDecay);
+    const lo = ensureFftLayout();
+    const sm = METER.fftSmooth;
+    // Per-bin attack/release smoothing. fftL[i] is in dB (-Infinity..0).
+    // Floor the input to FFT_DB_FLOOR so the smoother is well-defined.
+    for (let i = 0; i < N_BINS; i++) {
+      let v = fftL[i];
+      if (!isFinite(v) || v < FFT_DB_FLOOR) v = FFT_DB_FLOOR;
+      const prev = sm[i];
+      const k = (v > prev) ? FFT_ATTACK : FFT_RELEASE;
+      sm[i] = prev * k + v * (1 - k);
     }
+
+    // Background.
     ctx.fillStyle = COL_BG; ctx.fillRect(0, 0, W, H);
-    // Octave-spaced verticals (every 4 bands ≈ 1.5 octaves on this map).
-    ctx.strokeStyle = COL_PHB; ctx.lineWidth = 1; ctx.beginPath();
-    for (let i = 4; i < 32; i += 4) {
-      const x = Math.round((i / 32) * W) + 0.5;
-      ctx.moveTo(x, 4); ctx.lineTo(x, H - 4);
-    }
+
+    // dB ↔ y, helper closures (cheap; called O(grid) times not O(W)).
+    const dbSpan = FFT_DB_TOP - FFT_DB_FLOOR;
+    const dbToY = db => lo.plotY + (1 - (db - FFT_DB_FLOOR) / dbSpan) * lo.plotH;
+    const fToX  = f  => lo.plotX + (Math.log(f) - lo.logFmin) / lo.logFspan * lo.plotW;
+
+    // dB grid (horizontal). Slightly brighter at 0 dB to anchor the eye.
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = "rgba(200,232,90,0.10)";
+    ctx.beginPath();
+    FFT_DB_GRID.forEach(db => {
+      const y = Math.round(dbToY(db)) + 0.5;
+      ctx.moveTo(lo.plotX, y); ctx.lineTo(lo.plotX + lo.plotW, y);
+    });
     ctx.stroke();
-    // Bars.
-    const bw = (W - 4) / 32;
-    for (let i = 0; i < 32; i++) {
-      const v = METER.fftBands[i];
-      const h = v * (H - 14);
-      const x = 2 + i * bw;
-      // Gradient warmer up top.
-      const grad = ctx.createLinearGradient(0, H - 4, 0, 4);
-      grad.addColorStop(0, "rgba(200,232,90,0.55)");
-      grad.addColorStop(0.7, "rgba(200,232,90,0.95)");
-      grad.addColorStop(0.92, "rgba(255,179,71,0.95)");
-      grad.addColorStop(1, "rgba(226,75,74,0.95)");
-      ctx.fillStyle = grad;
-      ctx.fillRect(x, H - 4 - h, bw - 1.5, h);
+    // 0 dB highlight line.
+    ctx.strokeStyle = "rgba(255,179,71,0.30)";
+    ctx.beginPath();
+    const y0 = Math.round(dbToY(0)) + 0.5;
+    ctx.moveTo(lo.plotX, y0); ctx.lineTo(lo.plotX + lo.plotW, y0);
+    ctx.stroke();
+
+    // Hz grid (vertical) — only label the decades + 1/2/5 to avoid clutter.
+    ctx.strokeStyle = "rgba(200,232,90,0.10)";
+    ctx.beginPath();
+    FFT_HZ_GRID.forEach(f => {
+      if (f > lo.fmax) return;
+      const x = Math.round(fToX(f)) + 0.5;
+      ctx.moveTo(x, lo.plotY); ctx.lineTo(x, lo.plotY + lo.plotH);
+    });
+    ctx.stroke();
+
+    // Compute spectrum y-values for each pixel column ONCE; reuse for
+    // both the filled curve and the outline trace.
+    const ys = new Float32Array(lo.plotW + 1);
+    for (let px = 0; px <= lo.plotW; px++) {
+      const a = lo.binLo[px], b = lo.binHi[px];
+      let mx = sm[a];
+      for (let i = a + 1; i <= b; i++) if (sm[i] > mx) mx = sm[i];
+      ys[px] = dbToY(mx);
+    }
+
+    // Filled curve — vertical gradient (warmer near 0 dB, dim near floor).
+    ctx.beginPath();
+    ctx.moveTo(lo.plotX, lo.plotY + lo.plotH);
+    for (let px = 0; px <= lo.plotW; px++) {
+      ctx.lineTo(lo.plotX + px, ys[px]);
+    }
+    ctx.lineTo(lo.plotX + lo.plotW, lo.plotY + lo.plotH);
+    ctx.closePath();
+    const grad = ctx.createLinearGradient(0, lo.plotY, 0, lo.plotY + lo.plotH);
+    grad.addColorStop(0,    "rgba(255,179,71,0.45)");      // amber at 0 dB
+    grad.addColorStop(0.20, "rgba(200,232,90,0.42)");
+    grad.addColorStop(0.55, "rgba(200,232,90,0.20)");
+    grad.addColorStop(1,    "rgba(200,232,90,0.04)");
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // Outline trace — phosphor with subtle glow.
+    ctx.beginPath();
+    ctx.moveTo(lo.plotX, ys[0]);
+    for (let px = 1; px <= lo.plotW; px++) ctx.lineTo(lo.plotX + px, ys[px]);
+    ctx.strokeStyle = COL_PH;
+    ctx.lineWidth = 1.25;
+    ctx.shadowColor = COL_PH;
+    ctx.shadowBlur = 3;
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+
+    // Axis labels — dB on the right inside the plot, Hz on the bottom.
+    ctx.fillStyle = COL_TX;
+    ctx.font = "9px 'Fragment Mono', 'JetBrains Mono', monospace";
+    ctx.textBaseline = "middle";
+    ctx.textAlign = "left";
+    FFT_DB_GRID.forEach(db => {
+      const y = dbToY(db);
+      const label = db === 0 ? "0 dB" : (db + "");
+      ctx.fillText(label, lo.plotX + lo.plotW + 4, y);
+    });
+    ctx.textBaseline = "top";
+    ctx.textAlign = "center";
+    FFT_HZ_GRID.forEach(f => {
+      if (f > lo.fmax) return;
+      const x = fToX(f);
+      const label = f >= 1000 ? (f / 1000) + "k" : (f + "");
+      ctx.fillText(label, x, lo.plotY + lo.plotH + 4);
+    });
+
+    // Mouse-hover crosshair + readout. Only drawn when fftCursor is set.
+    if (METER.fftCursor) {
+      const cur = METER.fftCursor;
+      // Snap y to the actual spectrum height at the hovered pixel so the
+      // tooltip dB matches what the user "sees" (peak at that x).
+      const px = Math.max(0, Math.min(lo.plotW, Math.round(cur.x - lo.plotX)));
+      const ySpec = ys[px];
+      // Convert ySpec back to dB for the tooltip.
+      const dbAt = FFT_DB_TOP - (ySpec - lo.plotY) / lo.plotH * dbSpan;
+      ctx.strokeStyle = "rgba(230,227,220,0.35)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(cur.x + 0.5, lo.plotY); ctx.lineTo(cur.x + 0.5, lo.plotY + lo.plotH);
+      ctx.moveTo(lo.plotX, ySpec + 0.5); ctx.lineTo(lo.plotX + lo.plotW, ySpec + 0.5);
+      ctx.stroke();
+      // Marker dot at the spectrum peak under the cursor.
+      ctx.fillStyle = COL_HI;
+      ctx.beginPath(); ctx.arc(cur.x, ySpec, 2.5, 0, Math.PI * 2); ctx.fill();
+      // Tooltip — freq + dB at cursor's spectrum point.
+      const fLabel = cur.freq >= 1000 ? (cur.freq / 1000).toFixed(2) + "k Hz" : cur.freq.toFixed(0) + " Hz";
+      const dLabel = (dbAt >= 0 ? "+" : "") + dbAt.toFixed(1) + " dB";
+      const tip = fLabel + "  " + dLabel;
+      ctx.font = "10px 'Fragment Mono', 'JetBrains Mono', monospace";
+      const tw = ctx.measureText(tip).width;
+      const tx = Math.min(lo.plotX + lo.plotW - tw - 6, cur.x + 8);
+      const ty = Math.max(lo.plotY + 4, ySpec - 18);
+      ctx.fillStyle = "rgba(5,6,8,0.85)";
+      ctx.fillRect(tx - 4, ty - 2, tw + 8, 14);
+      ctx.strokeStyle = "rgba(200,232,90,0.30)";
+      ctx.strokeRect(tx - 4 + 0.5, ty - 2 + 0.5, tw + 8, 14);
+      ctx.fillStyle = COL_PH;
+      ctx.textBaseline = "top";
+      ctx.textAlign = "left";
+      ctx.fillText(tip, tx, ty);
     }
   }
 
@@ -8576,7 +8755,7 @@ function startMeterLoop() {
     if (cornerEl) {
       if (METER.mode === "vu")    cornerEl.textContent = "max " + fmtDb(Math.max(dbValL, dbValR));
       else if (METER.mode === "scope") cornerEl.textContent = "± " + (Math.max(pL, pR)).toFixed(3);
-      else if (METER.mode === "fft")   cornerEl.textContent = "log·hz";
+      else if (METER.mode === "fft")   cornerEl.textContent = "fft 2048 · log hz";
     }
 
     if (METER.smoothL < 1e-4 && METER.smoothR < 1e-4) meterEl.classList.add("silent");
@@ -8611,6 +8790,11 @@ function stopMeterLoop() {
     cx.strokeStyle = "rgba(200,232,90,0.18)";
     cx.beginPath(); cx.moveTo(0, c.height / 2); cx.lineTo(c.width, c.height / 2); cx.stroke();
   }
+  // Drop FFT state — analyser is being recreated next time, bin count
+  // and smoothed values would be stale.
+  METER.fftSmooth = null;
+  METER.fftLayout = null;
+  METER.fftCursor = null;
   // Reset piano too.
   resetPiano();
 }
