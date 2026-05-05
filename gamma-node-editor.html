@@ -6622,58 +6622,127 @@ document.getElementById("btn-ink-go").addEventListener("click", async () => {
     return;
   }
 
-  const png = strokesToPng(inkBox, inkStrokes);
+  const { dataUrl, base64 } = strokesToPng(inkBox, inkStrokes);
   console.log("[hwr] strokes=" + inkStrokes.length + " provider=" + aiSettings.provider + " model=" + (aiSettings.model || provider.defaultModel));
   setVoiceStatus("Recognizing handwriting…", "thinking");
 
-  if (aiSettings.provider === "gemma") {
-    setGemmaProgressHook((p) => {
-      const pct = p.progress != null ? Math.round(p.progress * 100) : 0;
-      const label = p.file || p.status || "loading model…";
-      setVoiceStatus(`${label} (${pct}%)`, "thinking");
-    });
+  // Recognition strategy — try fast / reliable Tesseract OCR first
+  // (purpose-built for text, ~5 MB, no model setup). If it produces
+  // a plausible match, use it; otherwise fall back to the multimodal
+  // AI provider for messier handwriting.
+  let matched = null;
+  let lastReply = "";
+  try {
+    const ocrText = await tesseractRecognize(dataUrl);
+    lastReply = ocrText;
+    console.log("[hwr] tesseract reply:", JSON.stringify(ocrText));
+    if (ocrText) matched = tryCreateFromLabel(ocrText, inkBox, /*silent*/ true);
+  } catch (err) {
+    console.warn("[hwr] tesseract failed, will try AI fallback:", err);
   }
 
-  try {
-    const reply = await callVision(png, key);
-    console.log("[hwr] raw reply:", JSON.stringify(reply));
-    const matched = tryCreateFromLabel(reply, inkBox);
-    if (matched) {
-      setVoiceStatus(`✓ matched “${matched}”`, "");
-      setTimeout(() => setVoiceStatus("", ""), 2400);
+  if (!matched) {
+    if (aiSettings.provider === "gemma") {
+      setGemmaProgressHook((p) => {
+        const pct = p.progress != null ? Math.round(p.progress * 100) : 0;
+        const label = p.file || p.status || "loading model…";
+        setVoiceStatus(`${label} (${pct}%)`, "thinking");
+      });
     }
-  } catch (err) {
-    console.error("[hwr] failed:", err);
-    setVoiceStatus("Recognize failed: " + (err.message || err), "err");
-  } finally {
-    setGemmaProgressHook(null);
-    clearInk();
+    try {
+      setVoiceStatus("Tesseract didn't match — trying " + aiSettings.provider + "…", "thinking");
+      const reply = await callVision(base64, key);
+      lastReply = reply;
+      console.log("[hwr] ai-vision reply:", JSON.stringify(reply));
+      matched = tryCreateFromLabel(reply, inkBox, /*silent*/ false);
+    } catch (err) {
+      console.error("[hwr] ai-vision failed:", err);
+      setVoiceStatus("Recognize failed: " + (err.message || err) + " · OCR returned “" + (lastReply || "").trim().slice(0,30) + "”", "err");
+    } finally {
+      setGemmaProgressHook(null);
+    }
   }
+
+  if (matched) {
+    setVoiceStatus(`✓ matched “${matched}”`, "");
+    setTimeout(() => setVoiceStatus("", ""), 2400);
+  }
+  clearInk();
 });
 
+/* Tesseract.js OCR — primary handwriting / printed-text path. Loaded
+ * lazily on first recognize click. ~5 MB total (lib + eng traineddata),
+ * cached aggressively by the browser after the first call. Runs on the
+ * CPU via WASM; no WebGPU, no API key, no AI provider required. */
+let tesseractWorker = null;
+let tesseractLoading = null;
+async function getTesseract() {
+  if (tesseractWorker) return tesseractWorker;
+  if (tesseractLoading) return tesseractLoading;
+  tesseractLoading = (async () => {
+    const mod = await import("https://cdn.jsdelivr.net/npm/tesseract.js@5/+esm");
+    const createWorker = mod.createWorker || (mod.default && mod.default.createWorker);
+    if (typeof createWorker !== "function") {
+      throw new Error("tesseract.js loaded but createWorker not found");
+    }
+    const w = await createWorker("eng", 1, {
+      logger: m => {
+        if (m && m.status === "recognizing text") {
+          setVoiceStatus(`OCR ${Math.round((m.progress || 0) * 100)}%`, "thinking");
+        }
+      }
+    });
+    // Restrict the recognized character set + treat the image as a
+    // single short word — both nudge tesseract toward better accuracy
+    // on short labels like "AD", "Sine", "LFO".
+    await w.setParameters({
+      tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+      tessedit_pageseg_mode: "8"   // PSM_SINGLE_WORD
+    });
+    tesseractWorker = w;
+    return w;
+  })();
+  try { return await tesseractLoading; }
+  finally { tesseractLoading = null; }
+}
+async function tesseractRecognize(dataUrl) {
+  const w = await getTesseract();
+  const { data } = await w.recognize(dataUrl);
+  return (data && data.text || "").trim();
+}
+
 function strokesToPng(box, strokes) {
-  // Rasterize strokes into a PNG sized to the box, with white background
-  // and black ink — gives the model a clean, high-contrast image.
-  const pad = 8;
-  const W = Math.ceil(box.w) + pad * 2;
-  const H = Math.ceil(box.h) + pad * 2;
+  // Rasterize strokes. Upscale to a min target size + fatten strokes
+  // proportionally + generous padding. Both Tesseract OCR and small
+  // multimodal LLMs are dramatically more accurate on big high-contrast
+  // images than on the tiny ~80x40 px boxes users typically draw.
+  // Returns { dataUrl, base64 } so callers that want either form can
+  // pick without re-encoding.
+  const pad = 24;
+  const minSide = 320;
+  const scale = Math.max(1, minSide / Math.max(box.w, box.h));
+  const W = Math.ceil(box.w * scale) + pad * 2;
+  const H = Math.ceil(box.h * scale) + pad * 2;
   const c = document.createElement("canvas");
   c.width = W; c.height = H;
   const ctx = c.getContext("2d");
   ctx.fillStyle = "white";
   ctx.fillRect(0, 0, W, H);
   ctx.strokeStyle = "black";
-  ctx.lineWidth = 3;
+  ctx.lineWidth = Math.max(5, 4 * scale);
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
   strokes.forEach(s => {
     if (s.length < 2) return;
     ctx.beginPath();
-    ctx.moveTo(s[0].x - box.x + pad, s[0].y - box.y + pad);
-    for (let i = 1; i < s.length; i++) ctx.lineTo(s[i].x - box.x + pad, s[i].y - box.y + pad);
+    ctx.moveTo((s[0].x - box.x) * scale + pad, (s[0].y - box.y) * scale + pad);
+    for (let i = 1; i < s.length; i++) {
+      ctx.lineTo((s[i].x - box.x) * scale + pad, (s[i].y - box.y) * scale + pad);
+    }
     ctx.stroke();
   });
-  return c.toDataURL("image/png").split(",")[1]; // base64
+  const dataUrl = c.toDataURL("image/png");
+  return { dataUrl, base64: dataUrl.split(",")[1] };
 }
 
 /* Unified vision call — uses whichever provider is selected. The provider's
@@ -6710,18 +6779,20 @@ Allowed nodes: ${nodeList}`;
   });
 }
 
-function tryCreateFromLabel(rawLabel, box) {
+function tryCreateFromLabel(rawLabel, box, silent) {
   // The model may return more than one word, with whitespace, periods,
   // markdown bullets, "node:" prefixes, etc. Extract candidate tokens
   // and try each against TYPES with progressively looser matching.
+  // When `silent` is true, no status pill update on failure — caller
+  // is expected to fall back to another recognizer.
   const types = Object.keys(TYPES);
   if (!rawLabel) {
-    setVoiceStatus("Recognizer returned nothing.", "err");
+    if (!silent) setVoiceStatus("Recognizer returned nothing.", "err");
     return null;
   }
   const cleanedFull = rawLabel.replace(/[`*_~"'.,:;!?()\[\]\n]/g, " ").trim();
   if (/^\s*UNKNOWN\s*$/i.test(cleanedFull) || !cleanedFull) {
-    setVoiceStatus(`Recognizer didn't identify a node type — got “${rawLabel.trim().slice(0,40)}”. Try writing larger / more clearly.`, "err");
+    if (!silent) setVoiceStatus(`Recognizer didn't identify a node type — got “${rawLabel.trim().slice(0,40)}”. Try writing larger / more clearly.`, "err");
     return null;
   }
   // Drop obvious filler the model sometimes appends.
@@ -6747,7 +6818,7 @@ function tryCreateFromLabel(rawLabel, box) {
     if (match) break;
   }
   if (!match) {
-    setVoiceStatus(`No node type matches “${rawLabel.trim().slice(0,40)}”.`, "err");
+    if (!silent) setVoiceStatus(`No node type matches “${rawLabel.trim().slice(0,40)}”.`, "err");
     return null;
   }
   pushHistory("hwr:add");
