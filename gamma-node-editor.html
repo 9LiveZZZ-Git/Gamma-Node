@@ -5761,13 +5761,9 @@ const PROVIDERS = {
     requiresKey: true,
     supportsImage: true,
     supportsAudio: false,   // Whisper isn't routed through this path
-    async call({ system, user, model, key, onToken, image, audio }) {
-      // Audio is not supported by this provider; reject early so the caller
-      // can route to Gemma instead. (Audio coming through here would mean
-      // a programming error, so a hard throw is fine.)
+    async call({ system, user, model, key, onToken, image, audio, temperature }) {
       if (audio) throw new Error("Anthropic provider does not handle audio input. Use Gemma for voice.");
 
-      // For HWR / vision: build a multimodal user message
       const userContent = image
         ? [
             { type: "image", source: { type: "base64", media_type: "image/png", data: image } },
@@ -5782,6 +5778,7 @@ const PROVIDERS = {
         messages: [{ role: "user", content: userContent }],
         stream: !!onToken
       };
+      if (typeof temperature === "number") body.temperature = temperature;
       const res = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers: {
@@ -5831,19 +5828,16 @@ const PROVIDERS = {
     requiresKey: false,
     supportsImage: true,
     supportsAudio: true,
-    async call({ system, user, model, onToken, image, audio }) {
+    async call({ system, user, model, onToken, image, audio, temperature }) {
       const pipe = await ensureGemmaPipeline(model);
 
       // Build the messages array. Multimodal content (image / audio) goes
       // BEFORE the text per Google's recommendation for best results.
       const userContent = [];
       if (image) {
-        // image is base64 (no data: prefix). Convert to data URL the
-        // pipeline accepts.
         userContent.push({ type: "image", image: "data:image/png;base64," + image });
       }
       if (audio) {
-        // audio is a Float32Array @ 16kHz mono
         userContent.push({ type: "audio", audio });
       }
       userContent.push({ type: "text", text: user });
@@ -5853,9 +5847,6 @@ const PROVIDERS = {
         { role: "user",   content: userContent }
       ];
 
-      // pipe is now { processor, model, tokenizer } — apply chat
-      // template manually, generate, decode. Same call shape as the
-      // Hugging Face Python example for AutoModelForImageTextToText.
       const tx = await getTransformersJs();
       const inputs = await pipe.processor.apply_chat_template(messages, {
         add_generation_prompt: true,
@@ -5863,11 +5854,14 @@ const PROVIDERS = {
         return_dict: true
       });
 
+      // Deterministic decode (HWR / classification) when caller passes
+      // temperature: 0; sample for free-form text generation otherwise.
+      const det = (typeof temperature === "number" && temperature <= 0);
       const generateOpts = {
         ...inputs,
-        max_new_tokens: 2048,
-        do_sample: true,
-        temperature: 0.4
+        max_new_tokens: det ? 16 : 2048,
+        do_sample: !det,
+        temperature: det ? 1.0 : (typeof temperature === "number" ? temperature : 0.4)
       };
       if (onToken) {
         generateOpts.streamer = new tx.TextStreamer(pipe.tokenizer, {
@@ -6603,18 +6597,21 @@ document.getElementById("btn-ink-go").addEventListener("click", async () => {
   if (!inkBox) return;
   const provider = PROVIDERS[aiSettings.provider];
 
-  // Provider must support image input. Both Gemma 4 and Anthropic do.
   if (!provider.supportsImage) {
-    alert("Current provider doesn't support image input. Switch to Gemma 4 (local) or Anthropic in ⚙ AI settings.");
+    setVoiceStatus("Provider doesn't support images — switch to Gemma 4 or Anthropic in ⚙ AI settings.", "err");
     return;
   }
   let key = "";
   if (provider.requiresKey) {
     key = aiSettings.anthropicKey;
     if (!key) {
-      alert("No API key set — click ⚙ in the User DSP tab to configure.");
+      setVoiceStatus("No Anthropic API key set — click ⚙ in the User DSP tab.", "err");
       return;
     }
+  }
+  if (aiSettings.provider === "gemma" && !setupGemmaAvailable()) {
+    setVoiceStatus("WebGPU not available — Gemma 4 needs Chrome/Edge or recent Safari. Or set an Anthropic key.", "err");
+    return;
   }
 
   // No strokes? Treat as a placeholder; just ask user for label inline.
@@ -6626,10 +6623,9 @@ document.getElementById("btn-ink-go").addEventListener("click", async () => {
   }
 
   const png = strokesToPng(inkBox, inkStrokes);
+  console.log("[hwr] strokes=" + inkStrokes.length + " provider=" + aiSettings.provider + " model=" + (aiSettings.model || provider.defaultModel));
   setVoiceStatus("Recognizing handwriting…", "thinking");
 
-  // For Gemma, hook progress so the user sees "loading model… (NN%)" if
-  // this is the first time the pipeline is being loaded.
   if (aiSettings.provider === "gemma") {
     setGemmaProgressHook((p) => {
       const pct = p.progress != null ? Math.round(p.progress * 100) : 0;
@@ -6640,11 +6636,15 @@ document.getElementById("btn-ink-go").addEventListener("click", async () => {
 
   try {
     const reply = await callVision(png, key);
-    setVoiceStatus("Got: " + reply, "");
-    tryCreateFromLabel(reply, inkBox);
-    setTimeout(() => setVoiceStatus("", ""), 2000);
+    console.log("[hwr] raw reply:", JSON.stringify(reply));
+    const matched = tryCreateFromLabel(reply, inkBox);
+    if (matched) {
+      setVoiceStatus(`✓ matched “${matched}”`, "");
+      setTimeout(() => setVoiceStatus("", ""), 2400);
+    }
   } catch (err) {
-    setVoiceStatus("Error: " + err.message, "err");
+    console.error("[hwr] failed:", err);
+    setVoiceStatus("Recognize failed: " + (err.message || err), "err");
   } finally {
     setGemmaProgressHook(null);
     clearInk();
@@ -6679,9 +6679,23 @@ function strokesToPng(box, strokes) {
 /* Unified vision call — uses whichever provider is selected. The provider's
  * own call() handles image input via its supportsImage path. */
 async function callVision(pngBase64, key) {
-  const nodeList = Object.keys(TYPES).join(", ");
-  const sys = `You are a handwriting recognizer for a Gamma DSP node editor. The user has handwritten a single short label on a small canvas. Reply with EXACTLY ONE word: the closest matching node type from this list — or "UNKNOWN" if none clearly matches. Reply with nothing else: no explanation, no punctuation. Available types: ${nodeList}`;
-  const userPrompt = "What is written here?";
+  // Show only the most-relevant subset of node types in the prompt to
+  // keep the model focused. Full registry has 100+ entries and confuses
+  // a small model; the popular set covers ~95% of demo use.
+  const popular = [
+    "Sine","Saw","Square","Triangle","Impulse","LFO","Noise","NoiseWhite","NoiseBrown",
+    "AD","ADSR","AHD","Mul","Add","Sub","Div","Output","OutputStereo",
+    "Biquad","BiquadLP","BiquadHP","BiquadBP","StateVariableFilter","MoogLadder",
+    "Delay","Delay1","Reverb","BlockAvg","Pan2","KeyboardIn"
+  ].filter(n => n in TYPES);
+  const nodeList = popular.join(", ");
+  const sys =
+`You read a single short word handwritten on a small canvas (white background, black ink) and reply with the closest matching Gamma DSP node name. Output rules:
+- Reply with EXACTLY ONE node name from this allowed list, nothing else.
+- No explanation, no punctuation, no quotes, no markdown.
+- If the writing is unreadable or doesn't match anything, reply: UNKNOWN
+Allowed nodes: ${nodeList}`;
+  const userPrompt = "Identify the handwritten node name.";
 
   const provider = PROVIDERS[aiSettings.provider];
   return await provider.call({
@@ -6689,30 +6703,58 @@ async function callVision(pngBase64, key) {
     user: userPrompt,
     model: aiSettings.model,
     key,
-    image: pngBase64
+    image: pngBase64,
+    // Deterministic for HWR — temperature is only honored by gemma path,
+    // anthropic ignores unknown keys.
+    temperature: 0
   });
 }
 
-function tryCreateFromLabel(label, box) {
-  // Best-effort match: exact, then case-insensitive prefix, then substring
-  if (!label || label === "UNKNOWN") {
-    setVoiceStatus("Recognizer didn't identify a node type. Try again.", "err");
-    return;
-  }
-  const cleaned = label.replace(/[^A-Za-z0-9]/g, "");
+function tryCreateFromLabel(rawLabel, box) {
+  // The model may return more than one word, with whitespace, periods,
+  // markdown bullets, "node:" prefixes, etc. Extract candidate tokens
+  // and try each against TYPES with progressively looser matching.
   const types = Object.keys(TYPES);
-  let match = types.find(t => t === cleaned);
-  if (!match) match = types.find(t => t.toLowerCase() === cleaned.toLowerCase());
-  if (!match) match = types.find(t => t.toLowerCase().startsWith(cleaned.toLowerCase()));
-  if (!match) match = types.find(t => t.toLowerCase().includes(cleaned.toLowerCase()));
+  if (!rawLabel) {
+    setVoiceStatus("Recognizer returned nothing.", "err");
+    return null;
+  }
+  const cleanedFull = rawLabel.replace(/[`*_~"'.,:;!?()\[\]\n]/g, " ").trim();
+  if (/^\s*UNKNOWN\s*$/i.test(cleanedFull) || !cleanedFull) {
+    setVoiceStatus(`Recognizer didn't identify a node type — got “${rawLabel.trim().slice(0,40)}”. Try writing larger / more clearly.`, "err");
+    return null;
+  }
+  // Drop obvious filler the model sometimes appends.
+  const STOP = new Set(["node","wave","filter","oscillator","the","a","an","is","this","says"]);
+  const tokens = cleanedFull
+    .split(/\s+/)
+    .map(t => t.replace(/[^A-Za-z0-9]/g, ""))
+    .filter(t => t.length > 0 && !STOP.has(t.toLowerCase()));
+  // Candidate strings to try, in priority order: full-cleaned, each token,
+  // longest token last (better than shortest if longer is more specific).
+  const candidates = [cleanedFull.replace(/[^A-Za-z0-9]/g, ""), ...tokens];
+  const matchOne = (s) => {
+    if (!s) return null;
+    const lc = s.toLowerCase();
+    return types.find(t => t === s)
+        || types.find(t => t.toLowerCase() === lc)
+        || types.find(t => t.toLowerCase().startsWith(lc) && lc.length >= 3)
+        || types.find(t => t.toLowerCase().includes(lc) && lc.length >= 3);
+  };
+  let match = null;
+  for (const c of candidates) {
+    match = matchOne(c);
+    if (match) break;
+  }
   if (!match) {
-    setVoiceStatus(`No node type matches "${label}".`, "err");
-    return;
+    setVoiceStatus(`No node type matches “${rawLabel.trim().slice(0,40)}”.`, "err");
+    return null;
   }
   pushHistory("hwr:add");
   const newId = makeNode(match, Math.round(box.x), Math.round(box.y));
   if (newId) selectOne(newId);
   render();
+  return match;
 }
 
 /* =========================================================================
