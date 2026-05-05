@@ -1679,15 +1679,7 @@
     font-variant-numeric: tabular-nums;
     pointer-events: none;
     letter-spacing: 0.04em;
-    transition: color 0.12s;
   }
-  /* In FFT mode the corner becomes a click-to-cycle FFT-size control. */
-  .monitor-display-corner.cyclable {
-    pointer-events: auto;
-    cursor: pointer;
-    user-select: none;
-  }
-  .monitor-display-corner.cyclable:hover { color: var(--phosphor); }
   .monitor-readouts {
     display: grid;
     grid-template-columns: repeat(3, 1fr);
@@ -8316,13 +8308,16 @@ async function ensureAudioWorklet() {
   const splitter = previewState.audioCtx.createChannelSplitter(2);
   const analyserL = previewState.audioCtx.createAnalyser();
   const analyserR = previewState.audioCtx.createAnalyser();
-  // Initial fftSize from user preference (default 8192). The corner-
-  // readout cycle button in FFT mode lets the user trade frequency
-  // resolution for transient response on the fly. smoothingTimeConstant
-  // left at 0 — we do attack/release in the render loop instead.
-  const initSize = loadFftSize();
-  analyserL.fftSize = initSize; analyserL.smoothingTimeConstant = 0;
-  analyserR.fftSize = initSize; analyserR.smoothingTimeConstant = 0;
+  // 8192-point FFT → 4096 bins, ~5.86 Hz/bin at 48 kHz. Resolves
+  // adjacent semitones cleanly above ~150 Hz and gives sharp peaks
+  // for sustained tones — a 220 Hz sine lands in bin ~37 as a single
+  // spike rather than straddling 9–10 at the old 2048 size. Window
+  // length is 8192/sr ≈ 170 ms; transients shorter than that smear,
+  // but for sustained sounds this is the sweet spot. We do attack/
+  // release smoothing in the render loop (smoothingTimeConstant: 0
+  // disables the browser's symmetric one-pole).
+  analyserL.fftSize = 8192; analyserL.smoothingTimeConstant = 0;
+  analyserR.fftSize = 8192; analyserR.smoothingTimeConstant = 0;
   node.connect(splitter);
   splitter.connect(analyserL, 0);
   splitter.connect(analyserR, 1);
@@ -8389,16 +8384,6 @@ const FFT_ATTACK    = 0.50;     // 0=instant, 1=never; smaller = snappier rise
 const FFT_RELEASE   = 0.93;     // larger = slower fall
 const FFT_HZ_GRID   = [50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000];
 const FFT_DB_GRID   = [-80, -60, -40, -20, 0];
-// Selectable FFT sizes (must be powers of 2 in AnalyserNode's allowed
-// range). Smaller → snappier transients, less frequency resolution.
-// Larger → sharper peaks for sustained tones, longer effective window.
-const FFT_SIZES = [1024, 2048, 4096, 8192, 16384];
-function loadFftSize() {
-  try {
-    const v = parseInt(localStorage.getItem("gamma-fft-size") || "8192", 10);
-    return FFT_SIZES.indexOf(v) >= 0 ? v : 8192;
-  } catch (_) { return 8192; }
-}
 function dbFromAmp(amp) { if (amp < 1e-5) return -Infinity; return 20 * Math.log10(amp); }
 function fmtDb(db) { if (!isFinite(db)) return "−∞"; return (db >= 0 ? "+" : "") + db.toFixed(1); }
 
@@ -8407,25 +8392,10 @@ function setMeterMode(mode) {
   document.querySelectorAll(".monitor-mode-tab").forEach(b => {
     b.classList.toggle("active", b.dataset.mode === mode);
   });
-  // Toggle the corner-readout interaction so it's only clickable in
-  // FFT mode (where cycling makes sense).
-  const cornerEl = document.getElementById("meter-overlay-corner");
-  if (cornerEl) cornerEl.classList.toggle("cyclable", mode === "fft");
 }
 document.addEventListener("click", (ev) => {
   const t = ev.target.closest(".monitor-mode-tab");
-  if (t && t.dataset.mode) { setMeterMode(t.dataset.mode); return; }
-  // Click-to-cycle FFT size — only fires when the corner has the
-  // cyclable class (i.e., we're in FFT mode and the meter is live).
-  const corner = ev.target.closest(".monitor-display-corner.cyclable");
-  if (corner) {
-    const cur = previewState.analyserL ? previewState.analyserL.fftSize : 8192;
-    const idx = FFT_SIZES.indexOf(cur);
-    const next = FFT_SIZES[(idx + 1) % FFT_SIZES.length];
-    if (previewState.analyserL) previewState.analyserL.fftSize = next;
-    if (previewState.analyserR) previewState.analyserR.fftSize = next;
-    try { localStorage.setItem("gamma-fft-size", String(next)); } catch (_) {}
-  }
+  if (t && t.dataset.mode) setMeterMode(t.dataset.mode);
 });
 
 function startMeterLoop() {
@@ -8443,25 +8413,9 @@ function startMeterLoop() {
   // CSS sets the visual size via stretching to the container.
   const ctx = canvas.getContext("2d", { alpha: false });
   const W = canvas.width, H = canvas.height;
-  // Per-frame buffers are reallocated lazily — fftSize is user-
-  // mutable via the cycle button, so any of these can grow/shrink.
-  let bufL = new Float32Array(previewState.analyserL.fftSize);
-  let bufR = new Float32Array(previewState.analyserR.fftSize);
-  let fftL = new Float32Array(previewState.analyserL.frequencyBinCount);
-  function refreshBuffersIfNeeded() {
-    const sz = previewState.analyserL.fftSize;
-    const half = previewState.analyserL.frequencyBinCount;
-    if (bufL.length !== sz) {
-      bufL = new Float32Array(sz);
-      bufR = new Float32Array(sz);
-    }
-    if (fftL.length !== half) {
-      fftL = new Float32Array(half);
-      // bin count changed → smoothed values + layout cache go stale.
-      METER.fftSmooth = new Float32Array(half).fill(FFT_DB_FLOOR);
-      METER.fftLayout = null;
-    }
-  }
+  const bufL = new Float32Array(previewState.analyserL.fftSize);
+  const bufR = new Float32Array(previewState.analyserR.fftSize);
+  const fftL = new Float32Array(previewState.analyserL.frequencyBinCount);
 
   // Canvas colors — phosphor lab instrument.
   const COL_PH  = "#c8e85a";                  // primary trace
@@ -8487,15 +8441,15 @@ function startMeterLoop() {
   // vertical gradient from amber-at-top to phosphor-at-floor for
   // magnitude-at-a-glance reading; outline trace on top has subtle
   // phosphor glow for crisp peak resolution.
-  // N_BINS is re-read each frame via refreshBuffersIfNeeded — the
-  // user can flip fftSize live, so we never cap it here.
+  const N_BINS = previewState.analyserL.frequencyBinCount;
+  if (!METER.fftSmooth || METER.fftSmooth.length !== N_BINS) {
+    METER.fftSmooth = new Float32Array(N_BINS).fill(FFT_DB_FLOOR);
+  }
 
   // Cache per-pixel bin ranges + grid positions whenever the canvas
-  // dimensions change OR the bin count changes. Cleared on stop or
-  // when refreshBuffersIfNeeded sees a different fftSize.
+  // dimensions change. Cleared on canvas resize via stopMeterLoop.
   function ensureFftLayout() {
-    const N_BINS = previewState.analyserL.frequencyBinCount;
-    if (METER.fftLayout && METER.fftLayout.W === W && METER.fftLayout.H === H && METER.fftLayout.N === N_BINS) return METER.fftLayout;
+    if (METER.fftLayout && METER.fftLayout.W === W && METER.fftLayout.H === H) return METER.fftLayout;
     const sr = previewState.audioCtx ? previewState.audioCtx.sampleRate : 48000;
     const fmin = FFT_F_MIN;
     const fmax = Math.min(FFT_F_MAX, sr / 2);
@@ -8524,7 +8478,7 @@ function startMeterLoop() {
       binF [px] = fc * 2 * N_BINS / sr;
     }
     METER.fftLayout = {
-      W, H, N: N_BINS, fmin, fmax, ML, MR, MT, MB, plotX, plotY, plotW, plotH,
+      W, H, fmin, fmax, ML, MR, MT, MB, plotX, plotY, plotW, plotH,
       logFmin, logFspan, binLo, binHi, binF
     };
     return METER.fftLayout;
@@ -8639,11 +8593,9 @@ function startMeterLoop() {
   }
 
   function drawFFT() {
-    refreshBuffersIfNeeded();
     previewState.analyserL.getFloatFrequencyData(fftL);
     const lo = ensureFftLayout();
     const sm = METER.fftSmooth;
-    const N_BINS = sm.length;
     // Per-bin attack/release smoothing. fftL[i] is in dB (-Infinity..0).
     // Floor the input to FFT_DB_FLOOR so the smoother is well-defined.
     for (let i = 0; i < N_BINS; i++) {
@@ -8831,7 +8783,7 @@ function startMeterLoop() {
     if (cornerEl) {
       if (METER.mode === "vu")    cornerEl.textContent = "max " + fmtDb(Math.max(dbValL, dbValR));
       else if (METER.mode === "scope") cornerEl.textContent = "± " + (Math.max(pL, pR)).toFixed(3);
-      else if (METER.mode === "fft")   cornerEl.textContent = "fft " + (previewState.analyserL ? previewState.analyserL.fftSize : 8192) + " ↻";
+      else if (METER.mode === "fft")   cornerEl.textContent = "fft 8192 · log hz";
     }
 
     if (METER.smoothL < 1e-4 && METER.smoothR < 1e-4) meterEl.classList.add("silent");
