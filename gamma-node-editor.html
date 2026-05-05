@@ -54,6 +54,7 @@
     --audio:        #1d9e75;
     --param:        #7f77dd;
     --gate:         #d8a030;
+    --clock:        #6dc5b5;     /* Phase 5 — clock port type (sequencer rate) */
     --selected:     #4a8fdc;
     --danger:       #e24b4a;
     --info:         #83e8ff;
@@ -443,9 +444,11 @@
   .port.audio { border-color: var(--audio); }
   .port.param { border-color: var(--param); border-style: dashed; }
   .port.gate  { border-color: var(--gate); }
+  .port.clock { border-color: var(--clock); border-style: double; border-width: 3px; }
   .port.connected.audio { background: var(--audio); }
   .port.connected.param { background: var(--param); border-style: solid; }
   .port.connected.gate  { background: var(--gate); }
+  .port.connected.clock { background: var(--clock); border-style: solid; }
   .port:hover { transform: translateY(-50%) scale(1.4); }
 
   /* ---------------- footer panel ---------------- */
@@ -2640,7 +2643,8 @@
         <p class="modal-note" style="margin: 0;">
           <strong>Port types</strong> — <span class="legend-dot" style="--c: var(--audio)"></span> audio (solid),
           <span class="legend-dot legend-dot--dashed" style="--c: var(--param)"></span> param (dashed),
-          <span class="legend-dot" style="--c: var(--gate)"></span> gate (trigger event).
+          <span class="legend-dot" style="--c: var(--gate)"></span> gate (trigger event),
+          <span class="legend-dot" style="--c: var(--clock); border-style: double; border-width: 3px;"></span> clock (sequencer rate).
         </p>
       </div>
     </div>
@@ -3007,6 +3011,76 @@ public:
     autoExpose: ["value"],
     uiOnlyParams: ["min", "max"],
     description: "On-screen slider → float output. Set min/max in props, drag in the Monitor tab's Controls panel. Wire out into any param."
+  },
+
+  /* Phase 5.1 — master clock. Single instance per patch (typically).
+   * Tracks elapsed samples → emits one-sample gate ticks on bar /
+   * beat / quarter / eighth / sixteenth boundaries plus a 0..1
+   * phase ramp per beat and the live BPM as a param-rate float.
+   *
+   * Output ticks read as plain audio-rate floats (1.0 for one sample
+   * on the boundary, 0.0 otherwise). Wired into a gate input they
+   * fire AD/AHD/etc. via the existing Schmitt-trigger codegen; wired
+   * into a param input they nudge a setter once per division.
+   *
+   * Sample rate is read from gam::sampleRate() at construction —
+   * which the worklet sets via preview_set_sr before preview_init,
+   * so timing is locked to the AudioContext's actual rate. */
+  MasterClock: {
+    category: "Convert", color: COLOR.convert, header: null,
+    cppType: "GammaMasterClock",
+    helperClass:
+`class GammaMasterClock {
+    float bpm_ = 120.f;
+    float spb_ = 24000.f;
+    float sr_ = 48000.f;
+    double sampleCount_ = 0.0;
+    int prevBeat_ = -1;
+    int prevHalf_ = -1;
+    int prev16_  = -1;
+    void recalc() { spb_ = sr_ * 60.f / (bpm_ > 0.f ? bpm_ : 1.f); }
+public:
+    struct Out { float bpm, bar, beat, quarter, eighth, sixteenth, phase; };
+    GammaMasterClock() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+        recalc();
+    }
+    void setBpm(float v) { bpm_ = v; recalc(); }
+    void reset() { sampleCount_ = 0.0; prevBeat_ = -1; prevHalf_ = -1; prev16_ = -1; }
+    Out operator()() {
+        Out o = { bpm_, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
+        const double curBeat = sampleCount_ / spb_;
+        const int beatIdx = (int)curBeat;
+        const int halfIdx = (int)(curBeat * 2.0);
+        const int idx16   = (int)(curBeat * 4.0);
+        if (beatIdx != prevBeat_) {
+            o.beat = 1.f; o.quarter = 1.f;
+            if ((beatIdx & 3) == 0) o.bar = 1.f;
+            prevBeat_ = beatIdx;
+        }
+        if (halfIdx != prevHalf_) { o.eighth = 1.f; prevHalf_ = halfIdx; }
+        if (idx16   != prev16_)   { o.sixteenth = 1.f; prev16_ = idx16; }
+        o.phase = (float)(curBeat - beatIdx);
+        sampleCount_ += 1.0;
+        return o;
+    }
+};`,
+    ins: [{ n: "trig", t: "gate" }],   // optional reset trigger
+    outs: [
+      { n: "bpm",       t: "param", access: ".bpm" },
+      { n: "bar",       t: "clock", access: ".bar" },
+      { n: "beat",      t: "clock", access: ".beat" },
+      { n: "quarter",   t: "clock", access: ".quarter" },
+      { n: "eighth",    t: "clock", access: ".eighth" },
+      { n: "sixteenth", t: "clock", access: ".sixteenth" },
+      { n: "phase",     t: "audio", access: ".phase" }
+    ],
+    params: { bpm: 120 },
+    methods: { bpm: "setBpm" },
+    gateMethods: { trig: "reset" },
+    autoExpose: ["bpm"],
+    description: "Master clock. Outputs BPM (param), bar/beat/quarter/eighth/sixteenth gate ticks, and a 0..1 phase ramp per beat. trig resets the clock to bar 1. Wire any tick output into a gate input (AD.trig, sequencer step) for tempo-locked rhythms."
   },
 
   /* Phase 3.5 — multi-output state-variable filter via helperClass.
@@ -4172,9 +4246,19 @@ function renderWires(temp) {
     if (!def) return;
     const portDef = def.outs.find(p => p.n === e.from.port);
     const t = portDef ? portDef.t : "audio";
-    const color = t === "audio" ? "var(--audio)" : (t === "gate" ? "var(--gate)" : "var(--param)");
-    const da = t === "param" ? ' stroke-dasharray="4,4"' : "";
-    html += `<path d="${wirePath(a.x, a.y, b.x, b.y)}" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round"${da} />`;
+    const path = wirePath(a.x, a.y, b.x, b.y);
+    if (t === "clock") {
+      // Double-line look — render the same path twice, once thicker
+      // in clock color and once thinner in the canvas bg, leaving two
+      // parallel cyan stripes with a hairline gap. Distinct from the
+      // dashed-param and solid-audio wires.
+      html += `<path d="${path}" fill="none" stroke="var(--clock)" stroke-width="4" stroke-linecap="round" />`;
+      html += `<path d="${path}" fill="none" stroke="var(--bg)"    stroke-width="1.5" stroke-linecap="round" />`;
+    } else {
+      const color = t === "audio" ? "var(--audio)" : (t === "gate" ? "var(--gate)" : "var(--param)");
+      const da = t === "param" ? ' stroke-dasharray="4,4"' : "";
+      html += `<path d="${path}" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round"${da} />`;
+    }
   });
   if (temp) {
     html += `<path d="${wirePath(temp.x1, temp.y1, temp.x2, temp.y2)}" fill="none" stroke="#888" stroke-width="1.5" stroke-linecap="round" stroke-dasharray="3,4" opacity="0.7" />`;
