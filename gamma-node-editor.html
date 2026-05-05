@@ -8308,14 +8308,16 @@ async function ensureAudioWorklet() {
   const splitter = previewState.audioCtx.createChannelSplitter(2);
   const analyserL = previewState.audioCtx.createAnalyser();
   const analyserR = previewState.audioCtx.createAnalyser();
-  // 2048-point FFT → 1024 bins, ~23 Hz/bin at 48 kHz. Wide enough to
-  // resolve adjacent semitones above ~600 Hz and gives a usable
-  // spectrogram below 100 Hz. smoothingTimeConstant left at 0 — we
-  // do attack/release in the render loop instead so the look is closer
-  // to professional analyzers (fast rise, slow fall) rather than the
-  // browser's symmetric one-pole.
-  analyserL.fftSize = 2048; analyserL.smoothingTimeConstant = 0;
-  analyserR.fftSize = 2048; analyserR.smoothingTimeConstant = 0;
+  // 8192-point FFT → 4096 bins, ~5.86 Hz/bin at 48 kHz. Resolves
+  // adjacent semitones cleanly above ~150 Hz and gives sharp peaks
+  // for sustained tones — a 220 Hz sine lands in bin ~37 as a single
+  // spike rather than straddling 9–10 at the old 2048 size. Window
+  // length is 8192/sr ≈ 170 ms; transients shorter than that smear,
+  // but for sustained sounds this is the sweet spot. We do attack/
+  // release smoothing in the render loop (smoothingTimeConstant: 0
+  // disables the browser's symmetric one-pole).
+  analyserL.fftSize = 8192; analyserL.smoothingTimeConstant = 0;
+  analyserR.fftSize = 8192; analyserR.smoothingTimeConstant = 0;
   node.connect(splitter);
   splitter.connect(analyserL, 0);
   splitter.connect(analyserR, 1);
@@ -8455,22 +8457,29 @@ function startMeterLoop() {
     const plotX = ML, plotY = MT;
     const plotW = W - ML - MR, plotH = H - MT - MB;
     const logFmin = Math.log(fmin), logFspan = Math.log(fmax) - logFmin;
-    // Pixel → bin range (inclusive). Pre-compute so the render loop
-    // is a tight scan with no Math.log calls.
+    // Pixel → bin range (inclusive) + fractional bin position at the
+    // pixel's CENTER. The integer range drives max-search when a pixel
+    // spans multiple bins; the fractional position drives linear
+    // interpolation when a pixel falls inside a single bin (the
+    // common case at low frequencies on a log axis, where adjacent
+    // pixels often map to fractional offsets within the same bin).
     const binLo = new Int32Array(plotW + 1);
     const binHi = new Int32Array(plotW + 1);
+    const binF  = new Float32Array(plotW + 1);
     for (let px = 0; px <= plotW; px++) {
       const f0 = Math.exp(logFmin + (px       / plotW) * logFspan);
       const f1 = Math.exp(logFmin + ((px + 1) / plotW) * logFspan);
+      const fc = Math.exp(logFmin + ((px + 0.5) / plotW) * logFspan);
       let lo = Math.floor(f0 * 2 * N_BINS / sr);
       let hi = Math.ceil (f1 * 2 * N_BINS / sr);
       if (lo < 0) lo = 0; if (hi >= N_BINS) hi = N_BINS - 1;
       if (hi < lo) hi = lo;
       binLo[px] = lo; binHi[px] = hi;
+      binF [px] = fc * 2 * N_BINS / sr;
     }
     METER.fftLayout = {
       W, H, fmin, fmax, ML, MR, MT, MB, plotX, plotY, plotW, plotH,
-      logFmin, logFspan, binLo, binHi
+      logFmin, logFspan, binLo, binHi, binF
     };
     return METER.fftLayout;
   }
@@ -8633,12 +8642,31 @@ function startMeterLoop() {
 
     // Compute spectrum y-values for each pixel column ONCE; reuse for
     // both the filled curve and the outline trace.
+    //
+    // Two strategies:
+    //   - Pixel spans MULTIPLE bins (high frequencies, where the log
+    //     axis compresses): take max so peaks survive.
+    //   - Pixel falls INSIDE a single bin (low frequencies, where log
+    //     stretches one bin across many pixels): linear-interpolate
+    //     between this bin and the next using the pixel's fractional
+    //     bin position. Removes the staircase look at low freqs and
+    //     makes a clean sine read as a single sharp spike.
     const ys = new Float32Array(lo.plotW + 1);
+    const lastBin = N_BINS - 1;
     for (let px = 0; px <= lo.plotW; px++) {
       const a = lo.binLo[px], b = lo.binHi[px];
-      let mx = sm[a];
-      for (let i = a + 1; i <= b; i++) if (sm[i] > mx) mx = sm[i];
-      ys[px] = dbToY(mx);
+      let v;
+      if (b > a) {
+        v = sm[a];
+        for (let i = a + 1; i <= b; i++) if (sm[i] > v) v = sm[i];
+      } else {
+        const f = lo.binF[px];
+        const i0 = Math.floor(f);
+        const i1 = i0 < lastBin ? i0 + 1 : i0;
+        const t = f - i0;
+        v = sm[i0] * (1 - t) + sm[i1] * t;
+      }
+      ys[px] = dbToY(v);
     }
 
     // Filled curve — vertical gradient (warmer near 0 dB, dim near floor).
@@ -8755,7 +8783,7 @@ function startMeterLoop() {
     if (cornerEl) {
       if (METER.mode === "vu")    cornerEl.textContent = "max " + fmtDb(Math.max(dbValL, dbValR));
       else if (METER.mode === "scope") cornerEl.textContent = "± " + (Math.max(pL, pR)).toFixed(3);
-      else if (METER.mode === "fft")   cornerEl.textContent = "fft 2048 · log hz";
+      else if (METER.mode === "fft")   cornerEl.textContent = "fft 8192 · log hz";
     }
 
     if (METER.smoothL < 1e-4 && METER.smoothR < 1e-4) meterEl.classList.add("silent");
