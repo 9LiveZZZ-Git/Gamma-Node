@@ -3122,37 +3122,68 @@ public:
     cppType: "GammaButton",
     helperClass:
 `class GammaButton {
+    float lut_[64];
     int counter_  = 0;
     int duration_ = 4800;        // samples; 100ms at 48kHz
-    int shape_    = 0;           // 0=pulse, 1=linRamp, 2=expDecay
+    int shape_    = 0;           // 0=pulse, 1=linRamp, 2=expDecay, 3=custom
     float sr_     = 48000.f;
 public:
     GammaButton() {
         const float sr = (float)gam::sampleRate();
         if (sr > 1.f) sr_ = sr;
+        for (int i = 0; i < 64; i++) lut_[i] = 1.f - (float)i / 63.f;
     }
     void setDuration(float ms) { duration_ = (int)(ms * sr_ * 0.001f); if (duration_ < 1) duration_ = 1; }
     void setShape(float s)     { shape_ = (int)s; }
+    void setLut(const float* src, int n) {
+        if (n > 64) n = 64;
+        for (int i = 0; i < n; i++) lut_[i] = src[i];
+    }
     void press() { counter_ = (shape_ == 0) ? 1 : duration_; }
     float operator()() {
         if (counter_ <= 0) return 0.f;
         counter_--;
         if (shape_ == 0) return 1.f;
         const float t = (float)(counter_ + 1) / (float)duration_;
-        if (shape_ == 1) return t;          // linear 1->0
-        return t * t;                        // expDecay (polynomial)
+        if (shape_ == 1) return t;
+        if (shape_ == 2) return t * t;
+        // shape_ == 3: custom LUT, indexed by (1 - t) so 0 = trigger, 1 = end.
+        const float u  = 1.f - t;
+        const float fi = u * 63.f;
+        const int   i0 = (int)fi;
+        const int   i1 = i0 < 63 ? i0 + 1 : 63;
+        const float k  = fi - i0;
+        return lut_[i0] * (1.f - k) + lut_[i1] * k;
     }
 };`,
     ins: [],
     outs: [{ n: "gate", t: "audio" }],
     params: { label: "press", shape: "pulse", duration: 100 },
     methods: { duration: "setDuration", shape: "setShape" },
-    paramOptions: { shape: ["pulse", "linRamp", "expDecay"] },
-    enumMap:      { shape: { pulse: "0", linRamp: "1", expDecay: "2" } },
+    paramOptions: { shape: ["pulse", "linRamp", "expDecay", "custom"] },
+    enumMap:      { shape: { pulse: "0", linRamp: "1", expDecay: "2", custom: "3" } },
     gateMethods: { trig: "press" },
     hostGates: ["trig"],
-    uiOnlyParams: ["label"],
-    description: "On-screen button → gate output. Default pulse is a single 1.f sample; shape linRamp / expDecay turn it into a one-shot envelope over `duration` ms. Wire into a Mul to gate audio, or AD.trig for combined envelopes."
+    uiOnlyParams: ["label", "curveTable"],
+    extraCtor: [
+      (n) => {
+        if (!n.params || n.params.shape !== "custom") return null;
+        const tbl = n.params.curveTable;
+        if (!Array.isArray(tbl) || tbl.length === 0) return null;
+        const N = tbl.length;
+        const vals = tbl.map(v => {
+          const f = Number(v);
+          return (isFinite(f) ? f : 0).toFixed(4) + "f";
+        }).join(", ");
+        return [
+          "        {",
+          `            static constexpr float ${n.id}_lut[] = { ${vals} };`,
+          `            ${n.id}.setLut(${n.id}_lut, ${N});`,
+          "        }"
+        ].join("\n");
+      }
+    ],
+    description: "On-screen button → gate output. shape: pulse (single 1.f sample), linRamp / expDecay (1→0 over `duration` ms), or custom (drawable envelope). Wire into a Mul to gate audio, or AD.trig for combined envelopes."
   },
 
   /* On-screen slider. Renders as a horizontal slider in the Monitor
@@ -3174,8 +3205,8 @@ public:
     params: { value: 0.5, min: 0, max: 1, curve: "linear" },
     methods: { value: "setValue" },
     autoExpose: ["value"],
-    uiOnlyParams: ["min", "max", "curve"],
-    description: "On-screen slider → float output. Set min/max + curve (linear/log/exp/s-curve) in the ramp editor. Drag in the Monitor's Controls panel. Wire out into any param."
+    uiOnlyParams: ["min", "max", "curve", "curveTable"],
+    description: "On-screen slider → float output. Set min/max + curve (linear/log/exp/s-curve/custom) in the ramp editor. Drag in the Monitor's Controls panel. Wire out into any param."
   },
 
   /* Custom ramp / curve shaper. Takes any 0..1 signal in, applies the
@@ -4625,10 +4656,12 @@ function renderProps() {
       pushHistory("param:" + node.id + ":" + sel.dataset.key);
       node.params[sel.dataset.key] = sel.value;   // string, not number
       renderCode(); renderJson();
-      // If the user picked "custom" on a Ramp shape dropdown, jump
-      // straight into the drawing modal — saves an extra click.
-      if (sel.value === "custom" && node.type === "Ramp" && sel.dataset.key === "shape") {
-        openRampModal("ramp", node.id);
+      // If the user picked "custom" on a ramp-editable enum dropdown
+      // (Ramp shape, Button shape), jump straight into the drawing
+      // modal — saves an extra click.
+      if (sel.value === "custom") {
+        if (node.type === "Ramp"   && sel.dataset.key === "shape") openRampModal("ramp",   node.id);
+        if (node.type === "Button" && sel.dataset.key === "shape") openRampModal("button", node.id);
       }
     });
   });
@@ -9841,14 +9874,45 @@ const SLIDER_CURVES = {
     return (lo + hi) / 2;
   }}
 };
-function sliderValueFromT(t, min, max, curve) {
-  const fn = (SLIDER_CURVES[curve] || SLIDER_CURVES.linear).fwd;
-  return min + (max - min) * fn(Math.max(0, Math.min(1, t)));
+// LUT-driven curve mapping (drag pos t ∈ [0,1] → output 0..1).
+// Inverse uses bisection — needed when the table is non-monotonic
+// (free-drawn curves) so we just find the closest x for a given y.
+function lutForward(t, tbl) {
+  const N = tbl.length;
+  if (N === 0) return t;
+  const fi = Math.max(0, Math.min(1, t)) * (N - 1);
+  const i0 = Math.floor(fi), i1 = Math.min(N - 1, i0 + 1);
+  return tbl[i0] * (1 - (fi - i0)) + tbl[i1] * (fi - i0);
 }
-function sliderTFromValue(v, min, max, curve) {
+function lutInverse(y, tbl) {
+  const N = tbl.length;
+  if (N === 0) return y;
+  // Linear scan for the closest table entry — fine at N=64.
+  let bestT = 0, bestDist = Infinity;
+  for (let i = 0; i < N; i++) {
+    const d = Math.abs(tbl[i] - y);
+    if (d < bestDist) { bestDist = d; bestT = i / (N - 1); }
+  }
+  return bestT;
+}
+function sliderValueFromT(t, min, max, curve, tbl) {
+  let mapped;
+  if (curve === "custom" && Array.isArray(tbl) && tbl.length) {
+    mapped = lutForward(t, tbl);
+  } else {
+    const fn = (SLIDER_CURVES[curve] || SLIDER_CURVES.linear).fwd;
+    mapped = fn(Math.max(0, Math.min(1, t)));
+  }
+  return min + (max - min) * mapped;
+}
+function sliderTFromValue(v, min, max, curve, tbl) {
   if (max === min) return 0;
+  const yNorm = Math.max(0, Math.min(1, (v - min) / (max - min)));
+  if (curve === "custom" && Array.isArray(tbl) && tbl.length) {
+    return lutInverse(yNorm, tbl);
+  }
   const inv = (SLIDER_CURVES[curve] || SLIDER_CURVES.linear).inv;
-  return Math.max(0, Math.min(1, inv(Math.max(0, Math.min(1, (v - min) / (max - min))))));
+  return Math.max(0, Math.min(1, inv(yNorm)));
 }
 
 function renderMonitorControls() {
@@ -9895,14 +9959,18 @@ function renderMonitorControls() {
     const idx = findIdx(s.id, "value", false);
     const min = (s.params && typeof s.params.min === "number") ? s.params.min : 0;
     const max = (s.params && typeof s.params.max === "number" && s.params.max > min) ? s.params.max : (min + 1);
-    const curve = (s.params && typeof s.params.curve === "string" && SLIDER_CURVES[s.params.curve]) ? s.params.curve : "linear";
+    // curve can be "linear" / "log" / "exp" / "sCurve" (analytic) or
+    // "custom" (uses params.curveTable). Fall back to linear if unknown.
+    const rawCurve = s.params && typeof s.params.curve === "string" ? s.params.curve : "linear";
+    const curve = (SLIDER_CURVES[rawCurve] || rawCurve === "custom") ? rawCurve : "linear";
+    const tbl = (s.params && Array.isArray(s.params.curveTable)) ? s.params.curveTable : null;
     let cur = (s.params && typeof s.params.value === "number") ? s.params.value : (min + max) / 2;
     if (cur < min) cur = min; if (cur > max) cur = max;
     if (s.params && s.params.value !== cur) s.params.value = cur;
     // Range input always uses LINEAR t in 0..1; we map to the curved
     // value on every change. Inverse-mapping the stored value seeds
     // the thumb to the right position on first render.
-    const initT = sliderTFromValue(cur, min, max, curve);
+    const initT = sliderTFromValue(cur, min, max, curve, tbl);
     const stepT = 0.001;
     const digits = Math.max(0, Math.ceil(-Math.log10((max - min) / 1000 || 1e-4)));
     const fmtVal = v => v.toFixed(digits);
@@ -9919,7 +9987,7 @@ function renderMonitorControls() {
     const val = row.querySelector(".monitor-control-value");
     slider.addEventListener("input", () => {
       const t = Number(slider.value);
-      const v = sliderValueFromT(t, min, max, curve);
+      const v = sliderValueFromT(t, min, max, curve, tbl);
       val.textContent = fmtVal(v);
       const node = state.nodes.find(n => n.id === s.id);
       if (node) node.params.value = v;
@@ -9944,25 +10012,27 @@ function defaultCurveTable() {
 const RAMP_CONFIG = {
   slider: {
     title: "Edit slider curve",
-    note:  "Pick how the slider's drag position maps to its output. Linear is 1:1; log gives finer control at the bottom (good for frequency / amplitude); exp gives finer control at the top (good for time / decay); s-curve eases in and out.",
+    note:  "Pick how the slider's drag position maps to its output. Linear is 1:1; log gives finer control at the bottom (good for frequency / amplitude); exp gives finer control at the top (good for time / decay); s-curve eases in and out; custom lets you draw the response.",
     paramKey: "curve",
     defaultKey: "linear",
     options: [
       { key: "linear", label: "linear" },
       { key: "log",    label: "log" },
       { key: "exp",    label: "exp" },
-      { key: "sCurve", label: "s-curve" }
+      { key: "sCurve", label: "s-curve" },
+      { key: "custom", label: "custom ✎" }
     ]
   },
   button: {
     title: "Edit button gate shape",
-    note:  "How the button's gate output looks when pressed. pulse is a single 1.f sample (default — drives gates via Schmitt threshold). linRamp + expDecay output a 1→0 envelope over the button's duration param (ms). Wire the gate into a Mul to gate audio amplitude with the envelope.",
+    note:  "How the button's gate output looks when pressed. pulse is a single 1.f sample (default — drives gates via Schmitt threshold). linRamp + expDecay output a 1→0 envelope over the button's duration param (ms); custom lets you draw the envelope. Wire the gate into a Mul to gate audio amplitude with the envelope.",
     paramKey: "shape",
     defaultKey: "pulse",
     options: [
       { key: "pulse",    label: "pulse" },
       { key: "linRamp",  label: "linear" },
-      { key: "expDecay", label: "exp decay" }
+      { key: "expDecay", label: "exp decay" },
+      { key: "custom",   label: "custom ✎" }
     ]
   },
   ramp: {
@@ -9988,8 +10058,32 @@ function rampSvgPath(option, kind, w, h, node) {
   const samples = 32;
   const pts = [];
   // Helper closures pick the y value for a given t depending on kind+option.
+  // "custom" reads the saved curveTable; everything else uses an analytic fn.
+  const tblOrDefault = () =>
+    (node && Array.isArray(node.params && node.params.curveTable) && node.params.curveTable.length)
+      ? node.params.curveTable
+      : defaultCurveTable();
   let yAt;
-  if (kind === "slider") {
+  if (option.key === "custom") {
+    const tbl = tblOrDefault();
+    const N = tbl.length;
+    if (kind === "button") {
+      // Buttons: x axis is "time since trigger" (0=trigger, 1=end).
+      // The C++ helper indexes by (1 - t) so the LUT runs from
+      // trigger->silence; mirror that here for an honest preview.
+      yAt = t => {
+        const fi = t * (N - 1);
+        const i0 = Math.floor(fi), i1 = Math.min(N - 1, i0 + 1);
+        return tbl[i0] * (1 - (fi - i0)) + tbl[i1] * (fi - i0);
+      };
+    } else {
+      yAt = t => {
+        const fi = t * (N - 1);
+        const i0 = Math.floor(fi), i1 = Math.min(N - 1, i0 + 1);
+        return tbl[i0] * (1 - (fi - i0)) + tbl[i1] * (fi - i0);
+      };
+    }
+  } else if (kind === "slider") {
     const fn = (SLIDER_CURVES[option.key] || SLIDER_CURVES.linear).fwd;
     yAt = fn;
   } else if (kind === "button") {
@@ -9997,17 +10091,7 @@ function rampSvgPath(option, kind, w, h, node) {
     else if (option.key === "linRamp") yAt = t => 1 - t;
     else /* expDecay */                yAt = t => (1 - t) * (1 - t);
   } else /* ramp */ {
-    if (option.key === "custom") {
-      const tbl = (node && Array.isArray(node.params.curveTable) && node.params.curveTable.length)
-        ? node.params.curveTable
-        : defaultCurveTable();
-      const N = tbl.length;
-      yAt = t => {
-        const fi = t * (N - 1);
-        const i0 = Math.floor(fi), i1 = Math.min(N - 1, i0 + 1);
-        return tbl[i0] * (1 - (fi - i0)) + tbl[i1] * (fi - i0);
-      };
-    } else if (option.key === "log")        yAt = t => Math.log10(1 + 9 * t);
+    if (option.key === "log")               yAt = t => Math.log10(1 + 9 * t);
     else if (option.key === "exp")          yAt = t => t * t;
     else if (option.key === "sCurve")       yAt = t => t * t * (3 - 2 * t);
     else if (option.key === "expSteep")     yAt = t => t * t * t * t;
@@ -10123,8 +10207,9 @@ function buildCurveDrawPane(node) {
   function endStroke() {
     last = null;
     // Re-render the patch + monitor + active card preview so the
-    // changes ripple through to codegen.
+    // changes ripple through to codegen and the slider/button widget.
     renderCode(); renderJson();
+    if (typeof renderMonitorControls === "function") renderMonitorControls();
     refreshActiveCardPreview();
   }
   svg.addEventListener("pointerup",     endStroke);
@@ -10136,6 +10221,7 @@ function buildCurveDrawPane(node) {
     for (let i = 0; i < N; i++) tbl[i] = i / (N - 1);
     refreshPaths();
     renderCode(); renderJson();
+    if (typeof renderMonitorControls === "function") renderMonitorControls();
     refreshActiveCardPreview();
   });
   pane.querySelector("#btn-curve-smooth").addEventListener("click", () => {
@@ -10145,6 +10231,7 @@ function buildCurveDrawPane(node) {
     for (let i = 0; i < N; i++) tbl[i] = nxt[i];
     refreshPaths();
     renderCode(); renderJson();
+    if (typeof renderMonitorControls === "function") renderMonitorControls();
     refreshActiveCardPreview();
   });
   pane.querySelector("#btn-curve-done").addEventListener("click", closeRampModal);
@@ -10206,9 +10293,12 @@ function openRampModal(kind, nodeId) {
       card.classList.add("active");
       renderMonitorControls();
       renderCode(); renderJson();
-      // Show / hide the drawing pane based on selection.
+      // Show / hide the drawing pane based on selection. All three
+      // kinds (ramp / slider / button) share the canvas — semantics
+      // differ only in how the LUT is consumed downstream (JS for
+      // slider, C++ helperClass for ramp + button).
       const existingPane = body.querySelector(".curve-draw-pane");
-      if (opt.key === "custom" && cfg.paramKey === "shape" && kind === "ramp") {
+      if (opt.key === "custom") {
         if (!existingPane) body.appendChild(buildCurveDrawPane(node));
       } else if (existingPane) {
         existingPane.remove();
@@ -10217,7 +10307,7 @@ function openRampModal(kind, nodeId) {
     grid.appendChild(card);
   });
   // If we opened straight into "custom" mode, inject the drawing pane up front.
-  if (current === "custom" && kind === "ramp") {
+  if (current === "custom") {
     body.appendChild(buildCurveDrawPane(node));
   }
   modal.style.display = "flex";
