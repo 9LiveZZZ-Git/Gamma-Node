@@ -2977,17 +2977,19 @@ public:
 };`,
     ins: [],
     outs: [{ n: "gate", t: "audio" }],
-    params: {},
+    params: { label: "press" },
     methods: {},
     gateMethods: { trig: "press" },
     hostGates: ["trig"],
-    description: "On-screen button → one-sample gate pulse on click. Wire gate into AD.trig or any gate input."
+    uiOnlyParams: ["label"],
+    description: "On-screen button → one-sample gate pulse on click. Wire gate into AD.trig or any gate input. The label shows on the button itself."
   },
 
   /* On-screen slider. Renders as a horizontal slider in the Monitor
-   * tab's Controls panel; dragging the thumb writes a float (0..1
-   * by default) into the patch. Wire output into Sine.freq, filter
-   * cutoff, etc. — anything that takes a param. */
+   * tab's Controls panel; dragging the thumb writes a float into the
+   * patch. min / max define the output range — set min=200, max=15000
+   * for a filter-cutoff slider; min=0.5, max=20 for a Q slider; etc.
+   * value persists as the current position (in raw output units). */
   Slider: {
     category: "Convert", color: COLOR.convert, header: null,
     cppType: "GammaSlider",
@@ -3000,10 +3002,11 @@ public:
 };`,
     ins: [],
     outs: [{ n: "out", t: "audio" }],
-    params: { value: 0.5 },
+    params: { value: 0.5, min: 0, max: 1 },
     methods: { value: "setValue" },
     autoExpose: ["value"],
-    description: "On-screen slider → audio-rate float output. Drag in the Monitor tab's Controls panel."
+    uiOnlyParams: ["min", "max"],
+    description: "On-screen slider → float output. Set min/max in props, drag in the Monitor tab's Controls panel. Wire out into any param."
   },
 
   /* Phase 3.5 — multi-output state-variable filter via helperClass.
@@ -3816,19 +3819,26 @@ function reset() {
   // Demo: KeyboardIn drives BOTH freq AND gate. Pressing any key
   // sends a one-sample pulse on KeyboardIn.gate which fires AD.reset
   // via the Schmitt-trigger codegen (see prepareSample, gate-input
-  // branch). No need to expose AD.trig — the wire drives it.
-  const k = makeNode("KeyboardIn", 40, 60);
-  const a = makeNode("Sine",   220,  60, { freq: 220 });
-  const b = makeNode("AD",     220, 230, { attack: 0.01, decay: 0.6 });
-  const c = makeNode("Mul",    400, 130);
-  const d = makeNode("BiquadLP",580, 110, { cutoff: 1200, q: 1.4 });
-  const e = makeNode("Output", 760, 130);
-  state.edges.push({ from: { node: k, port: "freq" }, to: { node: a, port: "freq" } });
-  state.edges.push({ from: { node: k, port: "gate" }, to: { node: b, port: "trig" } });
-  state.edges.push({ from: { node: a, port: "out" }, to: { node: c, port: "a" } });
-  state.edges.push({ from: { node: b, port: "out" }, to: { node: c, port: "b" } });
-  state.edges.push({ from: { node: c, port: "out" }, to: { node: d, port: "in" } });
-  state.edges.push({ from: { node: d, port: "out" }, to: { node: e, port: "L" } });
+  // branch). Two on-screen Sliders in the Monitor tab drive the
+  // BiquadLP cutoff + Q in real time so users can dial the filter
+  // while playing notes. No need to expose AD.trig — the wire
+  // drives it.
+  const k  = makeNode("KeyboardIn", 40,  60);
+  const a  = makeNode("Sine",      220,  60, { freq: 220 });
+  const b  = makeNode("AD",        220, 230, { attack: 0.01, decay: 0.6 });
+  const sc = makeNode("Slider",     40, 380, { value: 1200, min: 80, max: 12000 });
+  const sq = makeNode("Slider",    220, 380, { value: 1.4,  min: 0.5, max: 10 });
+  const c  = makeNode("Mul",       400, 130);
+  const d  = makeNode("BiquadLP",  580, 110, { cutoff: 1200, q: 1.4 });
+  const e  = makeNode("Output",    760, 130);
+  state.edges.push({ from: { node: k,  port: "freq" }, to: { node: a, port: "freq" } });
+  state.edges.push({ from: { node: k,  port: "gate" }, to: { node: b, port: "trig" } });
+  state.edges.push({ from: { node: a,  port: "out"  }, to: { node: c, port: "a" } });
+  state.edges.push({ from: { node: b,  port: "out"  }, to: { node: c, port: "b" } });
+  state.edges.push({ from: { node: c,  port: "out"  }, to: { node: d, port: "in" } });
+  state.edges.push({ from: { node: sc, port: "out"  }, to: { node: d, port: "cutoff" } });
+  state.edges.push({ from: { node: sq, port: "out"  }, to: { node: d, port: "q" } });
+  state.edges.push({ from: { node: d,  port: "out"  }, to: { node: e, port: "L" } });
 }
 
 function makeNode(type, x, y, params) {
@@ -4203,12 +4213,16 @@ function renderProps() {
     if (keys.length) {
       html += `<div class="prop-section">Parameters</div>`;
       html += `<div class="prop-grid">`;
+      const uiOnly = def.uiOnlyParams || [];
       keys.forEach(k => {
         const ex = !!state.exposed[node.id + "." + k];
         const enumOpts = def.paramOptions && def.paramOptions[k];
+        const isUiOnly = uiOnly.includes(k);
+        const isString = typeof node.params[k] === "string";
         // Enum params can't be exposed as runtime float setters — they
         // take a distinct C++ symbol type and are construction-only.
-        const exposable = !!def.cppType && !enumOpts;
+        // ui-only params (Slider min/max, Button label) are not C++ at all.
+        const exposable = !!def.cppType && !enumOpts && !isUiOnly && !isString;
         let inputHtml;
         if (enumOpts) {
           const opts = enumOpts.map(o => {
@@ -4216,6 +4230,8 @@ function renderProps() {
             return `<option value="${escapeAttr(o)}"${sel}>${escapeText(o)}</option>`;
           }).join("");
           inputHtml = `<select class="enum-select" data-key="${escapeAttr(k)}">${opts}</select>`;
+        } else if (isString) {
+          inputHtml = `<input type="text" value="${escapeAttr(String(node.params[k]))}" data-key="${escapeAttr(k)}" data-string="1" />`;
         } else {
           inputHtml = `<input type="number" step="any" value="${node.params[k]}" data-key="${escapeAttr(k)}" />`;
         }
@@ -4223,7 +4239,9 @@ function renderProps() {
           ? `<label class="expose" title="When checked, the generated class exposes a ${k}(float) setter."><input type="checkbox" data-expose="${escapeAttr(k)}" ${ex?"checked":""} /> expose</label>`
           : enumOpts
             ? `<span class="prop-inline">construction-time</span>`
-            : `<span class="prop-inline">inlined at compile</span>`;
+            : isUiOnly
+              ? `<span class="prop-inline">UI only</span>`
+              : `<span class="prop-inline">inlined at compile</span>`;
         html += `
           <label class="k">${escapeText(k)}</label>
           ${inputHtml}
@@ -4256,6 +4274,14 @@ function renderProps() {
       const v = parseFloat(inp.value);
       node.params[inp.dataset.key] = isNaN(v) ? 0 : v;
       renderCode(); renderJson();
+      if (typeof renderMonitorControls === "function") renderMonitorControls();
+    });
+  });
+  propsEl.querySelectorAll('input[type="text"][data-string="1"]').forEach(inp => {
+    inp.addEventListener("input", () => {
+      pushHistory("param:" + node.id + ":" + inp.dataset.key);
+      node.params[inp.dataset.key] = inp.value;
+      if (typeof renderMonitorControls === "function") renderMonitorControls();
     });
   });
   propsEl.querySelectorAll('select.enum-select').forEach(sel => {
@@ -4682,8 +4708,10 @@ function generateCode() {
       def.extraCtor.forEach(t => ctorBody.push(`        ${t.replace(/\{id\}/g, n.id)}`));
     }
 
+    const uiOnly = def.uiOnlyParams || [];
     if (def.cppType && def.methods) {
       Object.keys(node_methods(def)).forEach(k => {
+        if (uiOnly.includes(k)) return;     // ui-only params (Slider min/max, Button label) never reach the C++ side
         if (node_methods(def)[k] && n.params[k] !== undefined) {
           const m = node_methods(def)[k];
           ctorBody.push(`        ${n.id}.${m}(${fmtParam(def, k, n.params[k])});`);
@@ -4693,6 +4721,7 @@ function generateCode() {
 
     const auto = def.autoExpose || [];
     Object.keys(n.params).forEach(k => {
+      if (uiOnly.includes(k)) return;
       if (!state.exposed[n.id + "." + k] && !auto.includes(k)) return;
       if (!def.cppType) return;
       // Enum params can't be exposed as float setters — they take a
@@ -7715,7 +7744,9 @@ function collectExposedSetters() {
     const def = defOf(n);
     if (!def || !def.cppType) return;
     const auto = def.autoExpose || [];
+    const uiOnly = def.uiOnlyParams || [];
     Object.keys(n.params).forEach(k => {
+      if (uiOnly.includes(k)) return;
       if (!state.exposed[n.id + "." + k] && !auto.includes(k)) return;
       if (def.paramOptions && def.paramOptions[k]) return;
       let name = k;
@@ -9439,13 +9470,15 @@ function renderMonitorControls() {
   wrap.innerHTML = "";
   buttons.forEach(b => {
     const idx = findIdx(b.id, "trig", true);
+    const label = (b.params && typeof b.params.label === "string" && b.params.label) ? b.params.label : "press";
     const row = document.createElement("div");
     row.className = "monitor-control";
     row.innerHTML =
       '<span class="monitor-control-id">btn <b>' + b.id + '</b></span>' +
-      '<button class="monitor-control-button">press</button>' +
+      '<button class="monitor-control-button"></button>' +
       '<span></span>';
     const btn = row.querySelector("button");
+    btn.textContent = label;
     btn.addEventListener("click", () => {
       if (idx < 0 || !previewState.workletNode || previewState.state !== "playing") return;
       previewState.workletNode.port.postMessage({ type: "set", index: idx, value: 0 });
@@ -9456,19 +9489,30 @@ function renderMonitorControls() {
   });
   sliders.forEach(s => {
     const idx = findIdx(s.id, "value", false);
-    const cur = (s.params && typeof s.params.value === "number") ? s.params.value : 0.5;
+    const min = (s.params && typeof s.params.min === "number") ? s.params.min : 0;
+    const max = (s.params && typeof s.params.max === "number" && s.params.max > min) ? s.params.max : (min + 1);
+    let cur = (s.params && typeof s.params.value === "number") ? s.params.value : (min + max) / 2;
+    if (cur < min) cur = min; if (cur > max) cur = max;
+    // Persist clamped value back so saved patches stay coherent.
+    if (s.params && s.params.value !== cur) s.params.value = cur;
+    // Step size: 1000 increments across the range, but at least 1e-4
+    // to avoid degenerate cases when min/max are very close.
+    const step = Math.max(1e-4, (max - min) / 1000);
+    // Display precision: enough digits to resolve the step size.
+    const digits = Math.max(0, Math.ceil(-Math.log10(step)));
+    const fmt = v => v.toFixed(digits);
     const row = document.createElement("div");
     row.className = "monitor-control";
     row.innerHTML =
       '<span class="monitor-control-id">sld <b>' + s.id + '</b></span>' +
-      '<input class="monitor-control-slider" type="range" min="0" max="1" step="0.001" value="' + cur + '" />' +
-      '<span class="monitor-control-value">' + Number(cur).toFixed(3) + '</span>';
+      '<input class="monitor-control-slider" type="range"' +
+        ' min="' + min + '" max="' + max + '" step="' + step + '" value="' + cur + '" />' +
+      '<span class="monitor-control-value">' + fmt(cur) + '</span>';
     const slider = row.querySelector("input");
     const val = row.querySelector(".monitor-control-value");
     slider.addEventListener("input", () => {
       const v = Number(slider.value);
-      val.textContent = v.toFixed(3);
-      // Persist to node params so saved patches retain the slider position.
+      val.textContent = fmt(v);
       const node = state.nodes.find(n => n.id === s.id);
       if (node) node.params.value = v;
       if (idx < 0 || !previewState.workletNode || previewState.state !== "playing") return;
