@@ -1872,6 +1872,57 @@
   .piano-key.overridden.active { box-shadow: inset 0 -3px 0 var(--warn), 0 0 14px var(--phosphor-mid); }
 
   /* ---------- Keymap modal grid ---------- */
+  /* Ramp editor — modal grid of curve/shape preview cards. */
+  .ramp-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px;
+    margin-top: 8px;
+  }
+  .ramp-card {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 10px 12px 8px;
+    cursor: pointer;
+    transition: border-color 0.12s, background 0.12s;
+    user-select: none;
+  }
+  .ramp-card:hover { border-color: var(--text-3); background: var(--surface-3); }
+  .ramp-card.active { border-color: var(--accent); }
+  .ramp-card svg { display: block; width: 100%; height: 56px; }
+  .ramp-card-label {
+    margin-top: 6px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.10em;
+    color: var(--text-2);
+    text-align: center;
+  }
+  .ramp-card.active .ramp-card-label { color: var(--accent); }
+
+  /* Small ≈ button on each Monitor-control row that opens the editor. */
+  .monitor-control-curve {
+    background: transparent;
+    border: 1px solid var(--instr-rule);
+    color: var(--phosphor-mid);
+    width: 22px; height: 22px;
+    border-radius: 2px;
+    cursor: pointer;
+    font-size: 12px;
+    line-height: 1;
+    padding: 0;
+    transition: color 0.12s, border-color 0.12s;
+  }
+  .monitor-control-curve:hover { color: var(--phosphor); border-color: var(--phosphor-dim); }
+  .monitor-control-grid-with-edit {
+    grid-template-columns: auto 1fr 22px auto !important;
+  }
+  .monitor-control-grid-button {
+    grid-template-columns: auto 1fr 22px auto !important;
+  }
+
   .keymap-grid {
     display: grid;
     grid-template-columns: 32px 90px 1fr 28px;
@@ -2614,6 +2665,26 @@
     </div>
   </div>
 
+  <!-- Ramp editor — picks how a Slider's drag position maps to its
+       output (linear / log / exp / sCurve) or a Button's gate-output
+       envelope shape (pulse / linRamp / expDecay). Same modal, two
+       option sets — opened from the Monitor controls panel via the
+       little "≈" button on each row. -->
+  <div class="modal-backdrop" id="ramp-modal" style="display:none;">
+    <div class="modal" style="width: 520px;">
+      <div class="modal-head">
+        <span id="ramp-modal-title">Edit slider curve</span>
+        <button class="btn modal-x" id="btn-ramp-close">×</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-note" id="ramp-modal-note">
+          Pick how the slider's drag position maps to its output. Linear is 1:1; log gives finer control at the bottom (good for frequency / amplitude); exp gives finer control at the top (good for time / decay); s-curve eases in and out.
+        </p>
+        <div class="ramp-grid" id="ramp-grid"></div>
+      </div>
+    </div>
+  </div>
+
   <div class="modal-backdrop" id="help-modal" style="display:none;">
     <div class="modal">
       <div class="modal-head">
@@ -2988,29 +3059,43 @@ public:
     cppType: "GammaButton",
     helperClass:
 `class GammaButton {
-    bool pulse_ = false;
+    int counter_  = 0;
+    int duration_ = 4800;        // samples; 100ms at 48kHz
+    int shape_    = 0;           // 0=pulse, 1=linRamp, 2=expDecay
+    float sr_     = 48000.f;
 public:
-    void press() { pulse_ = true; }
+    GammaButton() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+    }
+    void setDuration(float ms) { duration_ = (int)(ms * sr_ * 0.001f); if (duration_ < 1) duration_ = 1; }
+    void setShape(float s)     { shape_ = (int)s; }
+    void press() { counter_ = (shape_ == 0) ? 1 : duration_; }
     float operator()() {
-        if (pulse_) { pulse_ = false; return 1.f; }
-        return 0.f;
+        if (counter_ <= 0) return 0.f;
+        counter_--;
+        if (shape_ == 0) return 1.f;
+        const float t = (float)(counter_ + 1) / (float)duration_;
+        if (shape_ == 1) return t;          // linear 1->0
+        return t * t;                        // expDecay (polynomial)
     }
 };`,
     ins: [],
     outs: [{ n: "gate", t: "audio" }],
-    params: { label: "press" },
-    methods: {},
+    params: { label: "press", shape: "pulse", duration: 100 },
+    methods: { duration: "setDuration", shape: "setShape" },
+    paramOptions: { shape: ["pulse", "linRamp", "expDecay"] },
+    enumMap:      { shape: { pulse: "0", linRamp: "1", expDecay: "2" } },
     gateMethods: { trig: "press" },
     hostGates: ["trig"],
     uiOnlyParams: ["label"],
-    description: "On-screen button → one-sample gate pulse on click. Wire gate into AD.trig or any gate input. The label shows on the button itself."
+    description: "On-screen button → gate output. Default pulse is a single 1.f sample; shape linRamp / expDecay turn it into a one-shot envelope over `duration` ms. Wire into a Mul to gate audio, or AD.trig for combined envelopes."
   },
 
   /* On-screen slider. Renders as a horizontal slider in the Monitor
    * tab's Controls panel; dragging the thumb writes a float into the
-   * patch. min / max define the output range — set min=200, max=15000
-   * for a filter-cutoff slider; min=0.5, max=20 for a Q slider; etc.
-   * value persists as the current position (in raw output units). */
+   * patch. min / max define the output range; curve picks how the
+   * drag position maps to that range (linear / log / exp / sCurve). */
   Slider: {
     category: "Convert", color: COLOR.convert, header: null,
     cppType: "GammaSlider",
@@ -3023,11 +3108,11 @@ public:
 };`,
     ins: [],
     outs: [{ n: "out", t: "audio" }],
-    params: { value: 0.5, min: 0, max: 1 },
+    params: { value: 0.5, min: 0, max: 1, curve: "linear" },
     methods: { value: "setValue" },
     autoExpose: ["value"],
-    uiOnlyParams: ["min", "max"],
-    description: "On-screen slider → float output. Set min/max in props, drag in the Monitor tab's Controls panel. Wire out into any param."
+    uiOnlyParams: ["min", "max", "curve"],
+    description: "On-screen slider → float output. Set min/max + curve (linear/log/exp/s-curve) in the ramp editor. Drag in the Monitor's Controls panel. Wire out into any param."
   },
 
   /* Phase 5.1 — master clock. Single instance per patch (typically).
@@ -9559,6 +9644,35 @@ function closeKeymapModal() {
  * value setter on input. Setter indices are looked up via
  * collectExposedSetters by nodeId. Re-rendered on render() since the
  * node set can change at any time. */
+/* Curve helpers — drag position t in [0..1] → output in [min..max].
+ * Used by sliders to remap the linear range input into perceptually
+ * useful curves (frequency / amplitude / decay / etc.). The inverse
+ * is needed to compute the slider's drag position from a stored
+ * value — analytic for linear/log/exp; sCurve uses a binary search
+ * since 3t² - 2t³ has no clean inverse. */
+const SLIDER_CURVES = {
+  linear: { fwd: t => t,                                inv: y => y },
+  log:    { fwd: t => Math.log10(1 + 9 * t),            inv: y => (Math.pow(10, y) - 1) / 9 },
+  exp:    { fwd: t => t * t,                            inv: y => Math.sqrt(Math.max(0, y)) },
+  sCurve: { fwd: t => t * t * (3 - 2 * t),              inv: y => {
+    let lo = 0, hi = 1;
+    for (let i = 0; i < 16; i++) {
+      const mid = (lo + hi) / 2;
+      if (mid * mid * (3 - 2 * mid) < y) lo = mid; else hi = mid;
+    }
+    return (lo + hi) / 2;
+  }}
+};
+function sliderValueFromT(t, min, max, curve) {
+  const fn = (SLIDER_CURVES[curve] || SLIDER_CURVES.linear).fwd;
+  return min + (max - min) * fn(Math.max(0, Math.min(1, t)));
+}
+function sliderTFromValue(v, min, max, curve) {
+  if (max === min) return 0;
+  const inv = (SLIDER_CURVES[curve] || SLIDER_CURVES.linear).inv;
+  return Math.max(0, Math.min(1, inv(Math.max(0, Math.min(1, (v - min) / (max - min))))));
+}
+
 function renderMonitorControls() {
   const wrap = document.getElementById("monitor-controls");
   if (!wrap) return;
@@ -9576,18 +9690,19 @@ function renderMonitorControls() {
     }
     return -1;
   };
-  // Clear and rebuild.
   wrap.innerHTML = "";
   buttons.forEach(b => {
     const idx = findIdx(b.id, "trig", true);
     const label = (b.params && typeof b.params.label === "string" && b.params.label) ? b.params.label : "press";
     const row = document.createElement("div");
-    row.className = "monitor-control";
+    row.className = "monitor-control monitor-control-grid-button";
     row.innerHTML =
       '<span class="monitor-control-id">btn <b>' + b.id + '</b></span>' +
       '<button class="monitor-control-button"></button>' +
+      '<button class="monitor-control-curve" title="Edit gate-output shape">≈</button>' +
       '<span></span>';
-    const btn = row.querySelector("button");
+    const btn = row.querySelector(".monitor-control-button");
+    const editBtn = row.querySelector(".monitor-control-curve");
     btn.textContent = label;
     btn.addEventListener("click", () => {
       if (idx < 0 || !previewState.workletNode || previewState.state !== "playing") return;
@@ -9595,42 +9710,153 @@ function renderMonitorControls() {
       btn.classList.add("firing");
       setTimeout(() => btn.classList.remove("firing"), 80);
     });
+    editBtn.addEventListener("click", () => openRampModal("button", b.id));
     wrap.appendChild(row);
   });
   sliders.forEach(s => {
     const idx = findIdx(s.id, "value", false);
     const min = (s.params && typeof s.params.min === "number") ? s.params.min : 0;
     const max = (s.params && typeof s.params.max === "number" && s.params.max > min) ? s.params.max : (min + 1);
+    const curve = (s.params && typeof s.params.curve === "string" && SLIDER_CURVES[s.params.curve]) ? s.params.curve : "linear";
     let cur = (s.params && typeof s.params.value === "number") ? s.params.value : (min + max) / 2;
     if (cur < min) cur = min; if (cur > max) cur = max;
-    // Persist clamped value back so saved patches stay coherent.
     if (s.params && s.params.value !== cur) s.params.value = cur;
-    // Step size: 1000 increments across the range, but at least 1e-4
-    // to avoid degenerate cases when min/max are very close.
-    const step = Math.max(1e-4, (max - min) / 1000);
-    // Display precision: enough digits to resolve the step size.
-    const digits = Math.max(0, Math.ceil(-Math.log10(step)));
-    const fmt = v => v.toFixed(digits);
+    // Range input always uses LINEAR t in 0..1; we map to the curved
+    // value on every change. Inverse-mapping the stored value seeds
+    // the thumb to the right position on first render.
+    const initT = sliderTFromValue(cur, min, max, curve);
+    const stepT = 0.001;
+    const digits = Math.max(0, Math.ceil(-Math.log10((max - min) / 1000 || 1e-4)));
+    const fmtVal = v => v.toFixed(digits);
     const row = document.createElement("div");
-    row.className = "monitor-control";
+    row.className = "monitor-control monitor-control-grid-with-edit";
     row.innerHTML =
       '<span class="monitor-control-id">sld <b>' + s.id + '</b></span>' +
       '<input class="monitor-control-slider" type="range"' +
-        ' min="' + min + '" max="' + max + '" step="' + step + '" value="' + cur + '" />' +
-      '<span class="monitor-control-value">' + fmt(cur) + '</span>';
-    const slider = row.querySelector("input");
+        ' min="0" max="1" step="' + stepT + '" value="' + initT + '" />' +
+      '<button class="monitor-control-curve" title="Edit slider response curve">≈</button>' +
+      '<span class="monitor-control-value">' + fmtVal(cur) + '</span>';
+    const slider = row.querySelector(".monitor-control-slider");
+    const editBtn = row.querySelector(".monitor-control-curve");
     const val = row.querySelector(".monitor-control-value");
     slider.addEventListener("input", () => {
-      const v = Number(slider.value);
-      val.textContent = fmt(v);
+      const t = Number(slider.value);
+      const v = sliderValueFromT(t, min, max, curve);
+      val.textContent = fmtVal(v);
       const node = state.nodes.find(n => n.id === s.id);
       if (node) node.params.value = v;
       if (idx < 0 || !previewState.workletNode || previewState.state !== "playing") return;
       previewState.workletNode.port.postMessage({ type: "set", index: idx, value: v });
     });
+    editBtn.addEventListener("click", () => openRampModal("slider", s.id));
     wrap.appendChild(row);
   });
 }
+
+/* Ramp editor — modal that picks a curve / shape for a Slider or
+ * Button. Same modal, two option sets: sliders pick from
+ * SLIDER_CURVES; buttons pick from a small list of envelope shapes
+ * that the helperClass C++ already knows how to render. */
+const RAMP_CONFIG = {
+  slider: {
+    title: "Edit slider curve",
+    note:  "Pick how the slider's drag position maps to its output. Linear is 1:1; log gives finer control at the bottom (good for frequency / amplitude); exp gives finer control at the top (good for time / decay); s-curve eases in and out.",
+    paramKey: "curve",
+    defaultKey: "linear",
+    options: [
+      { key: "linear", label: "linear" },
+      { key: "log",    label: "log" },
+      { key: "exp",    label: "exp" },
+      { key: "sCurve", label: "s-curve" }
+    ]
+  },
+  button: {
+    title: "Edit button gate shape",
+    note:  "How the button's gate output looks when pressed. pulse is a single 1.f sample (default — drives gates via Schmitt threshold). linRamp + expDecay output a 1→0 envelope over the button's duration param (ms). Wire the gate into a Mul to gate audio amplitude with the envelope.",
+    paramKey: "shape",
+    defaultKey: "pulse",
+    options: [
+      { key: "pulse",    label: "pulse" },
+      { key: "linRamp",  label: "linear" },
+      { key: "expDecay", label: "exp decay" }
+    ]
+  }
+};
+// SVG path for a curve — t in 0..1 → y in 0..1 (1 at top of card,
+// 0 at bottom). Returns an "M x,y L ..." path string scaled to the
+// preview viewport.
+function rampSvgPath(option, kind, w, h) {
+  const samples = 32;
+  const pts = [];
+  for (let i = 0; i <= samples; i++) {
+    const t = i / samples;
+    let y;
+    if (kind === "slider") {
+      const fn = (SLIDER_CURVES[option.key] || SLIDER_CURVES.linear).fwd;
+      y = fn(t);
+    } else {
+      // Button: visualise the gate-output ENVELOPE — flipped time
+      // axis (0 = trigger, 1 = end of envelope), value 0..1.
+      if (option.key === "pulse") y = i === 0 ? 1 : 0;       // single spike at the start
+      else if (option.key === "linRamp")  y = 1 - t;         // linear 1→0
+      else /* expDecay */                  y = (1 - t) * (1 - t);
+    }
+    const x = (t * w).toFixed(1);
+    const py = ((1 - y) * h).toFixed(1);
+    pts.push((i === 0 ? "M" : "L") + x + "," + py);
+  }
+  return pts.join(" ");
+}
+function openRampModal(kind, nodeId) {
+  const cfg = RAMP_CONFIG[kind];
+  if (!cfg) return;
+  const node = state.nodes.find(n => n.id === nodeId);
+  if (!node) return;
+  const titleEl = document.getElementById("ramp-modal-title");
+  const noteEl  = document.getElementById("ramp-modal-note");
+  const grid    = document.getElementById("ramp-grid");
+  const modal   = document.getElementById("ramp-modal");
+  if (!titleEl || !grid || !modal) return;
+  titleEl.textContent = cfg.title + " · " + node.id;
+  noteEl.textContent  = cfg.note;
+  const current = (node.params && node.params[cfg.paramKey]) || cfg.defaultKey;
+  grid.innerHTML = "";
+  const svgW = 220, svgH = 56;
+  cfg.options.forEach(opt => {
+    const card = document.createElement("div");
+    card.className = "ramp-card" + (opt.key === current ? " active" : "");
+    const path = rampSvgPath(opt, kind, svgW, svgH);
+    card.innerHTML =
+      '<svg viewBox="0 0 ' + svgW + ' ' + svgH + '" preserveAspectRatio="none">' +
+        '<path d="' + path + '" fill="none" stroke="var(--accent)" stroke-width="1.5" />' +
+      '</svg>' +
+      '<div class="ramp-card-label">' + opt.label + '</div>';
+    card.addEventListener("click", () => {
+      pushHistory("ramp:" + nodeId);
+      node.params[cfg.paramKey] = opt.key;
+      grid.querySelectorAll(".ramp-card").forEach(c => c.classList.remove("active"));
+      card.classList.add("active");
+      // Re-render so live audio (slider) or codegen (button) reflect
+      // the new pick. For button we also need to re-Play — the shape
+      // is constructor-only — but rendering the controls panel keeps
+      // the popup state consistent.
+      renderMonitorControls();
+      renderCode(); renderJson();
+    });
+    grid.appendChild(card);
+  });
+  modal.style.display = "flex";
+}
+function closeRampModal() {
+  const modal = document.getElementById("ramp-modal");
+  if (modal) modal.style.display = "none";
+}
+(function setupRampModal() {
+  const close = document.getElementById("btn-ramp-close");
+  const modal = document.getElementById("ramp-modal");
+  if (close) close.addEventListener("click", closeRampModal);
+  if (modal) modal.addEventListener("click", e => { if (e.target === modal) closeRampModal(); });
+})();
 // Hook into render() so adding/removing Button or Slider nodes refreshes
 // the controls panel.
 const _render_for_controls = render;
