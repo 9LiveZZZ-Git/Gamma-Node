@@ -2377,6 +2377,92 @@
     width: fit-content;
   }
 
+  /* Piano-roll editor — drawable note grid (time × pitch) inside its
+   * own modal. Pitch axis runs top→bottom (high→low MIDI), time
+   * axis left→right. Notes render as horizontal bars spanning their
+   * duration in steps. */
+  .pianoroll-toolbar {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    margin: 4px 0 12px;
+  }
+  .pianoroll-toolbar-field {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-2);
+  }
+  .pianoroll-toolbar-field input {
+    width: 64px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    padding: 4px 6px;
+    outline: none;
+  }
+  .pianoroll-toolbar-field input:focus { border-color: var(--accent); }
+  .pianoroll-toolbar-spacer { flex: 1; }
+  .pianoroll-grid-wrap {
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg);
+    max-height: 480px;
+    overflow: auto;
+    user-select: none;
+  }
+  .pianoroll-grid {
+    display: block;
+    cursor: crosshair;
+    touch-action: none;
+  }
+  .pianoroll-grid .pr-bg-row-white { fill: var(--surface); }
+  .pianoroll-grid .pr-bg-row-black { fill: var(--bg); }
+  .pianoroll-grid .pr-grid-line { stroke: var(--border); stroke-width: 1; }
+  .pianoroll-grid .pr-beat-line { stroke: var(--text-3); stroke-width: 1; }
+  .pianoroll-grid .pr-pitch-label {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    fill: var(--text-3);
+  }
+  .pianoroll-grid .pr-step-label {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    fill: var(--text-3);
+  }
+  .pianoroll-grid .pr-note {
+    fill: var(--accent);
+    stroke: var(--accent-ink);
+    stroke-width: 0.5;
+    cursor: pointer;
+  }
+  .pianoroll-grid .pr-note:hover { fill: var(--audio); }
+  .pianoroll-grid .pr-preview {
+    fill: rgba(200, 232, 90, 0.35);
+    stroke: var(--accent);
+    stroke-width: 1;
+    pointer-events: none;
+  }
+  .pianoroll-grid .pr-playhead {
+    stroke: var(--audio);
+    stroke-width: 1.5;
+    opacity: 0.6;
+    pointer-events: none;
+  }
+  .pianoroll-summary {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 6px;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--text-3);
+  }
+
   /* Step-grid editor for StepSeq16 / StepSeq32 — clickable cells that
    * toggle node.params.steps[i]. 16-step layout uses 8 cols × 2 rows;
    * 32-step uses 16 cols × 2 rows. Cells are small buttons with the
@@ -2779,6 +2865,39 @@
           Pick how the slider's drag position maps to its output. Linear is 1:1; log gives finer control at the bottom (good for frequency / amplitude); exp gives finer control at the top (good for time / decay); s-curve eases in and out.
         </p>
         <div class="ramp-grid" id="ramp-grid"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Piano-roll editor — opened from a PianoRoll node's props pane.
+       Modal contains a time × pitch grid; click+drag to draw a note,
+       click an existing note to delete. Pattern length / pitch range
+       configurable. Notes persist into node.params.notes and codegen
+       emits clearNotes + addNote at constructor time. -->
+  <div class="modal-backdrop" id="pianoroll-modal" style="display:none;">
+    <div class="modal" style="width: 760px; max-width: calc(100vw - 32px);">
+      <div class="modal-head">
+        <span id="pianoroll-modal-title">Edit piano roll</span>
+        <button class="btn modal-x" id="btn-pianoroll-close">×</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-note">
+          Click + drag horizontally inside the grid to draw a note (start..end in steps). Click an existing note to remove it. Each step is one clock-tick — wire <code>MasterClock.sixteenth</code> for sixteenth-note resolution. Notes carry MIDI pitch + velocity (1.0 default).
+        </p>
+        <div class="pianoroll-toolbar">
+          <label class="pianoroll-toolbar-field">
+            <span>Steps</span>
+            <input id="pianoroll-len" type="number" min="1" max="64" step="1" />
+          </label>
+          <label class="pianoroll-toolbar-field">
+            <span>Velocity</span>
+            <input id="pianoroll-vel" type="number" min="0" max="1" step="0.05" />
+          </label>
+          <span class="pianoroll-toolbar-spacer"></span>
+          <button class="btn" id="btn-pianoroll-clear">Clear</button>
+          <button class="btn primary" id="btn-pianoroll-done">Done</button>
+        </div>
+        <div class="pianoroll-grid-wrap" id="pianoroll-grid-wrap"></div>
       </div>
     </div>
   </div>
@@ -3684,6 +3803,105 @@ public:
       }
     ],
     description: "Arpeggiator. notes = comma-separated semitone offsets (e.g. \"0, 4, 7\" = major triad). On each clock-edge, advances per mode (up/down/upDown/random) + outputs baseFreq scaled by the offset. Wire freq into Sine.freq."
+  },
+
+  /* Phase 5 extra — Piano Roll. A drawable monophonic note sequencer.
+   * Notes carry { start, dur, midi, vel }; on each clock-edge the
+   * playhead advances one step and any note whose start matches the
+   * current step fires (single-sample gate pulse) + sets curFreq +
+   * curVel. patternLen wraps the playhead. Editor lives in a modal
+   * — click+drag to draw a note (start..end in steps), click an
+   * existing note to delete. */
+  PianoRoll: {
+    category: "Convert", color: COLOR.convert, header: null,
+    cppType: "GammaPianoRoll",
+    helperClass:
+`class GammaPianoRoll {
+    static constexpr int MAX_NOTES = 128;
+    struct Note { int start, dur, midi; float vel; };
+    Note notes_[MAX_NOTES];
+    int  nNotes_     = 0;
+    int  patternLen_ = 16;
+    int  curStep_    = -1;
+    int  prev_       = 0;
+    float curFreq_   = 220.f;
+    float curVel_    = 1.f;
+    float gatePulse_ = 0.f;
+public:
+    struct Out { float freq, gate, vel; };
+    void setPatternLen(float v) {
+        int n = (int)v;
+        if (n < 1) n = 1;
+        if (n > 256) n = 256;
+        patternLen_ = n;
+    }
+    void clearNotes() { nNotes_ = 0; }
+    void addNote(float start, float dur, float midi, float vel) {
+        if (nNotes_ >= MAX_NOTES) return;
+        notes_[nNotes_].start = (int)start;
+        notes_[nNotes_].dur   = (int)dur > 0 ? (int)dur : 1;
+        notes_[nNotes_].midi  = (int)midi;
+        notes_[nNotes_].vel   = (vel < 0.f) ? 0.f : (vel > 1.f ? 1.f : vel);
+        nNotes_++;
+    }
+    void reset() { curStep_ = -1; prev_ = 0; gatePulse_ = 0.f; }
+    Out operator()(float clk) {
+        Out o;
+        const int cur = (clk > 0.5f) ? 1 : 0;
+        const bool edge = cur && !prev_;
+        prev_ = cur;
+        gatePulse_ = 0.f;
+        if (edge) {
+            curStep_ = (curStep_ + 1) % patternLen_;
+            for (int i = 0; i < nNotes_; i++) {
+                if (notes_[i].start == curStep_) {
+                    curFreq_   = 440.f * std::pow(2.f, ((float)notes_[i].midi - 69.f) / 12.f);
+                    curVel_    = notes_[i].vel;
+                    gatePulse_ = 1.f;
+                    break;
+                }
+            }
+        }
+        o.freq = curFreq_;
+        o.gate = gatePulse_;
+        o.vel  = curVel_;
+        return o;
+    }
+};`,
+    ins: [
+      { n: "clock", t: "audio" },
+      { n: "trig",  t: "gate" }
+    ],
+    outs: [
+      { n: "freq", t: "audio", access: ".freq" },
+      { n: "gate", t: "clock", access: ".gate" },
+      { n: "vel",  t: "audio", access: ".vel"  }
+    ],
+    params: { patternLen: 16, notes: [] },
+    methods: { patternLen: "setPatternLen" },
+    gateMethods: { trig: "reset" },
+    autoExpose: ["patternLen"],
+    uiOnlyParams: ["notes"],
+    kind: "pianoRoll",
+    extraHeaders: ["<cmath>"],
+    extraCtor: [
+      (n) => {
+        const list = (n.params && Array.isArray(n.params.notes)) ? n.params.notes : [];
+        if (!list.length) return null;
+        const lines = [`        ${n.id}.clearNotes();`];
+        list.slice(0, 128).forEach(note => {
+          if (!note || typeof note !== "object") return;
+          const s = Math.round(Number(note.start) || 0);
+          const d = Math.round(Number(note.dur)   || 1);
+          const m = Math.round(Number(note.midi)  || 60);
+          const v = Number(note.vel);
+          const vc = isFinite(v) ? Math.max(0, Math.min(1, v)) : 1;
+          lines.push(`        ${n.id}.addNote(${s}.f, ${d}.f, ${m}.f, ${vc.toFixed(3)}f);`);
+        });
+        return lines.join("\n");
+      }
+    ],
+    description: "Piano-roll sequencer. Wire a clock signal (e.g. MasterClock.sixteenth) into clock; click 'Edit pattern' in props to open the drawable editor. Outputs freq + gate + velocity per note-on."
   },
 
   /* Phase 3.5 — multi-output state-variable filter via helperClass.
@@ -4960,6 +5178,17 @@ function renderProps() {
       });
       html += `</div>`;
     }
+    // Piano-roll: a single button that opens the editor modal.
+    // Notes live in node.params.notes; the modal handles all the
+    // drawing / saving.
+    if (def.kind === "pianoRoll") {
+      const noteCount = (Array.isArray(node.params.notes) ? node.params.notes.length : 0);
+      const len = (typeof node.params.patternLen === "number") ? node.params.patternLen : 16;
+      html += `<div class="prop-section">Pattern</div>`;
+      html += `<div class="prop-grid" style="grid-template-columns: 1fr;">
+        <button class="btn primary" id="btn-open-pianoroll" style="width: 100%;">Edit piano roll · ${noteCount} note${noteCount===1?"":"s"} · ${len} steps</button>
+      </div>`;
+    }
     // Step-grid UI for sequencer nodes — N small clickable cells
     // mirroring node.params.steps (boolean array). Click to toggle.
     if (def.kind === "stepSeq") {
@@ -4978,6 +5207,9 @@ function renderProps() {
     }
   }
   propsEl.innerHTML = html;
+  // Wire the "Edit piano roll" button if the node is a PianoRoll.
+  const openPianoRollBtn = propsEl.querySelector('#btn-open-pianoroll');
+  if (openPianoRollBtn) openPianoRollBtn.addEventListener('click', () => openPianoRollModal(node.id));
   // Wire step-grid clicks (after innerHTML so the buttons exist).
   propsEl.querySelectorAll('.step-cell').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -10678,6 +10910,226 @@ function closeRampModal() {
   const modal = document.getElementById("ramp-modal");
   if (close) close.addEventListener("click", closeRampModal);
   if (modal) modal.addEventListener("click", e => { if (e.target === modal) closeRampModal(); });
+})();
+
+/* ------------- Piano-roll modal ------------- */
+/* Drawable monophonic note sequencer. Notes live in node.params.notes
+ * as { start, dur, midi, vel } objects. Modal renders a time × pitch
+ * grid with the C-of-each-octave slightly highlighted; click+drag
+ * draws a new note (start..end in steps), click an existing note
+ * deletes it. Pattern length is editable in the toolbar. */
+const PR_PITCH_LO  = 36;     // MIDI C2
+const PR_PITCH_HI  = 84;     // MIDI C6 (exclusive upper)
+const PR_CELL_W    = 28;
+const PR_CELL_H    = 14;
+const PR_LABEL_W   = 36;
+const PR_HEADER_H  = 18;
+const NOTE_NAMES_PR = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
+function prMidiName(m) {
+  const idx = ((m % 12) + 12) % 12;
+  return NOTE_NAMES_PR[idx] + Math.floor(m / 12 - 1);
+}
+function prIsBlackKey(m) {
+  const idx = ((m % 12) + 12) % 12;
+  return idx === 1 || idx === 3 || idx === 6 || idx === 8 || idx === 10;
+}
+
+let _pianoRollNodeId = null;
+let _pianoRollVel    = 1.0;
+
+function renderPianoRollGrid() {
+  const wrap = document.getElementById("pianoroll-grid-wrap");
+  if (!wrap) return;
+  const node = state.nodes.find(n => n.id === _pianoRollNodeId);
+  if (!node) return;
+  const len = Math.max(1, Math.min(64, parseInt(node.params.patternLen, 10) || 16));
+  const notes = Array.isArray(node.params.notes) ? node.params.notes : [];
+  const pitchCount = PR_PITCH_HI - PR_PITCH_LO;          // rows
+  const W = PR_LABEL_W + len * PR_CELL_W;
+  const H = PR_HEADER_H + pitchCount * PR_CELL_H;
+
+  let html = `<svg class="pianoroll-grid" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">`;
+  // Row backgrounds — black-key rows slightly darker. Pitches descend
+  // top→bottom (highest at the top).
+  for (let r = 0; r < pitchCount; r++) {
+    const midi = PR_PITCH_HI - 1 - r;
+    const y = PR_HEADER_H + r * PR_CELL_H;
+    html += `<rect class="${prIsBlackKey(midi) ? "pr-bg-row-black" : "pr-bg-row-white"}" x="${PR_LABEL_W}" y="${y}" width="${len * PR_CELL_W}" height="${PR_CELL_H}" />`;
+    if (midi % 12 === 0) {
+      // C labels every octave
+      html += `<text class="pr-pitch-label" x="2" y="${y + PR_CELL_H - 3}">${prMidiName(midi)}</text>`;
+    } else if (r === 0 || (midi % 12 === 5)) {
+      html += `<text class="pr-pitch-label" x="2" y="${y + PR_CELL_H - 3}">${prMidiName(midi)}</text>`;
+    }
+  }
+  // Vertical step lines + step labels (every 4 steps).
+  for (let s = 0; s <= len; s++) {
+    const x = PR_LABEL_W + s * PR_CELL_W;
+    const isBeat = (s % 4) === 0;
+    html += `<line class="${isBeat ? "pr-beat-line" : "pr-grid-line"}" x1="${x}" y1="${PR_HEADER_H}" x2="${x}" y2="${H}" />`;
+    if (isBeat && s < len) {
+      html += `<text class="pr-step-label" x="${x + 3}" y="${PR_HEADER_H - 4}">${s + 1}</text>`;
+    }
+  }
+  // Horizontal lines between rows.
+  for (let r = 0; r <= pitchCount; r++) {
+    const y = PR_HEADER_H + r * PR_CELL_H;
+    html += `<line class="pr-grid-line" x1="${PR_LABEL_W}" y1="${y}" x2="${W}" y2="${y}" />`;
+  }
+  // Existing notes.
+  notes.forEach((nt, idx) => {
+    if (!nt || nt.midi == null) return;
+    if (nt.midi < PR_PITCH_LO || nt.midi >= PR_PITCH_HI) return;
+    if (nt.start < 0 || nt.start >= len) return;
+    const dur = Math.max(1, Math.min(len - nt.start, nt.dur || 1));
+    const x = PR_LABEL_W + nt.start * PR_CELL_W + 1;
+    const y = PR_HEADER_H + (PR_PITCH_HI - 1 - nt.midi) * PR_CELL_H + 1;
+    const w = dur * PR_CELL_W - 2;
+    const h = PR_CELL_H - 2;
+    const op = Math.max(0.4, Math.min(1, nt.vel != null ? nt.vel : 1));
+    html += `<rect class="pr-note" data-idx="${idx}" x="${x}" y="${y}" width="${w}" height="${h}" rx="2" opacity="${op}" />`;
+  });
+  // Drag preview (filled by handlers below).
+  html += `<rect class="pr-preview" x="0" y="0" width="0" height="0" style="display:none" />`;
+  html += `</svg>`;
+
+  wrap.innerHTML = html;
+
+  // ---- Pointer interaction ----
+  const svg = wrap.querySelector(".pianoroll-grid");
+  const preview = svg.querySelector(".pr-preview");
+  let dragStart = null;        // { step, midi }
+
+  function cellAt(ev) {
+    const r = svg.getBoundingClientRect();
+    const cx = (ev.clientX - r.left) * (W / r.width);
+    const cy = (ev.clientY - r.top)  * (H / r.height);
+    if (cx < PR_LABEL_W || cy < PR_HEADER_H) return null;
+    const step = Math.floor((cx - PR_LABEL_W) / PR_CELL_W);
+    const row  = Math.floor((cy - PR_HEADER_H) / PR_CELL_H);
+    if (step < 0 || step >= len) return null;
+    if (row  < 0 || row  >= pitchCount) return null;
+    const midi = PR_PITCH_HI - 1 - row;
+    return { step, midi };
+  }
+
+  svg.addEventListener("pointerdown", ev => {
+    ev.preventDefault();
+    // Click on existing note → delete it.
+    const target = ev.target;
+    if (target && target.classList.contains("pr-note")) {
+      const idx = parseInt(target.dataset.idx, 10);
+      pushHistory("pr:delete:" + node.id);
+      notes.splice(idx, 1);
+      renderPianoRollGrid();
+      renderCode(); renderJson(); renderProps();
+      return;
+    }
+    const cell = cellAt(ev);
+    if (!cell) return;
+    dragStart = cell;
+    svg.setPointerCapture(ev.pointerId);
+    showPreview(cell.step, cell.midi, 1);
+  });
+  svg.addEventListener("pointermove", ev => {
+    if (!dragStart) return;
+    const cell = cellAt(ev);
+    if (!cell) return;
+    const lo = Math.min(dragStart.step, cell.step);
+    const hi = Math.max(dragStart.step, cell.step);
+    showPreview(lo, dragStart.midi, hi - lo + 1);
+  });
+  function endDrag(ev) {
+    if (!dragStart) return;
+    const cell = cellAt(ev) || dragStart;
+    const lo = Math.min(dragStart.step, cell.step);
+    const hi = Math.max(dragStart.step, cell.step);
+    const dur = hi - lo + 1;
+    pushHistory("pr:add:" + node.id);
+    notes.push({ start: lo, dur, midi: dragStart.midi, vel: _pianoRollVel });
+    if (!Array.isArray(node.params.notes)) node.params.notes = [];
+    node.params.notes = notes;
+    dragStart = null;
+    preview.setAttribute("style", "display:none");
+    renderPianoRollGrid();
+    renderCode(); renderJson(); renderProps();
+  }
+  svg.addEventListener("pointerup",     endDrag);
+  svg.addEventListener("pointercancel", () => { dragStart = null; preview.setAttribute("style", "display:none"); });
+
+  function showPreview(step, midi, dur) {
+    if (midi < PR_PITCH_LO || midi >= PR_PITCH_HI) {
+      preview.setAttribute("style", "display:none");
+      return;
+    }
+    const x = PR_LABEL_W + step * PR_CELL_W + 1;
+    const y = PR_HEADER_H + (PR_PITCH_HI - 1 - midi) * PR_CELL_H + 1;
+    const w = dur * PR_CELL_W - 2;
+    const h = PR_CELL_H - 2;
+    preview.setAttribute("x", x);
+    preview.setAttribute("y", y);
+    preview.setAttribute("width", w);
+    preview.setAttribute("height", h);
+    preview.setAttribute("rx", "2");
+    preview.setAttribute("style", "");
+  }
+}
+
+function openPianoRollModal(nodeId) {
+  const node = state.nodes.find(n => n.id === nodeId);
+  if (!node) return;
+  _pianoRollNodeId = nodeId;
+  if (!Array.isArray(node.params.notes)) node.params.notes = [];
+  if (typeof node.params.patternLen !== "number") node.params.patternLen = 16;
+  const lenInput = document.getElementById("pianoroll-len");
+  const velInput = document.getElementById("pianoroll-vel");
+  if (lenInput) lenInput.value = node.params.patternLen;
+  if (velInput) velInput.value = _pianoRollVel.toFixed(2);
+  const titleEl = document.getElementById("pianoroll-modal-title");
+  if (titleEl) titleEl.textContent = "Edit piano roll · " + node.id;
+  document.getElementById("pianoroll-modal").style.display = "flex";
+  renderPianoRollGrid();
+}
+function closePianoRollModal() {
+  const m = document.getElementById("pianoroll-modal");
+  if (m) m.style.display = "none";
+  _pianoRollNodeId = null;
+}
+(function setupPianoRollModal() {
+  const close = document.getElementById("btn-pianoroll-close");
+  const done  = document.getElementById("btn-pianoroll-done");
+  const clr   = document.getElementById("btn-pianoroll-clear");
+  const modal = document.getElementById("pianoroll-modal");
+  const lenIn = document.getElementById("pianoroll-len");
+  const velIn = document.getElementById("pianoroll-vel");
+  if (close) close.addEventListener("click", closePianoRollModal);
+  if (done)  done.addEventListener("click", closePianoRollModal);
+  if (modal) modal.addEventListener("click", e => { if (e.target === modal) closePianoRollModal(); });
+  if (clr) clr.addEventListener("click", () => {
+    const node = state.nodes.find(n => n.id === _pianoRollNodeId);
+    if (!node) return;
+    pushHistory("pr:clear:" + node.id);
+    node.params.notes = [];
+    renderPianoRollGrid();
+    renderCode(); renderJson(); renderProps();
+  });
+  if (lenIn) lenIn.addEventListener("input", () => {
+    const node = state.nodes.find(n => n.id === _pianoRollNodeId);
+    if (!node) return;
+    const v = Math.max(1, Math.min(64, parseInt(lenIn.value, 10) || 16));
+    pushHistory("pr:len:" + node.id);
+    node.params.patternLen = v;
+    // Trim or keep notes that fall within the new length.
+    if (Array.isArray(node.params.notes)) {
+      node.params.notes = node.params.notes.filter(n => n && n.start < v);
+    }
+    renderPianoRollGrid();
+    renderCode(); renderJson(); renderProps();
+  });
+  if (velIn) velIn.addEventListener("input", () => {
+    const v = parseFloat(velIn.value);
+    if (isFinite(v)) _pianoRollVel = Math.max(0, Math.min(1, v));
+  });
 })();
 // Hook into render() so adding/removing Button or Slider nodes refreshes
 // the controls panel.
