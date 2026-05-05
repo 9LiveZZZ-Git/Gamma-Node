@@ -1902,6 +1902,69 @@
   }
   .ramp-card.active .ramp-card-label { color: var(--accent); }
 
+  /* Wrap so the ≈ edit button hugs the enum select on its right edge. */
+  .enum-select-wrap {
+    display: inline-flex;
+    gap: 4px;
+    align-items: stretch;
+    width: 100%;
+  }
+  .enum-select-wrap > select { flex: 1; }
+  button.ramp-edit-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-2);
+    border-radius: 3px;
+    width: 26px;
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+    padding: 0;
+    transition: color 0.12s, border-color 0.12s;
+  }
+  button.ramp-edit-btn:hover { color: var(--accent); border-color: var(--text-3); }
+
+  /* Drawable curve editor — second pane in the ramp modal, shown when
+   * the user picks "custom". Free-draw with click+drag; X axis is
+   * input (0..1), Y axis is output (0..1, top = 1). */
+  .curve-draw-pane {
+    margin-top: 4px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .curve-draw-svg {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    width: 100%;
+    height: 180px;
+    cursor: crosshair;
+    touch-action: none;
+  }
+  .curve-draw-svg .curve-grid { stroke: var(--border); stroke-width: 1; }
+  .curve-draw-svg .curve-axis-label {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    fill: var(--text-3);
+  }
+  .curve-draw-svg .curve-line {
+    fill: none;
+    stroke: var(--accent);
+    stroke-width: 1.5;
+    stroke-linejoin: round;
+    stroke-linecap: round;
+  }
+  .curve-draw-svg .curve-fill {
+    fill: rgba(200, 232, 90, 0.10);
+    stroke: none;
+  }
+  .curve-draw-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+  }
+
   /* Small ≈ button on each Monitor-control row that opens the editor. */
   .monitor-control-curve {
     background: transparent;
@@ -3131,9 +3194,17 @@ public:
     cppType: "GammaRamp",
     helperClass:
 `class GammaRamp {
+    float lut_[64];
     int shape_ = 0;
 public:
+    GammaRamp() {
+        for (int i = 0; i < 64; i++) lut_[i] = (float)i / 63.f;
+    }
     void setShape(float s) { shape_ = (int)s; }
+    void setLut(const float* src, int n) {
+        if (n > 64) n = 64;
+        for (int i = 0; i < n; i++) lut_[i] = src[i];
+    }
     float operator()(float x) {
         if (x < 0.f) x = 0.f; else if (x > 1.f) x = 1.f;
         switch (shape_) {
@@ -3141,6 +3212,13 @@ public:
             case 2: return x * x;
             case 3: return x * x * (3.f - 2.f * x);
             case 4: return x * x * x * x;
+            case 5: {
+                const float fi = x * 63.f;
+                const int   i0 = (int)fi;
+                const int   i1 = i0 < 63 ? i0 + 1 : 63;
+                const float t = fi - i0;
+                return lut_[i0] * (1.f - t) + lut_[i1] * t;
+            }
         }
         return x;
     }
@@ -3149,10 +3227,34 @@ public:
     outs: [{ n: "out", t: "audio" }],
     params: { shape: "linear" },
     methods: { shape: "setShape" },
-    paramOptions: { shape: ["linear", "log", "exp", "sCurve", "expSteep"] },
-    enumMap:      { shape: { linear: "0", log: "1", exp: "2", sCurve: "3", expSteep: "4" } },
+    paramOptions: { shape: ["linear", "log", "exp", "sCurve", "expSteep", "custom"] },
+    enumMap:      { shape: { linear: "0", log: "1", exp: "2", sCurve: "3", expSteep: "4", custom: "5" } },
+    uiOnlyParams: ["curveTable"],
     extraHeaders: ["<cmath>"],
-    description: "Reshape a 0..1 signal through a curve (linear / log / exp / s-curve / expSteep). Drop between an LFO/envelope/slider and a destination param to control how the modulation feels. Pick the curve in the props pane."
+    // When shape=custom, emit a static constexpr LUT inside the ctor
+    // body and bind it via setLut. extraCtor entries can be functions
+    // that receive the node and return a literal C++ string — used
+    // here for per-instance data; static-string entries with {id}
+    // substitution still work alongside.
+    extraCtor: [
+      (n) => {
+        if (!n.params || n.params.shape !== "custom") return null;
+        const tbl = n.params.curveTable;
+        if (!Array.isArray(tbl) || tbl.length === 0) return null;
+        const N = tbl.length;
+        const vals = tbl.map(v => {
+          const f = Number(v);
+          return (isFinite(f) ? f : 0).toFixed(4) + "f";
+        }).join(", ");
+        return [
+          "        {",
+          `            static constexpr float ${n.id}_lut[] = { ${vals} };`,
+          `            ${n.id}.setLut(${n.id}_lut, ${N});`,
+          "        }"
+        ].join("\n");
+      }
+    ],
+    description: "Reshape a 0..1 signal through a curve (linear / log / exp / sCurve / expSteep / custom). 'custom' opens a drawable editor — sketch any response. Drop between an LFO/envelope/slider and a destination to shape modulation."
   },
 
   /* Phase 5.1 — master clock. Single instance per patch (typically).
@@ -4455,7 +4557,15 @@ function renderProps() {
             const sel = node.params[k] === o ? " selected" : "";
             return `<option value="${escapeAttr(o)}"${sel}>${escapeText(o)}</option>`;
           }).join("");
-          inputHtml = `<select class="enum-select" data-key="${escapeAttr(k)}">${opts}</select>`;
+          // For nodes with a "custom" curve / shape option, attach a
+          // small ≈ button that opens the ramp/curve modal directly
+          // (so the user doesn't have to first pick "custom" + then
+          // hunt for the editor — one click and they're drawing).
+          const hasCustom = enumOpts.indexOf("custom") >= 0;
+          const editBtn = hasCustom
+            ? `<button class="ramp-edit-btn" data-ramp-edit="${escapeAttr(k)}" title="Open curve editor">≈</button>`
+            : "";
+          inputHtml = `<span class="enum-select-wrap"><select class="enum-select" data-key="${escapeAttr(k)}">${opts}</select>${editBtn}</span>`;
         } else if (isString) {
           inputHtml = `<input type="text" value="${escapeAttr(String(node.params[k]))}" data-key="${escapeAttr(k)}" data-string="1" />`;
         } else {
@@ -4515,6 +4625,21 @@ function renderProps() {
       pushHistory("param:" + node.id + ":" + sel.dataset.key);
       node.params[sel.dataset.key] = sel.value;   // string, not number
       renderCode(); renderJson();
+      // If the user picked "custom" on a Ramp shape dropdown, jump
+      // straight into the drawing modal — saves an extra click.
+      if (sel.value === "custom" && node.type === "Ramp" && sel.dataset.key === "shape") {
+        openRampModal("ramp", node.id);
+      }
+    });
+  });
+  // Inline ≈ button next to enum dropdowns that carry a "custom" option.
+  propsEl.querySelectorAll('button.ramp-edit-btn').forEach(btn => {
+    btn.addEventListener("click", () => {
+      const kind = node.type === "Ramp" ? "ramp"
+                : node.type === "Slider" ? "slider"
+                : node.type === "Button" ? "button"
+                : "ramp";
+      openRampModal(kind, node.id);
     });
   });
   propsEl.querySelectorAll('input[type="checkbox"]').forEach(cb => {
@@ -4935,7 +5060,20 @@ function generateCode() {
     }
     if (def.cppType) decls.push(`    ${def.cppType} ${n.id};`);
     if (def.extraCtor) {
-      def.extraCtor.forEach(t => ctorBody.push(`        ${t.replace(/\{id\}/g, n.id)}`));
+      // extraCtor entries can be either:
+      //  - a static template string with {id} substitution (existing
+      //    pattern; pushed with 8-space indent)
+      //  - a function (node) => string that returns its own already-
+      //    indented C++ (used when the emitted code depends on the
+      //    node's per-instance params, e.g. Ramp's custom curveTable)
+      def.extraCtor.forEach(t => {
+        if (typeof t === "function") {
+          const line = t(n);
+          if (line) ctorBody.push(line);
+        } else {
+          ctorBody.push(`        ${t.replace(/\{id\}/g, n.id)}`);
+        }
+      });
     }
 
     const uiOnly = def.uiOnlyParams || [];
@@ -9797,6 +9935,12 @@ function renderMonitorControls() {
  * Button. Same modal, two option sets: sliders pick from
  * SLIDER_CURVES; buttons pick from a small list of envelope shapes
  * that the helperClass C++ already knows how to render. */
+const CURVE_TABLE_SIZE = 64;
+function defaultCurveTable() {
+  const t = new Array(CURVE_TABLE_SIZE);
+  for (let i = 0; i < CURVE_TABLE_SIZE; i++) t[i] = i / (CURVE_TABLE_SIZE - 1);
+  return t;
+}
 const RAMP_CONFIG = {
   slider: {
     title: "Edit slider curve",
@@ -9820,32 +9964,206 @@ const RAMP_CONFIG = {
       { key: "linRamp",  label: "linear" },
       { key: "expDecay", label: "exp decay" }
     ]
+  },
+  ramp: {
+    title: "Edit ramp curve",
+    note:  "Pick a preset or 'custom' to draw your own response. Linear is 1:1; log gives finer control at the bottom; exp gives finer control at the top; s-curve eases in and out; expSteep is a sharper exp. Custom samples 64 points across the input — the editor saves the table directly into the patch.",
+    paramKey: "shape",
+    defaultKey: "linear",
+    options: [
+      { key: "linear",    label: "linear" },
+      { key: "log",       label: "log" },
+      { key: "exp",       label: "exp" },
+      { key: "sCurve",    label: "s-curve" },
+      { key: "expSteep",  label: "exp steep" },
+      { key: "custom",    label: "custom ✎" }
+    ]
   }
 };
 // SVG path for a curve — t in 0..1 → y in 0..1 (1 at top of card,
 // 0 at bottom). Returns an "M x,y L ..." path string scaled to the
-// preview viewport.
-function rampSvgPath(option, kind, w, h) {
+// preview viewport. For Ramp's "custom" option, samples the saved
+// curveTable; for the analytic presets, evaluates the matching fn.
+function rampSvgPath(option, kind, w, h, node) {
   const samples = 32;
   const pts = [];
+  // Helper closures pick the y value for a given t depending on kind+option.
+  let yAt;
+  if (kind === "slider") {
+    const fn = (SLIDER_CURVES[option.key] || SLIDER_CURVES.linear).fwd;
+    yAt = fn;
+  } else if (kind === "button") {
+    if (option.key === "pulse")        yAt = (t, i) => i === 0 ? 1 : 0;
+    else if (option.key === "linRamp") yAt = t => 1 - t;
+    else /* expDecay */                yAt = t => (1 - t) * (1 - t);
+  } else /* ramp */ {
+    if (option.key === "custom") {
+      const tbl = (node && Array.isArray(node.params.curveTable) && node.params.curveTable.length)
+        ? node.params.curveTable
+        : defaultCurveTable();
+      const N = tbl.length;
+      yAt = t => {
+        const fi = t * (N - 1);
+        const i0 = Math.floor(fi), i1 = Math.min(N - 1, i0 + 1);
+        return tbl[i0] * (1 - (fi - i0)) + tbl[i1] * (fi - i0);
+      };
+    } else if (option.key === "log")        yAt = t => Math.log10(1 + 9 * t);
+    else if (option.key === "exp")          yAt = t => t * t;
+    else if (option.key === "sCurve")       yAt = t => t * t * (3 - 2 * t);
+    else if (option.key === "expSteep")     yAt = t => t * t * t * t;
+    else /* linear */                       yAt = t => t;
+  }
   for (let i = 0; i <= samples; i++) {
     const t = i / samples;
-    let y;
-    if (kind === "slider") {
-      const fn = (SLIDER_CURVES[option.key] || SLIDER_CURVES.linear).fwd;
-      y = fn(t);
-    } else {
-      // Button: visualise the gate-output ENVELOPE — flipped time
-      // axis (0 = trigger, 1 = end of envelope), value 0..1.
-      if (option.key === "pulse") y = i === 0 ? 1 : 0;       // single spike at the start
-      else if (option.key === "linRamp")  y = 1 - t;         // linear 1→0
-      else /* expDecay */                  y = (1 - t) * (1 - t);
-    }
+    const y = Math.max(0, Math.min(1, yAt(t, i)));
     const x = (t * w).toFixed(1);
     const py = ((1 - y) * h).toFixed(1);
     pts.push((i === 0 ? "M" : "L") + x + "," + py);
   }
   return pts.join(" ");
+}
+
+/* Drawable curve canvas. Rendered into the modal body when the user
+ * picks "custom" on a ramp-editable node. Free-draw: click+drag sets
+ * the y value at each sampled x position; gaps between consecutive
+ * pointer samples are linearly interpolated so a fast drag still
+ * fills the table cleanly. Reset restores identity. */
+function buildCurveDrawPane(node) {
+  const W = 480, H = 180;
+  const pad = 8;
+  const plotW = W - pad * 2;
+  const plotH = H - pad * 2;
+  const tbl = (node.params && Array.isArray(node.params.curveTable) && node.params.curveTable.length)
+    ? node.params.curveTable.slice()
+    : defaultCurveTable();
+  if (!node.params) node.params = {};
+  node.params.curveTable = tbl;
+  const N = tbl.length;
+
+  const pane = document.createElement("div");
+  pane.className = "curve-draw-pane";
+  pane.innerHTML =
+    '<svg class="curve-draw-svg" viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none">' +
+      '<line class="curve-grid" x1="' + pad + '" y1="' + (pad + plotH * 0.5) + '" x2="' + (W - pad) + '" y2="' + (pad + plotH * 0.5) + '" />' +
+      '<line class="curve-grid" x1="' + (pad + plotW * 0.5) + '" y1="' + pad + '" x2="' + (pad + plotW * 0.5) + '" y2="' + (H - pad) + '" />' +
+      '<line class="curve-grid" x1="' + pad + '" y1="' + pad + '" x2="' + (W - pad) + '" y2="' + pad + '" />' +
+      '<line class="curve-grid" x1="' + pad + '" y1="' + (H - pad) + '" x2="' + (W - pad) + '" y2="' + (H - pad) + '" />' +
+      '<path class="curve-fill"  d="" />' +
+      '<path class="curve-line"  d="" />' +
+      '<text class="curve-axis-label" x="' + (pad + 2) + '" y="' + (pad + 10) + '">1.0</text>' +
+      '<text class="curve-axis-label" x="' + (pad + 2) + '" y="' + (H - pad - 2) + '">0.0</text>' +
+      '<text class="curve-axis-label" x="' + (W - pad - 22) + '" y="' + (H - pad - 2) + '">1.0</text>' +
+    '</svg>' +
+    '<div class="curve-draw-actions">' +
+      '<button class="btn" id="btn-curve-reset">Reset to linear</button>' +
+      '<button class="btn" id="btn-curve-smooth">Smooth</button>' +
+      '<button class="btn primary" id="btn-curve-done">Done</button>' +
+    '</div>';
+
+  const svg = pane.querySelector(".curve-draw-svg");
+  const fillPath = pane.querySelector(".curve-fill");
+  const linePath = pane.querySelector(".curve-line");
+
+  function tableToPathData() {
+    const pts = [];
+    for (let i = 0; i < N; i++) {
+      const x = pad + (i / (N - 1)) * plotW;
+      const y = pad + (1 - tbl[i]) * plotH;
+      pts.push((i === 0 ? "M" : "L") + x.toFixed(1) + "," + y.toFixed(1));
+    }
+    return pts.join(" ");
+  }
+  function refreshPaths() {
+    const d = tableToPathData();
+    linePath.setAttribute("d", d);
+    fillPath.setAttribute("d", d + ` L ${pad + plotW},${pad + plotH} L ${pad},${pad + plotH} Z`);
+  }
+  function paintFromPointer(ev, prev) {
+    const r = svg.getBoundingClientRect();
+    const cx = ev.clientX - r.left;
+    const cy = ev.clientY - r.top;
+    // Map to plot coords (pad-aware, scaled to viewBox).
+    const sx = W / r.width;
+    const sy = H / r.height;
+    const px = (cx * sx - pad) / plotW;       // 0..1 normalized x
+    const py = 1 - (cy * sy - pad) / plotH;   // 0..1 normalized y, inverted
+    const i = Math.round(Math.max(0, Math.min(1, px)) * (N - 1));
+    const v = Math.max(0, Math.min(1, py));
+    if (prev && prev.i !== undefined) {
+      // Linear-interp fill between consecutive pointer samples so a
+      // fast drag still writes every bin in between.
+      const lo = Math.min(prev.i, i), hi = Math.max(prev.i, i);
+      if (hi > lo) {
+        const a = (lo === prev.i) ? prev.v : v;
+        const b = (lo === prev.i) ? v : prev.v;
+        for (let k = lo; k <= hi; k++) {
+          const t = (k - lo) / (hi - lo);
+          tbl[k] = a * (1 - t) + b * t;
+        }
+      } else {
+        tbl[i] = v;
+      }
+    } else {
+      tbl[i] = v;
+    }
+    refreshPaths();
+    return { i, v };
+  }
+  let last = null;
+  svg.addEventListener("pointerdown", ev => {
+    ev.preventDefault();
+    svg.setPointerCapture(ev.pointerId);
+    last = paintFromPointer(ev, null);
+    pushHistory("curve:" + node.id);
+  });
+  svg.addEventListener("pointermove", ev => {
+    if (!last) return;
+    last = paintFromPointer(ev, last);
+  });
+  function endStroke() {
+    last = null;
+    // Re-render the patch + monitor + active card preview so the
+    // changes ripple through to codegen.
+    renderCode(); renderJson();
+    refreshActiveCardPreview();
+  }
+  svg.addEventListener("pointerup",     endStroke);
+  svg.addEventListener("pointercancel", endStroke);
+  svg.addEventListener("pointerleave", () => { if (last) endStroke(); });
+
+  pane.querySelector("#btn-curve-reset").addEventListener("click", () => {
+    pushHistory("curve:" + node.id);
+    for (let i = 0; i < N; i++) tbl[i] = i / (N - 1);
+    refreshPaths();
+    renderCode(); renderJson();
+    refreshActiveCardPreview();
+  });
+  pane.querySelector("#btn-curve-smooth").addEventListener("click", () => {
+    pushHistory("curve:" + node.id);
+    const nxt = tbl.slice();
+    for (let i = 1; i < N - 1; i++) nxt[i] = (tbl[i - 1] + tbl[i] + tbl[i + 1]) / 3;
+    for (let i = 0; i < N; i++) tbl[i] = nxt[i];
+    refreshPaths();
+    renderCode(); renderJson();
+    refreshActiveCardPreview();
+  });
+  pane.querySelector("#btn-curve-done").addEventListener("click", closeRampModal);
+
+  function refreshActiveCardPreview() {
+    // Update the preview SVG inside the "custom" card so it mirrors
+    // the drawing as the user paints.
+    const grid = document.getElementById("ramp-grid");
+    if (!grid) return;
+    const customCard = grid.querySelector('.ramp-card[data-key="custom"]');
+    if (!customCard) return;
+    const path = customCard.querySelector("path");
+    if (!path) return;
+    const d = rampSvgPath({ key: "custom" }, "ramp", 220, 56, node);
+    path.setAttribute("d", d);
+  }
+
+  refreshPaths();
+  return pane;
 }
 function openRampModal(kind, nodeId) {
   const cfg = RAMP_CONFIG[kind];
@@ -9856,16 +10174,21 @@ function openRampModal(kind, nodeId) {
   const noteEl  = document.getElementById("ramp-modal-note");
   const grid    = document.getElementById("ramp-grid");
   const modal   = document.getElementById("ramp-modal");
-  if (!titleEl || !grid || !modal) return;
+  const body    = modal && modal.querySelector(".modal-body");
+  if (!titleEl || !grid || !modal || !body) return;
   titleEl.textContent = cfg.title + " · " + node.id;
   noteEl.textContent  = cfg.note;
   const current = (node.params && node.params[cfg.paramKey]) || cfg.defaultKey;
+  // Tear down any previously-injected drawing pane before rebuilding.
+  const oldPane = body.querySelector(".curve-draw-pane");
+  if (oldPane) oldPane.remove();
   grid.innerHTML = "";
   const svgW = 220, svgH = 56;
   cfg.options.forEach(opt => {
     const card = document.createElement("div");
     card.className = "ramp-card" + (opt.key === current ? " active" : "");
-    const path = rampSvgPath(opt, kind, svgW, svgH);
+    card.dataset.key = opt.key;
+    const path = rampSvgPath(opt, kind, svgW, svgH, node);
     card.innerHTML =
       '<svg viewBox="0 0 ' + svgW + ' ' + svgH + '" preserveAspectRatio="none">' +
         '<path d="' + path + '" fill="none" stroke="var(--accent)" stroke-width="1.5" />' +
@@ -9874,17 +10197,29 @@ function openRampModal(kind, nodeId) {
     card.addEventListener("click", () => {
       pushHistory("ramp:" + nodeId);
       node.params[cfg.paramKey] = opt.key;
+      // Initialize the LUT lazily on first switch to "custom" so the
+      // user has something to draw on.
+      if (opt.key === "custom" && (!Array.isArray(node.params.curveTable) || !node.params.curveTable.length)) {
+        node.params.curveTable = defaultCurveTable();
+      }
       grid.querySelectorAll(".ramp-card").forEach(c => c.classList.remove("active"));
       card.classList.add("active");
-      // Re-render so live audio (slider) or codegen (button) reflect
-      // the new pick. For button we also need to re-Play — the shape
-      // is constructor-only — but rendering the controls panel keeps
-      // the popup state consistent.
       renderMonitorControls();
       renderCode(); renderJson();
+      // Show / hide the drawing pane based on selection.
+      const existingPane = body.querySelector(".curve-draw-pane");
+      if (opt.key === "custom" && cfg.paramKey === "shape" && kind === "ramp") {
+        if (!existingPane) body.appendChild(buildCurveDrawPane(node));
+      } else if (existingPane) {
+        existingPane.remove();
+      }
     });
     grid.appendChild(card);
   });
+  // If we opened straight into "custom" mode, inject the drawing pane up front.
+  if (current === "custom" && kind === "ramp") {
+    body.appendChild(buildCurveDrawPane(node));
+  }
   modal.style.display = "flex";
 }
 function closeRampModal() {
