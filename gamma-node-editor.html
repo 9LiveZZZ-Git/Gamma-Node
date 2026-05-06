@@ -5542,15 +5542,46 @@ const TYPES = {
     gateMethods: { trig: "phase(0.f)" },
     description: "Bandlimited impulse train. Optional trig resets phase."
   },
+  /* LFO + Triangle — both wrapped in GammaLFOWrap below. Reason:
+   * gam::LFO inherits Accum::operator() which returns bool (true
+   * once per phase wrap), so calling `n()` directly gave a sparse
+   * impulse train, not the LFO's actual waveshape. The wrapper
+   * picks one of LFO's named output methods (.tri / .sqr / .up /
+   * .down / .pulse / .para) based on the shape param. Triangle is
+   * the same wrapper with shape locked to 0 in the registry, no
+   * UI dropdown. */
   LFO: {
     category: "Oscillator", color: COLOR.oscillator, header: "Oscillator",
-    cppType: "gam::LFO<>",
+    cppType: "GammaLFOWrap",
+    helperClass:
+`class GammaLFOWrap {
+    gam::LFO<> lfo_;
+    int shape_ = 0;       // 0=tri, 1=sqr, 2=up, 3=down, 4=pulse, 5=para, 6=sinPara
+public:
+    void freq(float v)    { lfo_.freq(v); }
+    void mod(float v)     { lfo_.mod(v); }
+    void phase(float p)   { lfo_.phase(p); }
+    void setShape(float s){ shape_ = (int)s; }
+    float operator()() {
+        switch (shape_) {
+            case 1: return lfo_.sqr();
+            case 2: return lfo_.up();
+            case 3: return lfo_.down();
+            case 4: return lfo_.pulse();
+            case 5: return lfo_.para();
+            case 6: return lfo_.sinPara();
+            default: return lfo_.tri();
+        }
+    }
+};`,
     ins: [{n:"trig", t:"gate"}, {n:"freq", t:"param"}, {n:"mod", t:"param"}],
     outs: [{n:"out", t:"audio"}],
-    params: { freq: 1, mod: 0.5 },
-    methods: { freq: "freq", mod: "mod" },
+    params: { freq: 1, mod: 0.5, shape: "tri" },
+    methods: { freq: "freq", mod: "mod", shape: "setShape" },
+    paramOptions: { shape: ["tri", "sqr", "up", "down", "pulse", "para", "sinPara"] },
+    enumMap:      { shape: { tri: "0", sqr: "1", up: "2", down: "3", pulse: "4", para: "5", sinPara: "6" } },
     gateMethods: { trig: "phase(0.f)" },
-    description: "Low-freq oscillator. Optional trig resets phase (sync to clock)."
+    description: "Low-freq oscillator. shape picks the output waveform; mod adjusts pulse-width / wave-morph (used by sqr / pulse / stair shapes). Optional trig resets phase to 0 (sync to clock)."
   },
   Buzz: {
     category: "Oscillator", color: COLOR.oscillator, header: "Oscillator",
@@ -5600,26 +5631,58 @@ const TYPES = {
     gateMethods: { trig: "phase(0.f)" },
     description: "Complex sine (rotates on unit circle). Optional trig resets phase."
   },
+  /* Triangle — same wrapper as LFO, shape pinned to 0 (= .tri()).
+   * The previous registry was broken multiple ways: amp setter
+   * didn't exist on LFO, .mode()/::TRI weren't real members, and
+   * the bare `n()` returns bool from Accum's operator(). All gone
+   * now via the GammaLFOWrap helper (defined on the LFO entry,
+   * deduped in codegen). */
   Triangle: {
     category: "Oscillator", color: COLOR.oscillator, header: "Oscillator",
-    cppType: "gam::LFO<>",
+    cppType: "GammaLFOWrap",
+    helperClass:
+`class GammaLFOWrap {
+    gam::LFO<> lfo_;
+    int shape_ = 0;
+public:
+    void freq(float v)    { lfo_.freq(v); }
+    void mod(float v)     { lfo_.mod(v); }
+    void phase(float p)   { lfo_.phase(p); }
+    void setShape(float s){ shape_ = (int)s; }
+    float operator()() {
+        switch (shape_) {
+            case 1: return lfo_.sqr();
+            case 2: return lfo_.up();
+            case 3: return lfo_.down();
+            case 4: return lfo_.pulse();
+            case 5: return lfo_.para();
+            case 6: return lfo_.sinPara();
+            default: return lfo_.tri();
+        }
+    }
+};`,
     ins: [{n:"trig", t:"gate"}, {n:"freq", t:"param"}],
     outs: [{n:"out", t:"audio"}],
-    params: { freq: 220, amp: 1 },
-    methods: { freq: "freq", amp: "amp" },
+    params: { freq: 220 },
+    methods: { freq: "freq" },
     gateMethods: { trig: "phase(0.f)" },
-    extraCtor: ["{id}.mode(gam::LFO<>::TRI);"],
-    description: "Bandlimited triangle (LFO in TRI mode). Optional trig resets phase."
+    description: "Bandlimited triangle (LFO in tri mode, audio-rate). Optional trig resets phase to 0."
   },
+  /* TableSine — gam::TableSine<> doesn't exist. The class was
+   * referenced in Gamma's docstrings but never declared. Aliasing
+   * to gam::Sine (the polynomial-approximation sine, not actually
+   * table-based) so the node still functions; the description
+   * walks back the "table" claim. Doesn't need its own helper —
+   * the cppType, methods, ins/outs are identical to plain Sine. */
   TableSine: {
     category: "Oscillator", color: COLOR.oscillator, header: "Oscillator",
-    cppType: "gam::TableSine<>",
+    cppType: "gam::Sine<>",
     ins: [{n:"trig", t:"gate"}, {n:"freq", t:"param"}],
     outs: [{n:"out", t:"audio"}],
     params: { freq: 440 },
     methods: { freq: "freq" },
     gateMethods: { trig: "phase(0.f)" },
-    description: "Pre-computed sine table — cheaper than Sine when freq is fixed. Optional trig resets phase."
+    description: "Sine wave (alias of Sine — the original gam::TableSine class doesn't exist in this Gamma checkout). Optional trig resets phase."
   },
   Sweep: {
     category: "Oscillator", color: COLOR.oscillator, header: "Oscillator",
@@ -8438,21 +8501,22 @@ public:
   },
 
   /* ---- Multi-output (codegen binds these to a temporary; consumers index into it) ---- */
+  /* gam::Pan (NOT Pan2 — that name was a registry typo). operator()(in)
+   * returns Vec<2,T> which exposes [0]=L and [1]=R. setter is .pos. */
   Pan2: {
     category: "Effect", color: COLOR.effect, header: "Effects",
-    cppType: "gam::Pan2<>",
+    cppType: "gam::Pan<>",
     ins: [{n:"in", t:"audio"}, {n:"pan", t:"param"}],
-    // outs[*].access is the suffix appended to the bound `_id` to read
-    // each port. For Gamma's Pan2 the call returns a Vec2-like with
-    // [0]=L, [1]=R. If your Gamma version uses .first/.second instead,
-    // change the access strings here — the codegen path is the same.
     outs: [{n:"L", t:"audio", access: "[0]"}, {n:"R", t:"audio", access: "[1]"}],
     params: { pan: 0 },
     methods: { pan: "pos" },
     description: "Equal-power stereo panner. pan ∈ [-1, 1]."
   },
+  /* gam::Hilbert lives in Filter.h, not Effects.h. operator()(in)
+   * returns a gam::Complex which exposes [0]=real and [1]=imag —
+   * the existing access pattern is correct. */
   Hilbert: {
-    category: "Effect", color: COLOR.effect, header: "Effects",
+    category: "Effect", color: COLOR.effect, header: "Filter",
     cppType: "gam::Hilbert<>",
     ins: [{n:"in", t:"audio"}],
     outs: [{n:"real", t:"audio", access: "[0]"}, {n:"imag", t:"audio", access: "[1]"}],
@@ -8461,14 +8525,24 @@ public:
   },
 
   /* ---- Effects (Effects.h) ---- */
+  /* gam::ReverbMS lives in Spatial.h, NOT Effects.h. The previous
+   * `header: "Effects"` was including the wrong file → compile fail.
+   * It also requires a one-time .resize(flavor) call before output
+   * is non-zero — the default-constructed reverb has zero combs and
+   * zero allpasses, which routes input → silence. extraCtor below
+   * sets it to FREEVERB on instantiation (Jezar's algorithm: 8
+   * combs + 4 allpasses). decay() and damping() are the chained
+   * setters; both return ReverbMS&, so the patch ctor's chained
+   * call site has to discard them — already what generateCode does. */
   ReverbMS: {
-    category: "Effect", color: COLOR.effect, header: "Effects",
+    category: "Effect", color: COLOR.effect, header: "Spatial",
     cppType: "gam::ReverbMS<>",
     ins: [{n:"in", t:"audio"}],
     outs: [{n:"out", t:"audio"}],
-    params: { decay: 0.85 },
-    methods: { decay: "decay" },
-    description: "Moorer-Schroeder reverb"
+    params: { decay: 0.85, damping: 0.5 },
+    methods: { decay: "decay", damping: "damping" },
+    extraCtor: ["{id}.resize(gam::FREEVERB);"],
+    description: "Moorer-Schroeder reverb (Jezar's Freeverb topology — 8 combs + 4 allpasses). decay sets the comb-loop gain; damping sets the per-comb low-pass amount."
   },
   Burst: {
     category: "Effect", color: COLOR.effect, header: "Effects",
@@ -8478,14 +8552,18 @@ public:
     params: {},
     description: "Filtered noise burst (configure freq1/freq2/decay in ctor by hand)"
   },
+  /* The Gamma class is gam::Pluck (not PluckedString — that was a
+   * registry typo). Self-driven (no audio input — the helper has its
+   * own internal noise + decay envelope); trig fires reset() to
+   * restart the envelope. */
   PluckedString: {
     category: "Effect", color: COLOR.effect, header: "Effects",
-    cppType: "gam::PluckedString",
+    cppType: "gam::Pluck",
     ins: [{n:"trig", t:"gate"}, {n:"freq", t:"param"}],
     outs: [{n:"out", t:"audio"}],
     params: { freq: 220 },
     methods: { freq: "freq" },
-    description: "Karplus-Strong plucked string"
+    description: "Karplus-Strong plucked string (Gamma's gam::Pluck — internal noise + decay envelope, comb-filter delay loop)."
   },
   FreqShift: {
     category: "Effect", color: COLOR.effect, header: "Effects",
@@ -8496,8 +8574,9 @@ public:
     methods: { freq: "freq" },
     description: "Hilbert-based frequency shifter"
   },
+  /* gam::Chirplet lives in Oscillator.h, not Effects.h. */
   Chirplet: {
-    category: "Effect", color: COLOR.effect, header: "Effects",
+    category: "Effect", color: COLOR.effect, header: "Oscillator",
     cppType: "gam::Chirplet<>",
     ins: [{n:"trig", t:"gate"}],
     outs: [{n:"out", t:"audio"}],
@@ -8525,23 +8604,26 @@ public:
   },
 
   /* ---- Conversion (scl::, inline functions) ---- */
+  /* Inline math — `gam::scl::mtof` / `ftom` aren't actually in
+   * Gamma (only the dB-conversion helpers are). The standard
+   * MIDI conversion is two lines of cmath; emit it directly. */
   MtoF: {
-    category: "Convert", color: COLOR.convert, header: null,
+    category: "Convert", color: COLOR.convert, header: "cmath",
     cppType: "",
     ins: [{n:"in", t:"audio"}],
     outs: [{n:"out", t:"audio"}],
     params: {},
-    template: "gam::scl::mtof({in})",
-    description: "MIDI note → frequency (Hz)"
+    template: "(440.f * powf(2.f, ({in} - 69.f) / 12.f))",
+    description: "MIDI note → frequency (Hz). 69 = A4 = 440 Hz reference."
   },
   FtoM: {
-    category: "Convert", color: COLOR.convert, header: null,
+    category: "Convert", color: COLOR.convert, header: "cmath",
     cppType: "",
     ins: [{n:"in", t:"audio"}],
     outs: [{n:"out", t:"audio"}],
     params: {},
-    template: "gam::scl::ftom({in})",
-    description: "Frequency (Hz) → MIDI note"
+    template: "(69.f + 12.f * log2f({in} / 440.f))",
+    description: "Frequency (Hz) → MIDI note. Inverse of MtoF."
   },
   DBtoA: {
     category: "Convert", color: COLOR.convert, header: null,
