@@ -3649,6 +3649,651 @@ const TYPES = {
     description: "Linear ramp from 0 to 1, then wraps. Useful as a phase source. trig restarts the ramp."
   },
 
+  /* ============================================================
+   * Composite oscillators — synthesis primitives implemented as
+   * helper classes (not direct gam:: bindings). Each maintains its
+   * own phase + state and uses std::sin / std::pow from <cmath>.
+   * Naive (non-bandlimited) — fine for use cases where the user
+   * stacks an anti-aliased filter or runs at high sample-rates;
+   * a bandlimited variant pass can swap implementations later
+   * without changing the registry shape.
+   * ============================================================ */
+
+  /* Wavetable oscillator — single-cycle 256-sample table looked up
+   * with linear interpolation. The table is initialized from a
+   * `shape` enum at constructor time (sine / saw / square / triangle
+   * / halfSine / noise / hollow / spike). A future revision will add
+   * a drawable wavetable editor (kind: "waveTable" hook reserved). */
+  WavetableOsc: {
+    category: "Oscillator", color: COLOR.oscillator, header: null,
+    cppType: "GammaWavetableOsc",
+    helperClass:
+`class GammaWavetableOsc {
+    static constexpr int N = 256;
+    float table_[N];
+    float phase_ = 0.f;
+    float freq_ = 220.f;
+    float sr_ = 48000.f;
+public:
+    GammaWavetableOsc() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+        // Sine fallback so the osc produces sound out of the box.
+        for (int i = 0; i < N; i++) table_[i] = std::sin(2.f * 3.14159265f * i / N);
+    }
+    void setFreq(float f) { freq_ = f; }
+    void setShape(float s) {
+        const int sh = (int)s;
+        for (int i = 0; i < N; i++) {
+            const float t = (float)i / N;
+            switch (sh) {
+                case 0: table_[i] = std::sin(2.f * 3.14159265f * t);                 break; // sine
+                case 1: table_[i] = 2.f * t - 1.f;                                   break; // saw
+                case 2: table_[i] = (t < 0.5f) ? 1.f : -1.f;                          break; // square
+                case 3: table_[i] = (t < 0.5f) ? (4.f*t - 1.f) : (3.f - 4.f*t);       break; // triangle
+                case 4: table_[i] = (t < 0.5f) ? std::sin(2.f * 3.14159265f * t) : 0.f; break; // halfSine
+                case 5: { unsigned r = (unsigned)i * 1664525u + 1013904223u;
+                          table_[i] = ((float)((r >> 8) & 0xFFFFu) / 32768.f - 1.f); break; } // noise
+                case 6: table_[i] = std::sin(2.f * 3.14159265f * t)
+                                  - 0.5f * std::sin(4.f * 3.14159265f * t);          break; // hollow
+                case 7: table_[i] = (t < 0.05f || t > 0.95f) ? 1.f : 0.f;            break; // spike
+                default: table_[i] = std::sin(2.f * 3.14159265f * t);
+            }
+        }
+    }
+    void setTable(const float* src, int n) {
+        if (n > N) n = N;
+        for (int i = 0; i < n; i++) table_[i] = src[i];
+    }
+    void reset() { phase_ = 0.f; }
+    float operator()() {
+        phase_ += freq_ / sr_;
+        if (phase_ >= 1.f) phase_ -= (int)phase_;
+        if (phase_ < 0.f)  phase_ += 1.f - (int)phase_;
+        const float fi = phase_ * N;
+        const int   i0 = (int)fi;
+        const int   i1 = i0 < N - 1 ? i0 + 1 : 0;
+        const float t  = fi - i0;
+        return table_[i0] * (1.f - t) + table_[i1] * t;
+    }
+};`,
+    ins: [
+      { n: "trig", t: "gate" },
+      { n: "freq", t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { freq: 220, shape: "sine" },
+    methods: { freq: "setFreq", shape: "setShape" },
+    paramOptions: { shape: ["sine", "saw", "square", "triangle", "halfSine", "noise", "hollow", "spike"] },
+    enumMap:      { shape: { sine: "0", saw: "1", square: "2", triangle: "3", halfSine: "4", noise: "5", hollow: "6", spike: "7" } },
+    gateMethods: { trig: "reset" },
+    extraHeaders: ["<cmath>"],
+    // No extraCtor needed — the methods.shape entry causes the
+    // codegen to emit `setShape(<enum>)` at construction time, which
+    // initializes the table to the picked preset.
+    description: "Wavetable oscillator — single-cycle 256-sample table, linearly interpolated. Pick a shape preset (sine / saw / square / triangle / halfSine / noise / hollow / spike). Wire trig to reset phase. Drawable wavetable editor is on the roadmap."
+  },
+
+  /* Pulse-Width-Modulated square. width = 0.5 is a 50% duty square;
+   * 0.0..1.0 sweeps the pulse width. Wire an LFO into `width` for
+   * classic PWM motion. Naive (aliasing above ~3kHz at 48k SR);
+   * stack an anti-aliasing lowpass downstream for clean tone. */
+  PulsePWM: {
+    category: "Oscillator", color: COLOR.oscillator, header: null,
+    cppType: "GammaPulsePWM",
+    helperClass:
+`class GammaPulsePWM {
+    float phase_ = 0.f;
+    float freq_ = 220.f;
+    float width_ = 0.5f;
+    float sr_ = 48000.f;
+public:
+    GammaPulsePWM() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+    }
+    void setFreq(float f) { freq_ = f; }
+    void setWidth(float w) { width_ = w; }
+    void reset() { phase_ = 0.f; }
+    float operator()() {
+        phase_ += freq_ / sr_;
+        if (phase_ >= 1.f) phase_ -= (int)phase_;
+        if (phase_ < 0.f)  phase_ += 1.f - (int)phase_;
+        const float w = width_ < 0.01f ? 0.01f : (width_ > 0.99f ? 0.99f : width_);
+        return phase_ < w ? 1.f : -1.f;
+    }
+};`,
+    ins: [
+      { n: "trig", t: "gate" },
+      { n: "freq", t: "param" },
+      { n: "width", t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { freq: 220, width: 0.5 },
+    methods: { freq: "setFreq", width: "setWidth" },
+    gateMethods: { trig: "reset" },
+    description: "Pulse-Width-Modulated square. width 0..1 sets duty cycle (0.5 = symmetric). Wire LFO into width for PWM. Naive (aliases above ~3kHz at 48k); follow with a lowpass for clean tone."
+  },
+
+  /* Supersaw — 7 detuned saws summed. Classic JP-8000 "Roland trance"
+   * sound. detune controls the spread (0 = unison, 1 = wide); mix
+   * blends the 6 side voices vs the center voice (0 = pure center,
+   * 1 = pure sides). The default mix=0.7 gives the characteristic
+   * "shimmery" supersaw timbre. */
+  Supersaw: {
+    category: "Oscillator", color: COLOR.oscillator, header: null,
+    cppType: "GammaSupersaw",
+    helperClass:
+`class GammaSupersaw {
+    static constexpr int N = 7;
+    float phase_[N] = { 0.f, 0.13f, 0.27f, 0.41f, 0.59f, 0.71f, 0.83f };
+    float freq_ = 220.f;
+    float detune_ = 0.3f;
+    float mix_ = 0.7f;
+    float sr_ = 48000.f;
+public:
+    GammaSupersaw() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+    }
+    void setFreq(float f) { freq_ = f; }
+    void setDetune(float d) { detune_ = d; }
+    void setMix(float m) { mix_ = m; }
+    void reset() { for (int i = 0; i < N; i++) phase_[i] = (float)i * 0.137f; }
+    float operator()() {
+        // Voice freq ratios — center + 3 above + 3 below, in cents.
+        // Curve from Adam Szabo's "How to Emulate the Super Saw".
+        static constexpr float ratios[N] = {
+            1.f, 1.0079f, 1.0158f, 1.0237f, 0.9921f, 0.9844f, 0.9766f
+        };
+        float out = 0.f;
+        for (int i = 0; i < N; i++) {
+            const float r = 1.f + (ratios[i] - 1.f) * detune_;
+            phase_[i] += (freq_ * r) / sr_;
+            if (phase_[i] >= 1.f) phase_[i] -= (int)phase_[i];
+            if (phase_[i] < 0.f)  phase_[i] += 1.f - (int)phase_[i];
+            const float saw = 2.f * phase_[i] - 1.f;
+            const float w = (i == 0) ? (1.f - mix_) : (mix_ / 6.f);
+            out += saw * w;
+        }
+        return out;
+    }
+};`,
+    ins: [
+      { n: "trig", t: "gate" },
+      { n: "freq", t: "param" },
+      { n: "detune", t: "param" },
+      { n: "mix",  t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { freq: 220, detune: 0.3, mix: 0.7 },
+    methods: { freq: "setFreq", detune: "setDetune", mix: "setMix" },
+    gateMethods: { trig: "reset" },
+    description: "Supersaw — 7 detuned saws summed (JP-8000 style). detune sets spread (0..1); mix blends side voices vs center (0=center, 1=sides). Iconic '90s trance / EDM lead sound."
+  },
+
+  /* 2-operator FM — carrier sine modulated by a second sine. ratio
+   * sets modulator-to-carrier freq ratio (1.0 = same; 2.0 = octave
+   * up; 0.5 = octave down; non-integer = inharmonic / metallic).
+   * index controls modulation depth in radians (0..10 typical). */
+  FMOp: {
+    category: "Oscillator", color: COLOR.oscillator, header: null,
+    cppType: "GammaFMOp",
+    helperClass:
+`class GammaFMOp {
+    float pCar_ = 0.f, pMod_ = 0.f;
+    float freq_ = 220.f, ratio_ = 1.f, index_ = 1.f;
+    float sr_ = 48000.f;
+public:
+    GammaFMOp() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+    }
+    void setFreq(float f) { freq_ = f; }
+    void setRatio(float r) { ratio_ = r; }
+    void setIndex(float i) { index_ = i; }
+    void reset() { pCar_ = 0.f; pMod_ = 0.f; }
+    float operator()() {
+        pMod_ += (freq_ * ratio_) / sr_;
+        if (pMod_ >= 1.f) pMod_ -= (int)pMod_;
+        if (pMod_ < 0.f)  pMod_ += 1.f - (int)pMod_;
+        const float mod = std::sin(2.f * 3.14159265f * pMod_) * index_;
+        pCar_ += freq_ / sr_;
+        if (pCar_ >= 1.f) pCar_ -= (int)pCar_;
+        if (pCar_ < 0.f)  pCar_ += 1.f - (int)pCar_;
+        return std::sin(2.f * 3.14159265f * pCar_ + mod);
+    }
+};`,
+    ins: [
+      { n: "trig", t: "gate" },
+      { n: "freq", t: "param" },
+      { n: "ratio", t: "param" },
+      { n: "index", t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { freq: 220, ratio: 1.0, index: 1.0 },
+    methods: { freq: "setFreq", ratio: "setRatio", index: "setIndex" },
+    gateMethods: { trig: "reset" },
+    extraHeaders: ["<cmath>"],
+    description: "2-op FM — carrier sine + modulator sine. ratio = modulator/carrier freq (integers = harmonic; non-integers = bell/metallic). index = modulation depth (0..10). DX-style timbres without the 6-op complexity."
+  },
+
+  /* Phase modulation oscillator — sine carrier whose phase is
+   * modulated by an audio-rate input signal (typically another
+   * oscillator's output). Wire any audio source into `pm`. depth
+   * scales the modulation. PMOsc is what real DX synths use under
+   * the hood (Yamaha called it FM but it's PM internally). */
+  PMOsc: {
+    category: "Oscillator", color: COLOR.oscillator, header: null,
+    cppType: "GammaPMOsc",
+    helperClass:
+`class GammaPMOsc {
+    float phase_ = 0.f;
+    float freq_ = 220.f, depth_ = 1.f;
+    float sr_ = 48000.f;
+public:
+    GammaPMOsc() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+    }
+    void setFreq(float f) { freq_ = f; }
+    void setDepth(float d) { depth_ = d; }
+    void reset() { phase_ = 0.f; }
+    float operator()(float pm) {
+        phase_ += freq_ / sr_;
+        if (phase_ >= 1.f) phase_ -= (int)phase_;
+        if (phase_ < 0.f)  phase_ += 1.f - (int)phase_;
+        return std::sin(2.f * 3.14159265f * phase_ + pm * depth_);
+    }
+};`,
+    ins: [
+      { n: "pm",   t: "audio" },
+      { n: "trig", t: "gate" },
+      { n: "freq", t: "param" },
+      { n: "depth", t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { freq: 220, depth: 1.0 },
+    methods: { freq: "setFreq", depth: "setDepth" },
+    gateMethods: { trig: "reset" },
+    extraHeaders: ["<cmath>"],
+    description: "Phase modulation oscillator — sine carrier whose phase is modulated by the `pm` audio input. depth scales the modulation (0..10 typical). The PM building block for DX-style FM patches: chain two PMOscs to build a 2-op stack."
+  },
+
+  /* Self-feedback sine — Yamaha-style. The osc's own previous output
+   * is fed back into its phase, scaled by `feedback` (0..2). At
+   * feedback ≈ 1.5 the sine breaks down into noisy / sawtooth-like
+   * output — used for percussion and noise effects on FM synths. */
+  FBSine: {
+    category: "Oscillator", color: COLOR.oscillator, header: null,
+    cppType: "GammaFBSine",
+    helperClass:
+`class GammaFBSine {
+    float phase_ = 0.f, last_ = 0.f;
+    float freq_ = 220.f, fb_ = 0.f;
+    float sr_ = 48000.f;
+public:
+    GammaFBSine() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+    }
+    void setFreq(float f) { freq_ = f; }
+    void setFeedback(float f) { fb_ = f; }
+    void reset() { phase_ = 0.f; last_ = 0.f; }
+    float operator()() {
+        phase_ += freq_ / sr_;
+        if (phase_ >= 1.f) phase_ -= (int)phase_;
+        if (phase_ < 0.f)  phase_ += 1.f - (int)phase_;
+        last_ = std::sin(2.f * 3.14159265f * phase_ + last_ * fb_);
+        return last_;
+    }
+};`,
+    ins: [
+      { n: "trig", t: "gate" },
+      { n: "freq", t: "param" },
+      { n: "feedback", t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { freq: 220, feedback: 0.0 },
+    methods: { freq: "setFreq", feedback: "setFeedback" },
+    gateMethods: { trig: "reset" },
+    extraHeaders: ["<cmath>"],
+    description: "Self-feedback sine — output is fed back into phase. feedback 0..2; at ≈1.5 the sine breaks into saw-like noise (DX percussion trick). Standalone DX op approximation."
+  },
+
+  /* Phase distortion (Casio CZ-style) — warps the phase ramp through
+   * a kink at `amount` before the sine lookup, producing harmonics
+   * that sweep with `amount`. amount=0.5 ≈ pure sine; lower or higher
+   * values bend the spectrum. The CZ-101's signature timbre. */
+  PhaseDistortion: {
+    category: "Oscillator", color: COLOR.oscillator, header: null,
+    cppType: "GammaPhaseDistortion",
+    helperClass:
+`class GammaPhaseDistortion {
+    float phase_ = 0.f;
+    float freq_ = 220.f, amount_ = 0.5f;
+    float sr_ = 48000.f;
+public:
+    GammaPhaseDistortion() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+    }
+    void setFreq(float f) { freq_ = f; }
+    void setAmount(float a) { amount_ = a; }
+    void reset() { phase_ = 0.f; }
+    float operator()() {
+        phase_ += freq_ / sr_;
+        if (phase_ >= 1.f) phase_ -= (int)phase_;
+        if (phase_ < 0.f)  phase_ += 1.f - (int)phase_;
+        const float a = amount_ < 0.05f ? 0.05f : (amount_ > 0.95f ? 0.95f : amount_);
+        float p;
+        if (phase_ < a) p = 0.5f * phase_ / a;
+        else            p = 0.5f + 0.5f * (phase_ - a) / (1.f - a);
+        return std::sin(2.f * 3.14159265f * p);
+    }
+};`,
+    ins: [
+      { n: "trig", t: "gate" },
+      { n: "freq", t: "param" },
+      { n: "amount", t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { freq: 220, amount: 0.5 },
+    methods: { freq: "setFreq", amount: "setAmount" },
+    gateMethods: { trig: "reset" },
+    extraHeaders: ["<cmath>"],
+    description: "Phase-distortion oscillator (Casio CZ-style). `amount` warps the phase through a kink before the sine lookup — sweeping it produces harmonic motion. amount=0.5 ≈ pure sine."
+  },
+
+  /* Hard-sync oscillator pair — master saw runs at masterFreq, slave
+   * saw runs at slaveFreq but is reset to phase 0 every time the
+   * master phase wraps. Sweeping slaveFreq above masterFreq produces
+   * the characteristic sync-sweep timbre (Cars, "Just What I Needed";
+   * '80s synth-pop lead). */
+  HardSync: {
+    category: "Oscillator", color: COLOR.oscillator, header: null,
+    cppType: "GammaHardSync",
+    helperClass:
+`class GammaHardSync {
+    float phaseM_ = 0.f, phaseS_ = 0.f;
+    float freqM_ = 110.f, freqS_ = 220.f;
+    float sr_ = 48000.f;
+public:
+    GammaHardSync() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+    }
+    void setMasterFreq(float f) { freqM_ = f; }
+    void setSlaveFreq(float f)  { freqS_ = f; }
+    void reset() { phaseM_ = 0.f; phaseS_ = 0.f; }
+    float operator()() {
+        phaseM_ += freqM_ / sr_;
+        if (phaseM_ >= 1.f) {
+            phaseM_ -= (int)phaseM_;
+            phaseS_ = 0.f;  // hard-sync the slave on master wrap
+        }
+        if (phaseM_ < 0.f) phaseM_ += 1.f - (int)phaseM_;
+        phaseS_ += freqS_ / sr_;
+        if (phaseS_ >= 1.f) phaseS_ -= (int)phaseS_;
+        if (phaseS_ < 0.f)  phaseS_ += 1.f - (int)phaseS_;
+        return 2.f * phaseS_ - 1.f;
+    }
+};`,
+    ins: [
+      { n: "trig", t: "gate" },
+      { n: "master", t: "param" },
+      { n: "slave",  t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { master: 110, slave: 220 },
+    methods: { master: "setMasterFreq", slave: "setSlaveFreq" },
+    gateMethods: { trig: "reset" },
+    description: "Hard-sync oscillator pair. master sets pitch; slave generates harmonic content (sweep above master for sync-sweep). Iconic '80s synth-pop lead. Output is slave saw."
+  },
+
+  /* Karplus-Strong plucked-string synthesis. A delay line filled with
+   * noise on `pluck`, with a 2-tap lowpass in the feedback loop for
+   * natural decay. damping (0..1) controls how fast highs roll off
+   * (1 = bright, 0 = dull/dead string). feedback (0..1) sets sustain
+   * (1 = infinite, 0.99 = realistic decay). Wire trig into pluck for
+   * note-on triggering. Length is driven by setFreq → buffer length. */
+  KSString: {
+    category: "Oscillator", color: COLOR.oscillator, header: null,
+    cppType: "GammaKSString",
+    helperClass:
+`class GammaKSString {
+    static constexpr int MAX_DELAY = 4096;
+    float buf_[MAX_DELAY];
+    int   len_ = 200;
+    int   pos_ = 0;
+    float damping_ = 0.5f;
+    float feedback_ = 0.997f;
+    float prev_ = 0.f;
+    float sr_ = 48000.f;
+    unsigned rng_ = 0x12345u;
+public:
+    GammaKSString() {
+        for (int i = 0; i < MAX_DELAY; i++) buf_[i] = 0.f;
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+        setFreq(220.f);
+    }
+    void setFreq(float f) {
+        if (f < 1.f) f = 1.f;
+        len_ = (int)(sr_ / f);
+        if (len_ < 2) len_ = 2;
+        if (len_ >= MAX_DELAY) len_ = MAX_DELAY - 1;
+    }
+    void setDamping(float d)  { damping_ = d; }
+    void setFeedback(float f) { feedback_ = f; }
+    void pluck() {
+        for (int i = 0; i < len_; i++) {
+            rng_ = rng_ * 1664525u + 1013904223u;
+            buf_[i] = ((float)((rng_ >> 8) & 0xFFFFu) / 32768.f - 1.f);
+        }
+        prev_ = 0.f;
+        pos_ = 0;
+    }
+    void reset() { for (int i = 0; i < MAX_DELAY; i++) buf_[i] = 0.f; prev_ = 0.f; pos_ = 0; }
+    float operator()() {
+        const float s = buf_[pos_];
+        const float lp = 0.5f * (s + prev_);
+        prev_ = s;
+        const float filtered = damping_ * lp + (1.f - damping_) * s;
+        buf_[pos_] = filtered * feedback_;
+        pos_++;
+        if (pos_ >= len_) pos_ = 0;
+        return s;
+    }
+};`,
+    ins: [
+      { n: "trig", t: "gate" },
+      { n: "freq", t: "param" },
+      { n: "damping",  t: "param" },
+      { n: "feedback", t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { freq: 220, damping: 0.5, feedback: 0.997 },
+    methods: { freq: "setFreq", damping: "setDamping", feedback: "setFeedback" },
+    gateMethods: { trig: "pluck" },
+    description: "Karplus-Strong plucked string. trig fills the delay line with noise (the pluck); damping (0..1) sets brightness, feedback (0..1) sets sustain. freq drives the delay length (= pitch). Classic acoustic-guitar / harp / koto sound."
+  },
+
+  /* Additive oscillator — 8 sine partials with per-partial amplitude
+   * + a partial mode (harmonic / odd-only / Shepard / inharmonic).
+   * amp1..amp8 are the partial gains. Wire LFOs into them for
+   * morphing additive timbres. The harmonic series default (1, 1/2,
+   * 1/3, …, 1/8) gives a saw-like spectrum. */
+  AdditiveOsc: {
+    category: "Oscillator", color: COLOR.oscillator, header: null,
+    cppType: "GammaAdditiveOsc",
+    helperClass:
+`class GammaAdditiveOsc {
+    static constexpr int N = 8;
+    float phase_[N] = {0,0,0,0,0,0,0,0};
+    float amp_[N]   = {1.f, 0.5f, 0.333f, 0.25f, 0.2f, 0.166f, 0.143f, 0.125f};
+    float ratio_[N] = {1.f, 2.f, 3.f, 4.f, 5.f, 6.f, 7.f, 8.f};
+    float freq_ = 220.f;
+    float sr_ = 48000.f;
+public:
+    GammaAdditiveOsc() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+    }
+    void setFreq(float f) { freq_ = f; }
+    void setMode(float m) {
+        const int mode = (int)m;
+        for (int i = 0; i < N; i++) {
+            switch (mode) {
+                case 0: ratio_[i] = (float)(i + 1); break;             // harmonic 1,2,3,...
+                case 1: ratio_[i] = (float)(2*i + 1); break;            // odd-only 1,3,5,...
+                case 2: ratio_[i] = std::pow(2.f, (float)i / 2.f); break; // half-octave (Shepard-ish)
+                case 3: ratio_[i] = (float)(i + 1) + 0.07f * (float)i;  break; // slightly inharmonic (bell-ish)
+                default: ratio_[i] = (float)(i + 1);
+            }
+        }
+    }
+    void setAmp0(float a) { amp_[0] = a; }
+    void setAmp1(float a) { amp_[1] = a; }
+    void setAmp2(float a) { amp_[2] = a; }
+    void setAmp3(float a) { amp_[3] = a; }
+    void setAmp4(float a) { amp_[4] = a; }
+    void setAmp5(float a) { amp_[5] = a; }
+    void setAmp6(float a) { amp_[6] = a; }
+    void setAmp7(float a) { amp_[7] = a; }
+    void reset() { for (int i = 0; i < N; i++) phase_[i] = 0.f; }
+    float operator()() {
+        float out = 0.f;
+        for (int i = 0; i < N; i++) {
+            phase_[i] += (freq_ * ratio_[i]) / sr_;
+            if (phase_[i] >= 1.f) phase_[i] -= (int)phase_[i];
+            if (phase_[i] < 0.f)  phase_[i] += 1.f - (int)phase_[i];
+            out += std::sin(2.f * 3.14159265f * phase_[i]) * amp_[i];
+        }
+        return out;
+    }
+};`,
+    ins: [
+      { n: "trig", t: "gate" },
+      { n: "freq", t: "param" },
+      { n: "amp1", t: "param" }, { n: "amp2", t: "param" },
+      { n: "amp3", t: "param" }, { n: "amp4", t: "param" },
+      { n: "amp5", t: "param" }, { n: "amp6", t: "param" },
+      { n: "amp7", t: "param" }, { n: "amp8", t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: {
+      freq: 220, mode: "harmonic",
+      amp1: 1.0,  amp2: 0.5,  amp3: 0.333, amp4: 0.25,
+      amp5: 0.2,  amp6: 0.166, amp7: 0.143, amp8: 0.125
+    },
+    methods: {
+      freq: "setFreq", mode: "setMode",
+      amp1: "setAmp0", amp2: "setAmp1", amp3: "setAmp2", amp4: "setAmp3",
+      amp5: "setAmp4", amp6: "setAmp5", amp7: "setAmp6", amp8: "setAmp7"
+    },
+    paramOptions: { mode: ["harmonic", "odd", "shepard", "inharmonic"] },
+    enumMap:      { mode: { harmonic: "0", odd: "1", shepard: "2", inharmonic: "3" } },
+    gateMethods: { trig: "reset" },
+    extraHeaders: ["<cmath>"],
+    description: "Additive oscillator — 8 sine partials with per-partial amplitude. mode picks the partial-frequency series (harmonic 1,2,3..; odd 1,3,5..; shepard half-octave; inharmonic bell). Modulate amp1..amp8 with LFOs for morphing timbres."
+  },
+
+  /* Wavefolder (Buchla-style) — reflects the input back into [-t, t]
+   * when out of range, producing harmonic-rich folded sound. Pair
+   * with an oscillator + amplitude envelope for evolving timbres
+   * (Buchla "Easel" patches). threshold sets the fold point. */
+  Foldback: {
+    category: "Effect", color: COLOR.effect, header: null,
+    cppType: "GammaFoldback",
+    helperClass:
+`class GammaFoldback {
+    float threshold_ = 1.f;
+public:
+    void setThreshold(float t) { threshold_ = (t < 0.001f) ? 0.001f : t; }
+    float operator()(float in) {
+        float x = in;
+        const float t = threshold_;
+        // Clamp iterations to prevent infinite loops on huge inputs.
+        for (int i = 0; i < 16; i++) {
+            if (x > t)       x = 2.f * t - x;
+            else if (x < -t) x = -2.f * t - x;
+            else break;
+        }
+        return x;
+    }
+};`,
+    ins: [
+      { n: "in", t: "audio" },
+      { n: "threshold", t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { threshold: 1.0 },
+    methods: { threshold: "setThreshold" },
+    description: "Wavefolder (Buchla-style). Reflects input back into [-threshold, threshold] when it exceeds — producing harmonic-rich folded sound. Drive an oscillator hot into a Foldback for evolving timbres. Pair with envelope-modulated input gain for the classic Easel sound."
+  },
+
+  /* Multi-phasor — sum of 4 free-running phasors at user-set frequency
+   * ratios (not necessarily harmonic). Outputs the summed phase ramps
+   * (0..1 each). Useful as a multi-rate phase source for shaping
+   * other oscillators (chain into PMOsc.pm or PhaseDistortion.amount
+   * for polyrhythmic modulation). */
+  MultiPhasorOsc: {
+    category: "Oscillator", color: COLOR.oscillator, header: null,
+    cppType: "GammaMultiPhasor",
+    helperClass:
+`class GammaMultiPhasor {
+    float phase_[4] = {0.f, 0.f, 0.f, 0.f};
+    float ratio_[4] = {1.f, 2.f, 3.f, 5.f};
+    float freq_ = 1.f;
+    float sr_ = 48000.f;
+public:
+    GammaMultiPhasor() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+    }
+    void setFreq(float f)   { freq_ = f; }
+    void setRatio0(float r) { ratio_[0] = r; }
+    void setRatio1(float r) { ratio_[1] = r; }
+    void setRatio2(float r) { ratio_[2] = r; }
+    void setRatio3(float r) { ratio_[3] = r; }
+    void reset() { for (int i = 0; i < 4; i++) phase_[i] = 0.f; }
+    struct Out { float p1, p2, p3, p4, sum; };
+    Out operator()() {
+        Out o;
+        for (int i = 0; i < 4; i++) {
+            phase_[i] += (freq_ * ratio_[i]) / sr_;
+            if (phase_[i] >= 1.f) phase_[i] -= (int)phase_[i];
+            if (phase_[i] < 0.f)  phase_[i] += 1.f - (int)phase_[i];
+        }
+        o.p1 = phase_[0]; o.p2 = phase_[1]; o.p3 = phase_[2]; o.p4 = phase_[3];
+        o.sum = 0.25f * (phase_[0] + phase_[1] + phase_[2] + phase_[3]);
+        return o;
+    }
+};`,
+    ins: [
+      { n: "trig", t: "gate" },
+      { n: "freq",   t: "param" },
+      { n: "ratio1", t: "param" }, { n: "ratio2", t: "param" },
+      { n: "ratio3", t: "param" }, { n: "ratio4", t: "param" }
+    ],
+    outs: [
+      { n: "p1",  t: "audio", access: ".p1"  },
+      { n: "p2",  t: "audio", access: ".p2"  },
+      { n: "p3",  t: "audio", access: ".p3"  },
+      { n: "p4",  t: "audio", access: ".p4"  },
+      { n: "sum", t: "audio", access: ".sum" }
+    ],
+    params: { freq: 1.0, ratio1: 1.0, ratio2: 2.0, ratio3: 3.0, ratio4: 5.0 },
+    methods: {
+      freq: "setFreq",
+      ratio1: "setRatio0", ratio2: "setRatio1",
+      ratio3: "setRatio2", ratio4: "setRatio3"
+    },
+    gateMethods: { trig: "reset" },
+    description: "Multi-phasor — 4 free-running phasors at independent frequency ratios. Outputs each ramp (p1..p4, all 0..1) plus their average (sum). Useful as a multi-rate phase source for cross-modulation (PMOsc / PhaseDistortion) or polyrhythmic LFO clusters."
+  },
+
   /* ---- Noise (Noise.h) ---- */
   NoiseWhite: {
     category: "Noise", color: COLOR.noise, header: "Noise",
