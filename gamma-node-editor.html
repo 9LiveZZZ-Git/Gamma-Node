@@ -7066,31 +7066,43 @@ public:
     cppType: "GammaKeyboard",
     helperClass:
 `class GammaKeyboard {
-    float freq_ = 220.f;
-    bool  pulse_ = false;
+    /* Sustained-note source. trigger() fires a one-sample pulse on
+     * gate (key-down); release() fires a one-sample pulse on rel
+     * (key-up). Wire gate into a gate-input that starts an envelope
+     * (AD.trig / ADSR.trig) and rel into ADSR's rel input so the
+     * envelope sustains while the key is held and releases on key
+     * release. For mono triggers (AD), wiring gate alone is enough
+     * — rel can be left unconnected. */
+    float freq_   = 220.f;
+    bool  pulse_  = false;
+    bool  rPulse_ = false;
 public:
-    struct Out { float freq, gate; };
+    struct Out { float freq, gate, rel; };
     void setFreq(float v) { freq_ = v; }
-    void trigger() { pulse_ = true; }
+    void trigger() { pulse_  = true; }
+    void release() { rPulse_ = true; }
     Out operator()() {
         Out o;
         o.freq = freq_;
-        if (pulse_) { o.gate = 1.f; pulse_ = false; }
-        else        { o.gate = 0.f; }
+        o.gate = pulse_  ? 1.f : 0.f;
+        o.rel  = rPulse_ ? 1.f : 0.f;
+        pulse_  = false;
+        rPulse_ = false;
         return o;
     }
 };`,
     ins: [],
     outs: [
       { n: "freq", t: "audio", access: ".freq" },
-      { n: "gate", t: "audio", access: ".gate" }
+      { n: "gate", t: "gate",  access: ".gate" },
+      { n: "rel",  t: "gate",  access: ".rel"  }
     ],
     params: { freq: 220 },
     methods: { freq: "setFreq" },
-    gateMethods: { trig: "trigger" },
-    hostGates: ["trig"],
+    gateMethods: { trig: "trigger", rel: "release" },
+    hostGates: ["trig", "rel"],
     autoExpose: ["freq"],
-    description: "Computer keyboard → freq + gate. A–K = white keys, W,E,T,Y,U = black. Wire freq into Sine.freq for pitch and gate into AD.trig (or any gate input) for envelope retriggering."
+    description: "Computer keyboard → freq + gate + rel. A–K = white keys, W/E/T/Y/U = black. Wire freq into Sine.freq for pitch, gate into AD.trig or ADSR.trig to start the envelope, and rel into ADSR.rel for sustained notes (release on key-up)."
   },
 
   /* On-screen button. Renders as a clickable button in the Monitor
@@ -7137,7 +7149,7 @@ public:
     }
 };`,
     ins: [],
-    outs: [{ n: "gate", t: "audio" }],
+    outs: [{ n: "gate", t: "gate" }],
     params: { label: "press", shape: "pulse", duration: 100 },
     methods: { duration: "setDuration", shape: "setShape" },
     paramOptions: { shape: ["pulse", "linRamp", "expDecay", "custom"] },
@@ -15505,10 +15517,22 @@ function findKeyboardSetterIndex() {
   }
   return -1;
 }
-function listGateSetterIndices() {
+/* Gate setters split by role. "press" = anything that should fire on
+ * key-down (the default — covers AD.trig, Button.press, KeyboardIn's
+ * trigger, etc.); "release" = anything bound to a key-up event. The
+ * heuristic is purely by setter key name: "rel" / "release" are
+ * release; everything else is press. Without this split, adding
+ * KeyboardIn's rel hostGate would cause press-and-immediate-release
+ * since the JS used to fire ALL gate setters on every keydown. */
+function listGateSetterIndices(role) {
+  role = role || "press";
   const setters = collectExposedSetters();
   const out = [];
-  setters.forEach((s, i) => { if (s.isGate) out.push(i); });
+  setters.forEach((s, i) => {
+    if (!s.isGate) return;
+    const isRelease = (s.key === "rel" || s.key === "release");
+    if (role === "release" ? isRelease : !isRelease) out.push(i);
+  });
   return out;
 }
 
@@ -15530,7 +15554,9 @@ function playKeyboardNote(qwertyKey) {
     freq = midiToFreq(midi);
   }
   previewState.workletNode.port.postMessage({ type: "set", index: kbIdx, value: freq });
-  listGateSetterIndices().forEach(i => {
+  // Fire only press-style gate setters (trigger / press / reset).
+  // Release-style gates (KeyboardIn.rel / ADSR.rel) fire on key-up.
+  listGateSetterIndices("press").forEach(i => {
     previewState.workletNode.port.postMessage({ type: "set", index: i, value: 0 });
   });
   highlightPianoKey(qwertyKey, true);
@@ -15546,6 +15572,14 @@ function freqToMidi(hz) {
 function releaseKeyboardNote(qwertyKey) {
   if (!(qwertyKey in QWERTY_TO_MIDI)) return;
   highlightPianoKey(qwertyKey, false);
+  // Fire any release-style gate setters (KeyboardIn.rel → ADSR.rel etc).
+  // Lets a held QWERTY key sustain an ADSR envelope; key-up triggers
+  // the release stage. No-op if no release gate is exposed.
+  if (previewState.workletNode && previewState.state === "playing") {
+    listGateSetterIndices("release").forEach(i => {
+      previewState.workletNode.port.postMessage({ type: "set", index: i, value: 0 });
+    });
+  }
 }
 
 document.addEventListener("keydown", (ev) => {
@@ -15643,7 +15677,7 @@ function renderPiano() {
   wrap.querySelectorAll(".piano-key").forEach(el => {
     const m = parseInt(el.dataset.midi, 10);
     const onDown = (ev) => { ev.preventDefault(); playMidi(m, el); };
-    const onUp   = ()     => { el.classList.remove("active"); };
+    const onUp   = ()     => { releaseMidi(el); };
     el.addEventListener("pointerdown", onDown);
     el.addEventListener("pointerup",   onUp);
     el.addEventListener("pointerleave",onUp);
@@ -15659,11 +15693,21 @@ function playMidi(midi, keyEl) {
   if (kbIdx < 0) return;
   const freq = midiToFreq(midi);
   previewState.workletNode.port.postMessage({ type: "set", index: kbIdx, value: freq });
-  listGateSetterIndices().forEach(i => {
+  listGateSetterIndices("press").forEach(i => {
     previewState.workletNode.port.postMessage({ type: "set", index: i, value: 0 });
   });
   if (keyEl) keyEl.classList.add("active");
   updatePianoReadout(midi, freq);
+}
+/* Mouse-up on a piano key — counterpart to playMidi. Fires any
+ * release-gate setters so an ADSR envelope's release stage triggers
+ * when the user lets go of a clicked key. */
+function releaseMidi(keyEl) {
+  if (keyEl) keyEl.classList.remove("active");
+  if (!previewState.workletNode || previewState.state !== "playing") return;
+  listGateSetterIndices("release").forEach(i => {
+    previewState.workletNode.port.postMessage({ type: "set", index: i, value: 0 });
+  });
 }
 function highlightPianoKey(qwertyKey, on) {
   const wrap = document.getElementById("piano-keys");
