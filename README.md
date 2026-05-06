@@ -58,7 +58,7 @@ Requires **Node 20+** and **git** on your `PATH`.
 npx @9livezzz/gamma-compile-server
 
 # Until then, clone + run locally:
-git clone https://github.com/9LiveZZZ-Git/gamma-compile-server.git
+git clone https://github.com/9LiveZZZ-Git/gamma-compile-server
 cd gamma-compile-server
 npm install
 node bin/gamma-compile-server.js
