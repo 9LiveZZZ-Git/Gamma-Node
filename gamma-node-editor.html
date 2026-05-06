@@ -1990,6 +1990,61 @@
     justify-content: flex-end;
   }
 
+  /* Drawable ADSR — extra elements layered onto the same SVG canvas
+   * as .curve-draw-svg. The attack region (left of the sustain bar)
+   * gets a soft phosphor tint, the release region (right) gets a
+   * warmer amber tint, and the sustain marker is a draggable
+   * vertical bar with a grip handle at the top. */
+  .envdraw-region-attack { fill: rgba(131, 232, 255, 0.06); }
+  .envdraw-region-release { fill: rgba(216, 160, 48, 0.06); }
+  .envdraw-sustain-line {
+    stroke: var(--gate);
+    stroke-width: 1.5;
+    stroke-dasharray: 4 3;
+    cursor: ew-resize;
+    filter: drop-shadow(0 0 4px rgba(216, 160, 48, 0.5));
+  }
+  .envdraw-sustain-grip {
+    fill: var(--gate);
+    cursor: ew-resize;
+    filter: drop-shadow(0 0 6px rgba(216, 160, 48, 0.65));
+  }
+  .envdraw-sustain-grip:hover { fill: #ecbb55; }
+  .envdraw-sustain-label {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    fill: var(--gate);
+    letter-spacing: 0.06em;
+    pointer-events: none;
+    text-shadow: 0 0 4px rgba(216, 160, 48, 0.3);
+  }
+  .envdraw-fields {
+    display: grid;
+    grid-template-columns: auto 80px auto 80px 1fr;
+    gap: 8px;
+    align-items: center;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-2);
+  }
+  .envdraw-fields input[type="number"] {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 4px 8px;
+    border-radius: 3px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    outline: none;
+  }
+  .envdraw-fields input:focus { border-color: var(--accent); }
+  .envdraw-readout {
+    color: var(--text-3);
+    font-size: 9.5px;
+    letter-spacing: 0.06em;
+    text-align: right;
+  }
+
   /* Small ≈ button on each Monitor-control row that opens the editor. */
   .monitor-control-curve {
     background: transparent;
@@ -5040,6 +5095,26 @@
     </div>
   </div>
 
+  <!-- Drawable ADSR — opened from an EnvDraw node's props pane. Free-
+       draw the full envelope shape with a movable sustain marker. The
+       attack region (left of sustain) and release region (right) are
+       tinted differently so the user can see where the held part sits.
+       Saves into node.params.curveTable + node.params.sustainIdx. -->
+  <div class="modal-backdrop" id="envdraw-modal" style="display:none;">
+    <div class="modal" style="width: 560px;">
+      <div class="modal-head">
+        <span id="envdraw-modal-title">Edit envelope</span>
+        <button class="btn modal-x" id="btn-envdraw-close">×</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-note">
+          Click+drag to draw the envelope shape. The amber dashed line is the sustain marker — drag it left/right to choose where the curve holds while the gate is active. Indices left of the marker play during attack; the value at the marker is held; indices right play during release.
+        </p>
+        <div id="envdraw-pane"></div>
+      </div>
+    </div>
+  </div>
+
   <!-- Piano-roll editor — opened from a PianoRoll node's props pane.
        Pro-grade time × pitch sequencer with dedicated piano-keyboard
        sidebar, beat ruler, velocity lane, tool modes, snap, zoom, and
@@ -7008,6 +7083,118 @@ public:
     params: { decay: 1 },
     methods: { decay: "decay" },
     description: "Exponential decay (–60 dB length)"
+  },
+
+  /* Drawable ADSR — sketch any envelope shape with a movable sustain
+   * point. The 64-sample LUT covers the entire envelope; sustainIdx
+   * marks where the curve "holds" while the gate is active. attack
+   * controls how long indices [0..sustainIdx] take to play (key
+   * down → sustain); release controls how long [sustainIdx..63]
+   * takes (key up → silence). Wire trig/rel exactly like ADSR.
+   * Click "Edit envelope" in the props pane to draw / drag the
+   * sustain handle. */
+  EnvDraw: {
+    category: "Envelope", color: COLOR.envelope, header: null,
+    cppType: "GammaEnvDraw",
+    helperClass:
+`class GammaEnvDraw {
+    /* Drawable ADSR envelope. The LUT stores the full shape from
+     * trigger (index 0) to natural end (index N-1). sustainIdx_
+     * splits the curve in two halves: indices [0..sustainIdx_]
+     * are traversed during attack at attack-time pace; the LUT
+     * value at sustainIdx_ is held while the gate is active; on
+     * release, indices [sustainIdx_..N-1] are traversed at
+     * release-time pace. */
+    static constexpr int N = 64;
+    float lut_[N];
+    int   sustainIdx_ = 32;
+    float aDur_ = 0.5f;
+    float rDur_ = 0.5f;
+    float sr_   = 48000.f;
+    int   stage_ = 0;          // 0=idle, 1=attack, 2=sustain, 3=release
+    float phase_ = 0.f;        // float index within LUT
+public:
+    GammaEnvDraw() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+        // Default shape: triangular peak at sustain — ramp up, ramp down.
+        for (int i = 0; i <= sustainIdx_; i++) lut_[i] = (float)i / (float)sustainIdx_;
+        for (int i = sustainIdx_+1; i < N; i++) lut_[i] = (float)(N - 1 - i) / (float)(N - 1 - sustainIdx_);
+    }
+    void setAttack(float s)  { aDur_ = (s > 0.0001f) ? s : 0.0001f; }
+    void setRelease(float s) { rDur_ = (s > 0.0001f) ? s : 0.0001f; }
+    void setSustainIdx(float i) {
+        int v = (int)i;
+        if (v < 1) v = 1;
+        if (v > N - 2) v = N - 2;
+        sustainIdx_ = v;
+    }
+    void setLut(const float* src, int n) {
+        if (n > N) n = N;
+        for (int i = 0; i < n; i++) lut_[i] = src[i];
+    }
+    void trigger() { stage_ = 1; phase_ = 0.f; }
+    void release() {
+        if (stage_ == 0 || stage_ == 3) return;
+        stage_ = 3;
+        if (phase_ < (float)sustainIdx_) phase_ = (float)sustainIdx_;
+    }
+    float lookup_(float fi) {
+        if (fi < 0.f) fi = 0.f;
+        if (fi > (float)(N - 1)) fi = (float)(N - 1);
+        const int i0 = (int)fi;
+        const int i1 = (i0 < N - 1) ? i0 + 1 : N - 1;
+        const float t = fi - (float)i0;
+        return lut_[i0] * (1.f - t) + lut_[i1] * t;
+    }
+    float operator()() {
+        if (stage_ == 0) return 0.f;
+        if (stage_ == 1) {
+            const float step = (float)sustainIdx_ / (aDur_ * sr_);
+            phase_ += step;
+            if (phase_ >= (float)sustainIdx_) {
+                phase_ = (float)sustainIdx_;
+                stage_ = 2;
+            }
+            return lookup_(phase_);
+        }
+        if (stage_ == 2) {
+            return lookup_((float)sustainIdx_);
+        }
+        const float step = (float)(N - 1 - sustainIdx_) / (rDur_ * sr_);
+        phase_ += step;
+        if (phase_ >= (float)(N - 1)) {
+            phase_ = (float)(N - 1);
+            stage_ = 0;
+            return 0.f;
+        }
+        return lookup_(phase_);
+    }
+};`,
+    ins: [{n:"trig", t:"gate"}, {n:"rel", t:"gate"}],
+    outs: [{n:"out", t:"audio"}],
+    params: { attack: 0.5, release: 0.5 },
+    methods: { attack: "setAttack", release: "setRelease" },
+    gateMethods: { trig: "trigger", rel: "release" },
+    uiOnlyParams: ["curveTable", "sustainIdx"],
+    kind: "envDraw",
+    extraCtor: [
+      (n) => {
+        const tbl  = n.params && n.params.curveTable;
+        const sIdx = (n.params && typeof n.params.sustainIdx === "number") ? n.params.sustainIdx : 32;
+        const parts = [];
+        if (Array.isArray(tbl) && tbl.length > 0) {
+          const vals = tbl.map(v => Number(v).toFixed(4) + "f").join(", ");
+          parts.push(`        {`);
+          parts.push(`            static constexpr float ${n.id}_lut[] = { ${vals} };`);
+          parts.push(`            ${n.id}.setLut(${n.id}_lut, ${tbl.length});`);
+          parts.push(`        }`);
+        }
+        parts.push(`        ${n.id}.setSustainIdx(${sIdx}.f);`);
+        return parts.join("\n");
+      }
+    ],
+    description: "Drawable ADSR envelope — sketch the full shape and drag the sustain marker. Wire trig to start, rel to release. attack/release set how long each side of the curve takes to play."
   },
   Gate: {
     category: "Envelope", color: COLOR.envelope, header: "Envelope",
@@ -10134,6 +10321,20 @@ function renderProps() {
         <button class="btn primary" id="btn-open-wavetable" style="width: 100%;">Edit waveform${len ? ` · ${len} samples` : ""}</button>
       </div>`;
     }
+    // EnvDraw: drawable ADSR with movable sustain marker. The button
+    // shows a quick stat (current sustain index + attack/release
+    // times) so the user knows what they've set without opening it.
+    if (def.kind === "envDraw") {
+      const tbl = Array.isArray(node.params && node.params.curveTable) ? node.params.curveTable : null;
+      const sIdx = (node.params && typeof node.params.sustainIdx === "number") ? node.params.sustainIdx : 32;
+      const len = tbl ? tbl.length : 0;
+      const aT = (node.params && typeof node.params.attack === "number") ? node.params.attack.toFixed(2) : "0.50";
+      const rT = (node.params && typeof node.params.release === "number") ? node.params.release.toFixed(2) : "0.50";
+      html += `<div class="prop-section">Envelope shape</div>`;
+      html += `<div class="prop-grid" style="grid-template-columns: 1fr;">
+        <button class="btn primary" id="btn-open-envdraw" style="width: 100%;">Edit envelope${len ? ` · sustain ${sIdx}/${len-1} · A ${aT}s · R ${rT}s` : ""}</button>
+      </div>`;
+    }
     // WavetableScan: button opens the 3D stacked-frames modal. Custom-
     // frame count is shown so the user knows whether they've overridden
     // any of the algorithmic bank's defaults.
@@ -10253,6 +10454,9 @@ function renderProps() {
   if (openWtBtn) openWtBtn.addEventListener('click', () => openWavetableEditModal({ nodeId: node.id, mode: "single" }));
   const openWsBtn = propsEl.querySelector('#btn-open-wavescan');
   if (openWsBtn) openWsBtn.addEventListener('click', () => openWavescanModal(node.id));
+  // EnvDraw — drawable ADSR modal.
+  const openEnvBtn = propsEl.querySelector('#btn-open-envdraw');
+  if (openEnvBtn) openEnvBtn.addEventListener('click', () => openEnvDrawModal(node.id));
 
   // Sample-host action buttons — load opens a file picker, open
   // launches the waveform editor modal, clear detaches the asset
@@ -16293,6 +16497,272 @@ function openRampModal(kind, nodeId) {
 function closeRampModal() {
   const modal = document.getElementById("ramp-modal");
   if (modal) modal.style.display = "none";
+}
+
+/* ====================================================================
+ * Drawable ADSR (EnvDraw node) modal
+ *
+ * Single SVG canvas: 64-sample LUT painted with click+drag, plus a
+ * draggable vertical sustain marker that splits the curve into the
+ * attack half (left, plays start→sustain) and release half (right,
+ * plays sustain→end). Saves directly into node.params.curveTable
+ * and node.params.sustainIdx; codegen reads both via extraCtor.
+ * ================================================================== */
+
+function defaultEnvDrawTable() {
+  // Triangular peak at index 32 — ramp up, ramp down. Mirrors the
+  // helper class's default constructor so the JS preview matches
+  // the C++ side before the user paints anything.
+  const N = CURVE_TABLE_SIZE;
+  const sIdx = Math.floor(N / 2);
+  const t = new Array(N);
+  for (let i = 0; i <= sIdx; i++)     t[i] = i / sIdx;
+  for (let i = sIdx + 1; i < N; i++)  t[i] = (N - 1 - i) / (N - 1 - sIdx);
+  return t;
+}
+
+function openEnvDrawModal(nodeId) {
+  const node = state.nodes.find(n => n.id === nodeId);
+  if (!node || !node.params) return;
+  if (!Array.isArray(node.params.curveTable) || !node.params.curveTable.length) {
+    node.params.curveTable = defaultEnvDrawTable();
+  }
+  if (typeof node.params.sustainIdx !== "number") {
+    node.params.sustainIdx = Math.floor(node.params.curveTable.length / 2);
+  }
+  const titleEl = document.getElementById("envdraw-modal-title");
+  if (titleEl) titleEl.textContent = "Edit envelope · " + nodeId;
+  const pane = document.getElementById("envdraw-pane");
+  if (pane) {
+    pane.innerHTML = "";
+    pane.appendChild(buildEnvDrawPane(node));
+  }
+  const modal = document.getElementById("envdraw-modal");
+  if (modal) modal.style.display = "flex";
+}
+function closeEnvDrawModal() {
+  const modal = document.getElementById("envdraw-modal");
+  if (modal) modal.style.display = "none";
+}
+(function setupEnvDrawModal() {
+  const close = document.getElementById("btn-envdraw-close");
+  const modal = document.getElementById("envdraw-modal");
+  if (close) close.addEventListener("click", closeEnvDrawModal);
+  if (modal) modal.addEventListener("click", e => { if (e.target === modal) closeEnvDrawModal(); });
+})();
+
+/* Builds the draw pane for an EnvDraw node. Mirrors buildCurveDrawPane
+ * but adds a draggable sustain marker (amber dashed vertical line)
+ * and tinted regions on either side of it. Painting and sustain-drag
+ * use the same pointer-capture pattern; the pointerdown decides which
+ * mode (paint vs sustain-drag) based on hit-test against the marker
+ * grip. */
+function buildEnvDrawPane(node) {
+  const W = 520, H = 200;
+  const pad = 8;
+  const plotW = W - pad * 2;
+  const plotH = H - pad * 2;
+  const tbl = node.params.curveTable;
+  const N = tbl.length;
+  const HANDLE_HIT = 12;     // px hit-zone around the sustain line
+
+  const xForIdx = (i) => pad + (i / (N - 1)) * plotW;
+  const idxForX = (cx) => Math.round(((cx - pad) / plotW) * (N - 1));
+
+  const pane = document.createElement("div");
+  pane.className = "curve-draw-pane";
+
+  const sIdx = node.params.sustainIdx;
+  const sx = xForIdx(sIdx).toFixed(1);
+
+  pane.innerHTML =
+    '<svg class="curve-draw-svg" viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none">' +
+      // Background regions — attack (left) and release (right) tints.
+      '<rect class="envdraw-region-attack"  x="' + pad + '" y="' + pad + '" width="' + (sx - pad) + '" height="' + plotH + '" />' +
+      '<rect class="envdraw-region-release" x="' + sx  + '" y="' + pad + '" width="' + (W - pad - sx) + '" height="' + plotH + '" />' +
+      // Grid + axis labels.
+      '<line class="curve-grid" x1="' + pad + '" y1="' + (pad + plotH * 0.5) + '" x2="' + (W - pad) + '" y2="' + (pad + plotH * 0.5) + '" />' +
+      '<line class="curve-grid" x1="' + pad + '" y1="' + pad + '" x2="' + (W - pad) + '" y2="' + pad + '" />' +
+      '<line class="curve-grid" x1="' + pad + '" y1="' + (H - pad) + '" x2="' + (W - pad) + '" y2="' + (H - pad) + '" />' +
+      '<text class="curve-axis-label" x="' + (pad + 2) + '" y="' + (pad + 10) + '">1.0</text>' +
+      '<text class="curve-axis-label" x="' + (pad + 2) + '" y="' + (H - pad - 2) + '">0.0</text>' +
+      // Curve fill + stroke.
+      '<path class="curve-fill" d="" />' +
+      '<path class="curve-line" d="" />' +
+      // Sustain marker — dashed line plus a fat grip box at the top
+      // for easy grabbing. Rendered last so it sits above the curve.
+      '<line class="envdraw-sustain-line" x1="' + sx + '" y1="' + pad + '" x2="' + sx + '" y2="' + (H - pad) + '" />' +
+      '<rect class="envdraw-sustain-grip" x="' + (sx - 5) + '" y="' + pad + '" width="10" height="10" />' +
+      '<text class="envdraw-sustain-label" x="' + (sx - 24) + '" y="' + (pad + 22) + '">SUST</text>' +
+    '</svg>' +
+    '<div class="envdraw-fields">' +
+      '<label>Attack</label>' +
+      '<input type="number" id="envdraw-attack" min="0.001" max="10" step="0.01" />' +
+      '<label>Release</label>' +
+      '<input type="number" id="envdraw-release" min="0.001" max="10" step="0.01" />' +
+      '<span class="envdraw-readout" id="envdraw-readout">sustain @ index — / — · 0.0 v</span>' +
+    '</div>' +
+    '<div class="curve-draw-actions">' +
+      '<button class="btn" id="btn-envdraw-reset">Reset shape</button>' +
+      '<button class="btn" id="btn-envdraw-smooth">Smooth</button>' +
+      '<button class="btn primary" id="btn-envdraw-done">Done</button>' +
+    '</div>';
+
+  const svg = pane.querySelector(".curve-draw-svg");
+  const fillPath = pane.querySelector(".curve-fill");
+  const linePath = pane.querySelector(".curve-line");
+  const regAtk = pane.querySelector(".envdraw-region-attack");
+  const regRel = pane.querySelector(".envdraw-region-release");
+  const sLine  = pane.querySelector(".envdraw-sustain-line");
+  const sGrip  = pane.querySelector(".envdraw-sustain-grip");
+  const sLabel = pane.querySelector(".envdraw-sustain-label");
+  const atkInp = pane.querySelector("#envdraw-attack");
+  const relInp = pane.querySelector("#envdraw-release");
+  const readout = pane.querySelector("#envdraw-readout");
+
+  atkInp.value = (typeof node.params.attack === "number") ? node.params.attack.toFixed(2) : "0.50";
+  relInp.value = (typeof node.params.release === "number") ? node.params.release.toFixed(2) : "0.50";
+
+  function tableToPathData() {
+    const pts = [];
+    for (let i = 0; i < N; i++) {
+      const x = xForIdx(i);
+      const y = pad + (1 - tbl[i]) * plotH;
+      pts.push((i === 0 ? "M" : "L") + x.toFixed(1) + "," + y.toFixed(1));
+    }
+    return pts.join(" ");
+  }
+  function refreshAll() {
+    const d = tableToPathData();
+    linePath.setAttribute("d", d);
+    fillPath.setAttribute("d", d + ` L ${pad + plotW},${pad + plotH} L ${pad},${pad + plotH} Z`);
+    const sIdxNow = node.params.sustainIdx;
+    const sxNow = xForIdx(sIdxNow);
+    regAtk.setAttribute("width", (sxNow - pad).toFixed(1));
+    regRel.setAttribute("x", sxNow.toFixed(1));
+    regRel.setAttribute("width", (W - pad - sxNow).toFixed(1));
+    sLine.setAttribute("x1", sxNow.toFixed(1));
+    sLine.setAttribute("x2", sxNow.toFixed(1));
+    sGrip.setAttribute("x", (sxNow - 5).toFixed(1));
+    sLabel.setAttribute("x", (sxNow - 24).toFixed(1));
+    const v = (typeof tbl[sIdxNow] === "number") ? tbl[sIdxNow] : 0;
+    readout.textContent = `sustain @ index ${sIdxNow} / ${N - 1} · ${v.toFixed(2)} v`;
+  }
+
+  // Mode determined on pointerdown: "paint" (free-draw curve) vs
+  // "sustain" (drag the marker). Hit-test the sustain grip first
+  // so the marker is always grabbable from anywhere along its
+  // vertical extent (within ±HANDLE_HIT pixels).
+  let mode = null;
+  let last = null;
+
+  function svgCoords(ev) {
+    const r = svg.getBoundingClientRect();
+    const sx = W / r.width;
+    const sy = H / r.height;
+    return {
+      x: (ev.clientX - r.left) * sx,
+      y: (ev.clientY - r.top)  * sy
+    };
+  }
+  function paintAt(c, prev) {
+    const px = (c.x - pad) / plotW;
+    const py = 1 - (c.y - pad) / plotH;
+    const i = Math.round(Math.max(0, Math.min(1, px)) * (N - 1));
+    const v = Math.max(0, Math.min(1, py));
+    if (prev && prev.i !== undefined) {
+      const lo = Math.min(prev.i, i), hi = Math.max(prev.i, i);
+      if (hi > lo) {
+        const a = (lo === prev.i) ? prev.v : v;
+        const b = (lo === prev.i) ? v : prev.v;
+        for (let k = lo; k <= hi; k++) {
+          const t = (k - lo) / (hi - lo);
+          tbl[k] = a * (1 - t) + b * t;
+        }
+      } else {
+        tbl[i] = v;
+      }
+    } else {
+      tbl[i] = v;
+    }
+    return { i, v };
+  }
+
+  svg.addEventListener("pointerdown", ev => {
+    ev.preventDefault();
+    svg.setPointerCapture(ev.pointerId);
+    const c = svgCoords(ev);
+    const sxNow = xForIdx(node.params.sustainIdx);
+    if (Math.abs(c.x - sxNow) <= HANDLE_HIT) {
+      mode = "sustain";
+      pushHistory("envdraw:sustain:" + node.id);
+    } else {
+      mode = "paint";
+      pushHistory("envdraw:curve:" + node.id);
+      last = paintAt(c, null);
+    }
+  });
+  svg.addEventListener("pointermove", ev => {
+    if (!mode) return;
+    const c = svgCoords(ev);
+    if (mode === "sustain") {
+      let i = idxForX(c.x);
+      if (i < 1) i = 1;
+      if (i > N - 2) i = N - 2;
+      node.params.sustainIdx = i;
+    } else {
+      last = paintAt(c, last);
+    }
+    refreshAll();
+  });
+  function endStroke() {
+    if (!mode) return;
+    mode = null;
+    last = null;
+    renderCode(); renderJson();
+  }
+  svg.addEventListener("pointerup",     endStroke);
+  svg.addEventListener("pointercancel", endStroke);
+  svg.addEventListener("pointerleave", endStroke);
+
+  // Numeric inputs for attack / release time.
+  atkInp.addEventListener("change", () => {
+    const v = parseFloat(atkInp.value);
+    if (isFinite(v) && v > 0) {
+      pushHistory("envdraw:attack:" + node.id);
+      node.params.attack = v;
+      renderCode(); renderJson();
+    }
+  });
+  relInp.addEventListener("change", () => {
+    const v = parseFloat(relInp.value);
+    if (isFinite(v) && v > 0) {
+      pushHistory("envdraw:release:" + node.id);
+      node.params.release = v;
+      renderCode(); renderJson();
+    }
+  });
+
+  pane.querySelector("#btn-envdraw-reset").addEventListener("click", () => {
+    pushHistory("envdraw:reset:" + node.id);
+    const def = defaultEnvDrawTable();
+    for (let i = 0; i < N; i++) tbl[i] = def[i];
+    node.params.sustainIdx = Math.floor(N / 2);
+    refreshAll();
+    renderCode(); renderJson();
+  });
+  pane.querySelector("#btn-envdraw-smooth").addEventListener("click", () => {
+    pushHistory("envdraw:smooth:" + node.id);
+    const nxt = tbl.slice();
+    for (let i = 1; i < N - 1; i++) nxt[i] = (tbl[i - 1] + tbl[i] + tbl[i + 1]) / 3;
+    for (let i = 0; i < N; i++) tbl[i] = nxt[i];
+    refreshAll();
+    renderCode(); renderJson();
+  });
+  pane.querySelector("#btn-envdraw-done").addEventListener("click", closeEnvDrawModal);
+
+  refreshAll();
+  return pane;
 }
 (function setupRampModal() {
   const close = document.getElementById("btn-ramp-close");
