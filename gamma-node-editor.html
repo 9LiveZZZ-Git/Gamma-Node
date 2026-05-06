@@ -359,6 +359,125 @@
     user-select: none;
   }
 
+  /* ---------------- groups ----------------
+   * Backdrop drawn behind expanded groups (z-index 1, just above
+   * the canvas grid but below the nodes which sit at z 2). The
+   * header bar sits at the top with the group name + collapse
+   * button. Members render at their normal positions on top. */
+  .group-backdrop {
+    position: absolute;
+    z-index: 1;
+    background: rgba(200, 232, 90, 0.04);
+    border: 1px dashed var(--phosphor-dim);
+    border-radius: 6px;
+    pointer-events: auto;
+    transition: background .15s, border-color .15s;
+  }
+  .group-backdrop.selected {
+    background: rgba(200, 232, 90, 0.10);
+    border-color: var(--phosphor);
+    border-style: solid;
+    box-shadow: 0 0 0 1px var(--phosphor-dim), 0 0 24px rgba(200, 232, 90, 0.20);
+  }
+  .group-head {
+    height: 26px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 10px;
+    background: linear-gradient(to bottom, rgba(200,232,90,0.10), rgba(200,232,90,0.02));
+    border-bottom: 1px dashed var(--phosphor-dim);
+    border-radius: 5px 5px 0 0;
+    cursor: grab;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    user-select: none;
+  }
+  .group-head:active { cursor: grabbing; }
+  .group-head .group-mark {
+    color: var(--phosphor-mid);
+    font-size: 10px;
+  }
+  .group-head .group-name {
+    flex: 1;
+    color: var(--phosphor);
+    text-shadow: 0 0 6px rgba(200,232,90,0.30);
+    letter-spacing: 0.06em;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  .group-head .group-meta {
+    font-size: 9.5px;
+    color: var(--text-3);
+    letter-spacing: 0.04em;
+  }
+  .group-collapse-btn {
+    background: transparent;
+    border: 1px solid var(--instr-rule);
+    color: var(--phosphor-mid);
+    width: 20px; height: 18px;
+    border-radius: 2px;
+    font-size: 11px;
+    cursor: pointer;
+    line-height: 1;
+    padding: 0;
+  }
+  .group-collapse-btn:hover {
+    color: var(--phosphor);
+    background: rgba(200,232,90,0.08);
+    border-color: var(--phosphor-dim);
+  }
+
+  /* Collapsed group renders as a regular .node block (so it inherits
+   * the existing port / selection / drag styles) — the .group-node
+   * class adds a phosphor strip + accent-tinted name. */
+  .node.group-node {
+    border-color: var(--phosphor-dim);
+    background:
+      linear-gradient(to bottom, rgba(200,232,90,0.04), transparent 30%),
+      var(--surface);
+  }
+  .node.group-node.selected {
+    border-color: var(--phosphor);
+    box-shadow: 0 0 0 1px var(--phosphor), 0 0 18px rgba(200, 232, 90, 0.25);
+  }
+  .node.group-node .group-head-collapsed .name {
+    font-family: var(--font-instr);
+    letter-spacing: 0.10em;
+    color: var(--phosphor);
+    text-shadow: 0 0 6px rgba(200,232,90,0.30);
+  }
+
+  /* Member-list inside the group props pane */
+  .group-member-list {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    margin-bottom: 8px;
+    max-height: 220px;
+    overflow-y: auto;
+  }
+  .group-member-row {
+    display: grid;
+    grid-template-columns: 10px 1fr auto;
+    gap: 8px;
+    align-items: center;
+    padding: 4px 8px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+  }
+  .group-member-dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    box-shadow: 0 0 4px currentColor;
+  }
+  .group-member-type { color: var(--text); }
+  .group-member-id { color: var(--text-3); font-size: 9.5px; }
+
   /* ---------------- nodes ---------------- */
   .node {
     position: absolute;
@@ -9242,6 +9361,12 @@ let collapsedCats = {};
 // `selectedSet` is the visual + group-operation set. Single-click puts
 // only the clicked id in both. Shift-click adds.
 let selectedSet = new Set();
+// `selectedGroupId` flags that the GROUP entity is the current
+// selection (clicked the group header, not an inner node). When set,
+// the props pane shows group-specific UI (rename / collapse / save-
+// as-gpatch) rather than node UI. Mutually exclusive with selectedSet
+// in the sense that a header click clears selectedSet.
+let selectedGroupId = null;
 
 // Pan + zoom view transform. Transient, not persisted to .gpatch.
 const view = { panX: 0, panY: 0, zoom: 1 };
@@ -9263,14 +9388,16 @@ let lastPushReason = null;
 let lastPushTime = 0;
 
 function snapshotState() {
-  // Strip transient underscored fields before snapshotting.
+  // Strip transient underscored fields before snapshotting. Groups
+  // included so undo/redo restores group structure too.
   return JSON.stringify({
     version:   state.version,
     patchName: state.patchName,
     filename:  state.filename,
     nodes:     state.nodes,
     edges:     state.edges,
-    exposed:   state.exposed
+    exposed:   state.exposed,
+    groups:    state.groups || []
   });
 }
 function restoreSnapshot(snap) {
@@ -9281,9 +9408,11 @@ function restoreSnapshot(snap) {
   state.nodes     = o.nodes;
   state.edges     = o.edges;
   state.exposed   = o.exposed;
+  state.groups    = Array.isArray(o.groups) ? o.groups : [];
   // Selection refers to ids that may no longer exist after undo/redo.
   selectedSet = new Set([...selectedSet].filter(id => state.nodes.some(n => n.id === id)));
   selected = selectedSet.size ? [...selectedSet][selectedSet.size - 1] : null;
+  if (selectedGroupId && !groupById(selectedGroupId)) selectedGroupId = null;
 }
 function pushHistory(reason) {
   const now = Date.now();
@@ -9337,6 +9466,63 @@ function selectAll() {
 function clearSelection() {
   selectedSet.clear();
   selected = null;
+  selectedGroupId = null;
+}
+
+/* ─── Group operations ─────────────────────────────────────────── */
+/* Wrap the current selection into a new group. Requires ≥1 node;
+ * any node already in another group is kept in its existing group
+ * (a node can belong to at most one group). */
+function groupSelection() {
+  const ids = [...selectedSet].filter(id => !groupOfNode(id));
+  if (!ids.length) return;
+  pushHistory("group");
+  if (!Array.isArray(state.groups)) state.groups = [];
+  const groupId = "g" + (nextId++);
+  const name = "Group " + (state.groups.length + 1);
+  state.groups.push({ id: groupId, name, collapsed: false, members: ids });
+  selectedSet.clear();
+  selected = null;
+  selectedGroupId = groupId;
+  render();
+  renderProps && renderProps();
+}
+/* Remove the currently-selected group (the group entity, not its
+ * members). The members revert to free top-level nodes. Keyboard
+ * convention: Ctrl/Cmd+Shift+G. */
+function ungroupSelection() {
+  if (!selectedGroupId) return;
+  pushHistory("ungroup");
+  const g = groupById(selectedGroupId);
+  state.groups = state.groups.filter(x => x.id !== selectedGroupId);
+  // Re-select the (now ungrouped) member nodes for continuity.
+  if (g && g.members) {
+    selectedSet = new Set(g.members);
+    selected = g.members[g.members.length - 1];
+  }
+  selectedGroupId = null;
+  render();
+  renderProps && renderProps();
+}
+/* Toggle expand/collapse on a group. Pure UI flag; the underlying
+ * node + edge graph is unchanged. Wires re-route on next renderWires
+ * (collapsed-group endpoints redirect to the group's port stubs). */
+function toggleGroupCollapse(groupId) {
+  const g = groupById(groupId);
+  if (!g) return;
+  pushHistory("group-collapse:" + groupId);
+  g.collapsed = !g.collapsed;
+  render();
+  renderWires && renderWires();
+}
+/* Update the human-readable name on a group. */
+function renameGroup(groupId, newName) {
+  const g = groupById(groupId);
+  if (!g) return;
+  pushHistory("group-rename:" + groupId);
+  g.name = String(newName || "").trim() || g.name;
+  render();
+  renderProps && renderProps();
 }
 
 function applyView() {
@@ -9362,7 +9548,87 @@ function nodeById(id) { return state.nodes.find(n => n.id === id); }
 function defOf(node) { return TYPES[node.type]; }
 
 function freshState() {
-  return { version: 1, patchName: "MyPatch", nodes: [], edges: [], exposed: {}, filename: "untitled.gpatch" };
+  return {
+    version: 2,
+    patchName: "MyPatch",
+    nodes: [], edges: [], exposed: {},
+    /* Groups: visual organization layer over the flat node graph.
+     * Each entry is { id, name, collapsed, members: [nodeIds] }.
+     * Members are by ID; a node belongs to at most one group. The
+     * codegen path is unaware of groups — they're purely a UI
+     * abstraction. When collapsed, member nodes hide and the group
+     * renders as a single block with port stubs derived from
+     * cross-boundary edges. */
+    groups: [],
+    filename: "untitled.gpatch"
+  };
+}
+
+/* Group helpers — kept tiny and pure so the rest of the editor
+ * doesn't need to learn about groups except where it matters
+ * (render, wire routing, selection, save). */
+function groupOfNode(nodeId) {
+  if (!state.groups) return null;
+  return state.groups.find(g => g.members && g.members.includes(nodeId)) || null;
+}
+function groupById(groupId) {
+  return state.groups && state.groups.find(g => g.id === groupId) || null;
+}
+function isInCollapsedGroup(nodeId) {
+  const g = groupOfNode(nodeId);
+  return !!(g && g.collapsed);
+}
+/* Bounding rect of a group's member nodes in world coords. Returns
+ * null if the group has no members. NODE_W is fixed; for height we
+ * over-estimate from row count since exact height depends on DOM
+ * measurement that isn't available pre-render. */
+function groupBounds(group) {
+  if (!group || !group.members || !group.members.length) return null;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  group.members.forEach(id => {
+    const n = nodeById(id);
+    if (!n) return;
+    const def = defOf(n);
+    const rows = def ? Math.max(def.ins.length, def.outs.length, 1) : 2;
+    const h = 28 + 6 + rows * 22 + 6;   // head + padding + rows
+    minX = Math.min(minX, n.x);
+    minY = Math.min(minY, n.y);
+    maxX = Math.max(maxX, n.x + NODE_W);
+    maxY = Math.max(maxY, n.y + h);
+  });
+  if (!isFinite(minX)) return null;
+  return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+}
+/* Cross-boundary edges → input/output stubs on the collapsed-group
+ * block. Each stub is identified by its inner-node + inner-port pair
+ * and rendered with a label of the form "n3.trig" so the user can
+ * tell which inner endpoint they're connecting to. */
+function computeGroupPorts(group) {
+  const set = new Set(group.members);
+  const seenIn = new Set(), seenOut = new Set();
+  const inputs = [], outputs = [];
+  state.edges.forEach(e => {
+    const fromIn = set.has(e.from.node);
+    const toIn = set.has(e.to.node);
+    if (!fromIn && toIn) {
+      const k = e.to.node + "." + e.to.port;
+      if (seenIn.has(k)) return;
+      seenIn.add(k);
+      // Look up inner port type from the registry so the stub gets
+      // the right port-color hint.
+      const def = defOf(nodeById(e.to.node));
+      const portDef = def && def.ins.find(p => p.n === e.to.port);
+      inputs.push({ innerNode: e.to.node, innerPort: e.to.port, t: (portDef && portDef.t) || "audio" });
+    } else if (fromIn && !toIn) {
+      const k = e.from.node + "." + e.from.port;
+      if (seenOut.has(k)) return;
+      seenOut.add(k);
+      const def = defOf(nodeById(e.from.node));
+      const portDef = def && def.outs.find(p => p.n === e.from.port);
+      outputs.push({ innerNode: e.from.node, innerPort: e.from.port, t: (portDef && portDef.t) || "audio" });
+    }
+  });
+  return { inputs, outputs };
 }
 
 function reset() {
@@ -10254,6 +10520,23 @@ function addFromPalette(type) {
 const NODE_W = 140;
 
 function portPos(nodeId, portName, isOut) {
+  // If this node is inside a collapsed group, the wire endpoint
+  // redirects to the matching stub on the group's collapsed block
+  // (rather than the now-hidden inner node). Returns null if the
+  // edge is fully internal to a collapsed group (renderWires uses
+  // null on either end as the "skip this wire" signal).
+  const g = groupOfNode(nodeId);
+  if (g && g.collapsed) {
+    const ports = computeGroupPorts(g);
+    const list = isOut ? ports.outputs : ports.inputs;
+    const idx = list.findIndex(p => p.innerNode === nodeId && p.innerPort === portName);
+    if (idx === -1) return null;
+    const b = groupBounds(g);
+    if (!b) return null;
+    const x = isOut ? b.x + NODE_W : b.x;
+    const y = b.y + 33 + idx * 20 + 10;
+    return { x, y };
+  }
   const n = nodeById(nodeId);
   if (!n) return null;
   const d = defOf(n);
@@ -10278,10 +10561,37 @@ function isConnected(nodeId, portName, isOut) {
  * ======================================================================== */
 function render() {
   canvasWorld.querySelectorAll(".node").forEach(n => n.remove());
+  canvasWorld.querySelectorAll(".group-backdrop").forEach(g => g.remove());
 
   // Recompute validation state once per render so node CSS classes
   // (cycle-error overlay, etc.) are up to date with the graph.
   state._cycleErrors = findInvalidCycles();
+
+  // Groups — render expanded-group backdrops BEFORE nodes (lower
+  // z-index so they sit visually behind their members). Collapsed
+  // groups skip the backdrop and instead render as a single .node
+  // block in the main loop below.
+  (state.groups || []).forEach(g => {
+    if (g.collapsed) return;
+    const b = groupBounds(g);
+    if (!b) return;
+    const PAD = 18, HEAD = 26;
+    const bd = document.createElement("div");
+    bd.className = "group-backdrop" + (selectedGroupId === g.id ? " selected" : "");
+    bd.dataset.groupId = g.id;
+    bd.style.left = (b.x - PAD) + "px";
+    bd.style.top  = (b.y - PAD - HEAD) + "px";
+    bd.style.width  = (b.w + PAD * 2) + "px";
+    bd.style.height = (b.h + PAD * 2 + HEAD) + "px";
+    bd.innerHTML =
+      `<div class="group-head">` +
+        `<span class="group-mark">▾</span>` +
+        `<span class="group-name">${escapeText(g.name)}</span>` +
+        `<span class="group-meta">${g.members.length} nodes</span>` +
+        `<button class="group-collapse-btn" data-group-collapse="${g.id}" title="Collapse group">⊟</button>` +
+      `</div>`;
+    canvasWorld.appendChild(bd);
+  });
 
   // Disconnected-output warning: if the patch has an Output / OutputStereo
   // node but it isn't fed by any edge, mark it amber so the user notices
@@ -10292,6 +10602,12 @@ function render() {
   state.nodes.forEach(node => {
     const def = defOf(node);
     const isSel = selectedSet.has(node.id);
+
+    // Skip nodes inside a collapsed group — the group renders its
+    // own block via the loop further down. Wires that cross the
+    // boundary get redirected to the group's port stubs in
+    // renderWires.
+    if (isInCollapsedGroup(node.id)) return;
 
     // Unknown node types: render a red placeholder so the user can see
     // and delete the orphan rather than the editor silently dropping it
@@ -10361,6 +10677,70 @@ function render() {
     canvasWorld.appendChild(el);
   });
 
+  // Render each collapsed group as a single node-like block. The
+  // block's position is recomputed every render from the member-
+  // node bounds — so when the user drags the block, the underlying
+  // member positions update and the next render reflects them
+  // automatically. No bounds caching needed.
+  (state.groups || []).forEach(g => {
+    if (!g.collapsed) return;
+    const b = groupBounds(g);
+    if (!b) return;
+    const x = b.x;
+    const y = b.y;
+    const ports = computeGroupPorts(g);
+    const isSel = selectedGroupId === g.id;
+    const el = document.createElement("div");
+    el.className = "node group-node" + (isSel ? " selected" : "");
+    el.style.left = x + "px";
+    el.style.top  = y + "px";
+    el.dataset.groupId = g.id;
+    const inputCount = ports.inputs.length, outputCount = ports.outputs.length;
+    const rowN = Math.max(inputCount, outputCount, 1);
+    el.innerHTML =
+      `<div class="node-strip" style="background: var(--accent)"></div>` +
+      `<div class="node-head group-head-collapsed">` +
+        `<span class="name" title="Click to select this group; double-click to expand">⊟ ${escapeText(g.name)}</span>` +
+        `<span class="node-id">${g.members.length}n</span>` +
+      `</div>`;
+    const rows = document.createElement("div");
+    rows.className = "node-rows";
+    for (let i = 0; i < rowN; i++) {
+      const inP = ports.inputs[i];
+      const outP = ports.outputs[i];
+      const row = document.createElement("div");
+      row.className = "row";
+      const left = document.createElement("span");
+      left.className = "label-l";
+      left.textContent = inP ? inP.innerPort : "";
+      if (inP) {
+        const port = document.createElement("div");
+        port.className = "port in " + inP.t;
+        port.dataset.node = inP.innerNode;
+        port.dataset.port = inP.innerPort;
+        port.dataset.groupStub = "in";
+        port.dataset.groupId = g.id;
+        row.appendChild(port);
+      }
+      row.appendChild(left);
+      const right = document.createElement("span");
+      right.className = "label-r";
+      right.textContent = outP ? outP.innerPort : "";
+      if (outP) {
+        const port = document.createElement("div");
+        port.className = "port out " + outP.t;
+        port.dataset.node = outP.innerNode;
+        port.dataset.port = outP.innerPort;
+        port.dataset.groupStub = "out";
+        port.dataset.groupId = g.id;
+        row.appendChild(port);
+      }
+      row.appendChild(right);
+      rows.appendChild(row);
+    }
+    el.appendChild(rows);
+    canvasWorld.appendChild(el);
+  });
   renderWires();
   stats.textContent = state.nodes.length + " nodes · " + state.edges.length + " connections";
   filenameEl.textContent = state.filename;
@@ -10431,6 +10811,12 @@ function wirePath(x1, y1, x2, y2) {
 function renderWires(temp) {
   let html = "";
   state.edges.forEach(e => {
+    // Skip edges that are fully internal to a collapsed group —
+    // both endpoints sit inside the same collapsed block, so the
+    // wire would be a zero-length self-loop on the group's block.
+    const fromG = groupOfNode(e.from.node);
+    const toG   = groupOfNode(e.to.node);
+    if (fromG && fromG.collapsed && toG && toG.collapsed && fromG.id === toG.id) return;
     const a = portPos(e.from.node, e.from.port, true);
     const b = portPos(e.to.node, e.to.port, false);
     if (!a || !b) return;
@@ -10462,7 +10848,140 @@ function renderWires(temp) {
 /* =========================================================================
  * Properties pane
  * ======================================================================== */
+
+/* Group props — shown when selectedGroupId is set. Layout mirrors
+ * the regular node-prop pane: a head row + sections for the editable
+ * fields (name, collapse), a quick member list, and an actions
+ * footer (ungroup + save-as-gpatch). */
+function renderGroupProps(g) {
+  const dot = `background: var(--accent); --prop-dot: var(--accent);`;
+  const memberRows = (g.members || []).map(id => {
+    const n = nodeById(id);
+    if (!n) return "";
+    const def = defOf(n);
+    const colour = def ? def.color : "var(--text-3)";
+    return `<div class="group-member-row">
+      <span class="group-member-dot" style="background:${colour}"></span>
+      <span class="group-member-type">${escapeText(n.type)}</span>
+      <span class="group-member-id">${n.id}</span>
+    </div>`;
+  }).join("");
+  const ports = computeGroupPorts(g);
+  const portsHtml = (ports.inputs.length || ports.outputs.length)
+    ? `<div class="prop-section">Cross-boundary ports</div>
+       <div class="prop-inline" style="opacity:0.75;">
+         ${ports.inputs.length} in / ${ports.outputs.length} out — these stub up on the collapsed block so you can wire to/from the group as a whole.
+       </div>`
+    : "";
+  return `
+    <div class="prop-head">
+      <span class="dot" style="${dot}"></span>
+      <span style="font-family: var(--font-instr); letter-spacing: 0.12em;">${g.collapsed ? "⊟" : "▾"} GROUP</span>
+      <span class="id">${g.id}</span>
+      <span class="desc">${g.collapsed ? "collapsed — double-click block or press E to expand" : "expanded — drag header to move all members"}</span>
+    </div>
+    <div class="prop-section">Name</div>
+    <div class="prop-grid" style="grid-template-columns: 1fr;">
+      <input type="text" id="group-name-input" value="${escapeAttr(g.name)}" style="background: var(--surface-2); border: 1px solid var(--border); color: var(--text); padding: 6px 10px; border-radius: 3px; font-family: var(--font-mono); font-size: 12px;" />
+    </div>
+    <div class="prop-section">View</div>
+    <div class="prop-grid" style="grid-template-columns: 1fr 1fr;">
+      <button class="btn" id="group-collapse-btn">${g.collapsed ? "Expand (E)" : "Collapse (E)"}</button>
+      <button class="btn" id="group-ungroup-btn">Ungroup (Ctrl+Shift+G)</button>
+    </div>
+    <div class="prop-section">Members · ${(g.members||[]).length} nodes</div>
+    <div class="group-member-list">${memberRows}</div>
+    ${portsHtml}
+    <div class="prop-section">Export</div>
+    <div class="prop-grid" style="grid-template-columns: 1fr;">
+      <button class="btn primary" id="group-save-gpatch-btn">Save group as .gpatch</button>
+      <p class="prop-inline" style="opacity:0.55; font-size:10px;">Writes a standalone .gpatch containing only this group's member nodes + their internal edges. Cross-boundary edges become exposed setters / unconnected ports on the saved patch.</p>
+    </div>
+  `;
+}
+function wireGroupPropsHandlers(g) {
+  const nameInp = document.getElementById("group-name-input");
+  if (nameInp) {
+    nameInp.addEventListener("change", () => renameGroup(g.id, nameInp.value));
+    nameInp.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { renameGroup(g.id, nameInp.value); nameInp.blur(); }
+    });
+  }
+  const cbtn = document.getElementById("group-collapse-btn");
+  if (cbtn) cbtn.addEventListener("click", () => toggleGroupCollapse(g.id));
+  const ubtn = document.getElementById("group-ungroup-btn");
+  if (ubtn) ubtn.addEventListener("click", () => ungroupSelection());
+  const sbtn = document.getElementById("group-save-gpatch-btn");
+  if (sbtn) sbtn.addEventListener("click", () => saveGroupAsGpatch(g));
+}
+
+/* Export a group as a standalone .gpatch file. The output contains:
+ *   • Only the group's member nodes (positions translated to start
+ *     near the origin so the loaded patch isn't off-screen).
+ *   • Only the edges that are fully internal to the group (cross-
+ *     boundary edges become dangling endpoints — the user wires
+ *     them up after importing into another patch).
+ *   • A patchName derived from the group name (sanitized to be a
+ *     valid C++ identifier so codegen produces a clean class).
+ *   • Exposed-setter entries that survive the cut (only those that
+ *     reference member nodes). */
+function saveGroupAsGpatch(g) {
+  if (!g) return;
+  const memberSet = new Set(g.members);
+  const memberNodes = (g.members || []).map(id => nodeById(id)).filter(Boolean);
+  if (!memberNodes.length) { alert("Group has no members — nothing to save."); return; }
+  // Translate to origin so the saved patch loads at a sane location.
+  let minX = Infinity, minY = Infinity;
+  memberNodes.forEach(n => { if (n.x < minX) minX = n.x; if (n.y < minY) minY = n.y; });
+  const dx = isFinite(minX) ? Math.max(0, minX - 60) : 0;
+  const dy = isFinite(minY) ? Math.max(0, minY - 60) : 0;
+  const nodes = memberNodes.map(n => ({
+    ...JSON.parse(JSON.stringify(n)),  // deep copy so we don't mutate live state
+    x: n.x - dx,
+    y: n.y - dy
+  }));
+  // Internal edges only — drop cross-boundary connections.
+  const edges = state.edges
+    .filter(e => memberSet.has(e.from.node) && memberSet.has(e.to.node))
+    .map(e => JSON.parse(JSON.stringify(e)));
+  // Restrict exposed-setter map to entries that reference member nodes.
+  const exposed = {};
+  Object.keys(state.exposed || {}).forEach(k => {
+    const id = k.split(".")[0];
+    if (memberSet.has(id)) exposed[k] = state.exposed[k];
+  });
+  const className = (g.name || "Group").replace(/[^A-Za-z0-9_]/g, "_");
+  const filename = (g.name || "group").replace(/[^A-Za-z0-9_-]/g, "_") + ".gpatch";
+  const out = {
+    version: 2,
+    patchName: className || "Group",
+    nodes, edges, exposed,
+    groups: [],   // empty — the group itself becomes the new patch
+    filename
+  };
+  const blob = new Blob([JSON.stringify(out, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 function renderProps() {
+  // Group selection takes precedence — when the user has a group
+  // entity selected (clicked the header / collapsed block), the
+  // props pane shows group-specific UI: rename, expand/collapse,
+  // member list, save-as-.gpatch.
+  if (selectedGroupId) {
+    const g = groupById(selectedGroupId);
+    if (g) {
+      empty.style.display = "none";
+      propsEl.innerHTML = renderGroupProps(g);
+      wireGroupPropsHandlers(g);
+      return;
+    }
+    selectedGroupId = null;  // stale id — fall through to node path
+  }
   if (!selected) {
     empty.style.display = "block";
     propsEl.innerHTML = "";
@@ -11715,9 +12234,66 @@ canvas.addEventListener("pointerdown", e => {
     }
   }
 
+  // Group-backdrop header — click selects the group entity; drag
+  // the header to translate all members together. Double-click to
+  // collapse (handled separately on dblclick).
+  const groupHeadEl = e.target.closest && e.target.closest(".group-backdrop");
+  if (groupHeadEl && (e.target.closest(".group-head") || e.target.closest(".group-collapse-btn"))) {
+    const gid = groupHeadEl.dataset.groupId;
+    if (e.target.closest(".group-collapse-btn")) {
+      toggleGroupCollapse(gid);
+      return;
+    }
+    selectedSet.clear();
+    selected = null;
+    selectedGroupId = gid;
+    pushHistory("group-drag-start:" + gid);
+    const g = groupById(gid);
+    const originals = new Map();
+    if (g && g.members) g.members.forEach(mid => {
+      const sn = nodeById(mid);
+      if (sn) originals.set(mid, { x: sn.x, y: sn.y });
+    });
+    groupDrag = { id: gid, dx: 0, dy: 0, startX: w.x, startY: w.y, originals, kind: "group" };
+    render();
+    return;
+  }
+
   const nodeEl = e.target.closest && e.target.closest(".node");
   if (nodeEl) {
+    // Collapsed group block (data-group-id, no data-id) — clicking
+    // the header selects the group entity and starts a drag that
+    // moves all members in unison (preserving their relative
+    // layout for when the group is re-expanded).
+    if (nodeEl.dataset.groupId && !nodeEl.dataset.id) {
+      const gid = nodeEl.dataset.groupId;
+      const onHead = !!(e.target.closest(".node-head") || e.target.closest(".node-strip"));
+      const onPort = e.target.classList && e.target.classList.contains("port");
+      if (onPort) {
+        // Fall through to the port-drag path below — port handling
+        // below treats data-node + data-port as the source, which
+        // we set to the inner node + inner port on stub render.
+      } else {
+        selectedSet.clear();
+        selected = null;
+        selectedGroupId = gid;
+        if (onHead) {
+          pushHistory("group-drag-start:" + gid);
+          const g = groupById(gid);
+          const originals = new Map();
+          if (g && g.members) g.members.forEach(mid => {
+            const sn = nodeById(mid);
+            if (sn) originals.set(mid, { x: sn.x, y: sn.y });
+          });
+          groupDrag = { id: gid, dx: 0, dy: 0, startX: w.x, startY: w.y, originals, kind: "group" };
+        }
+        render();
+        return;
+      }
+    }
     const id = nodeEl.dataset.id;
+    if (!id) { /* fall through if not a regular node — port handling below */ }
+    else {
     if (e.shiftKey) {
       addToSelection(id);
     } else if (!selectedSet.has(id)) {
@@ -11727,6 +12303,7 @@ canvas.addEventListener("pointerdown", e => {
       // collapsing the set (so a group drag still moves all selected).
       selected = id;
     }
+    selectedGroupId = null;
     const onHead = !!(e.target.closest(".node-head") || e.target.closest(".node-strip"));
     if (onHead) {
       const node = nodeById(id);
@@ -11749,6 +12326,7 @@ canvas.addEventListener("pointerdown", e => {
     }
     render();
     return;
+    }
   }
 
   // Empty canvas: shift extends current selection via marquee, plain
@@ -12071,11 +12649,35 @@ document.addEventListener("keydown", e => {
       duplicateSelection();
       return;
     }
+    // Group / ungroup. Ctrl+G groups the current selection (1+
+    // free nodes); Ctrl+Shift+G removes the currently-selected
+    // group entity (members revert to free top-level nodes).
+    if ((e.key === "g" || e.key === "G") && !e.shiftKey) {
+      if (selectedSet.size === 0) return;
+      e.preventDefault();
+      groupSelection();
+      return;
+    }
+    if ((e.key === "g" || e.key === "G") && e.shiftKey) {
+      if (!selectedGroupId) return;
+      e.preventDefault();
+      ungroupSelection();
+      return;
+    }
     // Reset view (Cmd+0 is OS-reserved on some browsers; we also bind
     // bare "0" below for the same effect)
     if (e.key === "0") {
       e.preventDefault();
       resetView();
+      return;
+    }
+  }
+  // Bare 'e' (no modifier) toggles expand/collapse on the currently
+  // selected group entity. Skipped if the user is typing in a field.
+  if (!mod && (e.key === "e" || e.key === "E") && !isTextInput(document.activeElement)) {
+    if (selectedGroupId) {
+      e.preventDefault();
+      toggleGroupCollapse(selectedGroupId);
       return;
     }
   }
@@ -12089,6 +12691,23 @@ document.addEventListener("keydown", e => {
     if (e.key === "4") { switchTab("udsp"); return; }
     if (e.key === "5") { switchTab("monitor"); return; }
     if (e.key === "0") { e.preventDefault(); resetView(); return; }
+  }
+});
+
+/* Double-click a collapsed-group block (or its expanded backdrop
+ * header) to flip the collapse state. Quick gesture for users who
+ * don't want to learn the keyboard shortcut. */
+canvas.addEventListener("dblclick", (e) => {
+  const collapsed = e.target.closest && e.target.closest(".node.group-node");
+  if (collapsed && collapsed.dataset.groupId) {
+    toggleGroupCollapse(collapsed.dataset.groupId);
+    return;
+  }
+  const expanded = e.target.closest && e.target.closest(".group-backdrop");
+  if (expanded && expanded.dataset.groupId &&
+      (e.target.closest(".group-head") || e.target === expanded)) {
+    toggleGroupCollapse(expanded.dataset.groupId);
+    return;
   }
 });
 
@@ -12233,7 +12852,11 @@ document.getElementById("file-input").addEventListener("change", ev => {
     try {
       const loaded = JSON.parse(reader.result);
       if (!loaded.nodes || !loaded.edges) throw new Error("missing nodes/edges");
-      state = Object.assign({ version: 1, patchName: "MyPatch", exposed: {} }, loaded);
+      state = Object.assign({ version: 2, patchName: "MyPatch", exposed: {}, groups: [] }, loaded);
+      // Older .gpatch files (pre-grouping) won't have a groups field;
+      // make sure it's at least an array so render / save paths can
+      // iterate without null checks.
+      if (!Array.isArray(state.groups)) state.groups = [];
       state.filename = file.name;
       const stem = file.name.replace(/\.[^.]+$/, "");
       if (!loaded.patchName) state.patchName = stem.replace(/[^A-Za-z0-9_]/g, "_");
