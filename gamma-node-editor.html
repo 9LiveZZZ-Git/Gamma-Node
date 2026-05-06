@@ -3116,6 +3116,60 @@
    * Click toggles 0↔±1; vertical drag inside a cell adjusts gain
    * continuously. The router lives in the props pane (not a modal)
    * so you can wire wires + tweak routes without context-switching. */
+  /* Asset card — file metadata block shown in props when a sample-host
+   * node has an asset loaded. Phosphor border for "active" state, info-
+   * cyan warning chip when the sample is too big to embed in codegen. */
+  .asset-card {
+    background: rgba(0,0,0,0.4);
+    border: 1px solid var(--phosphor-dim);
+    border-radius: 3px;
+    padding: 10px 12px;
+    box-shadow: 0 0 12px rgba(200,232,90,0.06) inset;
+  }
+  .asset-card-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+  }
+  .asset-card-name {
+    flex: 1;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--phosphor);
+    text-shadow: 0 0 6px rgba(200,232,90,0.25);
+    letter-spacing: 0.04em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .asset-warn {
+    font-family: var(--font-instr);
+    font-size: 8px;
+    letter-spacing: 0.16em;
+    color: var(--info);
+    background: rgba(131,232,255,0.1);
+    border: 1px solid rgba(131,232,255,0.3);
+    border-radius: 2px;
+    padding: 2px 6px;
+    cursor: help;
+  }
+  .asset-card-meta {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--text-3);
+    letter-spacing: 0.04em;
+    margin-bottom: 8px;
+  }
+  .asset-card-row {
+    display: flex;
+    gap: 6px;
+  }
+  .asset-card-row .pr-btn {
+    flex: 1;
+    margin: 0;
+  }
+
   .patch-matrix-wrap {
     display: grid;
     grid-template-columns: 56px repeat(8, 1fr);
@@ -4937,6 +4991,558 @@ public:
     },
     gateMethods: { trig: "reset" },
     description: "Multi-phasor — 4 free-running phasors at independent frequency ratios. Outputs each ramp (p1..p4, all 0..1) plus their average (sum). Useful as a multi-rate phase source for cross-modulation (PMOsc / PhaseDistortion) or polyrhythmic LFO clusters."
+  },
+
+  /* ============================================================
+   * Sample / mic / live-audio nodes. Sample-based nodes (mono /
+   * stereo / granular players) reference audio data via an
+   * `assetId` stored on the node — actual Float32Arrays live in
+   * the editor's asset registry, persisted to IndexedDB. The
+   * codegen embeds samples up to ASSET_EMBED_LIMIT samples (~5.3s
+   * at 48kHz mono) directly; bigger samples emit a TODO + meta
+   * comment + setSampleRate call so users wire up runtime sample
+   * loading externally for full musical stems.
+   * ============================================================ */
+
+  /* Mono sample player. Wire trig into trig to retrigger from start;
+   * loop=1 wraps back to start at end. pitch=1 plays at correct pitch
+   * (resamples for source SR ≠ engine SR). start/end are seconds. */
+  SamplePlayer: {
+    category: "Oscillator", color: COLOR.sample, header: null,
+    cppType: "GammaSamplePlayer",
+    helperClass:
+`class GammaSamplePlayer {
+    std::vector<float> buf_;
+    int    nSamples_ = 0;
+    double pos_ = 0.0;
+    float  pitch_ = 1.f;
+    float  startSec_ = 0.f;
+    float  endSec_ = 1e9f;
+    bool   loop_ = false;
+    bool   playing_ = false;
+    float  sr_ = 48000.f;
+    float  sourceSr_ = 48000.f;
+public:
+    GammaSamplePlayer() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+    }
+    void setSampleRate(float sr) { sourceSr_ = sr; }
+    void load(const float* src, int n) {
+        buf_.assign(src, src + n);
+        nSamples_ = n;
+    }
+    void setPitch(float p) { pitch_ = p; }
+    void setStart(float s) { startSec_ = s; }
+    void setEnd(float e)   { endSec_   = e < 0.f ? 1e9f : e; }
+    void setLoop(float l)  { loop_     = l > 0.5f; }
+    void play()  { pos_ = (double)startSec_ * (double)sourceSr_; playing_ = true; }
+    void stop()  { playing_ = false; }
+    void reset() { pos_ = (double)startSec_ * (double)sourceSr_; }
+    float operator()() {
+        if (!playing_ || nSamples_ < 2) return 0.f;
+        const double endSamp = (double)endSec_ * (double)sourceSr_;
+        const double cap = (double)(nSamples_ - 1);
+        const double endLim = endSamp < cap ? endSamp : cap;
+        if (pos_ >= endLim) {
+            if (loop_) pos_ = (double)startSec_ * (double)sourceSr_;
+            else { playing_ = false; return 0.f; }
+        }
+        const int i0 = (int)pos_;
+        if (i0 < 0 || i0 >= nSamples_ - 1) return 0.f;
+        const float t = (float)(pos_ - i0);
+        const float v = buf_[i0] * (1.f - t) + buf_[i0 + 1] * t;
+        pos_ += (double)pitch_ * ((double)sourceSr_ / (double)sr_);
+        return v;
+    }
+};`,
+    ins: [
+      { n: "trig", t: "gate" },
+      { n: "pitch", t: "param" },
+      { n: "start", t: "param" },
+      { n: "end",   t: "param" },
+      { n: "loop",  t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { assetId: "", pitch: 1.0, start: 0.0, end: -1.0, loop: 0 },
+    methods: { pitch: "setPitch", start: "setStart", end: "setEnd", loop: "setLoop" },
+    gateMethods: { trig: "play" },
+    autoExpose: ["pitch", "start", "end", "loop"],
+    uiOnlyParams: ["assetId"],
+    kind: "sampleHost",
+    extraHeaders: ["<vector>"],
+    extraCtor: [
+      (n) => emitAssetLoadCpp(n, 0, "load", "setSampleRate")
+    ],
+    description: "Mono sample player. Drop a .wav onto the props pane to load (any SR; resampled at runtime). trig retriggers from `start`; loop=1 wraps to start at end. pitch=1 plays at correct pitch."
+  },
+
+  /* Stereo variant — two channel buffers (L/R), two outputs. Same
+   * controls otherwise. Mono files duplicate to both channels on load. */
+  StereoSamplePlayer: {
+    category: "Oscillator", color: COLOR.sample, header: null,
+    cppType: "GammaStereoSamplePlayer",
+    helperClass:
+`class GammaStereoSamplePlayer {
+    std::vector<float> bufL_, bufR_;
+    int    nSamples_ = 0;
+    double pos_ = 0.0;
+    float  pitch_ = 1.f;
+    float  startSec_ = 0.f;
+    float  endSec_ = 1e9f;
+    bool   loop_ = false;
+    bool   playing_ = false;
+    float  sr_ = 48000.f;
+    float  sourceSr_ = 48000.f;
+public:
+    GammaStereoSamplePlayer() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+    }
+    void setSampleRate(float sr) { sourceSr_ = sr; }
+    void loadL(const float* src, int n) { bufL_.assign(src, src + n); nSamples_ = n; }
+    void loadR(const float* src, int n) { bufR_.assign(src, src + n); if (n > nSamples_) nSamples_ = n; }
+    void setPitch(float p) { pitch_ = p; }
+    void setStart(float s) { startSec_ = s; }
+    void setEnd(float e)   { endSec_   = e < 0.f ? 1e9f : e; }
+    void setLoop(float l)  { loop_     = l > 0.5f; }
+    void play()  { pos_ = (double)startSec_ * (double)sourceSr_; playing_ = true; }
+    void stop()  { playing_ = false; }
+    void reset() { pos_ = (double)startSec_ * (double)sourceSr_; }
+    struct Out { float l, r; };
+    Out operator()() {
+        Out o = { 0.f, 0.f };
+        if (!playing_ || nSamples_ < 2) return o;
+        const double endSamp = (double)endSec_ * (double)sourceSr_;
+        const double cap = (double)(nSamples_ - 1);
+        const double endLim = endSamp < cap ? endSamp : cap;
+        if (pos_ >= endLim) {
+            if (loop_) pos_ = (double)startSec_ * (double)sourceSr_;
+            else { playing_ = false; return o; }
+        }
+        const int i0 = (int)pos_;
+        if (i0 < 0 || i0 >= nSamples_ - 1) return o;
+        const float t = (float)(pos_ - i0);
+        if (i0 + 1 < (int)bufL_.size()) o.l = bufL_[i0] * (1.f - t) + bufL_[i0 + 1] * t;
+        if (i0 + 1 < (int)bufR_.size()) o.r = bufR_[i0] * (1.f - t) + bufR_[i0 + 1] * t;
+        else                            o.r = o.l;
+        pos_ += (double)pitch_ * ((double)sourceSr_ / (double)sr_);
+        return o;
+    }
+};`,
+    ins: [
+      { n: "trig", t: "gate" },
+      { n: "pitch", t: "param" },
+      { n: "start", t: "param" },
+      { n: "end",   t: "param" },
+      { n: "loop",  t: "param" }
+    ],
+    outs: [
+      { n: "L", t: "audio", access: ".l" },
+      { n: "R", t: "audio", access: ".r" }
+    ],
+    params: { assetId: "", pitch: 1.0, start: 0.0, end: -1.0, loop: 0 },
+    methods: { pitch: "setPitch", start: "setStart", end: "setEnd", loop: "setLoop" },
+    gateMethods: { trig: "play" },
+    autoExpose: ["pitch", "start", "end", "loop"],
+    uiOnlyParams: ["assetId"],
+    kind: "sampleHost",
+    extraHeaders: ["<vector>"],
+    extraCtor: [
+      // Mono asset: duplicate the L data into R via loadR. Stereo
+      // asset: emit both channels' data separately.
+      (n) => {
+        const a = getAsset(n.params && n.params.assetId);
+        if (!a) return `        // ${n.id}: no sample loaded`;
+        const lLines = emitAssetLoadCpp(n, 0, "loadL", "setSampleRate");
+        if (a.channels >= 2) {
+          // emitAssetLoadCpp's setSampleRate is idempotent; cheap to repeat.
+          const rLines = emitAssetLoadCpp(n, 1, "loadR", "setSampleRate");
+          return [lLines, rLines].join("\n");
+        }
+        // Mono → also wire R to the same data via loadR for symmetry.
+        const rLines = emitAssetLoadCpp(n, 0, "loadR", "setSampleRate");
+        return [lLines, rLines].join("\n");
+      }
+    ],
+    description: "Stereo sample player. Wire L/R into OutputStereo. Same controls as SamplePlayer; mono files duplicate to both channels on load."
+  },
+
+  /* Asynchronous granular player. Spawns up to MAX_GRAINS overlapping
+   * grains randomly from the sample at `position` (0..1 = play head
+   * within source). density = grains/sec, grainSize in ms, spread =
+   * randomness of the read position around `position`. Pitch shifts
+   * each grain independently. The classic "time-stretching freeze"
+   * happens at high density + low spread; "smear" at high spread. */
+  GranularPlayer: {
+    category: "Oscillator", color: COLOR.sample, header: null,
+    cppType: "GammaGranularPlayer",
+    helperClass:
+`class GammaGranularPlayer {
+    static constexpr int MAX_GRAINS = 32;
+    struct Grain {
+        bool   active = false;
+        double pos = 0.0;
+        int    age = 0;
+        int    duration = 0;
+        float  pitch = 1.f;
+    };
+    std::vector<float> buf_;
+    int    nSamples_ = 0;
+    Grain  grains_[MAX_GRAINS];
+    float  density_ = 30.f;
+    float  grainSizeMs_ = 50.f;
+    float  position_ = 0.f;
+    float  pitch_ = 1.f;
+    float  spread_ = 0.05f;
+    float  sr_ = 48000.f;
+    float  sourceSr_ = 48000.f;
+    unsigned rng_ = 0x12345u;
+    float rand01() {
+        rng_ = rng_ * 1664525u + 1013904223u;
+        return (float)((rng_ >> 8) & 0xFFFFu) / 65535.f;
+    }
+public:
+    GammaGranularPlayer() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+        for (int i = 0; i < MAX_GRAINS; i++) grains_[i].active = false;
+    }
+    void setSampleRate(float sr) { sourceSr_ = sr; }
+    void load(const float* src, int n) {
+        buf_.assign(src, src + n);
+        nSamples_ = n;
+    }
+    void setDensity(float d)   { density_ = d; }
+    void setGrainSize(float m) { grainSizeMs_ = m; }
+    void setPosition(float p)  { position_ = p; }
+    void setPitch(float p)     { pitch_ = p; }
+    void setSpread(float s)    { spread_ = s; }
+    float operator()() {
+        if (nSamples_ < 2) return 0.f;
+        // Probabilistic grain trigger — density grains/sec means
+        // probability density/sr per sample.
+        const float pTrig = density_ / sr_;
+        if (rand01() < pTrig) {
+            for (int i = 0; i < MAX_GRAINS; i++) {
+                if (!grains_[i].active) {
+                    grains_[i].active = true;
+                    grains_[i].age = 0;
+                    grains_[i].duration = (int)(grainSizeMs_ * sr_ * 0.001f);
+                    if (grains_[i].duration < 4) grains_[i].duration = 4;
+                    const float spr = (rand01() * 2.f - 1.f) * spread_;
+                    float p = position_ + spr;
+                    if (p < 0.f) p = 0.f; if (p > 1.f) p = 1.f;
+                    grains_[i].pos = (double)p * (double)(nSamples_ - 1);
+                    grains_[i].pitch = pitch_;
+                    break;
+                }
+            }
+        }
+        float out = 0.f;
+        constexpr float TWO_PI = 6.28318530718f;
+        for (int i = 0; i < MAX_GRAINS; i++) {
+            if (!grains_[i].active) continue;
+            const float t = (float)grains_[i].age / (float)grains_[i].duration;
+            const float env = 0.5f * (1.f - std::cos(TWO_PI * t));
+            const int p0 = (int)grains_[i].pos;
+            if (p0 >= 0 && p0 < nSamples_ - 1) {
+                const float ft = (float)(grains_[i].pos - p0);
+                const float v = buf_[p0] * (1.f - ft) + buf_[p0 + 1] * ft;
+                out += v * env;
+            }
+            grains_[i].pos += (double)grains_[i].pitch * ((double)sourceSr_ / (double)sr_);
+            grains_[i].age++;
+            if (grains_[i].age >= grains_[i].duration) grains_[i].active = false;
+        }
+        return out * 0.5f;
+    }
+};`,
+    ins: [
+      { n: "trig",      t: "gate" },
+      { n: "position",  t: "param" },
+      { n: "density",   t: "param" },
+      { n: "grainSize", t: "param" },
+      { n: "pitch",     t: "param" },
+      { n: "spread",    t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { assetId: "", position: 0.5, density: 30, grainSize: 50, pitch: 1.0, spread: 0.05 },
+    methods: {
+      position: "setPosition", density: "setDensity",
+      grainSize: "setGrainSize", pitch: "setPitch", spread: "setSpread"
+    },
+    gateMethods: { trig: "reset" },
+    autoExpose: ["position", "density", "grainSize", "pitch", "spread"],
+    uiOnlyParams: ["assetId"],
+    kind: "sampleHost",
+    extraHeaders: ["<vector>", "<cmath>"],
+    extraCtor: [(n) => emitAssetLoadCpp(n, 0, "load", "setSampleRate")],
+    description: "Asynchronous granular player. Spawns overlapping grains from a sample at `position`. density (grains/sec), grainSize (ms), spread (random position offset). Time-stretch freeze at high density + low spread; smear at high spread."
+  },
+
+  /* Pulsar synthesis (Curtis Roads). A pulsar is a short waveform
+   * (formant grain) with an envelope; pulsars repeat at the
+   * fundamentalFreq rate, with each pulsar containing a waveform at
+   * formantFreq. duty (0..1) is the fraction of each period filled by
+   * the pulsar; the rest is silence. As duty → 1, output approaches a
+   * straight sine at formantFreq. As duty → 0, output thins into clicks. */
+  PulsarSynth: {
+    category: "Oscillator", color: COLOR.oscillator, header: null,
+    cppType: "GammaPulsarSynth",
+    helperClass:
+`class GammaPulsarSynth {
+    float sampleInPeriod_ = 0.f;
+    float fundamentalFreq_ = 100.f;
+    float formantFreq_     = 800.f;
+    float duty_            = 0.5f;
+    int   waveform_        = 0;       // 0=sine, 1=saw, 2=square, 3=triangle
+    float sr_ = 48000.f;
+public:
+    GammaPulsarSynth() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+    }
+    void setFundamental(float f) { fundamentalFreq_ = f; }
+    void setFormant(float f)     { formantFreq_ = f; }
+    void setDuty(float d)        { duty_ = d < 0.01f ? 0.01f : (d > 0.99f ? 0.99f : d); }
+    void setWaveform(float w)    { waveform_ = (int)w; }
+    void reset() { sampleInPeriod_ = 0.f; }
+    float operator()() {
+        const float periodSamples = sr_ / fundamentalFreq_;
+        if (sampleInPeriod_ >= periodSamples) sampleInPeriod_ -= periodSamples;
+        const float pulsarSamples = duty_ * periodSamples;
+        constexpr float TWO_PI = 6.28318530718f;
+        if (sampleInPeriod_ >= pulsarSamples) {
+            sampleInPeriod_ += 1.f;
+            return 0.f;
+        }
+        const float t = sampleInPeriod_ / pulsarSamples;
+        const float env = 0.5f * (1.f - std::cos(TWO_PI * t));
+        const float wp = formantFreq_ * (sampleInPeriod_ / sr_);
+        float wave;
+        const float wpf = wp - (int)wp;
+        switch (waveform_) {
+            case 1: wave = 2.f * wpf - 1.f; break;
+            case 2: wave = wpf < 0.5f ? 1.f : -1.f; break;
+            case 3: wave = wpf < 0.5f ? (4.f * wpf - 1.f) : (3.f - 4.f * wpf); break;
+            default: wave = std::sin(TWO_PI * wpf);
+        }
+        sampleInPeriod_ += 1.f;
+        return wave * env;
+    }
+};`,
+    ins: [
+      { n: "trig",        t: "gate" },
+      { n: "fundamental", t: "param" },
+      { n: "formant",     t: "param" },
+      { n: "duty",        t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { fundamental: 100, formant: 800, duty: 0.5, waveform: "sine" },
+    methods: {
+      fundamental: "setFundamental",
+      formant: "setFormant",
+      duty: "setDuty",
+      waveform: "setWaveform"
+    },
+    paramOptions: { waveform: ["sine", "saw", "square", "triangle"] },
+    enumMap:      { waveform: { sine: "0", saw: "1", square: "2", triangle: "3" } },
+    gateMethods: { trig: "reset" },
+    autoExpose: ["fundamental", "formant", "duty"],
+    extraHeaders: ["<cmath>"],
+    description: "Pulsar synthesis (Curtis Roads). Pulsars repeat at fundamental rate; each contains waveform at formant rate; duty 0..1 = pulsar/period ratio. Spans pitched tones (high duty) → granular clicks (low duty) → trains (varying fundamental)."
+  },
+
+  /* Live looper. Records audio in → buffer → plays buffer back as a
+   * loop. recStart starts a fresh recording; recStop sets the loop
+   * length to whatever was captured. playStart/playStop control
+   * playback. While playing, recording overdubs (writes input + buffer
+   * × feedback). clear wipes everything. maxSec sets the max buffer
+   * length (allocated upfront). */
+  LiveLooper: {
+    category: "Effect", color: COLOR.effect, header: null,
+    cppType: "GammaLiveLooper",
+    helperClass:
+`class GammaLiveLooper {
+    std::vector<float> buf_;
+    int   nSamples_ = 0;
+    int   maxSamples_ = 480000;
+    int   wpos_ = 0;
+    int   rpos_ = 0;
+    bool  recording_ = false;
+    bool  playing_ = false;
+    float feedback_ = 0.7f;
+    float sr_ = 48000.f;
+public:
+    GammaLiveLooper() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+        buf_.assign(maxSamples_, 0.f);
+    }
+    void setMaxSec(float s) {
+        int n = (int)(s * sr_);
+        if (n < 1024) n = 1024;
+        maxSamples_ = n;
+        buf_.assign(maxSamples_, 0.f);
+        nSamples_ = 0; wpos_ = 0; rpos_ = 0;
+    }
+    void setFeedback(float f) { feedback_ = f; }
+    void recStart() { recording_ = true; wpos_ = 0; nSamples_ = 0; }
+    void recStop()  { recording_ = false; nSamples_ = wpos_; }
+    void playStart() { playing_ = true; rpos_ = 0; }
+    void playStop()  { playing_ = false; }
+    void clear() {
+        recording_ = false; playing_ = false; nSamples_ = 0; wpos_ = 0; rpos_ = 0;
+        std::fill(buf_.begin(), buf_.end(), 0.f);
+    }
+    float operator()(float in) {
+        if (recording_) {
+            if (nSamples_ == 0) {
+                if (wpos_ < maxSamples_) {
+                    buf_[wpos_] = in;
+                    wpos_++;
+                }
+            }
+        }
+        if (!playing_) return in;
+        if (nSamples_ < 2) return in;
+        float v = buf_[rpos_];
+        if (recording_ && nSamples_ > 0) {
+            buf_[rpos_] = in + buf_[rpos_] * feedback_;
+        }
+        rpos_++;
+        if (rpos_ >= nSamples_) rpos_ = 0;
+        return in + v;
+    }
+};`,
+    ins: [
+      { n: "in",       t: "audio" },
+      { n: "recStart", t: "gate" },
+      { n: "recStop",  t: "gate" },
+      { n: "playStart",t: "gate" },
+      { n: "playStop", t: "gate" },
+      { n: "clear",    t: "gate" },
+      { n: "maxSec",   t: "param" },
+      { n: "feedback", t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { maxSec: 10.0, feedback: 0.7 },
+    methods: { maxSec: "setMaxSec", feedback: "setFeedback" },
+    gateMethods: {
+      recStart: "recStart", recStop: "recStop",
+      playStart: "playStart", playStop: "playStop", clear: "clear"
+    },
+    autoExpose: ["maxSec", "feedback"],
+    hostGates: ["recStart", "recStop", "playStart", "playStop", "clear"],
+    extraHeaders: ["<vector>", "<algorithm>"],
+    description: "Live looper. recStart/recStop captures audio in → buffer; playStart loops the buffer back at output. Overdub while playing (feedback scales the buffer's existing content before adding the new input). maxSec sets buffer cap."
+  },
+
+  /* Live microphone input. Helper class is a setter-driven pass-through
+   * — the runtime AudioWorklet writes incoming mic samples via setIn
+   * each sample. NOTE: the AudioWorklet runtime integration that pipes
+   * `inputs[0]` → `preview_set_mic` → setIn isn't yet wired; live
+   * preview will be silent until that lands [v2]. The helper class +
+   * codegen still emit cleanly so AlloLib export users can wire mic
+   * routing externally. */
+  MicInput: {
+    category: "Sample", color: COLOR.sample, header: null,
+    cppType: "GammaMicInput",
+    helperClass:
+`class GammaMicInput {
+    float in_ = 0.f;
+public:
+    void setIn(float v) { in_ = v; }
+    float operator()() { return in_; }
+};`,
+    ins: [],
+    outs: [{ n: "out", t: "audio" }],
+    params: {},
+    methods: {},
+    kind: "micInput",
+    description: "Live mic input source. Click 'Enable mic' in props to grant microphone access. NOTE: live-preview audio routing is not yet wired (v2); compiles + exports correctly today, but mic-through during preview is silent."
+  },
+
+  /* Voice activity detection — energy-based gate with attack / hold /
+   * release. Outputs:
+   *   env  — smoothed input envelope (audio-rate signal 0..N)
+   *   gate — 1 while voice active, 0 while silent (with hysteresis)
+   *   trig — one-sample pulse on each rising edge (gate goes 0→1)
+   * Wire mic → VoiceTrigger.in. Wire .gate or .trig into AD.trig,
+   * sequencer.trig, or any gate-typed input to drive other nodes
+   * from voice activity. */
+  VoiceTrigger: {
+    category: "Analysis", color: COLOR.analysis, header: null,
+    cppType: "GammaVoiceTrigger",
+    helperClass:
+`class GammaVoiceTrigger {
+    float env_ = 0.f;
+    float threshold_ = 0.05f;
+    float attackMs_ = 5.f;
+    float releaseMs_ = 100.f;
+    float holdMs_ = 200.f;
+    int   holdSamples_ = 0;
+    bool  active_ = false;
+    float ka_ = 1.f, kr_ = 1.f;
+    float sr_ = 48000.f;
+    void recalc() {
+        ka_ = 1.f - std::exp(-1.f / (attackMs_  * sr_ * 0.001f));
+        kr_ = 1.f - std::exp(-1.f / (releaseMs_ * sr_ * 0.001f));
+    }
+public:
+    GammaVoiceTrigger() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+        recalc();
+    }
+    void setThreshold(float t) { threshold_ = t; }
+    void setAttack(float ms)   { attackMs_  = ms; recalc(); }
+    void setRelease(float ms)  { releaseMs_ = ms; recalc(); }
+    void setHold(float ms)     { holdMs_    = ms; }
+    struct Out { float env, gate, trig; };
+    Out operator()(float in) {
+        const float a = in < 0.f ? -in : in;
+        const float k = a > env_ ? ka_ : kr_;
+        env_ += k * (a - env_);
+        Out o;
+        o.env = env_;
+        const bool wasActive = active_;
+        if (env_ > threshold_) {
+            active_ = true;
+            holdSamples_ = (int)(holdMs_ * sr_ * 0.001f);
+        } else if (active_ && holdSamples_ > 0) {
+            holdSamples_--;
+        } else {
+            active_ = false;
+        }
+        o.gate = active_ ? 1.f : 0.f;
+        o.trig = (active_ && !wasActive) ? 1.f : 0.f;
+        return o;
+    }
+};`,
+    ins: [
+      { n: "in",        t: "audio" },
+      { n: "threshold", t: "param" },
+      { n: "attack",    t: "param" },
+      { n: "release",   t: "param" },
+      { n: "hold",      t: "param" }
+    ],
+    outs: [
+      { n: "env",  t: "audio", access: ".env"  },
+      { n: "gate", t: "clock", access: ".gate" },
+      { n: "trig", t: "clock", access: ".trig" }
+    ],
+    params: { threshold: 0.05, attack: 5, release: 100, hold: 200 },
+    methods: {
+      threshold: "setThreshold",
+      attack:    "setAttack",
+      release:   "setRelease",
+      hold:      "setHold"
+    },
+    autoExpose: ["threshold", "attack", "release", "hold"],
+    extraHeaders: ["<cmath>"],
+    description: "Voice activity detection. Wire audio (e.g. MicInput.out) into in. env = smoothed envelope, gate = active flag (with hold + hysteresis), trig = one-sample pulse on each voice onset. Wire trig into AD.trig / sequencer.trig to drive nodes from voice activity."
   },
 
   /* ---- Noise (Noise.h) ---- */
@@ -7440,6 +8046,50 @@ function renderProps() {
         <button class="btn primary" id="btn-open-wavescan" style="width: 100%;">Edit wavetable bank${overrides ? ` · ${overrides} custom frame${overrides === 1 ? "" : "s"}` : ""}</button>
       </div>`;
     }
+    // Sample-host nodes (SamplePlayer / StereoSamplePlayer / Granular):
+    // file-drop button, current-asset readout, "Load" + "Clear" buttons.
+    // Files are decoded via decodeAudioData and stored in editor.assets;
+    // node.params.assetId references the loaded record.
+    if (def.kind === "sampleHost") {
+      const a = getAsset(node.params && node.params.assetId);
+      html += `<div class="prop-section">Sample asset</div>`;
+      html += `<div class="prop-grid" style="grid-template-columns: 1fr;">`;
+      if (a) {
+        const ch = a.channels >= 2 ? "stereo" : "mono";
+        const samp = Array.isArray(a.data) ? a.data[0].length : a.data.length;
+        const tooBig = samp > ASSET_EMBED_LIMIT;
+        const sizeNote = tooBig
+          ? `<span class="asset-warn" title="Too large to embed in codegen — fine for live preview but exporting will need runtime sample loading">stem-sized · v2 export</span>`
+          : ``;
+        html += `<div class="asset-card">
+          <div class="asset-card-head">
+            <span class="asset-card-name" title="${escapeAttr(a.name)}">${escapeText(a.name)}</span>
+            ${sizeNote}
+          </div>
+          <div class="asset-card-meta">${a.durationSec.toFixed(2)} s · ${a.sampleRate} Hz · ${ch} · ${samp.toLocaleString()} samples</div>
+          <div class="asset-card-row">
+            <button class="btn pr-btn" data-asset-action="load">REPLACE…</button>
+            <button class="btn pr-btn" data-asset-action="clear">CLEAR</button>
+          </div>
+        </div>`;
+      } else {
+        html += `<button class="btn primary" data-asset-action="load" style="width: 100%;">Load .wav / .mp3 / .ogg</button>`;
+        html += `<p class="prop-inline">Files persist to IndexedDB — survive reloads. Up to ~5s embeds in codegen; longer stems need runtime loading on the export side.</p>`;
+      }
+      html += `</div>`;
+    }
+    // MicInput: permission button + status line. The actual audio
+    // routing (worklet inputs → wasm setIn) is v2; clicking enable
+    // gets the user's grant + holds the stream so the editor knows
+    // which hardware is in use.
+    if (def.kind === "micInput") {
+      html += `<div class="prop-section">Microphone</div>`;
+      html += `<div class="prop-grid" style="grid-template-columns: 1fr;">
+        <button class="btn primary" id="btn-enable-mic" style="width: 100%;">Enable microphone</button>
+        <p class="prop-inline" id="mic-status-${node.id}">${(_micStream ? "Granted ✓ · " + (_micDeviceLabel || "default device") : "Not yet enabled")}</p>
+        <p class="prop-inline" style="opacity: 0.6;">v2 note: live preview audio routing for mic isn't wired yet — codegen + export work today, but mic-through is silent during preview. Use this to grant permission early so the worklet can pick up the stream when v2 lands.</p>
+      </div>`;
+    }
     if (def.kind === "patchMatrix") {
       if (!Array.isArray(node.params.matrix) || node.params.matrix.length !== 8) {
         node.params.matrix = Array.from({ length: 8 }, () => new Array(8).fill(0));
@@ -7499,6 +8149,63 @@ function renderProps() {
   if (openWtBtn) openWtBtn.addEventListener('click', () => openWavetableEditModal({ nodeId: node.id, mode: "single" }));
   const openWsBtn = propsEl.querySelector('#btn-open-wavescan');
   if (openWsBtn) openWsBtn.addEventListener('click', () => openWavescanModal(node.id));
+
+  // Sample-host action buttons — load opens a file picker, clear
+  // detaches the asset (does NOT delete the asset record from IDB
+  // so other nodes referencing it still work).
+  propsEl.querySelectorAll('[data-asset-action]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const action = btn.dataset.assetAction;
+      if (action === "clear") {
+        pushHistory("asset:clear:" + node.id);
+        node.params.assetId = "";
+        renderProps(); renderCode(); renderJson();
+        return;
+      }
+      // "load" — file picker → decode → store → attach
+      const inp = document.createElement("input");
+      inp.type = "file";
+      inp.accept = "audio/*,.wav,.mp3,.ogg,.flac,.aac,.m4a";
+      inp.addEventListener("change", async () => {
+        const f = inp.files && inp.files[0];
+        if (!f) return;
+        btn.textContent = "DECODING…";
+        try {
+          const rec = await loadAudioFileToAsset(f);
+          pushHistory("asset:load:" + node.id);
+          node.params.assetId = rec.id;
+          renderProps(); renderCode(); renderJson();
+        } catch (e) {
+          alert("Audio decode failed: " + (e && e.message || e));
+          renderProps();
+        }
+      });
+      inp.click();
+    });
+  });
+
+  // Mic enable — request permission + hold the MediaStream so the
+  // worklet (when v2 lands) can pick it up. Stream is reused across
+  // multiple MicInput nodes — only one grant per session.
+  const enableMicBtn = propsEl.querySelector('#btn-enable-mic');
+  if (enableMicBtn) enableMicBtn.addEventListener('click', async () => {
+    if (_micStream) {
+      // Already granted — re-enumerate so the device label gets fresh.
+      renderProps();
+      return;
+    }
+    try {
+      enableMicBtn.textContent = "REQUESTING…";
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      _micStream = stream;
+      const tracks = stream.getAudioTracks();
+      _micDeviceLabel = tracks.length ? tracks[0].label : "default";
+      renderProps();
+    } catch (err) {
+      enableMicBtn.textContent = "Enable microphone";
+      alert("Microphone access denied: " + (err && err.message || err));
+    }
+  });
 
   // PatchMatrix cell interaction. Click toggles 0↔1; shift-click sets
   // -1 (inversion); vertical drag inside the cell adjusts gain
@@ -15243,6 +15950,263 @@ function setupWavescanModal() {
   }, true);
 }
 setupWavescanModal();
+
+/* ====================================================================
+ * SAMPLE ASSET REGISTRY
+ *
+ * Sample-based nodes (SamplePlayer / StereoSamplePlayer / Granular)
+ * reference audio data via an `assetId` stored on the node's params.
+ * The actual Float32Array(s) live in this in-memory registry, with
+ * IndexedDB-backed persistence keyed by patch filename so samples
+ * survive page reloads.
+ *
+ * Storage shape:
+ *   editor.assets : Map<assetId, AssetRecord>
+ *   AssetRecord = {
+ *     id, name (original filename),
+ *     sampleRate (decoded SR),
+ *     channels (1 = mono Float32Array; 2 = [L, R]),
+ *     durationSec,
+ *     data (Float32Array or [Float32Array, Float32Array])
+ *   }
+ *
+ * Sidecar manifest: on .gpatch save we emit `<patch>.assets.json`
+ * alongside the .gpatch, listing each referenced assetId and its
+ * metadata. The actual sample binaries are NOT bundled with the
+ * .gpatch (multi-MB stems would inflate the JSON beyond reason);
+ * users keep the .wav files they originally dragged in. The IDB
+ * cache keeps them browser-side for repeat editing sessions.
+ *
+ * Codegen embeds samples up to 256K samples (~5.3 sec @ 48k mono)
+ * directly as a static constexpr float[] + load() call. Larger
+ * samples emit a TODO comment with the metadata so the user can
+ * wire up runtime loading on the AlloLib side.
+ * ================================================================= */
+
+const _assets = new Map();          // assetId → AssetRecord
+let _assetIdCounter = 1;
+const ASSET_EMBED_LIMIT = 262144;   // ~5.3 sec @ 48kHz mono
+
+/* Globally-held mic MediaStream + cached device label. One grant per
+ * session shared across all MicInput nodes (browsers only need one
+ * `getUserMedia` permission per origin). When the AudioWorklet
+ * runtime integration lands [v2], this is the stream that gets
+ * connected via MediaStreamAudioSourceNode → AudioWorkletNode. */
+let _micStream = null;
+let _micDeviceLabel = "";
+
+function _newAssetId() {
+  return "a_" + Date.now().toString(36) + "_" + (_assetIdCounter++).toString(36);
+}
+
+/* ── IndexedDB layer ─────────────────────────────────────────────
+ * Single object store "assets", keyed by assetId. Float32Arrays are
+ * structured-cloned natively, no serialization needed. */
+const IDB_NAME = "gamma-node-assets";
+const IDB_STORE = "assets";
+let _idbPromise = null;
+function _idbOpen() {
+  if (_idbPromise) return _idbPromise;
+  _idbPromise = new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(IDB_STORE)) {
+        db.createObjectStore(IDB_STORE, { keyPath: "id" });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  return _idbPromise;
+}
+async function _idbPut(record) {
+  const db = await _idbOpen();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, "readwrite");
+    tx.objectStore(IDB_STORE).put(record);
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
+}
+async function _idbDelete(id) {
+  const db = await _idbOpen();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, "readwrite");
+    tx.objectStore(IDB_STORE).delete(id);
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
+}
+async function _idbLoadAll() {
+  const db = await _idbOpen();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, "readonly");
+    const req = tx.objectStore(IDB_STORE).getAll();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+/* Restore all previously-stored assets into the in-memory map on
+ * startup. Idempotent — calls a second time noop if already loaded. */
+let _assetsLoaded = false;
+async function loadAssetsFromIdb() {
+  if (_assetsLoaded) return;
+  _assetsLoaded = true;
+  try {
+    const records = await _idbLoadAll();
+    records.forEach(r => _assets.set(r.id, r));
+    // Refresh any open props pane so file-name labels appear.
+    if (typeof renderProps === "function") renderProps();
+  } catch (e) {
+    console.warn("[assets] IDB load failed:", e);
+  }
+}
+// Kick off the load — no need to await; UI fills in as data arrives.
+loadAssetsFromIdb();
+
+/* ── Audio file decode + asset creation ─────────────────────────── */
+async function loadAudioFileToAsset(file) {
+  const buf = await file.arrayBuffer();
+  // Use the page's existing AudioContext (first one created on Play
+  // start) when available — otherwise spawn a transient one. Either
+  // way it's only used to decode; we take a copy of the channel data.
+  let ctx = (previewState && previewState.audioCtx) || null;
+  let ctxIsTransient = false;
+  if (!ctx) {
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    ctxIsTransient = true;
+  }
+  const decoded = await ctx.decodeAudioData(buf.slice(0));
+  let data;
+  if (decoded.numberOfChannels >= 2) {
+    data = [decoded.getChannelData(0).slice(), decoded.getChannelData(1).slice()];
+  } else {
+    data = decoded.getChannelData(0).slice();
+  }
+  if (ctxIsTransient) try { ctx.close(); } catch (e) {}
+  const id = _newAssetId();
+  const record = {
+    id,
+    name: file.name,
+    sampleRate: decoded.sampleRate,
+    channels: decoded.numberOfChannels,
+    durationSec: decoded.duration,
+    data
+  };
+  _assets.set(id, record);
+  // Persist async — don't block the UI on slow disks.
+  _idbPut(record).catch(e => console.warn("[assets] IDB put failed:", e));
+  return record;
+}
+
+function getAsset(id) { return id ? _assets.get(id) : null; }
+
+async function deleteAsset(id) {
+  if (!id) return;
+  _assets.delete(id);
+  try { await _idbDelete(id); } catch (e) {}
+}
+
+/* Codegen helper — emit a setSampleRate + load(...) call for a node
+ * with an assetId. For mono nodes pass channelIndex (default 0); for
+ * stereo nodes call twice (channels 0 and 1) into setLoadL/setLoadR.
+ * Samples larger than ASSET_EMBED_LIMIT emit a TODO comment with the
+ * asset's metadata so the user can hook runtime loading externally
+ * (full musical stems use this path). */
+function emitAssetLoadCpp(node, channel, methodLoad, methodSetSr) {
+  const id = node.params && node.params.assetId;
+  const a = getAsset(id);
+  if (!a) {
+    return `        // ${node.id}: no sample loaded`;
+  }
+  const arr = (a.channels >= 2 && Array.isArray(a.data)) ? a.data[channel | 0] : a.data;
+  if (!arr || !arr.length) return `        // ${node.id}: empty sample`;
+  const N = arr.length;
+  if (N > ASSET_EMBED_LIMIT) {
+    // Stem-sized samples — too big to embed as constexpr without
+    // bloating the source. Skip the embed and leave a TODO; live
+    // preview's AudioWorklet path will load via postMessage in v2.
+    return [
+      `        // ${node.id}: sample too large to embed (${N} samples,`,
+      `        //   ${a.durationSec.toFixed(2)}s @ ${a.sampleRate}Hz, file=${JSON.stringify(a.name)})`,
+      `        //   wire runtime sample loading manually if exporting; live preview`,
+      `        //   loads via AudioWorklet postMessage [v2 — not yet implemented]`,
+      `        ${node.id}.${methodSetSr}(${a.sampleRate.toFixed(1)}f);`
+    ].join("\n");
+  }
+  // Embed up to ASSET_EMBED_LIMIT samples as a static constexpr float[].
+  // Per-sample lit takes ~9 chars × N — ~2.3MB worst case at the limit;
+  // reasonable for an exported header. Wrap in a brace-block scope so
+  // multiple instances don't collide on the array name.
+  const chunks = [];
+  for (let i = 0; i < N; i += 8) {
+    const slice = [];
+    for (let j = 0; j < 8 && i + j < N; j++) {
+      const v = arr[i + j];
+      slice.push((isFinite(v) ? v : 0).toFixed(5) + "f");
+    }
+    chunks.push(slice.join(", "));
+  }
+  const arrName = `${node.id}_${channel === 1 ? "R" : "L"}`;
+  const loadMeth = methodLoad;
+  return [
+    `        {`,
+    `            static constexpr float ${arrName}[] = {`,
+    `                ${chunks.join(",\n                ")}`,
+    `            };`,
+    `            ${node.id}.${methodSetSr}(${a.sampleRate.toFixed(1)}f);`,
+    `            ${node.id}.${loadMeth}(${arrName}, ${N});`,
+    `        }`
+  ].join("\n");
+}
+
+/* Sidecar manifest — emitted alongside the .gpatch on save. JSON
+ * listing the asset metadata for any sample-based node in the patch.
+ * Audio data is NOT included (would inflate the file beyond reason);
+ * the .wav files stay on the user's disk in their original location. */
+function buildAssetManifest() {
+  const used = new Set();
+  state.nodes.forEach(n => {
+    const id = n.params && n.params.assetId;
+    if (id) used.add(id);
+  });
+  const out = { version: 1, assets: {} };
+  used.forEach(id => {
+    const a = _assets.get(id);
+    if (!a) return;
+    out.assets[id] = {
+      name: a.name,
+      sampleRate: a.sampleRate,
+      channels: a.channels,
+      durationSec: a.durationSec,
+      lengthSamples: Array.isArray(a.data) ? a.data[0].length : a.data.length
+    };
+  });
+  return out;
+}
+
+/* Hook into the existing btn-save click. We can't replace the listener
+ * cleanly (it's attached above), so instead extend the save flow by
+ * adding a second listener that also drops a sidecar. The original
+ * downloads .gpatch as well — both files arrive in the user's
+ * Downloads folder back-to-back. */
+(function installSidecarSave() {
+  const saveBtn = document.getElementById("btn-save");
+  if (!saveBtn) return;
+  saveBtn.addEventListener("click", () => {
+    const manifest = buildAssetManifest();
+    if (!Object.keys(manifest.assets).length) return;  // no samples → no sidecar
+    const blob = new Blob([JSON.stringify(manifest, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = (state.filename || "patch.gpatch").replace(/\.gpatch$/, "") + ".assets.json";
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  });
+})();
 
 // Hook into render() so adding/removing Button or Slider nodes refreshes
 // the controls panel.
