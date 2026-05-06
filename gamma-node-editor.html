@@ -412,7 +412,10 @@
     color: var(--text-3);
     letter-spacing: 0.04em;
   }
-  .group-collapse-btn {
+  /* Shared collapse / expand button. ⊟ on expanded backdrops,
+   * ⊞ on collapsed blocks. Same DOM hook so the pointer-down
+   * handler can find either via `[data-group-toggle]`. */
+  .group-toggle-btn {
     background: transparent;
     border: 1px solid var(--instr-rule);
     color: var(--phosphor-mid);
@@ -422,11 +425,26 @@
     cursor: pointer;
     line-height: 1;
     padding: 0;
+    transition: color .12s, background .12s, border-color .12s;
   }
-  .group-collapse-btn:hover {
+  .group-toggle-btn:hover {
     color: var(--phosphor);
-    background: rgba(200,232,90,0.08);
+    background: rgba(200,232,90,0.10);
     border-color: var(--phosphor-dim);
+  }
+  /* Collapsed-block variant — sits on the collapsed group's head
+   * row alongside the name + member-count badge. Slightly more
+   * prominent (always full-color phosphor) since it's the user's
+   * primary affordance to expand the group. */
+  .group-toggle-btn.collapsed {
+    color: var(--phosphor);
+    border-color: var(--phosphor-dim);
+    background: rgba(200,232,90,0.06);
+    margin-left: 4px;
+  }
+  .group-toggle-btn.collapsed:hover {
+    background: rgba(200,232,90,0.18);
+    box-shadow: 0 0 8px rgba(200,232,90,0.30);
   }
 
   /* Collapsed group renders as a regular .node block (so it inherits
@@ -442,11 +460,20 @@
     border-color: var(--phosphor);
     box-shadow: 0 0 0 1px var(--phosphor), 0 0 18px rgba(200, 232, 90, 0.25);
   }
+  .node.group-node .group-head-collapsed {
+    /* head row contents: name (1fr, ellipsizes) + ⊞ button (auto)
+     * + n-count badge (auto). Override the default .node-head
+     * justify-content space-between so the toggle button sits
+     * tucked right next to the badge instead of hogging the gap. */
+    gap: 4px;
+  }
   .node.group-node .group-head-collapsed .name {
     font-family: var(--font-instr);
     letter-spacing: 0.10em;
     color: var(--phosphor);
     text-shadow: 0 0 6px rgba(200,232,90,0.30);
+    flex: 1;
+    max-width: none;
   }
 
   /* Member-list inside the group props pane */
@@ -9599,34 +9626,42 @@ function groupBounds(group) {
   if (!isFinite(minX)) return null;
   return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
 }
-/* Cross-boundary edges → input/output stubs on the collapsed-group
- * block. Each stub is identified by its inner-node + inner-port pair
- * and rendered with a label of the form "n3.trig" so the user can
- * tell which inner endpoint they're connecting to. */
+/* Group stubs: every port on a member node that ISN'T fully wired
+ * inside the group becomes a stub on the collapsed block. Two cases
+ * collapse to the same rule:
+ *   • Cross-boundary edge — the port already has an external
+ *     connection; the stub mirrors that wire so it stays visible
+ *     when the group is collapsed.
+ *   • Unconnected source / sink — the port has zero connections,
+ *     i.e. it's at the "beginning of a chain" (input on a node no
+ *     internal node feeds) or "end of a chain" (output on a node
+ *     no internal node consumes). Surfacing these lets the user
+ *     wire to/from the group post-hoc — drop the group, then wire
+ *     its dangling endpoints to the rest of the patch.
+ * Equivalent rule: a port is "internal-only" (HIDDEN on the
+ * collapsed block) only when every one of its edges goes to other
+ * members. Anything else exposes. */
 function computeGroupPorts(group) {
   const set = new Set(group.members);
-  const seenIn = new Set(), seenOut = new Set();
   const inputs = [], outputs = [];
-  state.edges.forEach(e => {
-    const fromIn = set.has(e.from.node);
-    const toIn = set.has(e.to.node);
-    if (!fromIn && toIn) {
-      const k = e.to.node + "." + e.to.port;
-      if (seenIn.has(k)) return;
-      seenIn.add(k);
-      // Look up inner port type from the registry so the stub gets
-      // the right port-color hint.
-      const def = defOf(nodeById(e.to.node));
-      const portDef = def && def.ins.find(p => p.n === e.to.port);
-      inputs.push({ innerNode: e.to.node, innerPort: e.to.port, t: (portDef && portDef.t) || "audio" });
-    } else if (fromIn && !toIn) {
-      const k = e.from.node + "." + e.from.port;
-      if (seenOut.has(k)) return;
-      seenOut.add(k);
-      const def = defOf(nodeById(e.from.node));
-      const portDef = def && def.outs.find(p => p.n === e.from.port);
-      outputs.push({ innerNode: e.from.node, innerPort: e.from.port, t: (portDef && portDef.t) || "audio" });
-    }
+  (group.members || []).forEach(memberId => {
+    const node = nodeById(memberId);
+    if (!node) return;
+    const def = defOf(node);
+    if (!def) return;
+    // Input ports — expose if no incoming edge OR at least one
+    // incoming edge originates outside the group.
+    (def.ins || []).forEach(p => {
+      const incoming = state.edges.filter(e => e.to.node === memberId && e.to.port === p.n);
+      const exposed = incoming.length === 0 || incoming.some(e => !set.has(e.from.node));
+      if (exposed) inputs.push({ innerNode: memberId, innerPort: p.n, t: p.t || "audio" });
+    });
+    // Output ports — same rule, mirrored.
+    (def.outs || []).forEach(p => {
+      const outgoing = state.edges.filter(e => e.from.node === memberId && e.from.port === p.n);
+      const exposed = outgoing.length === 0 || outgoing.some(e => !set.has(e.to.node));
+      if (exposed) outputs.push({ innerNode: memberId, innerPort: p.n, t: p.t || "audio" });
+    });
   });
   return { inputs, outputs };
 }
@@ -10588,7 +10623,7 @@ function render() {
         `<span class="group-mark">▾</span>` +
         `<span class="group-name">${escapeText(g.name)}</span>` +
         `<span class="group-meta">${g.members.length} nodes</span>` +
-        `<button class="group-collapse-btn" data-group-collapse="${g.id}" title="Collapse group">⊟</button>` +
+        `<button class="group-toggle-btn" data-group-toggle="${g.id}" title="Collapse this group (E)" aria-label="collapse">⊟</button>` +
       `</div>`;
     canvasWorld.appendChild(bd);
   });
@@ -10700,7 +10735,8 @@ function render() {
     el.innerHTML =
       `<div class="node-strip" style="background: var(--accent)"></div>` +
       `<div class="node-head group-head-collapsed">` +
-        `<span class="name" title="Click to select this group; double-click to expand">⊟ ${escapeText(g.name)}</span>` +
+        `<span class="name" title="Click to select this group; double-click or use ⊞ to expand">${escapeText(g.name)}</span>` +
+        `<button class="group-toggle-btn collapsed" data-group-toggle="${g.id}" title="Expand this group (E)" aria-label="expand">⊞</button>` +
         `<span class="node-id">${g.members.length}n</span>` +
       `</div>`;
     const rows = document.createElement("div");
@@ -12234,16 +12270,24 @@ canvas.addEventListener("pointerdown", e => {
     }
   }
 
+  // Toggle button on a group's head — works on both the expanded
+  // backdrop's collapse button (⊟) and the collapsed block's expand
+  // button (⊞). Same data-group-toggle attribute on both. Has to
+  // run BEFORE the generic node-element / group-header click logic
+  // since the button sits inside both containers.
+  const toggleBtn = e.target.closest && e.target.closest("[data-group-toggle]");
+  if (toggleBtn) {
+    e.stopPropagation();
+    toggleGroupCollapse(toggleBtn.dataset.groupToggle);
+    return;
+  }
+
   // Group-backdrop header — click selects the group entity; drag
   // the header to translate all members together. Double-click to
   // collapse (handled separately on dblclick).
   const groupHeadEl = e.target.closest && e.target.closest(".group-backdrop");
-  if (groupHeadEl && (e.target.closest(".group-head") || e.target.closest(".group-collapse-btn"))) {
+  if (groupHeadEl && e.target.closest(".group-head")) {
     const gid = groupHeadEl.dataset.groupId;
-    if (e.target.closest(".group-collapse-btn")) {
-      toggleGroupCollapse(gid);
-      return;
-    }
     selectedSet.clear();
     selected = null;
     selectedGroupId = gid;
