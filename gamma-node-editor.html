@@ -451,6 +451,16 @@
   .port.connected.clock { background: var(--clock); border-style: solid; }
   .port:hover { transform: translateY(-50%) scale(1.4); }
 
+  /* Brief red pulse when a wire-drop is refused by portsCompatible(). The
+   * destination port flashes for ~400ms so the rejection is visible without
+   * needing a toast. Class added by pointerup, removed by animationend. */
+  @keyframes port-reject-flash {
+    0%   { background: #ff5a5a; box-shadow: 0 0 0 0 rgba(255,90,90,0.55); }
+    60%  { background: #ff5a5a; box-shadow: 0 0 0 10px rgba(255,90,90,0); }
+    100% { background: var(--surface); box-shadow: 0 0 0 0 rgba(255,90,90,0); }
+  }
+  .port.reject-flash { animation: port-reject-flash 400ms ease-out; }
+
   /* ---------------- footer panel ---------------- */
   footer {
     border-top: 1px solid var(--border);
@@ -2377,90 +2387,398 @@
     width: fit-content;
   }
 
-  /* Piano-roll editor — drawable note grid (time × pitch) inside its
-   * own modal. Pitch axis runs top→bottom (high→low MIDI), time
-   * axis left→right. Notes render as horizontal bars spanning their
-   * duration in steps. */
-  .pianoroll-toolbar {
+  /* ─────────────────────────────────────────────────────────────────────
+   * Piano roll editor — pro-grade time × pitch sequencer modeled after
+   * Ableton's Live but rendered through the lab-instrument lens
+   * (phosphor traces on a CRT field). Modal expands to ~92vw × 88vh
+   * and is laid out as a 2×3 CSS grid:
+   *   ┌──────┬──────────────┐  corner    ruler
+   *   ├──────┼──────────────┤  keys      grid
+   *   ├──────┼──────────────┤  velCorner velLane
+   *   └──────┴──────────────┘
+   * The grid scrolls; ruler / keys / velocity are scroll-mirrored to it
+   * via JS so everything stays aligned. Notes glow via drop-shadow,
+   * black-key rows recede into instr-bg, and the pattern-end marker is
+   * a dashed danger-red barrier. All section labels are Major Mono
+   * Display caps with letter-spacing, matching the Monitor pane.
+   * ───────────────────────────────────────────────────────────────── */
+
+  .pr-modal {
+    width: 92vw;
+    max-width: 1480px;
+    height: 88vh;
+    max-height: 920px;
     display: flex;
-    gap: 12px;
-    align-items: center;
-    margin: 4px 0 12px;
+    flex-direction: column;
+    background:
+      radial-gradient(ellipse at 50% -20%, rgba(200,232,90,0.05), transparent 60%),
+      var(--instr-bg);
+    border: 1px solid var(--phosphor-dim);
+    box-shadow:
+      0 0 0 1px rgba(200,232,90,0.04) inset,
+      0 30px 80px rgba(0,0,0,0.6),
+      0 0 60px rgba(200,232,90,0.05);
+    border-radius: 4px;
+    overflow: hidden;
   }
-  .pianoroll-toolbar-field {
+  .pr-modal-head {
+    border-bottom: 1px solid var(--instr-rule);
+    background: linear-gradient(to bottom, rgba(200,232,90,0.04), transparent);
+    padding: 10px 14px;
+    gap: 12px;
+    display: flex;
+    align-items: center;
+  }
+  .pr-title-mark {
+    font-family: var(--font-instr);
+    color: var(--phosphor);
+    font-size: 13px;
+    letter-spacing: 0.10em;
+    text-shadow: 0 0 12px rgba(200,232,90,0.4);
+  }
+  .pr-title-id {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--phosphor-mid);
+    padding: 3px 8px;
+    border: 1px solid var(--phosphor-dim);
+    border-radius: 2px;
+    background: rgba(0,0,0,0.4);
+    letter-spacing: 0.04em;
+  }
+  .pr-title-spacer { flex: 1; }
+  .pr-readout {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--phosphor);
+    background: rgba(0,0,0,0.4);
+    padding: 5px 12px;
+    border: 1px solid var(--phosphor-dim);
+    border-radius: 2px;
+    letter-spacing: 0.06em;
+    text-shadow: 0 0 10px rgba(200,232,90,0.35);
+    min-width: 220px;
+    text-align: center;
+    white-space: pre;
+  }
+
+  /* ── Toolbar ── */
+  .pr-toolbar {
+    display: flex;
+    align-items: stretch;
+    background:
+      linear-gradient(to bottom, rgba(200,232,90,0.03), transparent 80%),
+      var(--surface);
+    border-bottom: 1px solid var(--instr-rule);
+    flex: 0 0 auto;
+  }
+  .pr-tool-group {
     display: flex;
     align-items: center;
     gap: 6px;
+    padding: 8px 14px;
+    border-right: 1px solid var(--instr-rule);
+  }
+  .pr-tool-label {
+    font-family: var(--font-instr);
+    font-size: 9px;
+    letter-spacing: 0.18em;
+    color: var(--text-3);
+    margin-right: 4px;
+  }
+  .pr-tool {
+    width: 28px;
+    height: 26px;
+    background: transparent;
+    border: 1px solid var(--instr-rule);
+    color: var(--text-2);
+    cursor: pointer;
+    border-radius: 2px;
+    font-size: 13px;
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    transition: color .12s, border-color .12s, background .12s, box-shadow .12s;
+    font-family: var(--font-mono);
+  }
+  .pr-tool:hover { color: var(--phosphor-mid); border-color: var(--phosphor-dim); }
+  .pr-tool.active {
+    color: var(--accent-ink);
+    background: var(--phosphor);
+    border-color: var(--phosphor);
+    box-shadow: 0 0 12px rgba(200,232,90,0.4), 0 0 0 1px rgba(200,232,90,0.4);
+  }
+  .pr-select {
+    height: 26px;
+    background: rgba(0,0,0,0.4);
+    border: 1px solid var(--instr-rule);
+    color: var(--phosphor);
     font-family: var(--font-mono);
     font-size: 11px;
-    color: var(--text-2);
+    padding: 0 8px;
+    border-radius: 2px;
+    cursor: pointer;
+    text-shadow: 0 0 8px rgba(200,232,90,0.25);
   }
-  .pianoroll-toolbar-field input {
-    width: 64px;
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    border-radius: 3px;
-    color: var(--text);
+  .pr-select:focus { outline: none; border-color: var(--phosphor-mid); }
+  .pr-tool-group input[type="number"] {
+    width: 56px;
+    height: 26px;
+    background: rgba(0,0,0,0.4);
+    border: 1px solid var(--instr-rule);
+    color: var(--phosphor);
     font-family: var(--font-mono);
-    font-size: 12px;
-    padding: 4px 6px;
+    font-size: 11px;
+    padding: 0 7px;
+    border-radius: 2px;
+    text-align: right;
     outline: none;
+    text-shadow: 0 0 8px rgba(200,232,90,0.35);
   }
-  .pianoroll-toolbar-field input:focus { border-color: var(--accent); }
-  .pianoroll-toolbar-spacer { flex: 1; }
-  .pianoroll-grid-wrap {
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    background: var(--bg);
-    max-height: 480px;
+  .pr-tool-group input[type="number"]:focus { border-color: var(--phosphor-mid); }
+  .pr-tool-suffix {
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    color: var(--text-3);
+    letter-spacing: 0.06em;
+  }
+  .pr-zoom-btn {
+    width: 24px;
+    height: 22px;
+    background: transparent;
+    border: 1px solid var(--instr-rule);
+    color: var(--text-2);
+    cursor: pointer;
+    border-radius: 2px;
+    font-size: 12px;
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    transition: color .1s, border-color .1s;
+  }
+  .pr-zoom-btn:hover { color: var(--phosphor); border-color: var(--phosphor-dim); }
+  .pr-zoom-sep { width: 6px; }
+  .pr-tool-spacer { flex: 1; }
+  .pr-btn {
+    margin: 6px 4px;
+    height: 26px;
+    background: transparent;
+    border: 1px solid var(--instr-rule);
+    color: var(--text-2);
+    cursor: pointer;
+    border-radius: 2px;
+    font-family: var(--font-instr);
+    font-size: 9.5px;
+    letter-spacing: 0.14em;
+    padding: 0 12px;
+    transition: color .1s, border-color .1s, background .1s, box-shadow .1s;
+  }
+  .pr-btn:hover { color: var(--phosphor); border-color: var(--phosphor-dim); }
+  .pr-btn-primary {
+    background: var(--phosphor);
+    color: var(--accent-ink);
+    border-color: var(--phosphor);
+    margin-right: 14px;
+  }
+  .pr-btn-primary:hover {
+    background: var(--phosphor);
+    color: var(--accent-ink);
+    box-shadow: 0 0 16px rgba(200,232,90,0.55);
+  }
+
+  /* ── Stage layout ── */
+  .pr-stage {
+    flex: 1;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: 64px 1fr;
+    grid-template-rows: 28px 1fr 110px;
+    background: var(--instr-bg);
+    border-bottom: 1px solid var(--instr-rule);
+    position: relative;
+  }
+  .pr-corner {
+    border-right: 1px solid var(--phosphor-dim);
+    border-bottom: 1px solid var(--phosphor-dim);
+    padding: 4px 6px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    background: rgba(0,0,0,0.4);
+    font-family: var(--font-instr);
+    font-size: 7.5px;
+    letter-spacing: 0.20em;
+    color: var(--text-3);
+  }
+  .pr-corner-mark { line-height: 1; }
+  .pr-vel-corner {
+    border-right: 1px solid var(--phosphor-dim);
+    border-top: 1px solid var(--phosphor-dim);
+    background: rgba(0,0,0,0.4);
+    font-family: var(--font-instr);
+    font-size: 9px;
+    letter-spacing: 0.20em;
+    color: var(--phosphor-mid);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .pr-ruler-wrap, .pr-keys-wrap, .pr-vel-wrap {
+    overflow: hidden;
+    position: relative;
+  }
+  .pr-ruler-wrap { border-bottom: 1px solid var(--phosphor-dim); }
+  .pr-vel-wrap   { border-top:    1px solid var(--phosphor-dim); }
+  .pr-keys-wrap  { border-right:  1px solid var(--phosphor-dim); }
+  .pr-grid-wrap {
     overflow: auto;
+    position: relative;
     user-select: none;
+    background: var(--instr-bg);
   }
-  .pianoroll-grid {
-    display: block;
-    cursor: crosshair;
-    touch-action: none;
-  }
-  .pianoroll-grid .pr-bg-row-white { fill: var(--surface); }
-  .pianoroll-grid .pr-bg-row-black { fill: var(--bg); }
-  .pianoroll-grid .pr-grid-line { stroke: var(--border); stroke-width: 1; }
-  .pianoroll-grid .pr-beat-line { stroke: var(--text-3); stroke-width: 1; }
-  .pianoroll-grid .pr-pitch-label {
+
+  .pr-ruler, .pr-keys, .pr-grid, .pr-vel { display: block; }
+
+  /* ── SVG primitives — phosphor traces on near-black ── */
+  .pr-row-white  { fill: var(--surface); }
+  .pr-row-black  { fill: var(--instr-bg-2); }
+  .pr-row-c      { fill: rgba(200,232,90,0.05); }
+  .pr-grid-line  { stroke: rgba(200,232,90,0.05); stroke-width: 1; }
+  .pr-step-line  { stroke: rgba(200,232,90,0.10); stroke-width: 1; }
+  .pr-beat-line  { stroke: rgba(200,232,90,0.18); stroke-width: 1; }
+  .pr-bar-line   { stroke: rgba(200,232,90,0.32); stroke-width: 1; }
+  .pr-end-line   { stroke: var(--danger); stroke-width: 1.5; stroke-dasharray: 3 3; opacity: 0.7; }
+
+  .pr-key-white  { fill: var(--surface-2); stroke: var(--phosphor-dim); stroke-width: 0.5; }
+  .pr-key-black  { fill: var(--instr-bg);  stroke: var(--phosphor-dim); stroke-width: 0.5; }
+  .pr-key-c      { fill: rgba(200,232,90,0.07); stroke: var(--phosphor-dim); stroke-width: 0.5; }
+  .pr-key-cap    { fill: rgba(0,0,0,0.55); pointer-events: none; }
+  .pr-key-label {
     font-family: var(--font-mono);
     font-size: 9px;
-    fill: var(--text-3);
+    fill: var(--phosphor-mid);
+    letter-spacing: 0.04em;
+    pointer-events: none;
   }
-  .pianoroll-grid .pr-step-label {
+  .pr-key-label-c {
+    fill: var(--phosphor);
+    text-shadow: 0 0 6px rgba(200,232,90,0.4);
+  }
+
+  .pr-bar-num {
     font-family: var(--font-mono);
-    font-size: 9px;
+    font-size: 10px;
+    fill: var(--phosphor);
+    letter-spacing: 0.04em;
+  }
+  .pr-step-num {
+    font-family: var(--font-mono);
+    font-size: 8.5px;
     fill: var(--text-3);
   }
-  .pianoroll-grid .pr-note {
-    fill: var(--accent);
-    stroke: var(--accent-ink);
+
+  /* Notes (glowing phosphor blocks) */
+  .pr-note {
+    fill: var(--phosphor);
+    stroke: rgba(0,0,0,0.55);
     stroke-width: 0.5;
     cursor: pointer;
+    filter: drop-shadow(0 0 4px rgba(200,232,90,0.45));
+    transition: filter .12s;
   }
-  .pianoroll-grid .pr-note:hover { fill: var(--audio); }
-  .pianoroll-grid .pr-preview {
-    fill: rgba(200, 232, 90, 0.35);
-    stroke: var(--accent);
+  .pr-note:hover { filter: drop-shadow(0 0 8px rgba(200,232,90,0.7)); }
+  .pr-note.selected {
+    stroke: var(--info);
+    stroke-width: 1.5;
+    filter: drop-shadow(0 0 10px rgba(131,232,255,0.55))
+            drop-shadow(0 0 4px rgba(200,232,90,0.4));
+  }
+  .pr-note-handle {
+    fill: rgba(0,0,0,0.45);
+    cursor: ew-resize;
+    pointer-events: all;
+  }
+  .pr-note-handle:hover { fill: rgba(0,0,0,0.65); }
+
+  .pr-preview {
+    fill: rgba(200,232,90,0.30);
+    stroke: var(--phosphor);
     stroke-width: 1;
     pointer-events: none;
+    filter: drop-shadow(0 0 6px rgba(200,232,90,0.5));
   }
-  .pianoroll-grid .pr-playhead {
-    stroke: var(--audio);
-    stroke-width: 1.5;
-    opacity: 0.6;
+  .pr-marquee {
+    fill: rgba(131,232,255,0.08);
+    stroke: var(--info);
+    stroke-width: 1;
+    stroke-dasharray: 4 3;
     pointer-events: none;
   }
-  .pianoroll-summary {
+  .pr-cross-h, .pr-cross-v {
+    stroke: rgba(200,232,90,0.20);
+    stroke-width: 1;
+    stroke-dasharray: 2 4;
+    pointer-events: none;
+  }
+
+  /* Velocity-lane bars */
+  .pr-vel-bar { fill: var(--phosphor); opacity: 0.85; }
+  .pr-vel-bar.selected { fill: var(--info); opacity: 1; }
+  .pr-vel-baseline { stroke: var(--phosphor-mid); stroke-width: 1; }
+  .pr-vel-grid { stroke: rgba(200,232,90,0.06); stroke-width: 1; }
+  .pr-vel-handle { fill: var(--phosphor); cursor: ns-resize; opacity: 0.9; }
+  .pr-vel-handle:hover { fill: var(--info); opacity: 1; }
+
+  /* Cursor states by tool */
+  .pr-grid-wrap[data-tool="draw"]   { cursor: crosshair; }
+  .pr-grid-wrap[data-tool="select"] { cursor: default; }
+  .pr-grid-wrap[data-tool="erase"]  { cursor: crosshair; }
+
+  /* ── Status bar ── */
+  .pr-status {
+    flex: 0 0 auto;
     display: flex;
-    justify-content: space-between;
-    margin-top: 6px;
+    align-items: center;
+    background: rgba(0,0,0,0.55);
+    border-top: 1px solid var(--instr-rule);
+  }
+  .pr-status-cell {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 7px 14px;
+    border-right: 1px solid var(--instr-rule);
+  }
+  .pr-status-cell-grow { flex: 1; border-right: 0; padding: 0; }
+  .pr-stat-key {
+    font-family: var(--font-instr);
+    font-size: 8.5px;
+    letter-spacing: 0.18em;
+    color: var(--text-3);
+  }
+  .pr-stat-val {
     font-family: var(--font-mono);
     font-size: 10.5px;
+    color: var(--phosphor);
+    letter-spacing: 0.04em;
+    text-shadow: 0 0 6px rgba(200,232,90,0.25);
+  }
+  .pr-stat-val.muted {
     color: var(--text-3);
+    text-shadow: none;
+    font-size: 9.5px;
+    letter-spacing: 0.06em;
+  }
+
+  @media (max-width: 720px) {
+    .pr-modal { width: 100vw; height: 100vh; max-height: 100vh; max-width: 100vw; border-radius: 0; }
+    .pr-tool-group { padding: 6px 10px; }
+    .pr-tool-label { display: none; }
+    .pr-readout { min-width: 0; font-size: 10px; padding: 3px 8px; }
   }
 
   /* Step-grid editor for StepSeq16 / StepSeq32 — clickable cells that
@@ -2870,34 +3188,97 @@
   </div>
 
   <!-- Piano-roll editor — opened from a PianoRoll node's props pane.
-       Modal contains a time × pitch grid; click+drag to draw a note,
-       click an existing note to delete. Pattern length / pitch range
-       configurable. Notes persist into node.params.notes and codegen
-       emits clearNotes + addNote at constructor time. -->
+       Pro-grade time × pitch sequencer with dedicated piano-keyboard
+       sidebar, beat ruler, velocity lane, tool modes, snap, zoom, and
+       multi-select. Notes persist into node.params.notes and codegen
+       emits clearNotes + addNote at constructor time. The {start,
+       dur, midi, vel} schema is unchanged; runtime _id is added on
+       open for selection persistence and stripped on save. -->
   <div class="modal-backdrop" id="pianoroll-modal" style="display:none;">
-    <div class="modal" style="width: 760px; max-width: calc(100vw - 32px);">
-      <div class="modal-head">
-        <span id="pianoroll-modal-title">Edit piano roll</span>
+    <div class="modal pr-modal">
+      <div class="modal-head pr-modal-head">
+        <span class="pr-title-mark">PIANO ROLL</span>
+        <span class="pr-title-id" id="pianoroll-modal-title">[—]</span>
+        <span class="pr-title-spacer"></span>
+        <span class="pr-readout" id="pianoroll-readout">PITCH —    POS —.—.—</span>
         <button class="btn modal-x" id="btn-pianoroll-close">×</button>
       </div>
-      <div class="modal-body">
-        <p class="modal-note">
-          Click + drag horizontally inside the grid to draw a note (start..end in steps). Click an existing note to remove it. Each step is one clock-tick — wire <code>MasterClock.sixteenth</code> for sixteenth-note resolution. Notes carry MIDI pitch + velocity (1.0 default).
-        </p>
-        <div class="pianoroll-toolbar">
-          <label class="pianoroll-toolbar-field">
-            <span>Steps</span>
-            <input id="pianoroll-len" type="number" min="1" max="64" step="1" />
-          </label>
-          <label class="pianoroll-toolbar-field">
-            <span>Velocity</span>
-            <input id="pianoroll-vel" type="number" min="0" max="1" step="0.05" />
-          </label>
-          <span class="pianoroll-toolbar-spacer"></span>
-          <button class="btn" id="btn-pianoroll-clear">Clear</button>
-          <button class="btn primary" id="btn-pianoroll-done">Done</button>
+
+      <div class="pr-toolbar">
+        <div class="pr-tool-group">
+          <span class="pr-tool-label">TOOL</span>
+          <button class="pr-tool" data-tool="draw"   title="Pencil — click+drag to draw notes (B)">✎</button>
+          <button class="pr-tool" data-tool="select" title="Select — marquee or click; drag to move; drag right edge to resize (V)">▭</button>
+          <button class="pr-tool" data-tool="erase"  title="Erase — click a note to remove (E)">⌫</button>
         </div>
-        <div class="pianoroll-grid-wrap" id="pianoroll-grid-wrap"></div>
+        <div class="pr-tool-group">
+          <span class="pr-tool-label">GRID</span>
+          <select id="pr-snap" class="pr-select" title="Snap drawing/move to this resolution">
+            <option value="0">1/16</option>
+            <option value="1">1/8</option>
+            <option value="2">1/4</option>
+            <option value="3">1/2</option>
+            <option value="4">1/1</option>
+          </select>
+        </div>
+        <div class="pr-tool-group">
+          <span class="pr-tool-label">LENGTH</span>
+          <input id="pianoroll-len" type="number" min="1" max="64" step="1" />
+          <span class="pr-tool-suffix">STEPS</span>
+        </div>
+        <div class="pr-tool-group">
+          <span class="pr-tool-label">VEL</span>
+          <input id="pianoroll-vel" type="number" min="0" max="1" step="0.05" title="Default velocity for newly-drawn notes" />
+        </div>
+        <div class="pr-tool-group">
+          <span class="pr-tool-label">ZOOM</span>
+          <button class="pr-zoom-btn" data-zoom="hout" title="Zoom out horizontally">⇤</button>
+          <button class="pr-zoom-btn" data-zoom="hin"  title="Zoom in horizontally">⇥</button>
+          <span class="pr-zoom-sep"></span>
+          <button class="pr-zoom-btn" data-zoom="vout" title="Zoom out vertically">⤓</button>
+          <button class="pr-zoom-btn" data-zoom="vin"  title="Zoom in vertically">⤒</button>
+        </div>
+        <div class="pr-tool-group">
+          <span class="pr-tool-label">OCTAVE</span>
+          <button class="pr-zoom-btn" data-oct="-1" title="Scroll down an octave">⇩</button>
+          <button class="pr-zoom-btn" data-oct="+1" title="Scroll up an octave">⇧</button>
+        </div>
+        <span class="pr-tool-spacer"></span>
+        <button class="btn pr-btn" id="btn-pianoroll-duplicate" title="Duplicate selection (⌘ D)">DUPLICATE</button>
+        <button class="btn pr-btn" id="btn-pianoroll-clear" title="Remove all notes">CLEAR</button>
+        <button class="btn pr-btn pr-btn-primary" id="btn-pianoroll-done">DONE</button>
+      </div>
+
+      <div class="pr-stage">
+        <div class="pr-corner">
+          <span class="pr-corner-mark">PITCH</span>
+          <span class="pr-corner-mark">TIME →</span>
+        </div>
+        <div class="pr-ruler-wrap"><svg id="pr-ruler" class="pr-ruler"></svg></div>
+        <div class="pr-keys-wrap"><svg id="pr-keys" class="pr-keys"></svg></div>
+        <div class="pr-grid-wrap" id="pr-grid-wrap" data-tool="draw"><svg id="pr-grid" class="pr-grid"></svg></div>
+        <div class="pr-vel-corner">VEL</div>
+        <div class="pr-vel-wrap"><svg id="pr-vel" class="pr-vel"></svg></div>
+      </div>
+
+      <div class="pr-status">
+        <span class="pr-status-cell">
+          <span class="pr-stat-key">NOTES</span>
+          <span class="pr-stat-val" id="pr-stat-count">0</span>
+        </span>
+        <span class="pr-status-cell">
+          <span class="pr-stat-key">SELECTED</span>
+          <span class="pr-stat-val" id="pr-stat-selected">0</span>
+        </span>
+        <span class="pr-status-cell">
+          <span class="pr-stat-key">SNAP</span>
+          <span class="pr-stat-val" id="pr-stat-snap">1/16</span>
+        </span>
+        <span class="pr-status-cell pr-status-cell-grow"></span>
+        <span class="pr-status-cell">
+          <span class="pr-stat-key">SHORTCUTS</span>
+          <span class="pr-stat-val muted">B PEN · V SEL · E ERASE · ⌫ DEL · ↑↓ TRANSPOSE · ⇧↑↓ OCT · ⌘D DUP · ⌘A ALL · ESC CLOSE</span>
+        </span>
       </div>
     </div>
   </div>
@@ -3611,7 +3992,7 @@ public:
     }
 };`,
     ins: [
-      { n: "clock", t: "audio" },
+      { n: "clock", t: "clock" },
       { n: "trig",  t: "gate" }
     ],
     outs: [{ n: "out", t: "clock" }],
@@ -3650,7 +4031,7 @@ public:
     }
 };`,
     ins: [
-      { n: "clock", t: "audio" },
+      { n: "clock", t: "clock" },
       { n: "trig",  t: "gate" }
     ],
     outs: [{ n: "out", t: "clock" }],
@@ -3701,7 +4082,7 @@ public:
     }
 };`,
     ins: [
-      { n: "clock", t: "audio" },
+      { n: "clock", t: "clock" },
       { n: "trig",  t: "gate" }
     ],
     outs: [{ n: "out", t: "clock" }],
@@ -3777,7 +4158,7 @@ public:
     }
 };`,
     ins: [
-      { n: "clock", t: "audio" },
+      { n: "clock", t: "clock" },
       { n: "freq",  t: "param" },
       { n: "trig",  t: "gate" }
     ],
@@ -3869,7 +4250,7 @@ public:
     }
 };`,
     ins: [
-      { n: "clock", t: "audio" },
+      { n: "clock", t: "clock" },
       { n: "trig",  t: "gate" }
     ],
     outs: [
@@ -5051,6 +5432,47 @@ function makePort(nodeId, p, dir) {
   return port;
 }
 
+/* Connection-legality matrix. Predicate is consulted at wire completion
+ * (pointerup over an input port) — incompatible drops are rejected and
+ * the destination port flashes red.
+ *
+ * Current rule set:
+ *   - audio / param / gate / clock are all "signal" types — sample-rate
+ *     or control-rate floats, structurally interchangeable. The codegen
+ *     handles whatever lands where (Schmitt-trigger codegen for *->gate,
+ *     raw 0/1 float for clock, etc.). Same-type and cross-signal pairs
+ *     all allowed.
+ *   - Future port types (texture / transform / mesh from Phase 6+) are
+ *     NOT signal types and will only allow same-type or explicit
+ *     converter-node bridges. Add them to a sibling set as they ship.
+ *
+ * Today the predicate is permissive — its purpose is to be the single
+ * place that says "yes" so that Phase 6 has a single place to start
+ * saying "no". */
+const SIGNAL_PORT_TYPES = new Set(["audio", "param", "gate", "clock"]);
+function portsCompatible(srcType, dstType) {
+  if (srcType === dstType) return true;
+  if (SIGNAL_PORT_TYPES.has(srcType) && SIGNAL_PORT_TYPES.has(dstType)) return true;
+  return false;
+}
+
+/* Briefly flash a port red to signal a rejected connection. The CSS
+ * keyframe handles the visuals; we just toggle the class and clean it
+ * up after the animation so a subsequent reject re-fires it. */
+function flashRejectPort(portEl) {
+  if (!portEl) return;
+  portEl.classList.remove("reject-flash");
+  // Force reflow so re-adding the class restarts the animation even if
+  // the same port is rejected twice in a row.
+  void portEl.offsetWidth;
+  portEl.classList.add("reject-flash");
+  const onEnd = () => {
+    portEl.classList.remove("reject-flash");
+    portEl.removeEventListener("animationend", onEnd);
+  };
+  portEl.addEventListener("animationend", onEnd);
+}
+
 function wirePath(x1, y1, x2, y2) {
   const dx = Math.abs(x2 - x1) * 0.5 + 24;
   return `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
@@ -5296,6 +5718,20 @@ function renderProps() {
  * return type and final return expression.
  * ======================================================================== */
 
+/* signalInput finds the input port that should feed a node's operator()
+ * sample-rate argument (i.e. id(in_expr) in generated C++). Audio is the
+ * canonical signal type, but clock-typed inputs count too — a clock signal
+ * is just a 0/1 sample-rate float, structurally identical to audio. Used
+ * by computeBase + prepareSample so re-typing a sequencer's clock input
+ * from "audio" to "clock" doesn't strip its operator() argument.
+ *
+ * If a node has both audio and clock inputs, audio wins (declared order
+ * is irrelevant — audio is always the conventional signal arg). */
+function signalInput(def) {
+  if (!def || !def.ins) return null;
+  return def.ins.find(p => p.t === "audio") || def.ins.find(p => p.t === "clock") || null;
+}
+
 /* exprFor builds the C++ expression for one of a node's output ports.
  * For single-output nodes the srcPortName is irrelevant (the node has
  * one output and that's what's returned). For multi-output nodes
@@ -5367,17 +5803,17 @@ function computeBase(node, def, cgCtx) {
       return ctx[k] !== undefined ? "(" + ctx[k] + ")" : m;
     });
   } else if (def.cppType) {
-    const audioIn = def.ins.find(p => p.t === "audio");
-    if (audioIn) {
-      const e = state.edges.find(ed => ed.to.node === node.id && ed.to.port === audioIn.n);
+    const sigIn = signalInput(def);
+    if (sigIn) {
+      const e = state.edges.find(ed => ed.to.node === node.id && ed.to.port === sigIn.n);
       const inExpr = e ? exprFor(e.from.node, e.from.port, cgCtx) : "0.f";
       return `${node.id}(${inExpr})`;
     }
     return `${node.id}()`;
   } else {
-    const audioIn = def.ins.find(p => p.t === "audio");
-    if (audioIn) {
-      const e = state.edges.find(ed => ed.to.node === node.id && ed.to.port === audioIn.n);
+    const sigIn = signalInput(def);
+    if (sigIn) {
+      const e = state.edges.find(ed => ed.to.node === node.id && ed.to.port === sigIn.n);
       return e ? exprFor(e.from.node, e.from.port, cgCtx) : "0.f";
     }
     return "0.f";
@@ -5455,13 +5891,13 @@ function prepareSample(cgCtx) {
     //       once and share the local.
     const multiOut = def.outs && def.outs.length > 1;
     if (cgCtx.fanout[nodeId] > 1 || multiOut) {
-      const audioIn = def.ins.find(p => p.t === "audio");
+      const sigIn = signalInput(def);
       let inExpr = "0.f";
-      if (audioIn) {
-        const e = state.edges.find(ed => ed.to.node === nodeId && ed.to.port === audioIn.n);
+      if (sigIn) {
+        const e = state.edges.find(ed => ed.to.node === nodeId && ed.to.port === sigIn.n);
         if (e) inExpr = exprFor(e.from.node, e.from.port, cgCtx);
       }
-      const callExpr = audioIn ? `${nodeId}(${inExpr})` : `${nodeId}()`;
+      const callExpr = sigIn ? `${nodeId}(${inExpr})` : `${nodeId}()`;
       cgCtx.cache[nodeId] = `_${nodeId}`;
       lines.push(`        auto _${nodeId} = ${callExpr};`);
     }
@@ -5899,8 +6335,20 @@ function renderCode() {
   codeOut.innerHTML = highlightCpp(generateCode());
 }
 
+/* JSON.stringify replacer that strips runtime-only fields (any key
+ * prefixed with `_`) from serialization. Currently in use:
+ *   - state._cycleErrors  — cycle-detector cache rebuilt on each render
+ *   - notes[i]._id        — piano-roll selection key, regenerated on
+ *                           open from the (start, dur, midi, vel) tuple
+ * Both .gpatch save and the JSON preview tab use this so transient
+ * editor bookkeeping never lands in source files or pasted snippets. */
+function _omitRuntimeKeys(key, val) {
+  if (typeof key === "string" && key.length > 0 && key.charCodeAt(0) === 95) return undefined;
+  return val;
+}
+
 function renderJson() {
-  jsonOut.textContent = JSON.stringify(state, null, 2);
+  jsonOut.textContent = JSON.stringify(state, _omitRuntimeKeys, 2);
 }
 
 /* =========================================================================
@@ -6062,12 +6510,19 @@ document.addEventListener("pointerup", e => {
   if (wire) {
     const port = e.target.closest && e.target.closest(".port");
     if (port && port.dataset.dir === "in" && port.dataset.node !== wire.fromNode) {
-      pushHistory("connect");
-      state.edges = state.edges.filter(ed => !(ed.to.node === port.dataset.node && ed.to.port === port.dataset.port));
-      state.edges.push({
-        from: { node: wire.fromNode, port: wire.fromPort },
-        to:   { node: port.dataset.node, port: port.dataset.port }
-      });
+      // Legality check — see portsCompatible() above. A reject just
+      // flashes the destination port red and drops the wire; no edge
+      // mutation, no history push.
+      if (!portsCompatible(wire.fromType, port.dataset.type)) {
+        flashRejectPort(port);
+      } else {
+        pushHistory("connect");
+        state.edges = state.edges.filter(ed => !(ed.to.node === port.dataset.node && ed.to.port === port.dataset.port));
+        state.edges.push({
+          from: { node: wire.fromNode, port: wire.fromPort },
+          to:   { node: port.dataset.node, port: port.dataset.port }
+        });
+      }
     }
     wire = null;
     render();
@@ -6147,7 +6602,7 @@ function serializeSelection() {
     const idPart = dot >= 0 ? k.slice(0, dot) : k;
     if (ids.has(idPart)) exposed[k] = state.exposed[k];
   });
-  return JSON.stringify({ kind: CLIPBOARD_MIME, nodes, edges, exposed });
+  return JSON.stringify({ kind: CLIPBOARD_MIME, nodes, edges, exposed }, _omitRuntimeKeys);
 }
 
 function pasteFragment(json, offset) {
@@ -6448,7 +6903,7 @@ document.getElementById("btn-gen").addEventListener("click", () => {
 });
 
 document.getElementById("btn-save").addEventListener("click", () => {
-  const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
+  const blob = new Blob([JSON.stringify(state, _omitRuntimeKeys, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url; a.download = state.filename || "patch.gpatch";
@@ -10912,224 +11367,978 @@ function closeRampModal() {
   if (modal) modal.addEventListener("click", e => { if (e.target === modal) closeRampModal(); });
 })();
 
-/* ------------- Piano-roll modal ------------- */
-/* Drawable monophonic note sequencer. Notes live in node.params.notes
- * as { start, dur, midi, vel } objects. Modal renders a time × pitch
- * grid with the C-of-each-octave slightly highlighted; click+drag
- * draws a new note (start..end in steps), click an existing note
- * deletes it. Pattern length is editable in the toolbar. */
-const PR_PITCH_LO  = 36;     // MIDI C2
-const PR_PITCH_HI  = 84;     // MIDI C6 (exclusive upper)
-const PR_CELL_W    = 28;
-const PR_CELL_H    = 14;
-const PR_LABEL_W   = 36;
-const PR_HEADER_H  = 18;
+/* ====================================================================
+ * PIANO-ROLL EDITOR
+ *
+ * Pro-grade time × pitch sequencer modeled after Ableton Live, rendered
+ * through the lab-instrument lens (CRT phosphor on near-black). Layout
+ * is a 2×3 CSS grid:
+ *
+ *     ┌──────┬───────────────┐
+ *     │ corn │ ruler         │   ← 28px ruler (bar.beat numbers)
+ *     ├──────┼───────────────┤
+ *     │ keys │ NOTE GRID     │   ← scroll origin (X + Y)
+ *     │      │ ── scrolls ── │
+ *     ├──────┼───────────────┤
+ *     │ vC   │ velocity lane │   ← scrolls X with grid
+ *     └──────┴───────────────┘
+ *
+ * Sub-divs around the grid (`overflow: hidden`) get their scrollLeft /
+ * scrollTop driven by JS so everything stays aligned.
+ *
+ * Tools:   draw / select / erase
+ * Snap:    1/16, 1/8, 1/4, 1/2, 1/1 (snap is delta-quantized for moves
+ *          so off-grid notes preserve their off-grid offsets)
+ * Zoom:    H × V independent presets
+ * Selection: stable runtime ids on each note so re-renders don't lose
+ *          the selection set.
+ *
+ * Storage: node.params.notes = [{ start, dur, midi, vel }, ...]. The
+ * runtime adds an `_id` to each note for selection tracking; the
+ * codegen + serializer ignore it (see extraCtor in the registry —
+ * iterates explicit fields only).
+ * ================================================================== */
+
+const PR_PITCH_LO = 36;                       // MIDI C2 (lowest visible)
+const PR_PITCH_HI = 96;                       // MIDI C7 (exclusive upper)
+const PR_KEYS_W   = 64;
+const PR_RULER_H  = 28;
+const PR_VEL_H    = 110;
+const PR_HANDLE_W = 6;                        // resize-handle width (px, screen)
+
+const PR_ZOOM_X = [12, 18, 28, 42, 64, 96];   // px per step
+const PR_ZOOM_Y = [10, 14, 18, 24, 32];       // px per pitch row
+const PR_SNAP_VALUES = [1, 2, 4, 8, 16];      // steps per snap
+const PR_SNAP_LABELS = ["1/16", "1/8", "1/4", "1/2", "1/1"];
+
 const NOTE_NAMES_PR = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
 function prMidiName(m) {
   const idx = ((m % 12) + 12) % 12;
   return NOTE_NAMES_PR[idx] + Math.floor(m / 12 - 1);
 }
+function prPitchClass(m) { return ((m % 12) + 12) % 12; }
 function prIsBlackKey(m) {
-  const idx = ((m % 12) + 12) % 12;
-  return idx === 1 || idx === 3 || idx === 6 || idx === 8 || idx === 10;
+  const c = prPitchClass(m);
+  return c === 1 || c === 3 || c === 6 || c === 8 || c === 10;
+}
+function prIsCKey(m) { return prPitchClass(m) === 0; }
+
+/* Stable runtime ids on notes — selection set is keyed by these so
+ * full re-renders don't blow away the selection. Stripped implicitly
+ * on serialize because extraCtor iterates only the canonical fields. */
+let _prNoteIdCounter = 1;
+function prEnsureIds(notes) {
+  notes.forEach(n => { if (n && n._id == null) n._id = "n" + (_prNoteIdCounter++); });
 }
 
+/* Editor state. Tool / snap / zoom persist across opens — once you set
+ * them the first time you don't have to set them every time. */
+const _prEd = {
+  nodeId:   null,
+  tool:     "draw",
+  snapIx:   0,                    // index into PR_SNAP_VALUES
+  zoomX:    2,                    // index into PR_ZOOM_X
+  zoomY:    1,                    // index into PR_ZOOM_Y
+  defaultVel: 1.0,
+  selected: new Set(),            // runtime _ids
+  drag:     null,                 // { kind, ... } during pointerdown..up
+  hoverCell:null,                 // { step, midi } | null
+};
+
+/* Backwards-compat alias — older code in this file references
+ * _pianoRollNodeId / _pianoRollVel directly. Keep the names live. */
 let _pianoRollNodeId = null;
 let _pianoRollVel    = 1.0;
 
-function renderPianoRollGrid() {
-  const wrap = document.getElementById("pianoroll-grid-wrap");
-  if (!wrap) return;
-  const node = state.nodes.find(n => n.id === _pianoRollNodeId);
-  if (!node) return;
-  const len = Math.max(1, Math.min(64, parseInt(node.params.patternLen, 10) || 16));
-  const notes = Array.isArray(node.params.notes) ? node.params.notes : [];
-  const pitchCount = PR_PITCH_HI - PR_PITCH_LO;          // rows
-  const W = PR_LABEL_W + len * PR_CELL_W;
-  const H = PR_HEADER_H + pitchCount * PR_CELL_H;
+function prCellW() { return PR_ZOOM_X[_prEd.zoomX]; }
+function prCellH() { return PR_ZOOM_Y[_prEd.zoomY]; }
+function prSnapSteps() { return PR_SNAP_VALUES[_prEd.snapIx] || 1; }
+function prRoundSnap(steps) {
+  const s = prSnapSteps();
+  return Math.round(steps / s) * s;
+}
 
-  let html = `<svg class="pianoroll-grid" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">`;
-  // Row backgrounds — black-key rows slightly darker. Pitches descend
-  // top→bottom (highest at the top).
+function prGetNode() {
+  return state.nodes.find(n => n.id === _prEd.nodeId);
+}
+function prGetLen() {
+  const n = prGetNode();
+  if (!n) return 16;
+  return Math.max(1, Math.min(64, parseInt(n.params.patternLen, 10) || 16));
+}
+
+/* ── Rendering ──────────────────────────────────────────────────── */
+
+function renderPianoRollGrid() {
+  // Public name kept for the rest of the codebase that calls it.
+  renderPianoRoll();
+}
+
+function renderPianoRoll() {
+  const node = prGetNode();
+  if (!node) return;
+  if (!Array.isArray(node.params.notes)) node.params.notes = [];
+  prEnsureIds(node.params.notes);
+
+  const len   = prGetLen();
+  const cellW = prCellW();
+  const cellH = prCellH();
+  const pitchCount = PR_PITCH_HI - PR_PITCH_LO;
+  const gridW = len * cellW;
+  const gridH = pitchCount * cellH;
+
+  const wrap = document.getElementById("pr-grid-wrap");
+  // Snapshot scroll before re-render so we can restore it.
+  const sX = wrap ? wrap.scrollLeft : 0;
+  const sY = wrap ? wrap.scrollTop  : 0;
+
+  prRenderRuler(len, cellW);
+  prRenderKeys(pitchCount, cellH);
+  prRenderGrid(node, len, cellW, cellH, pitchCount, gridW, gridH);
+  prRenderVel(node, len, cellW, gridW);
+
+  if (wrap) {
+    wrap.scrollLeft = sX;
+    wrap.scrollTop  = sY;
+  }
+  prSyncScroll();
+
+  prRenderStatus(node);
+  prRenderReadout();
+  prSyncToolbar();
+}
+
+function prRenderRuler(len, cellW) {
+  const svg = document.getElementById("pr-ruler");
+  if (!svg) return;
+  const W = len * cellW;
+  const H = PR_RULER_H;
+  svg.setAttribute("width",  W);
+  svg.setAttribute("height", H);
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  let html = "";
+  for (let s = 0; s <= len; s++) {
+    const x = s * cellW;
+    if (s % 16 === 0) {
+      html += `<line class="pr-bar-line" x1="${x}" y1="0" x2="${x}" y2="${H}" />`;
+      if (s < len) {
+        const bar = (s / 16) + 1;
+        html += `<text class="pr-bar-num" x="${x + 5}" y="${H - 9}">${bar}</text>`;
+      }
+    } else if (s % 4 === 0) {
+      html += `<line class="pr-beat-line" x1="${x}" y1="${H * 0.4}" x2="${x}" y2="${H}" />`;
+      if (s < len && cellW >= 22) {
+        const beat = ((s % 16) / 4) + 1;
+        const bar  = Math.floor(s / 16) + 1;
+        html += `<text class="pr-step-num" x="${x + 3}" y="${H - 9}">${bar}.${beat}</text>`;
+      }
+    } else {
+      html += `<line class="pr-step-line" x1="${x}" y1="${H * 0.7}" x2="${x}" y2="${H}" />`;
+    }
+  }
+  // Pattern-end barrier
+  html += `<line class="pr-end-line" x1="${len * cellW - 0.5}" y1="0" x2="${len * cellW - 0.5}" y2="${H}" />`;
+  svg.innerHTML = html;
+}
+
+function prRenderKeys(pitchCount, cellH) {
+  const svg = document.getElementById("pr-keys");
+  if (!svg) return;
+  const W = PR_KEYS_W;
+  const H = pitchCount * cellH;
+  svg.setAttribute("width",  W);
+  svg.setAttribute("height", H);
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  let html = "";
   for (let r = 0; r < pitchCount; r++) {
     const midi = PR_PITCH_HI - 1 - r;
-    const y = PR_HEADER_H + r * PR_CELL_H;
-    html += `<rect class="${prIsBlackKey(midi) ? "pr-bg-row-black" : "pr-bg-row-white"}" x="${PR_LABEL_W}" y="${y}" width="${len * PR_CELL_W}" height="${PR_CELL_H}" />`;
-    if (midi % 12 === 0) {
-      // C labels every octave
-      html += `<text class="pr-pitch-label" x="2" y="${y + PR_CELL_H - 3}">${prMidiName(midi)}</text>`;
-    } else if (r === 0 || (midi % 12 === 5)) {
-      html += `<text class="pr-pitch-label" x="2" y="${y + PR_CELL_H - 3}">${prMidiName(midi)}</text>`;
+    const y = r * cellH;
+    const isC = prIsCKey(midi);
+    const isB = prIsBlackKey(midi);
+    const cls = isC ? "pr-key-c" : (isB ? "pr-key-black" : "pr-key-white");
+    html += `<rect class="${cls}" x="0" y="${y}" width="${W}" height="${cellH}" data-midi="${midi}" />`;
+    if (isB) {
+      // Inset darker cap on the right, mimicking a real piano keyboard.
+      html += `<rect class="pr-key-cap" x="${W * 0.50}" y="${y + 1}" width="${W * 0.50}" height="${cellH - 2}" />`;
+    }
+    // Label every C, plus boundary rows for orientation when zoomed in.
+    if (isC) {
+      const labelCls = "pr-key-label pr-key-label-c";
+      const fz = Math.max(8, Math.min(11, cellH * 0.7));
+      html += `<text class="${labelCls}" x="6" y="${y + cellH * 0.7}" font-size="${fz}">${prMidiName(midi)}</text>`;
+    } else if (cellH >= 18) {
+      // At higher zoom, label every white key for finer orientation.
+      if (!isB) {
+        html += `<text class="pr-key-label" x="6" y="${y + cellH * 0.7}">${prMidiName(midi)}</text>`;
+      }
     }
   }
-  // Vertical step lines + step labels (every 4 steps).
-  for (let s = 0; s <= len; s++) {
-    const x = PR_LABEL_W + s * PR_CELL_W;
-    const isBeat = (s % 4) === 0;
-    html += `<line class="${isBeat ? "pr-beat-line" : "pr-grid-line"}" x1="${x}" y1="${PR_HEADER_H}" x2="${x}" y2="${H}" />`;
-    if (isBeat && s < len) {
-      html += `<text class="pr-step-label" x="${x + 3}" y="${PR_HEADER_H - 4}">${s + 1}</text>`;
-    }
+  svg.innerHTML = html;
+}
+
+function prRenderGrid(node, len, cellW, cellH, pitchCount, gridW, gridH) {
+  const svg = document.getElementById("pr-grid");
+  if (!svg) return;
+  svg.setAttribute("width",  gridW);
+  svg.setAttribute("height", gridH);
+  svg.setAttribute("viewBox", `0 0 ${gridW} ${gridH}`);
+
+  let html = "";
+  // Row backgrounds — black-key rows recede, C rows get a faint phosphor
+  // wash so the user can find octaves at a glance.
+  for (let r = 0; r < pitchCount; r++) {
+    const midi = PR_PITCH_HI - 1 - r;
+    const y = r * cellH;
+    const isC = prIsCKey(midi);
+    const isB = prIsBlackKey(midi);
+    const cls = isC ? "pr-row-c" : (isB ? "pr-row-black" : "pr-row-white");
+    html += `<rect class="${cls}" x="0" y="${y}" width="${gridW}" height="${cellH}" />`;
   }
-  // Horizontal lines between rows.
+  // Horizontal pitch lines — emphasize each octave (B→C boundary).
   for (let r = 0; r <= pitchCount; r++) {
-    const y = PR_HEADER_H + r * PR_CELL_H;
-    html += `<line class="pr-grid-line" x1="${PR_LABEL_W}" y1="${y}" x2="${W}" y2="${y}" />`;
+    const y = r * cellH;
+    const midi = r < pitchCount ? PR_PITCH_HI - 1 - r : PR_PITCH_LO;
+    const cls = prIsCKey(midi) ? "pr-step-line" : "pr-grid-line";
+    html += `<line class="${cls}" x1="0" y1="${y}" x2="${gridW}" y2="${y}" />`;
   }
-  // Existing notes.
-  notes.forEach((nt, idx) => {
+  // Vertical step lines — bars > beats > steps, intensity stepped down.
+  for (let s = 0; s <= len; s++) {
+    const x = s * cellW;
+    const cls = (s % 16 === 0) ? "pr-bar-line"
+              : (s % 4  === 0) ? "pr-beat-line"
+              :                  "pr-step-line";
+    html += `<line class="${cls}" x1="${x}" y1="0" x2="${x}" y2="${gridH}" />`;
+  }
+  // Notes with resize handles.
+  const notes = node.params.notes;
+  notes.forEach(nt => {
     if (!nt || nt.midi == null) return;
     if (nt.midi < PR_PITCH_LO || nt.midi >= PR_PITCH_HI) return;
     if (nt.start < 0 || nt.start >= len) return;
     const dur = Math.max(1, Math.min(len - nt.start, nt.dur || 1));
-    const x = PR_LABEL_W + nt.start * PR_CELL_W + 1;
-    const y = PR_HEADER_H + (PR_PITCH_HI - 1 - nt.midi) * PR_CELL_H + 1;
-    const w = dur * PR_CELL_W - 2;
-    const h = PR_CELL_H - 2;
-    const op = Math.max(0.4, Math.min(1, nt.vel != null ? nt.vel : 1));
-    html += `<rect class="pr-note" data-idx="${idx}" x="${x}" y="${y}" width="${w}" height="${h}" rx="2" opacity="${op}" />`;
+    const x = nt.start * cellW + 1;
+    const y = (PR_PITCH_HI - 1 - nt.midi) * cellH + 1;
+    const w = dur * cellW - 2;
+    const h = cellH - 2;
+    const sel = _prEd.selected.has(nt._id) ? " selected" : "";
+    const v = nt.vel != null ? nt.vel : 1;
+    const op = Math.max(0.55, Math.min(1, 0.55 + 0.45 * v));
+    html += `<rect class="pr-note${sel}" data-nid="${nt._id}" x="${x}" y="${y}" width="${w}" height="${h}" rx="2" opacity="${op}" />`;
+    if (w > PR_HANDLE_W * 1.6) {
+      html += `<rect class="pr-note-handle" data-nid="${nt._id}" data-handle="1" x="${x + w - PR_HANDLE_W}" y="${y}" width="${PR_HANDLE_W}" height="${h}" rx="1" />`;
+    }
   });
-  // Drag preview (filled by handlers below).
+  // Transient overlays (preview / marquee / crosshair) — JS toggles them
+  // via attribute instead of re-rendering the whole grid.
   html += `<rect class="pr-preview" x="0" y="0" width="0" height="0" style="display:none" />`;
-  html += `</svg>`;
+  html += `<rect class="pr-marquee" x="0" y="0" width="0" height="0" style="display:none" />`;
+  html += `<line class="pr-cross-v" x1="0" y1="0" x2="0" y2="${gridH}" style="display:none" />`;
+  html += `<line class="pr-cross-h" x1="0" y1="0" x2="${gridW}" y2="0" style="display:none" />`;
+  svg.innerHTML = html;
+}
 
-  wrap.innerHTML = html;
-
-  // ---- Pointer interaction ----
-  const svg = wrap.querySelector(".pianoroll-grid");
-  const preview = svg.querySelector(".pr-preview");
-  let dragStart = null;        // { step, midi }
-
-  function cellAt(ev) {
-    const r = svg.getBoundingClientRect();
-    const cx = (ev.clientX - r.left) * (W / r.width);
-    const cy = (ev.clientY - r.top)  * (H / r.height);
-    if (cx < PR_LABEL_W || cy < PR_HEADER_H) return null;
-    const step = Math.floor((cx - PR_LABEL_W) / PR_CELL_W);
-    const row  = Math.floor((cy - PR_HEADER_H) / PR_CELL_H);
-    if (step < 0 || step >= len) return null;
-    if (row  < 0 || row  >= pitchCount) return null;
-    const midi = PR_PITCH_HI - 1 - row;
-    return { step, midi };
+function prRenderVel(node, len, cellW, gridW) {
+  const svg = document.getElementById("pr-vel");
+  if (!svg) return;
+  const H = PR_VEL_H;
+  svg.setAttribute("width",  gridW);
+  svg.setAttribute("height", H);
+  svg.setAttribute("viewBox", `0 0 ${gridW} ${H}`);
+  let html = "";
+  // Background bar/beat ticks
+  for (let s = 0; s <= len; s++) {
+    const x = s * cellW;
+    const cls = (s % 16 === 0) ? "pr-bar-line"
+              : (s % 4  === 0) ? "pr-beat-line"
+              :                  "pr-step-line";
+    html += `<line class="${cls}" x1="${x}" y1="0" x2="${x}" y2="${H}" />`;
   }
+  [0.25, 0.5, 0.75].forEach(v => {
+    const y = H - v * H;
+    html += `<line class="pr-vel-grid" x1="0" y1="${y}" x2="${gridW}" y2="${y}" />`;
+  });
+  html += `<line class="pr-vel-baseline" x1="0" y1="${H - 0.5}" x2="${gridW}" y2="${H - 0.5}" />`;
+
+  const notes = node.params.notes;
+  notes.forEach(nt => {
+    if (!nt || nt.midi == null) return;
+    if (nt.start < 0 || nt.start >= len) return;
+    const x = nt.start * cellW + 2;
+    const w = Math.max(2, cellW - 4);
+    const v = nt.vel != null ? nt.vel : 1;
+    const barH = Math.max(2, v * (H - 4));
+    const y = H - barH - 1;
+    const sel = _prEd.selected.has(nt._id) ? " selected" : "";
+    html += `<rect class="pr-vel-bar${sel}" data-nid="${nt._id}" x="${x}" y="${y}" width="${w}" height="${barH}" rx="1" />`;
+    html += `<rect class="pr-vel-handle" data-nid="${nt._id}" x="${x - 1}" y="${y - 3}" width="${w + 2}" height="6" rx="1" />`;
+  });
+  svg.innerHTML = html;
+}
+
+function prRenderStatus(node) {
+  const cnt = document.getElementById("pr-stat-count");
+  const sel = document.getElementById("pr-stat-selected");
+  const snp = document.getElementById("pr-stat-snap");
+  if (cnt) cnt.textContent = String((node.params.notes || []).length);
+  if (sel) sel.textContent = String(_prEd.selected.size);
+  if (snp) snp.textContent = PR_SNAP_LABELS[_prEd.snapIx] || "1/16";
+}
+
+function prRenderReadout() {
+  const r = document.getElementById("pianoroll-readout");
+  if (!r) return;
+  const c = _prEd.hoverCell;
+  if (!c) { r.textContent = "PITCH —    POS —.—.—"; return; }
+  const bar  = Math.floor(c.step / 16) + 1;
+  const beat = Math.floor((c.step % 16) / 4) + 1;
+  const six  = (c.step % 4) + 1;
+  const name = prMidiName(c.midi);
+  r.textContent = `PITCH ${name.padEnd(4)}  POS ${bar}.${beat}.${six}`;
+}
+
+function prSyncToolbar() {
+  document.querySelectorAll(".pr-tool").forEach(b => {
+    b.classList.toggle("active", b.dataset.tool === _prEd.tool);
+  });
+  const wrap = document.getElementById("pr-grid-wrap");
+  if (wrap) wrap.dataset.tool = _prEd.tool;
+  const snapEl = document.getElementById("pr-snap");
+  if (snapEl) snapEl.value = String(_prEd.snapIx);
+}
+
+function prSyncScroll() {
+  const wrap  = document.getElementById("pr-grid-wrap");
+  const ruler = document.querySelector(".pr-ruler-wrap");
+  const keys  = document.querySelector(".pr-keys-wrap");
+  const vel   = document.querySelector(".pr-vel-wrap");
+  if (!wrap || !ruler || !keys || !vel) return;
+  ruler.scrollLeft = wrap.scrollLeft;
+  keys.scrollTop   = wrap.scrollTop;
+  vel.scrollLeft   = wrap.scrollLeft;
+}
+
+/* ── Hit testing & cell math ────────────────────────────────────── */
+
+function prCellAt(ev) {
+  const svg = document.getElementById("pr-grid");
+  if (!svg) return null;
+  const r = svg.getBoundingClientRect();
+  const cellW = prCellW(), cellH = prCellH();
+  const cx = ev.clientX - r.left;
+  const cy = ev.clientY - r.top;
+  if (cx < 0 || cy < 0 || cx > r.width || cy > r.height) return null;
+  const step = Math.floor(cx / cellW);
+  const row  = Math.floor(cy / cellH);
+  const len  = prGetLen();
+  const pitchCount = PR_PITCH_HI - PR_PITCH_LO;
+  if (step < 0 || step >= len) return null;
+  if (row  < 0 || row  >= pitchCount) return null;
+  return { step, midi: PR_PITCH_HI - 1 - row, x: cx, y: cy };
+}
+
+function prFindNote(nid) {
+  const node = prGetNode();
+  if (!node) return null;
+  return (node.params.notes || []).find(n => n._id === nid) || null;
+}
+
+/* ── Interaction: pointer on the grid ───────────────────────────── */
+
+function prInstallGridHandlers() {
+  const svg = document.getElementById("pr-grid");
+  const wrap = document.getElementById("pr-grid-wrap");
+  if (!svg || !wrap) return;
 
   svg.addEventListener("pointerdown", ev => {
+    if (ev.button !== 0) return;
     ev.preventDefault();
-    // Click on existing note → delete it.
+    const node = prGetNode();
+    if (!node) return;
     const target = ev.target;
-    if (target && target.classList.contains("pr-note")) {
-      const idx = parseInt(target.dataset.idx, 10);
-      pushHistory("pr:delete:" + node.id);
-      notes.splice(idx, 1);
-      renderPianoRollGrid();
-      renderCode(); renderJson(); renderProps();
+    const isHandle = target && target.classList.contains("pr-note-handle");
+    const isNote   = target && target.classList.contains("pr-note");
+    const cell = prCellAt(ev);
+
+    // Erase tool — click any note (or its handle) deletes it.
+    if (_prEd.tool === "erase") {
+      if (isNote || isHandle) {
+        const nid = target.dataset.nid;
+        prDeleteNotes([nid]);
+      }
       return;
     }
-    const cell = cellAt(ev);
+
+    // Resize handle (any tool except erase): drag right edge to lengthen.
+    if (isHandle) {
+      const nid = target.dataset.nid;
+      // If clicking handle of a non-selected note, replace selection.
+      if (!_prEd.selected.has(nid)) {
+        _prEd.selected = new Set([nid]);
+      }
+      const orig = {};
+      _prEd.selected.forEach(id => {
+        const nt = prFindNote(id);
+        if (nt) orig[id] = { start: nt.start, dur: nt.dur };
+      });
+      _prEd.drag = { kind: "resize", anchor: cell, orig };
+      try { svg.setPointerCapture(ev.pointerId); } catch (e) {}
+      pushHistory("pr:resize:" + node.id);
+      return;
+    }
+
+    // Note body click — depends on tool.
+    if (isNote) {
+      const nid = target.dataset.nid;
+      if (_prEd.tool === "draw") {
+        // In pencil mode, clicking a note picks it up to move.
+        if (!_prEd.selected.has(nid)) _prEd.selected = new Set([nid]);
+      } else { // select
+        if (ev.shiftKey) {
+          if (_prEd.selected.has(nid)) _prEd.selected.delete(nid);
+          else _prEd.selected.add(nid);
+        } else if (!_prEd.selected.has(nid)) {
+          _prEd.selected = new Set([nid]);
+        }
+      }
+      const orig = {};
+      _prEd.selected.forEach(id => {
+        const nt = prFindNote(id);
+        if (nt) orig[id] = { start: nt.start, midi: nt.midi };
+      });
+      _prEd.drag = { kind: "move", anchor: cell, orig, moved: false };
+      try { svg.setPointerCapture(ev.pointerId); } catch (e) {}
+      // Snapshot history at drag start so undo reverts to the pre-drag
+      // layout. If the user clicks without dragging the snapshot is a
+      // duplicate of the current state — harmless (one extra no-op undo).
+      pushHistory("pr:move:" + node.id);
+      renderPianoRoll();
+      return;
+    }
+
+    // Empty grid — depends on tool.
     if (!cell) return;
-    dragStart = cell;
-    svg.setPointerCapture(ev.pointerId);
-    showPreview(cell.step, cell.midi, 1);
+    if (_prEd.tool === "draw") {
+      if (!ev.shiftKey) _prEd.selected.clear();
+      _prEd.drag = { kind: "draw", anchor: cell };
+      try { svg.setPointerCapture(ev.pointerId); } catch (e) {}
+      prShowPreview(cell.step, cell.midi, 1);
+    } else if (_prEd.tool === "select") {
+      if (!ev.shiftKey) _prEd.selected.clear();
+      _prEd.drag = { kind: "marquee", origin: cell, startMembers: new Set(_prEd.selected) };
+      try { svg.setPointerCapture(ev.pointerId); } catch (e) {}
+    }
+    renderPianoRoll();
   });
+
   svg.addEventListener("pointermove", ev => {
-    if (!dragStart) return;
-    const cell = cellAt(ev);
-    if (!cell) return;
-    const lo = Math.min(dragStart.step, cell.step);
-    const hi = Math.max(dragStart.step, cell.step);
-    showPreview(lo, dragStart.midi, hi - lo + 1);
+    const cell = prCellAt(ev);
+    _prEd.hoverCell = cell;
+    prRenderReadout();
+    prShowCrosshair(ev);
+    const drag = _prEd.drag;
+    if (!drag) return;
+    if (drag.kind === "draw") {
+      if (!cell) return;
+      const lo = Math.min(drag.anchor.step, cell.step);
+      const hi = Math.max(drag.anchor.step, cell.step);
+      prShowPreview(lo, drag.anchor.midi, hi - lo + 1);
+    } else if (drag.kind === "move") {
+      if (!cell) return;
+      const dStep = prRoundSnap(cell.step - drag.anchor.step);
+      const dMidi = cell.midi - drag.anchor.midi;
+      if (dStep !== 0 || dMidi !== 0) drag.moved = true;
+      prApplyMovePreview(drag, dStep, dMidi);
+    } else if (drag.kind === "resize") {
+      if (!cell) return;
+      const dStep = prRoundSnap(cell.step - drag.anchor.step);
+      prApplyResizePreview(drag, dStep);
+    } else if (drag.kind === "marquee") {
+      if (!cell) return;
+      prUpdateMarquee(drag.origin, cell);
+      prMarqueeSelect(drag.origin, cell, drag.startMembers);
+    }
   });
+
   function endDrag(ev) {
-    if (!dragStart) return;
-    const cell = cellAt(ev) || dragStart;
-    const lo = Math.min(dragStart.step, cell.step);
-    const hi = Math.max(dragStart.step, cell.step);
-    const dur = hi - lo + 1;
-    pushHistory("pr:add:" + node.id);
-    notes.push({ start: lo, dur, midi: dragStart.midi, vel: _pianoRollVel });
-    if (!Array.isArray(node.params.notes)) node.params.notes = [];
-    node.params.notes = notes;
-    dragStart = null;
-    preview.setAttribute("style", "display:none");
-    renderPianoRollGrid();
+    const drag = _prEd.drag;
+    if (!drag) return;
+    if (drag.kind === "draw") {
+      const cell = prCellAt(ev) || drag.anchor;
+      const node = prGetNode();
+      if (node) {
+        const lo = Math.min(drag.anchor.step, cell.step);
+        const hi = Math.max(drag.anchor.step, cell.step);
+        const dur = Math.max(1, hi - lo + 1);
+        pushHistory("pr:add:" + node.id);
+        const newNote = { start: lo, dur, midi: drag.anchor.midi, vel: _prEd.defaultVel, _id: "n" + (_prNoteIdCounter++) };
+        node.params.notes.push(newNote);
+        // Auto-select the just-drawn note for chained operations.
+        _prEd.selected = new Set([newNote._id]);
+      }
+    }
+    // Move / resize already mutated state in the live preview; commit
+    // means clear the drag state and renormalize.
+    _prEd.drag = null;
+    prHidePreview();
+    prHideMarquee();
+    renderPianoRoll();
     renderCode(); renderJson(); renderProps();
   }
   svg.addEventListener("pointerup",     endDrag);
-  svg.addEventListener("pointercancel", () => { dragStart = null; preview.setAttribute("style", "display:none"); });
-
-  function showPreview(step, midi, dur) {
-    if (midi < PR_PITCH_LO || midi >= PR_PITCH_HI) {
-      preview.setAttribute("style", "display:none");
-      return;
-    }
-    const x = PR_LABEL_W + step * PR_CELL_W + 1;
-    const y = PR_HEADER_H + (PR_PITCH_HI - 1 - midi) * PR_CELL_H + 1;
-    const w = dur * PR_CELL_W - 2;
-    const h = PR_CELL_H - 2;
-    preview.setAttribute("x", x);
-    preview.setAttribute("y", y);
-    preview.setAttribute("width", w);
-    preview.setAttribute("height", h);
-    preview.setAttribute("rx", "2");
-    preview.setAttribute("style", "");
-  }
+  svg.addEventListener("pointercancel", () => {
+    _prEd.drag = null; prHidePreview(); prHideMarquee(); renderPianoRoll();
+  });
+  svg.addEventListener("pointerleave", () => {
+    _prEd.hoverCell = null;
+    prRenderReadout();
+    prHideCrosshair();
+  });
 }
+
+function prShowPreview(step, midi, dur) {
+  const el = document.querySelector("#pr-grid .pr-preview");
+  if (!el) return;
+  if (midi < PR_PITCH_LO || midi >= PR_PITCH_HI) {
+    el.setAttribute("style", "display:none"); return;
+  }
+  const cellW = prCellW(), cellH = prCellH();
+  const x = step * cellW + 1;
+  const y = (PR_PITCH_HI - 1 - midi) * cellH + 1;
+  const w = dur * cellW - 2;
+  const h = cellH - 2;
+  el.setAttribute("x", x);
+  el.setAttribute("y", y);
+  el.setAttribute("width", Math.max(2, w));
+  el.setAttribute("height", Math.max(2, h));
+  el.setAttribute("rx", "2");
+  el.setAttribute("style", "");
+}
+function prHidePreview() {
+  const el = document.querySelector("#pr-grid .pr-preview");
+  if (el) el.setAttribute("style", "display:none");
+}
+
+function prUpdateMarquee(origin, cell) {
+  const el = document.querySelector("#pr-grid .pr-marquee");
+  if (!el) return;
+  const cellW = prCellW(), cellH = prCellH();
+  const x1 = Math.min(origin.x, cell.x);
+  const y1 = Math.min(origin.y, cell.y);
+  const w  = Math.abs(cell.x - origin.x);
+  const h  = Math.abs(cell.y - origin.y);
+  el.setAttribute("x", x1);
+  el.setAttribute("y", y1);
+  el.setAttribute("width", w);
+  el.setAttribute("height", h);
+  el.setAttribute("style", "");
+}
+function prHideMarquee() {
+  const el = document.querySelector("#pr-grid .pr-marquee");
+  if (el) el.setAttribute("style", "display:none");
+}
+
+function prMarqueeSelect(origin, cell, startMembers) {
+  const node = prGetNode();
+  if (!node) return;
+  const cellW = prCellW(), cellH = prCellH();
+  const xMin = Math.min(origin.x, cell.x);
+  const xMax = Math.max(origin.x, cell.x);
+  const yMin = Math.min(origin.y, cell.y);
+  const yMax = Math.max(origin.y, cell.y);
+  const next = new Set(startMembers);
+  (node.params.notes || []).forEach(nt => {
+    const dur = Math.max(1, nt.dur || 1);
+    const nx1 = nt.start * cellW;
+    const nx2 = (nt.start + dur) * cellW;
+    const ny1 = (PR_PITCH_HI - 1 - nt.midi) * cellH;
+    const ny2 = ny1 + cellH;
+    if (nx2 < xMin || nx1 > xMax || ny2 < yMin || ny1 > yMax) return;
+    next.add(nt._id);
+  });
+  _prEd.selected = next;
+  // Just patch class on the existing note rects to avoid re-render churn.
+  document.querySelectorAll("#pr-grid .pr-note").forEach(el => {
+    el.classList.toggle("selected", next.has(el.dataset.nid));
+  });
+  document.querySelectorAll("#pr-vel .pr-vel-bar").forEach(el => {
+    el.classList.toggle("selected", next.has(el.dataset.nid));
+  });
+  prRenderStatus(node);
+}
+
+function prShowCrosshair(ev) {
+  const cell = _prEd.hoverCell;
+  if (!cell) { prHideCrosshair(); return; }
+  if (_prEd.tool !== "draw") { prHideCrosshair(); return; }
+  const v = document.querySelector("#pr-grid .pr-cross-v");
+  const h = document.querySelector("#pr-grid .pr-cross-h");
+  if (!v || !h) return;
+  const cellW = prCellW(), cellH = prCellH();
+  const x = cell.step * cellW;
+  const y = (PR_PITCH_HI - 1 - cell.midi) * cellH;
+  v.setAttribute("x1", x); v.setAttribute("x2", x);
+  v.setAttribute("style", "");
+  h.setAttribute("y1", y + cellH / 2); h.setAttribute("y2", y + cellH / 2);
+  h.setAttribute("style", "");
+}
+function prHideCrosshair() {
+  const v = document.querySelector("#pr-grid .pr-cross-v");
+  const h = document.querySelector("#pr-grid .pr-cross-h");
+  if (v) v.setAttribute("style", "display:none");
+  if (h) h.setAttribute("style", "display:none");
+}
+
+/* Live note mutation during move/resize — operate on node.params.notes
+ * directly so the preview is just the next render. The drag's `orig`
+ * map holds each note's pre-drag state so deltas don't accumulate. */
+function prApplyMovePreview(drag, dStep, dMidi) {
+  const node = prGetNode();
+  if (!node) return;
+  const len = prGetLen();
+  Object.keys(drag.orig).forEach(id => {
+    const nt = prFindNote(id);
+    if (!nt) return;
+    const o  = drag.orig[id];
+    const dur = Math.max(1, nt.dur || 1);
+    let s = o.start + dStep;
+    let m = o.midi  + dMidi;
+    s = Math.max(0, Math.min(len - dur, s));
+    m = Math.max(PR_PITCH_LO, Math.min(PR_PITCH_HI - 1, m));
+    nt.start = s; nt.midi = m;
+  });
+  renderPianoRoll();
+}
+
+function prApplyResizePreview(drag, dStep) {
+  const node = prGetNode();
+  if (!node) return;
+  const len = prGetLen();
+  Object.keys(drag.orig).forEach(id => {
+    const nt = prFindNote(id);
+    if (!nt) return;
+    const o = drag.orig[id];
+    let dur = o.dur + dStep;
+    if (dur < 1) dur = 1;
+    if (nt.start + dur > len) dur = len - nt.start;
+    if (dur < 1) dur = 1;
+    nt.dur = dur;
+  });
+  renderPianoRoll();
+}
+
+/* ── Velocity-lane drag ────────────────────────────────────────── */
+
+function prInstallVelHandlers() {
+  const svg = document.getElementById("pr-vel");
+  if (!svg) return;
+  let drag = null;
+
+  function velAt(ev) {
+    const r = svg.getBoundingClientRect();
+    const cy = ev.clientY - r.top;
+    const v = 1 - cy / r.height;
+    return Math.max(0, Math.min(1, v));
+  }
+
+  svg.addEventListener("pointerdown", ev => {
+    if (ev.button !== 0) return;
+    const target = ev.target;
+    const isHandle = target && target.classList.contains("pr-vel-handle");
+    const isBar    = target && target.classList.contains("pr-vel-bar");
+    if (!isHandle && !isBar) return;
+    ev.preventDefault();
+    const nid = target.dataset.nid;
+    const node = prGetNode();
+    if (!node) return;
+    const ids = _prEd.selected.has(nid) && _prEd.selected.size > 1
+      ? Array.from(_prEd.selected)
+      : [nid];
+    const orig = {};
+    ids.forEach(id => {
+      const nt = prFindNote(id);
+      if (nt) orig[id] = nt.vel != null ? nt.vel : 1;
+    });
+    drag = { ids, orig, anchorV: velAt(ev) };
+    try { svg.setPointerCapture(ev.pointerId); } catch (e) {}
+    pushHistory("pr:vel:" + node.id);
+  });
+  svg.addEventListener("pointermove", ev => {
+    if (!drag) return;
+    const v = velAt(ev);
+    const dv = v - drag.anchorV;
+    drag.ids.forEach(id => {
+      const nt = prFindNote(id);
+      if (!nt) return;
+      nt.vel = Math.max(0, Math.min(1, drag.orig[id] + dv));
+    });
+    renderPianoRoll();
+  });
+  function endVelDrag() {
+    if (!drag) return;
+    drag = null;
+    renderPianoRoll();
+    renderCode(); renderJson();
+  }
+  svg.addEventListener("pointerup", endVelDrag);
+  svg.addEventListener("pointercancel", endVelDrag);
+}
+
+/* ── Keyboard sidebar audition (visual only) ───────────────────── */
+
+function prInstallKeysHandlers() {
+  const svg = document.getElementById("pr-keys");
+  if (!svg) return;
+  // Hover highlight on a key row — light visual feedback only; no
+  // auditory preview because the audio runtime is independent.
+  svg.addEventListener("pointermove", ev => {
+    const t = ev.target;
+    svg.querySelectorAll(".pr-key-row-hover").forEach(el => el.classList.remove("pr-key-row-hover"));
+    if (t && t.tagName === "rect" && t.dataset.midi != null) {
+      t.classList.add("pr-key-row-hover");
+    }
+  });
+  svg.addEventListener("pointerleave", () => {
+    svg.querySelectorAll(".pr-key-row-hover").forEach(el => el.classList.remove("pr-key-row-hover"));
+  });
+}
+
+/* ── Bulk operations ───────────────────────────────────────────── */
+
+function prDeleteNotes(ids) {
+  const node = prGetNode();
+  if (!node) return;
+  const set = new Set(ids);
+  pushHistory("pr:delete:" + node.id);
+  node.params.notes = (node.params.notes || []).filter(n => !set.has(n._id));
+  ids.forEach(id => _prEd.selected.delete(id));
+  renderPianoRoll();
+  renderCode(); renderJson(); renderProps();
+}
+
+function prDeleteSelection() {
+  if (!_prEd.selected.size) return;
+  prDeleteNotes(Array.from(_prEd.selected));
+}
+
+function prTransposeSelection(semitones) {
+  const node = prGetNode();
+  if (!node || !_prEd.selected.size) return;
+  pushHistory("pr:transpose:" + node.id);
+  (node.params.notes || []).forEach(n => {
+    if (!_prEd.selected.has(n._id)) return;
+    let m = n.midi + semitones;
+    m = Math.max(PR_PITCH_LO, Math.min(PR_PITCH_HI - 1, m));
+    n.midi = m;
+  });
+  renderPianoRoll();
+  renderCode(); renderJson();
+}
+
+function prDuplicateSelection() {
+  const node = prGetNode();
+  if (!node || !_prEd.selected.size) return;
+  const len = prGetLen();
+  // Duplicate offset: longest selected duration, so the copy starts
+  // immediately after the last edge of the selection.
+  const sel = (node.params.notes || []).filter(n => _prEd.selected.has(n._id));
+  if (!sel.length) return;
+  const lastEnd = sel.reduce((m, n) => Math.max(m, n.start + (n.dur || 1)), 0);
+  const firstStart = sel.reduce((m, n) => Math.min(m, n.start), Infinity);
+  const offset = Math.max(1, lastEnd - firstStart);
+  pushHistory("pr:duplicate:" + node.id);
+  const newIds = new Set();
+  sel.forEach(n => {
+    const ns = n.start + offset;
+    if (ns >= len) return;
+    const nd = Math.min(n.dur || 1, len - ns);
+    const copy = { start: ns, dur: nd, midi: n.midi, vel: n.vel, _id: "n" + (_prNoteIdCounter++) };
+    node.params.notes.push(copy);
+    newIds.add(copy._id);
+  });
+  _prEd.selected = newIds;
+  renderPianoRoll();
+  renderCode(); renderJson(); renderProps();
+}
+
+function prSelectAll() {
+  const node = prGetNode();
+  if (!node) return;
+  _prEd.selected = new Set((node.params.notes || []).map(n => n._id));
+  renderPianoRoll();
+}
+
+/* ── Modal lifecycle ───────────────────────────────────────────── */
 
 function openPianoRollModal(nodeId) {
   const node = state.nodes.find(n => n.id === nodeId);
   if (!node) return;
-  _pianoRollNodeId = nodeId;
+  _prEd.nodeId = nodeId;
+  _pianoRollNodeId = nodeId;     // legacy alias kept live
   if (!Array.isArray(node.params.notes)) node.params.notes = [];
   if (typeof node.params.patternLen !== "number") node.params.patternLen = 16;
+  prEnsureIds(node.params.notes);
+  _prEd.selected.clear();
+  _prEd.drag = null;
+  _prEd.hoverCell = null;
+
+  const titleEl = document.getElementById("pianoroll-modal-title");
+  if (titleEl) titleEl.textContent = "[" + node.id + "]";
   const lenInput = document.getElementById("pianoroll-len");
   const velInput = document.getElementById("pianoroll-vel");
   if (lenInput) lenInput.value = node.params.patternLen;
-  if (velInput) velInput.value = _pianoRollVel.toFixed(2);
-  const titleEl = document.getElementById("pianoroll-modal-title");
-  if (titleEl) titleEl.textContent = "Edit piano roll · " + node.id;
+  if (velInput) velInput.value = _prEd.defaultVel.toFixed(2);
+
   document.getElementById("pianoroll-modal").style.display = "flex";
-  renderPianoRollGrid();
+  // Render once visible so layout calculations have real dimensions.
+  requestAnimationFrame(() => {
+    renderPianoRoll();
+    // Center the keyboard view on C4 (MIDI 60) the first time this
+    // modal opens — easier to find your bearings than starting at the
+    // top of the range.
+    const wrap = document.getElementById("pr-grid-wrap");
+    if (wrap) {
+      const targetRow = PR_PITCH_HI - 1 - 60;
+      const cellH = prCellH();
+      const wantTop = targetRow * cellH - wrap.clientHeight / 2 + cellH / 2;
+      wrap.scrollTop = Math.max(0, wantTop);
+      prSyncScroll();
+    }
+  });
 }
+
 function closePianoRollModal() {
   const m = document.getElementById("pianoroll-modal");
   if (m) m.style.display = "none";
+  _prEd.nodeId = null;
   _pianoRollNodeId = null;
+  _prEd.selected.clear();
+  _prEd.drag = null;
 }
+
 (function setupPianoRollModal() {
-  const close = document.getElementById("btn-pianoroll-close");
-  const done  = document.getElementById("btn-pianoroll-done");
-  const clr   = document.getElementById("btn-pianoroll-clear");
-  const modal = document.getElementById("pianoroll-modal");
-  const lenIn = document.getElementById("pianoroll-len");
-  const velIn = document.getElementById("pianoroll-vel");
+  const close   = document.getElementById("btn-pianoroll-close");
+  const done    = document.getElementById("btn-pianoroll-done");
+  const clr     = document.getElementById("btn-pianoroll-clear");
+  const dup     = document.getElementById("btn-pianoroll-duplicate");
+  const modal   = document.getElementById("pianoroll-modal");
+  const lenIn   = document.getElementById("pianoroll-len");
+  const velIn   = document.getElementById("pianoroll-vel");
+  const snapEl  = document.getElementById("pr-snap");
+
   if (close) close.addEventListener("click", closePianoRollModal);
   if (done)  done.addEventListener("click", closePianoRollModal);
   if (modal) modal.addEventListener("click", e => { if (e.target === modal) closePianoRollModal(); });
+
   if (clr) clr.addEventListener("click", () => {
-    const node = state.nodes.find(n => n.id === _pianoRollNodeId);
+    const node = prGetNode();
     if (!node) return;
     pushHistory("pr:clear:" + node.id);
     node.params.notes = [];
-    renderPianoRollGrid();
+    _prEd.selected.clear();
+    renderPianoRoll();
     renderCode(); renderJson(); renderProps();
   });
+
+  if (dup) dup.addEventListener("click", prDuplicateSelection);
+
   if (lenIn) lenIn.addEventListener("input", () => {
-    const node = state.nodes.find(n => n.id === _pianoRollNodeId);
+    const node = prGetNode();
     if (!node) return;
     const v = Math.max(1, Math.min(64, parseInt(lenIn.value, 10) || 16));
     pushHistory("pr:len:" + node.id);
     node.params.patternLen = v;
-    // Trim or keep notes that fall within the new length.
     if (Array.isArray(node.params.notes)) {
       node.params.notes = node.params.notes.filter(n => n && n.start < v);
     }
-    renderPianoRollGrid();
+    renderPianoRoll();
     renderCode(); renderJson(); renderProps();
   });
+
   if (velIn) velIn.addEventListener("input", () => {
     const v = parseFloat(velIn.value);
-    if (isFinite(v)) _pianoRollVel = Math.max(0, Math.min(1, v));
+    if (isFinite(v)) {
+      _prEd.defaultVel = Math.max(0, Math.min(1, v));
+      _pianoRollVel = _prEd.defaultVel;
+    }
   });
+
+  if (snapEl) snapEl.addEventListener("change", () => {
+    _prEd.snapIx = Math.max(0, Math.min(PR_SNAP_VALUES.length - 1, parseInt(snapEl.value, 10) || 0));
+    prRenderStatus(prGetNode() || { params: { notes: [] } });
+  });
+
+  // Tool buttons
+  document.querySelectorAll(".pr-tool").forEach(b => {
+    b.addEventListener("click", () => {
+      _prEd.tool = b.dataset.tool || "draw";
+      prSyncToolbar();
+    });
+  });
+
+  // Zoom buttons
+  document.querySelectorAll(".pr-zoom-btn[data-zoom]").forEach(b => {
+    b.addEventListener("click", () => {
+      const k = b.dataset.zoom;
+      if (k === "hin")  _prEd.zoomX = Math.min(PR_ZOOM_X.length - 1, _prEd.zoomX + 1);
+      if (k === "hout") _prEd.zoomX = Math.max(0, _prEd.zoomX - 1);
+      if (k === "vin")  _prEd.zoomY = Math.min(PR_ZOOM_Y.length - 1, _prEd.zoomY + 1);
+      if (k === "vout") _prEd.zoomY = Math.max(0, _prEd.zoomY - 1);
+      renderPianoRoll();
+    });
+  });
+
+  // Octave-jump buttons (vertical scroll by one octave's worth of rows)
+  document.querySelectorAll(".pr-zoom-btn[data-oct]").forEach(b => {
+    b.addEventListener("click", () => {
+      const dir = parseInt(b.dataset.oct, 10) || 0;
+      const wrap = document.getElementById("pr-grid-wrap");
+      if (!wrap) return;
+      // dir = +1 means scroll UP an octave (toward higher pitches at top).
+      wrap.scrollTop -= dir * 12 * prCellH();
+      prSyncScroll();
+    });
+  });
+
+  // Scroll mirroring
+  const wrap = document.getElementById("pr-grid-wrap");
+  if (wrap) wrap.addEventListener("scroll", prSyncScroll, { passive: true });
+
+  // Wheel: ctrl/cmd = zoom; shift = horizontal pan; default = vertical scroll
+  if (wrap) {
+    wrap.addEventListener("wheel", e => {
+      if (e.ctrlKey || e.metaKey) {
+        e.preventDefault();
+        // Cmd+wheel zooms horizontally (most musical context wants
+        // narrower / wider, not taller / shorter rows). Hold shift to
+        // zoom vertically instead.
+        const upd = (e.shiftKey ? "zoomY" : "zoomX");
+        const arr = (e.shiftKey ? PR_ZOOM_Y : PR_ZOOM_X);
+        if (e.deltaY < 0) _prEd[upd] = Math.min(arr.length - 1, _prEd[upd] + 1);
+        else              _prEd[upd] = Math.max(0, _prEd[upd] - 1);
+        renderPianoRoll();
+      }
+    }, { passive: false });
+  }
+
+  // Keyboard shortcuts — only when the modal is open.
+  document.addEventListener("keydown", e => {
+    if (_prEd.nodeId == null) return;
+    if (isTextInput(e.target)) return;
+    const k = e.key;
+    if (k === "Escape")      { e.preventDefault(); closePianoRollModal(); return; }
+    if (k === "b" || k === "B") { e.preventDefault(); _prEd.tool = "draw";   prSyncToolbar(); return; }
+    if (k === "v" || k === "V") { e.preventDefault(); _prEd.tool = "select"; prSyncToolbar(); return; }
+    if (k === "e" || k === "E") { e.preventDefault(); _prEd.tool = "erase";  prSyncToolbar(); return; }
+    if (k === "Delete" || k === "Backspace") { e.preventDefault(); prDeleteSelection(); return; }
+    if (k === "ArrowUp")   { e.preventDefault(); prTransposeSelection(e.shiftKey ? 12 : 1);   return; }
+    if (k === "ArrowDown") { e.preventDefault(); prTransposeSelection(e.shiftKey ? -12 : -1); return; }
+    if ((e.metaKey || e.ctrlKey) && (k === "a" || k === "A")) { e.preventDefault(); prSelectAll(); return; }
+    if ((e.metaKey || e.ctrlKey) && (k === "d" || k === "D")) { e.preventDefault(); prDuplicateSelection(); return; }
+  });
+
+  prInstallGridHandlers();
+  prInstallVelHandlers();
+  prInstallKeysHandlers();
 })();
 // Hook into render() so adding/removing Button or Slider nodes refreshes
 // the controls panel.
