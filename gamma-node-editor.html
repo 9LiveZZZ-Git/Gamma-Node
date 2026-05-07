@@ -296,11 +296,16 @@
   .canvas {
     position: absolute; inset: 0; overflow: hidden;
     /* Suppress native pinch-zoom and scroll on the canvas — we handle
-     * them via wheel and pointer events. Falls back to default in
-     * browsers that don't support touch-action. */
+     * them via wheel and two-finger pointer pinch. Falls back to default
+     * in browsers that don't support touch-action.
+     * -webkit-touch-callout: none stops iOS from popping the
+     * long-press "Copy / Look up / Share" sheet over a node when the
+     * user holds a finger on the canvas. */
     touch-action: none;
     -webkit-user-select: none;
     user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
   }
   #canvas-world {
     position: absolute;
@@ -14336,11 +14341,85 @@ function renderJson() {
  * stay transparent to the rest of the editor. Pan engages on middle-click
  * or Space+drag. Wire-drag and node-drag use world coords directly.
  * Marquee drag (on empty canvas, no Space) selects multiple nodes.
+ *
+ * Touch (iPad / phone) story:
+ *   • CSS `touch-action: none` on the canvas blocks the browser's own
+ *     pinch-zoom and scroll, so we own all gestures.
+ *   • Single touch behaves identically to a mouse left-click: drag a
+ *     node, draw a wire, marquee on empty canvas, etc.
+ *   • Two-finger gesture below pinch-zooms toward the midpoint AND pans
+ *     by midpoint movement at the same time (Maps-style — natural and
+ *     replaces the wheel-zoom that doesn't exist on touch). Engaging
+ *     pinch cancels any single-touch wire/marquee/drag in flight.
+ *   • Apple Pencil (`pointerType === "pen"`) is routed to the ink layer
+ *     for handwriting recognition and never to the canvas hit-tests.
  * ======================================================================== */
+
+/* Multi-touch pinch + pan. activePointers tracks every down pointer
+ * (touch only — pen and mouse skip it). When 2 are active we enter
+ * pinchState and the existing single-pointer move/up handlers no-op
+ * (they check pinchState first). Dropping back to 1 or 0 pointers
+ * exits the gesture cleanly without resuming any cancelled drag. */
+const activePointers = new Map();
+let pinchState = null;
+function _midpoint(a, b) { return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }; }
+function _ptDist(a, b)   { return Math.hypot(a.x - b.x, a.y - b.y); }
+canvas.addEventListener("pointerdown", e => {
+  if (e.pointerType !== "touch") return;
+  activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (activePointers.size === 2) {
+    // Cancel any single-touch state that the first finger started so
+    // the user doesn't accidentally drop a wire or shrink a marquee
+    // while pinching.
+    if (wire)        { wire = null; renderWires(); }
+    if (marquee)     { marquee = null; if (marqueeEl) marqueeEl.style.display = "none"; }
+    if (groupDrag)   { groupDrag = null; }
+    if (panning)     { panning = null; canvas.classList.remove("panning"); }
+    const pts = [...activePointers.values()];
+    const rect = canvas.getBoundingClientRect();
+    const mid = _midpoint(pts[0], pts[1]);
+    pinchState = {
+      startDist: _ptDist(pts[0], pts[1]) || 1,
+      startZoom: view.zoom,
+      // Lock the WORLD coordinate that lives under the gesture's start
+      // midpoint. Then on every move we just place that world point
+      // back under the current screen midpoint at the new zoom — same
+      // anchor math as wheel-zoom-toward-cursor.
+      anchorWorldX: ((mid.x - rect.left) - view.panX) / view.zoom,
+      anchorWorldY: ((mid.y - rect.top)  - view.panY) / view.zoom
+    };
+    e.preventDefault();
+  }
+}, true);
+canvas.addEventListener("pointermove", e => {
+  if (!activePointers.has(e.pointerId)) return;
+  activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (!pinchState || activePointers.size < 2) return;
+  e.preventDefault();
+  const pts = [...activePointers.values()];
+  const rect = canvas.getBoundingClientRect();
+  const newDist = _ptDist(pts[0], pts[1]);
+  const newMid  = _midpoint(pts[0], pts[1]);
+  const ratio = newDist / pinchState.startDist;
+  view.zoom = Math.max(0.25, Math.min(2.0, pinchState.startZoom * ratio));
+  view.panX = (newMid.x - rect.left) - pinchState.anchorWorldX * view.zoom;
+  view.panY = (newMid.y - rect.top)  - pinchState.anchorWorldY * view.zoom;
+  applyView();
+}, true);
+function _endTouchPointer(e) {
+  if (!activePointers.has(e.pointerId)) return;
+  activePointers.delete(e.pointerId);
+  if (pinchState && activePointers.size < 2) pinchState = null;
+}
+canvas.addEventListener("pointerup",     _endTouchPointer, true);
+canvas.addEventListener("pointercancel", _endTouchPointer, true);
+
 canvas.addEventListener("pointerdown", e => {
   // Touch + pen come through the same event — only react to primary
   // pointer, and ignore pen entirely (the ink layer handles that).
   if (e.pointerType === "pen") return;
+  // Multi-touch in progress (or about to be) — let the pinch handler own it.
+  if (pinchState || activePointers.size >= 2) return;
   // Pan: middle-click anywhere, or Space + left-click.
   if (e.button === 1 || (e.button === 0 && spaceHeld)) {
     e.preventDefault();
@@ -14495,6 +14574,9 @@ canvas.addEventListener("pointerdown", e => {
 });
 
 document.addEventListener("pointermove", e => {
+  // Multi-touch pinch in progress — ignore single-pointer logic so it
+  // doesn't drag a wire or update a marquee from one of the pinch fingers.
+  if (pinchState) return;
   if (panning) {
     view.panX = panning.startPanX + (e.clientX - panning.startX);
     view.panY = panning.startPanY + (e.clientY - panning.startY);
@@ -14529,6 +14611,8 @@ document.addEventListener("pointermove", e => {
 });
 
 document.addEventListener("pointerup", e => {
+  // Skip when pinch is in progress — _endTouchPointer handles its own bookkeeping.
+  if (pinchState) return;
   if (panning) {
     panning = null;
     canvas.classList.remove("panning");
@@ -18274,8 +18358,10 @@ function startMeterLoop() {
   }
   if (!canvas.dataset.fftWired) {
     canvas.dataset.fftWired = "1";
-    canvas.addEventListener("mousemove", fftHandlePointer);
-    canvas.addEventListener("mouseleave", () => { METER.fftCursor = null; });
+    // Pointer events instead of mouse events so the FFT cursor readout
+    // works on iPad / phone too. mouseleave maps to pointerleave.
+    canvas.addEventListener("pointermove",  fftHandlePointer);
+    canvas.addEventListener("pointerleave", () => { METER.fftCursor = null; });
   }
 
   function drawVU(pL, pR) {

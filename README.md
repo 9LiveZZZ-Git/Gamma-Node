@@ -69,7 +69,8 @@ First run downloads ~700 MB (Emscripten SDK + Gamma source) into a per-OS cache 
 ### CLI flags
 
 ```
-gamma-compile-server [--port 8765] [--cacheDir <path>]
+gamma-compile-server [--port 8765] [--host 127.0.0.1]
+                     [--allowOrigin <url>]... [--cacheDir <path>]
                      [--skipSetup] [--setupOnly]
 ```
 
@@ -84,6 +85,54 @@ Default cache directories:
 ### Why a daemon
 
 Native Emscripten produces full-fidelity Gamma builds in seconds on any dev machine; in-browser clang fundamentally can't, regardless of flag tuning. The daemon is the simplest fast-path that keeps the editor itself a single static HTML file.
+
+## Patching from an iPad / phone (LAN setup)
+
+The editor is touch-friendly — single-finger drag wires and moves nodes, **two-finger pinch** zooms toward the gesture midpoint and pans simultaneously, and an Apple Pencil routes straight to the handwriting-recognition tool.
+
+The catch: real-time audio preview needs the compile daemon, and the daemon doesn't run on iOS. Workaround — run the daemon on a Mac/PC on the same network and point the iPad at it.
+
+**On the host machine** (the one with the toolchain):
+
+```bash
+# 1. Start the daemon, opened to LAN, allow-listing the URL you'll
+#    serve the editor from. Replace 192.168.1.42 with this machine's
+#    LAN IP (`ipconfig getifaddr en0` on macOS, `ip a` on Linux,
+#    `ipconfig` on Windows).
+cd gamma-compile-server
+node bin/gamma-compile-server.js \
+  --host 0.0.0.0 \
+  --allowOrigin "http://192.168.1.42:8000"
+
+# 2. Serve the editor over plain HTTP from the same host. Browsers
+#    block fetches from HTTPS pages (the GitHub Pages copy) to
+#    non-localhost HTTP URLs, so we have to host the editor over
+#    HTTP too. In a separate terminal:
+cd Gamma-Node
+python -m http.server 8000
+```
+
+**On the iPad / phone:**
+
+1. Open `http://192.168.1.42:8000/gamma-node-editor.html` in Safari.
+2. User DSP tab → ⚙ Settings → scroll to **Compile server**.
+3. Set **Server URL** to `http://192.168.1.42:8765`, tap **Test connection** (should turn green with `✓ reachable v0.2.0`), tap **Save**.
+4. Hit ▶ on a patch — compile routes through the host machine. Compile time stays the same as desktop.
+
+⚠ `--host 0.0.0.0` exposes `/compile` to your LAN; the endpoint runs Emscripten on whatever C++ it receives. **Only do this on a trusted network** (your home Wi-Fi, not a coffee shop).
+
+### Touch gestures
+
+| Gesture | Effect |
+|---|---|
+| Single-finger drag on a node | Move it |
+| Single-finger drag on an out-port | Draw a wire |
+| Single-finger drag on empty canvas | Marquee-select |
+| Two-finger pinch | Zoom toward midpoint |
+| Two-finger drag (with pinch) | Pan |
+| Apple Pencil | Routes to handwriting / draw tool, never to canvas hit-tests |
+
+Hover-to-preview affordances (e.g. tooltip on long node titles) don't fire on touch — tap to select instead, the properties pane shows the same info.
 
 ## Files
 
