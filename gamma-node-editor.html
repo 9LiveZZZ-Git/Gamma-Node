@@ -1755,6 +1755,50 @@
   /* Everything in #app sits on top of the visual layer. */
   #app { position: relative; z-index: 1; }
 
+  /* ---------------- Rig pane (Phase 6.5) ---------------- */
+  .rig-pane { padding: 4px 0; }
+  .rig-pane-head {
+    display: flex; align-items: baseline; gap: 10px;
+    padding: 0 4px 8px; margin-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .rig-pane-title {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  .rig-pane-sub { font-size: 11px; color: var(--text-3); }
+  .rig-display-list {
+    margin-top: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .rig-display-list-head {
+    font-size: 10.5px;
+    color: var(--text-3);
+    margin-bottom: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .rig-display-row {
+    display: grid;
+    grid-template-columns: 22px 80px 1fr;
+    gap: 8px;
+    padding: 5px 6px;
+    border-radius: 4px;
+    background: var(--surface-2);
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    align-items: center;
+  }
+  .rig-display-row + .rig-display-row { margin-top: 1px; }
+  .rig-display-idx { color: var(--accent); text-align: right; }
+  .rig-display-name { color: var(--text); }
+  .rig-display-meta { color: var(--text-2); font-size: 10px; }
+
   /* ---------------- Live Mode ---------------- */
   /* Activated by toggleLiveMode() — sets body.live-mode. The whole
    * editor UI disappears via display:none on #app, leaving the
@@ -11859,8 +11903,14 @@ public:
     cppType: "",
     ins: [{ n: "in", t: "texture" }],
     outs: [],
-    params: {},
-    description: "Visual sink — wire a texture into in to drive the visual layer (the WebGPU canvas behind the editor). Press L (or click ◐) to enter Live Mode and see the result fullscreen."
+    // Phase 6.5 — `display` indexes into state.rig.displays. Default
+    // 0 means "render to display 0 of the auto-created 1-display rig"
+    // — preserves single-display behavior for patches that don't care
+    // about the rig system. The props pane renders this as a dropdown
+    // sourced from the live rig.displays list (see renderProps).
+    params:  { display: 0 },
+    methods: { display: null },
+    description: "Visual sink — wire a texture into in to drive the visual layer for the chosen display. Multiple VisualOutput nodes wired to the same shader render the SHARED image across the rig (the shader runs once per display with display-specific u_view + u_world_uv). Press L to enter Live Mode and see the rig fullscreen."
   },
 
   /* Phase 6.2.x — first two shader-frag nodes. Both are kind:
@@ -12673,8 +12723,198 @@ function freshState() {
      * renders as a single block with port stubs derived from
      * cross-boundary edges. */
     groups: [],
+    /* Phase 6.5 — distributed display rig. The rig is a list of N
+     * virtual displays + a global preview-projection mode + a master
+     * resolution shared by all displays in 6.5 (per-display res
+     * comes in 6.6). Each VisualOutput.display param indexes into
+     * rig.displays.
+     *
+     * worldUv on each display defines that display's slice of the
+     * rig's master canvas. When one shader feeds N displays, each
+     * display's render pass receives world-UV uniforms that map its
+     * local screen [0,1] into the slice — so a Pinwheel wired into
+     * two side-by-side displays renders ONCE conceptually, with the
+     * two passes drawing left and right halves of a single shared
+     * image. Existing single-display patches default to a 1-display
+     * rig with worldUv = [0,0]→[1,1], so old shaders see no change. */
+    rig: defaultRig(),
     filename: "untitled.gpatch"
   };
+}
+
+/* ---------- Phase 6.5 — rig data layer + templates ---------- */
+
+/* The default rig: one flat display covering the full master canvas.
+ * Existing patches that don't carry a rig get this on load — combined
+ * with VisualOutput's display param defaulting to 0, the editor's
+ * pre-Phase-6.5 single-display behavior is preserved exactly. */
+function defaultRig() {
+  return {
+    templateKey: "single",
+    masterRes:   [1920, 1080],
+    previewMode: "tile",          // tile | cylinder | equirect | fisheye
+    displays:    [_makeDisplay("d0", "Display 1", {
+      pose: { yaw: 0, pitch: 0, roll: 0 },
+      fov:  { h: 90, v: 60 },
+      worldUv: { minU: 0, minV: 0, maxU: 1, maxV: 1 }
+    })]
+  };
+}
+
+function _makeDisplay(id, name, overrides) {
+  return Object.assign({
+    id,
+    name,
+    pose:      { yaw: 0, pitch: 0, roll: 0 },
+    fov:       { h: 90, v: 60 },
+    aspect:    16 / 9,
+    curvature: 0,
+    worldUv:   { minU: 0, minV: 0, maxU: 1, maxV: 1 }
+  }, overrides);
+}
+
+/* Catalog of rig templates. Each builds a display list from a single
+ * key. The math for cylindrical / spherical layouts:
+ *   - Cylindrical: yaws spaced evenly around the azimuth covered by
+ *     the rig (90° for quarter, 180° for half, 360° for full). Each
+ *     display's worldUv.u range is its azimuth slice / total
+ *     azimuth. v range is full [0,1].
+ *   - Cube: 6 displays each looking down a cardinal axis (front /
+ *     back / left / right / up / down). worldUv slices a cubemap
+ *     unfold into 6 rectangles.
+ *   - AlloSphere-like: 16 displays in a partial sphere matching the
+ *     practical AlloSphere coverage (~360° H × ~150° V on a bisected
+ *     sphere). worldUv slices an equirect master into 16 rects in a
+ *     4-cols × 4-rows arrangement that approximates the dome's
+ *     projector layout. Real AlloSphere has 26 projectors; 16 is
+ *     the "consumer-class" approximation per docs/DISTRIBUTED-RIG.md
+ *     §9.3. */
+const RIG_TEMPLATES = {
+  single: {
+    label: "Single (1 display)",
+    build: () => [_makeDisplay("d0", "Display 1", {
+      pose: { yaw: 0, pitch: 0, roll: 0 },
+      fov:  { h: 90, v: 60 },
+      worldUv: { minU: 0, minV: 0, maxU: 1, maxV: 1 }
+    })]
+  },
+  "side-by-side": {
+    label: "Side-by-side (2 flat)",
+    build: () => [
+      _makeDisplay("d0", "Left", {
+        pose: { yaw: -45, pitch: 0, roll: 0 },
+        fov:  { h: 90, v: 60 },
+        worldUv: { minU: 0,   minV: 0, maxU: 0.5, maxV: 1 }
+      }),
+      _makeDisplay("d1", "Right", {
+        pose: { yaw:  45, pitch: 0, roll: 0 },
+        fov:  { h: 90, v: 60 },
+        worldUv: { minU: 0.5, minV: 0, maxU: 1,   maxV: 1 }
+      })
+    ]
+  },
+  "quarter-wrap": {
+    label: "Quarter-wrap (4 flat, 90°)",
+    build: () => _evenAzimuthRing(4, 90, "Q")
+  },
+  "half-wrap": {
+    label: "Half-wrap (8 flat, 180°)",
+    build: () => _evenAzimuthRing(8, 180, "H")
+  },
+  cube: {
+    label: "Cube (6 faces)",
+    build: () => {
+      const pose = (yaw, pitch) => ({ yaw, pitch, roll: 0 });
+      // Standard cubemap unfold: 4 sides + top + bottom in a 4×3 layout
+      // but compressed into a 1×6 row in the master canvas for
+      // simplicity. Each face is 1/6th of the master width.
+      const f = 1 / 6;
+      const fov = { h: 90, v: 90 };
+      return [
+        _makeDisplay("front",  "+Z front",  { pose: pose(0,    0),  fov, worldUv: { minU: 0*f, minV: 0, maxU: 1*f, maxV: 1 } }),
+        _makeDisplay("right",  "+X right",  { pose: pose(90,   0),  fov, worldUv: { minU: 1*f, minV: 0, maxU: 2*f, maxV: 1 } }),
+        _makeDisplay("back",   "-Z back",   { pose: pose(180,  0),  fov, worldUv: { minU: 2*f, minV: 0, maxU: 3*f, maxV: 1 } }),
+        _makeDisplay("left",   "-X left",   { pose: pose(-90,  0),  fov, worldUv: { minU: 3*f, minV: 0, maxU: 4*f, maxV: 1 } }),
+        _makeDisplay("top",    "+Y top",    { pose: pose(0,   90),  fov, worldUv: { minU: 4*f, minV: 0, maxU: 5*f, maxV: 1 } }),
+        _makeDisplay("bottom", "-Y bottom", { pose: pose(0,  -90),  fov, worldUv: { minU: 5*f, minV: 0, maxU: 6*f, maxV: 1 } })
+      ];
+    }
+  },
+  "allosphere-like": {
+    label: "AlloSphere-like (16 partial sphere)",
+    build: () => {
+      // 4 columns × 4 rows on a partial sphere. Vertical FOV ≈ 150°
+      // (bisected sphere), horizontal 360°. Each cell is one display.
+      // worldUv tiles the equirect master into a 4×4 grid.
+      const cols = 4, rows = 4;
+      const out = [];
+      const cellW = 1 / cols;
+      const cellH = 1 / rows;
+      const azimuthStep   = 360 / cols;
+      const elevationStep = 150 / rows;   // partial sphere: 150° vertical
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          const idx = r * cols + c;
+          const yaw   = -180 + (c + 0.5) * azimuthStep;        // span -180..180
+          const pitch =  -75 + (r + 0.5) * elevationStep;      // span -75..75
+          out.push(_makeDisplay("a" + idx, "Allo-" + (idx + 1), {
+            pose: { yaw, pitch, roll: 0 },
+            fov:  { h: azimuthStep, v: elevationStep },
+            curvature: 22,   // soft curve, ≈ projector throw aperture
+            worldUv: {
+              minU: c * cellW, minV: r * cellH,
+              maxU: (c + 1) * cellW, maxV: (r + 1) * cellH
+            }
+          }));
+        }
+      }
+      return out;
+    }
+  }
+};
+
+/* Helper for cylindrical-wrap templates: N displays evenly spaced
+ * across a horizontal arc of `azimuthDeg` total. Each display gets an
+ * equal slice of worldUv along U. */
+function _evenAzimuthRing(n, azimuthDeg, prefix) {
+  const out = [];
+  const fovH = azimuthDeg / n;
+  const start = -azimuthDeg / 2;
+  for (let i = 0; i < n; i++) {
+    const yaw = start + (i + 0.5) * fovH;
+    out.push(_makeDisplay(prefix + i, prefix + (i + 1), {
+      pose: { yaw, pitch: 0, roll: 0 },
+      fov:  { h: fovH, v: 60 },
+      worldUv: {
+        minU: i / n,       minV: 0,
+        maxU: (i + 1) / n, maxV: 1
+      }
+    }));
+  }
+  return out;
+}
+
+/* Replace the rig's display list with the catalog template's output.
+ * Preserves rig-level settings (masterRes, previewMode) so the user's
+ * choice of resolution + projection survives a template swap. */
+function applyRigTemplate(key) {
+  const t = RIG_TEMPLATES[key];
+  if (!t) return;
+  pushHistory("rig-template:" + key);
+  if (!state.rig) state.rig = defaultRig();
+  state.rig.templateKey = key;
+  state.rig.displays    = t.build();
+  // Validate that any VisualOutput nodes still point at a valid
+  // display index. Anything pointing past the new display count gets
+  // clamped to the last available display.
+  const max = state.rig.displays.length - 1;
+  state.nodes.forEach(n => {
+    if (n.type === "VisualOutput" && n.params && typeof n.params.display === "number") {
+      if (n.params.display > max) n.params.display = max;
+    }
+  });
+  render();
+  renderProps && renderProps();
 }
 
 /* Group helpers — kept tiny and pure so the rest of the editor
@@ -14071,6 +14311,78 @@ function renderWires(temp) {
  * the regular node-prop pane: a head row + sections for the editable
  * fields (name, collapse), a quick member list, and an actions
  * footer (ungroup + save-as-gpatch). */
+/* ---------- Phase 6.5 — rig props pane ---------- */
+/* Shown when nothing is selected (the old "empty" placeholder slot).
+ * Two sections: template picker + display list. The display list is
+ * read-only in 6.5 MVP — each row shows the display's name + key
+ * pose/FOV values. Per-display editing (drag yaw/pitch sliders, edit
+ * FOV) lands in 6.5.15 (week 3 of the phase).
+ *
+ * Template change rebuilds rig.displays from RIG_TEMPLATES[key].
+ * Existing VisualOutput nodes get their display index clamped to the
+ * new display count if the new template has fewer displays. */
+function renderRigPane() {
+  const rig = state.rig || defaultRig();
+  const tplOptions = Object.keys(RIG_TEMPLATES).map(k =>
+    `<option value="${k}"${k === rig.templateKey ? " selected" : ""}>${escapeText(RIG_TEMPLATES[k].label)}</option>`
+  ).join("");
+  const displayRows = rig.displays.map((d, i) => {
+    return `<div class="rig-display-row" data-display-index="${i}">
+      <span class="rig-display-idx">${i}</span>
+      <span class="rig-display-name">${escapeText(d.name || ("Display " + (i + 1)))}</span>
+      <span class="rig-display-meta">yaw ${(d.pose.yaw|0)}° · pitch ${(d.pose.pitch|0)}° · fov ${(d.fov.h|0)}°×${(d.fov.v|0)}°${d.curvature ? " · curve " + (d.curvature|0) + "°" : ""}</span>
+    </div>`;
+  }).join("");
+  return `
+    <div class="rig-pane">
+      <div class="rig-pane-head">
+        <span class="rig-pane-title">Display rig</span>
+        <span class="rig-pane-sub">${rig.displays.length} display${rig.displays.length === 1 ? "" : "s"}</span>
+      </div>
+      <div class="row">
+        <label>Template</label>
+        <select id="rig-template-select">${tplOptions}</select>
+      </div>
+      <div class="row">
+        <label>Preview</label>
+        <select id="rig-preview-select">
+          <option value="tile"${rig.previewMode === "tile" ? " selected" : ""}>Tiled flat</option>
+          <option value="cylinder"${rig.previewMode === "cylinder" ? " selected" : ""}>Cylindrical unwrap</option>
+          <option value="equirect"${rig.previewMode === "equirect" ? " selected" : ""}>Equirectangular</option>
+          <option value="fisheye"${rig.previewMode === "fisheye" ? " selected" : ""}>Stereographic / fisheye</option>
+        </select>
+      </div>
+      <div class="rig-display-list">
+        <div class="rig-display-list-head">Displays (read-only — drag-to-edit ships in 6.5.15)</div>
+        ${displayRows}
+      </div>
+      <p class="modal-note" style="margin-top: 12px;">
+        Wire any shader's texture output into a VisualOutput node and pick its display index in that node's properties. Multiple VisualOutput nodes wired to the same shader render the same image SHARED across their displays — the shader runs once per display with per-display u_view + u_world_uv uniforms.
+      </p>
+    </div>
+  `;
+}
+
+function wireRigPaneHandlers() {
+  const tpl = document.getElementById("rig-template-select");
+  if (tpl) {
+    tpl.addEventListener("change", () => {
+      applyRigTemplate(tpl.value);
+    });
+  }
+  const pv = document.getElementById("rig-preview-select");
+  if (pv) {
+    pv.addEventListener("change", () => {
+      pushHistory("rig-preview:" + pv.value);
+      if (!state.rig) state.rig = defaultRig();
+      state.rig.previewMode = pv.value;
+      // The actual preview-mode-aware compositor lands in 6.5.10–6.5.13.
+      // For now this just persists the user's choice in the .gpatch.
+      render();
+    });
+  }
+}
+
 function renderGroupProps(g) {
   const dot = `background: var(--accent); --prop-dot: var(--accent);`;
   const memberRows = (g.members || []).map(id => {
@@ -14201,8 +14513,13 @@ function renderProps() {
     selectedGroupId = null;  // stale id — fall through to node path
   }
   if (!selected) {
-    empty.style.display = "block";
-    propsEl.innerHTML = "";
+    // Phase 6.5 — when nothing is selected, the props pane shows the
+    // RIG editor instead of being empty. Lets users tune their
+    // distributed-display layout without first having to create a
+    // dummy node to select.
+    empty.style.display = "none";
+    propsEl.innerHTML = renderRigPane();
+    wireRigPaneHandlers();
     return;
   }
   const node = nodeById(selected);
@@ -14238,7 +14555,23 @@ function renderProps() {
         // ui-only params (Slider min/max, Button label) are not C++ at all.
         const exposable = !!def.cppType && !enumOpts && !isUiOnly && !isString;
         let inputHtml;
-        if (enumOpts) {
+        // Phase 6.5 — VisualOutput.display: dynamic dropdown sourced
+        // from the live rig.displays list. Updates whenever the user
+        // swaps templates or edits the display list. Treated like an
+        // enum but the option list is fetched from state.rig instead
+        // of the static def.paramOptions.
+        const isRigDisplayDropdown = node.type === "VisualOutput" && k === "display";
+        if (isRigDisplayDropdown) {
+          const displays = (state.rig && state.rig.displays) || [];
+          const opts = displays.map((d, i) => {
+            const sel = (node.params[k] | 0) === i ? " selected" : "";
+            return `<option value="${i}"${sel}>${i}: ${escapeText(d.name || ("Display " + (i + 1)))}</option>`;
+          }).join("");
+          const placeholder = displays.length === 0
+            ? `<option value="0" selected>(no displays — pick a template in rig pane)</option>`
+            : "";
+          inputHtml = `<select class="enum-select" data-key="${escapeAttr(k)}" data-rig-display="1">${placeholder}${opts}</select>`;
+        } else if (enumOpts) {
           const opts = enumOpts.map(o => {
             const sel = node.params[k] === o ? " selected" : "";
             return `<option value="${escapeAttr(o)}"${sel}>${escapeText(o)}</option>`;
@@ -14257,13 +14590,15 @@ function renderProps() {
         } else {
           inputHtml = `<input type="number" step="any" value="${node.params[k]}" data-key="${escapeAttr(k)}" />`;
         }
-        const trailing = exposable
-          ? `<label class="expose" title="When checked, the generated class exposes a ${k}(float) setter."><input type="checkbox" data-expose="${escapeAttr(k)}" ${ex?"checked":""} /> expose</label>`
-          : enumOpts
-            ? `<span class="prop-inline">construction-time</span>`
-            : isUiOnly
-              ? `<span class="prop-inline">UI only</span>`
-              : `<span class="prop-inline">inlined at compile</span>`;
+        const trailing = isRigDisplayDropdown
+          ? `<span class="prop-inline">rig display index</span>`
+          : exposable
+            ? `<label class="expose" title="When checked, the generated class exposes a ${k}(float) setter."><input type="checkbox" data-expose="${escapeAttr(k)}" ${ex?"checked":""} /> expose</label>`
+            : enumOpts
+              ? `<span class="prop-inline">construction-time</span>`
+              : isUiOnly
+                ? `<span class="prop-inline">UI only</span>`
+                : `<span class="prop-inline">inlined at compile</span>`;
         html += `
           <label class="k">${escapeText(k)}</label>
           ${inputHtml}
@@ -14766,7 +15101,14 @@ function renderProps() {
   propsEl.querySelectorAll('select.enum-select').forEach(sel => {
     sel.addEventListener("change", () => {
       pushHistory("param:" + node.id + ":" + sel.dataset.key);
-      node.params[sel.dataset.key] = sel.value;   // string, not number
+      // Phase 6.5 — rig-display selects are numeric indices, not enum
+      // strings. Convert before assigning so downstream code (validation,
+      // render path) gets a number consistently.
+      if (sel.dataset.rigDisplay) {
+        node.params[sel.dataset.key] = parseInt(sel.value, 10) | 0;
+      } else {
+        node.params[sel.dataset.key] = sel.value;   // string, not number
+      }
       renderCode(); renderJson();
       // If the user picked "custom" on a ramp-editable enum dropdown
       // (Ramp shape, Button shape), jump straight into the drawing
@@ -16641,6 +16983,19 @@ document.getElementById("file-input").addEventListener("change", ev => {
       // make sure it's at least an array so render / save paths can
       // iterate without null checks.
       if (!Array.isArray(state.groups)) state.groups = [];
+      // Phase 6.5 — synthesize the default 1-display rig for patches
+      // saved before the rig data layer existed. Any VisualOutput
+      // nodes without a `display` param land on display 0 of that
+      // synthesized rig, preserving exact pre-6.5 behavior.
+      if (!state.rig || !Array.isArray(state.rig.displays)) {
+        state.rig = defaultRig();
+      }
+      state.nodes.forEach(n => {
+        if (n.type === "VisualOutput") {
+          if (!n.params) n.params = {};
+          if (typeof n.params.display !== "number") n.params.display = 0;
+        }
+      });
       state.filename = file.name;
       const stem = file.name.replace(/\.[^.]+$/, "");
       if (!loaded.patchName) state.patchName = stem.replace(/[^A-Za-z0-9_]/g, "_");
