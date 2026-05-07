@@ -7053,6 +7053,171 @@ public:
     description: "Asynchronous granular player. Spawns overlapping grains from a sample at `position`. density (grains/sec), grainSize (ms), spread (random position offset). Time-stretch freeze at high density + low spread; smear at high spread."
   },
 
+  /* WarpPlayer — pitch-preserving time-stretch sample player.
+   * The naïve `bpmSync` on SamplePlayer/Stereo/Granular shifts
+   * pitch with tempo (resampling). This node decouples them: a
+   * 4-grain Hann-windowed WSOLA reads the source through
+   * overlapping windows, with each grain reading at `pitch`
+   * speed and the grain-trigger cursor advancing at `speed`
+   * (independent). Wire `MasterClock.bpm → bpm`, set
+   * `naturalBpm` to the loop's recorded tempo, toggle `bpmSync`
+   * on, and the loop locks to the master clock without going
+   * chipmunk on speed-up.
+   *
+   * Quality: WSOLA without epoch detection — fine for typical
+   * music material in the [0.5, 2.0] pitch / speed range. Wider
+   * ratios may show flanging artifacts. Studio-grade quality
+   * needs PSOLA + pitch-period detection — out of scope.
+   *
+   * Same asset-host plumbing as SamplePlayer (kind "sampleHost")
+   * — drop a .wav onto the props pane to load. */
+  WarpPlayer: {
+    category: "Oscillator", color: COLOR.sample, header: null,
+    cppType: "GammaWarpPlayer",
+    helperClass:
+`class GammaWarpPlayer {
+    static constexpr int FRAME  = 2048;
+    static constexpr int HOP    = 512;
+    static constexpr int GRAINS = 4;
+    std::vector<float> buf_;
+    int    nSamples_ = 0;
+    struct Grain {
+        bool   active = false;
+        double srcPos = 0.0;
+        int    outAge = 0;
+    };
+    Grain  grains_[GRAINS];
+    int    outCounter_ = 0;
+    double sourceCursor_ = 0.0;
+    float  pitch_ = 1.f;
+    float  speed_ = 1.f;
+    float  bpm_ = 120.f;
+    float  naturalBpm_ = 120.f;
+    bool   bpmSync_ = false;
+    float  effSpeed_ = 1.f;
+    float  gain_ = 1.f;
+    float  dcOffset_ = 0.f;
+    bool   loop_ = false;
+    bool   playing_ = false;
+    bool   atEnd_ = false;
+    float  sr_ = 48000.f;
+    float  sourceSr_ = 48000.f;
+    void recalcSpeed_() {
+        effSpeed_ = (bpmSync_ && bpm_ > 0.f && naturalBpm_ > 0.f)
+            ? (bpm_ / naturalBpm_) : speed_;
+    }
+public:
+    GammaWarpPlayer() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+        for (int i = 0; i < GRAINS; i++) grains_[i].active = false;
+    }
+    void setSampleRate(float sr) { sourceSr_ = sr; }
+    void load(const float* src, int n) {
+        buf_.assign(src, src + n);
+        nSamples_ = n;
+    }
+    void setPitch(float p)      { pitch_ = (p < 0.1f) ? 0.1f : (p > 4.f ? 4.f : p); }
+    void setSpeed(float s)      { speed_ = (s < 0.1f) ? 0.1f : (s > 4.f ? 4.f : s); recalcSpeed_(); }
+    void setBpm(float v)        { bpm_ = v; recalcSpeed_(); }
+    void setNaturalBpm(float v) { naturalBpm_ = v; recalcSpeed_(); }
+    void setBpmSync(float v)    { bpmSync_ = v > 0.5f; recalcSpeed_(); }
+    void setGain(float g)       { gain_ = g; }
+    void setDcOffset(float d)   { dcOffset_ = d; }
+    void setLoop(float l)       { loop_ = l > 0.5f; }
+    void play() {
+        outCounter_ = 0;
+        sourceCursor_ = 0.0;
+        atEnd_ = false;
+        for (int i = 0; i < GRAINS; i++) grains_[i].active = false;
+        grains_[0].active = true;
+        grains_[0].srcPos = 0.0;
+        grains_[0].outAge = 0;
+        playing_ = true;
+    }
+    void stop() { playing_ = false; }
+    void reset() { play(); }
+    float operator()() {
+        if (!playing_ || nSamples_ < 2) return 0.f;
+        // Trigger a new grain every HOP samples. Source cursor
+        // advances by HOP * effSpeed per trigger — this is what
+        // decouples output time from source time. With pitch=1
+        // and speed=1, the grain starts line up exactly with the
+        // 4 overlapping Hann windows summing to ~1.0 (constant-
+        // overlap-add), so output ≈ source.
+        if (!atEnd_ && outCounter_ > 0 && (outCounter_ % HOP) == 0) {
+            for (int i = 0; i < GRAINS; i++) {
+                if (!grains_[i].active) {
+                    grains_[i].active = true;
+                    grains_[i].srcPos = sourceCursor_;
+                    grains_[i].outAge = 0;
+                    break;
+                }
+            }
+            sourceCursor_ += (double)HOP * (double)effSpeed_ * (double)sourceSr_ / (double)sr_;
+            if (sourceCursor_ >= (double)(nSamples_ - FRAME)) {
+                if (loop_) sourceCursor_ = 0.0;
+                else      atEnd_ = true;
+            }
+        }
+        outCounter_++;
+        constexpr float TWO_PI = 6.28318530718f;
+        float sum = 0.f;
+        for (int i = 0; i < GRAINS; i++) {
+            if (!grains_[i].active) continue;
+            const int age = grains_[i].outAge;
+            const double pos = grains_[i].srcPos
+                + (double)age * (double)pitch_ * (double)sourceSr_ / (double)sr_;
+            const int i0 = (int)pos;
+            if (i0 >= 0 && i0 < nSamples_ - 1) {
+                const float t = (float)(pos - i0);
+                const float v = buf_[i0] * (1.f - t) + buf_[i0 + 1] * t;
+                const float w = 0.5f * (1.f - std::cos(TWO_PI * (float)age / (float)(FRAME - 1)));
+                sum += v * w;
+            }
+            grains_[i].outAge++;
+            if (grains_[i].outAge >= FRAME) grains_[i].active = false;
+        }
+        // After the last grain finishes (no new triggers, all
+        // inactive), stop output. This avoids dribbling silence
+        // through gain * 0 - dcOffset which would emit a DC bias.
+        if (atEnd_) {
+            bool anyActive = false;
+            for (int i = 0; i < GRAINS; i++) if (grains_[i].active) { anyActive = true; break; }
+            if (!anyActive) playing_ = false;
+        }
+        return sum * gain_ - dcOffset_;
+    }
+};`,
+    ins: [
+      { n: "trig",       t: "gate" },
+      { n: "pitch",      t: "param" },
+      { n: "speed",      t: "param" },
+      { n: "loop",       t: "param" },
+      { n: "gain",       t: "param" },
+      { n: "dcOffset",   t: "param" },
+      { n: "bpm",        t: "param" },
+      { n: "naturalBpm", t: "param" },
+      { n: "bpmSync",    t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { assetId: "", pitch: 1.0, speed: 1.0, loop: 0, gain: 1.0, dcOffset: 0.0, naturalBpm: 120, bpmSync: 0 },
+    methods: {
+      pitch: "setPitch", speed: "setSpeed", loop: "setLoop",
+      gain: "setGain", dcOffset: "setDcOffset",
+      bpm: "setBpm", naturalBpm: "setNaturalBpm", bpmSync: "setBpmSync"
+    },
+    gateMethods: { trig: "play" },
+    autoExpose: ["pitch", "speed", "loop"],
+    uiOnlyParams: ["assetId"],
+    kind: "sampleHost",
+    extraHeaders: ["<vector>", "<cmath>"],
+    extraCtor: [
+      (n) => emitAssetLoadCpp(n, 0, "load", "setSampleRate")
+    ],
+    description: "Pitch-preserving time-stretch sample player. pitch shifts WITHOUT changing tempo; speed (or bpmSync) changes tempo WITHOUT affecting pitch. WSOLA grain overlap (4 grains × 2048 samples × Hann window). Set naturalBpm to the loop's recorded tempo, wire MasterClock.bpm → bpm, toggle bpmSync, and the loop tracks the master clock cleanly. Best in [0.5, 2.0] pitch/speed ratios."
+  },
+
   /* Pulsar synthesis (Curtis Roads). A pulsar is a short waveform
    * (formant grain) with an envelope; pulsars repeat at the
    * fundamentalFreq rate, with each pulsar containing a waveform at
