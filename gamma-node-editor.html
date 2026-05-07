@@ -15615,7 +15615,7 @@ const PROVIDERS = {
     requiresKey: false,
     supportsImage: true,
     supportsAudio: true,
-    async call({ system, user, model, onToken, image, audio, temperature }) {
+    async call({ system, user, model, onToken, image, audio, temperature, maxTokens }) {
       const pipe = await ensureGemmaPipeline(model);
 
       // Build the messages array. Multimodal content (image / audio) goes
@@ -15643,10 +15643,15 @@ const PROVIDERS = {
 
       // Deterministic decode (HWR / classification) when caller passes
       // temperature: 0; sample for free-form text generation otherwise.
+      // maxTokens lets callers override the per-task budget — HWR needs
+      // ~48 (room for "The word is X." style preamble before our parser
+      // strips it), generation needs ~2048.
       const det = (typeof temperature === "number" && temperature <= 0);
+      const detTokens = (typeof maxTokens === "number" && maxTokens > 0) ? maxTokens : 16;
+      const genTokens = (typeof maxTokens === "number" && maxTokens > 0) ? maxTokens : 2048;
       const generateOpts = {
         ...inputs,
-        max_new_tokens: det ? 16 : 2048,
+        max_new_tokens: det ? detTokens : genTokens,
         do_sample: !det,
         temperature: det ? 1.0 : (typeof temperature === "number" ? temperature : 0.4)
       };
@@ -16525,20 +16530,36 @@ function strokesToPng(box, strokes) {
   // proportionally + generous padding. Both Tesseract OCR and small
   // multimodal LLMs are dramatically more accurate on big high-contrast
   // images than on the tiny ~80x40 px boxes users typically draw.
+  //
+  // Sizing heuristic: target the *short* side of the bounding box at
+  // ≥ 240 px, the *long* side at ≥ 640 px. This gives the VLM enough
+  // pixels to disambiguate similar letterforms ("S" vs "5", "O" vs "0",
+  // "n" vs "h") on tall short labels like "AD" or wide ones like
+  // "MultibandComp" without producing an extreme aspect ratio.
   // Returns { dataUrl, base64 } so callers that want either form can
   // pick without re-encoding.
-  const pad = 24;
-  const minSide = 320;
-  const scale = Math.max(1, minSide / Math.max(box.w, box.h));
+  const pad = 32;
+  const minLong  = 640;
+  const minShort = 240;
+  const longSide  = Math.max(box.w, box.h);
+  const shortSide = Math.max(1, Math.min(box.w, box.h));
+  const scale = Math.max(1, minLong / longSide, minShort / shortSide);
   const W = Math.ceil(box.w * scale) + pad * 2;
   const H = Math.ceil(box.h * scale) + pad * 2;
   const c = document.createElement("canvas");
   c.width = W; c.height = H;
   const ctx = c.getContext("2d");
-  ctx.fillStyle = "white";
+  // Slight off-white background reads as "paper" to vision models —
+  // pure white can read as "blank canvas" and trip false UNKNOWNs on
+  // small models. The diff is barely visible to the eye.
+  ctx.fillStyle = "#fdfdfd";
   ctx.fillRect(0, 0, W, H);
-  ctx.strokeStyle = "black";
-  ctx.lineWidth = Math.max(5, 4 * scale);
+  ctx.strokeStyle = "#0a0a0a";
+  // Thicker strokes scale with the upscale factor so handwriting reads
+  // as bold ink, not faint pencil. ~1.2% of the long edge worked best
+  // empirically — narrow enough to keep "L" and "I" distinct, fat
+  // enough that closures (loops in 'e', 'a', 'o') stay closed.
+  ctx.lineWidth = Math.max(6, 0.012 * Math.max(W, H));
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
   strokes.forEach(s => {
@@ -16555,21 +16576,27 @@ function strokesToPng(box, strokes) {
 }
 
 /* Unified vision call — uses whichever provider is selected. The provider's
- * own call() handles image input via its supportsImage path. */
+ * own call() handles image input via its supportsImage path.
+ *
+ * Strategy: ask the model to *transcribe* the handwriting, not to classify
+ * it against a list. Earlier we passed all 200 node names and asked Gemma
+ * to pick one — small VLMs (~2B params) aren't reliable classifiers over
+ * long lists, they hallucinate near-matches or punt to UNKNOWN. The
+ * downstream matcher (tryCreateFromLabel) is already good at fuzzy /
+ * Levenshtein / OCR-confusable matching, so we offload the categorization
+ * there and let the VLM do the one thing it's actually good at: reading
+ * a single short handwritten word. The list is included as gentle context
+ * to nudge spelling on ambiguous handwriting (e.g., "Sin" → "Sine"). */
 async function callVision(pngBase64, key) {
-  // List the live registry directly so the prompt stays in sync with the
-  // actual TYPES — earlier this was a hardcoded "popular" subset of ~30
-  // names, which silently rejected every node added afterward (LFO,
-  // Impulse, the dynamics batch, automation lanes, etc.). The full list
-  // is ~190 short names; both Gemma 4 and Claude handle it fine.
   const nodeList = Object.keys(TYPES).sort().join(", ");
   const sys =
-`You read a single short word handwritten on a small canvas (white background, black ink) and reply with the closest matching Gamma DSP node name. Output rules:
-- Reply with EXACTLY ONE node name from this allowed list, nothing else.
-- No explanation, no punctuation, no quotes, no markdown.
-- If the writing is unreadable or doesn't match anything, reply: UNKNOWN
-Allowed nodes: ${nodeList}`;
-  const userPrompt = "Identify the handwritten node name.";
+`You transcribe a single short word handwritten on a small canvas (white background, black ink). Reply with ONLY the word — no preamble, no explanation, no punctuation, no quotes.
+
+If the word resembles one of these audio DSP node names, prefer that exact spelling (the names use CamelCase, e.g. "MultibandComp" not "multiband comp"):
+${nodeList}
+
+If you genuinely can't read it, reply: UNKNOWN`;
+  const userPrompt = "Word:";
 
   const provider = PROVIDERS[aiSettings.provider];
   return await provider.call({
@@ -16580,7 +16607,12 @@ Allowed nodes: ${nodeList}`;
     image: pngBase64,
     // Deterministic for HWR — temperature is only honored by gemma path,
     // anthropic ignores unknown keys.
-    temperature: 0
+    temperature: 0,
+    // Vision-token budget: enough for the longest node name + a tiny bit
+    // of slack if the model adds whitespace/punctuation we'll strip. The
+    // provider call defaults to 16 (good for chat classification, too
+    // tight when a small VLM emits "The word is X.") — bump just for HWR.
+    maxTokens: 48
   });
 }
 
@@ -16681,13 +16713,27 @@ function tryCreateFromLabel(rawLabel, box, silent) {
     if (!silent) setVoiceStatus("Recognizer returned nothing.", "err");
     return null;
   }
-  const cleanedFull = rawLabel.replace(/[`*_~"'.,:;!?()\[\]\n]/g, " ").trim();
+  // Strip common VLM preambles BEFORE punctuation cleaning so the
+  // patterns can use word boundaries. Small VLMs love to wrap a
+  // one-word answer in "The handwritten word is 'X'" / "It says X" /
+  // "The image shows the word X" / "Looks like X". We've also seen
+  // markdown like "**X**" and code-fence wraps. Strip aggressively.
+  let preStripped = rawLabel
+    .replace(/^[\s\-•*]*the (?:handwritten )?(?:word|text|writing|label|node)?\s*(?:is|reads|says)?:?\s*/i, "")
+    .replace(/^[\s\-•*]*(?:it|this|that)\s+(?:is|says|reads|appears to (?:be|say)|looks like)\s*:?\s*/i, "")
+    .replace(/^[\s\-•*]*(?:the\s+)?image (?:shows?|contains?|displays?|has)\s+(?:the\s+)?(?:word|text|letters?|handwriting)?\s*:?\s*/i, "")
+    .replace(/^[\s\-•*]*(?:looks like|appears to be|reads as|i (?:see|read))\s*:?\s*/i, "")
+    .replace(/^[\s\-•*]*(?:answer|word|text|node|label)\s*[:=]\s*/i, "")
+    .replace(/^[\s\-•*]*```[a-z]*\s*/i, "")
+    .replace(/```\s*$/i, "")
+    .trim();
+  const cleanedFull = preStripped.replace(/[`*_~"'.,:;!?()\[\]\n]/g, " ").trim();
   if (/^\s*UNKNOWN\s*$/i.test(cleanedFull) || !cleanedFull) {
     if (!silent) setVoiceStatus(`Recognizer didn't identify a node type — got “${rawLabel.trim().slice(0,40)}”. Try writing larger / more clearly.`, "err");
     return null;
   }
   // Drop obvious filler the model sometimes appends.
-  const STOP = new Set(["node","wave","filter","oscillator","the","a","an","is","this","says"]);
+  const STOP = new Set(["node","wave","filter","oscillator","the","a","an","is","this","says","reads","appears","looks","like","seems","probably","maybe","might","could","be","i","it","that","handwritten","word","text","label","letter","letters","says","writing"]);
   const tokens = cleanedFull
     .split(/\s+/)
     .map(t => t.replace(/[^A-Za-z0-9]/g, ""))
@@ -16702,13 +16748,28 @@ function tryCreateFromLabel(rawLabel, box, silent) {
     .replace(/1/g, "I")
     .replace(/5/g, "S")
     .replace(/8/g, "B");
-  const baseCandidates = [cleanedFull.replace(/[^A-Za-z0-9]/g, ""), ...tokens];
+  // n-grams: try concatenations of 1..4 consecutive tokens. Catches
+  // VLM responses like "Multi band Comp" (3 tokens) → "MultibandComp"
+  // and "Auto Filter" (2 tokens) → "AutoFilter". We try longest n-grams
+  // first since they're more specific.
+  const ngrams = [];
+  for (let n = Math.min(4, tokens.length); n >= 1; n--) {
+    for (let i = 0; i + n <= tokens.length; i++) {
+      ngrams.push(tokens.slice(i, i + n).join(""));
+    }
+  }
+  const baseCandidates = [
+    cleanedFull.replace(/[^A-Za-z0-9]/g, ""),
+    ...ngrams,
+    ...tokens
+  ];
+  const seen = new Set();
   const candidates = [];
   for (const c of baseCandidates) {
     if (!c) continue;
-    candidates.push(c);
+    if (!seen.has(c)) { seen.add(c); candidates.push(c); }
     const dc = deconfuse(c);
-    if (dc !== c) candidates.push(dc);
+    if (dc !== c && !seen.has(dc)) { seen.add(dc); candidates.push(dc); }
   }
   const matchOne = (s) => {
     if (!s) return null;
