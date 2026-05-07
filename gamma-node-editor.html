@@ -10535,6 +10535,200 @@ public:
     description: "3-band compressor. Splits at lowFreq + highFreq via Biquad LP/HP crossovers; each band has its own threshold / ratio / makeup. Useful for separately controlling bass body, midrange punch, and high-end air on a master bus or program material."
   },
 
+  /* UpwardComp — pulls *quiet* signals up toward threshold rather than
+   * pushing peaks down. Useful for raising sustain tails on a piano,
+   * thickening room ambience, lifting reverb decays, or "clarifying"
+   * vocals without squashing transients. Gain law in dB:
+   *   out_dB = thresh_dB - (thresh_dB - in_dB) / ratio   (when in < thresh)
+   *   out_dB = in_dB                                     (when in ≥ thresh)
+   * In linear amplitude that's gain = (thresh/env)^((ratio-1)/ratio).
+   * Capped at 50× (≈ 34 dB) so a near-zero env doesn't blow up. */
+  UpwardComp: {
+    category: "Effect", color: COLOR.effect, header: null,
+    extraHeaders: ["<cmath>"],
+    cppType: "GammaUpwardComp",
+    helperClass:
+`class GammaUpwardComp {
+    float env_ = 0.f;
+    float thresh_ = 0.1f;
+    float ratio_ = 2.f;
+    float makeup_ = 1.f;
+    float attackMs_ = 5.f, releaseMs_ = 80.f;
+    float ka_ = 1.f, kr_ = 1.f;
+    float sr_ = 48000.f;
+    static constexpr float maxGain_ = 50.f;
+    void recalc_() {
+        ka_ = 1.f - std::exp(-1.f / (attackMs_  * sr_ * 0.001f));
+        kr_ = 1.f - std::exp(-1.f / (releaseMs_ * sr_ * 0.001f));
+    }
+public:
+    GammaUpwardComp() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+        recalc_();
+    }
+    void setThreshold(float t) { thresh_ = (t < 0.001f) ? 0.001f : (t > 1.f ? 1.f : t); }
+    void setRatio(float r)     { ratio_ = (r < 1.f) ? 1.f : (r > 50.f ? 50.f : r); }
+    void setAttack(float ms)   { attackMs_ = (ms < 0.05f) ? 0.05f : ms; recalc_(); }
+    void setRelease(float ms)  { releaseMs_ = (ms < 1.f)  ? 1.f  : ms; recalc_(); }
+    void setMakeup(float m)    { makeup_ = (m < 0.f) ? 0.f : (m > 8.f ? 8.f : m); }
+    float operator()(float in) {
+        const float a = (in < 0.f) ? -in : in;
+        const float k = (a > env_) ? ka_ : kr_;
+        env_ += k * (a - env_);
+        float gain = 1.f;
+        if (env_ < thresh_ && env_ > 1e-6f) {
+            // Pull quiet signals up. exponent = (ratio-1)/ratio so at
+            // ratio=∞ this approaches gain = thresh/env (full upward
+            // limit), at ratio=1 it approaches 1× (no boost).
+            const float exponent = (ratio_ - 1.f) / ratio_;
+            gain = std::pow(thresh_ / env_, exponent);
+            if (gain > maxGain_) gain = maxGain_;
+        }
+        return in * gain * makeup_;
+    }
+};`,
+    ins: [
+      { n: "in",        t: "audio" },
+      { n: "threshold", t: "param" },
+      { n: "ratio",     t: "param" },
+      { n: "attack",    t: "param" },
+      { n: "release",   t: "param" },
+      { n: "makeup",    t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { threshold: 0.1, ratio: 2, attack: 5, release: 80, makeup: 1 },
+    methods: { threshold: "setThreshold", ratio: "setRatio", attack: "setAttack", release: "setRelease", makeup: "setMakeup" },
+    description: "Upward compressor — boosts quiet signals (env < threshold) toward the threshold by ratio. Above threshold the signal passes through unchanged. Boost is capped at 50× (~34 dB). Use for thickening sustain, raising tails, parallel-compression-style detail lift."
+  },
+
+  /* OTT — "Over The Top". 3-band parallel up+down compression with
+   * a single Depth knob, modeled on Xfer's plugin (a fixture in
+   * EDM/dubstep mastering and sound design). Each band runs through
+   * a downward compressor (squashes peaks at thresh ≥ ~0.5) followed
+   * by an upward compressor (lifts quiet tails at thresh ≤ ~0.1).
+   * The signature aggressive character comes from doing *both* on
+   * three independently-EQ'd bands at fast time constants.
+   *
+   * Depth (0..1) crossfades the entire wet processed signal against
+   * dry — it's the one knob the user actually rides. Per-band thresh
+   * up/down + per-band makeup let you sculpt the response; ratios
+   * are fixed internally at 3:1 (classic OTT) to keep the param
+   * count manageable. Crossover defaults match MultibandComp
+   * (200 Hz / 2 kHz). */
+  OTT: {
+    category: "Effect", color: COLOR.effect, header: "Filter",
+    extraHeaders: ["<cmath>"],
+    cppType: "GammaOTT",
+    helperClass:
+`class GammaOTT {
+    gam::Biquad<> lowLP_, midHP_, midLP_, highHP_;
+    float envD_[3] = { 0.f, 0.f, 0.f };
+    float envU_[3] = { 0.f, 0.f, 0.f };
+    float threshD_[3] = { 0.5f, 0.5f, 0.5f };
+    float threshU_[3] = { 0.1f, 0.1f, 0.1f };
+    float makeup_[3]  = { 1.f, 1.f, 1.f };
+    float depth_ = 1.f;
+    float ka_ = 1.f, kr_ = 1.f;
+    float sr_ = 48000.f;
+    static constexpr float ratioD_ = 3.f;
+    static constexpr float ratioU_ = 3.f;
+    static constexpr float upExp_  = (ratioU_ - 1.f) / ratioU_;
+    static constexpr float maxUpGain_ = 50.f;
+public:
+    GammaOTT() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+        lowLP_.type(gam::LOW_PASS);   lowLP_.freq(200.f);
+        midHP_.type(gam::HIGH_PASS);  midHP_.freq(200.f);
+        midLP_.type(gam::LOW_PASS);   midLP_.freq(2000.f);
+        highHP_.type(gam::HIGH_PASS); highHP_.freq(2000.f);
+        // Faster envelope than MultibandComp — OTT is supposed to grab
+        // transients aggressively (3 ms attack / 50 ms release).
+        ka_ = 1.f - std::exp(-1.f / (3.f  * sr_ * 0.001f));
+        kr_ = 1.f - std::exp(-1.f / (50.f * sr_ * 0.001f));
+    }
+    void setLowFreq(float f)      { lowLP_.freq(f); midHP_.freq(f); }
+    void setHighFreq(float f)     { midLP_.freq(f); highHP_.freq(f); }
+    void setDepth(float d)        { depth_ = (d < 0.f) ? 0.f : (d > 1.f ? 1.f : d); }
+    void setLowThreshD(float t)   { threshD_[0] = (t < 0.001f) ? 0.001f : (t > 1.f ? 1.f : t); }
+    void setMidThreshD(float t)   { threshD_[1] = (t < 0.001f) ? 0.001f : (t > 1.f ? 1.f : t); }
+    void setHighThreshD(float t)  { threshD_[2] = (t < 0.001f) ? 0.001f : (t > 1.f ? 1.f : t); }
+    void setLowThreshU(float t)   { threshU_[0] = (t < 0.001f) ? 0.001f : (t > 1.f ? 1.f : t); }
+    void setMidThreshU(float t)   { threshU_[1] = (t < 0.001f) ? 0.001f : (t > 1.f ? 1.f : t); }
+    void setHighThreshU(float t)  { threshU_[2] = (t < 0.001f) ? 0.001f : (t > 1.f ? 1.f : t); }
+    void setLowMakeup(float m)    { makeup_[0] = (m < 0.f) ? 0.f : (m > 8.f ? 8.f : m); }
+    void setMidMakeup(float m)    { makeup_[1] = (m < 0.f) ? 0.f : (m > 8.f ? 8.f : m); }
+    void setHighMakeup(float m)   { makeup_[2] = (m < 0.f) ? 0.f : (m > 8.f ? 8.f : m); }
+    float processBand_(int b, float bandIn) {
+        // Downward stage — env tracks |in|, gain reduces above thresh.
+        const float a = (bandIn < 0.f) ? -bandIn : bandIn;
+        const float k = (a > envD_[b]) ? ka_ : kr_;
+        envD_[b] += k * (a - envD_[b]);
+        float gainD = 1.f;
+        if (envD_[b] > threshD_[b]) {
+            const float reduced = threshD_[b] + (envD_[b] - threshD_[b]) / ratioD_;
+            gainD = reduced / envD_[b];
+        }
+        const float postDown = bandIn * gainD;
+        // Upward stage — env recomputed on the post-down signal so the
+        // upward thresh references the already-squashed level.
+        const float aU = (postDown < 0.f) ? -postDown : postDown;
+        const float kU = (aU > envU_[b]) ? ka_ : kr_;
+        envU_[b] += kU * (aU - envU_[b]);
+        float gainU = 1.f;
+        if (envU_[b] < threshU_[b] && envU_[b] > 1e-6f) {
+            gainU = std::pow(threshU_[b] / envU_[b], upExp_);
+            if (gainU > maxUpGain_) gainU = maxUpGain_;
+        }
+        return postDown * gainU * makeup_[b];
+    }
+    float operator()(float in) {
+        const float low   = lowLP_(in);
+        const float midHi = midHP_(in);
+        const float mid   = midLP_(midHi);
+        const float high  = highHP_(in);
+        const float wet =
+            processBand_(0, low) +
+            processBand_(1, mid) +
+            processBand_(2, high);
+        // Global dry/wet — depth=0 returns the original input untouched
+        // (perfect bypass), depth=1 returns full processed signal.
+        return in + depth_ * (wet - in);
+    }
+};`,
+    ins: [
+      { n: "in",         t: "audio" },
+      { n: "depth",      t: "param" },
+      { n: "lowFreq",    t: "param" },
+      { n: "highFreq",   t: "param" },
+      { n: "lowThreshD",  t: "param" },
+      { n: "midThreshD",  t: "param" },
+      { n: "highThreshD", t: "param" },
+      { n: "lowThreshU",  t: "param" },
+      { n: "midThreshU",  t: "param" },
+      { n: "highThreshU", t: "param" },
+      { n: "lowMakeup",  t: "param" },
+      { n: "midMakeup",  t: "param" },
+      { n: "highMakeup", t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: {
+      depth: 1, lowFreq: 200, highFreq: 2000,
+      lowThreshD: 0.5, midThreshD: 0.5, highThreshD: 0.5,
+      lowThreshU: 0.1, midThreshU: 0.1, highThreshU: 0.1,
+      lowMakeup: 1, midMakeup: 1, highMakeup: 1
+    },
+    methods: {
+      depth: "setDepth",
+      lowFreq: "setLowFreq", highFreq: "setHighFreq",
+      lowThreshD: "setLowThreshD", midThreshD: "setMidThreshD", highThreshD: "setHighThreshD",
+      lowThreshU: "setLowThreshU", midThreshU: "setMidThreshU", highThreshU: "setHighThreshU",
+      lowMakeup: "setLowMakeup",   midMakeup: "setMidMakeup",   highMakeup: "setHighMakeup"
+    },
+    description: "OTT-style 3-band parallel up+down compressor. Each band: downward comp (3:1) → upward comp (3:1). depth crossfades dry/wet (0=bypass, 1=full). threshD = downward threshold (squashes peaks), threshU = upward threshold (lifts tails). Aggressive program-material processor — drums, bass, full mixes."
+  },
+
   /* ---- Analysis (Analysis.h) ---- */
   EnvFollow: {
     category: "Analysis", color: COLOR.analysis, header: "Analysis",
