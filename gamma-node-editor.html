@@ -7609,7 +7609,7 @@ public:
       { n: "gate", t: "clock", access: ".gate" },
       { n: "trig", t: "clock", access: ".trig" }
     ],
-    params: { threshold: 0.05, attack: 5, release: 100, hold: 200, triggerSamples: [], matchThreshold: 0.85 },
+    params: { threshold: 0.05, attack: 5, release: 100, hold: 200, triggerSamples: [], matchThreshold: 0.85, detectMode: "envelope" },
     methods: {
       threshold: "setThreshold",
       attack:    "setAttack",
@@ -7619,10 +7619,10 @@ public:
     gateMethods: { match: "triggerFromJS" },
     hostGates: ["match"],
     autoExpose: ["threshold", "attack", "release", "hold"],
-    uiOnlyParams: ["triggerSamples", "matchThreshold"],
+    uiOnlyParams: ["triggerSamples", "matchThreshold", "detectMode"],
     kind: "keywordSpotter",
     extraHeaders: ["<cmath>"],
-    description: "Keyword / wake-word detection. Wire MicInput.out into in. Record 3–5 takes of the trigger word in the props pane. While preview is playing, the editor compares the live mic stream against your templates via amplitude-envelope shape matching; trig fires when a match exceeds matchThreshold (cosine similarity, default 0.85). env / gate behave like VoiceTrigger so this drops in as a strict superset."
+    description: "Keyword / wake-word detection. Wire MicInput.out into in. Record 3–5 takes of the trigger word in the props pane. detectMode picks the algorithm: 'envelope' = fast amplitude-envelope cosine similarity (no model, instant); 'whisper' = phoneme-level transcription via Whisper-tiny (~75 MB one-time download, English-only, more accurate). Hybrid mode runs both — envelope fires immediately, whisper confirms or rejects. trig fires through the `match` host gate."
   },
 
   /* ---- Noise (Noise.h) ----
@@ -12610,15 +12610,25 @@ function renderProps() {
         html += `<p class="prop-inline" style="opacity: 0.6; font-style: italic;">No recordings yet. Record 3–5 takes of the trigger word for best detection.</p>`;
       }
       html += `<button class="btn primary" id="btn-vt-record" style="width:100%;">⏺ Record trigger word (1.5 s)</button>`;
-      // KeywordSpotter-only: match-threshold slider + live status pill.
+      // KeywordSpotter-only: detect-mode dropdown + match-threshold
+      // slider + live status pill.
       if (isSpotter) {
         const mt = (typeof node.params.matchThreshold === "number") ? node.params.matchThreshold : 0.85;
+        const mode = (typeof node.params.detectMode === "string") ? node.params.detectMode : "envelope";
+        html += `<label class="prop-inline" style="display:flex; gap:8px; align-items:center; margin-top: 4px;">
+          <span style="opacity:0.7; min-width: 110px;">Detect mode</span>
+          <select id="ks-mode-${node.id}" style="flex:1; background: var(--surface-2); color: var(--text); border: 1px solid var(--border); padding: 4px 6px; border-radius: 3px; font-family: var(--font-mono); font-size: 11px;">
+            <option value="envelope"${mode === "envelope" ? " selected" : ""}>envelope · fast, no model</option>
+            <option value="whisper"${mode === "whisper" ? " selected" : ""}>whisper · phoneme-aware (~75 MB)</option>
+            <option value="hybrid"${mode === "hybrid" ? " selected" : ""}>hybrid · envelope + whisper confirm</option>
+          </select>
+        </label>`;
         html += `<label class="prop-inline" style="display:flex; gap:8px; align-items:center; margin-top: 4px;">
           <span style="opacity:0.7; min-width: 110px;">Match threshold</span>
           <input type="range" id="ks-thresh-${node.id}" min="0.5" max="0.99" step="0.01" value="${mt}" style="flex:1;" />
           <span id="ks-thresh-val-${node.id}" style="font-family:var(--font-mono); font-size:11px; color:var(--phosphor); width:42px; text-align:right;">${mt.toFixed(2)}</span>
         </label>`;
-        html += `<p class="prop-inline" style="opacity: 0.55; font-size: 10px; margin-top: 2px;">Cosine similarity threshold (0.5 lax · 0.99 strict). Higher = fewer false positives but may miss real utterances. Detection compares 16-point amplitude-envelope fingerprints; works best for short, distinct words.</p>`;
+        html += `<p class="prop-inline" style="opacity: 0.55; font-size: 10px; margin-top: 2px;">In <strong>envelope</strong> mode: cosine similarity of 16-point amplitude-envelope fingerprints (loudness-invariant; can't distinguish phonemes). In <strong>whisper</strong> mode: Whisper-tiny transcribes the live audio and the threshold becomes a fuzzy-string match score (1.0 = template fully contained in transcript). <strong>Hybrid</strong> uses envelope for the fast path and whisper as a confirm/cancel filter — best of both at the cost of model download.</p>`;
         const liveStatusId = `ks-status-${node.id}`;
         html += `<p class="prop-inline" id="${liveStatusId}" style="font-family:var(--font-mono); font-size:10px; color:var(--text-3); margin-top: 4px;">Detector: ${recs.length ? `${recs.length} template${recs.length===1?"":"s"} loaded · ` : ""}${(typeof previewState !== "undefined" && previewState.state === "playing") ? "running" : "idle (start preview to enable)"}</p>`;
       } else {
@@ -12795,6 +12805,24 @@ function renderProps() {
     });
     ksThresh.addEventListener('change', () => {
       pushHistory("ks-thresh:" + node.id);
+    });
+  }
+  // KeywordSpotter detect-mode dropdown — switching modes tears
+  // down the running detector and re-sets up so whisper templates
+  // get transcribed on the way in (or skipped on the way out).
+  const ksMode = propsEl.querySelector('#ks-mode-' + node.id);
+  if (ksMode) {
+    ksMode.addEventListener('change', () => {
+      pushHistory("ks-mode:" + node.id);
+      node.params.detectMode = ksMode.value;
+      // Restart the detector if it was running so the mode change
+      // takes effect immediately (without a full preview-stop/start).
+      if (typeof teardownKeywordSpotter === "function") teardownKeywordSpotter(node.id);
+      if (typeof setupKeywordSpotter === "function" &&
+          typeof previewState !== "undefined" && previewState.state === "playing") {
+        setupKeywordSpotter(node);
+      }
+      renderJson();
     });
   }
 
@@ -18194,6 +18222,53 @@ function _ksCosine(a, b) {
   return dot / denom;
 }
 
+/* Fuzzy transcript similarity — used in whisper / hybrid modes.
+ * Strips punctuation, lowercases. Returns 1 if the template
+ * (typically a short word) appears as a substring of the live
+ * transcript (best case for keyword spotting — user said the
+ * trigger word, possibly surrounded by other speech). Falls back
+ * to in-order word-overlap ratio for partial matches. */
+function _ksTranscriptMatch(live, template) {
+  const norm = s => (s || "").toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();
+  const L = norm(live);
+  const T = norm(template);
+  if (!L || !T) return 0;
+  if (L.includes(T)) return 1;
+  if (T.includes(L)) return Math.min(1, L.length / Math.max(1, T.length));
+  // In-order word overlap.
+  const tWords = T.split(" ");
+  const lWords = L.split(" ");
+  if (!tWords.length) return 0;
+  let matched = 0, li = 0;
+  for (const tw of tWords) {
+    while (li < lWords.length && lWords[li] !== tw) li++;
+    if (li < lWords.length) { matched++; li++; }
+  }
+  return matched / tWords.length;
+}
+
+/* Lazy-load the Whisper-tiny pipeline (the same instance the AI-
+ * prompt voice button uses, exposed via the `whisperPipeline`
+ * global at the top of that block). Kept async + serialized so a
+ * burst of KeywordSpotter setups doesn't trigger N parallel
+ * loads. */
+let _ksWhisperLoading = null;
+async function _ksEnsureWhisper() {
+  if (typeof whisperPipeline !== "undefined" && whisperPipeline) return whisperPipeline;
+  if (_ksWhisperLoading) return _ksWhisperLoading;
+  _ksWhisperLoading = (async () => {
+    const tx = await getTransformersJs();
+    // eslint-disable-next-line no-undef -- whisperPipeline is a top-level let in the AI section
+    whisperPipeline = await tx.pipeline("automatic-speech-recognition", "Xenova/whisper-tiny.en");
+    return whisperPipeline;
+  })();
+  try {
+    return await _ksWhisperLoading;
+  } finally {
+    _ksWhisperLoading = null;
+  }
+}
+
 /* Find the setter index for a KeywordSpotter's `match` host gate.
  * Returns -1 if not found (e.g., the patch wasn't compiled with
  * the spotter, or the setter table is stale). */
@@ -18210,19 +18285,51 @@ function _ksFindMatchSetterIndex(nodeId) {
 /* Stand up the detector for one KeywordSpotter node. Idempotent —
  * if a detector is already running for the node, it's torn down
  * and recreated (used when the user re-records or changes the
- * threshold). */
-function setupKeywordSpotter(node) {
+ * threshold or detect-mode). Async because the whisper / hybrid
+ * modes load the pipeline + transcribe templates upfront. */
+async function setupKeywordSpotter(node) {
   if (!node || node.type !== "KeywordSpotter") return;
   const recs = (node.params && node.params.triggerSamples) || [];
   if (!recs.length) return;
   if (!previewState.audioCtx || !_micStream) return;
   // Tear down any existing detector for this node first.
   teardownKeywordSpotter(node.id);
-  // Compute templates from each recording.
+  // Always compute envelope templates — used by 'envelope' mode
+  // directly and by 'hybrid' mode as the fast pre-filter.
   const templates = recs
     .filter(r => r && Array.isArray(r.data) && r.data.length > 0)
     .map(r => _ksComputeEnvelope(r.data, r.data.length));
   if (!templates.length) return;
+  const mode = (typeof node.params.detectMode === "string") ? node.params.detectMode : "envelope";
+  // For whisper / hybrid modes, transcribe each recording so we
+  // have a string template to match against the live transcript.
+  let templateTranscripts = null;
+  if (mode === "whisper" || mode === "hybrid") {
+    const statusEl = document.getElementById("ks-status-" + node.id);
+    if (statusEl) statusEl.textContent = "Detector: loading Whisper-tiny (one-time, ~75 MB)…";
+    try {
+      const wp = await _ksEnsureWhisper();
+      const validRecs = recs.filter(r => r && Array.isArray(r.data) && r.data.length > 0);
+      templateTranscripts = [];
+      for (let i = 0; i < validRecs.length; i++) {
+        if (statusEl) statusEl.textContent = `Detector: transcribing template ${i+1}/${validRecs.length}…`;
+        const audio = new Float32Array(validRecs[i].data);
+        try {
+          const out = await wp(audio);
+          const text = (out && out.text || "").trim();
+          templateTranscripts.push(text);
+        } catch (e) {
+          console.warn("[ks] template transcribe failed:", e);
+          templateTranscripts.push("");
+        }
+      }
+      console.info("[ks] node", node.id, "template transcripts:", templateTranscripts);
+    } catch (err) {
+      console.warn("[ks] whisper load failed, falling back to envelope:", err);
+      if (statusEl) statusEl.textContent = "Detector: Whisper load failed — using envelope mode.";
+      templateTranscripts = null;
+    }
+  }
   // Tap the mic into a ScriptProcessor so we can read live frames.
   const ctx = previewState.audioCtx;
   const PROC_BUF = 1024;
@@ -18233,6 +18340,8 @@ function setupKeywordSpotter(node) {
   const ringBuf = new Float32Array(bufferSamples);
   const state = {
     templates,
+    templateTranscripts,    // null in envelope mode; array of strings in whisper/hybrid
+    mode,                   // "envelope" | "whisper" | "hybrid"
     threshold: (typeof node.params.matchThreshold === "number") ? node.params.matchThreshold : 0.85,
     sampleRate: ctx.sampleRate,
     ringBuf,
@@ -18243,7 +18352,9 @@ function setupKeywordSpotter(node) {
     muteGain: null,
     intervalId: null,
     lastFireMs: 0,
-    fireSetterIndex: _ksFindMatchSetterIndex(node.id)
+    fireSetterIndex: _ksFindMatchSetterIndex(node.id),
+    transcribeInFlight: false,
+    lastTranscribeMs: 0
   };
   proc.onaudioprocess = (ev) => {
     const inBuf = ev.inputBuffer.getChannelData(0);
@@ -18264,47 +18375,128 @@ function setupKeywordSpotter(node) {
   // Run the comparison on a JS interval. Keep the work small —
   // 16-point envelope on a 1.5 s buffer + 16-element dot products
   // for each template + a few comparisons. Cheap.
-  state.intervalId = setInterval(() => {
-    // Read the rolling buffer in chronological order.
+  // Reusable: snapshot the rolling buffer in chronological order.
+  function _snapshotBuffer() {
     const frame = new Float32Array(state.bufferSamples);
     let r = state.writeIdx;
     for (let i = 0; i < state.bufferSamples; i++) {
       frame[i] = state.ringBuf[r];
       r = (r + 1) % state.bufferSamples;
     }
+    return frame;
+  }
+  // Reusable: dispatch the `match` host gate. Re-resolves the
+  // setter index lazily since the setter order can change between
+  // recompiles.
+  function _fireMatch(reason, scoreText, statusEl) {
+    const now = Date.now();
+    if (now - state.lastFireMs <= KS_COOLDOWN_MS) return false;
+    state.lastFireMs = now;
+    if (state.fireSetterIndex < 0) {
+      state.fireSetterIndex = _ksFindMatchSetterIndex(node.id);
+    }
+    if (state.fireSetterIndex >= 0 && previewState.workletNode) {
+      previewState.workletNode.port.postMessage({
+        type: "set",
+        index: state.fireSetterIndex,
+        value: 0
+      });
+    }
+    if (statusEl) {
+      statusEl.style.color = "var(--phosphor)";
+      statusEl.textContent = `▲ MATCH · ${reason} ${scoreText}`;
+      setTimeout(() => { if (statusEl) statusEl.style.color = ""; }, 400);
+    }
+    return true;
+  }
+  // Schedule a Whisper transcription on the current buffer if one
+  // isn't already in flight and the cadence (~600 ms) has elapsed.
+  // Returns immediately; the result drives _fireMatch via promise.
+  // Used by both 'whisper' (sole detector) and 'hybrid' (confirm).
+  function _maybeTranscribe(onResult) {
+    if (state.transcribeInFlight) return;
+    const now = Date.now();
+    if (now - state.lastTranscribeMs < 600) return;
+    state.lastTranscribeMs = now;
+    state.transcribeInFlight = true;
+    const frame = _snapshotBuffer();
+    Promise.resolve()
+      .then(() => whisperPipeline(frame))
+      .then((out) => {
+        const live = (out && out.text || "").trim();
+        let bestSim = 0;
+        if (state.templateTranscripts) {
+          for (const tt of state.templateTranscripts) {
+            const sim = _ksTranscriptMatch(live, tt);
+            if (sim > bestSim) bestSim = sim;
+          }
+        }
+        onResult(live, bestSim);
+      })
+      .catch((err) => { console.warn("[ks] transcribe error:", err); })
+      .finally(() => { state.transcribeInFlight = false; });
+  }
+  state.intervalId = setInterval(() => {
+    const statusEl = document.getElementById("ks-status-" + node.id);
+    // Always compute the envelope similarity — needed for 'envelope'
+    // and 'hybrid' modes, and useful as a status readout in
+    // 'whisper' mode too.
+    const frame = _snapshotBuffer();
     const liveEnv = _ksComputeEnvelope(frame, frame.length);
-    let bestSim = -1;
+    let bestEnv = -1;
     for (let i = 0; i < state.templates.length; i++) {
       const sim = _ksCosine(liveEnv, state.templates[i]);
-      if (sim > bestSim) bestSim = sim;
+      if (sim > bestEnv) bestEnv = sim;
     }
-    // Update the live status pill in the props pane (if visible).
-    const statusEl = document.getElementById("ks-status-" + node.id);
-    if (statusEl) {
-      statusEl.textContent =
-        `Detector: ${state.templates.length} templates · best similarity ${bestSim.toFixed(2)} / threshold ${state.threshold.toFixed(2)}`;
-    }
-    if (bestSim > state.threshold) {
-      const now = Date.now();
-      if (now - state.lastFireMs > KS_COOLDOWN_MS) {
-        state.lastFireMs = now;
-        // Re-resolve the setter index in case the patch was
-        // recompiled since we set up (setter ordering can change).
-        if (state.fireSetterIndex < 0) {
-          state.fireSetterIndex = _ksFindMatchSetterIndex(node.id);
-        }
-        if (state.fireSetterIndex >= 0 && previewState.workletNode) {
-          previewState.workletNode.port.postMessage({
-            type: "set",
-            index: state.fireSetterIndex,
-            value: 0
-          });
-        }
+    if (state.mode === "envelope") {
+      if (statusEl) {
+        statusEl.textContent =
+          `Detector [env]: ${state.templates.length} templates · best ${bestEnv.toFixed(2)} / threshold ${state.threshold.toFixed(2)}`;
+      }
+      if (bestEnv > state.threshold) {
+        _fireMatch("envelope", `· similarity ${bestEnv.toFixed(2)}`, statusEl);
+      }
+    } else if (state.mode === "whisper") {
+      // Pure whisper mode — fire only on transcript match.
+      if (statusEl && !state.transcribeInFlight) {
+        statusEl.textContent =
+          `Detector [whisper]: ${state.templates.length} templates · listening… (env ${bestEnv.toFixed(2)} unused) / threshold ${state.threshold.toFixed(2)}`;
+      }
+      _maybeTranscribe((live, bestSim) => {
         if (statusEl) {
-          statusEl.style.color = "var(--phosphor)";
-          statusEl.textContent = `▲ MATCH · similarity ${bestSim.toFixed(2)}`;
-          setTimeout(() => { if (statusEl) statusEl.style.color = ""; }, 400);
+          statusEl.textContent =
+            `Detector [whisper]: heard "${(live || "—").slice(0, 40)}" · match ${bestSim.toFixed(2)} / threshold ${state.threshold.toFixed(2)}`;
         }
+        if (bestSim > state.threshold) {
+          _fireMatch("whisper", `· "${(live || "").slice(0, 30)}" match ${bestSim.toFixed(2)}`, statusEl);
+        }
+      });
+    } else if (state.mode === "hybrid") {
+      // Hybrid: envelope is the fast trigger, whisper is the
+      // confirm/cancel filter. Logic — fire only when envelope
+      // suggests a candidate AND whisper agrees within a recent
+      // window. We keep a "pending envelope hit" state and let
+      // the whisper pass either upgrade it to a fire or drop it.
+      const envHot = bestEnv > state.threshold;
+      const ENV_HOT_TTL_MS = 800;   // how long after envelope-hot the whisper pass has to confirm
+      const now = Date.now();
+      if (envHot) state.envHotUntilMs = now + ENV_HOT_TTL_MS;
+      const stillHot = state.envHotUntilMs && now < state.envHotUntilMs;
+      if (statusEl && !state.transcribeInFlight) {
+        statusEl.textContent =
+          `Detector [hybrid]: env ${bestEnv.toFixed(2)} ${stillHot ? "· hot — awaiting whisper confirm" : ""} / threshold ${state.threshold.toFixed(2)}`;
+      }
+      if (stillHot) {
+        _maybeTranscribe((live, bestSim) => {
+          if (statusEl) {
+            statusEl.textContent =
+              `Detector [hybrid]: env ${bestEnv.toFixed(2)} · whisper "${(live || "—").slice(0, 30)}" match ${bestSim.toFixed(2)}`;
+          }
+          if (bestSim > state.threshold) {
+            _fireMatch("hybrid", `· env ${bestEnv.toFixed(2)} + whisper ${bestSim.toFixed(2)}`, statusEl);
+            state.envHotUntilMs = 0;
+          }
+        });
       }
     }
   }, KS_DETECT_INTERVAL_MS);
@@ -18329,30 +18521,53 @@ function teardownAllKeywordSpotters() {
 }
 
 /* Re-prime templates for a single node. Called from the props
- * pane when the user adds or deletes a recording. If the node
- * isn't currently running (no preview), this is a no-op — the
- * fresh templates will be computed at next preview start. */
-function refreshKeywordSpotterTemplates(nodeId) {
+ * pane when the user adds or deletes a recording or moves the
+ * threshold slider. If the node isn't currently running (no
+ * preview), this is a no-op — the fresh templates will be
+ * computed at next preview start. Re-transcribes templates if
+ * the detector is in whisper / hybrid mode. */
+async function refreshKeywordSpotterTemplates(nodeId) {
   if (!_ksDetectors.has(nodeId)) return;
   const node = nodeById(nodeId);
   if (!node) { teardownKeywordSpotter(nodeId); return; }
   const recs = (node.params && node.params.triggerSamples) || [];
   if (!recs.length) { teardownKeywordSpotter(nodeId); return; }
-  // Recompute templates + threshold; reuse the existing audio graph.
   const s = _ksDetectors.get(nodeId);
   s.templates = recs
     .filter(r => r && Array.isArray(r.data) && r.data.length > 0)
     .map(r => _ksComputeEnvelope(r.data, r.data.length));
   s.threshold = (typeof node.params.matchThreshold === "number") ? node.params.matchThreshold : 0.85;
+  // Whisper / hybrid: re-transcribe templates if the recording
+  // set changed. Threshold-only updates skip this since they
+  // don't affect the templates themselves.
+  if ((s.mode === "whisper" || s.mode === "hybrid") && typeof whisperPipeline !== "undefined" && whisperPipeline) {
+    const validRecs = recs.filter(r => r && Array.isArray(r.data) && r.data.length > 0);
+    const next = [];
+    for (const r of validRecs) {
+      try {
+        const audio = new Float32Array(r.data);
+        const out = await whisperPipeline(audio);
+        next.push((out && out.text || "").trim());
+      } catch (e) {
+        next.push("");
+      }
+    }
+    s.templateTranscripts = next;
+    console.info("[ks] refreshed transcripts for", nodeId, ":", next);
+  }
 }
 
 /* Stand up detectors for every KeywordSpotter in the current
  * patch. Called from the preview-start path after the mic stream
- * is hooked up. */
-function setupAllKeywordSpotters() {
-  state.nodes.forEach(n => {
-    if (n.type === "KeywordSpotter") setupKeywordSpotter(n);
-  });
+ * is hooked up. Async since whisper-mode setup loads the
+ * pipeline + transcribes templates upfront. */
+async function setupAllKeywordSpotters() {
+  for (const n of state.nodes) {
+    if (n.type === "KeywordSpotter") {
+      try { await setupKeywordSpotter(n); }
+      catch (e) { console.warn("[ks] setup failed for", n.id, e); }
+    }
+  }
 }
 
 function showCompileStderr(stderr, errMsg) {
