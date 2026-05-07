@@ -16363,16 +16363,12 @@ function strokesToPng(box, strokes) {
 /* Unified vision call — uses whichever provider is selected. The provider's
  * own call() handles image input via its supportsImage path. */
 async function callVision(pngBase64, key) {
-  // Show only the most-relevant subset of node types in the prompt to
-  // keep the model focused. Full registry has 100+ entries and confuses
-  // a small model; the popular set covers ~95% of demo use.
-  const popular = [
-    "Sine","Saw","Square","Triangle","Impulse","LFO","Noise","NoiseWhite","NoiseBrown",
-    "AD","ADSR","AHD","Mul","Add","Sub","Div","Output","OutputStereo",
-    "Biquad","BiquadLP","BiquadHP","BiquadBP","StateVariableFilter","MoogLadder",
-    "Delay","Delay1","Reverb","BlockAvg","Pan2","KeyboardIn"
-  ].filter(n => n in TYPES);
-  const nodeList = popular.join(", ");
+  // List the live registry directly so the prompt stays in sync with the
+  // actual TYPES — earlier this was a hardcoded "popular" subset of ~30
+  // names, which silently rejected every node added afterward (LFO,
+  // Impulse, the dynamics batch, automation lanes, etc.). The full list
+  // is ~190 short names; both Gemma 4 and Claude handle it fine.
+  const nodeList = Object.keys(TYPES).sort().join(", ");
   const sys =
 `You read a single short word handwritten on a small canvas (white background, black ink) and reply with the closest matching Gamma DSP node name. Output rules:
 - Reply with EXACTLY ONE node name from this allowed list, nothing else.
@@ -16502,9 +16498,24 @@ function tryCreateFromLabel(rawLabel, box, silent) {
     .split(/\s+/)
     .map(t => t.replace(/[^A-Za-z0-9]/g, ""))
     .filter(t => t.length > 0 && !STOP.has(t.toLowerCase()));
-  // Candidate strings to try, in priority order: full-cleaned, each token,
-  // longest token last (better than shortest if longer is more specific).
-  const candidates = [cleanedFull.replace(/[^A-Za-z0-9]/g, ""), ...tokens];
+  // OCR commonly swaps look-alike glyphs in short uppercase words —
+  // e.g. "LFO" → "LF0", "Impulse" → "1mpu1se", "Saw" → "5aw". Generate
+  // an additional candidate for each token with digits replaced by their
+  // letter twin. Done as extra candidates (not a replacement) so genuine
+  // digit-bearing names like "Delay1" still match.
+  const deconfuse = (s) => s
+    .replace(/0/g, "O")
+    .replace(/1/g, "I")
+    .replace(/5/g, "S")
+    .replace(/8/g, "B");
+  const baseCandidates = [cleanedFull.replace(/[^A-Za-z0-9]/g, ""), ...tokens];
+  const candidates = [];
+  for (const c of baseCandidates) {
+    if (!c) continue;
+    candidates.push(c);
+    const dc = deconfuse(c);
+    if (dc !== c) candidates.push(dc);
+  }
   const matchOne = (s) => {
     if (!s) return null;
     const lc = s.toLowerCase();
@@ -16518,13 +16529,18 @@ function tryCreateFromLabel(rawLabel, box, silent) {
     match = matchOne(c);
     if (match) break;
   }
-  // Fuzzy fallback — Levenshtein distance ≤ ceil(len/4) handles OCR
-  // character errors on longer names like "KeyboardIn" → "Keybcardia".
+  // Fuzzy fallback — Levenshtein distance ≤ ceil(len/3) handles OCR
+  // character errors on names of any length. Threshold lowered from 4 to
+  // 3 chars so short uppercase names ("LFO", "AHD", "FFT") still get a
+  // fuzzy chance after deconfusing fails.
   if (!match) {
     const longest = candidates.filter(Boolean).sort((a, b) => b.length - a.length)[0];
-    if (longest && longest.length >= 4) {
+    if (longest && longest.length >= 3) {
       const lc = longest.toLowerCase();
-      const tol = Math.max(1, Math.ceil(lc.length / 4));
+      // ceil(len/3) gives 1 for 3-char names (one OCR slip allowed),
+      // 2 for 4–6 chars, 3 for 7–9, etc. Tighter than the old /4 ratio
+      // for medium-length names without becoming permissive on shorts.
+      const tol = Math.max(1, Math.ceil(lc.length / 3));
       let best = null, bestDist = tol + 1;
       for (const t of types) {
         const tl = t.toLowerCase();
