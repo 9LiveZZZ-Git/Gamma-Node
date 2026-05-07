@@ -5999,7 +5999,9 @@ const COLOR = {
   sample:     "#4a8fdc",
   convert:    "#6dc5b5",
   math:       "#888780",
-  sink:       "#3a3d44"
+  sink:       "#3a3d44",
+  visual:     "#1f3a4a"     /* Phase 6 — visual nodes (sinks today,
+                               shader-frag/vert/compute starting 6.4.x) */
 };
 
 const TYPES = {
@@ -11827,6 +11829,29 @@ public:
     outs: [],
     params: {},
     description: "Stereo output (operator() returns std::pair<float,float>)"
+  },
+
+  /* Phase 6.1.7 — visual sink. Like Output / OutputStereo for the
+   * audio side, this is the entry point for the visual layer's
+   * render pipeline. cppType is empty + the node name isn't
+   * Output/OutputStereo, so the existing audio codegen ignores it
+   * naturally — it's only reachable from texture-typed wires which
+   * carry zero audio dependencies.
+   *
+   * Today the visual canvas already runs a smoke-clear render loop
+   * regardless of whether VisualOutput exists in the graph. Once
+   * shader nodes ship in 6.4.x, the render loop will walk the graph
+   * from VisualOutput backward and chain shader passes into the
+   * framebuffer; until then, dropping VisualOutput is a documentation
+   * placeholder + a pre-wired socket for the first user-controllable
+   * texture wire (which arrives with the first shader node). */
+  VisualOutput: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    ins: [{ n: "in", t: "texture" }],
+    outs: [],
+    params: {},
+    description: "Visual sink — wire a texture into in to drive the visual layer (the WebGPU canvas behind the editor). Press L (or click ◐) to enter Live Mode and see the result fullscreen. Until shader nodes ship the visual layer renders a smoke-clear; the wire is a no-op but the socket reserves the connection."
   },
 
   /* ---- B1: Math, single-arg trig (cmath) ---- */
@@ -18579,6 +18604,10 @@ async function ensureGPUDevice() {
       _allocateFramebuffer();
       _rebuildBlitBindGroup();
       smokeClearVisual();
+      // Phase 6.1.7 — kick off the rAF render loop. From this point
+      // on the visual canvas refreshes every frame; the fps pill in
+      // the visual HUD goes from "— fps" to a live readout.
+      startVisualRenderLoop();
     }
 
     Visual.available = true;
@@ -18901,6 +18930,67 @@ function smokeClearVisual() {
   blit.end();
 
   Visual.device.queue.submit([enc.finish()]);
+}
+
+/* ----- Phase 6.1.7 — render loop (rAF) -------------------------------- */
+
+/* The visual render loop. Starts when the WebGPU device is ready and
+ * runs continuously at the browser's rAF cadence (60 fps on most
+ * displays, 120 on ProMotion / 144Hz panels). Each tick:
+ *   1. Update the fps EMA + readout pill (6.1.5 plumbed this — the
+ *      "— fps" placeholder finally goes live).
+ *   2. If Visual.frozen is true (freeze button toggled), skip the
+ *      render but keep ticking fps so the user can see the loop is
+ *      still alive.
+ *   3. Otherwise call renderVisualFrame() — currently smokeClearVisual,
+ *      which clears FBO + blits to canvas. Will evolve in 6.4.x to
+ *      walk the graph from VisualOutput backward, chaining shader
+ *      passes into the FBO before the final blit.
+ *
+ * The loop runs unconditionally once the device is ready, regardless
+ * of whether VisualOutput exists in the patch. Reasons:
+ *   - The fps readout stays informative (you can see the GPU is alive
+ *     even with no visual content yet).
+ *   - Window-resize / DPR-change re-renders happen automatically on
+ *     the next frame.
+ *   - The cost is one render-pass-clear + one fullscreen-triangle
+ *     blit per frame ≈ ~0.1ms on integrated GPUs; well under budget.
+ *   - Future tickets that animate even without VisualOutput (test
+ *     pattern, idle backdrop) get the loop for free.
+ *
+ * Stops on device loss; ensureGPUDevice's lost-handler nulls
+ * Visual.device, the next tick sees it and bails out without
+ * re-arming rAF — loop terminates cleanly. */
+let _visualRafHandle = null;
+
+function renderVisualFrame() {
+  // Today this is the smoke-clear path. 6.4.x will replace it with a
+  // graph-walk that renders shader nodes into the framebuffer.
+  smokeClearVisual();
+}
+
+function _visualRenderTick(t) {
+  // Bail if the device went away (loss handler in ensureGPUDevice
+  // sets Visual.device = null). Don't re-arm rAF in that case —
+  // a fresh ensureGPUDevice() call will restart the loop.
+  if (!Visual.device) {
+    _visualRafHandle = null;
+    return;
+  }
+  _tickFpsReadout(t);
+  if (!Visual.frozen) renderVisualFrame();
+  _visualRafHandle = requestAnimationFrame(_visualRenderTick);
+}
+
+function startVisualRenderLoop() {
+  if (_visualRafHandle != null) return;
+  _visualRafHandle = requestAnimationFrame(_visualRenderTick);
+}
+function stopVisualRenderLoop() {
+  if (_visualRafHandle != null) {
+    cancelAnimationFrame(_visualRafHandle);
+    _visualRafHandle = null;
+  }
 }
 
 /* =========================================================================
