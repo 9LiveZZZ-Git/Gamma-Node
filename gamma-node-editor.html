@@ -10056,6 +10056,485 @@ public:
     description: "Diode-style soft clip via signed exponential softening. sign(x)·(1−e^−|x|) — smoother knee than tanh, bites harder at high drive. Use as a softer alternative to SoftClip for guitar / drums / anywhere you want grit without harsh top-end."
   },
 
+  /* ---- Dynamics ----
+   * Seven nodes that share the same shape: a single-pole envelope
+   * detector (peak-style |in| → smoothed env via attack / release
+   * coefficients) feeds a gain computer that produces a per-sample
+   * gain factor based on threshold, ratio, and various extra
+   * params. Each node bakes in its own gain-computer law:
+   *   • Compressor — gain = (thresh + (env-thresh)/ratio) / env when env > thresh
+   *   • Limiter    — brick wall: gain = thresh / env when env > thresh
+   *   • Expander   — gain = (env/thresh)^(ratio-1) when env < thresh
+   *   • NoiseGate  — hysteresis gate: open / hold / close with
+   *                  separate attack/release on the gain envelope
+   *   • Sidechain  — Compressor with the envelope reading from a
+   *                  key input instead of in
+   *   • Ducker     — Sidechain with a single `reduction` amount
+   *                  (no ratio knob — fixed attenuation when key
+   *                  exceeds threshold)
+   *   • MultibandComp — three crossover-split bands, three
+   *                  independent compressors, summed back. */
+
+  Compressor: {
+    category: "Effect", color: COLOR.effect, header: null,
+    extraHeaders: ["<cmath>"],
+    cppType: "GammaCompressor",
+    helperClass:
+`class GammaCompressor {
+    /* Linear-amplitude compressor — env tracks |in| via a one-pole
+     * smoother (attack on rise, release on fall). When env exceeds
+     * threshold, the excess is reduced by ratio. Soft-knee math
+     * skipped for compactness; the per-sample cost is one abs +
+     * one compare + one divide on the gain path. makeup is a
+     * post-gain multiplier the user dials in to compensate for
+     * the dB lost to compression. */
+    float env_ = 0.f;
+    float thresh_ = 0.5f;
+    float ratio_ = 4.f;
+    float makeup_ = 1.f;
+    float attackMs_ = 5.f, releaseMs_ = 80.f;
+    float ka_ = 1.f, kr_ = 1.f;
+    float sr_ = 48000.f;
+    void recalc_() {
+        ka_ = 1.f - std::exp(-1.f / (attackMs_  * sr_ * 0.001f));
+        kr_ = 1.f - std::exp(-1.f / (releaseMs_ * sr_ * 0.001f));
+    }
+public:
+    GammaCompressor() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+        recalc_();
+    }
+    void setThreshold(float t) { thresh_ = (t < 0.001f) ? 0.001f : (t > 1.f ? 1.f : t); }
+    void setRatio(float r)     { ratio_ = (r < 1.f) ? 1.f : (r > 50.f ? 50.f : r); }
+    void setAttack(float ms)   { attackMs_ = (ms < 0.05f) ? 0.05f : ms; recalc_(); }
+    void setRelease(float ms)  { releaseMs_ = (ms < 1.f)  ? 1.f  : ms; recalc_(); }
+    void setMakeup(float m)    { makeup_ = (m < 0.f) ? 0.f : (m > 8.f ? 8.f : m); }
+    float operator()(float in) {
+        const float a = (in < 0.f) ? -in : in;
+        const float k = (a > env_) ? ka_ : kr_;
+        env_ += k * (a - env_);
+        float gain = 1.f;
+        if (env_ > thresh_) {
+            const float reduced = thresh_ + (env_ - thresh_) / ratio_;
+            gain = reduced / env_;
+        }
+        return in * gain * makeup_;
+    }
+};`,
+    ins: [
+      { n: "in",        t: "audio" },
+      { n: "threshold", t: "param" },
+      { n: "ratio",     t: "param" },
+      { n: "attack",    t: "param" },
+      { n: "release",   t: "param" },
+      { n: "makeup",    t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { threshold: 0.5, ratio: 4, attack: 5, release: 80, makeup: 1 },
+    methods: { threshold: "setThreshold", ratio: "setRatio", attack: "setAttack", release: "setRelease", makeup: "setMakeup" },
+    description: "Linear-amplitude compressor. threshold ∈ [0,1] (peak amplitude), ratio ≥ 1, attack/release in ms, makeup is post-gain. Above threshold, gain = (thresh + (env−thresh)/ratio)/env."
+  },
+
+  /* Limiter — brick-wall variant with very fast attack. Same
+   * envelope detector + gain computer as Compressor but the
+   * gain law is just (thresh / env) above threshold (effective
+   * ratio = ∞:1). No lookahead — that would need a delay line
+   * and two-pass compute; quality preview-grade limiting.
+   * Default attack 1 ms, release 50 ms. */
+  Limiter: {
+    category: "Effect", color: COLOR.effect, header: null,
+    extraHeaders: ["<cmath>"],
+    cppType: "GammaLimiter",
+    helperClass:
+`class GammaLimiter {
+    float env_ = 0.f;
+    float thresh_ = 0.95f;
+    float attackMs_ = 1.f, releaseMs_ = 50.f;
+    float ka_ = 1.f, kr_ = 1.f;
+    float sr_ = 48000.f;
+    void recalc_() {
+        ka_ = 1.f - std::exp(-1.f / (attackMs_  * sr_ * 0.001f));
+        kr_ = 1.f - std::exp(-1.f / (releaseMs_ * sr_ * 0.001f));
+    }
+public:
+    GammaLimiter() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+        recalc_();
+    }
+    void setThreshold(float t) { thresh_ = (t < 0.001f) ? 0.001f : (t > 1.f ? 1.f : t); }
+    void setAttack(float ms)   { attackMs_ = (ms < 0.05f) ? 0.05f : ms; recalc_(); }
+    void setRelease(float ms)  { releaseMs_ = (ms < 1.f)  ? 1.f  : ms; recalc_(); }
+    float operator()(float in) {
+        const float a = (in < 0.f) ? -in : in;
+        const float k = (a > env_) ? ka_ : kr_;
+        env_ += k * (a - env_);
+        const float gain = (env_ > thresh_) ? (thresh_ / env_) : 1.f;
+        return in * gain;
+    }
+};`,
+    ins: [
+      { n: "in",        t: "audio" },
+      { n: "threshold", t: "param" },
+      { n: "attack",    t: "param" },
+      { n: "release",   t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { threshold: 0.95, attack: 1, release: 50 },
+    methods: { threshold: "setThreshold", attack: "setAttack", release: "setRelease" },
+    description: "Brick-wall peak limiter. ∞:1 ratio above threshold, fast attack (default 1 ms). Use on the master bus to catch overshoots without affecting the body of the signal. No lookahead — overshoots within one envelope-attack period may slip through."
+  },
+
+  /* Expander — inverse compressor. Below threshold, gain falls
+   * off as `(env/thresh)^(ratio-1)`. ratio=1 → bypass. ratio→∞
+   * approaches a hard gate (use NoiseGate for that explicit
+   * shape). Useful for cleaning up the noise floor on quiet
+   * passages without abrupt gating. */
+  Expander: {
+    category: "Effect", color: COLOR.effect, header: null,
+    extraHeaders: ["<cmath>"],
+    cppType: "GammaExpander",
+    helperClass:
+`class GammaExpander {
+    float env_ = 0.f;
+    float thresh_ = 0.1f;
+    float ratio_ = 2.f;
+    float attackMs_ = 5.f, releaseMs_ = 80.f;
+    float ka_ = 1.f, kr_ = 1.f;
+    float sr_ = 48000.f;
+    void recalc_() {
+        ka_ = 1.f - std::exp(-1.f / (attackMs_  * sr_ * 0.001f));
+        kr_ = 1.f - std::exp(-1.f / (releaseMs_ * sr_ * 0.001f));
+    }
+public:
+    GammaExpander() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+        recalc_();
+    }
+    void setThreshold(float t) { thresh_ = (t < 0.001f) ? 0.001f : (t > 1.f ? 1.f : t); }
+    void setRatio(float r)     { ratio_ = (r < 1.f) ? 1.f : (r > 50.f ? 50.f : r); }
+    void setAttack(float ms)   { attackMs_ = (ms < 0.05f) ? 0.05f : ms; recalc_(); }
+    void setRelease(float ms)  { releaseMs_ = (ms < 1.f)  ? 1.f  : ms; recalc_(); }
+    float operator()(float in) {
+        const float a = (in < 0.f) ? -in : in;
+        const float k = (a > env_) ? ka_ : kr_;
+        env_ += k * (a - env_);
+        float gain = 1.f;
+        if (env_ < thresh_) {
+            const float ratioBelow = env_ / thresh_;
+            gain = std::pow((ratioBelow > 0.f) ? ratioBelow : 0.f, ratio_ - 1.f);
+        }
+        return in * gain;
+    }
+};`,
+    ins: [
+      { n: "in",        t: "audio" },
+      { n: "threshold", t: "param" },
+      { n: "ratio",     t: "param" },
+      { n: "attack",    t: "param" },
+      { n: "release",   t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { threshold: 0.1, ratio: 2, attack: 5, release: 80 },
+    methods: { threshold: "setThreshold", ratio: "setRatio", attack: "setAttack", release: "setRelease" },
+    description: "Downward expander — below threshold the signal is attenuated by the ratio. Smoother than NoiseGate (no hysteresis hard switching). Useful for low-noise tails and quiet passages."
+  },
+
+  /* NoiseGate — hard gate with hysteresis (open and close at
+   * different thresholds so the gate doesn't chatter on
+   * transients near the threshold) and configurable hold time
+   * (gate stays open `hold` ms after the signal falls below
+   * close-threshold, so quick gaps in speech don't chop the
+   * tail). The gain itself is smoothed via attack/release so
+   * there's no clicking on transitions. */
+  NoiseGate: {
+    category: "Effect", color: COLOR.effect, header: null,
+    extraHeaders: ["<cmath>"],
+    cppType: "GammaNoiseGate",
+    helperClass:
+`class GammaNoiseGate {
+    float env_ = 0.f;
+    float openThresh_ = 0.1f;
+    float closeThresh_ = 0.07f;     // 70% of open — hysteresis
+    float gain_ = 0.f;              // current smoothed gain
+    float attackMs_ = 1.f, releaseMs_ = 100.f;
+    float holdMs_ = 50.f;
+    int   holdSamples_ = 0;
+    bool  open_ = false;
+    float ka_ = 1.f, kr_ = 1.f;
+    float kaEnv_ = 1.f, krEnv_ = 1.f;
+    float sr_ = 48000.f;
+    void recalc_() {
+        ka_   = 1.f - std::exp(-1.f / (attackMs_  * sr_ * 0.001f));
+        kr_   = 1.f - std::exp(-1.f / (releaseMs_ * sr_ * 0.001f));
+        kaEnv_ = 1.f - std::exp(-1.f / (3.f  * sr_ * 0.001f));   // 3ms env attack
+        krEnv_ = 1.f - std::exp(-1.f / (30.f * sr_ * 0.001f));   // 30ms env release
+    }
+public:
+    GammaNoiseGate() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+        recalc_();
+    }
+    void setThreshold(float t) {
+        openThresh_  = (t < 0.001f) ? 0.001f : (t > 1.f ? 1.f : t);
+        closeThresh_ = openThresh_ * 0.7f;     // 30% hysteresis
+    }
+    void setAttack(float ms)  { attackMs_ = (ms < 0.05f) ? 0.05f : ms; recalc_(); }
+    void setRelease(float ms) { releaseMs_ = (ms < 1.f)  ? 1.f  : ms; recalc_(); }
+    void setHold(float ms)    { holdMs_ = (ms < 0.f) ? 0.f : ms; }
+    float operator()(float in) {
+        const float a = (in < 0.f) ? -in : in;
+        const float kE = (a > env_) ? kaEnv_ : krEnv_;
+        env_ += kE * (a - env_);
+        // Hysteresis state machine
+        if (open_) {
+            if (env_ < closeThresh_) {
+                if (holdSamples_ > 0) holdSamples_--;
+                else open_ = false;
+            } else {
+                holdSamples_ = (int)(holdMs_ * sr_ * 0.001f);
+            }
+        } else if (env_ > openThresh_) {
+            open_ = true;
+            holdSamples_ = (int)(holdMs_ * sr_ * 0.001f);
+        }
+        // Smooth target gain so transitions don't click
+        const float target = open_ ? 1.f : 0.f;
+        const float k = (target > gain_) ? ka_ : kr_;
+        gain_ += k * (target - gain_);
+        return in * gain_;
+    }
+};`,
+    ins: [
+      { n: "in",        t: "audio" },
+      { n: "threshold", t: "param" },
+      { n: "attack",    t: "param" },
+      { n: "release",   t: "param" },
+      { n: "hold",      t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { threshold: 0.1, attack: 1, release: 100, hold: 50 },
+    methods: { threshold: "setThreshold", attack: "setAttack", release: "setRelease", hold: "setHold" },
+    description: "Hard gate with hysteresis. Opens at threshold, closes at 70% of threshold (no chatter). hold = how long the gate stays open after the signal drops; attack/release smooth the gain transitions. Use on mics to remove room tone between phrases."
+  },
+
+  /* Sidechain — Compressor with a separate key input. Wire
+   * audio you want compressed into `in`, the trigger signal
+   * (e.g. kick drum bus) into `key`. The detector reads from
+   * key, the gain is applied to in. Same gain-computer law as
+   * Compressor; just a different signal goes into the
+   * envelope detector. */
+  Sidechain: {
+    category: "Effect", color: COLOR.effect, header: null,
+    extraHeaders: ["<cmath>"],
+    cppType: "GammaSidechain",
+    helperClass:
+`class GammaSidechain {
+    float env_ = 0.f, key_ = 0.f;
+    float thresh_ = 0.4f, ratio_ = 4.f, makeup_ = 1.f;
+    float attackMs_ = 5.f, releaseMs_ = 80.f;
+    float ka_ = 1.f, kr_ = 1.f;
+    float sr_ = 48000.f;
+    void recalc_() {
+        ka_ = 1.f - std::exp(-1.f / (attackMs_  * sr_ * 0.001f));
+        kr_ = 1.f - std::exp(-1.f / (releaseMs_ * sr_ * 0.001f));
+    }
+public:
+    GammaSidechain() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+        recalc_();
+    }
+    void setKey(float v)       { key_ = v; }
+    void setThreshold(float t) { thresh_ = (t < 0.001f) ? 0.001f : (t > 1.f ? 1.f : t); }
+    void setRatio(float r)     { ratio_ = (r < 1.f) ? 1.f : (r > 50.f ? 50.f : r); }
+    void setAttack(float ms)   { attackMs_ = (ms < 0.05f) ? 0.05f : ms; recalc_(); }
+    void setRelease(float ms)  { releaseMs_ = (ms < 1.f)  ? 1.f  : ms; recalc_(); }
+    void setMakeup(float m)    { makeup_ = (m < 0.f) ? 0.f : (m > 8.f ? 8.f : m); }
+    float operator()(float in) {
+        // Envelope tracks the key input, NOT in.
+        const float a = (key_ < 0.f) ? -key_ : key_;
+        const float k = (a > env_) ? ka_ : kr_;
+        env_ += k * (a - env_);
+        float gain = 1.f;
+        if (env_ > thresh_) {
+            const float reduced = thresh_ + (env_ - thresh_) / ratio_;
+            gain = reduced / env_;
+        }
+        return in * gain * makeup_;
+    }
+};`,
+    ins: [
+      { n: "in",        t: "audio" },
+      { n: "key",       t: "audio" },
+      { n: "threshold", t: "param" },
+      { n: "ratio",     t: "param" },
+      { n: "attack",    t: "param" },
+      { n: "release",   t: "param" },
+      { n: "makeup",    t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { threshold: 0.4, ratio: 4, attack: 5, release: 80, makeup: 1 },
+    methods: { key: "setKey", threshold: "setThreshold", ratio: "setRatio", attack: "setAttack", release: "setRelease", makeup: "setMakeup" },
+    description: "Sidechain compressor. Audio in `in` is compressed by the envelope of `key`. Classic use: pad audio in `in`, kick bus in `key`, ratio 4 + 5 ms attack / 100 ms release for the EDM 'pumping' effect."
+  },
+
+  /* Ducker — simpler sidechain variant. Instead of a ratio knob,
+   * just a `reduction` ∈ [0,1] that's the maximum attenuation
+   * applied when the key signal is well above threshold. The
+   * attenuation scales linearly between threshold and full-scale
+   * key. Good fit for "dim the music when the announcement
+   * comes in" — radio voiceover, in-game dialog mix. */
+  Ducker: {
+    category: "Effect", color: COLOR.effect, header: null,
+    extraHeaders: ["<cmath>"],
+    cppType: "GammaDucker",
+    helperClass:
+`class GammaDucker {
+    float env_ = 0.f, key_ = 0.f;
+    float thresh_ = 0.3f;
+    float reduction_ = 0.5f;
+    float attackMs_ = 10.f, releaseMs_ = 200.f;
+    float ka_ = 1.f, kr_ = 1.f;
+    float sr_ = 48000.f;
+    void recalc_() {
+        ka_ = 1.f - std::exp(-1.f / (attackMs_  * sr_ * 0.001f));
+        kr_ = 1.f - std::exp(-1.f / (releaseMs_ * sr_ * 0.001f));
+    }
+public:
+    GammaDucker() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+        recalc_();
+    }
+    void setKey(float v)        { key_ = v; }
+    void setThreshold(float t)  { thresh_ = (t < 0.001f) ? 0.001f : (t > 1.f ? 1.f : t); }
+    void setReduction(float r)  { reduction_ = (r < 0.f) ? 0.f : (r > 1.f ? 1.f : r); }
+    void setAttack(float ms)    { attackMs_ = (ms < 0.05f) ? 0.05f : ms; recalc_(); }
+    void setRelease(float ms)   { releaseMs_ = (ms < 1.f)  ? 1.f  : ms; recalc_(); }
+    float operator()(float in) {
+        const float a = (key_ < 0.f) ? -key_ : key_;
+        const float k = (a > env_) ? ka_ : kr_;
+        env_ += k * (a - env_);
+        float gain = 1.f;
+        if (env_ > thresh_) {
+            const float overshoot = (env_ - thresh_) / (1.f - thresh_);
+            const float clamped = (overshoot > 1.f) ? 1.f : ((overshoot < 0.f) ? 0.f : overshoot);
+            gain = 1.f - clamped * reduction_;
+        }
+        return in * gain;
+    }
+};`,
+    ins: [
+      { n: "in",        t: "audio" },
+      { n: "key",       t: "audio" },
+      { n: "threshold", t: "param" },
+      { n: "reduction", t: "param" },
+      { n: "attack",    t: "param" },
+      { n: "release",   t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { threshold: 0.3, reduction: 0.5, attack: 10, release: 200 },
+    methods: { key: "setKey", threshold: "setThreshold", reduction: "setReduction", attack: "setAttack", release: "setRelease" },
+    description: "Ducker — auto-attenuates `in` when `key` exceeds threshold. reduction ∈ [0,1] is the maximum attenuation amount (0=bypass, 1=mute). Smoother attack/release than Sidechain by default. Use for voice-over-music ducking."
+  },
+
+  /* MultibandComp — split into 3 bands via Biquad LP/HP at user-
+   * configurable crossover frequencies; compress each band with
+   * its own threshold + ratio; sum back. Each band has its own
+   * envelope detector (3 ms attack / 50 ms release — fixed for
+   * compactness). All three thresholds + ratios + makeup gains
+   * are exposed; per-band attack/release would explode the
+   * param count, can be a follow-up. */
+  MultibandComp: {
+    category: "Effect", color: COLOR.effect, header: "Filter",
+    extraHeaders: ["<cmath>"],
+    cppType: "GammaMultibandComp",
+    helperClass:
+`class GammaMultibandComp {
+    /* Three-band crossover (LR-style 12 dB/oct via cascaded
+     * Biquads — not phase-perfect but cheap and audibly fine).
+     * Each band has its own envelope + gain computer + makeup.
+     * Bands sum to recover the original spectrum at unity gain
+     * with zero compression on every band. */
+    gam::Biquad<> lowLP_, midHP_, midLP_, highHP_;
+    float env_[3] = { 0.f, 0.f, 0.f };
+    float thresh_[3] = { 0.5f, 0.5f, 0.5f };
+    float ratio_[3]  = { 4.f, 4.f, 4.f };
+    float makeup_[3] = { 1.f, 1.f, 1.f };
+    float ka_ = 1.f, kr_ = 1.f;
+    float sr_ = 48000.f;
+public:
+    GammaMultibandComp() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+        lowLP_.type(gam::LOW_PASS);   lowLP_.freq(200.f);
+        midHP_.type(gam::HIGH_PASS);  midHP_.freq(200.f);
+        midLP_.type(gam::LOW_PASS);   midLP_.freq(2000.f);
+        highHP_.type(gam::HIGH_PASS); highHP_.freq(2000.f);
+        ka_ = 1.f - std::exp(-1.f / (3.f  * sr_ * 0.001f));
+        kr_ = 1.f - std::exp(-1.f / (50.f * sr_ * 0.001f));
+    }
+    void setLowFreq(float f)  { lowLP_.freq(f); midHP_.freq(f); }
+    void setHighFreq(float f) { midLP_.freq(f); highHP_.freq(f); }
+    void setLowThresh(float t)  { thresh_[0] = (t < 0.001f) ? 0.001f : (t > 1.f ? 1.f : t); }
+    void setMidThresh(float t)  { thresh_[1] = (t < 0.001f) ? 0.001f : (t > 1.f ? 1.f : t); }
+    void setHighThresh(float t) { thresh_[2] = (t < 0.001f) ? 0.001f : (t > 1.f ? 1.f : t); }
+    void setLowRatio(float r)   { ratio_[0] = (r < 1.f) ? 1.f : (r > 50.f ? 50.f : r); }
+    void setMidRatio(float r)   { ratio_[1] = (r < 1.f) ? 1.f : (r > 50.f ? 50.f : r); }
+    void setHighRatio(float r)  { ratio_[2] = (r < 1.f) ? 1.f : (r > 50.f ? 50.f : r); }
+    void setLowMakeup(float m)  { makeup_[0] = (m < 0.f) ? 0.f : (m > 8.f ? 8.f : m); }
+    void setMidMakeup(float m)  { makeup_[1] = (m < 0.f) ? 0.f : (m > 8.f ? 8.f : m); }
+    void setHighMakeup(float m) { makeup_[2] = (m < 0.f) ? 0.f : (m > 8.f ? 8.f : m); }
+    float compressBand_(int b, float bandIn) {
+        const float a = (bandIn < 0.f) ? -bandIn : bandIn;
+        const float k = (a > env_[b]) ? ka_ : kr_;
+        env_[b] += k * (a - env_[b]);
+        float gain = 1.f;
+        if (env_[b] > thresh_[b]) {
+            const float reduced = thresh_[b] + (env_[b] - thresh_[b]) / ratio_[b];
+            gain = reduced / env_[b];
+        }
+        return bandIn * gain * makeup_[b];
+    }
+    float operator()(float in) {
+        // Split. midLP/midHP are cascaded so the mid band is
+        // bandpassed through the two crossovers.
+        const float low  = lowLP_(in);
+        const float midHi = midHP_(in);   // > low cutoff
+        const float mid   = midLP_(midHi); // also < high cutoff = mid band
+        const float high  = highHP_(in);   // > high cutoff
+        return compressBand_(0, low) + compressBand_(1, mid) + compressBand_(2, high);
+    }
+};`,
+    ins: [
+      { n: "in",         t: "audio" },
+      { n: "lowFreq",    t: "param" },
+      { n: "highFreq",   t: "param" },
+      { n: "lowThresh",  t: "param" },
+      { n: "midThresh",  t: "param" },
+      { n: "highThresh", t: "param" },
+      { n: "lowRatio",   t: "param" },
+      { n: "midRatio",   t: "param" },
+      { n: "highRatio",  t: "param" },
+      { n: "lowMakeup",  t: "param" },
+      { n: "midMakeup",  t: "param" },
+      { n: "highMakeup", t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { lowFreq: 200, highFreq: 2000, lowThresh: 0.5, midThresh: 0.5, highThresh: 0.5, lowRatio: 4, midRatio: 4, highRatio: 4, lowMakeup: 1, midMakeup: 1, highMakeup: 1 },
+    methods: {
+      lowFreq: "setLowFreq", highFreq: "setHighFreq",
+      lowThresh: "setLowThresh", midThresh: "setMidThresh", highThresh: "setHighThresh",
+      lowRatio: "setLowRatio",   midRatio: "setMidRatio",   highRatio: "setHighRatio",
+      lowMakeup: "setLowMakeup", midMakeup: "setMidMakeup", highMakeup: "setHighMakeup"
+    },
+    description: "3-band compressor. Splits at lowFreq + highFreq via Biquad LP/HP crossovers; each band has its own threshold / ratio / makeup. Useful for separately controlling bass body, midrange punch, and high-end air on a master bus or program material."
+  },
+
   /* ---- Analysis (Analysis.h) ---- */
   EnvFollow: {
     category: "Analysis", color: COLOR.analysis, header: "Analysis",
