@@ -128,6 +128,7 @@ python -m http.server 8000
 | Single-finger drag on a node | Move it |
 | Single-finger drag on an out-port | Draw a wire |
 | Single-finger drag on empty canvas | Marquee-select |
+| **Long-press a node** (~½ s, hold still) | Pop the **action menu** above it: *Duplicate · Group · Delete*. Slide finger onto a chip and lift to commit, or release first and tap a chip. The Group chip shows only when ≥ 2 nodes are already selected. |
 | Two-finger pinch | Zoom toward midpoint |
 | Two-finger drag (with pinch) | Pan |
 | Apple Pencil | Routes to handwriting / draw tool, never to canvas hit-tests |

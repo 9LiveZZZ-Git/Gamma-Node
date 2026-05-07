@@ -1233,6 +1233,78 @@
     flex: 1;
   }
 
+  /* ---------------- Touch hold-and-swipe menu ----------------
+   * Long-press a node on touch → small floating menu floats above
+   * it with Duplicate / Delete (always) and Group (when ≥2 nodes are
+   * selected). Designed for finger-on-glass — chips are 44px tall to
+   * meet Apple's tap-target minimum, and the small triangle below
+   * acts as a pointer at the held node. Pointer-events on so the
+   * chips can capture taps; the menu itself is positioned absolute
+   * over the document so it can sit above the canvas + any panels.
+   * The .thm-active class lifts a chip when the user swipes a
+   * finger over it during the hold gesture (release commits). */
+  .touch-hold-menu {
+    position: absolute;
+    z-index: 9999;
+    display: none;
+    flex-direction: row;
+    gap: 4px;
+    padding: 4px;
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    box-shadow: 0 6px 24px rgba(0,0,0,0.55);
+    animation: thm-pop 110ms ease-out;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  @keyframes thm-pop {
+    from { transform: translateY(4px) scale(0.92); opacity: 0; }
+    to   { transform: translateY(0)    scale(1);    opacity: 1; }
+  }
+  .touch-hold-menu::after {
+    /* Little triangle pointing down at the held node. */
+    content: "";
+    position: absolute;
+    left: 50%;
+    bottom: -6px;
+    transform: translateX(-50%) rotate(45deg);
+    width: 10px; height: 10px;
+    background: var(--surface);
+    border-right: 1px solid var(--border-strong);
+    border-bottom: 1px solid var(--border-strong);
+  }
+  .thm-chip {
+    appearance: none;
+    background: var(--surface-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0 14px;
+    height: 44px;        /* iOS tap-target minimum */
+    min-width: 88px;
+    font-family: var(--font-sans);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    transition: transform 90ms ease, background 90ms ease, border-color 90ms ease;
+  }
+  .thm-chip.thm-danger { color: var(--danger); }
+  .thm-chip:hover     { background: var(--surface-3); }
+  .thm-chip.thm-active {
+    /* What the chip looks like when the user is mid-swipe over it.
+     * Pop slightly + accent border so the user can SEE which option
+     * will commit if they release now, without changing the layout. */
+    background: var(--surface-3);
+    border-color: var(--border-strong);
+    transform: translateY(-3px) scale(1.04);
+  }
+  .thm-chip.thm-danger.thm-active { border-color: var(--danger); }
+
   /* ---------------- Modal ---------------- */
   .modal-backdrop {
     position: fixed;
@@ -14414,6 +14486,142 @@ function _endTouchPointer(e) {
 canvas.addEventListener("pointerup",     _endTouchPointer, true);
 canvas.addEventListener("pointercancel", _endTouchPointer, true);
 
+/* ----- Touch hold-and-swipe context menu --------------------------------
+ * Long-press a node on touch (~500 ms, < 10 px movement) → small
+ * floating menu pops above the held node with Duplicate / Delete
+ * (always) and Group (when ≥2 nodes selected). Two release modes:
+ *
+ *   • SWIPE-AND-RELEASE — slide the held finger up onto a chip
+ *     (it glows .thm-active to confirm), lift to commit. Single
+ *     gesture, never breaks contact with the screen.
+ *   • TAP — release first; the menu stays visible and any chip
+ *     becomes a normal tap target. Tap outside to dismiss.
+ *
+ * Mouse and pen skip this — keyboard shortcuts + the existing
+ * delete button still cover those flows. */
+let touchHold = null;        // { pointerId, nodeId, startScreen, timer, menuOpen }
+const TOUCH_HOLD_MS       = 500;
+const TOUCH_HOLD_MOVE_PX  = 10;
+
+function _ensureTouchMenu() {
+  let m = document.getElementById("touch-hold-menu");
+  if (m) return m;
+  m = document.createElement("div");
+  m.id = "touch-hold-menu";
+  m.className = "touch-hold-menu";
+  // Order chosen for thumb reach: Duplicate left, Group middle (only
+  // shown when ≥2 selected), Delete right (danger style + furthest
+  // from a typical thumb tap to discourage accidental commits).
+  m.innerHTML =
+    '<button class="thm-chip" data-action="duplicate">⎘ Duplicate</button>' +
+    '<button class="thm-chip thm-group" data-action="group">⊞ Group</button>' +
+    '<button class="thm-chip thm-danger"  data-action="delete">⌫ Delete</button>';
+  document.body.appendChild(m);
+  m.querySelectorAll(".thm-chip").forEach(b => {
+    b.addEventListener("click", () => _commitTouchAction(b.dataset.action));
+  });
+  // Tap outside the menu closes it without action. Wired once on
+  // first construction; the handler is a no-op when the menu is
+  // already hidden.
+  document.addEventListener("pointerdown", (ev) => {
+    const menu = document.getElementById("touch-hold-menu");
+    if (!menu || menu.style.display !== "flex") return;
+    if (ev.target.closest && ev.target.closest("#touch-hold-menu")) return;
+    if (touchHold) return;   // active gesture owns the menu
+    _hideTouchMenu();
+  }, true);
+  return m;
+}
+
+function _showTouchMenu(screenX, screenY) {
+  const menu = _ensureTouchMenu();
+  // Show / hide Group chip based on current selection size. groupSelection
+  // also no-ops on a single node, but hiding the chip keeps the menu honest.
+  const groupChip = menu.querySelector(".thm-group");
+  groupChip.style.display = (selectedSet.size >= 2) ? "" : "none";
+  menu.style.display = "flex";
+  // Reset positioning so getBoundingClientRect measures real dimensions.
+  menu.style.left = "0px";
+  menu.style.top  = "0px";
+  const r = menu.getBoundingClientRect();
+  let left = screenX - r.width / 2;
+  let top  = screenY - r.height - 18;   // 18 = arrow + breathing room
+  // Clamp to viewport so the menu never appears off-screen if the user
+  // long-pressed near an edge.
+  const margin = 8;
+  left = Math.max(margin, Math.min(window.innerWidth  - r.width  - margin, left));
+  top  = Math.max(margin, Math.min(window.innerHeight - r.height - margin, top));
+  menu.style.left = left + "px";
+  menu.style.top  = top  + "px";
+  // Haptic feedback on devices that support it (Android Chrome). iOS
+  // ignores navigator.vibrate silently, so this is harmless there.
+  try { if (navigator.vibrate) navigator.vibrate(35); } catch (_) {}
+}
+function _hideTouchMenu() {
+  const m = document.getElementById("touch-hold-menu");
+  if (m) {
+    m.style.display = "none";
+    m.querySelectorAll(".thm-active").forEach(el => el.classList.remove("thm-active"));
+  }
+}
+function _highlightChipAt(x, y) {
+  const menu = document.getElementById("touch-hold-menu");
+  if (!menu) return;
+  const target = document.elementFromPoint(x, y);
+  const chip = target && target.closest && target.closest(".thm-chip");
+  menu.querySelectorAll(".thm-chip").forEach(el => {
+    el.classList.toggle("thm-active", el === chip);
+  });
+}
+function _chipActionAt(x, y) {
+  const target = document.elementFromPoint(x, y);
+  const chip = target && target.closest && target.closest(".thm-chip");
+  return chip ? chip.dataset.action : null;
+}
+function _startTouchHold(pointerId, nodeId, screenX, screenY) {
+  if (touchHold && touchHold.timer) clearTimeout(touchHold.timer);
+  touchHold = {
+    pointerId, nodeId,
+    startScreen: { x: screenX, y: screenY },
+    menuOpen: false,
+    timer: setTimeout(() => _fireTouchHold(), TOUCH_HOLD_MS)
+  };
+}
+function _cancelTouchHold() {
+  if (touchHold && touchHold.timer) clearTimeout(touchHold.timer);
+  touchHold = null;
+}
+function _fireTouchHold() {
+  if (!touchHold) return;
+  // Snap any held nodes back to their original positions before
+  // cancelling the drag — sub-threshold finger tremor (< 10 px) can
+  // shift things by a pixel or two during the hold, which feels
+  // wrong when the menu pops. The pushHistory("drag-start:") entry
+  // logged at touch-down is now an exact no-op against current state,
+  // so leaving it on the undo stack is harmless.
+  if (groupDrag && groupDrag.originals) {
+    groupDrag.originals.forEach((orig, id) => {
+      const n = nodeById(id);
+      if (n) { n.x = orig.x; n.y = orig.y; }
+    });
+  }
+  if (groupDrag) groupDrag = null;
+  if (wire)      { wire = null; renderWires(); }
+  // Make sure the held node is selected so deleteSelection /
+  // duplicateSelection / groupSelection have something to act on.
+  if (!selectedSet.has(touchHold.nodeId)) selectOne(touchHold.nodeId);
+  touchHold.menuOpen = true;
+  _showTouchMenu(touchHold.startScreen.x, touchHold.startScreen.y);
+  render();
+}
+function _commitTouchAction(action) {
+  if      (action === "duplicate") duplicateSelection();
+  else if (action === "delete")    deleteSelection();
+  else if (action === "group")     groupSelection();
+  _hideTouchMenu();
+  touchHold = null;
+}
+
 canvas.addEventListener("pointerdown", e => {
   // Touch + pen come through the same event — only react to primary
   // pointer, and ignore pen entirely (the ink layer handles that).
@@ -14558,6 +14766,15 @@ canvas.addEventListener("pointerdown", e => {
         startX: w.x, startY: w.y,
         originals
       };
+      // Touch-only: arm a long-press timer. If the user holds without
+      // moving for ~500 ms, the gesture flips into "menu mode" and the
+      // drag we just set up gets cancelled before any movement happens
+      // (so the node doesn't jump). Mouse and pen skip this — pen
+      // never reaches here anyway, and mouse users have keyboard
+      // shortcuts + the keyboard delete key.
+      if (e.pointerType === "touch") {
+        _startTouchHold(e.pointerId, id, e.clientX, e.clientY);
+      }
     }
     render();
     return;
@@ -14577,6 +14794,21 @@ document.addEventListener("pointermove", e => {
   // Multi-touch pinch in progress — ignore single-pointer logic so it
   // doesn't drag a wire or update a marquee from one of the pinch fingers.
   if (pinchState) return;
+  // Touch-hold tracking. Two phases:
+  //   1. Pre-fire: timer hasn't fired yet. If the user moves more than
+  //      a few pixels we cancel the timer and let the normal drag run.
+  //   2. Menu open: route moves to chip highlighting and absorb them
+  //      so the underlying drag/marquee logic stays frozen.
+  if (touchHold && e.pointerId === touchHold.pointerId) {
+    if (touchHold.menuOpen) {
+      _highlightChipAt(e.clientX, e.clientY);
+      e.preventDefault && e.preventDefault();
+      return;
+    }
+    const dx = e.clientX - touchHold.startScreen.x;
+    const dy = e.clientY - touchHold.startScreen.y;
+    if (Math.hypot(dx, dy) > TOUCH_HOLD_MOVE_PX) _cancelTouchHold();
+  }
   if (panning) {
     view.panX = panning.startPanX + (e.clientX - panning.startX);
     view.panY = panning.startPanY + (e.clientY - panning.startY);
@@ -14613,6 +14845,19 @@ document.addEventListener("pointermove", e => {
 document.addEventListener("pointerup", e => {
   // Skip when pinch is in progress — _endTouchPointer handles its own bookkeeping.
   if (pinchState) return;
+  // Touch-hold dispatch. If menu is open and the user releases over a
+  // chip → commit that action. If they release elsewhere → leave the
+  // menu open (they may tap a chip with a separate touch). If the
+  // timer never fired → just clean up.
+  if (touchHold && e.pointerId === touchHold.pointerId) {
+    if (touchHold.menuOpen) {
+      const action = _chipActionAt(e.clientX, e.clientY);
+      if (action) _commitTouchAction(action);
+      else        touchHold = null;   // menu stays visible; tap-outside watcher closes it
+      return;
+    }
+    _cancelTouchHold();
+  }
   if (panning) {
     panning = null;
     canvas.classList.remove("panning");
