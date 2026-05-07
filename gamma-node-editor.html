@@ -1609,6 +1609,61 @@
   .ver-pill:empty { display: none; }
   .ver-pill.dev::before { background: var(--text-3); box-shadow: none; }
   .ver-pill.dev { color: var(--text-3); border-color: var(--border-strong); background: var(--surface-2); }
+
+  /* GPU status pill — Phase 6.1.3. Mirrors .ver-pill shape so the two
+   * read as a pair in the header. State drives color via data-state
+   * attribute: probing (gray, default), ready (cyan = visual-port
+   * color), unavailable (warn yellow), error (danger red). The
+   * always-on dot makes the absence-of-WebGPU obvious without yelling
+   * — this is informational, not a hard error, since the audio side
+   * keeps working without WebGPU. */
+  .gpu-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border: 1px solid var(--border-strong);
+    border-radius: 999px;
+    background: var(--surface-2);
+    color: var(--text-3);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    user-select: none;
+    cursor: default;
+    transition: background .12s, border-color .12s, color .12s;
+  }
+  .gpu-pill::before {
+    content: "";
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--text-3);
+  }
+  .gpu-pill[data-state="ready"]       { color: var(--info); border-color: rgba(131,232,255,0.34); background: rgba(131,232,255,0.08); }
+  .gpu-pill[data-state="ready"]::before{ background: var(--info); box-shadow: 0 0 6px rgba(131,232,255,0.55); }
+  .gpu-pill[data-state="unavailable"] { color: var(--warn); border-color: rgba(255,179,71,0.34); background: rgba(255,179,71,0.08); }
+  .gpu-pill[data-state="unavailable"]::before { background: var(--warn); }
+  .gpu-pill[data-state="error"], .gpu-pill[data-state="lost"] { color: var(--danger); border-color: rgba(226,75,74,0.34); background: rgba(226,75,74,0.08); }
+  .gpu-pill[data-state="error"]::before, .gpu-pill[data-state="lost"]::before { background: var(--danger); }
+
+  /* Visual canvas — Phase 6.1.1. Full viewport behind everything;
+   * pointer-events disabled so the node graph's pointer handling is
+   * untouched. No background — body's --bg shows through until
+   * WebGPU acquires + a render pass paints it. */
+  #visual-bg {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100vw;
+    height: 100vh;
+    z-index: 0;
+    pointer-events: none;
+    /* The canvas is inert until WebGPU is configured against it
+     * (see ensureGPUDevice). Default appearance is whatever body
+     * background shows — invisible against the editor backdrop. */
+  }
+  /* Everything in #app sits on top of the visual layer. */
+  #app { position: relative; z-index: 1; }
   .brand .file {
     font-family: var(--font-mono);
     font-size: 13.5px;
@@ -4857,12 +4912,22 @@
 </style>
 </head>
 <body>
+
+<!-- Phase 6.1.1 — Visual canvas. Sits behind the entire editor at
+     z-index 0 with pointer-events: none so node-graph hit-testing is
+     unaffected. NOT inside any pan/zoom transform — stays full-
+     viewport at all times so the visual content is independent of
+     the node graph's pan/zoom state. WebGPU is configured against
+     this canvas in ensureGPUDevice(); see Visual.* below. -->
+<canvas id="visual-bg"></canvas>
+
 <div id="app">
 
   <header>
     <div class="brand">
       <span class="mark"><span class="mark-sq"></span>Gamma<span class="mark-sub">node editor</span></span>
       <a class="ver-pill" id="app-version" href="https://github.com/9LiveZZZ-Git/Gamma-Node/commits/main" target="_blank" rel="noopener" title="Auto-bumped on every push to main. Click to see commit history."></a>
+      <span class="gpu-pill" id="gpu-status" data-state="probing" title="WebGPU device — required for the upcoming visual layer (Phase 6+)">GPU</span>
       <span class="file" id="filename" title="Click to rename. Updates the .gpatch filename and the generated C++ class name." tabindex="0">untitled.gpatch</span>
       <span class="stats" id="stats">5 nodes · 4 connections</span>
     </div>
@@ -18171,6 +18236,202 @@ document.addEventListener("keydown", e => {
  * button reports a clear "Gamma archive not found" error.
  * ======================================================================== */
 
+/* =========================================================================
+ * Visual subsystem — Phase 6.1
+ *
+ * WebGPU-native rendering pipeline. This file currently scaffolds:
+ *   • Device + adapter acquisition (lazy singleton, auto-fired at end
+ *     of init since WebGPU is permissionless — no consent dialog risk).
+ *   • Canvas context configuration (alphaMode: premultiplied so future
+ *     shader output composes cleanly with the editor backdrop).
+ *   • DPR-aware sizing + window-resize re-sizing.
+ *   • Status pill in the header so the user can see at a glance whether
+ *     the device acquired (cyan dot), is missing (yellow), errored
+ *     (red), or got lost mid-session (red).
+ *   • A "smoke clear" render pass — fills the canvas with the editor
+ *     bg color so we can confirm end-to-end the device → command
+ *     encoder → context.getCurrentTexture() → present pipeline works.
+ *
+ * Future tickets layer on:
+ *   6.1.4 — Render-target framebuffer at user-selectable resolution
+ *   6.1.5 — Resolution HUD
+ *   6.1.6 — texture / transform / mesh port types in the legality matrix
+ *   6.1.7 — VisualOutput sink node
+ *   6.2.x — Pipeline cache + WGSL hot reload
+ *   6.3.x — Texture port machinery + ping-pong FBO ring
+ *   6.4.x — First built-in shader nodes (Gradient / Noise / Plasma / ...)
+ *   6.5.x — Audio reactivity bridge via SharedArrayBuffer
+ *   6.6.x — Polymorphic .gdsp shader-frag/vert/compute kinds
+ *   6.7.x — Editor controls (capture, perf overlay, Live Mode)
+ * ======================================================================== */
+
+const Visual = {
+  // null = unprobed; true = device acquired; false = unavailable / errored
+  available: null,
+  adapter: null,
+  device: null,
+  canvas: null,
+  context: null,
+  presentationFormat: null,
+  features: new Set(),    // active features the device opted into
+  // Future-ticket holders so callers can sanity-check whether a piece
+  // of infra is online before they try to render through it.
+  pipelineCache: null,    // 6.2.1
+  bindLayoutCache: null,  // 6.3.4
+  framebuffers: null      // 6.1.4 / 6.3.2
+};
+
+function webgpuAvailable() {
+  return typeof navigator !== "undefined" && !!navigator.gpu;
+}
+
+function setGpuStatusPill(state, msg) {
+  const pill = document.getElementById("gpu-status");
+  if (!pill) return;
+  pill.dataset.state = state;
+  if (msg) pill.title = msg;
+  // Tighter label per state — keeps the pill width compact.
+  const label = ({
+    probing:     "GPU…",
+    ready:       "GPU",
+    unavailable: "no GPU",
+    error:       "GPU err",
+    lost:        "GPU lost"
+  })[state] || "GPU";
+  pill.textContent = label;
+}
+
+async function ensureGPUDevice() {
+  if (Visual.device) return Visual.device;
+  if (Visual.available === false) return null;   // already determined unavailable; don't retry on every call
+  if (!webgpuAvailable()) {
+    Visual.available = false;
+    setGpuStatusPill("unavailable",
+      "WebGPU not supported in this browser. Phase 6+ visuals require Chrome / Edge / Safari 18+. " +
+      "Audio side keeps working.");
+    console.log("[visual] WebGPU not available — navigator.gpu missing");
+    return null;
+  }
+  try {
+    Visual.adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+    if (!Visual.adapter) throw new Error("requestAdapter returned null (no compatible adapter)");
+
+    // Capability detection — opt into features that are useful for
+    // shader nodes + future compute work, but only if the adapter
+    // actually exposes them. Missing features are silent (fall back
+    // to base spec); only log what we got.
+    const wantedFeatures = ["shader-f16", "timestamp-query", "float32-filterable"];
+    const requiredFeatures = wantedFeatures.filter(f => Visual.adapter.features.has(f));
+
+    Visual.device = await Visual.adapter.requestDevice({ requiredFeatures });
+    Visual.features = new Set(Array.from(Visual.device.features));
+
+    // Device-loss handler — surfaces in the pill so the user sees
+    // why visuals stopped. Most often happens on system sleep / GPU
+    // driver crash; a page reload re-acquires.
+    Visual.device.lost.then(info => {
+      console.warn("[visual] device lost:",
+                   info && info.reason || "?",
+                   info && info.message || "");
+      Visual.available = false;
+      Visual.device = null;
+      Visual.context = null;
+      setGpuStatusPill("lost", "GPU device lost — reload page to reacquire (info: " +
+        (info && info.message || "no detail") + ")");
+    });
+
+    Visual.canvas = document.getElementById("visual-bg");
+    if (Visual.canvas) {
+      Visual.context = Visual.canvas.getContext("webgpu");
+      Visual.presentationFormat = navigator.gpu.getPreferredCanvasFormat();
+      Visual.context.configure({
+        device: Visual.device,
+        format: Visual.presentationFormat,
+        alphaMode: "premultiplied"
+      });
+      sizeVisualCanvas();
+      smokeClearVisual();
+    }
+
+    Visual.available = true;
+    const info = Visual.adapter.info || {};
+    console.log(
+      "[visual] WebGPU device acquired:" +
+      " vendor=" + (info.vendor || "?") +
+      " arch=" + (info.architecture || "?") +
+      " device=" + (info.device || "?") +
+      " features=[" + Array.from(Visual.features).join(", ") + "]" +
+      " format=" + Visual.presentationFormat
+    );
+    setGpuStatusPill("ready",
+      "WebGPU ready — " + (info.architecture || "device") +
+      ", format " + Visual.presentationFormat +
+      (Visual.features.size ? ", features: " + Array.from(Visual.features).join(", ") : ""));
+    return Visual.device;
+  } catch (e) {
+    console.warn("[visual] WebGPU init failed:", e);
+    Visual.available = false;
+    Visual.device = null;
+    Visual.context = null;
+    setGpuStatusPill("error", "WebGPU init failed: " + (e && e.message || e));
+    return null;
+  }
+}
+
+/* DPR-aware canvas sizing. The visual canvas's CSS size stays at
+ * 100vw x 100vh, but its drawing-buffer size scales with
+ * devicePixelRatio so we render at native pixel density on Retina
+ * displays. WebGPU is happy with any size; future framebuffer
+ * targets in 6.1.4 will be sized to the user's render-resolution
+ * choice (1080p / 1440p / 4K / 8K) independently of this. */
+function sizeVisualCanvas() {
+  if (!Visual.canvas) return;
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.floor(window.innerWidth  * dpr));
+  const h = Math.max(1, Math.floor(window.innerHeight * dpr));
+  if (Visual.canvas.width !== w || Visual.canvas.height !== h) {
+    Visual.canvas.width  = w;
+    Visual.canvas.height = h;
+  }
+}
+window.addEventListener("resize", () => {
+  sizeVisualCanvas();
+  if (Visual.device && Visual.context) smokeClearVisual();
+});
+
+/* Smoke clear — submits a single render pass that clears the canvas
+ * to the editor's background color. Until VisualOutput (6.1.7) ships,
+ * this is the only render path; serves as proof-of-life that the
+ * device + context + present pipeline are working end-to-end.
+ * Imperceptible visually since the body's bg is the same color, but
+ * an inspector can confirm the canvas has been written to. */
+function smokeClearVisual() {
+  if (!Visual.device || !Visual.context) return;
+  let view;
+  try { view = Visual.context.getCurrentTexture().createView(); }
+  catch (e) {
+    // getCurrentTexture throws if the canvas was resized to 0 or the
+    // context dropped; sizeVisualCanvas should have handled the
+    // resize, but log if not.
+    console.warn("[visual] getCurrentTexture failed:", e);
+    return;
+  }
+  const enc = Visual.device.createCommandEncoder({ label: "smoke-clear" });
+  // --bg = #050608 → linear-ish RGB (premultiplied alpha; values just
+  // ratio'd from byte-space, no sRGB→linear since the canvas format
+  // is preferred-canvas-format, often unorm-srgb on macOS — close
+  // enough for proof-of-life).
+  enc.beginRenderPass({
+    colorAttachments: [{
+      view,
+      clearValue: { r: 5/255, g: 6/255, b: 8/255, a: 1.0 },
+      loadOp: "clear",
+      storeOp: "store"
+    }]
+  }).end();
+  Visual.device.queue.submit([enc.finish()]);
+}
+
 const PREVIEW = {
   // URL of the pre-built Gamma static-library tarball. Produce locally
   // via wasm-build/build-gamma-wasm.sh and host it under /assets/ on the
@@ -24871,6 +25132,15 @@ window.addEventListener("keydown", (ev) => {
 });
 
 render();
+
+/* Phase 6.1.2 — kick off WebGPU device acquisition. Lazy enough that
+ * it doesn't block first paint (the editor is fully usable for audio
+ * before this resolves), but eager enough that the GPU pill in the
+ * header settles to its final state (ready / unavailable / error)
+ * within ~50 ms of page load on a typical machine. WebGPU is
+ * permissionless — no consent dialog, no risk of surprising the user
+ * mid-session — so calling it at startup is safe. */
+ensureGPUDevice();
 </script>
 
 </body>
