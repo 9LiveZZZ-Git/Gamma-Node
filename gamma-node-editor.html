@@ -12185,8 +12185,91 @@ function parseGdsp(source) {
 function buildUserDspDef(source) {
   const { directives: d } = parseGdsp(source);
   if (!d.name) throw new Error("Missing @gdsp-name");
-  if (!d.input) throw new Error("Missing @gdsp-input (need at least one)");
   if (!d.output) throw new Error("Missing @gdsp-output (need at least one)");
+
+  // Phase 6.2.2 — shader-frag .gdsp kind. Branches BEFORE the C++ class
+  // checks below since the body is WGSL, not C++. Hot-reload comes for
+  // free: registerUserDsp updates TYPES[name].wgsl, the pipeline cache
+  // hashes content (so editing the body is a cache miss), and the
+  // per-instance pipelineEntry tracker keeps the old pipeline rendering
+  // until the new one finishes async-compiling.
+  if (d.kind === "shader-frag") {
+    if (!Array.isArray(d.output) || d.output.length !== 1) {
+      throw new Error("@gdsp-kind shader-frag requires exactly one @gdsp-output");
+    }
+    const outDecl = d.output[0].trim().split(/\s+/);
+    if (outDecl[1] !== "texture") {
+      throw new Error('@gdsp-kind shader-frag output must be type "texture" (got "' + outDecl[1] + '")');
+    }
+    // Light WGSL syntax check — the editor's standard pipeline expects
+    // both vs_main and fs_main entry points. WebGPU validation will
+    // catch deeper errors at compile time.
+    if (!/@vertex/.test(source))         throw new Error("WGSL body missing @vertex entry point");
+    if (!/@fragment/.test(source))       throw new Error("WGSL body missing @fragment entry point");
+    if (!/fn\s+vs_main\s*\(/.test(source))  throw new Error('WGSL body must define "fn vs_main(...)"');
+    if (!/fn\s+fs_main\s*\(/.test(source))  throw new Error('WGSL body must define "fn fs_main(...)"');
+
+    const def = {
+      category:    d.category || "Visual",
+      color:       d.color || COLOR.visual,
+      header:      null,
+      description: d.description || "",
+      cppType:     "",                  // no audio codegen
+      kind:        "shader-frag",
+      ins:         [],
+      outs:        [{ n: outDecl[0], t: "texture" }],
+      params:      {},
+      methods:     {},
+      isUserDsp:   true,
+      wgsl:        source
+    };
+
+    // Collect params from @gdsp-input. Only "param" allowed today;
+    // texture inputs (for composition shaders) ship in 6.4.x with their
+    // own bind-group layout.
+    const paramOrder = [];
+    if (Array.isArray(d.input)) {
+      for (const s of d.input) {
+        const parts = s.trim().split(/\s+/);
+        const [pname, ptype, pdefault] = parts;
+        if (!pname || !ptype) throw new Error(`Bad @gdsp-input: ${s}`);
+        if (ptype !== "param") {
+          throw new Error(`shader-frag @gdsp-input ${pname}: only "param" supported (got "${ptype}")`);
+        }
+        def.ins.push({ n: pname, t: "param" });
+        const dv = pdefault !== undefined ? parseFloat(pdefault) : 0;
+        def.params[pname] = isFinite(dv) ? dv : 0;
+        paramOrder.push(pname);
+      }
+    }
+
+    // Uniform-buffer size: 32-byte standard preamble (resolution +
+    // time + dt + vec2f pad) + N × 4 B for params, rounded up to a
+    // 16-byte boundary so vec4 fields the user might add later still
+    // align cleanly. Floor at 48 bytes (the SolidColor case) so the
+    // smallest shader still gets a comfortable buffer.
+    const N = paramOrder.length;
+    def.uniformBytes = Math.max(48, 32 + Math.ceil((N * 4) / 16) * 16);
+
+    // writeUniforms — pack params as f32 in declaration order, starting
+    // at scratch[8] (= byte offset 32, immediately after the preamble).
+    // The user's WGSL struct must declare matching f32 fields in the
+    // same order; see gdspFormatSpec for the convention + a worked
+    // example.
+    def.writeUniforms = function (node, scratch) {
+      const p = node.params || {};
+      for (let i = 0; i < paramOrder.length; i++) {
+        const name = paramOrder[i];
+        const v = p[name];
+        scratch[8 + i] = (typeof v === "number") ? v : 0;
+      }
+    };
+
+    return { def, name: d.name };
+  }
+
+  // -- Audio (cpp) path below — unchanged from before --
+  if (!d.input) throw new Error("Missing @gdsp-input (need at least one)");
 
   const def = {
     category:   d.category || "User DSP",
@@ -17061,7 +17144,94 @@ public:
     }
 };
 
-The output of your generation is the entire file — directives + class — and nothing else. No prose, no markdown fences.`;
+The output of your generation is the entire file — directives + class — and nothing else. No prose, no markdown fences.
+
+==========================================================================
+ALTERNATE KIND: shader-frag (Phase 6 visual layer)
+
+Set "// @gdsp-kind shader-frag" on the first metadata line to author a
+WGSL fragment shader instead of a C++ DSP class. The body is WGSL, not
+C++; the rest of the metadata + class checks above are bypassed.
+
+Required directives for shader-frag:
+  // @gdsp-kind        shader-frag
+  // @gdsp-name        ShaderName
+  // @gdsp-output      out  texture          (must be texture, exactly one)
+
+Optional:
+  // @gdsp-category    Visual                (default: Visual)
+  // @gdsp-input       paramName  param  default   (zero or more)
+  // @gdsp-description One-line description
+  // @gdsp-color       #rrggbb
+
+WGSL conventions:
+  - Define BOTH @vertex fn vs_main(...) -> VsOut and
+    @fragment fn fs_main(in: VsOut) -> @location(0) vec4f.
+  - Use a fullscreen triangle in vs_main (see SolidColor / Gradient for
+    the canonical pattern — three positions, derive uv from clip pos
+    with v flipped).
+  - Bind your uniform struct at @group(0) @binding(0). The struct must
+    start with the standard preamble:
+        u_resolution: vec4f,   // (w, h, 1/w, 1/h)
+        u_time:       f32,     // seconds since the GPU device acquired
+        u_dt:         f32,     // seconds since the previous frame
+        _pad:         vec2f,   // 8 B → next vec4 aligns to 16
+    Then your @gdsp-input params follow as f32 fields IN DECLARATION
+    ORDER (each param = 4 B). For non-trivial layouts (vec3, vec4)
+    interleave manual padding so 16-byte-aligned types start on
+    16-byte offsets — same rules as WGSL struct alignment in general.
+
+A complete shader-frag example:
+
+// @gdsp-kind        shader-frag
+// @gdsp-name        Pinwheel
+// @gdsp-category    Visual
+// @gdsp-description Rotating radial sweep
+// @gdsp-input       speed  param  1.0
+// @gdsp-input       arms   param  6.0
+// @gdsp-output      out    texture
+
+struct U {
+  u_resolution: vec4f,
+  u_time:       f32,
+  u_dt:         f32,
+  _pad:         vec2f,
+  speed:        f32,
+  arms:         f32,
+};
+@group(0) @binding(0) var<uniform> u: U;
+
+struct VsOut {
+  @builtin(position) pos: vec4f,
+  @location(0)       uv:  vec2f,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(
+    vec2f(-1.0, -1.0),
+    vec2f( 3.0, -1.0),
+    vec2f(-1.0,  3.0),
+  );
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let p = in.uv - vec2f(0.5);
+  let a = atan2(p.y, p.x) + u.u_time * u.speed;
+  let s = 0.5 + 0.5 * sin(a * u.arms);
+  return vec4f(s, s, s, 1.0);
+}
+
+Hot reload is automatic: any edit to the WGSL body re-hashes into a
+fresh pipeline-cache entry, async-compiles, and swaps onto live
+shader-frag nodes on the next frame — the old pipeline keeps rendering
+during compile so there's no flicker.`;
 }
 
 function buildPrompt(mode, userText, currentSource) {
@@ -19212,33 +19382,58 @@ function _getShaderPipeline(wgsl) {
   return entry;
 }
 
-/* Build per-node uniform buffer + bind group. Buffer size is
- * def.uniformBytes (registry-declared). Returns { uniformBuffer,
- * bindGroup, scratch }. Cached on Visual.shaderInstances. */
+/* Build (or refresh) per-node uniform buffer + bind group + tracked
+ * pipeline entry. Returns { uniformBuffer, bindGroup, scratch,
+ * pipelineEntry }. Hot-reload story (Phase 6.2.2):
+ *
+ *   • The pipelineEntry stored on the instance points at the cache
+ *     entry it's currently rendering with.
+ *   • When def.wgsl changes (user-edited shader-frag .gdsp), the
+ *     desired entry changes too. We DON'T swap immediately — that
+ *     would flicker to smoke-clear during the async compile. Instead
+ *     we only flip inst.pipelineEntry once the new entry's pipeline
+ *     is actually ready. The old pipeline keeps rendering until then.
+ *   • When def.uniformBytes changes (param count edited), the buffer
+ *     itself has to be reallocated; the old buffer is destroyed and a
+ *     fresh bind group is built. Pipeline entry is also re-checked. */
 function _ensureShaderInstance(nodeId, def) {
   let inst = Visual.shaderInstances.get(nodeId);
-  if (inst && inst._uniformBytes === def.uniformBytes) return inst;
-  if (inst && inst.uniformBuffer) {
-    try { inst.uniformBuffer.destroy(); } catch (_) {}
+  const desiredEntry = _getShaderPipeline(def.wgsl);
+
+  // Reallocate when the buffer size doesn't match (fresh node, or
+  // user edited @gdsp-input list and parameters changed).
+  if (!inst || inst._uniformBytes !== def.uniformBytes) {
+    if (inst && inst.uniformBuffer) {
+      try { inst.uniformBuffer.destroy(); } catch (_) {}
+    }
+    const bytes = def.uniformBytes;
+    const buf = Visual.device.createBuffer({
+      label: "shader-frag-uniform-" + nodeId,
+      size:  bytes,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+    const bg = Visual.device.createBindGroup({
+      label: "shader-frag-bg-" + nodeId,
+      layout: Visual.standardShaderBgl,
+      entries: [{ binding: 0, resource: { buffer: buf } }]
+    });
+    inst = {
+      uniformBuffer: buf,
+      bindGroup:     bg,
+      scratch:       new Float32Array(bytes / 4),
+      _uniformBytes: bytes,
+      pipelineEntry: desiredEntry
+    };
+    Visual.shaderInstances.set(nodeId, inst);
+    return inst;
   }
-  const bytes = def.uniformBytes;
-  const buf = Visual.device.createBuffer({
-    label: "shader-frag-uniform-" + nodeId,
-    size:  bytes,
-    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
-  });
-  const bg = Visual.device.createBindGroup({
-    label: "shader-frag-bg-" + nodeId,
-    layout: Visual.standardShaderBgl,
-    entries: [{ binding: 0, resource: { buffer: buf } }]
-  });
-  inst = {
-    uniformBuffer: buf,
-    bindGroup:     bg,
-    scratch:       new Float32Array(bytes / 4),
-    _uniformBytes: bytes
-  };
-  Visual.shaderInstances.set(nodeId, inst);
+
+  // Same instance, possibly different WGSL. Swap pipelineEntry only
+  // when the desired entry has actually compiled — the old entry
+  // keeps rendering during the compile so users don't see a flicker.
+  if (inst.pipelineEntry !== desiredEntry && desiredEntry && desiredEntry.pipeline) {
+    inst.pipelineEntry = desiredEntry;
+  }
   return inst;
 }
 
@@ -19278,11 +19473,17 @@ function _writeShaderPreamble(scratch, dtSec) {
 /* Encode a single shader-frag pass that renders the node's output
  * into Visual.framebuffer. Returns true if a pass was actually
  * encoded (pipeline ready, instance built); false if the pipeline
- * is still compiling or some prerequisite is missing. */
+ * is still compiling or some prerequisite is missing.
+ *
+ * The pipeline used is the one stored on the per-node instance —
+ * which during a hot-reload may still be the OLD pipeline while the
+ * new one is mid-compile. _ensureShaderInstance handles the swap-
+ * when-ready dance so this function just renders whichever pipeline
+ * the instance currently holds. */
 function _encodeShaderFragPass(enc, node, def, dtSec) {
-  const entry = _getShaderPipeline(def.wgsl);
-  if (!entry || !entry.pipeline) return false;
   const inst = _ensureShaderInstance(node.id, def);
+  const entry = inst.pipelineEntry;
+  if (!entry || !entry.pipeline) return false;
 
   // Pack uniforms — preamble first, then the registry-declared
   // writer for the per-node params.
