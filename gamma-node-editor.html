@@ -5145,10 +5145,14 @@
   <div class="modal-backdrop" id="settings-modal" style="display:none;">
     <div class="modal">
       <div class="modal-head">
-        <span>AI settings</span>
+        <span>Settings</span>
         <button class="btn modal-x" id="btn-settings-close">×</button>
       </div>
       <div class="modal-body">
+
+        <!-- AI section ------------------------------------------------- -->
+        <div class="settings-section-header" style="font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 10px;">AI provider</div>
+
         <p class="modal-note" id="settings-note-api">
           API keys are stored in this browser's localStorage in plain text and used only to call the chosen provider directly.
           They never leave your machine via this editor. Clear them any time with the button below.
@@ -5190,7 +5194,25 @@
           <p class="modal-note" id="gemma-preload-note" style="margin: 10px 0 0; min-height: 18px;"></p>
         </div>
 
-        <div class="modal-actions">
+        <!-- Compile server section ------------------------------------- -->
+        <div class="settings-section-header" style="font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin: 22px 0 10px; padding-top: 16px; border-top: 1px solid var(--border);">Compile server</div>
+
+        <p class="modal-note">
+          By default the editor probes <code>127.0.0.1:8765</code> for the local <code>gamma-compile-server</code> daemon. Set a custom URL to point at a daemon running on another machine on your LAN — e.g. patch on an iPad against a Mac running the daemon.
+        </p>
+        <p class="modal-note" style="margin-top: 6px;">
+          <strong>Mixed-content note:</strong> if you're loading the editor from <code>https://</code>, browsers block requests to non-<code>localhost</code> <code>http://</code> URLs. Workaround: serve the editor over <code>http://</code> from the same machine (e.g. <code>python -m http.server</code>), or run the daemon behind HTTPS.
+        </p>
+        <div class="settings-grid">
+          <label>Server URL</label>
+          <input id="settings-compile-url" placeholder="http://192.168.1.42:8765" />
+        </div>
+        <div class="modal-actions" style="margin-top: 10px; justify-content: flex-start;">
+          <button class="btn" id="btn-settings-test-server">Test connection</button>
+          <span id="settings-server-result" style="font-size: 11.5px; font-family: var(--font-mono); margin-left: 4px; align-self: center;"></span>
+        </div>
+
+        <div class="modal-actions" style="margin-top: 18px;">
           <button class="btn primary" id="btn-settings-save">Save</button>
           <button class="btn danger" id="btn-settings-clear">Clear key</button>
         </div>
@@ -5627,7 +5649,7 @@
  * Pages deploy workflow (.github/workflows/pages.yml). The string
  * after the equals sign is what the workflow's sed targets — don't
  * change the format of this line. */
-const APP_VERSION = "0.0.100";
+const APP_VERSION = "0.1.0";
 
 /* =========================================================================
  * Node type registry — covers ~55 Gamma DSP classes
@@ -15415,7 +15437,17 @@ function loadAiSettings() {
   return defaultAiSettings();
 }
 function defaultAiSettings() {
-  return { provider: "gemma", model: "onnx-community/gemma-4-E2B-it-ONNX", anthropicKey: "" };
+  // compileServerUrl: empty → use the default 127.0.0.1/localhost probe.
+  // Set to a full URL (e.g. "http://192.168.1.42:8765") to point at a
+  // daemon on another machine — useful for patching on an iPad against
+  // a Mac on the same LAN. The settings-modal field both reads and
+  // writes this value; probeLocalServer honors it when present.
+  return {
+    provider: "gemma",
+    model: "onnx-community/gemma-4-E2B-it-ONNX",
+    anthropicKey: "",
+    compileServerUrl: ""
+  };
 }
 function saveAiSettings() {
   try { localStorage.setItem(AI_LS_KEY, JSON.stringify(aiSettings)); } catch (e) {}
@@ -16080,6 +16112,8 @@ const sKey          = document.getElementById("settings-key");
 const sKeyLabel     = document.getElementById("settings-key-label");
 const sNoteApi      = document.getElementById("settings-note-api");
 const sNoteLocal    = document.getElementById("settings-note-local");
+const sCompileUrl   = document.getElementById("settings-compile-url");
+const sServerResult = document.getElementById("settings-server-result");
 
 function applyProviderUi(p) {
   const isLocal = p === "gemma";
@@ -16184,6 +16218,8 @@ function openSettings() {
     sModel.value = aiSettings.model;
     sKey.value   = aiSettings.anthropicKey;
   }
+  if (sCompileUrl) sCompileUrl.value = aiSettings.compileServerUrl || "";
+  if (sServerResult) { sServerResult.textContent = ""; sServerResult.style.color = ""; }
   applyProviderUi(aiSettings.provider);
   settingsModal.style.display = "flex";
 }
@@ -16222,10 +16258,52 @@ document.getElementById("btn-settings-save").addEventListener("click", () => {
     aiSettings.model = sModel.value.trim() || PROVIDERS.anthropic.defaultModel;
     aiSettings.anthropicKey = sKey.value.trim();
   }
+  // Compile-server URL: trim, strip trailing slash, accept blank to mean
+  // "use the default 127.0.0.1/localhost probe". Force a fresh probe on
+  // next Play so the new URL takes effect immediately.
+  if (sCompileUrl) {
+    let url = sCompileUrl.value.trim().replace(/\/+$/, "");
+    aiSettings.compileServerUrl = url;
+  }
+  localServerStatus = null;
+  localServerEndpoint = null;
   saveAiSettings();
   closeSettings();
   setAiStatus("Settings saved.", "ok");
   refreshModelBadge();
+});
+
+/* Test the user-entered (or default) compile server URL inline so they
+ * can confirm it's reachable before saving. Runs the same /health
+ * handshake as probeLocalServer, with a longer timeout (3 s) since LAN
+ * round-trips can be a touch slower than localhost. */
+document.getElementById("btn-settings-test-server").addEventListener("click", async () => {
+  if (!sServerResult) return;
+  const raw = (sCompileUrl ? sCompileUrl.value : "").trim().replace(/\/+$/, "");
+  const url = raw || "http://127.0.0.1:8765";
+  sServerResult.textContent = "probing " + url + "…";
+  sServerResult.style.color = "var(--text-3)";
+  try {
+    const res = await fetch(url + "/health", { signal: AbortSignal.timeout(3000) });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const j = await res.json();
+    if (!j || j.service !== "gamma-compile-server") throw new Error("not gamma-compile-server (got " + JSON.stringify(j).slice(0, 80) + ")");
+    const ver = j.version ? " v" + j.version : "";
+    sServerResult.textContent = "✓ reachable" + ver;
+    sServerResult.style.color = "var(--audio)";
+  } catch (e) {
+    // Mixed-content failures show as TypeError "Failed to fetch" with no
+    // useful detail in DevTools — surface a clearer hint inline.
+    const msg = (e && e.message) || String(e);
+    let hint = msg;
+    if (/Failed to fetch|NetworkError/i.test(msg) && /^https?:/i.test(location.protocol) && location.protocol === "https:" && url.startsWith("http://") && !/\/\/(127\.0\.0\.1|localhost)/.test(url)) {
+      hint = "blocked — editor is on https://, daemon is on http:// LAN. Serve the editor over http:// (e.g. python -m http.server) or run the daemon behind https.";
+    } else if (/abort|timeout/i.test(msg)) {
+      hint = "timeout — daemon not running or unreachable from this device";
+    }
+    sServerResult.textContent = "✗ " + hint;
+    sServerResult.style.color = "var(--danger)";
+  }
 });
 document.getElementById("btn-settings-clear").addEventListener("click", () => {
   if (!confirm("Clear stored Anthropic API key from this browser?")) return;
@@ -18524,19 +18602,29 @@ function stopMeterLoop() {
 /* ------------- Local compile-server detection ------------- */
 /* Probe localhost:8765/health on first Play click. If the daemon is
  * up, all compile requests route there (full Emscripten, ~5–15 s).
- * If not, fall back to the in-browser Wasmer path (~OOM-prone). */
+ * If not, fall back to the in-browser Wasmer path (~OOM-prone).
+ *
+ * If the user has set aiSettings.compileServerUrl (e.g. for a LAN
+ * daemon they're hitting from an iPad), that URL is the SOLE candidate
+ * — we don't also probe localhost, since on a remote device localhost
+ * just refers to the device itself and would dilute the timeout budget.
+ * The probe timeout is also bumped (3 s) since LAN round-trips can be
+ * slightly slower than the loopback adapter. */
 let localServerStatus = null;       // null = unprobed, true = available, false = not running
 let localServerEndpoint = null;     // base URL of whichever candidate responded
 async function probeLocalServer() {
   if (localServerStatus !== null) return localServerStatus;
-  // Try BOTH 127.0.0.1 and localhost in parallel — on some Windows
-  // setups `localhost` resolves to IPv6 ::1 first, which adds a slow
-  // fallback to IPv4 and trips our short timeout. 127.0.0.1 is direct.
-  const candidates = [
-    "http://127.0.0.1:8765",
-    "http://localhost:8765"
-  ];
-  const timeoutMs = Math.max(1500, PREVIEW.localServerProbeTimeoutMs);
+  const customUrl = (aiSettings && aiSettings.compileServerUrl || "").trim().replace(/\/+$/, "");
+  // Custom URL wins; otherwise try BOTH 127.0.0.1 and localhost in
+  // parallel — on some Windows setups `localhost` resolves to IPv6 ::1
+  // first, which adds a slow fallback to IPv4 and trips our short
+  // timeout. 127.0.0.1 is direct.
+  const candidates = customUrl
+    ? [customUrl]
+    : ["http://127.0.0.1:8765", "http://localhost:8765"];
+  const timeoutMs = customUrl
+    ? Math.max(3000, PREVIEW.localServerProbeTimeoutMs)
+    : Math.max(1500, PREVIEW.localServerProbeTimeoutMs);
   const results = await Promise.allSettled(candidates.map(async base => {
     const res = await fetch(base + "/health", {
       signal: AbortSignal.timeout(timeoutMs)
