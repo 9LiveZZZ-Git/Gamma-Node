@@ -9475,6 +9475,102 @@ public:
     description: "Stereo widener. Internally encodes L/R → M/S, scales the side channel by width, then decodes back. width=1 = pass-through; <1 collapses toward mono; >1 widens. Often paired with MonoMaker on the low end to keep bass mono while widening highs."
   },
 
+  /* HaasDelay — single-channel short delay for stereo width via
+   * the Haas effect. Mono in fans out to L straight and R delayed
+   * by 5–30 ms. The brain perceives this as a wider stereo image
+   * without summing-to-mono cancellation issues. Set delay around
+   * 15 ms for a subtle widening, 30+ ms for a clear "doubling"
+   * effect (you start hearing it as a discrete echo past 35 ms). */
+  HaasDelay: {
+    category: "Effect", color: COLOR.effect, header: null,
+    extraHeaders: ["<Gamma/Delay.h>"],
+    cppType: "GammaHaas",
+    helperClass:
+`class GammaHaas {
+    gam::Delay<> d_;
+public:
+    GammaHaas() {
+        d_.maxDelay(0.05f);
+        d_.delay(0.015f);
+    }
+    void setDelay(float ms) {
+        const float s = ms * 0.001f;
+        d_.delay((s < 0.001f) ? 0.001f : (s > 0.05f ? 0.05f : s));
+    }
+    struct Out { float l, r; };
+    Out operator()(float in) {
+        Out o;
+        o.l = in;
+        o.r = d_(in);
+        return o;
+    }
+};`,
+    ins: [
+      { n: "in",    t: "audio" },
+      { n: "delay", t: "param" }
+    ],
+    outs: [
+      { n: "L", t: "audio", access: ".l" },
+      { n: "R", t: "audio", access: ".r" }
+    ],
+    params: { delay: 15 },
+    methods: { delay: "setDelay" },
+    description: "Haas-effect stereo widener. Mono in → L straight + R delayed by `delay` ms (1–50). 10–25 ms reads as natural widening, 30+ ms starts to sound like a slap-back. Mono-compatible since the delayed copy doesn't cancel against the original at most listening distances."
+  },
+
+  /* MonoMaker — crossover that forces low frequencies to mono.
+   * Splits each channel into low + high via complementary
+   * Biquad LP/HP at `cutoff`; lows are summed and applied to
+   * both outputs, highs preserve the original L/R. Common on
+   * mastering bus to keep bass tight + centered while letting
+   * mids/highs stay wide. Pair with `StereoWidener` (above the
+   * cutoff) for a clean separation. */
+  MonoMaker: {
+    category: "Effect", color: COLOR.effect, header: "Filter",
+    cppType: "GammaMonoMaker",
+    helperClass:
+`class GammaMonoMaker {
+    gam::Biquad<> lpfL_, lpfR_, hpfL_, hpfR_;
+    float r_ = 0.f;
+    float cutoff_ = 120.f;
+public:
+    GammaMonoMaker() {
+        lpfL_.type(gam::LOW_PASS);  lpfL_.freq(120.f);
+        lpfR_.type(gam::LOW_PASS);  lpfR_.freq(120.f);
+        hpfL_.type(gam::HIGH_PASS); hpfL_.freq(120.f);
+        hpfR_.type(gam::HIGH_PASS); hpfR_.freq(120.f);
+    }
+    void setR(float v) { r_ = v; }
+    void setCutoff(float v) {
+        cutoff_ = (v < 20.f) ? 20.f : (v > 1000.f ? 1000.f : v);
+        lpfL_.freq(cutoff_); lpfR_.freq(cutoff_);
+        hpfL_.freq(cutoff_); hpfR_.freq(cutoff_);
+    }
+    struct Out { float l, r; };
+    Out operator()(float l) {
+        const float lLo = lpfL_(l),  rLo = lpfR_(r_);
+        const float lHi = hpfL_(l),  rHi = hpfR_(r_);
+        const float mono = (lLo + rLo) * 0.5f;
+        Out o;
+        o.l = mono + lHi;
+        o.r = mono + rHi;
+        return o;
+    }
+};`,
+    ins: [
+      { n: "L",      t: "audio" },
+      { n: "R",      t: "audio" },
+      { n: "cutoff", t: "param" }
+    ],
+    outs: [
+      { n: "L", t: "audio", access: ".l" },
+      { n: "R", t: "audio", access: ".r" }
+    ],
+    params: { cutoff: 120 },
+    methods: { R: "setR", cutoff: "setCutoff" },
+    description: "Forces stereo bass below `cutoff` Hz to mono. Below cutoff: (L+R)/2 to both channels. Above cutoff: L and R pass through. Default 120 Hz handles typical bass / kick. Wire stereo into L/R, route the output L/R into OutputStereo (or downstream stereo nodes)."
+  },
+
   /* ---- Effects (Effects.h) ---- */
   /* gam::ReverbMS lives in Spatial.h, NOT Effects.h. The previous
    * `header: "Effects"` was including the wrong file → compile fail.
@@ -9798,6 +9894,166 @@ public:
     params: { rate: 0.5, depth: 1 },
     methods: { rate: "setRate", depth: "setDepth" },
     description: "Auto-pan — LFO-driven stereo panner. rate in Hz; depth ∈ [0,1] (1 = full L↔R sweep). Mono in, stereo out — wire L/R into OutputStereo."
+  },
+
+  /* AutoFilter — LFO-modulated filter cutoff. The LFO sweeps the
+   * cutoff up and down by `depth` octaves around `baseFreq`,
+   * with a `mode` enum picking LP / HP / BP. Equivalent to wiring
+   * `LFO → some math → Biquad.freq` but baked into one node so
+   * the common case is a single drop-in. */
+  AutoFilter: {
+    category: "Effect", color: COLOR.effect, header: "Oscillator",
+    extraHeaders: ["<Gamma/Filter.h>", "<cmath>"],
+    cppType: "GammaAutoFilter",
+    helperClass:
+`class GammaAutoFilter {
+    gam::Biquad<> filter_;
+    gam::LFO<> lfo_;
+    float depth_ = 1.0f;          // octaves of sweep at full LFO swing
+    float baseFreq_ = 800.f;
+    int   mode_ = 0;              // 0=LP, 1=HP, 2=BP
+public:
+    GammaAutoFilter() {
+        filter_.type(gam::LOW_PASS);
+        filter_.freq(baseFreq_);
+        filter_.res(0.7f);
+        lfo_.freq(0.5f);
+    }
+    void setRate(float v)  { lfo_.freq(v); }
+    void setDepth(float v) { depth_ = (v < 0.f) ? 0.f : (v > 4.f ? 4.f : v); }
+    void setBase(float v)  { baseFreq_ = (v < 20.f) ? 20.f : (v > 12000.f ? 12000.f : v); }
+    void setRes(float v)   { filter_.res((v < 0.5f) ? 0.5f : (v > 20.f ? 20.f : v)); }
+    void setMode(float m) {
+        mode_ = (int)m;
+        switch (mode_) {
+            case 1: filter_.type(gam::HIGH_PASS); break;
+            case 2: filter_.type(gam::BAND_PASS); break;
+            default: filter_.type(gam::LOW_PASS); break;
+        }
+    }
+    float operator()(float in) {
+        // Exponential sweep — ±depth octaves around baseFreq.
+        const float f = baseFreq_ * std::pow(2.f, depth_ * lfo_.cos());
+        const float clamped = (f < 20.f) ? 20.f : (f > 18000.f ? 18000.f : f);
+        filter_.freq(clamped);
+        return filter_(in);
+    }
+};`,
+    ins: [
+      { n: "in",    t: "audio" },
+      { n: "rate",  t: "param" },
+      { n: "depth", t: "param" },
+      { n: "base",  t: "param" },
+      { n: "res",   t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { rate: 0.5, depth: 1, base: 800, res: 0.7, mode: "LP" },
+    methods: { rate: "setRate", depth: "setDepth", base: "setBase", res: "setRes", mode: "setMode" },
+    paramOptions: { mode: ["LP", "HP", "BP"] },
+    enumMap:      { mode: { LP: "0", HP: "1", BP: "2" } },
+    description: "LFO-modulated filter (LP/HP/BP). Cutoff sweeps ±`depth` octaves around `base` Hz at `rate` Hz. res sets resonance. Equivalent to wiring an LFO into a Biquad's freq but with the exponential-octave mapping baked in (so depth=1 = ±1 octave regardless of base)."
+  },
+
+  /* TubeSat — asymmetric tube-style soft saturation. tanh on the
+   * positive half-cycle, faster-rolling exponential on the
+   * negative half-cycle (the "12AX7-ish" curve). bias shifts the
+   * input DC offset before saturation, giving the classic
+   * even-harmonics warmth at small biases. drive is the input
+   * gain (output is auto-compensated so volume stays roughly
+   * constant). */
+  TubeSat: {
+    category: "Effect", color: COLOR.effect, header: null,
+    extraHeaders: ["<cmath>"],
+    cppType: "GammaTubeSat",
+    helperClass:
+`class GammaTubeSat {
+    float drive_ = 1.f;
+    float bias_ = 0.f;
+public:
+    void setDrive(float v) { drive_ = (v < 0.1f) ? 0.1f : (v > 10.f ? 10.f : v); }
+    void setBias(float v)  { bias_ = (v < -1.f) ? -1.f : (v > 1.f ? 1.f : v); }
+    float operator()(float in) {
+        const float x = in * drive_ + bias_;
+        // Asymmetric: tanh up top, sharper exp on the bottom.
+        const float y = (x >= 0.f) ? std::tanh(x) : -(1.f - std::exp(x));
+        return y / drive_;   // gain compensation
+    }
+};`,
+    ins: [
+      { n: "in",    t: "audio" },
+      { n: "drive", t: "param" },
+      { n: "bias",  t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { drive: 1.0, bias: 0.0 },
+    methods: { drive: "setDrive", bias: "setBias" },
+    description: "Tube-style soft saturation. Asymmetric curve (tanh top, exp bottom) for the even-harmonic warmth. drive controls input gain (output auto-compensated); bias shifts DC pre-saturation for the classic 12AX7 bias-into-distortion sound."
+  },
+
+  /* TapeSat — symmetric soft saturation with a touch of hysteresis
+   * so the curve has a tiny memory of its previous output. This is
+   * the audible "sag" of analog tape — fast transients soften, low-
+   * end fattens. drive is the input gain. */
+  TapeSat: {
+    category: "Effect", color: COLOR.effect, header: null,
+    extraHeaders: ["<cmath>"],
+    cppType: "GammaTapeSat",
+    helperClass:
+`class GammaTapeSat {
+    float drive_ = 1.f;
+    float prev_ = 0.f;
+public:
+    void setDrive(float v) { drive_ = (v < 0.1f) ? 0.1f : (v > 10.f ? 10.f : v); }
+    float operator()(float in) {
+        const float x = in * drive_;
+        const float y = std::tanh(x);
+        // Mild one-pole hysteresis — the saturated value remembers
+        // a small fraction of the previous output. Adds tape-like
+        // softening on transients and low-end body.
+        const float HYST = 0.06f;
+        const float out = y * (1.f - HYST) + prev_ * HYST;
+        prev_ = out;
+        return out / drive_;
+    }
+};`,
+    ins: [
+      { n: "in",    t: "audio" },
+      { n: "drive", t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { drive: 1.0 },
+    methods: { drive: "setDrive" },
+    description: "Tape-style soft saturation. Symmetric tanh + slight hysteresis (one-pole feedback of previous output) for the analog-tape sag — softens transients, adds low-end body. drive = input gain (output auto-compensated)."
+  },
+
+  /* Diode — diode-style soft clipping. sign(x) * (1 - exp(-|x|))
+   * gives a smoother knee than tanh and a different harmonic
+   * character — more of an "edge" sound at moderate drive,
+   * compresses harder at extreme drive. */
+  Diode: {
+    category: "Effect", color: COLOR.effect, header: null,
+    extraHeaders: ["<cmath>"],
+    cppType: "GammaDiode",
+    helperClass:
+`class GammaDiode {
+    float drive_ = 1.f;
+public:
+    void setDrive(float v) { drive_ = (v < 0.1f) ? 0.1f : (v > 10.f ? 10.f : v); }
+    float operator()(float in) {
+        const float x = in * drive_;
+        const float ax = std::fabs(x);
+        const float sgn = (x >= 0.f) ? 1.f : -1.f;
+        return sgn * (1.f - std::exp(-ax)) / drive_;
+    }
+};`,
+    ins: [
+      { n: "in",    t: "audio" },
+      { n: "drive", t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { drive: 1.0 },
+    methods: { drive: "setDrive" },
+    description: "Diode-style soft clip via signed exponential softening. sign(x)·(1−e^−|x|) — smoother knee than tanh, bites harder at high drive. Use as a softer alternative to SoftClip for guitar / drums / anywhere you want grit without harsh top-end."
   },
 
   /* ---- Analysis (Analysis.h) ---- */
