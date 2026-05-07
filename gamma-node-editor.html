@@ -18342,11 +18342,33 @@ const Visual = {
   context: null,
   presentationFormat: null,
   features: new Set(),    // active features the device opted into
+
+  // Phase 6.1.4 — render-target framebuffer + blit pipeline.
+  // Shader nodes (6.4.x) render INTO the framebuffer at the user-
+  // selected resolution; a single fullscreen-triangle blit samples
+  // it onto the visible canvas with letterbox / pillarbox bars to
+  // preserve aspect ratio (object-fit: contain semantics).
+  framebuffer: null,            // GPUTexture
+  framebufferView: null,        // GPUTextureView (rebuilt with FBO)
+  fbWidth:  1920,
+  fbHeight: 1080,
+  fbFormat: "rgba8unorm",
+  resolutionKey: "1080p",
+  RESOLUTIONS: [
+    { key: "1080p", w: 1920, h: 1080 },
+    { key: "1440p", w: 2560, h: 1440 },
+    { key: "4K",    w: 3840, h: 2160 },
+    { key: "8K",    w: 7680, h: 4320 }
+  ],
+  blitPipeline: null,           // GPURenderPipeline — fullscreen triangle
+  blitBindGroupLayout: null,    // GPUBindGroupLayout — texture + sampler
+  blitBindGroup: null,          // GPUBindGroup (rebuilt when FBO changes)
+  blitSampler: null,            // GPUSampler — linear / clamp-to-edge
+
   // Future-ticket holders so callers can sanity-check whether a piece
   // of infra is online before they try to render through it.
   pipelineCache: null,    // 6.2.1
-  bindLayoutCache: null,  // 6.3.4
-  framebuffers: null      // 6.1.4 / 6.3.2
+  bindLayoutCache: null   // 6.3.4
 };
 
 function webgpuAvailable() {
@@ -18418,6 +18440,15 @@ async function ensureGPUDevice() {
         alphaMode: "premultiplied"
       });
       sizeVisualCanvas();
+      // Phase 6.1.4 — allocate the FBO at the default resolution and
+      // build the blit pipeline before the first smoke render. Order
+      // matters: pipeline needs presentationFormat, FBO needs device,
+      // bind group needs both. allocateFramebuffer also creates the
+      // bind group; createBlitPipeline creates the layout that bind
+      // group references.
+      _createBlitPipeline();
+      _allocateFramebuffer();
+      _rebuildBlitBindGroup();
       smokeClearVisual();
     }
 
@@ -18467,36 +18498,215 @@ window.addEventListener("resize", () => {
   if (Visual.device && Visual.context) smokeClearVisual();
 });
 
-/* Smoke clear — submits a single render pass that clears the canvas
- * to the editor's background color. Until VisualOutput (6.1.7) ships,
- * this is the only render path; serves as proof-of-life that the
- * device + context + present pipeline are working end-to-end.
- * Imperceptible visually since the body's bg is the same color, but
- * an inspector can confirm the canvas has been written to. */
-function smokeClearVisual() {
-  if (!Visual.device || !Visual.context) return;
-  let view;
-  try { view = Visual.context.getCurrentTexture().createView(); }
-  catch (e) {
-    // getCurrentTexture throws if the canvas was resized to 0 or the
-    // context dropped; sizeVisualCanvas should have handled the
-    // resize, but log if not.
-    console.warn("[visual] getCurrentTexture failed:", e);
+/* ----- Phase 6.1.4 — render-target framebuffer + blit pipeline -------- */
+
+/* Allocate (or reallocate) the offscreen framebuffer texture at the
+ * current Visual.fbWidth × Visual.fbHeight. Shader nodes will render
+ * into this; the blit pipeline reads it onto the visible canvas. The
+ * texture is rgba8unorm (matches preferred canvas format, no extra
+ * conversion at blit time) with both RENDER_ATTACHMENT and
+ * TEXTURE_BINDING usage. Old texture is destroyed before the new one
+ * is allocated to free the GPU memory immediately rather than waiting
+ * for GC. */
+function _allocateFramebuffer() {
+  if (!Visual.device) return;
+  if (Visual.framebuffer) {
+    try { Visual.framebuffer.destroy(); } catch (_) {}
+  }
+  Visual.framebuffer = Visual.device.createTexture({
+    label: "visual-framebuffer-" + Visual.resolutionKey,
+    size: [Visual.fbWidth, Visual.fbHeight, 1],
+    format: Visual.fbFormat,
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
+  });
+  Visual.framebufferView = Visual.framebuffer.createView();
+}
+
+/* Build the fullscreen-triangle blit pipeline once at device init.
+ * The pipeline samples the framebuffer texture and writes to the
+ * visible canvas. Topology is a single triangle that overshoots the
+ * viewport on two sides — saves one vertex vs the two-triangle quad
+ * approach with no other downside (the rasterizer clips the overshoot).
+ * Layout is bind-group 0 = (texture, sampler). */
+function _createBlitPipeline() {
+  if (!Visual.device || !Visual.presentationFormat) return;
+  const wgsl = /* wgsl */ `
+struct VsOut {
+  @builtin(position) pos: vec4f,
+  @location(0) uv: vec2f,
+}
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  // Fullscreen triangle covering [-1,-1] to [1,1] with UVs that put
+  // (0,0) at the top-left of the texture (V is flipped vs clip-Y).
+  var p = array<vec2f, 3>(
+    vec2f(-1.0, -1.0),
+    vec2f( 3.0, -1.0),
+    vec2f(-1.0,  3.0),
+  );
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@group(0) @binding(0) var fbTex: texture_2d<f32>;
+@group(0) @binding(1) var fbSampler: sampler;
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  return textureSample(fbTex, fbSampler, in.uv);
+}
+`;
+  const module = Visual.device.createShaderModule({ label: "blit-shader", code: wgsl });
+
+  Visual.blitBindGroupLayout = Visual.device.createBindGroupLayout({
+    label: "blit-bgl",
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+      { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } }
+    ]
+  });
+
+  Visual.blitPipeline = Visual.device.createRenderPipeline({
+    label: "blit-pipeline",
+    layout: Visual.device.createPipelineLayout({
+      bindGroupLayouts: [Visual.blitBindGroupLayout]
+    }),
+    vertex:   { module, entryPoint: "vs_main" },
+    fragment: {
+      module,
+      entryPoint: "fs_main",
+      targets: [{ format: Visual.presentationFormat }]
+    },
+    primitive: { topology: "triangle-list" }
+  });
+
+  Visual.blitSampler = Visual.device.createSampler({
+    label: "blit-sampler",
+    magFilter: "linear",
+    minFilter: "linear",
+    addressModeU: "clamp-to-edge",
+    addressModeV: "clamp-to-edge"
+  });
+}
+
+/* Rebuild the blit bind group whenever the framebuffer is reallocated
+ * (resolution change, or first allocation). Cheap — just one
+ * createBindGroup call referencing the existing layout + sampler +
+ * the fresh framebuffer view. */
+function _rebuildBlitBindGroup() {
+  if (!Visual.device || !Visual.framebufferView ||
+      !Visual.blitBindGroupLayout || !Visual.blitSampler) return;
+  Visual.blitBindGroup = Visual.device.createBindGroup({
+    label: "blit-bg",
+    layout: Visual.blitBindGroupLayout,
+    entries: [
+      { binding: 0, resource: Visual.framebufferView },
+      { binding: 1, resource: Visual.blitSampler }
+    ]
+  });
+}
+
+/* Public API: change render resolution. Called from the resolution
+ * HUD (6.1.5, next ticket). Reallocates the FBO + rebuilds the bind
+ * group + re-runs the smoke render so the user sees the change
+ * immediately. Skips silently if the device isn't acquired yet —
+ * resolution preference is captured for when it is. */
+function setRenderResolution(key) {
+  const r = Visual.RESOLUTIONS.find(x => x.key === key);
+  if (!r) {
+    console.warn("[visual] unknown render resolution:", key);
     return;
   }
-  const enc = Visual.device.createCommandEncoder({ label: "smoke-clear" });
-  // --bg = #050608 → linear-ish RGB (premultiplied alpha; values just
-  // ratio'd from byte-space, no sRGB→linear since the canvas format
-  // is preferred-canvas-format, often unorm-srgb on macOS — close
-  // enough for proof-of-life).
+  Visual.resolutionKey = key;
+  Visual.fbWidth  = r.w;
+  Visual.fbHeight = r.h;
+  if (Visual.device && Visual.context) {
+    _allocateFramebuffer();
+    _rebuildBlitBindGroup();
+    smokeClearVisual();
+  }
+  console.log("[visual] render resolution = " + key + " (" + r.w + "×" + r.h + ")");
+}
+
+/* Compute the aspect-correct viewport rect inside the visible canvas
+ * for a framebuffer of (fbW, fbH). Mirrors object-fit: contain — the
+ * FBO scales uniformly to fit inside the canvas; remaining area is
+ * letterbox (top/bottom) or pillarbox (left/right) bars. Returns the
+ * viewport in physical pixels (canvas drawing-buffer space). */
+function _blitViewport() {
+  const cw = (Visual.canvas && Visual.canvas.width)  || 1;
+  const ch = (Visual.canvas && Visual.canvas.height) || 1;
+  const fbW = Visual.fbWidth  || 1;
+  const fbH = Visual.fbHeight || 1;
+  const scale = Math.min(cw / fbW, ch / fbH);
+  const vpW = Math.max(1, Math.floor(fbW * scale));
+  const vpH = Math.max(1, Math.floor(fbH * scale));
+  const vpX = Math.floor((cw - vpW) / 2);
+  const vpY = Math.floor((ch - vpH) / 2);
+  return { x: vpX, y: vpY, w: vpW, h: vpH };
+}
+
+/* Smoke render — two passes. Pass 1 clears the framebuffer to a
+ * recognizable debug color (slightly bluer than the editor backdrop
+ * so an inspector can see "yes the FBO is being drawn into"). Pass 2
+ * blits the FBO onto the visible canvas through the fullscreen-quad
+ * pipeline with object-fit: contain letterbox math.
+ *
+ * Until shader nodes ship in 6.4.x, the FBO content is just a flat
+ * clear. The point is to prove end-to-end:
+ *   device → FBO render pass → texture binding → blit pipeline →
+ *   canvas present
+ * works. Live Mode is the easiest way to see the result — toggle L
+ * on a touch-device-sized window and you'll see a near-black canvas
+ * with subtle blue tint, possibly with letterbox bars if the window's
+ * aspect doesn't match the FBO. Aspect-mismatch is the visible proof
+ * that the blit math is correct. */
+function smokeClearVisual() {
+  if (!Visual.device || !Visual.context || !Visual.framebufferView ||
+      !Visual.blitPipeline || !Visual.blitBindGroup) return;
+
+  const enc = Visual.device.createCommandEncoder({ label: "smoke" });
+
+  // Pass 1: clear FBO to debug color.
   enc.beginRenderPass({
+    label: "fbo-smoke-clear",
     colorAttachments: [{
-      view,
-      clearValue: { r: 5/255, g: 6/255, b: 8/255, a: 1.0 },
+      view: Visual.framebufferView,
+      clearValue: { r: 10/255, g: 14/255, b: 22/255, a: 1.0 },
       loadOp: "clear",
       storeOp: "store"
     }]
   }).end();
+
+  // Pass 2: blit FBO to visible canvas with letterbox bars.
+  let canvasView;
+  try { canvasView = Visual.context.getCurrentTexture().createView(); }
+  catch (e) {
+    console.warn("[visual] canvas getCurrentTexture failed:", e);
+    return;
+  }
+  const vp = _blitViewport();
+  const blit = enc.beginRenderPass({
+    label: "fbo-blit",
+    colorAttachments: [{
+      view: canvasView,
+      // Letterbox bars: pure black so they read as "no signal" rather
+      // than competing with the visual content.
+      clearValue: { r: 0, g: 0, b: 0, a: 1.0 },
+      loadOp: "clear",
+      storeOp: "store"
+    }]
+  });
+  blit.setPipeline(Visual.blitPipeline);
+  blit.setBindGroup(0, Visual.blitBindGroup);
+  blit.setViewport(vp.x, vp.y, vp.w, vp.h, 0, 1);
+  blit.draw(3);   // fullscreen triangle
+  blit.end();
+
   Visual.device.queue.submit([enc.finish()]);
 }
 
