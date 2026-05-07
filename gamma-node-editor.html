@@ -7506,6 +7506,125 @@ public:
     description: "Voice activity / keyword detection. Wire audio (e.g. MicInput.out) into in. env = smoothed envelope, gate = active flag (with hold + hysteresis), trig = one-sample pulse on each voice onset. Record trigger-word samples in the props pane to teach the detector your activation phrase (template-matching detection ships in a future build; energy gate is what fires today)."
   },
 
+  /* KeywordSpotter — VoiceTrigger upgraded with JS-side template
+   * matching. Same C++ helper shape as VoiceTrigger (energy gate
+   * + env / gate / trig outputs) PLUS a triggerFromJS hostGate
+   * that the JS detection pipeline calls when the live mic stream
+   * matches one of the recorded trigger-word templates.
+   *
+   * How it works:
+   *   1. User records 3–5 takes of the trigger word in the props
+   *      pane (same UI as VoiceTrigger — both nodes share the
+   *      recordTriggerSample / triggerSamples plumbing).
+   *   2. On preview start, the editor computes a 16-point
+   *      normalized amplitude envelope from each recording — a
+   *      simple but discriminative fingerprint that captures the
+   *      word's overall shape (sharpness, syllable structure,
+   *      rise/fall pattern).
+   *   3. While playing, JS taps the mic stream and maintains a
+   *      rolling buffer (~1.5 s). Every 80 ms it extracts the
+   *      same 16-point envelope from the buffer and compares to
+   *      each template via cosine similarity.
+   *   4. If the best similarity exceeds matchThreshold AND
+   *      enough time has passed since the last match (cooldown),
+   *      JS dispatches the C++ helper's triggerFromJS setter,
+   *      which fires the trig output for one sample.
+   *
+   * Limitations: envelope-shape matching is order-invariant in
+   * the time domain — it captures word duration + energy
+   * contour but not phonemes, so similar-shape words ("hello"
+   * vs "yellow") may be confused. For phoneme-level distinction
+   * the next pass would compute MFCCs (FFT + mel filterbank +
+   * DCT) per frame and run DTW between sequences. Out of scope
+   * for v1 — this ships something users can demo today. */
+  KeywordSpotter: {
+    category: "Analysis", color: COLOR.analysis, header: null,
+    cppType: "GammaKeywordSpotter",
+    helperClass:
+`class GammaKeywordSpotter {
+    /* Same energy-gate logic as VoiceTrigger, plus a one-shot
+     * pulse_ flag that the JS keyword detector flips via the
+     * triggerFromJS() setter. trig fires either on energy-gate
+     * onset (for backwards compat with VoiceTrigger patches)
+     * OR when JS posts a keyword-match event. */
+    float env_ = 0.f;
+    float threshold_ = 0.05f;
+    float attackMs_ = 5.f;
+    float releaseMs_ = 100.f;
+    float holdMs_ = 200.f;
+    int   holdSamples_ = 0;
+    bool  active_ = false;
+    bool  pulse_ = false;
+    float ka_ = 1.f, kr_ = 1.f;
+    float sr_ = 48000.f;
+    void recalc() {
+        ka_ = 1.f - std::exp(-1.f / (attackMs_  * sr_ * 0.001f));
+        kr_ = 1.f - std::exp(-1.f / (releaseMs_ * sr_ * 0.001f));
+    }
+public:
+    GammaKeywordSpotter() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+        recalc();
+    }
+    void setThreshold(float t)  { threshold_ = t; }
+    void setAttack(float ms)    { attackMs_  = ms; recalc(); }
+    void setRelease(float ms)   { releaseMs_ = ms; recalc(); }
+    void setHold(float ms)      { holdMs_    = ms; }
+    void triggerFromJS()        { pulse_ = true; }
+    struct Out { float env, gate, trig; };
+    Out operator()(float in) {
+        const float a = in < 0.f ? -in : in;
+        const float k = a > env_ ? ka_ : kr_;
+        env_ += k * (a - env_);
+        Out o;
+        o.env = env_;
+        const bool wasActive = active_;
+        if (env_ > threshold_) {
+            active_ = true;
+            holdSamples_ = (int)(holdMs_ * sr_ * 0.001f);
+        } else if (active_ && holdSamples_ > 0) {
+            holdSamples_--;
+        } else {
+            active_ = false;
+        }
+        o.gate = active_ ? 1.f : 0.f;
+        // trig: one-sample pulse on either (a) voice-activity
+        // onset (energy gate) or (b) JS keyword-match event.
+        const bool fireTrig = pulse_ || (active_ && !wasActive);
+        o.trig = fireTrig ? 1.f : 0.f;
+        if (pulse_) pulse_ = false;
+        return o;
+    }
+};`,
+    ins: [
+      { n: "in",        t: "audio" },
+      { n: "threshold", t: "param" },
+      { n: "attack",    t: "param" },
+      { n: "release",   t: "param" },
+      { n: "hold",      t: "param" }
+    ],
+    outs: [
+      { n: "env",  t: "audio", access: ".env"  },
+      { n: "gate", t: "clock", access: ".gate" },
+      { n: "trig", t: "clock", access: ".trig" }
+    ],
+    params: { threshold: 0.05, attack: 5, release: 100, hold: 200, triggerSamples: [], matchThreshold: 0.85 },
+    methods: {
+      threshold: "setThreshold",
+      attack:    "setAttack",
+      release:   "setRelease",
+      hold:      "setHold"
+    },
+    gateMethods: { match: "triggerFromJS" },
+    hostGates: ["match"],
+    autoExpose: ["threshold", "attack", "release", "hold"],
+    uiOnlyParams: ["triggerSamples", "matchThreshold"],
+    kind: "keywordSpotter",
+    extraHeaders: ["<cmath>"],
+    description: "Keyword / wake-word detection. Wire MicInput.out into in. Record 3–5 takes of the trigger word in the props pane. While preview is playing, the editor compares the live mic stream against your templates via amplitude-envelope shape matching; trig fires when a match exceeds matchThreshold (cosine similarity, default 0.85). env / gate behave like VoiceTrigger so this drops in as a strict superset."
+  },
+
   /* ---- Noise (Noise.h) ----
    * Each noise type is wrapped in a thin GammaNoiseT<> template so we
    * can attach a trigger() method (re-seeds the underlying generator
@@ -12209,13 +12328,14 @@ function renderProps() {
         <p class="prop-inline" style="opacity: 0.55; font-size: 10px;">Picks a specific input device on multi-mic systems. Takes effect on next ▶ Play. The device list populates after the first permission grant — click "Enable microphone" once to populate.</p>
       </div>`;
     }
-    // VoiceTrigger: trigger-word recording UI. Captures 1.5-second
-    // mic snippets into node.params.triggerSamples. Storage is
-    // in-memory + serialized into the .gpatch JSON; the runtime
-    // detection still uses the energy-based gate (template matching
-    // is future work). UI: list of recorded clips with name +
-    // duration + delete button, plus a RECORD button at the end.
-    if (def.kind === "voiceTrigger") {
+    // VoiceTrigger / KeywordSpotter: trigger-word recording UI.
+    // Captures 1.5-second mic snippets into node.params.triggerSamples.
+    // Storage is in-memory + serialized into the .gpatch JSON.
+    // VoiceTrigger uses energy gate at runtime; KeywordSpotter
+    // additionally runs JS-side amplitude-envelope template
+    // matching against the recordings (computed at preview start).
+    if (def.kind === "voiceTrigger" || def.kind === "keywordSpotter") {
+      const isSpotter = def.kind === "keywordSpotter";
       const recs = Array.isArray(node.params && node.params.triggerSamples) ? node.params.triggerSamples : [];
       html += `<div class="prop-section">Trigger word recordings</div>`;
       html += `<div class="prop-grid" style="grid-template-columns: 1fr;">`;
@@ -12234,7 +12354,20 @@ function renderProps() {
         html += `<p class="prop-inline" style="opacity: 0.6; font-style: italic;">No recordings yet. Record 3–5 takes of the trigger word for best detection.</p>`;
       }
       html += `<button class="btn primary" id="btn-vt-record" style="width:100%;">⏺ Record trigger word (1.5 s)</button>`;
-      html += `<p class="prop-inline" style="opacity: 0.55; font-size: 10px;">Recordings are stored per-node and saved with the .gpatch. Today's runtime fires .trig from the energy gate above; full template-matching detection ships in a future build (the recordings are the training data it'll consume).</p>`;
+      // KeywordSpotter-only: match-threshold slider + live status pill.
+      if (isSpotter) {
+        const mt = (typeof node.params.matchThreshold === "number") ? node.params.matchThreshold : 0.85;
+        html += `<label class="prop-inline" style="display:flex; gap:8px; align-items:center; margin-top: 4px;">
+          <span style="opacity:0.7; min-width: 110px;">Match threshold</span>
+          <input type="range" id="ks-thresh-${node.id}" min="0.5" max="0.99" step="0.01" value="${mt}" style="flex:1;" />
+          <span id="ks-thresh-val-${node.id}" style="font-family:var(--font-mono); font-size:11px; color:var(--phosphor); width:42px; text-align:right;">${mt.toFixed(2)}</span>
+        </label>`;
+        html += `<p class="prop-inline" style="opacity: 0.55; font-size: 10px; margin-top: 2px;">Cosine similarity threshold (0.5 lax · 0.99 strict). Higher = fewer false positives but may miss real utterances. Detection compares 16-point amplitude-envelope fingerprints; works best for short, distinct words.</p>`;
+        const liveStatusId = `ks-status-${node.id}`;
+        html += `<p class="prop-inline" id="${liveStatusId}" style="font-family:var(--font-mono); font-size:10px; color:var(--text-3); margin-top: 4px;">Detector: ${recs.length ? `${recs.length} template${recs.length===1?"":"s"} loaded · ` : ""}${(typeof previewState !== "undefined" && previewState.state === "playing") ? "running" : "idle (start preview to enable)"}</p>`;
+      } else {
+        html += `<p class="prop-inline" style="opacity: 0.55; font-size: 10px;">Recordings are stored per-node and saved with the .gpatch. Today's runtime fires .trig from the energy gate above. For ML keyword detection, swap this node for a <strong>KeywordSpotter</strong> — same recording UI plus live envelope-matching against the templates while preview is playing.</p>`;
+      }
       html += `</div>`;
     }
     if (def.kind === "patchMatrix") {
@@ -12376,7 +12509,7 @@ function renderProps() {
     if (!node.params) node.params = {};
     node.params.inputSourceId = micSrcSel.value || "";
   });
-  // VoiceTrigger record button + delete buttons.
+  // VoiceTrigger / KeywordSpotter record button + delete buttons.
   const vtRecBtn = propsEl.querySelector('#btn-vt-record');
   if (vtRecBtn) vtRecBtn.addEventListener('click', () => recordVoiceTriggerSample(node));
   propsEl.querySelectorAll('[data-vt-del]').forEach(btn => {
@@ -12385,9 +12518,29 @@ function renderProps() {
       if (!Array.isArray(node.params.triggerSamples)) return;
       pushHistory("vt-del:" + node.id);
       node.params.triggerSamples.splice(idx, 1);
+      // If the spotter is currently running, refresh its templates
+      // so the deleted recording stops being a match candidate.
+      if (typeof refreshKeywordSpotterTemplates === "function") refreshKeywordSpotterTemplates(node.id);
       renderProps(); renderJson();
     });
   });
+  // KeywordSpotter match-threshold slider — live update.
+  const ksThresh = propsEl.querySelector('#ks-thresh-' + node.id);
+  const ksThreshVal = propsEl.querySelector('#ks-thresh-val-' + node.id);
+  if (ksThresh) {
+    ksThresh.addEventListener('input', () => {
+      const v = parseFloat(ksThresh.value);
+      if (!isFinite(v)) return;
+      node.params.matchThreshold = v;
+      if (ksThreshVal) ksThreshVal.textContent = v.toFixed(2);
+      // Live update — no pushHistory on input (would spam the
+      // undo stack on every drag tick); commit on change instead.
+      if (typeof refreshKeywordSpotterTemplates === "function") refreshKeywordSpotterTemplates(node.id);
+    });
+    ksThresh.addEventListener('change', () => {
+      pushHistory("ks-thresh:" + node.id);
+    });
+  }
 
   // PatchMatrix cell interaction. Click toggles 0↔1; shift-click sets
   // -1 (inversion); vertical drag inside the cell adjusts gain
@@ -17519,19 +17672,24 @@ async function previewCompileAndPlay() {
     previewProgressStage("load-wasm");
     const node = await ensureAudioWorklet();
     if (previewState.audioCtx.state === "suspended") await previewState.audioCtx.resume();
-    // Mic auto-connect — if the patch contains a MicInput node and the
-    // user has previously granted mic permission, plumb the stream into
-    // the worklet now so the next tick picks up real audio. Permission
-    // is requested asynchronously; if not yet granted we proceed and
-    // the worklet ticks with zero mic input until granted.
-    const wantsMic = state.nodes.some(n => n.type === "MicInput");
+    // Mic auto-connect — if the patch contains a MicInput node OR
+    // a KeywordSpotter (which taps the mic for live detection), get
+    // the stream up. Permission is requested asynchronously; if not
+    // yet granted we proceed and the worklet ticks with zero mic
+    // input until the user grants.
+    const wantsMic = state.nodes.some(n =>
+      n.type === "MicInput" || n.type === "KeywordSpotter");
     if (wantsMic) {
       try { await ensureMicConnected(); }
       catch (e) { console.warn("[preview] mic auto-connect failed:", e); }
+      // Stand up the keyword-detection pipeline after the mic is
+      // connected. setupAllKeywordSpotters is a no-op if the
+      // patch has no KeywordSpotter nodes or none have recordings.
+      setupAllKeywordSpotters();
     } else {
-      // No MicInput — make sure any prior session's mic source is
-      // disconnected so we don't leak the stream or feed it into a
-      // patch that doesn't want it.
+      // No MicInput / KeywordSpotter — make sure any prior session's
+      // mic source is disconnected so we don't leak the stream or
+      // feed it into a patch that doesn't want it.
       disconnectMic();
     }
     node.port.postMessage({ type: "load", wasmBytes }, [wasmBytes]);
@@ -17700,6 +17858,245 @@ function disconnectMic() {
     previewState.micSource = null;
   }
   previewState.micConnected = false;
+  // Tear down any running KeywordSpotter detectors too — they tap
+  // the same mic stream and would dangle otherwise.
+  teardownAllKeywordSpotters();
+}
+
+/* =========================================================================
+ * KeywordSpotter detection pipeline
+ *
+ * For each KeywordSpotter node with at least one triggerSamples
+ * recording, run a JS-side detector that:
+ *   1. Computes a 16-point normalized amplitude envelope from each
+ *      recording at preview-start time (the "templates").
+ *   2. Taps the live mic stream via a ScriptProcessor and maintains
+ *      a rolling buffer of the last 1.5 s of audio.
+ *   3. Every ~80 ms, extracts the same 16-point envelope from the
+ *      buffer and compares to each template via cosine similarity.
+ *   4. When the best similarity exceeds matchThreshold AND a
+ *      cooldown has elapsed (so a single utterance can't fire
+ *      multiple times), dispatches a setter call to fire the
+ *      C++ helper's triggerFromJS hostGate.
+ *
+ * The 16-point envelope is computed by:
+ *   - Splitting the input into 16 equal chunks
+ *   - Taking RMS of each chunk
+ *   - Subtracting the mean and dividing by std-dev (zero-mean unit-
+ *     variance), so cosine similarity is loudness-invariant
+ *
+ * Limitations: amplitude-envelope shape is order-invariant
+ * relative to phonemes — captures word duration + energy contour
+ * but not what's actually said. Distinguishes "silence" from
+ * "speech" reliably; distinguishes a sharp consonant-heavy word
+ * from a soft vowel-heavy word; can't distinguish "hello" from
+ * "yellow" reliably. For phoneme-level detection the next pass
+ * needs MFCC features + DTW. Out of scope for v1.
+ * ======================================================================== */
+
+const KS_ENV_BINS = 16;
+const KS_TEMPLATE_DURATION_S = 1.5;
+const KS_DETECT_INTERVAL_MS = 80;
+const KS_COOLDOWN_MS = 600;
+
+// Map nodeId → { templates: [Float32Array(16)], spec: { sampleRate, bufferSec, ringBuf, writeIdx, scriptProc, sourceNode, intervalId, lastFireMs, threshold, fireSetterIndex }}
+const _ksDetectors = new Map();
+
+function _ksComputeEnvelope(data, len) {
+  // data: typed-array-like of mono PCM samples; len: number of samples to use
+  const out = new Float32Array(KS_ENV_BINS);
+  const usable = Math.max(1, Math.min(len || data.length, data.length));
+  const step = usable / KS_ENV_BINS;
+  for (let bin = 0; bin < KS_ENV_BINS; bin++) {
+    const lo = Math.floor(bin * step);
+    const hi = Math.min(usable, Math.floor((bin + 1) * step));
+    let sumSq = 0; let n = 0;
+    for (let i = lo; i < hi; i++) { const v = data[i]; sumSq += v * v; n++; }
+    out[bin] = n ? Math.sqrt(sumSq / n) : 0;
+  }
+  // Normalize to zero-mean, unit-variance so cosine similarity is
+  // loudness-invariant. Templates and live frames both go through
+  // this same normalization.
+  let mean = 0;
+  for (let i = 0; i < KS_ENV_BINS; i++) mean += out[i];
+  mean /= KS_ENV_BINS;
+  let varSum = 0;
+  for (let i = 0; i < KS_ENV_BINS; i++) { const d = out[i] - mean; out[i] = d; varSum += d * d; }
+  const std = Math.sqrt(varSum / KS_ENV_BINS) || 1;
+  for (let i = 0; i < KS_ENV_BINS; i++) out[i] /= std;
+  return out;
+}
+
+function _ksCosine(a, b) {
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < KS_ENV_BINS; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  const denom = Math.sqrt(na * nb) || 1;
+  return dot / denom;
+}
+
+/* Find the setter index for a KeywordSpotter's `match` host gate.
+ * Returns -1 if not found (e.g., the patch wasn't compiled with
+ * the spotter, or the setter table is stale). */
+function _ksFindMatchSetterIndex(nodeId) {
+  if (typeof collectExposedSetters !== "function") return -1;
+  const setters = collectExposedSetters();
+  for (let i = 0; i < setters.length; i++) {
+    const s = setters[i];
+    if (s.nodeId === nodeId && s.key === "match" && s.isGate) return i;
+  }
+  return -1;
+}
+
+/* Stand up the detector for one KeywordSpotter node. Idempotent —
+ * if a detector is already running for the node, it's torn down
+ * and recreated (used when the user re-records or changes the
+ * threshold). */
+function setupKeywordSpotter(node) {
+  if (!node || node.type !== "KeywordSpotter") return;
+  const recs = (node.params && node.params.triggerSamples) || [];
+  if (!recs.length) return;
+  if (!previewState.audioCtx || !_micStream) return;
+  // Tear down any existing detector for this node first.
+  teardownKeywordSpotter(node.id);
+  // Compute templates from each recording.
+  const templates = recs
+    .filter(r => r && Array.isArray(r.data) && r.data.length > 0)
+    .map(r => _ksComputeEnvelope(r.data, r.data.length));
+  if (!templates.length) return;
+  // Tap the mic into a ScriptProcessor so we can read live frames.
+  const ctx = previewState.audioCtx;
+  const PROC_BUF = 1024;
+  const sourceNode = ctx.createMediaStreamSource(_micStream);
+  const proc = ctx.createScriptProcessor(PROC_BUF, 1, 1);
+  // Rolling buffer of the last KS_TEMPLATE_DURATION_S seconds.
+  const bufferSamples = Math.ceil(KS_TEMPLATE_DURATION_S * ctx.sampleRate);
+  const ringBuf = new Float32Array(bufferSamples);
+  const state = {
+    templates,
+    threshold: (typeof node.params.matchThreshold === "number") ? node.params.matchThreshold : 0.85,
+    sampleRate: ctx.sampleRate,
+    ringBuf,
+    bufferSamples,
+    writeIdx: 0,
+    sourceNode,
+    scriptProc: proc,
+    muteGain: null,
+    intervalId: null,
+    lastFireMs: 0,
+    fireSetterIndex: _ksFindMatchSetterIndex(node.id)
+  };
+  proc.onaudioprocess = (ev) => {
+    const inBuf = ev.inputBuffer.getChannelData(0);
+    // Append into the circular buffer.
+    for (let i = 0; i < inBuf.length; i++) {
+      state.ringBuf[state.writeIdx] = inBuf[i];
+      state.writeIdx = (state.writeIdx + 1) % state.bufferSamples;
+    }
+  };
+  // Connect through a zero-gain node so the ScriptProcessor ticks
+  // (it needs a destination) without echoing the mic to speakers.
+  const muteGain = ctx.createGain();
+  muteGain.gain.value = 0;
+  sourceNode.connect(proc);
+  proc.connect(muteGain);
+  muteGain.connect(ctx.destination);
+  state.muteGain = muteGain;
+  // Run the comparison on a JS interval. Keep the work small —
+  // 16-point envelope on a 1.5 s buffer + 16-element dot products
+  // for each template + a few comparisons. Cheap.
+  state.intervalId = setInterval(() => {
+    // Read the rolling buffer in chronological order.
+    const frame = new Float32Array(state.bufferSamples);
+    let r = state.writeIdx;
+    for (let i = 0; i < state.bufferSamples; i++) {
+      frame[i] = state.ringBuf[r];
+      r = (r + 1) % state.bufferSamples;
+    }
+    const liveEnv = _ksComputeEnvelope(frame, frame.length);
+    let bestSim = -1;
+    for (let i = 0; i < state.templates.length; i++) {
+      const sim = _ksCosine(liveEnv, state.templates[i]);
+      if (sim > bestSim) bestSim = sim;
+    }
+    // Update the live status pill in the props pane (if visible).
+    const statusEl = document.getElementById("ks-status-" + node.id);
+    if (statusEl) {
+      statusEl.textContent =
+        `Detector: ${state.templates.length} templates · best similarity ${bestSim.toFixed(2)} / threshold ${state.threshold.toFixed(2)}`;
+    }
+    if (bestSim > state.threshold) {
+      const now = Date.now();
+      if (now - state.lastFireMs > KS_COOLDOWN_MS) {
+        state.lastFireMs = now;
+        // Re-resolve the setter index in case the patch was
+        // recompiled since we set up (setter ordering can change).
+        if (state.fireSetterIndex < 0) {
+          state.fireSetterIndex = _ksFindMatchSetterIndex(node.id);
+        }
+        if (state.fireSetterIndex >= 0 && previewState.workletNode) {
+          previewState.workletNode.port.postMessage({
+            type: "set",
+            index: state.fireSetterIndex,
+            value: 0
+          });
+        }
+        if (statusEl) {
+          statusEl.style.color = "var(--phosphor)";
+          statusEl.textContent = `▲ MATCH · similarity ${bestSim.toFixed(2)}`;
+          setTimeout(() => { if (statusEl) statusEl.style.color = ""; }, 400);
+        }
+      }
+    }
+  }, KS_DETECT_INTERVAL_MS);
+  _ksDetectors.set(node.id, state);
+}
+
+/* Tear down the detector for one node — disconnect Web Audio
+ * graph, clear the comparison interval. Called from preview stop,
+ * mic disconnect, and any node-edit that invalidates the templates. */
+function teardownKeywordSpotter(nodeId) {
+  const s = _ksDetectors.get(nodeId);
+  if (!s) return;
+  if (s.intervalId) clearInterval(s.intervalId);
+  try { s.sourceNode && s.sourceNode.disconnect(); } catch (e) {}
+  try { s.scriptProc && s.scriptProc.disconnect(); } catch (e) {}
+  try { s.muteGain && s.muteGain.disconnect(); } catch (e) {}
+  _ksDetectors.delete(nodeId);
+}
+
+function teardownAllKeywordSpotters() {
+  Array.from(_ksDetectors.keys()).forEach(teardownKeywordSpotter);
+}
+
+/* Re-prime templates for a single node. Called from the props
+ * pane when the user adds or deletes a recording. If the node
+ * isn't currently running (no preview), this is a no-op — the
+ * fresh templates will be computed at next preview start. */
+function refreshKeywordSpotterTemplates(nodeId) {
+  if (!_ksDetectors.has(nodeId)) return;
+  const node = nodeById(nodeId);
+  if (!node) { teardownKeywordSpotter(nodeId); return; }
+  const recs = (node.params && node.params.triggerSamples) || [];
+  if (!recs.length) { teardownKeywordSpotter(nodeId); return; }
+  // Recompute templates + threshold; reuse the existing audio graph.
+  const s = _ksDetectors.get(nodeId);
+  s.templates = recs
+    .filter(r => r && Array.isArray(r.data) && r.data.length > 0)
+    .map(r => _ksComputeEnvelope(r.data, r.data.length));
+  s.threshold = (typeof node.params.matchThreshold === "number") ? node.params.matchThreshold : 0.85;
+}
+
+/* Stand up detectors for every KeywordSpotter in the current
+ * patch. Called from the preview-start path after the mic stream
+ * is hooked up. */
+function setupAllKeywordSpotters() {
+  state.nodes.forEach(n => {
+    if (n.type === "KeywordSpotter") setupKeywordSpotter(n);
+  });
 }
 
 function showCompileStderr(stderr, errMsg) {
