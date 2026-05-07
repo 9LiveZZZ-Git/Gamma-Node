@@ -1,8 +1,10 @@
 # Gamma Node Editor
 
-A visual patching environment for the [Gamma](https://github.com/AlloSphere-Research-Group/Gamma) DSP library. Patches authored in the node editor compile down to plain Gamma C++ — and, with the optional local compile server, run as real WebAssembly in the browser for live audio preview.
+A browser-native visual node editor for real-time audio. Patches authored in the editor compile to plain [Gamma](https://github.com/AlloSphere-Research-Group/Gamma) C++ — and, with the optional local compile daemon, run as live WebAssembly inside the page. **205+ built-in DSP nodes**, an in-page AI assistant, voice + handwriting input, full touch / iPad support, and end-to-end live performance from a Mac, iPad, or Chromebook on the same Wi-Fi.
 
-Built for using AlloLib Studio Online — beginners can patch interactively without writing a `gam::` declaration by hand, and advanced users can use the editor as scaffolding before taking the generated code over.
+Designed as the visual companion to [AlloLib Studio Online](https://allolib.dev) — beginners can patch interactively without writing a `gam::` declaration by hand, advanced users use the editor as scaffolding before taking the generated code over, and live performers run the whole loop in-browser.
+
+> **Heads-up — visuals are coming, not here yet.** The roadmap's next phase is a WebGPU-native visual layer (shaders, 3D, video, audio reactivity). Today the editor is a *very* well-equipped audio environment; the visual side is in active development. `docs/ROADMAP.md` (gitignored, local) tracks current direction.
 
 ## Quick start
 
@@ -18,11 +20,13 @@ xdg-open gamma-node-editor.html     # Linux
 python -m http.server
 ```
 
-A Chromium-based browser (Chrome / Edge) is recommended — the optional AI panel uses WebGPU, and the real-time audio preview needs cross-origin isolation (the bundled service worker handles that).
+A Chromium-based browser (Chrome / Edge) is recommended — the AI panel uses WebGPU, and the real-time audio preview needs cross-origin isolation (the bundled service worker handles that). Safari 18+ works for everything except WebGPU-Gemma; the cloud Anthropic provider sidesteps that.
 
 ## What it does
 
-- **Drag nodes from the palette**, wire them together, edit parameters in the properties pane.
+- **Drag nodes from the palette**, wire them together, edit parameters in the properties pane. ~205 built-in nodes: oscillators (sine / saw / square / triangle / supersaw / 6 composite shapes / FM2 / FM4 / wavetable scan), noise, envelopes (AD / AHD / ADSR + drawable `EnvDraw`), filters (Biquad / SVF / Moog ladder / Hilbert / formant), delays (PingPong / MultiTap / TempoSync / Haas), reverbs (Freeverb / Plate / Spring / FDN8), full dynamics (Compressor / Limiter / Expander / Sidechain / MultibandComp / **OTT** / **UpwardComp**), modulation (Tremolo / Vibrato / Flanger / Phaser / AutoPan), saturation, stereo utilities, sample / mic / voice players, **MasterClock + sequencers + Arp + automation lanes**, and analysis.
+- **Touch + iPad-friendly.** Single-finger drag for nodes / wires / marquee. **Pinch-zoom + two-finger pan.** Long-press for an action menu (Duplicate / Group / Delete on nodes; Duplicate / Ungroup / Delete on collapsed groups). Wire-drop snaps to nearby compatible ports — tuned for fingertip imprecision. Apple Pencil routes to the handwriting tool. Full LAN setup so an iPad on Wi-Fi can drive a Mac running the compile daemon.
+- **Real-time audio preview** — click ▶ to compile and play the patch. Compile + audio routing happens via a local Emscripten daemon (~5–15 s per compile, hot-reload on change). The Monitor tab shows VU / scope / FFT meters and an on-screen piano. `KeyboardIn` makes your QWERTY keyboard a one-octave instrument right inside the patch.
 - **Save as `.gpatch`** (JSON, round-trips losslessly).
 - **Generated C++** updates live in the Code preview tab. Copy it into your AlloApp:
 
@@ -37,24 +41,28 @@ A Chromium-based browser (Chrome / Edge) is recommended — the optional AI pane
   };
   ```
 
-- **110+ built-in nodes** across oscillators, noise, envelopes, filters, delays, effects, analysis, conversion, math/logic, and sinks — plus a `KeyboardIn` node that turns your QWERTY keyboard into a one-octave instrument right inside the patch.
-- **Real-time audio preview** — click ▶ to compile and play the patch. The Monitor tab shows VU / scope / FFT meters and an on-screen piano.
-- **Custom nodes via `.gdsp`** — write a C++ class with `// @gdsp-*` metadata comments and it joins the palette.
-- **Optional AI panel** for generating, modifying, fixing, and explaining `.gdsp` source. Runs locally via Gemma 4 (WebGPU, no API key) or via the Anthropic API (cloud, user-supplied key).
+- **Custom nodes via `.gdsp`** — write a C++ class with `// @gdsp-*` metadata comments and it joins the palette. Validate / save / submit-to-community from inside the editor.
+- **Group nodes** — wrap a multi-selection into a collapsible group with port stubs. Ungroup to dissolve the wrapper. Duplicate to clone the whole subgraph including internal wiring.
+- **AI panel** for generating, modifying, fixing, and explaining `.gdsp` source. Two providers, no lock-in:
+  - **Gemma 4** local (E2B / E4B via Transformers.js + WebGPU) — no API key, no cloud. ~500 MB / 1.5 GB one-time download cached in IndexedDB.
+  - **Anthropic** (Claude) — cloud, user-supplied API key stored only in this browser.
+- **Voice input** — talk-to-edit. The 🎤 button records audio, transcribes via Whisper-tiny (~75 MB, English-only, runs on WebAssembly), and feeds the transcript into the AI prompt.
+- **Handwriting recognition** — the `✎` tool. Sketch a node name on the canvas, get the matching node placed at that location. Tesseract OCR primary path with Gemma vision fallback for the messier cases. Apple Pencil works extra well.
+- **Voice-trigger nodes** — `VoiceTrigger` (energy-gate VAD) and `KeywordSpotter` (envelope / Whisper / hybrid detection modes), both with per-node trigger-word recording UI. Useful for live performance where you want the patch to react to spoken cues.
 
-## Real-time audio preview — the local compile server (backend)
+## Real-time audio preview — the local compile server
 
-The editor's ▶ button compiles the current patch to WebAssembly and routes the bytes into an `AudioWorklet` for live playback. Two compile paths are supported:
+The editor's ▶ button compiles the current patch to WebAssembly and routes the bytes into an `AudioWorklet` for live playback. Two compile paths:
 
 1. **In-browser Wasmer clang** (default if no daemon is running). Works for trivial patches but reliably OOMs on Gamma's template-heavy headers — the in-browser clang hits a ~4 GB wasm memory ceiling.
-2. **Local compile server** (recommended). A tiny Express daemon — [`gamma-compile-server`](https://github.com/9LiveZZZ-Git/gamma-compile-server) — runs on `127.0.0.1:8765`, drives a real Emscripten + Gamma toolchain on your machine, and returns the compiled wasm in 5–15 seconds.
+2. **Local compile daemon** (recommended). The [`gamma-compile-server`](https://github.com/9LiveZZZ-Git/gamma-compile-server) Express daemon runs on `127.0.0.1:8765`, drives a real Emscripten + Gamma toolchain on your machine, and returns the compiled wasm in 5–15 seconds.
 
 ### Running the daemon
 
 Requires **Node 20+** and **git** on your `PATH`.
 
 ```bash
-# Coming soon (v0.1.0 publishes shortly):
+# Coming soon (npm publish in progress):
 npx @9livezzz/gamma-compile-server
 
 # Until then, clone + run locally:
@@ -84,7 +92,7 @@ Default cache directories:
 
 ### Why a daemon
 
-Native Emscripten produces full-fidelity Gamma builds in seconds on any dev machine; in-browser clang fundamentally can't, regardless of flag tuning. The daemon is the simplest fast-path that keeps the editor itself a single static HTML file.
+Native Emscripten produces full-fidelity Gamma builds in seconds on any dev machine; in-browser clang fundamentally can't, regardless of flag tuning. The daemon is the simplest fast path that keeps the editor itself a single static HTML file.
 
 ## Patching from an iPad / phone (LAN setup)
 
@@ -106,8 +114,8 @@ node bin/gamma-compile-server.js \
 
 # 2. Serve the editor over plain HTTP from the same host. Browsers
 #    block fetches from HTTPS pages (the GitHub Pages copy) to
-#    non-localhost HTTP URLs, so we have to host the editor over
-#    HTTP too. In a separate terminal:
+#    non-localhost HTTP URLs, so we host the editor over HTTP too.
+#    In a separate terminal:
 cd Gamma-Node
 python -m http.server 8000
 ```
@@ -126,7 +134,7 @@ python -m http.server 8000
 | Gesture | Effect |
 |---|---|
 | Single-finger drag on a node | Move it |
-| Single-finger drag on an out-port | Draw a wire |
+| Single-finger drag on an out-port | Draw a wire (snaps to nearby compatible input ports) |
 | Single-finger drag on empty canvas | Marquee-select |
 | **Long-press a node** (~½ s, hold still) | Pop the **action menu** above it: *Duplicate · Group · Delete*. Slide finger onto a chip and lift to commit, or release first and tap a chip. The Group chip shows only when ≥ 2 nodes are already selected. |
 | **Long-press a group** (collapsed block or expanded header) | Same gesture, group-aware menu: *Duplicate · Ungroup · Delete*. Duplicate clones every member + the internal wiring; Ungroup dissolves the wrapper but keeps members; Delete wipes the group AND every node inside it. |
@@ -140,12 +148,11 @@ Hover-to-preview affordances (e.g. tooltip on long node titles) don't fire on to
 
 | File | What it is |
 |------|------------|
-| `gamma-node-editor.html` | The editor. Single-file app, ~9 k lines (HTML + inline CSS + vanilla JS). |
+| `gamma-node-editor.html` | The editor. Single-file app, ~25 k lines (HTML + inline CSS + vanilla JS, no framework, no build step). |
 | `coi-serviceworker.min.js` | Local copy of the COOP/COEP service worker that enables cross-origin isolation on GitHub Pages. Patched to bypass localhost so the daemon's `/compile` requests reach the loopback adapter. |
 | `assets/gamma-wasm-v3.tar.gz` | Pre-built Gamma archive — fallback for the in-browser compile path. |
 | `SPEC.md` | Canonical specification — file format, codegen algorithm, UX, AlloLib integration. |
-| `EXPANSION.md` | Forward-looking roadmap of nodes and features to add. |
-| `OPTIONS.md` | Decision menu for unresolved design choices. |
+| `VERSION` | Auto-bumped per push. |
 
 ## How codegen works (one-line version)
 
@@ -153,17 +160,20 @@ Topo-sort the graph from sinks back to sources, declare a C++ member for each st
 
 ## Status
 
-Working V1 prototype with real-time audio preview operational via the local daemon. See `SPEC.md` §16 for what's implemented vs. what's planned for milestones M1 (production polish), M2 (AlloLib Studio Online integration), M3 (multi-output / enum / file-path nodes), and M4 (V2 features including spatial audio).
+**v0.1.8 — audio side is feature-complete for v1.** Phases 0–5 of the roadmap shipped: codegen correctness, editor polish, User DSP UX, multi-output codegen, real-time audio preview via local daemon, master-clock + sequencing + automation. AI panel, voice / handwriting input, group nodes, full touch + iPad UX all live.
+
+**Next up: Phase 6 — WebGPU-native visual layer.** Shader nodes, audio-reactive uniforms, a polymorphic `.gdsp` format that accepts WGSL bodies. WebGPU rather than WebGL2 — designed for live-performance latency targets. See `docs/ROADMAP.md` for the current ticket breakdown.
 
 ## Credits
 
-**The Gamma DSP library was created by [Lance Putnam](https://github.com/LancePutnam)** at the [AlloSphere Research Group, UC Santa Barbara](https://github.com/AlloSphere-Research-Group). This editor is a thin visual layer on top of his work — every audible node in the palette is a wrapper around a Gamma class he wrote. None of this exists without Gamma.
+**The Gamma DSP library was created by [Lance Putnam](https://github.com/LancePutnam)** at the [AlloSphere Research Group, UC Santa Barbara](https://github.com/AlloSphere-Research-Group). This editor is a visual layer on top of his work — every audible node in the palette is a wrapper around a Gamma class he wrote. None of this exists without Gamma.
 
 Other dependencies and influences:
 
-- [@huggingface/transformers](https://github.com/huggingface/transformers.js) — Gemma 4 inference for the AI panel.
+- [@huggingface/transformers](https://github.com/huggingface/transformers.js) — Gemma 4 + Whisper-tiny inference for the AI / voice panels.
 - [@wasmer/sdk](https://github.com/wasmerio/wasmer-js) — in-browser clang fallback.
 - [Emscripten](https://emscripten.org/) — the toolchain the local compile server drives.
+- [Tesseract.js](https://tesseract.projectnaptha.com/) — OCR primary path for the handwriting tool.
 - [coi-serviceworker](https://github.com/gzuidhof/coi-serviceworker) — cross-origin isolation on GitHub Pages.
 
 ## License
