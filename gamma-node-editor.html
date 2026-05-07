@@ -609,6 +609,21 @@
   .port.connected.gate  { background: var(--gate); }
   .port.connected.clock { background: var(--clock); border-style: solid; }
   .port:hover { transform: translateY(-50%) scale(1.4); }
+  /* Live snap target during a wire drag — when the dragged endpoint
+   * is within a screen-radius of a type-compatible input port, that
+   * port lights up so the user sees what'll connect on release. The
+   * scale + glow are large enough to register past a finger that's
+   * obscuring the port itself. Halo color matches the port type via
+   * the same border-color cascade used for connected/hover. */
+  .port.wire-snap-target {
+    transform: translateY(-50%) scale(1.65);
+    box-shadow: 0 0 0 4px rgba(200,232,90,0.18), 0 0 12px 4px rgba(200,232,90,0.45);
+    z-index: 5;
+  }
+  .port.wire-snap-target.audio { box-shadow: 0 0 0 4px rgba(29,158,117,0.20),  0 0 12px 4px rgba(29,158,117,0.55); }
+  .port.wire-snap-target.param { box-shadow: 0 0 0 4px rgba(127,119,221,0.22), 0 0 12px 4px rgba(127,119,221,0.55); }
+  .port.wire-snap-target.gate  { box-shadow: 0 0 0 4px rgba(216,160,48,0.22),  0 0 12px 4px rgba(216,160,48,0.55); }
+  .port.wire-snap-target.clock { box-shadow: 0 0 0 4px rgba(109,197,181,0.22), 0 0 12px 4px rgba(109,197,181,0.55); }
 
   /* Brief red pulse when a wire-drop is refused by portsCompatible(). The
    * destination port flashes for ~400ms so the rejection is visible without
@@ -13009,6 +13024,49 @@ function portsCompatible(srcType, dstType) {
   return false;
 }
 
+/* Wire-drop snap targeting. Ports are 11 px circles; a finger covers
+ * ~40-50 px, so the hit-test on e.target.closest(".port") routinely
+ * misses on touch even when the user "feels" like they're over the
+ * port. This finds the nearest type-compatible input port within a
+ * screen-pixel radius — used both for live visual feedback during
+ * the drag (.wire-snap-target glow) and as a fallback drop target
+ * when pointerup's e.target lands just off-port.
+ *
+ * Touch / pen get a generous 36 px radius (nearly half a fingertip);
+ * mouse gets a tighter 16 px so desktop drag-precision still feels
+ * crisp without adding magnetic snap surprise. */
+function _snapRadiusFor(pointerType) {
+  if (pointerType === "touch") return 36;
+  if (pointerType === "pen")   return 24;
+  return 16;
+}
+function findSnapPort(screenX, screenY, fromType, fromNode, radius) {
+  const ports = document.querySelectorAll('.port[data-dir="in"]');
+  let best = null, bestDist = radius;
+  for (const p of ports) {
+    if (p.dataset.node === fromNode) continue;
+    if (!portsCompatible(fromType, p.dataset.type)) continue;
+    const r = p.getBoundingClientRect();
+    if (r.width === 0) continue;   // hidden / inside collapsed group
+    const cx = r.left + r.width  / 2;
+    const cy = r.top  + r.height / 2;
+    const d = Math.hypot(cx - screenX, cy - screenY);
+    if (d < bestDist) { bestDist = d; best = p; }
+  }
+  return best;
+}
+function _setWireSnap(snapPort) {
+  if (!wire) return;
+  if (wire._snapPort === snapPort) return;
+  if (wire._snapPort) wire._snapPort.classList.remove("wire-snap-target");
+  if (snapPort)       snapPort.classList.add("wire-snap-target");
+  wire._snapPort = snapPort || null;
+}
+function _clearWireSnap() {
+  if (wire && wire._snapPort) wire._snapPort.classList.remove("wire-snap-target");
+  if (wire) wire._snapPort = null;
+}
+
 /* Briefly flash a port red to signal a rejected connection. The CSS
  * keyframe handles the visuals; we just toggle the class and clean it
  * up after the animation so a subsequent reject re-fires it. */
@@ -14532,7 +14590,7 @@ canvas.addEventListener("pointerdown", e => {
     // Cancel any single-touch state that the first finger started so
     // the user doesn't accidentally drop a wire or shrink a marquee
     // while pinching.
-    if (wire)        { wire = null; renderWires(); }
+    if (wire)        { _clearWireSnap(); wire = null; renderWires(); }
     if (marquee)     { marquee = null; if (marqueeEl) marqueeEl.style.display = "none"; }
     if (groupDrag)   { groupDrag = null; }
     if (panning)     { panning = null; canvas.classList.remove("panning"); }
@@ -14722,7 +14780,7 @@ function _fireTouchHold() {
     });
   }
   if (groupDrag) groupDrag = null;
-  if (wire)      { wire = null; renderWires(); }
+  if (wire)      { _clearWireSnap(); wire = null; renderWires(); }
   // Make sure the held entity is the active selection target so
   // operations have something to act on. Node mode → ensure the node
   // is in selectedSet (lets us cover both single-node and pre-existing
@@ -14988,6 +15046,22 @@ document.addEventListener("pointermove", e => {
   }
   if (wire) {
     wire.x2 = w.x; wire.y2 = w.y;
+    // Snap-to-nearest-compatible-port. Find candidate, light it up,
+    // and (if found) snap the wire's endpoint to its center so the
+    // user sees the connection forming visually. Endpoint is in
+    // world coords, port rect is in screen coords — convert through
+    // the current view transform.
+    const radius = _snapRadiusFor(e.pointerType);
+    const snap = findSnapPort(e.clientX, e.clientY, wire.fromType, wire.fromNode, radius);
+    _setWireSnap(snap);
+    if (snap) {
+      const r = snap.getBoundingClientRect();
+      const cx = r.left + r.width  / 2;
+      const cy = r.top  + r.height / 2;
+      const canvasRect = canvas.getBoundingClientRect();
+      wire.x2 = ((cx - canvasRect.left) - view.panX) / view.zoom;
+      wire.y2 = ((cy - canvasRect.top)  - view.panY) / view.zoom;
+    }
     renderWires(wire);
   }
 });
@@ -15031,7 +15105,16 @@ document.addEventListener("pointerup", e => {
     return;
   }
   if (wire) {
-    const port = e.target.closest && e.target.closest(".port");
+    // Hit-test priority: (1) finger / cursor exactly on a port; (2)
+    // failing that, fall back to the snap target the move handler
+    // chose. The latter is what fixes touch drops onto small ports —
+    // without it, the connection only lands when the contact-point
+    // pixel lies inside the 11-px port circle, which a fingertip
+    // routinely misses by a few pixels even when it's clearly
+    // hovering over the port.
+    let port = e.target.closest && e.target.closest(".port");
+    if (!port && wire._snapPort) port = wire._snapPort;
+    _clearWireSnap();
     if (port && port.dataset.dir === "in" && port.dataset.node !== wire.fromNode) {
       // Legality check — see portsCompatible() above. A reject just
       // flashes the destination port red and drops the wire; no edge
