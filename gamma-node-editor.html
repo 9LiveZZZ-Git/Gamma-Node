@@ -13032,13 +13032,24 @@ function portsCompatible(srcType, dstType) {
  * the drag (.wire-snap-target glow) and as a fallback drop target
  * when pointerup's e.target lands just off-port.
  *
- * Touch / pen get a generous 36 px radius (nearly half a fingertip);
- * mouse gets a tighter 16 px so desktop drag-precision still feels
- * crisp without adding magnetic snap surprise. */
+ * Radius defaults: mouse 16 px (gentle assist, no surprise snap),
+ * pen 24 px, ANYTHING ELSE 36 px (touch, plus unknown — some
+ * Chromebooks and hybrid devices don't reliably report
+ * pointerType === "touch" for touchscreen contacts; the safe default
+ * is to assume finger-like imprecision so those devices still get
+ * usable snap behavior). Mouse is the only pointer type all browsers
+ * report reliably as "mouse", so it's the right one to special-case.
+ *
+ * Hysteresis: once a snap is acquired, we keep it as long as the
+ * finger stays within radius + 14 px of the SAME port (sticky exit).
+ * Without this, the inevitable few-pixel finger drift in the last
+ * pointermove before release routinely cleared a successful snap
+ * just before pointerup, dropping the wire on empty canvas. */
+const SNAP_HYST_PX = 14;
 function _snapRadiusFor(pointerType) {
-  if (pointerType === "touch") return 36;
+  if (pointerType === "mouse") return 16;
   if (pointerType === "pen")   return 24;
-  return 16;
+  return 36;
 }
 function findSnapPort(screenX, screenY, fromType, fromNode, radius) {
   const ports = document.querySelectorAll('.port[data-dir="in"]');
@@ -13054,6 +13065,24 @@ function findSnapPort(screenX, screenY, fromType, fromNode, radius) {
     if (d < bestDist) { bestDist = d; best = p; }
   }
   return best;
+}
+/* Decide the snap target for this pointermove. If a snap is currently
+ * held, prefer keeping it as long as the finger is within the sticky
+ * exit radius (radius + SNAP_HYST_PX) of THAT port — even if some
+ * other port is now nearer. Only when the held snap is out of range
+ * do we run a fresh search. Returns null when nothing qualifies. */
+function _pickSnap(screenX, screenY, fromType, fromNode, radius) {
+  if (wire && wire._snapPort) {
+    const p  = wire._snapPort;
+    const r  = p.getBoundingClientRect();
+    if (r.width > 0 && portsCompatible(fromType, p.dataset.type) && p.dataset.node !== fromNode) {
+      const cx = r.left + r.width  / 2;
+      const cy = r.top  + r.height / 2;
+      const d  = Math.hypot(cx - screenX, cy - screenY);
+      if (d < radius + SNAP_HYST_PX) return p;
+    }
+  }
+  return findSnapPort(screenX, screenY, fromType, fromNode, radius);
 }
 function _setWireSnap(snapPort) {
   if (!wire) return;
@@ -14842,6 +14871,12 @@ canvas.addEventListener("pointerdown", e => {
       x1: start.x, y1: start.y,
       x2: w.x, y2: w.y
     };
+    // One-line diagnostic so users on flaky touch devices can paste
+    // the console output if snap isn't behaving. Tells us what
+    // pointerType the device reports + which radius they're getting.
+    console.log("[wire] start type=" + JSON.stringify(e.pointerType) +
+                " radius=" + _snapRadiusFor(e.pointerType) +
+                " from=" + port.dataset.node + "." + port.dataset.port);
     renderWires(wire);
     return;
   }
@@ -15046,13 +15081,14 @@ document.addEventListener("pointermove", e => {
   }
   if (wire) {
     wire.x2 = w.x; wire.y2 = w.y;
-    // Snap-to-nearest-compatible-port. Find candidate, light it up,
-    // and (if found) snap the wire's endpoint to its center so the
-    // user sees the connection forming visually. Endpoint is in
-    // world coords, port rect is in screen coords — convert through
-    // the current view transform.
+    // Snap-to-nearest-compatible-port. _pickSnap honors hysteresis —
+    // once a port is acquired we hold it until the finger leaves the
+    // sticky exit radius, so a few-pixel drift on the last move
+    // before release doesn't drop the snap. Endpoint is in world
+    // coords, port rect is in screen coords — convert through the
+    // current view transform.
     const radius = _snapRadiusFor(e.pointerType);
-    const snap = findSnapPort(e.clientX, e.clientY, wire.fromType, wire.fromNode, radius);
+    const snap = _pickSnap(e.clientX, e.clientY, wire.fromType, wire.fromNode, radius);
     _setWireSnap(snap);
     if (snap) {
       const r = snap.getBoundingClientRect();
@@ -15106,13 +15142,18 @@ document.addEventListener("pointerup", e => {
   }
   if (wire) {
     // Hit-test priority: (1) finger / cursor exactly on a port; (2)
-    // failing that, fall back to the snap target the move handler
-    // chose. The latter is what fixes touch drops onto small ports —
-    // without it, the connection only lands when the contact-point
-    // pixel lies inside the 11-px port circle, which a fingertip
-    // routinely misses by a few pixels even when it's clearly
-    // hovering over the port.
+    // elementFromPoint at the release coords — same effect but
+    // bypasses the e.target weirdness we've seen on some Chromebook
+    // touch drivers where pointerup's e.target is the canvas even
+    // when the contact pixel is on a port; (3) failing both, the
+    // snap target the move handler chose with hysteresis. Together
+    // these three layers make wire drops on small ports robust
+    // across mouse / pen / finger / unknown.
     let port = e.target.closest && e.target.closest(".port");
+    if (!port) {
+      const elPt = document.elementFromPoint(e.clientX, e.clientY);
+      port = elPt && elPt.closest && elPt.closest(".port");
+    }
     if (!port && wire._snapPort) port = wire._snapPort;
     _clearWireSnap();
     if (port && port.dataset.dir === "in" && port.dataset.node !== wire.fromNode) {
