@@ -5241,6 +5241,28 @@
     </div>
   </div>
 
+  <!-- Automation lane editor — opened from an AutomationLane or
+       MultiAutomationLane node's props pane. Drawable curve(s) with
+       beat / bar grid markers; multi-lane variant adds tab buttons
+       at the top to switch which lane the canvas edits. Saves into
+       node.params.curveTable (single) or node.params.lanes[i]
+       .curveTable (multi). -->
+  <div class="modal-backdrop" id="auto-lane-modal" style="display:none;">
+    <div class="modal" style="width: 720px;">
+      <div class="modal-head">
+        <span id="auto-lane-modal-title">Edit automation lane</span>
+        <button class="btn modal-x" id="btn-auto-lane-close">×</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-note">
+          Click + drag to draw the curve. The vertical grid lines mark beats; the bolder ones mark bars (4 beats / bar in 4/4). Total length = bars × 4 beats at the wired BPM. Click a lane tab (multi-lane node only) to switch which curve you're editing.
+        </p>
+        <div id="auto-lane-tabs"></div>
+        <div id="auto-lane-pane"></div>
+      </div>
+    </div>
+  </div>
+
   <!-- Drawable ADSR — opened from an EnvDraw node's props pane. Free-
        draw the full envelope shape with a movable sustain marker. The
        attack region (left of sustain) and release region (right) are
@@ -8193,6 +8215,230 @@ public:
       }
     ],
     description: "Arpeggiator. notes = comma-separated semitone offsets (e.g. \"0, 4, 7\" = major triad). On each clock-edge, advances per mode (up/down/upDown/random) + outputs baseFreq scaled by the offset. Wire freq into Sine.freq."
+  },
+
+  /* Automation lane — drawable parameter automation. The user
+   * sketches a curve in the modal; the node plays it back over a
+   * configurable number of measures, BPM-synced. Output is the
+   * curve's value remapped from [0..1] (storage range) into
+   * [min..max] (output range). Wire the output into ANY param
+   * input — Sine.freq, Biquad.cutoff, Mul.b, etc.
+   *
+   * Trigger model:
+   *   • trig (gate) — restart playback from index 0.
+   *   • If loop is on, the curve plays forever, wrapping at the
+   *     end of each cycle. Else it plays once and holds the last
+   *     value (or returns to the first if no trigger).
+   * BPM model:
+   *   • bpm (param) — wire from MasterClock.bpm for tempo-lock.
+   *     Total length = bars × 4 beats × (60/bpm) seconds (4/4).
+   *   • Without a wire, the internal default applies (120 BPM).
+   *
+   * The curveTable stores the drawn shape at AUTO_LANE_RES (256)
+   * samples; codegen emits it as a static constexpr LUT loaded
+   * via setLut at construction time. */
+  AutomationLane: {
+    category: "Convert", color: COLOR.convert, header: null,
+    cppType: "GammaAutoLane",
+    helperClass:
+`class GammaAutoLane {
+    static constexpr int N = 256;
+    float lut_[N];
+    float bpm_ = 120.f;
+    float bars_ = 4.0f;       // 4/4 — total length = bars * 4 beats
+    float minVal_ = 0.f;
+    float maxVal_ = 1.f;
+    bool  loop_ = false;
+    bool  playing_ = false;
+    float phase_ = 0.f;        // [0, N-1] float index
+    float sr_ = 48000.f;
+    float lengthSec_() const {
+        const float bps = (bpm_ > 0.f ? bpm_ : 120.f) / 60.f;
+        return (bars_ > 0.f ? bars_ : 1.f) * 4.f / bps;
+    }
+public:
+    GammaAutoLane() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+        for (int i = 0; i < N; i++) lut_[i] = 0.5f;
+    }
+    void setBpm(float v)   { bpm_ = v; }
+    void setBars(float v)  { bars_ = (v < 0.25f) ? 0.25f : v; }
+    void setMin(float v)   { minVal_ = v; }
+    void setMax(float v)   { maxVal_ = v; }
+    void setLoop(float v)  { loop_ = v > 0.5f; }
+    void setLut(const float* src, int n) {
+        if (n > N) n = N;
+        for (int i = 0; i < n; i++) lut_[i] = src[i];
+    }
+    void trigger() { phase_ = 0.f; playing_ = true; }
+    float lookup_(float fi) const {
+        if (fi < 0.f) fi = 0.f;
+        if (fi > (float)(N - 1)) fi = (float)(N - 1);
+        const int i0 = (int)fi;
+        const int i1 = (i0 < N - 1) ? i0 + 1 : N - 1;
+        const float t = fi - (float)i0;
+        return lut_[i0] * (1.f - t) + lut_[i1] * t;
+    }
+    float operator()() {
+        const float v = lookup_(phase_);
+        if (playing_) {
+            const float step = (float)(N - 1) / (lengthSec_() * sr_);
+            phase_ += step;
+            if (phase_ >= (float)(N - 1)) {
+                if (loop_) phase_ -= (float)(N - 1);
+                else      { phase_ = (float)(N - 1); playing_ = false; }
+            }
+        }
+        return minVal_ + (maxVal_ - minVal_) * v;
+    }
+};`,
+    ins: [
+      { n: "trig", t: "gate" },
+      { n: "bpm",  t: "param" },
+      { n: "bars", t: "param" }
+    ],
+    outs: [{ n: "out", t: "param" }],
+    params: { bars: 4, bpm: 120, min: 0, max: 1, loop: 1 },
+    methods: { bars: "setBars", bpm: "setBpm", min: "setMin", max: "setMax", loop: "setLoop" },
+    gateMethods: { trig: "trigger" },
+    uiOnlyParams: ["curveTable"],
+    kind: "autoLane",
+    extraCtor: [
+      (n) => {
+        const tbl = n.params && n.params.curveTable;
+        if (!Array.isArray(tbl) || !tbl.length) return null;
+        const vals = tbl.map(v => Number(v).toFixed(4) + "f").join(", ");
+        return [
+          "        {",
+          `            static constexpr float ${n.id}_lut[] = { ${vals} };`,
+          `            ${n.id}.setLut(${n.id}_lut, ${tbl.length});`,
+          "        }"
+        ].join("\n");
+      }
+    ],
+    description: "Drawable BPM-synced automation curve. Sketch the shape, set bars + min/max, wire trig to start (or set loop=1 for continuous) and bpm from MasterClock for tempo-lock. Output is a param-rate signal — wire into any param input."
+  },
+
+  /* MultiAutomationLane — 4 parallel automation lanes sharing the
+   * same trig + bpm + bars. Each lane has its own drawn curve and
+   * its own [min, max] output range. Outputs are 4 separate param
+   * signals (out1..out4) so a single trigger can sweep four
+   * different parameters in lock-step.
+   *
+   * Multi-output codegen: lanes are exposed as four `.l[0..3]`
+   * accesses. Storage shape: node.params.lanes is an array of 4
+   * entries each holding { name, min, max, curveTable }. */
+  MultiAutomationLane: {
+    category: "Convert", color: COLOR.convert, header: null,
+    cppType: "GammaMultiAutoLane",
+    helperClass:
+`class GammaMultiAutoLane {
+    static constexpr int N = 256;
+    static constexpr int LANES = 4;
+    float lut_[LANES][N];
+    float minVal_[LANES] = { 0.f, 0.f, 0.f, 0.f };
+    float maxVal_[LANES] = { 1.f, 1.f, 1.f, 1.f };
+    float bpm_ = 120.f;
+    float bars_ = 4.0f;
+    bool  loop_ = false;
+    bool  playing_ = false;
+    float phase_ = 0.f;
+    float sr_ = 48000.f;
+    float lengthSec_() const {
+        const float bps = (bpm_ > 0.f ? bpm_ : 120.f) / 60.f;
+        return (bars_ > 0.f ? bars_ : 1.f) * 4.f / bps;
+    }
+public:
+    struct Out { float l[LANES]; };
+    GammaMultiAutoLane() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+        for (int k = 0; k < LANES; k++)
+            for (int i = 0; i < N; i++) lut_[k][i] = 0.5f;
+    }
+    void setBpm(float v)   { bpm_ = v; }
+    void setBars(float v)  { bars_ = (v < 0.25f) ? 0.25f : v; }
+    void setLoop(float v)  { loop_ = v > 0.5f; }
+    void setLaneRange(int lane, float lo, float hi) {
+        if (lane < 0 || lane >= LANES) return;
+        minVal_[lane] = lo; maxVal_[lane] = hi;
+    }
+    void setMin1(float v) { minVal_[0] = v; }  void setMax1(float v) { maxVal_[0] = v; }
+    void setMin2(float v) { minVal_[1] = v; }  void setMax2(float v) { maxVal_[1] = v; }
+    void setMin3(float v) { minVal_[2] = v; }  void setMax3(float v) { maxVal_[2] = v; }
+    void setMin4(float v) { minVal_[3] = v; }  void setMax4(float v) { maxVal_[3] = v; }
+    void setLut(int lane, const float* src, int n) {
+        if (lane < 0 || lane >= LANES) return;
+        if (n > N) n = N;
+        for (int i = 0; i < n; i++) lut_[lane][i] = src[i];
+    }
+    void trigger() { phase_ = 0.f; playing_ = true; }
+    float lookup_(int lane, float fi) const {
+        if (fi < 0.f) fi = 0.f;
+        if (fi > (float)(N - 1)) fi = (float)(N - 1);
+        const int i0 = (int)fi;
+        const int i1 = (i0 < N - 1) ? i0 + 1 : N - 1;
+        const float t = fi - (float)i0;
+        return lut_[lane][i0] * (1.f - t) + lut_[lane][i1] * t;
+    }
+    Out operator()() {
+        Out o;
+        for (int k = 0; k < LANES; k++) {
+            const float v = lookup_(k, phase_);
+            o.l[k] = minVal_[k] + (maxVal_[k] - minVal_[k]) * v;
+        }
+        if (playing_) {
+            const float step = (float)(N - 1) / (lengthSec_() * sr_);
+            phase_ += step;
+            if (phase_ >= (float)(N - 1)) {
+                if (loop_) phase_ -= (float)(N - 1);
+                else      { phase_ = (float)(N - 1); playing_ = false; }
+            }
+        }
+        return o;
+    }
+};`,
+    ins: [
+      { n: "trig", t: "gate" },
+      { n: "bpm",  t: "param" },
+      { n: "bars", t: "param" }
+    ],
+    outs: [
+      { n: "out1", t: "param", access: ".l[0]" },
+      { n: "out2", t: "param", access: ".l[1]" },
+      { n: "out3", t: "param", access: ".l[2]" },
+      { n: "out4", t: "param", access: ".l[3]" }
+    ],
+    params: { bars: 4, bpm: 120, loop: 1, min1: 0, max1: 1, min2: 0, max2: 1, min3: 0, max3: 1, min4: 0, max4: 1 },
+    methods: {
+      bars: "setBars", bpm: "setBpm", loop: "setLoop",
+      min1: "setMin1", max1: "setMax1",
+      min2: "setMin2", max2: "setMax2",
+      min3: "setMin3", max3: "setMax3",
+      min4: "setMin4", max4: "setMax4"
+    },
+    gateMethods: { trig: "trigger" },
+    uiOnlyParams: ["lanes"],
+    kind: "multiAutoLane",
+    extraCtor: [
+      (n) => {
+        const lanes = n.params && n.params.lanes;
+        if (!Array.isArray(lanes) || !lanes.length) return null;
+        const parts = [];
+        lanes.forEach((lane, i) => {
+          const tbl = lane && lane.curveTable;
+          if (!Array.isArray(tbl) || !tbl.length) return;
+          const vals = tbl.map(v => Number(v).toFixed(4) + "f").join(", ");
+          parts.push(`        {`);
+          parts.push(`            static constexpr float ${n.id}_lut${i}[] = { ${vals} };`);
+          parts.push(`            ${n.id}.setLut(${i}, ${n.id}_lut${i}, ${tbl.length});`);
+          parts.push(`        }`);
+        });
+        return parts.length ? parts.join("\n") : null;
+      }
+    ],
+    description: "Four parallel BPM-synced automation lanes sharing the same trig / bpm / bars. Each lane has its own drawn curve + min/max range, output as out1..out4. Useful for sweeping multiple synth parameters in lock-step (e.g., cutoff up + resonance down + amp envelope all from one trigger)."
   },
 
   /* Phase 5 extra — Piano Roll. A drawable monophonic note sequencer.
@@ -11315,6 +11561,32 @@ function renderProps() {
         <button class="btn primary" id="btn-open-wavetable" style="width: 100%;">Edit waveform${len ? ` · ${len} samples` : ""}</button>
       </div>`;
     }
+    // AutomationLane / MultiAutomationLane: open the drawable
+    // automation modal. Single-lane has one curveTable; multi-lane
+    // has node.params.lanes[] (4 entries). Button label shows a
+    // quick stat line so the user sees what they've configured.
+    if (def.kind === "autoLane") {
+      const tbl = Array.isArray(node.params && node.params.curveTable) ? node.params.curveTable : null;
+      const len = tbl ? tbl.length : 0;
+      const bars = (typeof node.params.bars === "number") ? node.params.bars : 4;
+      const bpm = (typeof node.params.bpm === "number") ? node.params.bpm : 120;
+      const looping = node.params && node.params.loop ? "loop" : "one-shot";
+      html += `<div class="prop-section">Automation curve</div>`;
+      html += `<div class="prop-grid" style="grid-template-columns: 1fr;">
+        <button class="btn primary" id="btn-open-autolane" style="width: 100%;">Edit lane${len ? ` · ${bars} bars · ${bpm} BPM · ${looping}` : ""}</button>
+      </div>`;
+    }
+    if (def.kind === "multiAutoLane") {
+      const lanes = Array.isArray(node.params && node.params.lanes) ? node.params.lanes : [];
+      const bars = (typeof node.params.bars === "number") ? node.params.bars : 4;
+      const bpm = (typeof node.params.bpm === "number") ? node.params.bpm : 120;
+      const looping = node.params && node.params.loop ? "loop" : "one-shot";
+      const filledLanes = lanes.filter(l => l && Array.isArray(l.curveTable) && l.curveTable.length).length;
+      html += `<div class="prop-section">Automation lanes · 4 tracks</div>`;
+      html += `<div class="prop-grid" style="grid-template-columns: 1fr;">
+        <button class="btn primary" id="btn-open-autolane" style="width: 100%;">Edit lanes${filledLanes ? ` · ${filledLanes}/4 drawn · ${bars} bars · ${bpm} BPM · ${looping}` : ""}</button>
+      </div>`;
+    }
     // EnvDraw: drawable ADSR with movable sustain marker. The button
     // shows a quick stat (current sustain index + attack/release
     // times) so the user knows what they've set without opening it.
@@ -11494,6 +11766,9 @@ function renderProps() {
   // EnvDraw — drawable ADSR modal.
   const openEnvBtn = propsEl.querySelector('#btn-open-envdraw');
   if (openEnvBtn) openEnvBtn.addEventListener('click', () => openEnvDrawModal(node.id));
+  // AutomationLane / MultiAutomationLane — drawable automation modal.
+  const openAutoLaneBtn = propsEl.querySelector('#btn-open-autolane');
+  if (openAutoLaneBtn) openAutoLaneBtn.addEventListener('click', () => openAutoLaneModal(node.id));
 
   // Sample-host action buttons — load opens a file picker, open
   // launches the waveform editor modal, clear detaches the asset
@@ -17800,6 +18075,330 @@ function closeRampModal() {
  * plays sustain→end). Saves directly into node.params.curveTable
  * and node.params.sustainIdx; codegen reads both via extraCtor.
  * ================================================================== */
+
+/* ====================================================================
+ * Automation lane modal (single + multi)
+ *
+ * Single-lane: node.params.curveTable holds the drawn shape (256 floats).
+ * Multi-lane:  node.params.lanes is an array of 4 entries, each with
+ *              { name, min, max, curveTable }.
+ *
+ * The modal canvas is shared — lane tabs at the top swap which slot
+ * the painting writes into. The grid draws beat lines at 1/4 of the
+ * curve length (assumes 4 beats / bar) plus heavier bar lines.
+ * ================================================================== */
+
+const AUTO_LANE_RES = 256;
+
+function defaultAutoLaneTable() {
+  // Default to a flat 0.5 line — neither extreme; user paints from there.
+  const t = new Array(AUTO_LANE_RES);
+  for (let i = 0; i < AUTO_LANE_RES; i++) t[i] = 0.5;
+  return t;
+}
+function ensureAutoLaneState(node, isMulti) {
+  if (!node.params) node.params = {};
+  if (isMulti) {
+    if (!Array.isArray(node.params.lanes) || node.params.lanes.length !== 4) {
+      const tints = ["accent", "info", "param", "gate"];
+      node.params.lanes = [0,1,2,3].map(i => ({
+        name: "Lane " + (i+1),
+        min: 0, max: 1,
+        curveTable: defaultAutoLaneTable(),
+        tint: tints[i]
+      }));
+    }
+    // Each lane needs a curveTable
+    node.params.lanes.forEach(l => {
+      if (!Array.isArray(l.curveTable) || !l.curveTable.length) {
+        l.curveTable = defaultAutoLaneTable();
+      }
+    });
+  } else {
+    if (!Array.isArray(node.params.curveTable) || !node.params.curveTable.length) {
+      node.params.curveTable = defaultAutoLaneTable();
+    }
+  }
+}
+
+let _autoLaneActiveTab = 0;   // multi-lane only — which tab is selected
+
+function openAutoLaneModal(nodeId) {
+  const node = state.nodes.find(n => n.id === nodeId);
+  if (!node) return;
+  const isMulti = node.type === "MultiAutomationLane";
+  ensureAutoLaneState(node, isMulti);
+  _autoLaneActiveTab = 0;
+  const titleEl = document.getElementById("auto-lane-modal-title");
+  if (titleEl) titleEl.textContent = (isMulti ? "Edit multi-lane automation · " : "Edit automation lane · ") + nodeId;
+  const tabsEl = document.getElementById("auto-lane-tabs");
+  const paneEl = document.getElementById("auto-lane-pane");
+  if (tabsEl) tabsEl.innerHTML = isMulti ? buildAutoLaneTabsHtml(node) : "";
+  if (tabsEl && isMulti) {
+    tabsEl.querySelectorAll(".al-tab").forEach(b => {
+      b.addEventListener("click", () => {
+        _autoLaneActiveTab = parseInt(b.dataset.tab, 10) || 0;
+        // Re-render tabs (active state) + pane
+        tabsEl.innerHTML = buildAutoLaneTabsHtml(node);
+        paneEl.innerHTML = "";
+        paneEl.appendChild(buildAutoLanePane(node, isMulti));
+        // Re-bind tab handlers on the new DOM
+        tabsEl.querySelectorAll(".al-tab").forEach(bb => {
+          bb.addEventListener("click", arguments.callee);
+        });
+      });
+    });
+  }
+  if (paneEl) {
+    paneEl.innerHTML = "";
+    paneEl.appendChild(buildAutoLanePane(node, isMulti));
+  }
+  const modal = document.getElementById("auto-lane-modal");
+  if (modal) modal.style.display = "flex";
+}
+function closeAutoLaneModal() {
+  const modal = document.getElementById("auto-lane-modal");
+  if (modal) modal.style.display = "none";
+}
+(function setupAutoLaneModal() {
+  const close = document.getElementById("btn-auto-lane-close");
+  const modal = document.getElementById("auto-lane-modal");
+  if (close) close.addEventListener("click", closeAutoLaneModal);
+  if (modal) modal.addEventListener("click", e => { if (e.target === modal) closeAutoLaneModal(); });
+})();
+
+function buildAutoLaneTabsHtml(node) {
+  const lanes = node.params.lanes || [];
+  return `<div style="display:flex; gap:6px; margin-bottom: 8px; align-items: center;">
+    <span style="font-family: var(--font-mono); font-size: 9.5px; color: var(--text-3); letter-spacing: 0.10em; text-transform: uppercase; padding-right:6px;">Lane</span>
+    ${lanes.map((l, i) => {
+      const active = (i === _autoLaneActiveTab) ? " active" : "";
+      return `<button class="al-tab${active}" data-tab="${i}" style="padding: 4px 10px; background: ${i === _autoLaneActiveTab ? 'var(--accent)' : 'var(--surface-2)'}; color: ${i === _autoLaneActiveTab ? 'var(--accent-ink)' : 'var(--text)'}; border: 1px solid ${i === _autoLaneActiveTab ? 'var(--accent)' : 'var(--border)'}; border-radius: 3px; font-family: var(--font-mono); font-size: 10px; cursor: pointer; font-weight: ${i === _autoLaneActiveTab ? '600' : '400'};">${i+1} · ${escapeText(l.name || ('Lane ' + (i+1)))}</button>`;
+    }).join("")}
+  </div>`;
+}
+
+/* Builds the drawable canvas for a single curve. For multi-lane,
+ * `node.params.lanes[_autoLaneActiveTab].curveTable` is the live
+ * table; for single, `node.params.curveTable` is. The grid shows
+ * vertical beat lines + bar lines + horizontal mid line. */
+function buildAutoLanePane(node, isMulti) {
+  const W = 680, H = 240;
+  const pad = 10;
+  const plotW = W - pad * 2;
+  const plotH = H - pad * 2;
+
+  const slot = isMulti ? node.params.lanes[_autoLaneActiveTab] : node.params;
+  const tbl = slot.curveTable;
+  const N = tbl.length;
+  const bars = (typeof node.params.bars === "number" && node.params.bars > 0) ? node.params.bars : 4;
+  // Beats per bar = 4 (assumes 4/4). Vertical lines at every beat;
+  // heavier strokes at every bar boundary.
+  const totalBeats = Math.max(1, Math.round(bars * 4));
+
+  let gridLines = "";
+  for (let i = 0; i <= totalBeats; i++) {
+    const x = pad + (i / totalBeats) * plotW;
+    const isBar = (i % 4) === 0;
+    const stroke = isBar ? "rgba(200,232,90,0.35)" : "rgba(200,232,90,0.10)";
+    const w = isBar ? 1 : 0.5;
+    gridLines += `<line x1="${x.toFixed(1)}" y1="${pad}" x2="${x.toFixed(1)}" y2="${H - pad}" stroke="${stroke}" stroke-width="${w}" />`;
+  }
+  // Horizontal mid line
+  gridLines += `<line x1="${pad}" y1="${pad + plotH * 0.5}" x2="${W - pad}" y2="${pad + plotH * 0.5}" stroke="rgba(200,232,90,0.10)" stroke-width="0.5" />`;
+
+  const pane = document.createElement("div");
+  pane.className = "curve-draw-pane";
+
+  // Lane-specific color tint for multi-lane visualization
+  const tintMap = { accent: "var(--accent)", info: "var(--info)", param: "var(--param)", gate: "var(--gate)" };
+  const tint = (isMulti && slot.tint && tintMap[slot.tint]) ? tintMap[slot.tint] : "var(--accent)";
+
+  pane.innerHTML =
+    '<svg class="curve-draw-svg" viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" style="height:240px;">' +
+      gridLines +
+      `<text class="curve-axis-label" x="${pad+2}" y="${pad+10}">${(slot.max != null ? slot.max : 1).toFixed(2)}</text>` +
+      `<text class="curve-axis-label" x="${pad+2}" y="${H-pad-2}">${(slot.min != null ? slot.min : 0).toFixed(2)}</text>` +
+      `<text class="curve-axis-label" x="${W-pad-30}" y="${H-pad-2}">${bars} bars</text>` +
+      `<path class="curve-fill" d="" style="fill: ${tint}; opacity: 0.10;"/>` +
+      `<path class="curve-line" d="" style="stroke: ${tint};"/>` +
+    '</svg>' +
+    '<div class="envdraw-fields">' +
+      '<label>Bars</label>' +
+      '<input type="number" id="auto-lane-bars" min="0.25" max="64" step="0.25" />' +
+      '<label>Min</label>' +
+      '<input type="number" id="auto-lane-min" step="any" />' +
+      '<span class="envdraw-readout" id="auto-lane-readout">— · —</span>' +
+    '</div>' +
+    '<div class="envdraw-fields" style="margin-top: 4px;">' +
+      '<label>BPM</label>' +
+      '<input type="number" id="auto-lane-bpm" min="20" max="999" step="1" />' +
+      '<label>Max</label>' +
+      '<input type="number" id="auto-lane-max" step="any" />' +
+      '<span class="envdraw-readout" id="auto-lane-readout-2">loop · —</span>' +
+    '</div>' +
+    '<div class="curve-draw-actions">' +
+      '<label style="display:flex; align-items:center; gap:6px; font-family: var(--font-mono); font-size: 10px; color: var(--text-2); margin-right: auto;">' +
+        '<input type="checkbox" id="auto-lane-loop" />' +
+        '<span>Loop</span>' +
+      '</label>' +
+      '<button class="btn" id="btn-auto-lane-reset">Reset (flat)</button>' +
+      '<button class="btn" id="btn-auto-lane-smooth">Smooth</button>' +
+      '<button class="btn primary" id="btn-auto-lane-done">Done</button>' +
+    '</div>';
+
+  const svg = pane.querySelector(".curve-draw-svg");
+  const fillPath = pane.querySelector(".curve-fill");
+  const linePath = pane.querySelector(".curve-line");
+  const barsInp = pane.querySelector("#auto-lane-bars");
+  const bpmInp = pane.querySelector("#auto-lane-bpm");
+  const minInp = pane.querySelector("#auto-lane-min");
+  const maxInp = pane.querySelector("#auto-lane-max");
+  const loopChk = pane.querySelector("#auto-lane-loop");
+  const readout = pane.querySelector("#auto-lane-readout");
+  const readout2 = pane.querySelector("#auto-lane-readout-2");
+
+  barsInp.value = bars;
+  bpmInp.value = (typeof node.params.bpm === "number") ? node.params.bpm : 120;
+  // Per-lane min/max in multi mode; top-level in single mode.
+  const minRef = isMulti ? slot : node.params;
+  minInp.value = (typeof minRef.min === "number") ? minRef.min : 0;
+  maxInp.value = (typeof minRef.max === "number") ? minRef.max : 1;
+  loopChk.checked = !!node.params.loop;
+
+  function tableToPathData() {
+    const pts = [];
+    for (let i = 0; i < N; i++) {
+      const x = pad + (i / (N - 1)) * plotW;
+      const y = pad + (1 - tbl[i]) * plotH;
+      pts.push((i === 0 ? "M" : "L") + x.toFixed(1) + "," + y.toFixed(1));
+    }
+    return pts.join(" ");
+  }
+  function refreshPaths() {
+    const d = tableToPathData();
+    linePath.setAttribute("d", d);
+    fillPath.setAttribute("d", d + ` L ${pad + plotW},${pad + plotH} L ${pad},${pad + plotH} Z`);
+    const lo = parseFloat(minInp.value) || 0;
+    const hi = parseFloat(maxInp.value) || 1;
+    const bpm = parseFloat(bpmInp.value) || 120;
+    const lengthSec = bars * 4 * (60 / bpm);
+    readout.textContent = `range ${lo.toFixed(2)} → ${hi.toFixed(2)}`;
+    readout2.textContent = `${loopChk.checked ? "loop" : "one-shot"} · ${lengthSec.toFixed(2)} s @ ${bpm} BPM`;
+  }
+  function paintFromPointer(ev, prev) {
+    const r = svg.getBoundingClientRect();
+    const sx = W / r.width;
+    const sy = H / r.height;
+    const px = ((ev.clientX - r.left) * sx - pad) / plotW;
+    const py = 1 - ((ev.clientY - r.top) * sy - pad) / plotH;
+    const i = Math.round(Math.max(0, Math.min(1, px)) * (N - 1));
+    const v = Math.max(0, Math.min(1, py));
+    if (prev && prev.i !== undefined) {
+      const lo = Math.min(prev.i, i), hi = Math.max(prev.i, i);
+      if (hi > lo) {
+        const a = (lo === prev.i) ? prev.v : v;
+        const b = (lo === prev.i) ? v : prev.v;
+        for (let k = lo; k <= hi; k++) {
+          const t = (k - lo) / (hi - lo);
+          tbl[k] = a * (1 - t) + b * t;
+        }
+      } else {
+        tbl[i] = v;
+      }
+    } else {
+      tbl[i] = v;
+    }
+    refreshPaths();
+    return { i, v };
+  }
+  let last = null;
+  svg.addEventListener("pointerdown", ev => {
+    ev.preventDefault();
+    svg.setPointerCapture(ev.pointerId);
+    pushHistory("auto-lane:" + node.id);
+    last = paintFromPointer(ev, null);
+  });
+  svg.addEventListener("pointermove", ev => {
+    if (!last) return;
+    last = paintFromPointer(ev, last);
+  });
+  function endStroke() {
+    if (!last) return;
+    last = null;
+    renderCode(); renderJson();
+  }
+  svg.addEventListener("pointerup",     endStroke);
+  svg.addEventListener("pointercancel", endStroke);
+  svg.addEventListener("pointerleave",  () => { if (last) endStroke(); });
+
+  // Field commits — update on change.
+  barsInp.addEventListener("change", () => {
+    const v = parseFloat(barsInp.value);
+    if (isFinite(v) && v > 0) {
+      pushHistory("auto-lane:bars:" + node.id);
+      node.params.bars = v;
+      // Re-render the pane so the grid reflects the new bar count.
+      const paneEl = document.getElementById("auto-lane-pane");
+      paneEl.innerHTML = "";
+      paneEl.appendChild(buildAutoLanePane(node, isMulti));
+      renderCode(); renderJson();
+    }
+  });
+  bpmInp.addEventListener("change", () => {
+    const v = parseFloat(bpmInp.value);
+    if (isFinite(v) && v > 0) {
+      pushHistory("auto-lane:bpm:" + node.id);
+      node.params.bpm = v;
+      refreshPaths();
+      renderCode(); renderJson();
+    }
+  });
+  minInp.addEventListener("change", () => {
+    const v = parseFloat(minInp.value);
+    if (isFinite(v)) {
+      pushHistory("auto-lane:min:" + node.id);
+      if (isMulti) slot.min = v;
+      else         node.params.min = v;
+      refreshPaths();
+      renderCode(); renderJson();
+    }
+  });
+  maxInp.addEventListener("change", () => {
+    const v = parseFloat(maxInp.value);
+    if (isFinite(v)) {
+      pushHistory("auto-lane:max:" + node.id);
+      if (isMulti) slot.max = v;
+      else         node.params.max = v;
+      refreshPaths();
+      renderCode(); renderJson();
+    }
+  });
+  loopChk.addEventListener("change", () => {
+    pushHistory("auto-lane:loop:" + node.id);
+    node.params.loop = loopChk.checked ? 1 : 0;
+    refreshPaths();
+    renderCode(); renderJson();
+  });
+  pane.querySelector("#btn-auto-lane-reset").addEventListener("click", () => {
+    pushHistory("auto-lane:reset:" + node.id);
+    for (let i = 0; i < N; i++) tbl[i] = 0.5;
+    refreshPaths();
+    renderCode(); renderJson();
+  });
+  pane.querySelector("#btn-auto-lane-smooth").addEventListener("click", () => {
+    pushHistory("auto-lane:smooth:" + node.id);
+    const nxt = tbl.slice();
+    for (let i = 1; i < N - 1; i++) nxt[i] = (tbl[i - 1] + tbl[i] + tbl[i + 1]) / 3;
+    for (let i = 0; i < N; i++) tbl[i] = nxt[i];
+    refreshPaths();
+    renderCode(); renderJson();
+  });
+  pane.querySelector("#btn-auto-lane-done").addEventListener("click", closeAutoLaneModal);
+
+  refreshPaths();
+  return pane;
+}
 
 function defaultEnvDrawTable() {
   // Triangular peak at index 32 — ramp up, ramp down. Mirrors the
