@@ -9148,6 +9148,271 @@ public:
     description: "Frequency-swept Gaussian-windowed sinusoid (configure in ctor)"
   },
 
+  /* ---- Modulation effects ----
+   * All five share the same shape: an LFO drives one or more time-
+   * domain operations (gain, delay-tap, allpass freq) to produce a
+   * cyclic modulation. Wraps gam::LFO + (Delay or AllPass1) per
+   * effect. Use `rate` to set LFO frequency in Hz, `depth` to set
+   * the modulation amount, and `mix` (where present) to blend dry
+   * vs. wet. */
+
+  /* Tremolo — amplitude modulation. LFO scales the input gain.
+   * depth=0 → bypass; depth=1 → input fully gated by LFO. */
+  Tremolo: {
+    category: "Effect", color: COLOR.effect, header: "Oscillator",
+    cppType: "GammaTremolo",
+    helperClass:
+`class GammaTremolo {
+    gam::LFO<> lfo_;
+    float depth_ = 0.5f;
+public:
+    GammaTremolo() { lfo_.freq(5.f); }
+    void setRate(float v)  { lfo_.freq(v); }
+    void setDepth(float v) { depth_ = (v < 0.f) ? 0.f : (v > 1.f ? 1.f : v); }
+    float operator()(float in) {
+        // LFO.cos() returns -1..1; remap to 0..1 so the gain modulates
+        // between (1 - depth) and 1.0 rather than going negative.
+        const float m = 0.5f + 0.5f * lfo_.cos();
+        return in * (1.f - depth_ + depth_ * m);
+    }
+};`,
+    ins: [
+      { n: "in",    t: "audio" },
+      { n: "rate",  t: "param" },
+      { n: "depth", t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { rate: 5, depth: 0.5 },
+    methods: { rate: "setRate", depth: "setDepth" },
+    description: "Tremolo — LFO-modulated amplitude. rate in Hz; depth ∈ [0,1] sets how much the gain is modulated (0 = bypass, 1 = full chop)."
+  },
+
+  /* Vibrato — pitch modulation via short delay-tap modulation. The
+   * LFO sweeps the delay time around a base offset; varying delay
+   * = effective pitch shift. depth in ms (0..7); base delay 8ms so
+   * the read tap stays inside the buffer at any LFO position. */
+  Vibrato: {
+    category: "Effect", color: COLOR.effect, header: "Oscillator",
+    extraHeaders: ["<Gamma/Delay.h>"],
+    cppType: "GammaVibrato",
+    helperClass:
+`class GammaVibrato {
+    gam::Delay<> d_;
+    gam::LFO<> lfo_;
+    float depthSec_ = 0.005f;
+    float baseSec_ = 0.008f;
+public:
+    GammaVibrato() {
+        d_.maxDelay(0.05f);
+        d_.delay(baseSec_);
+        lfo_.freq(5.f);
+    }
+    void setRate(float v)   { lfo_.freq(v); }
+    void setDepth(float ms) {
+        const float s = ms * 0.001f;
+        depthSec_ = (s < 0.f) ? 0.f : (s > 0.007f ? 0.007f : s);
+    }
+    float operator()(float in) {
+        const float lfoVal = lfo_.cos();           // -1..1
+        const float t = baseSec_ + depthSec_ * lfoVal;
+        d_.delay(t);
+        return d_(in);
+    }
+};`,
+    ins: [
+      { n: "in",    t: "audio" },
+      { n: "rate",  t: "param" },
+      { n: "depth", t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { rate: 5, depth: 5 },
+    methods: { rate: "setRate", depth: "setDepth" },
+    description: "Vibrato — pitch wobble via short LFO-modulated delay. rate in Hz; depth in ms (0..7). Wet-only output (the modulation is the effect)."
+  },
+
+  /* Flanger — vibrato with feedback, blended dry/wet. The feedback
+   * path through the LFO-swept delay creates the comb-filter sweep
+   * that's the signature flanger sound. depth in ms; feedback
+   * clamped to 0.95 so it can't fully self-oscillate. */
+  Flanger: {
+    category: "Effect", color: COLOR.effect, header: "Oscillator",
+    extraHeaders: ["<Gamma/Delay.h>"],
+    cppType: "GammaFlanger",
+    helperClass:
+`class GammaFlanger {
+    gam::Delay<> d_;
+    gam::LFO<> lfo_;
+    float depthSec_ = 0.002f;
+    float baseSec_ = 0.005f;
+    float feedback_ = 0.5f;
+    float mix_ = 0.5f;
+public:
+    GammaFlanger() {
+        d_.maxDelay(0.02f);
+        lfo_.freq(0.5f);
+    }
+    void setRate(float v)     { lfo_.freq(v); }
+    void setDepth(float ms)   {
+        const float s = ms * 0.001f;
+        depthSec_ = (s < 0.f) ? 0.f : (s > 0.004f ? 0.004f : s);
+    }
+    void setFeedback(float v) { feedback_ = (v < 0.f) ? 0.f : (v > 0.95f ? 0.95f : v); }
+    void setMix(float v)      { mix_ = (v < 0.f) ? 0.f : (v > 1.f ? 1.f : v); }
+    float operator()(float in) {
+        // LFO 0..1 so the swept delay is always positive.
+        const float lfoVal = 0.5f + 0.5f * lfo_.cos();
+        const float t = baseSec_ - depthSec_ + 2.f * depthSec_ * lfoVal;
+        d_.delay(t);
+        const float wet = d_();              // read tap
+        d_.write(in + wet * feedback_);      // write input + feedback
+        return in * (1.f - mix_) + wet * mix_;
+    }
+};`,
+    ins: [
+      { n: "in",       t: "audio" },
+      { n: "rate",     t: "param" },
+      { n: "depth",    t: "param" },
+      { n: "feedback", t: "param" },
+      { n: "mix",      t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { rate: 0.5, depth: 2, feedback: 0.5, mix: 0.5 },
+    methods: { rate: "setRate", depth: "setDepth", feedback: "setFeedback", mix: "setMix" },
+    description: "Flanger — comb-filter sweep via LFO-modulated short delay with feedback. rate in Hz; depth in ms; feedback adds the resonant whoosh; mix blends dry/wet."
+  },
+
+  /* Phaser — cascaded allpass filters with LFO-swept frequencies.
+   * The phase shifts cancel at certain frequencies, producing the
+   * sweeping notch filter "phase" sound. Two variants (Phaser4 and
+   * Phaser6) share the same GammaPhaserT<N> template; codegen
+   * emits the helper class only once thanks to class-name dedup. */
+  Phaser4: {
+    category: "Effect", color: COLOR.effect, header: "Oscillator",
+    extraHeaders: ["<Gamma/Filter.h>"],
+    cppType: "GammaPhaserT<4>",
+    helperClass:
+`template<int STAGES> class GammaPhaserT {
+    gam::AllPass1<> ap_[STAGES];
+    gam::LFO<> lfo_;
+    float depth_ = 0.7f;       // 0..1 — controls the LFO sweep range
+    float feedback_ = 0.0f;
+    float mix_ = 0.5f;
+    float fbSample_ = 0.f;
+public:
+    GammaPhaserT() {
+        for (int i = 0; i < STAGES; i++) ap_[i].freq(800.f);
+        lfo_.freq(0.5f);
+    }
+    void setRate(float v)     { lfo_.freq(v); }
+    void setDepth(float v)    { depth_ = (v < 0.f) ? 0.f : (v > 1.f ? 1.f : v); }
+    void setFeedback(float v) { feedback_ = (v < 0.f) ? 0.f : (v > 0.95f ? 0.95f : v); }
+    void setMix(float v)      { mix_ = (v < 0.f) ? 0.f : (v > 1.f ? 1.f : v); }
+    float operator()(float in) {
+        const float lfoVal = 0.5f + 0.5f * lfo_.cos();   // 0..1
+        const float f = 200.f + 4000.f * depth_ * lfoVal;
+        for (int i = 0; i < STAGES; i++) ap_[i].freq(f);
+        float v = in + fbSample_ * feedback_;
+        for (int i = 0; i < STAGES; i++) v = ap_[i](v);
+        fbSample_ = v;
+        return in * (1.f - mix_) + v * mix_;
+    }
+};`,
+    ins: [
+      { n: "in",       t: "audio" },
+      { n: "rate",     t: "param" },
+      { n: "depth",    t: "param" },
+      { n: "feedback", t: "param" },
+      { n: "mix",      t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { rate: 0.5, depth: 0.7, feedback: 0, mix: 0.5 },
+    methods: { rate: "setRate", depth: "setDepth", feedback: "setFeedback", mix: "setMix" },
+    description: "4-stage phaser — cascaded allpass filters whose cutoffs sweep with an LFO. rate in Hz; depth controls the sweep range; feedback emphasizes the resonant peaks."
+  },
+  Phaser6: {
+    category: "Effect", color: COLOR.effect, header: "Oscillator",
+    extraHeaders: ["<Gamma/Filter.h>"],
+    cppType: "GammaPhaserT<6>",
+    helperClass:
+`template<int STAGES> class GammaPhaserT {
+    gam::AllPass1<> ap_[STAGES];
+    gam::LFO<> lfo_;
+    float depth_ = 0.7f;
+    float feedback_ = 0.0f;
+    float mix_ = 0.5f;
+    float fbSample_ = 0.f;
+public:
+    GammaPhaserT() {
+        for (int i = 0; i < STAGES; i++) ap_[i].freq(800.f);
+        lfo_.freq(0.5f);
+    }
+    void setRate(float v)     { lfo_.freq(v); }
+    void setDepth(float v)    { depth_ = (v < 0.f) ? 0.f : (v > 1.f ? 1.f : v); }
+    void setFeedback(float v) { feedback_ = (v < 0.f) ? 0.f : (v > 0.95f ? 0.95f : v); }
+    void setMix(float v)      { mix_ = (v < 0.f) ? 0.f : (v > 1.f ? 1.f : v); }
+    float operator()(float in) {
+        const float lfoVal = 0.5f + 0.5f * lfo_.cos();
+        const float f = 200.f + 4000.f * depth_ * lfoVal;
+        for (int i = 0; i < STAGES; i++) ap_[i].freq(f);
+        float v = in + fbSample_ * feedback_;
+        for (int i = 0; i < STAGES; i++) v = ap_[i](v);
+        fbSample_ = v;
+        return in * (1.f - mix_) + v * mix_;
+    }
+};`,
+    ins: [
+      { n: "in",       t: "audio" },
+      { n: "rate",     t: "param" },
+      { n: "depth",    t: "param" },
+      { n: "feedback", t: "param" },
+      { n: "mix",      t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { rate: 0.5, depth: 0.7, feedback: 0, mix: 0.5 },
+    methods: { rate: "setRate", depth: "setDepth", feedback: "setFeedback", mix: "setMix" },
+    description: "6-stage phaser — extra two allpass stages over Phaser4 for a deeper, more chorus-like swirl."
+  },
+
+  /* AutoPan — LFO-modulated stereo panning. Mono input, stereo
+   * output. Uses a simple linear pan law (sum of L and R always
+   * equals input × 1) since auto-pan typically wants symmetric
+   * gains rather than constant-power pan. */
+  AutoPan: {
+    category: "Effect", color: COLOR.effect, header: "Oscillator",
+    cppType: "GammaAutoPan",
+    helperClass:
+`class GammaAutoPan {
+    gam::LFO<> lfo_;
+    float depth_ = 1.f;
+public:
+    GammaAutoPan() { lfo_.freq(0.5f); }
+    void setRate(float v)  { lfo_.freq(v); }
+    void setDepth(float v) { depth_ = (v < 0.f) ? 0.f : (v > 1.f ? 1.f : v); }
+    struct Out { float l, r; };
+    Out operator()(float in) {
+        const float pos = lfo_.cos() * depth_;     // -depth .. +depth
+        const float lGain = 0.5f * (1.f - pos);
+        const float rGain = 0.5f * (1.f + pos);
+        Out o;
+        o.l = in * lGain;
+        o.r = in * rGain;
+        return o;
+    }
+};`,
+    ins: [
+      { n: "in",    t: "audio" },
+      { n: "rate",  t: "param" },
+      { n: "depth", t: "param" }
+    ],
+    outs: [
+      { n: "L", t: "audio", access: ".l" },
+      { n: "R", t: "audio", access: ".r" }
+    ],
+    params: { rate: 0.5, depth: 1 },
+    methods: { rate: "setRate", depth: "setDepth" },
+    description: "Auto-pan — LFO-driven stereo panner. rate in Hz; depth ∈ [0,1] (1 = full L↔R sweep). Mono in, stereo out — wire L/R into OutputStereo."
+  },
+
   /* ---- Analysis (Analysis.h) ---- */
   EnvFollow: {
     category: "Analysis", color: COLOR.analysis, header: "Analysis",
