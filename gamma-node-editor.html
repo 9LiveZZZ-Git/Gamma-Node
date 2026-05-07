@@ -11851,7 +11851,178 @@ public:
     ins: [{ n: "in", t: "texture" }],
     outs: [],
     params: {},
-    description: "Visual sink — wire a texture into in to drive the visual layer (the WebGPU canvas behind the editor). Press L (or click ◐) to enter Live Mode and see the result fullscreen. Until shader nodes ship the visual layer renders a smoke-clear; the wire is a no-op but the socket reserves the connection."
+    description: "Visual sink — wire a texture into in to drive the visual layer (the WebGPU canvas behind the editor). Press L (or click ◐) to enter Live Mode and see the result fullscreen."
+  },
+
+  /* Phase 6.2.x — first two shader-frag nodes. Both are kind:
+   * "shader-frag" with a hand-authored WGSL body shipped inline.
+   * The renderer (in the Visual subsystem above) recognizes
+   * kind === "shader-frag" + the wgsl/uniformBytes/writeUniforms
+   * trio and runs them through the standard shader pipeline at
+   * binding 0.
+   *
+   * Uniform-buffer layout shared across all shader-frag nodes:
+   *   bytes 0–15  — u_resolution: vec4f (w, h, 1/w, 1/h)
+   *   bytes 16–19 — u_time: f32 (seconds since device acquired)
+   *   bytes 20–23 — u_dt:   f32 (seconds since previous frame)
+   *   bytes 24–31 — _pad: vec2f (round to 16-byte alignment)
+   *   bytes 32+   — per-node params (registry-defined)
+   * Preamble is auto-written each frame by the renderer; each node's
+   * writeUniforms(node, scratch) function fills offset 8+ (= byte 32+)
+   * from the node's params. */
+
+  /* SolidColor — flat-fill the framebuffer with a single user-set
+   * RGB. Three params (r/g/b). Useful as a sanity test of the whole
+   * pipeline + as a backdrop layer once composition shaders ship. */
+  SolidColor: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    ins:  [
+      { n: "r", t: "param" },
+      { n: "g", t: "param" },
+      { n: "b", t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    params: { r: 0.20, g: 0.55, b: 0.85 },
+    methods: { r: null, g: null, b: null },   // no audio codegen — params live entirely on the GPU
+    uniformBytes: 48,
+    wgsl:
+`struct U {
+  u_resolution: vec4f,
+  u_time:       f32,
+  u_dt:         f32,
+  _pad:         vec2f,
+  color:        vec4f,
+};
+@group(0) @binding(0) var<uniform> u: U;
+
+struct VsOut {
+  @builtin(position) pos: vec4f,
+  @location(0) uv: vec2f,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(
+    vec2f(-1.0, -1.0),
+    vec2f( 3.0, -1.0),
+    vec2f(-1.0,  3.0),
+  );
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  return u.color;
+}`,
+    writeUniforms(node, scratch) {
+      // scratch is Float32Array of (uniformBytes/4) = 12 floats.
+      // Offsets [0..7] are the preamble (resolution, time, dt, pad).
+      // We fill [8..11] with the color.
+      const p = node.params || {};
+      scratch[8]  = (typeof p.r === "number") ? p.r : 0.5;
+      scratch[9]  = (typeof p.g === "number") ? p.g : 0.5;
+      scratch[10] = (typeof p.b === "number") ? p.b : 0.5;
+      scratch[11] = 1.0;   // alpha — opaque always
+    },
+    description: "Flat color fill — outputs a uniform RGB color across the entire framebuffer. r/g/b each ∈ [0, 1]. Wire into VisualOutput.in for a solid backdrop, or into BlendShader (Phase 6.4) as one of its inputs."
+  },
+
+  /* Gradient — 2-color linear blend along a configurable angle.
+   * Eight params: angle (radians), rA/gA/bA (start color), rB/gB/bB
+   * (end color). Useful as a backdrop or as a luma source for masks
+   * once composition shaders ship. */
+  Gradient: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    ins:  [
+      { n: "angle", t: "param" },
+      { n: "rA",    t: "param" },
+      { n: "gA",    t: "param" },
+      { n: "bA",    t: "param" },
+      { n: "rB",    t: "param" },
+      { n: "gB",    t: "param" },
+      { n: "bB",    t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    params: {
+      angle: 0.0,
+      rA: 0.05, gA: 0.10, bA: 0.20,
+      rB: 0.85, gB: 0.55, bB: 0.20
+    },
+    methods: {},
+    uniformBytes: 64,
+    wgsl:
+`struct U {
+  u_resolution: vec4f,
+  u_time:       f32,
+  u_dt:         f32,
+  angle:        f32,
+  _pad0:        f32,
+  colorA:       vec4f,
+  colorB:       vec4f,
+};
+@group(0) @binding(0) var<uniform> u: U;
+
+struct VsOut {
+  @builtin(position) pos: vec4f,
+  @location(0) uv: vec2f,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(
+    vec2f(-1.0, -1.0),
+    vec2f( 3.0, -1.0),
+    vec2f(-1.0,  3.0),
+  );
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  // Project the centered uv onto the angle direction; remap to [0,1]
+  // and clamp so the gradient stays visible regardless of angle.
+  let dir = vec2f(cos(u.angle), sin(u.angle));
+  let centered = in.uv - vec2f(0.5);
+  // dot range over uv∈[0,1] is [-0.707, 0.707] (worst case 45°),
+  // but along the cardinal axes it's [-0.5, 0.5]. Add 0.5 + saturate.
+  let t = clamp(dot(centered, dir) + 0.5, 0.0, 1.0);
+  return mix(u.colorA, u.colorB, t);
+}`,
+    writeUniforms(node, scratch) {
+      // 64-byte buffer = 16 f32 indices. WGSL struct alignment puts
+      // vec4 fields on 16-byte boundaries, so the layout is:
+      //   bytes  0–15  / indices  0–3  → u_resolution  (preamble)
+      //   bytes 16–19  / index    4    → u_time         (preamble)
+      //   bytes 20–23  / index    5    → u_dt           (preamble)
+      //   bytes 24–27  / index    6    → angle          (we overwrite preamble pad here)
+      //   bytes 28–31  / index    7    → _pad0          (leave 0)
+      //   bytes 32–47  / indices 8–11  → colorA  (rA, gA, bA, αA)
+      //   bytes 48–63  / indices 12–15 → colorB  (rB, gB, bB, αB)
+      const p = node.params || {};
+      scratch[6]  = (typeof p.angle === "number") ? p.angle : 0.0;
+      // scratch[7] = 0 — already zeroed by preamble.
+      scratch[8]  = (typeof p.rA === "number") ? p.rA : 0.05;
+      scratch[9]  = (typeof p.gA === "number") ? p.gA : 0.10;
+      scratch[10] = (typeof p.bA === "number") ? p.bA : 0.20;
+      scratch[11] = 1.0;
+      scratch[12] = (typeof p.rB === "number") ? p.rB : 0.85;
+      scratch[13] = (typeof p.gB === "number") ? p.gB : 0.55;
+      scratch[14] = (typeof p.bB === "number") ? p.bB : 0.20;
+      scratch[15] = 1.0;
+    },
+    description: "Linear gradient — interpolates colorA → colorB along an angle (radians). Default is dark teal → warm amber along +x. r/g/b each ∈ [0, 1]; angle wraps 0..2π. Wire into VisualOutput for a moving sunset backdrop (animate angle from a clock signal once 6.5's bridge nodes ship)."
   },
 
   /* ---- B1: Math, single-arg trig (cmath) ---- */
@@ -15978,6 +16149,12 @@ function deleteSelection() {
     const idPart = dot >= 0 ? k.slice(0, dot) : k;
     if (ids.has(idPart)) delete state.exposed[k];
   });
+  // Phase 6.2.1 — release any shader-instance GPU state held by
+  // deleted nodes. Free the uniform buffer + drop the bind-group
+  // reference so the GPU memory is reclaimed immediately.
+  if (typeof _disposeShaderInstance === "function") {
+    ids.forEach(id => _disposeShaderInstance(id));
+  }
   clearSelection();
   render();
 }
@@ -18515,9 +18692,31 @@ const Visual = {
   frozen: false,
   fps: 0,
 
-  // Future-ticket holders so callers can sanity-check whether a piece
-  // of infra is online before they try to render through it.
-  pipelineCache: null,    // 6.2.1
+  // Phase 6.1.7 / 6.2.1 — time tracking for shader uniforms. startTime
+  // is set once when the device acquires; u_time = (now - startTime)
+  // in seconds, u_dt = since-last-frame in seconds.
+  startTime: 0,
+  lastFrameT: 0,
+
+  // Phase 6.2.1 — WGSL pipeline cache. Keyed by FNV hash of the WGSL
+  // body so identical shader source shares one compile, even across
+  // multiple node instances of the same registry entry. Map stores
+  // { promise, pipeline, error } — promise is the in-flight async
+  // compile (callers await or skip), pipeline goes non-null once
+  // ready. Single shared layout for now (1 uniform buffer at @group 0
+  // @binding 0); composition shaders with texture inputs will get
+  // their own cache key in 6.4.x.
+  shaderPipelineCache: new Map(),
+  standardShaderBgl: null,
+  standardShaderPipelineLayout: null,
+
+  // Per-node-instance render state. Map<nodeId, { uniformBuffer,
+  // bindGroup, scratch }>. uniformBuffer is the GPU-side state that
+  // backs the shader's WGSL uniform struct; scratch is a Float32Array
+  // we pack into each frame and queue.writeBuffer to the uniform.
+  shaderInstances: new Map(),
+
+  // Future-ticket holders.
   bindLayoutCache: null   // 6.3.4
 };
 
@@ -18603,6 +18802,8 @@ async function ensureGPUDevice() {
       _createBlitPipeline();
       _allocateFramebuffer();
       _rebuildBlitBindGroup();
+      Visual.startTime  = performance.now();
+      Visual.lastFrameT = 0;
       smokeClearVisual();
       // Phase 6.1.7 — kick off the rAF render loop. From this point
       // on the visual canvas refreshes every frame; the fps pill in
@@ -18932,6 +19133,200 @@ function smokeClearVisual() {
   Visual.device.queue.submit([enc.finish()]);
 }
 
+/* ----- Phase 6.2.1 — shader pipeline cache + per-instance state ------- */
+
+/* FNV-1a 32-bit hash of a string. Cheap, no crypto, enough entropy
+ * to disambiguate WGSL bodies in our cache. Returns a hex string so
+ * we can use it as a Map key + label suffix interchangeably. */
+function _fnv1a(s) {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(16);
+}
+
+/* Shared bind-group layout for all built-in shader-frag nodes:
+ *   binding 0 → uniform buffer (preamble + per-node params)
+ * Composition nodes in 6.4.x that consume input textures will need a
+ * different layout (texture + sampler + uniform); they'll define
+ * their own cache keys to avoid colliding with this one. */
+function _ensureStandardShaderLayout() {
+  if (Visual.standardShaderBgl) return;
+  Visual.standardShaderBgl = Visual.device.createBindGroupLayout({
+    label: "shader-frag-standard-bgl",
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } }
+    ]
+  });
+  Visual.standardShaderPipelineLayout = Visual.device.createPipelineLayout({
+    label: "shader-frag-standard-pl",
+    bindGroupLayouts: [Visual.standardShaderBgl]
+  });
+}
+
+/* Get-or-create a render pipeline for a WGSL body. Returns the cache
+ * entry: { promise, pipeline, error }. First call kicks off async
+ * compile; subsequent calls share the promise. Renderer reads
+ * .pipeline directly — null means "not ready yet, skip this frame
+ * gracefully". */
+function _getShaderPipeline(wgsl) {
+  _ensureStandardShaderLayout();
+  const key = _fnv1a(wgsl);
+  let entry = Visual.shaderPipelineCache.get(key);
+  if (entry) return entry;
+
+  entry = { key, promise: null, pipeline: null, error: null };
+  entry.promise = (async () => {
+    try {
+      const module = Visual.device.createShaderModule({
+        label: "shader-frag-" + key,
+        code: wgsl
+      });
+      const pipeline = await Visual.device.createRenderPipelineAsync({
+        label: "shader-frag-pipeline-" + key,
+        layout: Visual.standardShaderPipelineLayout,
+        vertex:   { module, entryPoint: "vs_main" },
+        fragment: { module, entryPoint: "fs_main", targets: [{ format: Visual.fbFormat }] },
+        primitive: { topology: "triangle-list" }
+      });
+      entry.pipeline = pipeline;
+      return pipeline;
+    } catch (e) {
+      entry.error = e;
+      console.warn("[visual] shader-frag compile failed (key=" + key + "):", e);
+      throw e;
+    }
+  })();
+  Visual.shaderPipelineCache.set(key, entry);
+  return entry;
+}
+
+/* Build per-node uniform buffer + bind group. Buffer size is
+ * def.uniformBytes (registry-declared). Returns { uniformBuffer,
+ * bindGroup, scratch }. Cached on Visual.shaderInstances. */
+function _ensureShaderInstance(nodeId, def) {
+  let inst = Visual.shaderInstances.get(nodeId);
+  if (inst && inst._uniformBytes === def.uniformBytes) return inst;
+  if (inst && inst.uniformBuffer) {
+    try { inst.uniformBuffer.destroy(); } catch (_) {}
+  }
+  const bytes = def.uniformBytes;
+  const buf = Visual.device.createBuffer({
+    label: "shader-frag-uniform-" + nodeId,
+    size:  bytes,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+  });
+  const bg = Visual.device.createBindGroup({
+    label: "shader-frag-bg-" + nodeId,
+    layout: Visual.standardShaderBgl,
+    entries: [{ binding: 0, resource: { buffer: buf } }]
+  });
+  inst = {
+    uniformBuffer: buf,
+    bindGroup:     bg,
+    scratch:       new Float32Array(bytes / 4),
+    _uniformBytes: bytes
+  };
+  Visual.shaderInstances.set(nodeId, inst);
+  return inst;
+}
+
+/* Drop any cached GPU state for a node (called when it's deleted
+ * from the patch). Cheap garbage collection. Free to call on any
+ * node id — no-ops if no state was cached. */
+function _disposeShaderInstance(nodeId) {
+  const inst = Visual.shaderInstances.get(nodeId);
+  if (!inst) return;
+  try { inst.uniformBuffer && inst.uniformBuffer.destroy(); } catch (_) {}
+  Visual.shaderInstances.delete(nodeId);
+}
+
+/* Standard uniform-buffer preamble: 32 bytes laid out as
+ *   [u_resolution: vec4f]  (fb width, height, 1/width, 1/height)
+ *   [u_time: f32]
+ *   [u_dt: f32]
+ *   [_pad: vec2f]    (round preamble to 32 = next 16-aligned offset)
+ * Each shader's writeUniforms(node, scratch, offset) function is
+ * called with offset = 8 (in float-words, = 32 bytes), so the user
+ * params land directly after the preamble.
+ *
+ * scratch is the Float32Array view of the per-instance buffer; we
+ * write into it then queue.writeBuffer the whole thing. */
+function _writeShaderPreamble(scratch, dtSec) {
+  const t = (performance.now() - Visual.startTime) * 0.001;
+  scratch[0] = Visual.fbWidth;
+  scratch[1] = Visual.fbHeight;
+  scratch[2] = 1.0 / Visual.fbWidth;
+  scratch[3] = 1.0 / Visual.fbHeight;
+  scratch[4] = t;
+  scratch[5] = dtSec;
+  scratch[6] = 0;
+  scratch[7] = 0;
+}
+
+/* Encode a single shader-frag pass that renders the node's output
+ * into Visual.framebuffer. Returns true if a pass was actually
+ * encoded (pipeline ready, instance built); false if the pipeline
+ * is still compiling or some prerequisite is missing. */
+function _encodeShaderFragPass(enc, node, def, dtSec) {
+  const entry = _getShaderPipeline(def.wgsl);
+  if (!entry || !entry.pipeline) return false;
+  const inst = _ensureShaderInstance(node.id, def);
+
+  // Pack uniforms — preamble first, then the registry-declared
+  // writer for the per-node params.
+  _writeShaderPreamble(inst.scratch, dtSec);
+  if (typeof def.writeUniforms === "function") {
+    def.writeUniforms(node, inst.scratch);
+  }
+  Visual.device.queue.writeBuffer(inst.uniformBuffer, 0, inst.scratch.buffer, inst.scratch.byteOffset, inst.scratch.byteLength);
+
+  const pass = enc.beginRenderPass({
+    label: "shader-frag-" + node.type + "-" + node.id,
+    colorAttachments: [{
+      view: Visual.framebufferView,
+      clearValue: { r: 0, g: 0, b: 0, a: 1 },
+      loadOp: "clear",
+      storeOp: "store"
+    }]
+  });
+  pass.setPipeline(entry.pipeline);
+  pass.setBindGroup(0, inst.bindGroup);
+  pass.draw(3);   // fullscreen triangle (vs_main hardcodes the 3 verts)
+  pass.end();
+  return true;
+}
+
+/* Walk the visual subgraph from VisualOutput backward + encode
+ * shader passes. Returns true if we rendered something into the FBO,
+ * false if no graph or nothing renderable.
+ *
+ * Today's strict shape — the smallest demo of the chain:
+ *   [shader-frag node] --(texture)--> [VisualOutput]
+ *
+ * Multi-stage chains (Gradient → Blur → VisualOutput) require
+ * intermediate textures and ping-pong FBO management which lands
+ * in 6.3.2. For now: VisualOutput's input must come directly from a
+ * shader-frag node, and that node renders straight into the
+ * shared framebuffer. */
+function _encodeVisualGraph(enc, dtSec) {
+  if (typeof state === "undefined" || !state || !Array.isArray(state.nodes)) return false;
+  const sinks = state.nodes.filter(n => n.type === "VisualOutput");
+  if (sinks.length === 0) return false;
+  const sink = sinks[0];   // one canonical sink for now; multi-output is a future ticket
+  const sinkEdge = state.edges.find(e =>
+    e.to.node === sink.id && e.to.port === "in"
+  );
+  if (!sinkEdge) return false;
+  const src = state.nodes.find(n => n.id === sinkEdge.from.node);
+  if (!src) return false;
+  const def = TYPES[src.type];
+  if (!def || def.kind !== "shader-frag" || typeof def.wgsl !== "string") return false;
+  return _encodeShaderFragPass(enc, src, def, dtSec);
+}
+
 /* ----- Phase 6.1.7 — render loop (rAF) -------------------------------- */
 
 /* The visual render loop. Starts when the WebGPU device is ready and
@@ -18963,10 +19358,65 @@ function smokeClearVisual() {
  * re-arming rAF — loop terminates cleanly. */
 let _visualRafHandle = null;
 
+/* Per-frame render entry point. Walks the visual subgraph and encodes
+ * shader passes into the framebuffer, then a single blit pass copies
+ * the framebuffer onto the visible canvas with letterbox math.
+ * Falls back to a smoke clear when there's nothing renderable
+ * (no VisualOutput, unwired, source isn't a shader-frag, or pipeline
+ * still compiling). All passes share one command encoder + one
+ * queue.submit so the GPU sees them as one frame. */
 function renderVisualFrame() {
-  // Today this is the smoke-clear path. 6.4.x will replace it with a
-  // graph-walk that renders shader nodes into the framebuffer.
-  smokeClearVisual();
+  if (!Visual.device || !Visual.context || !Visual.framebufferView ||
+      !Visual.blitPipeline || !Visual.blitBindGroup) return;
+
+  const now = performance.now();
+  const dtSec = Visual.lastFrameT > 0 ? (now - Visual.lastFrameT) * 0.001 : 0;
+  Visual.lastFrameT = now;
+
+  const enc = Visual.device.createCommandEncoder({ label: "visual-frame" });
+
+  // Step 1: render the visual graph into the framebuffer.
+  const rendered = _encodeVisualGraph(enc, dtSec);
+
+  // Step 2: if no graph rendered (no VisualOutput, unwired, or shader
+  // pipeline still compiling), clear the FBO to the smoke debug color
+  // so the canvas isn't garbage from a previous frame's pass.
+  if (!rendered) {
+    enc.beginRenderPass({
+      label: "fbo-empty-clear",
+      colorAttachments: [{
+        view: Visual.framebufferView,
+        clearValue: { r: 10/255, g: 14/255, b: 22/255, a: 1.0 },
+        loadOp: "clear",
+        storeOp: "store"
+      }]
+    }).end();
+  }
+
+  // Step 3: blit FBO to visible canvas with object-fit: contain bars.
+  let canvasView;
+  try { canvasView = Visual.context.getCurrentTexture().createView(); }
+  catch (e) {
+    console.warn("[visual] canvas getCurrentTexture failed:", e);
+    return;
+  }
+  const vp = _blitViewport();
+  const blit = enc.beginRenderPass({
+    label: "fbo-blit",
+    colorAttachments: [{
+      view: canvasView,
+      clearValue: { r: 0, g: 0, b: 0, a: 1.0 },
+      loadOp: "clear",
+      storeOp: "store"
+    }]
+  });
+  blit.setPipeline(Visual.blitPipeline);
+  blit.setBindGroup(0, Visual.blitBindGroup);
+  blit.setViewport(vp.x, vp.y, vp.w, vp.h, 0, 1);
+  blit.draw(3);
+  blit.end();
+
+  Visual.device.queue.submit([enc.finish()]);
 }
 
 function _visualRenderTick(t) {
