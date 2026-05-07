@@ -129,6 +129,7 @@ python -m http.server 8000
 | Single-finger drag on an out-port | Draw a wire |
 | Single-finger drag on empty canvas | Marquee-select |
 | **Long-press a node** (~½ s, hold still) | Pop the **action menu** above it: *Duplicate · Group · Delete*. Slide finger onto a chip and lift to commit, or release first and tap a chip. The Group chip shows only when ≥ 2 nodes are already selected. |
+| **Long-press a group** (collapsed block or expanded header) | Same gesture, group-aware menu: *Duplicate · Ungroup · Delete*. Duplicate clones every member + the internal wiring; Ungroup dissolves the wrapper but keeps members; Delete wipes the group AND every node inside it. |
 | Two-finger pinch | Zoom toward midpoint |
 | Two-finger drag (with pinch) | Pan |
 | Apple Pencil | Routes to handwriting / draw tool, never to canvas hit-tests |

@@ -11629,6 +11629,95 @@ function ungroupSelection() {
   render();
   renderProps && renderProps();
 }
+/* Delete a group AND every node it contains, plus any edges touching
+ * those nodes and any exposed-setter entries pointing into them. The
+ * group entity itself goes too. Distinct from `ungroupSelection`,
+ * which keeps the members and only removes the group wrapper. */
+function deleteGroup(groupId) {
+  const g = groupById(groupId);
+  if (!g) return;
+  pushHistory("delete-group:" + groupId);
+  const memberSet = new Set(g.members || []);
+  state.nodes = state.nodes.filter(n => !memberSet.has(n.id));
+  state.edges = state.edges.filter(ed =>
+    !memberSet.has(ed.from.node) && !memberSet.has(ed.to.node)
+  );
+  Object.keys(state.exposed).forEach(k => {
+    const dot = k.indexOf(".");
+    const idPart = dot >= 0 ? k.slice(0, dot) : k;
+    if (memberSet.has(idPart)) delete state.exposed[k];
+  });
+  state.groups = state.groups.filter(x => x.id !== groupId);
+  selectedGroupId = null;
+  selectedSet.clear();
+  selected = null;
+  render();
+  renderProps && renderProps();
+}
+
+/* Clone a group: duplicates every member node, every edge whose BOTH
+ * endpoints are inside the group (internal wiring), every exposed-
+ * setter that points at a member, and creates a fresh group entity
+ * pointing at the new IDs. External wires aren't carried — same
+ * convention as `serializeSelection` for plain copy/paste. The new
+ * group is offset by (24, 24) so it lands visibly next to the
+ * original; the new group entity inherits the source's collapsed
+ * state and gets " copy" appended to its name. */
+function duplicateGroup(groupId) {
+  const g = groupById(groupId);
+  if (!g || !Array.isArray(g.members)) return;
+  pushHistory("duplicate-group:" + groupId);
+  const dx = 24, dy = 24;
+  const idMap = {};
+  g.members.forEach(mid => {
+    const orig = nodeById(mid);
+    if (!orig) return;
+    const newId = uid();
+    idMap[mid] = newId;
+    state.nodes.push({
+      id: newId,
+      type: orig.type,
+      x: orig.x + dx,
+      y: orig.y + dy,
+      params: { ...orig.params }
+    });
+  });
+  const memberSet = new Set(g.members);
+  state.edges.slice().forEach(ed => {
+    if (memberSet.has(ed.from.node) && memberSet.has(ed.to.node)) {
+      const fn = idMap[ed.from.node];
+      const tn = idMap[ed.to.node];
+      if (fn && tn) {
+        state.edges.push({
+          from: { node: fn, port: ed.from.port },
+          to:   { node: tn, port: ed.to.port }
+        });
+      }
+    }
+  });
+  Object.keys(state.exposed).forEach(k => {
+    const dot = k.indexOf(".");
+    const oldId = dot >= 0 ? k.slice(0, dot) : k;
+    const rest  = dot >= 0 ? k.slice(dot)    : "";
+    if (idMap[oldId]) {
+      state.exposed[idMap[oldId] + rest] = state.exposed[k];
+    }
+  });
+  if (!Array.isArray(state.groups)) state.groups = [];
+  const newGroupId = "g" + (nextId++);
+  state.groups.push({
+    id: newGroupId,
+    name: (g.name || "Group") + " copy",
+    collapsed: !!g.collapsed,
+    members: Object.values(idMap)
+  });
+  selectedSet.clear();
+  selected = null;
+  selectedGroupId = newGroupId;
+  render();
+  renderProps && renderProps();
+}
+
 /* Toggle expand/collapse on a group. Pure UI flag; the underlying
  * node + edge graph is unchanged. Wires re-route on next renderWires
  * (collapsed-group endpoints redirect to the group's port stubs). */
@@ -14487,10 +14576,19 @@ canvas.addEventListener("pointerup",     _endTouchPointer, true);
 canvas.addEventListener("pointercancel", _endTouchPointer, true);
 
 /* ----- Touch hold-and-swipe context menu --------------------------------
- * Long-press a node on touch (~500 ms, < 10 px movement) → small
- * floating menu pops above the held node with Duplicate / Delete
- * (always) and Group (when ≥2 nodes selected). Two release modes:
+ * Long-press a node OR a collapsed group on touch (~500 ms, < 10 px
+ * movement) → small floating menu pops above the held entity. Two
+ * action sets, switched by `touchHold.kind`:
  *
+ *   NODE  (held a regular node):
+ *     ⎘ Duplicate │ ⊞ Group (if ≥2 selected) │ ⌫ Delete
+ *   GROUP (held a collapsed group block):
+ *     ⎘ Duplicate │ ⊟ Ungroup │ ⌫ Delete
+ *     "Duplicate" clones the group + members + internal edges;
+ *     "Ungroup" dissolves the group wrapper but keeps members;
+ *     "Delete" wipes the group AND every member node.
+ *
+ * Two release modes either way:
  *   • SWIPE-AND-RELEASE — slide the held finger up onto a chip
  *     (it glows .thm-active to confirm), lift to commit. Single
  *     gesture, never breaks contact with the screen.
@@ -14499,7 +14597,7 @@ canvas.addEventListener("pointercancel", _endTouchPointer, true);
  *
  * Mouse and pen skip this — keyboard shortcuts + the existing
  * delete button still cover those flows. */
-let touchHold = null;        // { pointerId, nodeId, startScreen, timer, menuOpen }
+let touchHold = null;        // { pointerId, kind, entityId, startScreen, timer, menuOpen }
 const TOUCH_HOLD_MS       = 500;
 const TOUCH_HOLD_MOVE_PX  = 10;
 
@@ -14509,13 +14607,18 @@ function _ensureTouchMenu() {
   m = document.createElement("div");
   m.id = "touch-hold-menu";
   m.className = "touch-hold-menu";
-  // Order chosen for thumb reach: Duplicate left, Group middle (only
-  // shown when ≥2 selected), Delete right (danger style + furthest
-  // from a typical thumb tap to discourage accidental commits).
+  // All possible chips live in the DOM; visibility is toggled per
+  // gesture in _showTouchMenu based on touchHold.kind. Order chosen
+  // for thumb reach (Delete furthest right since it's destructive).
+  // Node-mode and group-mode actions share data-action codes that
+  // _commitTouchAction routes to the right operation.
   m.innerHTML =
-    '<button class="thm-chip" data-action="duplicate">⎘ Duplicate</button>' +
-    '<button class="thm-chip thm-group" data-action="group">⊞ Group</button>' +
-    '<button class="thm-chip thm-danger"  data-action="delete">⌫ Delete</button>';
+    '<button class="thm-chip thm-node-only"  data-action="duplicate">⎘ Duplicate</button>' +
+    '<button class="thm-chip thm-node-only  thm-group" data-action="group">⊞ Group</button>' +
+    '<button class="thm-chip thm-group-only" data-action="duplicate-group">⎘ Duplicate</button>' +
+    '<button class="thm-chip thm-group-only" data-action="ungroup">⊟ Ungroup</button>' +
+    '<button class="thm-chip thm-node-only  thm-danger" data-action="delete">⌫ Delete</button>' +
+    '<button class="thm-chip thm-group-only thm-danger" data-action="delete-group">⌫ Delete</button>';
   document.body.appendChild(m);
   m.querySelectorAll(".thm-chip").forEach(b => {
     b.addEventListener("click", () => _commitTouchAction(b.dataset.action));
@@ -14535,10 +14638,22 @@ function _ensureTouchMenu() {
 
 function _showTouchMenu(screenX, screenY) {
   const menu = _ensureTouchMenu();
-  // Show / hide Group chip based on current selection size. groupSelection
-  // also no-ops on a single node, but hiding the chip keeps the menu honest.
-  const groupChip = menu.querySelector(".thm-group");
-  groupChip.style.display = (selectedSet.size >= 2) ? "" : "none";
+  // Switch chip set based on what was long-pressed. Node-only chips
+  // hide on group gestures and vice versa. Group chip (between
+  // Duplicate and Delete in node mode) only shows when ≥2 nodes
+  // are already selected — single-node menus drop it.
+  const kind = touchHold && touchHold.kind || "node";
+  const isGroup = kind === "group";
+  menu.querySelectorAll(".thm-node-only").forEach(el => {
+    el.style.display = isGroup ? "none" : "";
+  });
+  menu.querySelectorAll(".thm-group-only").forEach(el => {
+    el.style.display = isGroup ? "" : "none";
+  });
+  if (!isGroup) {
+    const groupChip = menu.querySelector(".thm-group");
+    if (groupChip) groupChip.style.display = (selectedSet.size >= 2) ? "" : "none";
+  }
   menu.style.display = "flex";
   // Reset positioning so getBoundingClientRect measures real dimensions.
   menu.style.left = "0px";
@@ -14578,10 +14693,11 @@ function _chipActionAt(x, y) {
   const chip = target && target.closest && target.closest(".thm-chip");
   return chip ? chip.dataset.action : null;
 }
-function _startTouchHold(pointerId, nodeId, screenX, screenY) {
+function _startTouchHold(pointerId, entityId, screenX, screenY, kind) {
   if (touchHold && touchHold.timer) clearTimeout(touchHold.timer);
   touchHold = {
-    pointerId, nodeId,
+    pointerId, entityId,
+    kind: kind || "node",   // "node" | "group"
     startScreen: { x: screenX, y: screenY },
     menuOpen: false,
     timer: setTimeout(() => _fireTouchHold(), TOUCH_HOLD_MS)
@@ -14596,9 +14712,9 @@ function _fireTouchHold() {
   // Snap any held nodes back to their original positions before
   // cancelling the drag — sub-threshold finger tremor (< 10 px) can
   // shift things by a pixel or two during the hold, which feels
-  // wrong when the menu pops. The pushHistory("drag-start:") entry
-  // logged at touch-down is now an exact no-op against current state,
-  // so leaving it on the undo stack is harmless.
+  // wrong when the menu pops. The pushHistory("drag-start:") /
+  // pushHistory("group-drag-start:") entries logged at touch-down
+  // become exact no-ops against current state — harmless.
   if (groupDrag && groupDrag.originals) {
     groupDrag.originals.forEach((orig, id) => {
       const n = nodeById(id);
@@ -14607,17 +14723,38 @@ function _fireTouchHold() {
   }
   if (groupDrag) groupDrag = null;
   if (wire)      { wire = null; renderWires(); }
-  // Make sure the held node is selected so deleteSelection /
-  // duplicateSelection / groupSelection have something to act on.
-  if (!selectedSet.has(touchHold.nodeId)) selectOne(touchHold.nodeId);
+  // Make sure the held entity is the active selection target so
+  // operations have something to act on. Node mode → ensure the node
+  // is in selectedSet (lets us cover both single-node and pre-existing
+  // multi-select). Group mode → set selectedGroupId; ungroupSelection
+  // and the group-specific helpers read from there.
+  if (touchHold.kind === "group") {
+    selectedSet.clear();
+    selected = null;
+    selectedGroupId = touchHold.entityId;
+  } else {
+    if (!selectedSet.has(touchHold.entityId)) selectOne(touchHold.entityId);
+  }
   touchHold.menuOpen = true;
   _showTouchMenu(touchHold.startScreen.x, touchHold.startScreen.y);
   render();
 }
 function _commitTouchAction(action) {
-  if      (action === "duplicate") duplicateSelection();
-  else if (action === "delete")    deleteSelection();
-  else if (action === "group")     groupSelection();
+  // Group-mode action ids carry a "-group" suffix where they conflict
+  // with node-mode (duplicate / delete). Ungroup is group-only so its
+  // id stays bare. The kind switch happens here, not via separate
+  // chip click handlers, so the menu DOM stays a single static
+  // declaration.
+  if      (action === "duplicate")        duplicateSelection();
+  else if (action === "delete")           deleteSelection();
+  else if (action === "group")            groupSelection();
+  else if (action === "duplicate-group") {
+    if (touchHold && touchHold.entityId) duplicateGroup(touchHold.entityId);
+  }
+  else if (action === "delete-group") {
+    if (touchHold && touchHold.entityId) deleteGroup(touchHold.entityId);
+  }
+  else if (action === "ungroup")          ungroupSelection();
   _hideTouchMenu();
   touchHold = null;
 }
@@ -14698,6 +14835,13 @@ canvas.addEventListener("pointerdown", e => {
       if (sn) originals.set(mid, { x: sn.x, y: sn.y });
     });
     groupDrag = { id: gid, dx: 0, dy: 0, startX: w.x, startY: w.y, originals, kind: "group" };
+    // Touch-only: arm the long-press timer on the expanded group
+    // header too — same gesture, same chip set as the collapsed
+    // block. The user may want to Duplicate / Ungroup / Delete a
+    // group whether it's currently expanded or condensed.
+    if (e.pointerType === "touch") {
+      _startTouchHold(e.pointerId, gid, e.clientX, e.clientY, "group");
+    }
     render();
     return;
   }
@@ -14729,6 +14873,12 @@ canvas.addEventListener("pointerdown", e => {
             if (sn) originals.set(mid, { x: sn.x, y: sn.y });
           });
           groupDrag = { id: gid, dx: 0, dy: 0, startX: w.x, startY: w.y, originals, kind: "group" };
+          // Touch-only: arm the long-press timer on the collapsed group
+          // head. Same gesture as a node hold but the menu chips swap
+          // to Duplicate / Ungroup / Delete via touchHold.kind = "group".
+          if (e.pointerType === "touch") {
+            _startTouchHold(e.pointerId, gid, e.clientX, e.clientY, "group");
+          }
         }
         render();
         return;
