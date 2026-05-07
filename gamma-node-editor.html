@@ -15089,6 +15089,20 @@ document.addEventListener("pointermove", e => {
     // current view transform.
     const radius = _snapRadiusFor(e.pointerType);
     const snap = _pickSnap(e.clientX, e.clientY, wire.fromType, wire.fromNode, radius);
+    // Diagnostic: log first move (so we know moves are firing) and
+    // every snap-state change. Quiet on subsequent moves with same
+    // snap target to avoid spam.
+    if (wire._moveCount === undefined) {
+      wire._moveCount = 0;
+      console.log("[wire] first move type=" + JSON.stringify(e.pointerType) +
+                  " at=" + e.clientX + "," + e.clientY +
+                  " snap=" + (snap ? snap.dataset.node + "." + snap.dataset.port : "none"));
+    }
+    wire._moveCount++;
+    if (snap !== wire._lastLoggedSnap) {
+      console.log("[wire] snap " + (snap ? "→ " + snap.dataset.node + "." + snap.dataset.port : "cleared"));
+      wire._lastLoggedSnap = snap || null;
+    }
     _setWireSnap(snap);
     if (snap) {
       const r = snap.getBoundingClientRect();
@@ -15141,20 +15155,35 @@ document.addEventListener("pointerup", e => {
     return;
   }
   if (wire) {
-    // Hit-test priority: (1) finger / cursor exactly on a port; (2)
-    // elementFromPoint at the release coords — same effect but
-    // bypasses the e.target weirdness we've seen on some Chromebook
-    // touch drivers where pointerup's e.target is the canvas even
-    // when the contact pixel is on a port; (3) failing both, the
-    // snap target the move handler chose with hysteresis. Together
-    // these three layers make wire drops on small ports robust
-    // across mouse / pen / finger / unknown.
-    let port = e.target.closest && e.target.closest(".port");
-    if (!port) {
-      const elPt = document.elementFromPoint(e.clientX, e.clientY);
-      port = elPt && elPt.closest && elPt.closest(".port");
-    }
-    if (!port && wire._snapPort) port = wire._snapPort;
+    // FOUR-layer hit-test, evaluated in order. First non-null wins.
+    //   (a) e.target.closest(".port")      — normal path
+    //   (b) elementFromPoint(release)      — bypasses e.target
+    //                                        weirdness on Chromebook
+    //                                        touch drivers
+    //   (c) wire._snapPort                 — hysteretic snap from move
+    //   (d) findSnapPort at release coords — last-chance fresh search;
+    //                                        covers the case where
+    //                                        the device fired
+    //                                        pointerdown → pointerup
+    //                                        with zero pointermoves
+    //                                        in between (so wire._snapPort
+    //                                        was never set)
+    const targetA = e.target.closest && e.target.closest(".port");
+    const elPt    = document.elementFromPoint(e.clientX, e.clientY);
+    const targetB = elPt && elPt.closest && elPt.closest(".port");
+    const targetC = wire._snapPort;
+    const radius  = _snapRadiusFor(e.pointerType);
+    const targetD = (targetA || targetB || targetC) ? null
+                  : findSnapPort(e.clientX, e.clientY, wire.fromType, wire.fromNode, radius);
+    let port = targetA || targetB || targetC || targetD;
+    // Diagnostic — show every layer's vote so a "no connect" report
+    // is forensic. Format compresses to one line per release.
+    const fmt = p => p ? (p.dataset.node + "." + p.dataset.port + "/" + p.dataset.dir) : "null";
+    console.log("[wire] up at=" + e.clientX + "," + e.clientY +
+                " moves=" + (wire._moveCount || 0) +
+                " A=" + fmt(targetA) + " B=" + fmt(targetB) +
+                " C=" + fmt(targetC) + " D=" + fmt(targetD) +
+                " → " + fmt(port));
     _clearWireSnap();
     if (port && port.dataset.dir === "in" && port.dataset.node !== wire.fromNode) {
       // Legality check — see portsCompatible() above. A reject just
@@ -15174,6 +15203,59 @@ document.addEventListener("pointerup", e => {
     wire = null;
     render();
   }
+});
+
+/* Some touch drivers (we've seen this on Chromebook + a few hybrid
+ * Surface devices) fire pointercancel instead of pointerup when a
+ * touch gesture is "absorbed" by the system — e.g. a swipe touches
+ * an edge zone, or implicit capture on the start element ends. If
+ * a wire is in flight when that happens, pointerup never runs and
+ * the wire silently dangles forever. Treat pointercancel as a
+ * commit attempt: same four-layer hit-test as pointerup, just
+ * tagged so the diagnostic distinguishes the two paths.
+ *
+ * Marquee / drag / pan don't need this — they're stateless on
+ * cancel and the existing pinch handler already does the cleanup
+ * for two-finger gestures. Wire is the one that holds state across
+ * pointerdown→pointerup AND has a target-acquisition step that
+ * needs to fire on the way out. */
+document.addEventListener("pointercancel", e => {
+  if (pinchState) return;
+  if (touchHold && touchHold.menuOpen) {
+    _hideTouchMenu();
+    touchHold = null;
+    return;
+  }
+  if (!wire) return;
+  const targetA = e.target.closest && e.target.closest(".port");
+  const elPt    = document.elementFromPoint(e.clientX, e.clientY);
+  const targetB = elPt && elPt.closest && elPt.closest(".port");
+  const targetC = wire._snapPort;
+  const radius  = _snapRadiusFor(e.pointerType);
+  const targetD = (targetA || targetB || targetC) ? null
+                : findSnapPort(e.clientX, e.clientY, wire.fromType, wire.fromNode, radius);
+  let port = targetA || targetB || targetC || targetD;
+  const fmt = p => p ? (p.dataset.node + "." + p.dataset.port + "/" + p.dataset.dir) : "null";
+  console.log("[wire] CANCEL at=" + e.clientX + "," + e.clientY +
+              " moves=" + (wire._moveCount || 0) +
+              " A=" + fmt(targetA) + " B=" + fmt(targetB) +
+              " C=" + fmt(targetC) + " D=" + fmt(targetD) +
+              " → " + fmt(port));
+  _clearWireSnap();
+  if (port && port.dataset.dir === "in" && port.dataset.node !== wire.fromNode) {
+    if (!portsCompatible(wire.fromType, port.dataset.type)) {
+      flashRejectPort(port);
+    } else {
+      pushHistory("connect");
+      state.edges = state.edges.filter(ed => !(ed.to.node === port.dataset.node && ed.to.port === port.dataset.port));
+      state.edges.push({
+        from: { node: wire.fromNode, port: wire.fromPort },
+        to:   { node: port.dataset.node, port: port.dataset.port }
+      });
+    }
+  }
+  wire = null;
+  render();
 });
 
 function paintMarquee() {
