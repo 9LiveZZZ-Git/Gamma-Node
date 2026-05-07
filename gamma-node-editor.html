@@ -8646,6 +8646,178 @@ public:
     description: "Comb filter (feedforward + feedback)"
   },
 
+  /* PingPong — stereo delay where each side's output feeds the
+   * other side's input through a feedback gain. Mono input fans
+   * out to the L line; L's tap feeds R; R's tap feeds back into
+   * L. Both outputs carry the dry signal blended with their own
+   * delayed tap by `mix`. Time + feedback are continuous setters
+   * so an LFO can wobble either. Multi-output L / R; wire into
+   * OutputStereo for the bouncing-stereo effect. */
+  PingPong: {
+    category: "Delay", color: COLOR.delay, header: "Delay",
+    cppType: "GammaPingPong",
+    helperClass:
+`class GammaPingPong {
+    gam::Delay<> dL_, dR_;
+    float feedback_ = 0.5f;
+    float mix_ = 0.5f;
+public:
+    GammaPingPong() {
+        dL_.maxDelay(2.0f);
+        dR_.maxDelay(2.0f);
+        dL_.delay(0.5f);
+        dR_.delay(0.5f);
+    }
+    void setTime(float v) {
+        if (v < 0.001f) v = 0.001f;
+        if (v > 2.0f)   v = 2.0f;
+        dL_.delay(v);
+        dR_.delay(v);
+    }
+    void setFeedback(float v) { feedback_ = (v < 0.f) ? 0.f : (v > 0.99f ? 0.99f : v); }
+    void setMix(float v)      { mix_ = (v < 0.f) ? 0.f : (v > 1.f ? 1.f : v); }
+    struct Out { float l, r; };
+    Out operator()(float in) {
+        // Read each line's tap before writing — separates read/write
+        // so the feedback path is correctly one-sample old.
+        const float lOut = dL_();
+        const float rOut = dR_();
+        // Cross-couple: L gets in + R's tail; R gets L's tail.
+        dL_.write(in + rOut * feedback_);
+        dR_.write(lOut * feedback_);
+        Out o;
+        const float dryGain = 1.f - mix_;
+        o.l = in * dryGain + lOut * mix_;
+        o.r = in * dryGain + rOut * mix_;
+        return o;
+    }
+};`,
+    ins: [
+      { n: "in",       t: "audio" },
+      { n: "time",     t: "param" },
+      { n: "feedback", t: "param" },
+      { n: "mix",      t: "param" }
+    ],
+    outs: [
+      { n: "L", t: "audio", access: ".l" },
+      { n: "R", t: "audio", access: ".r" }
+    ],
+    params: { time: 0.5, feedback: 0.5, mix: 0.5 },
+    methods: { time: "setTime", feedback: "setFeedback", mix: "setMix" },
+    description: "Stereo ping-pong delay. Mono in, stereo out; each side's tail bounces into the other through a feedback gain. mix blends dry signal with the delayed taps. Wire L / R into OutputStereo for the classic ping-pong bounce."
+  },
+
+  /* MultiTap — single delay line with 4 read taps at independently
+   * configurable times. Sums the taps with per-tap gain into a mono
+   * output. Useful for textured delay effects (e.g., short slap-back
+   * + long ambient tail) and for rhythmic patterns where the taps
+   * land on specific subdivisions. */
+  MultiTap: {
+    category: "Delay", color: COLOR.delay, header: "Delay",
+    cppType: "GammaMultiTap4",
+    helperClass:
+`class GammaMultiTap4 {
+    gam::Multitap<> mt_;
+    float gains_[4] = { 1.0f, 0.7f, 0.5f, 0.3f };
+public:
+    GammaMultiTap4() : mt_(2.0f, 4) {
+        mt_.delay(0.125f, 0);
+        mt_.delay(0.250f, 1);
+        mt_.delay(0.375f, 2);
+        mt_.delay(0.500f, 3);
+    }
+    void setTap_(float v, int i) {
+        if (i < 0 || i >= 4) return;
+        if (v < 0.f)   v = 0.f;
+        if (v > 2.0f)  v = 2.0f;
+        mt_.delay(v, i);
+    }
+    void setT1(float v) { setTap_(v, 0); }
+    void setT2(float v) { setTap_(v, 1); }
+    void setT3(float v) { setTap_(v, 2); }
+    void setT4(float v) { setTap_(v, 3); }
+    void setG1(float v) { gains_[0] = v; }
+    void setG2(float v) { gains_[1] = v; }
+    void setG3(float v) { gains_[2] = v; }
+    void setG4(float v) { gains_[3] = v; }
+    float operator()(float in) {
+        const float out =
+            gains_[0] * mt_.read(0) +
+            gains_[1] * mt_.read(1) +
+            gains_[2] * mt_.read(2) +
+            gains_[3] * mt_.read(3);
+        mt_.write(in);
+        return out;
+    }
+};`,
+    ins: [
+      { n: "in", t: "audio" },
+      { n: "t1", t: "param" }, { n: "g1", t: "param" },
+      { n: "t2", t: "param" }, { n: "g2", t: "param" },
+      { n: "t3", t: "param" }, { n: "g3", t: "param" },
+      { n: "t4", t: "param" }, { n: "g4", t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { t1: 0.125, g1: 1.0, t2: 0.25, g2: 0.7, t3: 0.375, g3: 0.5, t4: 0.5, g4: 0.3 },
+    methods: {
+      t1: "setT1", g1: "setG1",
+      t2: "setT2", g2: "setG2",
+      t3: "setT3", g3: "setG3",
+      t4: "setT4", g4: "setG4"
+    },
+    description: "Four-tap delay with per-tap time + gain. Sums all four taps into a single mono output. No internal feedback — pair with a Mul + Add cycle through Delay1 if you want one. Useful for clusters, slap-backs, rhythmic patterns."
+  },
+
+  /* TempoSyncDelay — delay whose time is computed from an incoming
+   * BPM and a beat-fraction multiplier. Wire `MasterClock.bpm` into
+   * bpm; set division to 0.25 for a 1/16 note, 1.0 for a 1/4 note,
+   * 2.0 for a 1/2 note, etc. The internal delay line caps at 4 s
+   * (to handle slow tempos / long divisions cleanly). */
+  TempoSyncDelay: {
+    category: "Delay", color: COLOR.delay, header: "Delay",
+    cppType: "GammaTempoDelay",
+    helperClass:
+`class GammaTempoDelay {
+    gam::Delay<> d_;
+    float bpm_ = 120.f;
+    float division_ = 1.0f;
+    float feedback_ = 0.5f;
+    float mix_ = 0.5f;
+    void recalc_() {
+        const float secPerBeat = 60.f / (bpm_ > 0.f ? bpm_ : 120.f);
+        float t = secPerBeat * division_;
+        if (t < 0.001f) t = 0.001f;
+        if (t > 4.0f)   t = 4.0f;
+        d_.delay(t);
+    }
+public:
+    GammaTempoDelay() {
+        d_.maxDelay(4.0f);
+        recalc_();
+    }
+    void setBpm(float v)      { bpm_ = v; recalc_(); }
+    void setDivision(float v) { division_ = v; recalc_(); }
+    void setFeedback(float v) { feedback_ = (v < 0.f) ? 0.f : (v > 0.99f ? 0.99f : v); }
+    void setMix(float v)      { mix_ = (v < 0.f) ? 0.f : (v > 1.f ? 1.f : v); }
+    float operator()(float in) {
+        const float tap = d_();
+        d_.write(in + tap * feedback_);
+        return in * (1.f - mix_) + tap * mix_;
+    }
+};`,
+    ins: [
+      { n: "in",       t: "audio" },
+      { n: "bpm",      t: "param" },
+      { n: "division", t: "param" },
+      { n: "feedback", t: "param" },
+      { n: "mix",      t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { bpm: 120, division: 1.0, feedback: 0.5, mix: 0.5 },
+    methods: { bpm: "setBpm", division: "setDivision", feedback: "setFeedback", mix: "setMix" },
+    description: "Tempo-synced delay. Wire MasterClock.bpm → bpm; division is the beat-fraction multiplier (0.25 = 1/16, 0.5 = 1/8, 1.0 = 1/4, 2.0 = 1/2, 4.0 = 1/1). Common idiom: dotted = 1.5×, triplet = 2/3×."
+  },
+
   /* ---- Multi-output (codegen binds these to a temporary; consumers index into it) ---- */
   /* gam::Pan (NOT Pan2 — that name was a registry typo). operator()(in)
    * returns Vec<2,T> which exposes [0]=L and [1]=R. setter is .pos. */
