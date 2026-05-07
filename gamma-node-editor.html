@@ -1664,6 +1664,62 @@
   }
   /* Everything in #app sits on top of the visual layer. */
   #app { position: relative; z-index: 1; }
+
+  /* ---------------- Live Mode ---------------- */
+  /* Activated by toggleLiveMode() — sets body.live-mode. The whole
+   * editor UI disappears via display:none on #app, leaving the
+   * visual canvas as the only content. The floating overlay below
+   * is the user's way back; it lives outside #app so it survives
+   * the display:none. Designed for the on-stage moment — no UI
+   * chrome competing with the visuals.
+   *
+   * The class also marks the body so any modal that gets opened in
+   * live-mode (e.g. via a kept-alive global like the GPU-error
+   * toast) can hide its backdrop dim if it wants to. */
+  body.live-mode #app { display: none; }
+  body.live-mode #visual-bg { z-index: 1; }   /* nothing else in the stack */
+  body.live-mode { cursor: none; }            /* hide cursor on stage; reveals on movement (see JS) */
+  body.live-mode.cursor-revealed { cursor: default; }
+
+  /* Floating exit affordance — only rendered when body.live-mode.
+   * Top-right corner, semi-transparent, fades after stillness, re-
+   * appears on any pointermove. The visible-on-hover pattern keeps
+   * the exit findable without polluting the visual frame. */
+  #live-mode-overlay {
+    display: none;
+    position: fixed;
+    top: 16px;
+    right: 16px;
+    z-index: 10000;
+    pointer-events: auto;
+    transition: opacity 600ms ease;
+  }
+  body.live-mode #live-mode-overlay { display: block; }
+  body.live-mode.live-idle #live-mode-overlay { opacity: 0; pointer-events: none; }
+  .live-exit {
+    background: rgba(20, 24, 32, 0.72);
+    color: var(--text);
+    border: 1px solid rgba(200, 232, 90, 0.34);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    padding: 8px 16px;
+    font-size: 12px;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+  }
+  .live-exit:hover {
+    background: rgba(30, 36, 48, 0.85);
+    border-color: var(--accent);
+  }
+
+  /* Active-state styling for the toolbar's Live Mode button so the
+   * user can see at a glance whether they're toggled in. (Mostly
+   * relevant in the brief moment before the editor disappears.) */
+  #btn-live-mode.active {
+    background: var(--accent);
+    color: var(--accent-ink);
+    border-color: var(--accent);
+  }
   .brand .file {
     font-family: var(--font-mono);
     font-size: 13.5px;
@@ -4921,6 +4977,16 @@
      this canvas in ensureGPUDevice(); see Visual.* below. -->
 <canvas id="visual-bg"></canvas>
 
+<!-- Live Mode overlay — visible only when body.live-mode is set.
+     Floating "exit" affordance in the corner: discreet enough to
+     stay out of the visual content, obvious enough that the user
+     can find their way back. Auto-fades after a few seconds of
+     mouse stillness; reappears on any pointer movement. -->
+<div id="live-mode-overlay" aria-hidden="true">
+  <button class="btn live-exit" id="btn-live-exit" type="button"
+          title="Exit Live Mode (L or Esc)">↩ Exit Live</button>
+</div>
+
 <div id="app">
 
   <header>
@@ -4952,6 +5018,7 @@
         <span class="preview-progress-meta" id="preview-progress-meta"></span>
       </span>
       <button class="btn primary" id="btn-gen" title="Open the Generated C++ tab">Generate C++</button>
+      <button class="btn icon-btn" id="btn-live-mode" title="Live Mode — hide the editor, show only the visual layer (L)" aria-label="Toggle Live Mode">◐</button>
       <button class="btn icon-btn" id="btn-help" title="Keyboard shortcuts">?</button>
     </div>
   </header>
@@ -5780,6 +5847,7 @@
           <kbd>1 / 2 / 3 / 4 / 5</kbd><span>Switch tab (Properties / C++ / JSON / User DSP / Monitor)</span>
           <kbd>V / D</kbd><span><em>Select</em> / <em>Draw</em> tool (pen, handwriting). Disabled while playing.</span>
           <kbd>Z / X</kbd><span>Octave down / up while playing</span>
+          <kbd>L</kbd><span><em>Live Mode</em> — hide the editor, show only the visual layer. <kbd>L</kbd> or <kbd>Esc</kbd> exits.</span>
           <kbd>⌘ ↵</kbd><span>Run the AI prompt (when AI panel open)</span>
         </div>
         <p class="modal-note" style="margin-top: 16px;">
@@ -18432,6 +18500,82 @@ function smokeClearVisual() {
   Visual.device.queue.submit([enc.finish()]);
 }
 
+/* =========================================================================
+ * Live Mode — Phase 6.7.5 (shipped early, ahead of full visual layer)
+ *
+ * One-toggle full-screen visual mode. Hides the entire editor UI via
+ * a body class, leaving only the visual canvas. Designed for live-
+ * performance use: the moment you go on stage, you don't want palette /
+ * properties / code / preview chrome competing with the projected
+ * visuals.
+ *
+ * Three ways in/out:
+ *   • Toolbar "◐" button (#btn-live-mode)
+ *   • Hotkey `L` (context-aware: skipped when typing in any text input)
+ *   • Hotkey `Escape` from inside live mode (safety exit; never
+ *     ambiguous since modals close before this fires)
+ *
+ * Idle-fade: after 2.5 s of pointer stillness in live mode, the floating
+ * "Exit Live" affordance fades to opacity 0 and the cursor hides. Any
+ * pointermove restores both. Keeps the visual frame clean during long
+ * sustained passages.
+ * ======================================================================== */
+
+let liveMode = false;
+let _liveIdleTimer = null;
+const LIVE_IDLE_MS = 2500;
+
+function isLiveMode() { return liveMode; }
+
+function setLiveMode(on) {
+  on = !!on;
+  if (on === liveMode) return;
+  liveMode = on;
+  document.body.classList.toggle("live-mode", liveMode);
+  const btn = document.getElementById("btn-live-mode");
+  if (btn) btn.classList.toggle("active", liveMode);
+  if (liveMode) {
+    // Drop focus from any text input so the L-key exit doesn't get
+    // swallowed by an open Code / JSON tab textarea.
+    if (document.activeElement && typeof document.activeElement.blur === "function") {
+      document.activeElement.blur();
+    }
+    document.body.classList.remove("live-idle");
+    document.body.classList.add("cursor-revealed");
+    _scheduleLiveIdleFade();
+  } else {
+    document.body.classList.remove("live-idle", "cursor-revealed");
+    if (_liveIdleTimer) { clearTimeout(_liveIdleTimer); _liveIdleTimer = null; }
+  }
+}
+
+function toggleLiveMode() { setLiveMode(!liveMode); }
+
+function _scheduleLiveIdleFade() {
+  if (_liveIdleTimer) clearTimeout(_liveIdleTimer);
+  _liveIdleTimer = setTimeout(() => {
+    if (!liveMode) return;
+    document.body.classList.add("live-idle");
+    document.body.classList.remove("cursor-revealed");
+  }, LIVE_IDLE_MS);
+}
+
+// Reveal exit affordance + cursor on any movement / interaction in live
+// mode. Pointermove on document fires for both mouse and touch.
+window.addEventListener("pointermove", () => {
+  if (!liveMode) return;
+  if (document.body.classList.contains("live-idle") ||
+      !document.body.classList.contains("cursor-revealed")) {
+    document.body.classList.remove("live-idle");
+    document.body.classList.add("cursor-revealed");
+  }
+  _scheduleLiveIdleFade();
+}, { passive: true });
+
+// Wire button + hotkeys at end of init (after the existing keydown
+// handlers register so we can early-return cleanly without fighting
+// them). Done at the bottom of this script block.
+
 const PREVIEW = {
   // URL of the pre-built Gamma static-library tarball. Produce locally
   // via wasm-build/build-gamma-wasm.sh and host it under /assets/ on the
@@ -25141,6 +25285,38 @@ render();
  * permissionless — no consent dialog, no risk of surprising the user
  * mid-session — so calling it at startup is safe. */
 ensureGPUDevice();
+
+/* Live Mode wiring — toolbar button, in-mode exit button, and the L
+ * hotkey. The hotkey runs on the existing window keydown handler
+ * registered higher up; we add a second listener here that's gated on
+ * !isTextInput so typing 'l' in a CodeMirror or properties field
+ * doesn't trip live-mode. Escape inside live-mode also exits (safety
+ * fallback; doesn't conflict with modal-close because no modal can be
+ * open while #app is display:none). */
+{
+  const liveBtn  = document.getElementById("btn-live-mode");
+  const liveExit = document.getElementById("btn-live-exit");
+  if (liveBtn)  liveBtn.addEventListener("click",  () => toggleLiveMode());
+  if (liveExit) liveExit.addEventListener("click", () => setLiveMode(false));
+  window.addEventListener("keydown", (e) => {
+    // Modifier keys: leave alone — bare L only.
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === "l" || e.key === "L") {
+      // Context-aware: skip when the user is typing in any text input
+      // (props field, AI prompt, .gdsp source, etc.). isLiveMode is
+      // safe-to-toggle because in live-mode there are no text inputs
+      // visible — #app is display:none — so this branch wins.
+      if (!isLiveMode() && isTextInput(document.activeElement)) return;
+      e.preventDefault();
+      toggleLiveMode();
+      return;
+    }
+    if (e.key === "Escape" && isLiveMode()) {
+      e.preventDefault();
+      setLiveMode(false);
+    }
+  });
+}
 </script>
 
 </body>
