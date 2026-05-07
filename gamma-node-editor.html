@@ -349,6 +349,66 @@
     transition: color .12s, border-color .12s;
   }
   .view-hud:hover { color: var(--accent); border-color: var(--accent); }
+
+  /* Phase 6.1.5 — Visual HUD. Sits directly above the zoom HUD in
+   * the canvas's bottom-right corner. Three pills: render resolution
+   * (click to cycle 1080p / 1440p / 4K / 8K), frame-rate readout
+   * (placeholder "— fps" until 6.1.7's animation loop drives it),
+   * and a freeze toggle (❄). Same pill geometry as .view-hud so the
+   * stack reads as one unit.
+   *
+   * Hidden until the WebGPU device acquires (no point showing GPU
+   * controls when the GPU isn't available). The body.gpu-ready
+   * class — set in ensureGPUDevice on success — gates visibility. */
+  .visual-hud {
+    position: absolute;
+    bottom: 42px;       /* sits ~10 px above the view-hud (which is bottom:10) */
+    right: 12px;
+    display: none;       /* shown on body.gpu-ready */
+    gap: 4px;
+    z-index: 5;
+  }
+  body.gpu-ready .visual-hud { display: flex; }
+  .visual-hud-pill {
+    padding: 4px 9px;
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-radius: 999px;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--text-2);
+    cursor: pointer;
+    user-select: none;
+    transition: color .12s, border-color .12s, background .12s;
+    appearance: none;
+    line-height: 1.3;
+  }
+  .visual-hud-pill:hover {
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+  /* fps readout is informational only — no hover lift */
+  .visual-hud-readout {
+    cursor: default;
+    min-width: 56px;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+  }
+  .visual-hud-readout:hover {
+    color: var(--text-2);
+    border-color: var(--border-strong);
+  }
+  .visual-hud-icon {
+    padding: 4px 8px;
+    min-width: 28px;
+    text-align: center;
+  }
+  /* "Active" appearance for the freeze toggle when paused. */
+  .visual-hud-pill.active {
+    color: var(--accent);
+    border-color: var(--accent);
+    background: rgba(200, 232, 90, 0.10);
+  }
   .node.no-output-warn {
     border-color: var(--gate);
     box-shadow: 0 0 0 1px var(--gate), 0 0 14px rgba(216, 160, 48, 0.35);
@@ -5217,6 +5277,16 @@
           <button class="btn primary" id="btn-ink-go" title="Recognize handwriting → create node">✓ Recognize</button>
           <button class="btn" id="btn-ink-clear" title="Clear strokes (keep box, redo handwriting)">↻ Redo</button>
           <button class="btn" id="btn-ink-cancel" title="Discard the box entirely">× Cancel</button>
+        </div>
+        <!-- Phase 6.1.5 — Visual HUD (resolution / fps / freeze). Sits
+             above the existing zoom HUD when WebGPU is acquired. -->
+        <div class="visual-hud" id="visual-hud">
+          <button class="visual-hud-pill" id="res-pill" type="button"
+                  title="Render resolution — click to cycle 1080p → 1440p → 4K → 8K. Affects framebuffer size, not browser window size.">1080p</button>
+          <span class="visual-hud-pill visual-hud-readout" id="fps-readout"
+                title="Frame rate (rAF cadence). Stays at — fps until shader nodes drive an animation loop in Phase 6.1.7+.">— fps</span>
+          <button class="visual-hud-pill visual-hud-icon" id="freeze-btn" type="button"
+                  title="Freeze visual updates (audio keeps running). Useful for inspecting a single frame mid-set.">❄</button>
         </div>
         <div class="view-hud" id="view-hud" title="Click to reset view (or press 0)">100%</div>
       </div>
@@ -18365,6 +18435,13 @@ const Visual = {
   blitBindGroup: null,          // GPUBindGroup (rebuilt when FBO changes)
   blitSampler: null,            // GPUSampler — linear / clamp-to-edge
 
+  // Phase 6.1.5 — HUD state. `frozen` pauses the future rAF render
+  // loop without touching audio. `fps` is updated each frame by
+  // _tickFpsReadout (called from the rAF loop in 6.1.7+); for now
+  // it stays 0 since no animation is running.
+  frozen: false,
+  fps: 0,
+
   // Future-ticket holders so callers can sanity-check whether a piece
   // of infra is online before they try to render through it.
   pipelineCache: null,    // 6.2.1
@@ -18389,6 +18466,10 @@ function setGpuStatusPill(state, msg) {
     lost:        "GPU lost"
   })[state] || "GPU";
   pill.textContent = label;
+  // Body class gates the .visual-hud display. Only "ready" shows it;
+  // any other state (probing / unavailable / error / lost) hides the
+  // resolution + fps + freeze controls since they'd be inert.
+  document.body.classList.toggle("gpu-ready", state === "ready");
 }
 
 async function ensureGPUDevice() {
@@ -18610,11 +18691,13 @@ function _rebuildBlitBindGroup() {
   });
 }
 
-/* Public API: change render resolution. Called from the resolution
- * HUD (6.1.5, next ticket). Reallocates the FBO + rebuilds the bind
- * group + re-runs the smoke render so the user sees the change
- * immediately. Skips silently if the device isn't acquired yet —
- * resolution preference is captured for when it is. */
+/* Public API: change render resolution. Driven by the resolution
+ * HUD (6.1.5) or DevTools-console use. Reallocates the FBO + rebuilds
+ * the bind group + re-runs the smoke render so the user sees the
+ * change immediately. Skips render-side work silently if the device
+ * isn't acquired yet — resolution preference is captured for when
+ * it is. The HUD pill is updated unconditionally so callers don't
+ * have to know whether the device acquired or not. */
 function setRenderResolution(key) {
   const r = Visual.RESOLUTIONS.find(x => x.key === key);
   if (!r) {
@@ -18629,7 +18712,69 @@ function setRenderResolution(key) {
     _rebuildBlitBindGroup();
     smokeClearVisual();
   }
+  _updateResolutionPill();
   console.log("[visual] render resolution = " + key + " (" + r.w + "×" + r.h + ")");
+}
+
+/* ----- Phase 6.1.5 — Visual HUD helpers ------------------------------- */
+
+function _updateResolutionPill() {
+  const pill = document.getElementById("res-pill");
+  if (pill) pill.textContent = Visual.resolutionKey;
+}
+
+/* Click handler on the resolution pill. Cycles through the
+ * RESOLUTIONS array in declaration order: 1080p → 1440p → 4K → 8K
+ * → 1080p. Single-click is one step forward; live-performance
+ * friendly (no menu, no aim required). */
+function _cycleRenderResolution() {
+  const i = Visual.RESOLUTIONS.findIndex(r => r.key === Visual.resolutionKey);
+  const next = Visual.RESOLUTIONS[(i + 1) % Visual.RESOLUTIONS.length];
+  setRenderResolution(next.key);
+}
+
+/* Toggle the freeze flag. The future rAF loop (lands with 6.1.7's
+ * VisualOutput sink) will check Visual.frozen at the top of each
+ * tick and skip the render if true. Audio is unaffected. */
+function setVisualFrozen(on) {
+  Visual.frozen = !!on;
+  const btn = document.getElementById("freeze-btn");
+  if (btn) {
+    btn.classList.toggle("active", Visual.frozen);
+    btn.title = Visual.frozen
+      ? "Frozen — visual updates paused (click to resume)"
+      : "Freeze visual updates (audio keeps running). Useful for inspecting a single frame mid-set.";
+  }
+}
+function toggleVisualFreeze() { setVisualFrozen(!Visual.frozen); }
+
+/* Frame-rate readout updater. Called from the future rAF loop with
+ * the timestamp DOMHighResTimeStamp argument. Maintains an exponential
+ * moving average so the displayed number doesn't jitter every frame —
+ * α = 0.05 gives a ~20-frame (≈ ⅓ s at 60 fps) effective window,
+ * smooth without lagging too much. The readout DOM update is
+ * throttled to once every ~10 frames to avoid layout thrash; the
+ * underlying Visual.fps stays continuously current for any other
+ * consumer that wants the precise number. */
+let _fpsLastT = 0;
+let _fpsAvg = 0;
+let _fpsUpdateAccum = 0;
+function _tickFpsReadout(t) {
+  if (_fpsLastT > 0) {
+    const dt = t - _fpsLastT;
+    if (dt > 0) {
+      const inst = 1000 / dt;
+      _fpsAvg = _fpsAvg ? _fpsAvg * 0.95 + inst * 0.05 : inst;
+      Visual.fps = _fpsAvg;
+    }
+  }
+  _fpsLastT = t;
+  _fpsUpdateAccum++;
+  if (_fpsUpdateAccum >= 10) {
+    _fpsUpdateAccum = 0;
+    const el = document.getElementById("fps-readout");
+    if (el) el.textContent = Math.round(_fpsAvg) + " fps";
+  }
 }
 
 /* Compute the aspect-correct viewport rect inside the visible canvas
@@ -25526,6 +25671,22 @@ ensureGPUDevice();
       setLiveMode(false);
     }
   });
+}
+
+/* Phase 6.1.5 — Visual HUD wiring. Resolution pill cycles on click,
+ * freeze button toggles. fps readout is driven from the future rAF
+ * loop (6.1.7+); for now it stays at "— fps" placeholder. Initial
+ * pill text reflects the default resolution captured at Visual init. */
+{
+  const resPill   = document.getElementById("res-pill");
+  const freezeBtn = document.getElementById("freeze-btn");
+  if (resPill) {
+    _updateResolutionPill();
+    resPill.addEventListener("click", _cycleRenderResolution);
+  }
+  if (freezeBtn) {
+    freezeBtn.addEventListener("click", toggleVisualFreeze);
+  }
 }
 </script>
 
