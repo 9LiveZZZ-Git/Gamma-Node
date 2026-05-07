@@ -9088,6 +9088,109 @@ public:
     description: "Hilbert transformer — splits input into real and imaginary parts (analytic signal)"
   },
 
+  /* ---- Stereo utilities ----
+   * Three small helper-class composites that operate on a stereo
+   * pair. All follow the same pattern: L is the implicit operator()
+   * argument (the codegen's signalInput pick); R (and any other
+   * audio input) is plumbed through a per-sample setter. Outputs
+   * use the multi-out struct + .access pattern.
+   *
+   * Math:
+   *   M = (L + R) * 0.5     S = (L - R) * 0.5
+   *   L = M + S              R = M - S
+   * MidSide encodes; SideMid decodes; StereoWidener does both with
+   * a width gain on the side channel in between (1 = unchanged,
+   * 0 = mono, >1 = wider). */
+  MidSide: {
+    category: "Effect", color: COLOR.effect, header: null,
+    cppType: "GammaMidSide",
+    helperClass:
+`class GammaMidSide {
+    float r_ = 0.f;
+public:
+    void setR(float v) { r_ = v; }
+    struct Out { float m, s; };
+    Out operator()(float l) {
+        Out o;
+        o.m = (l + r_) * 0.5f;
+        o.s = (l - r_) * 0.5f;
+        return o;
+    }
+};`,
+    ins: [
+      { n: "L", t: "audio" },
+      { n: "R", t: "audio" }
+    ],
+    outs: [
+      { n: "M", t: "audio", access: ".m" },
+      { n: "S", t: "audio", access: ".s" }
+    ],
+    params: {},
+    methods: { R: "setR" },
+    description: "Mid/Side encoder. L+R→M (sum), L-R→S (difference). Wire stereo into L/R and route M/S separately for mid/side processing (e.g. compress M with one chain, EQ S with another, then SideMid back to L/R)."
+  },
+  SideMid: {
+    category: "Effect", color: COLOR.effect, header: null,
+    cppType: "GammaSideMid",
+    helperClass:
+`class GammaSideMid {
+    float s_ = 0.f;
+public:
+    void setS(float v) { s_ = v; }
+    struct Out { float l, r; };
+    Out operator()(float m) {
+        Out o;
+        o.l = m + s_;
+        o.r = m - s_;
+        return o;
+    }
+};`,
+    ins: [
+      { n: "M", t: "audio" },
+      { n: "S", t: "audio" }
+    ],
+    outs: [
+      { n: "L", t: "audio", access: ".l" },
+      { n: "R", t: "audio", access: ".r" }
+    ],
+    params: {},
+    methods: { S: "setS" },
+    description: "Side/Mid decoder. Inverse of MidSide: M+S→L, M−S→R. Use to convert back to L/R after processing the M and S channels separately."
+  },
+  StereoWidener: {
+    category: "Effect", color: COLOR.effect, header: null,
+    cppType: "GammaStereoWidener",
+    helperClass:
+`class GammaStereoWidener {
+    float r_ = 0.f;
+    float width_ = 1.f;
+public:
+    void setR(float v)     { r_ = v; }
+    void setWidth(float v) { width_ = (v < 0.f) ? 0.f : v; }
+    struct Out { float l, r; };
+    Out operator()(float l) {
+        const float m = (l + r_) * 0.5f;
+        const float s = (l - r_) * 0.5f * width_;
+        Out o;
+        o.l = m + s;
+        o.r = m - s;
+        return o;
+    }
+};`,
+    ins: [
+      { n: "L",     t: "audio" },
+      { n: "R",     t: "audio" },
+      { n: "width", t: "param" }
+    ],
+    outs: [
+      { n: "L", t: "audio", access: ".l" },
+      { n: "R", t: "audio", access: ".r" }
+    ],
+    params: { width: 1.0 },
+    methods: { R: "setR", width: "setWidth" },
+    description: "Stereo widener. Internally encodes L/R → M/S, scales the side channel by width, then decodes back. width=1 = pass-through; <1 collapses toward mono; >1 widens. Often paired with MonoMaker on the low end to keep bass mono while widening highs."
+  },
+
   /* ---- Effects (Effects.h) ---- */
   /* gam::ReverbMS lives in Spatial.h, NOT Effects.h. The previous
    * `header: "Effects"` was including the wrong file → compile fail.
