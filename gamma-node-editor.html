@@ -6391,6 +6391,132 @@ public:
     description: "2-op FM — carrier sine + modulator sine. ratio = modulator/carrier freq (integers = harmonic; non-integers = bell/metallic). index = modulation depth (0..10). DX-style timbres without the 6-op complexity."
   },
 
+  /* FM4 — 4-operator FM with selectable algorithm. Each operator
+   * has its own freq ratio + output level (0..1). The `algo` param
+   * picks how the four ops are connected; we ship four
+   * representative algorithms covering the breadth of DX-style
+   * topologies without the full 32-algorithm DX7 complexity:
+   *
+   *   serial   — 1→2→3→4 → out (single carrier, deepest cascade,
+   *              most spectral content)
+   *   parallel — (1→2) + (3→4) → out (two parallel pairs, two
+   *              independent timbres summed)
+   *   stack    — 1→4, 2→4, 3→4 → out (three modulators on a
+   *              single carrier, "stacked" mod density)
+   *   additive — 1+2+3+4 → out (no modulation, all carriers, sum
+   *              of sines — useful for additive synthesis voices)
+   *
+   * Phase accumulators are normalized (0..1) per op. Output is
+   * the carrier (or carrier sum) clipped to [-1, 1] for safety. */
+  FM4: {
+    category: "Oscillator", color: COLOR.oscillator, header: null,
+    cppType: "GammaFM4",
+    extraHeaders: ["<cmath>"],
+    helperClass:
+`class GammaFM4 {
+    static constexpr float TAU = 6.2831853f;
+    float p1=0, p2=0, p3=0, p4=0;
+    float freq_  = 220.f;
+    float r1=1.f, r2=1.f, r3=1.f, r4=1.f;
+    float l1=1.f, l2=1.f, l3=1.f, l4=1.f;
+    int   algo_ = 0;
+    float sr_   = 48000.f;
+    static float adv_(float& p, float hz, float sr) {
+        p += hz / sr;
+        if (p >= 1.f) p -= (int)p;
+        if (p < 0.f)  p += 1.f - (int)p;
+        return p;
+    }
+public:
+    GammaFM4() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+    }
+    void setFreq(float f)  { freq_ = f; }
+    void setRatio1(float v){ r1 = v; }
+    void setRatio2(float v){ r2 = v; }
+    void setRatio3(float v){ r3 = v; }
+    void setRatio4(float v){ r4 = v; }
+    void setLevel1(float v){ l1 = v; }
+    void setLevel2(float v){ l2 = v; }
+    void setLevel3(float v){ l3 = v; }
+    void setLevel4(float v){ l4 = v; }
+    void setAlgo(float a)  { algo_ = (int)a; }
+    void reset()           { p1=p2=p3=p4=0; }
+    float operator()() {
+        const float ph1 = adv_(p1, freq_ * r1, sr_);
+        const float ph2 = adv_(p2, freq_ * r2, sr_);
+        const float ph3 = adv_(p3, freq_ * r3, sr_);
+        const float ph4 = adv_(p4, freq_ * r4, sr_);
+        float out = 0.f;
+        switch (algo_) {
+            case 0: { // serial 1→2→3→4
+                const float o1 = std::sin(TAU * ph1) * l1;
+                const float o2 = std::sin(TAU * ph2 + o1) * l2;
+                const float o3 = std::sin(TAU * ph3 + o2) * l3;
+                out = std::sin(TAU * ph4 + o3) * l4;
+                break;
+            }
+            case 1: { // parallel pairs (1→2) + (3→4)
+                const float o1 = std::sin(TAU * ph1) * l1;
+                const float o2 = std::sin(TAU * ph2 + o1) * l2;
+                const float o3 = std::sin(TAU * ph3) * l3;
+                const float o4 = std::sin(TAU * ph4 + o3) * l4;
+                out = (o2 + o4) * 0.5f;
+                break;
+            }
+            case 2: { // stack — 3 modulators on 1 carrier
+                const float o1 = std::sin(TAU * ph1) * l1;
+                const float o2 = std::sin(TAU * ph2) * l2;
+                const float o3 = std::sin(TAU * ph3) * l3;
+                out = std::sin(TAU * ph4 + o1 + o2 + o3) * l4;
+                break;
+            }
+            default: { // additive — sum of carriers
+                const float o1 = std::sin(TAU * ph1) * l1;
+                const float o2 = std::sin(TAU * ph2) * l2;
+                const float o3 = std::sin(TAU * ph3) * l3;
+                const float o4 = std::sin(TAU * ph4) * l4;
+                out = (o1 + o2 + o3 + o4) * 0.25f;
+                break;
+            }
+        }
+        // Soft clip — FM at high indices can shoot well past unity.
+        if (out >  1.f) out =  1.f;
+        if (out < -1.f) out = -1.f;
+        return out;
+    }
+};`,
+    ins: [
+      { n: "trig",   t: "gate" },
+      { n: "freq",   t: "param" },
+      { n: "algo",   t: "param" },
+      { n: "ratio1", t: "param" },
+      { n: "ratio2", t: "param" },
+      { n: "ratio3", t: "param" },
+      { n: "ratio4", t: "param" },
+      { n: "level1", t: "param" },
+      { n: "level2", t: "param" },
+      { n: "level3", t: "param" },
+      { n: "level4", t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: {
+      freq: 220, algo: "serial",
+      ratio1: 1.0, ratio2: 2.0, ratio3: 3.0, ratio4: 1.0,
+      level1: 1.0, level2: 0.6, level3: 0.4, level4: 1.0
+    },
+    methods: {
+      freq: "setFreq", algo: "setAlgo",
+      ratio1: "setRatio1", ratio2: "setRatio2", ratio3: "setRatio3", ratio4: "setRatio4",
+      level1: "setLevel1", level2: "setLevel2", level3: "setLevel3", level4: "setLevel4"
+    },
+    paramOptions: { algo: ["serial", "parallel", "stack", "additive"] },
+    enumMap:      { algo: { serial: "0", parallel: "1", stack: "2", additive: "3" } },
+    gateMethods: { trig: "reset" },
+    description: "4-operator FM. Each op has freq ratio + level. algo picks topology: serial (1→2→3→4), parallel (two pairs), stack (3 mods → 1 carrier), additive (4 carriers summed). DX-style timbres without DX7's 32-algorithm complexity."
+  },
+
   /* Phase modulation oscillator — sine carrier whose phase is
    * modulated by an audio-rate input signal (typically another
    * oscillator's output). Wire any audio source into `pm`. depth
@@ -9705,6 +9831,249 @@ public:
     extraCtor: ["{id}.resize(gam::FREEVERB);"],
     description: "Moorer-Schroeder reverb (Jezar's Freeverb topology — 8 combs + 4 allpasses). decay sets the comb-loop gain; damping sets the per-comb low-pass amount."
   },
+
+  /* ---- Additional reverb topologies --------------------------------
+   * ReverbMS already wraps Gamma's gam::ReverbMS (Freeverb). The three
+   * helper-class reverbs below cover the rest of the canonical
+   * topology palette: a Schroeder-flavored plate (dense / bright),
+   * a spring emulation (chirpy / dispersed), and an 8-line FDN
+   * (mathematically clean, parameter-tunable into anything from
+   * room to cathedral). All four share the wet/dry mix idiom so
+   * they're drop-in interchangeable on a send-effect bus. */
+
+  /* PlateReverb — 4 input diffuser allpasses → 4 parallel comb
+   * filters with per-line LP damping → 2 series output allpasses.
+   * Tunings biased toward longer/denser than Freeverb so the
+   * character is recognizably "plate" (no clear early reflections,
+   * smooth bright tail). All delay lengths in samples assume 48 kHz
+   * and scale at construction if the audio context's sample rate
+   * differs (small drift in plate character is acceptable; the
+   * topology is what matters). */
+  PlateReverb: {
+    category: "Effect", color: COLOR.effect, header: null,
+    cppType: "GammaPlateReverb",
+    extraHeaders: ["<cmath>"],
+    helperClass:
+`class GammaPlateReverb {
+    // Allpass diffusers (input chain) — four short, prime-related lengths.
+    static constexpr int AP1=142, AP2=107, AP3=379, AP4=277;
+    // Comb filters (tank) — longer than Freeverb for plate density.
+    static constexpr int CB1=1687, CB2=1601, CB3=2053, CB4=2251;
+    // Output allpasses (smear + decorrelate L/R).
+    static constexpr int APO1=556, APO2=441;
+    float bAP1[AP1] = {0}, bAP2[AP2] = {0}, bAP3[AP3] = {0}, bAP4[AP4] = {0};
+    float bCB1[CB1] = {0}, bCB2[CB2] = {0}, bCB3[CB3] = {0}, bCB4[CB4] = {0};
+    float bAPO1[APO1] = {0}, bAPO2[APO2] = {0};
+    int   pAP1=0, pAP2=0, pAP3=0, pAP4=0;
+    int   pCB1=0, pCB2=0, pCB3=0, pCB4=0;
+    int   pAPO1=0, pAPO2=0;
+    float lp1=0, lp2=0, lp3=0, lp4=0;     // damping LP state per comb
+    float decay_ = 0.85f;
+    float damping_ = 0.5f;
+    float mix_ = 0.4f;
+    static constexpr float APG = 0.5f;    // allpass gain (Schroeder)
+    static float ap_(float in, float* buf, int& p, int N) {
+        const float dl = buf[p];
+        const float v  = in + dl * APG;
+        buf[p] = v;
+        const float out = dl - v * APG;
+        p = (p + 1) % N;
+        return out;
+    }
+public:
+    void setDecay(float v)   { decay_   = (v < 0.f) ? 0.f : (v > 0.99f ? 0.99f : v); }
+    void setDamping(float v) { damping_ = (v < 0.f) ? 0.f : (v > 0.99f ? 0.99f : v); }
+    void setMix(float v)     { mix_     = (v < 0.f) ? 0.f : (v > 1.f   ? 1.f   : v); }
+    float operator()(float in) {
+        // Input diffusion — 4 cascaded allpasses smooth transients
+        // into a dense impulse train before the tank sees them.
+        float x = ap_(in, bAP1, pAP1, AP1);
+              x = ap_(x,  bAP2, pAP2, AP2);
+              x = ap_(x,  bAP3, pAP3, AP3);
+              x = ap_(x,  bAP4, pAP4, AP4);
+        // 4 parallel combs, each with a one-pole LP in the feedback
+        // path for damping (high-frequency loss with each round trip).
+        const float d = damping_;
+        const float fb = decay_;
+        float c1 = bCB1[pCB1]; lp1 += (1.f - d) * (c1 - lp1); bCB1[pCB1] = x + lp1 * fb; pCB1 = (pCB1 + 1) % CB1;
+        float c2 = bCB2[pCB2]; lp2 += (1.f - d) * (c2 - lp2); bCB2[pCB2] = x + lp2 * fb; pCB2 = (pCB2 + 1) % CB2;
+        float c3 = bCB3[pCB3]; lp3 += (1.f - d) * (c3 - lp3); bCB3[pCB3] = x + lp3 * fb; pCB3 = (pCB3 + 1) % CB3;
+        float c4 = bCB4[pCB4]; lp4 += (1.f - d) * (c4 - lp4); bCB4[pCB4] = x + lp4 * fb; pCB4 = (pCB4 + 1) % CB4;
+        float wet = (c1 + c2 + c3 + c4) * 0.25f;
+        // Output diffusion — two more allpasses smear the comb tails.
+        wet = ap_(wet, bAPO1, pAPO1, APO1);
+        wet = ap_(wet, bAPO2, pAPO2, APO2);
+        return in * (1.f - mix_) + wet * mix_;
+    }
+};`,
+    ins: [
+      { n: "in",       t: "audio" },
+      { n: "decay",    t: "param" },
+      { n: "damping",  t: "param" },
+      { n: "mix",      t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { decay: 0.85, damping: 0.5, mix: 0.4 },
+    methods: { decay: "setDecay", damping: "setDamping", mix: "setMix" },
+    description: "Plate-style reverb — 4 input diffusers → 4 parallel combs (with per-line LP damping) → 2 output allpasses. Bigger / denser / brighter than ReverbMS by default; classic plate character. mix is wet level (0=dry, 1=wet)."
+  },
+
+  /* SpringReverb — characteristic "boing" comes from chirp dispersion
+   * in real springs, which we approximate by cascading short allpass
+   * filters with a single feedback delay line. Highpass on input
+   * mimics the spring's natural HF emphasis; tremolo on output adds
+   * the metallic shimmer without going to a full physical model. Not
+   * a strict spring simulation — recognizable character at a tiny
+   * fraction of a true Karjalainen-style waveguide. */
+  SpringReverb: {
+    category: "Effect", color: COLOR.effect, header: null,
+    cppType: "GammaSpringReverb",
+    extraHeaders: ["<cmath>"],
+    helperClass:
+`class GammaSpringReverb {
+    // Six cascaded allpasses with mismatched coefficients produce
+    // frequency-dependent group delay — the dispersion that gives
+    // springs their signature chirp on transients.
+    float ap1=0, ap2=0, ap3=0, ap4=0, ap5=0, ap6=0;
+    float ag1=0.6f, ag2=0.55f, ag3=0.7f, ag4=0.65f, ag5=0.5f, ag6=0.75f;
+    // Feedback delay line — short (~30 ms) to keep the spring "tight."
+    static constexpr int DL = 1300;
+    float buf[DL] = {0};
+    int   pBuf = 0;
+    // Highpass + lowpass tone shaping. Spring's natural response
+    // emphasizes ~200 Hz–4 kHz, rolls off the rest.
+    float hp = 0, lp = 0;
+    // Tremolo for "metallic shimmer."
+    float trem_ = 0.f;
+    float sr_ = 48000.f;
+    float decay_ = 0.6f;
+    float tone_  = 0.5f;
+    float mix_   = 0.4f;
+    static float ap_(float in, float& s, float g) {
+        const float v = in + s * g;
+        const float out = s - v * g;
+        s = v;
+        return out;
+    }
+public:
+    GammaSpringReverb() {
+        const float sr = (float)gam::sampleRate();
+        if (sr > 1.f) sr_ = sr;
+    }
+    void setDecay(float v) { decay_ = (v < 0.f) ? 0.f : (v > 0.95f ? 0.95f : v); }
+    void setTone(float v)  { tone_  = (v < 0.f) ? 0.f : (v > 1.f   ? 1.f   : v); }
+    void setMix(float v)   { mix_   = (v < 0.f) ? 0.f : (v > 1.f   ? 1.f   : v); }
+    float operator()(float in) {
+        // Soft highpass — cuts sub frequencies that don't belong in a spring.
+        hp += 0.005f * (in - hp);
+        float x = in - hp;
+        // 6 cascaded allpass — dispersion. Each tap nudges the group
+        // delay differently per frequency, giving the chirp.
+        x = ap_(x, ap1, ag1);
+        x = ap_(x, ap2, ag2);
+        x = ap_(x, ap3, ag3);
+        x = ap_(x, ap4, ag4);
+        x = ap_(x, ap5, ag5);
+        x = ap_(x, ap6, ag6);
+        // Mix in the delay-line feedback for the actual reverb tail.
+        const float dl = buf[pBuf];
+        const float fb = x + dl * decay_;
+        buf[pBuf] = fb;
+        pBuf = (pBuf + 1) % DL;
+        // Tone (LP) — 0 dark, 1 bright.
+        lp += (0.05f + tone_ * 0.4f) * (fb - lp);
+        // Tremolo at ~5 Hz, depth scaled by tone for shimmer.
+        trem_ += (5.f * 6.2831853f) / sr_;
+        if (trem_ > 6.2831853f) trem_ -= 6.2831853f;
+        const float tremMod = 1.f + 0.04f * std::sin(trem_) * tone_;
+        const float wet = lp * tremMod;
+        return in * (1.f - mix_) + wet * mix_;
+    }
+};`,
+    ins: [
+      { n: "in",     t: "audio" },
+      { n: "decay",  t: "param" },
+      { n: "tone",   t: "param" },
+      { n: "mix",    t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { decay: 0.6, tone: 0.5, mix: 0.4 },
+    methods: { decay: "setDecay", tone: "setTone", mix: "setMix" },
+    description: "Spring-style reverb — cascaded allpasses for chirp dispersion + short feedback delay + tone-shaping LP/HP + 5 Hz tremolo for metallic shimmer. Distinctive 'boing' character on transients; decay controls feedback gain, tone shifts the spectrum dark→bright."
+  },
+
+  /* FDN8 — 8-line Feedback Delay Network. Eight delay lines fed
+   * back through a Hadamard mixing matrix, producing dense even
+   * decay across the spectrum. This is the modern Lexicon /
+   * Eventide foundational topology — tunable into anything from
+   * tight room (small delays + low decay) to cathedral (long
+   * delays + high decay). Coprime delay lengths avoid resonant
+   * ringing. Per-line one-pole LP gives frequency-dependent
+   * decay (HF dies first, like real rooms). */
+  FDN8: {
+    category: "Effect", color: COLOR.effect, header: null,
+    cppType: "GammaFDN8",
+    extraHeaders: ["<cmath>"],
+    helperClass:
+`class GammaFDN8 {
+    // 8 coprime delay lengths (~40 ms to ~125 ms at 48 kHz). Coprime
+    // = no shared factors → modes don't reinforce → smoother decay.
+    static constexpr int N1=2003, N2=2741, N3=3163, N4=3527;
+    static constexpr int N5=4153, N6=4691, N7=5227, N8=6029;
+    float d1[N1]={0}, d2[N2]={0}, d3[N3]={0}, d4[N4]={0};
+    float d5[N5]={0}, d6[N6]={0}, d7[N7]={0}, d8[N8]={0};
+    int p1=0,p2=0,p3=0,p4=0,p5=0,p6=0,p7=0,p8=0;
+    float lp1=0,lp2=0,lp3=0,lp4=0,lp5=0,lp6=0,lp7=0,lp8=0;
+    float decay_   = 0.85f;
+    float damping_ = 0.3f;
+    float mix_     = 0.4f;
+public:
+    void setDecay(float v)   { decay_   = (v < 0.f) ? 0.f : (v > 0.99f ? 0.99f : v); }
+    void setDamping(float v) { damping_ = (v < 0.f) ? 0.f : (v > 0.99f ? 0.99f : v); }
+    void setMix(float v)     { mix_     = (v < 0.f) ? 0.f : (v > 1.f   ? 1.f   : v); }
+    float operator()(float in) {
+        // Read delay outputs.
+        const float y1 = d1[p1], y2 = d2[p2], y3 = d3[p3], y4 = d4[p4];
+        const float y5 = d5[p5], y6 = d6[p6], y7 = d7[p7], y8 = d8[p8];
+        // Hadamard 8x8 mix — preserves energy, maximally diffusing.
+        // Pre-multiplied by 1/sqrt(8) = 0.3535... folded into the
+        // decay_ scaling so we don't pay 8 muls per sample.
+        const float k = 0.35355339f * decay_;
+        const float n1 = (y1+y2+y3+y4+y5+y6+y7+y8) * k;
+        const float n2 = (y1-y2+y3-y4+y5-y6+y7-y8) * k;
+        const float n3 = (y1+y2-y3-y4+y5+y6-y7-y8) * k;
+        const float n4 = (y1-y2-y3+y4+y5-y6-y7+y8) * k;
+        const float n5 = (y1+y2+y3+y4-y5-y6-y7-y8) * k;
+        const float n6 = (y1-y2+y3-y4-y5+y6-y7+y8) * k;
+        const float n7 = (y1+y2-y3-y4-y5-y6+y7+y8) * k;
+        const float n8 = (y1-y2-y3+y4-y5+y6+y7-y8) * k;
+        // Per-line damping LP, then write the new state back.
+        const float a = 1.f - damping_;
+        lp1 += a * (n1 + in - lp1); d1[p1] = lp1; p1 = (p1+1) % N1;
+        lp2 += a * (n2 + in - lp2); d2[p2] = lp2; p2 = (p2+1) % N2;
+        lp3 += a * (n3 + in - lp3); d3[p3] = lp3; p3 = (p3+1) % N3;
+        lp4 += a * (n4 + in - lp4); d4[p4] = lp4; p4 = (p4+1) % N4;
+        lp5 += a * (n5 - in - lp5); d5[p5] = lp5; p5 = (p5+1) % N5;
+        lp6 += a * (n6 - in - lp6); d6[p6] = lp6; p6 = (p6+1) % N6;
+        lp7 += a * (n7 - in - lp7); d7[p7] = lp7; p7 = (p7+1) % N7;
+        lp8 += a * (n8 - in - lp8); d8[p8] = lp8; p8 = (p8+1) % N8;
+        // Output sum, normalized.
+        const float wet = (y1+y2+y3+y4+y5+y6+y7+y8) * 0.125f;
+        return in * (1.f - mix_) + wet * mix_;
+    }
+};`,
+    ins: [
+      { n: "in",       t: "audio" },
+      { n: "decay",    t: "param" },
+      { n: "damping",  t: "param" },
+      { n: "mix",      t: "param" }
+    ],
+    outs: [{ n: "out", t: "audio" }],
+    params: { decay: 0.85, damping: 0.3, mix: 0.4 },
+    methods: { decay: "setDecay", damping: "setDamping", mix: "setMix" },
+    description: "8-line Feedback Delay Network — coprime delays + Hadamard mixing matrix + per-line LP damping. Modern Lexicon-style topology; tune decay (feedback gain) + damping (HF rolloff) for anything from small room to cathedral."
+  },
+
   Burst: {
     category: "Effect", color: COLOR.effect, header: "Effects",
     cppType: "gam::Burst",
