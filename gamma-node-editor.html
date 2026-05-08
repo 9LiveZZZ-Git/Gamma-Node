@@ -12218,6 +12218,50 @@ public:
     description: "Patch-level rig HUD — overlays display tiles with labels (index/name), warp/blend status badges, and audio-reactive highlights. Drop one in the patch to enable; only the first RigGizmo's params take effect (the node is global). Tile preview only — non-tile modes hide the overlay."
   },
 
+  /* Phase 6.6.12 — Text overlay. Like RigGizmo: a patch-level
+   * visual node that draws on the 2D overlay canvas above the
+   * WebGPU output. Renders flat text in screen / display space so
+   * the projection pipeline never warps it — perfect for verifying
+   * which display is which and whether sharp content reaches the
+   * corners of each projector. Multiple Text nodes can coexist;
+   * each draws its own string. */
+  Text: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    ins:  [],
+    outs: [],
+    params: {
+      // Substitution tokens supported in the string:
+      //   {idx}  — display index (0, 1, 2…)
+      //   {name} — display.name
+      //   {n}    — total display count
+      // perDisplay=false ignores tokens (single instance, no idx).
+      text: "TEST {idx}",
+      // mono / sans / serif / display. The "display" stack uses a
+      // heavy sans-serif for high-contrast calibration overlays.
+      font: "sans",
+      // pixel size at 1× DPR; multiplied by devicePixelRatio when
+      // drawn so the text stays crisp on Retina / 4K canvases.
+      fontSize: 96,
+      // 0..1 each. Default white.
+      r: 1.0, g: 1.0, b: 1.0,
+      // Text x/y as a fraction of the host rect. 0.5/0.5 = center.
+      // perDisplay=true → host rect is each display's tile.
+      // perDisplay=false → host rect is the whole canvas.
+      x: 0.5,
+      y: 0.5,
+      // Repeat across each display in tile mode? Default true so
+      // dropping the node into a multi-display patch immediately
+      // gives a per-display label without further wiring.
+      perDisplay: true,
+      // 0..1 — black plate behind the text for readability against
+      // bright shader content. 0 = no plate.
+      plateOpacity: 0.55
+    },
+    methods: { text: null, font: null, fontSize: null, r: null, g: null, b: null, x: null, y: null, perDisplay: null, plateOpacity: null },
+    description: "Flat text overlay in screen / display space. Renders ABOVE the WebGPU output via the 2D overlay canvas, so projection / warp / blend never distort the text — useful for projection verification, calibration markers, and on-stage signage. {idx}, {name}, {n} substitution tokens get filled per-display when perDisplay is on."
+  },
+
   /* Phase 6.2.x — first two shader-frag nodes. Both are kind:
    * "shader-frag" with a hand-authored WGSL body shipped inline.
    * The renderer (in the Visual subsystem above) recognizes
@@ -22015,41 +22059,53 @@ function _drawVisualOverlay() {
   const W = ov.width, H = ov.height;
   ctx2.clearRect(0, 0, W, H);
 
-  // Find the first RigGizmo node — multiple are allowed in the patch
-  // but only one drives the overlay (the rest are silent).
-  const gizmoNode = (state && state.nodes || []).find(n => n && n.type === "RigGizmo");
-  if (!gizmoNode) return;
-
-  const mode = (state && state.rig && state.rig.previewMode) || "tile";
-  if (mode !== "tile") return;
-
+  const nodes    = (state && state.nodes) || [];
   const displays = (state && state.rig && state.rig.displays) || [];
   if (displays.length === 0) return;
+  const mode = (state && state.rig && state.rig.previewMode) || "tile";
 
-  const params = gizmoNode.params || {};
-  const baseIntensity = (typeof params.intensity === "number") ? params.intensity : 0.5;
-  const labelMode  = params.labelMode || "index";
-  const showWarp   = params.showWarp  !== false;
-  const showBlend  = params.showBlend !== false;
-  const outlineTiles = params.outlineTiles !== false;
-
-  // Sample audio peak from the master meter when preview is running.
-  // Falls back to 0 (just the base intensity) when silent or stopped.
-  let audioLevel = 0;
-  if (typeof METER !== "undefined" && METER && Number.isFinite(METER.smoothL)) {
-    audioLevel = Math.max(METER.smoothL || 0, METER.smoothR || 0);
-  }
-  // Highlight pulse: combine base + audio. Cap at 1.0 to avoid solid
-  // overdraw on loud peaks.
-  const intensity = Math.min(1, baseIntensity + audioLevel * 0.7);
-
-  // Tile geometry — same math as the warp pass.
+  // Tile geometry — shared between RigGizmo and Text per-display modes.
   const layerCount = Math.min(displays.length, RIG_MAX_DISPLAYS);
   const { cols, rows } = _rigTileLayout(layerCount);
   const masterAspect = _projectionMasterAspect();
   const vp = _projectionViewportRect(masterAspect);
   const tileW = vp.w / cols;
   const tileH = vp.h / rows;
+
+  // Phase 6.6.4b — RigGizmo HUD. Find first RigGizmo node; tile mode
+  // only since the per-tile labels don't make sense in audience-
+  // perspective unwraps.
+  const gizmoNode = nodes.find(n => n && n.type === "RigGizmo");
+  if (gizmoNode && mode === "tile") {
+    _drawRigGizmoHud(ctx2, gizmoNode, displays, layerCount, vp, tileW, tileH, cols);
+  }
+
+  // Phase 6.6.12 — Text overlays. Multiple Text nodes are drawn in
+  // patch order so users can stack them. perDisplay=true repeats each
+  // text on every tile; perDisplay=false draws once at the canvas
+  // center (or user-positioned). Works in every preview mode.
+  const textNodes = nodes.filter(n => n && n.type === "Text");
+  for (const t of textNodes) {
+    _drawTextOverlay(ctx2, t, displays, layerCount, vp, tileW, tileH, cols, mode);
+  }
+}
+
+/* Phase 6.6.4b helper extracted for clarity — was inline in
+ * _drawVisualOverlay. Renders the RigGizmo HUD on each display tile:
+ * outline, intensity-pulse highlight, label, warp/blend badges. */
+function _drawRigGizmoHud(ctx2, gizmoNode, displays, layerCount, vp, tileW, tileH, cols) {
+  const params = gizmoNode.params || {};
+  const baseIntensity = (typeof params.intensity === "number") ? params.intensity : 0.5;
+  const labelMode    = params.labelMode || "index";
+  const showWarp     = params.showWarp     !== false;
+  const showBlend    = params.showBlend    !== false;
+  const outlineTiles = params.outlineTiles !== false;
+
+  let audioLevel = 0;
+  if (typeof METER !== "undefined" && METER && Number.isFinite(METER.smoothL)) {
+    audioLevel = Math.max(METER.smoothL || 0, METER.smoothR || 0);
+  }
+  const intensity = Math.min(1, baseIntensity + audioLevel * 0.7);
 
   const defaultEB = _defaultEdgeBlend();
   const isCustomBlend = (eb) => !eb ||
@@ -22065,20 +22121,15 @@ function _drawVisualOverlay() {
     const tx  = vp.x + col * tileW;
     const ty  = vp.y + row * tileH;
 
-    // Highlight rectangle — semitransparent fill modulated by intensity.
     if (intensity > 0.01) {
       ctx2.fillStyle = "rgba(200, 232, 90, " + (0.06 + intensity * 0.18).toFixed(3) + ")";
       ctx2.fillRect(tx, ty, tileW, tileH);
     }
-
     if (outlineTiles) {
       ctx2.strokeStyle = "rgba(200, 232, 90, " + (0.35 + intensity * 0.45).toFixed(3) + ")";
       ctx2.lineWidth = Math.max(2, 2 * (window.devicePixelRatio || 1));
       ctx2.strokeRect(tx + 1, ty + 1, tileW - 2, tileH - 2);
     }
-
-    // Label — index or display name. Sized to ~5% of tile height,
-    // clamped to a sane range so 16-tile layouts stay readable.
     if (labelMode !== "none") {
       const text = labelMode === "name"
         ? (d.name || ("Display " + (i + 1)))
@@ -22089,14 +22140,12 @@ function _drawVisualOverlay() {
       ctx2.textBaseline = "top";
       const padX = fontPx * 0.5;
       const padY = fontPx * 0.4;
-      // Plate behind text for readability against bright shaders.
       const tw = ctx2.measureText(text).width;
       ctx2.fillStyle = "rgba(8, 11, 16, 0.55)";
       ctx2.fillRect(tx + padX - 4, ty + padY - 2, tw + 8, fontPx + 4);
       ctx2.fillStyle = "rgba(200, 232, 90, 0.92)";
       ctx2.fillText(text, tx + padX, ty + padY);
 
-      // Status badges — appended to the right of the label.
       const badges = [];
       if (showWarp && d.warpMesh) {
         badges.push({ text: d.warpMesh._isTest ? "WARP•TEST" : "WARP", color: "rgba(127, 119, 221, 0.95)" });
@@ -22119,6 +22168,91 @@ function _drawVisualOverlay() {
         }
       }
     }
+  }
+}
+
+/* Phase 6.6.12 — render one Text-node's string on the overlay
+ * canvas. perDisplay=true → once per tile, with {idx}/{name}/{n}
+ * substitution per display. perDisplay=false → once at the user-
+ * positioned spot on the canvas (or the rig's master viewport rect
+ * in non-tile modes — text stays inside the visible rendered area).
+ *
+ * Font stack maps the dropdown choice to the editor's loaded fonts:
+ *   mono    → JetBrains Mono (the editor default)
+ *   sans    → Inter / system-ui / sans-serif
+ *   serif   → Georgia / serif
+ *   display → Impact / Arial Black / heavy sans (for big calibration
+ *             markers that read from across the room)
+ */
+function _drawTextOverlay(ctx2, node, displays, layerCount, vp, tileW, tileH, cols, mode) {
+  const p = node.params || {};
+  const text = (typeof p.text === "string") ? p.text : "TEST";
+  if (!text) return;
+  const fontKey = p.font || "sans";
+  const fontStack = ({
+    mono:    "JetBrains Mono, ui-monospace, SFMono-Regular, monospace",
+    sans:    "Inter, system-ui, -apple-system, Segoe UI, sans-serif",
+    serif:   "Georgia, 'Times New Roman', serif",
+    display: "Impact, 'Arial Black', 'Helvetica Neue', sans-serif"
+  })[fontKey] || "Inter, sans-serif";
+
+  const dpr = window.devicePixelRatio || 1;
+  const fontSize = Math.max(8, (typeof p.fontSize === "number" ? p.fontSize : 96)) * dpr;
+  const r = Math.max(0, Math.min(1, typeof p.r === "number" ? p.r : 1));
+  const g = Math.max(0, Math.min(1, typeof p.g === "number" ? p.g : 1));
+  const b = Math.max(0, Math.min(1, typeof p.b === "number" ? p.b : 1));
+  const colorRgb = (Math.round(r*255)) + "," + (Math.round(g*255)) + "," + (Math.round(b*255));
+  const x = (typeof p.x === "number") ? p.x : 0.5;
+  const y = (typeof p.y === "number") ? p.y : 0.5;
+  const plateOpacity = Math.max(0, Math.min(1,
+    typeof p.plateOpacity === "number" ? p.plateOpacity : 0.55));
+  const perDisplay = p.perDisplay !== false;
+
+  ctx2.font = "700 " + fontSize + "px " + fontStack;
+  ctx2.textBaseline = "middle";
+  ctx2.textAlign    = "center";
+
+  const drawAt = (cx, cy, label) => {
+    const tw = ctx2.measureText(label).width;
+    const th = fontSize;
+    if (plateOpacity > 0.001) {
+      ctx2.fillStyle = "rgba(8, 11, 16, " + plateOpacity.toFixed(3) + ")";
+      const padX = fontSize * 0.25;
+      const padY = fontSize * 0.15;
+      ctx2.fillRect(cx - tw/2 - padX, cy - th/2 - padY, tw + padX*2, th + padY*2);
+    }
+    ctx2.fillStyle = "rgba(" + colorRgb + ",1)";
+    ctx2.fillText(label, cx, cy);
+  };
+
+  if (perDisplay && mode === "tile") {
+    // Per-tile rendering with token substitution.
+    for (let i = 0; i < layerCount; i++) {
+      const d = displays[i];
+      if (!d) continue;
+      const col = i % cols;
+      const row = Math.floor(i / cols);
+      const tx  = vp.x + col * tileW;
+      const ty  = vp.y + row * tileH;
+      const cx  = tx + tileW * x;
+      const cy  = ty + tileH * y;
+      const label = text
+        .replace(/\{idx\}/g,  String(i))
+        .replace(/\{name\}/g, d.name || ("Display " + (i + 1)))
+        .replace(/\{n\}/g,    String(layerCount));
+      drawAt(cx, cy, label);
+    }
+  } else {
+    // Single-instance: positioned within the master viewport rect so
+    // the text stays inside the actual rendered region (not in the
+    // letterbox bars). {idx} / {name} / {n} get a sensible fallback.
+    const cx = vp.x + vp.w * x;
+    const cy = vp.y + vp.h * y;
+    const label = text
+      .replace(/\{idx\}/g,  "")
+      .replace(/\{name\}/g, "")
+      .replace(/\{n\}/g,    String(layerCount));
+    drawAt(cx, cy, label);
   }
 }
 
