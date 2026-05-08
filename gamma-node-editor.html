@@ -13660,6 +13660,234 @@ function _makeTestWarpMesh(cols, rows) {
   return m;
 }
 
+/* ------------ Phase 6.6.3 — CSV / MPCDI exporters ---------------------- */
+
+/* CRC-32 (IEEE 802.3 polynomial 0xEDB88320). Required by the ZIP
+ * spec for every file entry's checksum. Pre-built table is built
+ * once on first use and cached. ~3 KB lookup table; trivial. */
+let _crc32Table = null;
+function _crc32(buf) {
+  if (!_crc32Table) {
+    _crc32Table = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      _crc32Table[n] = c;
+    }
+  }
+  let crc = 0xFFFFFFFF;
+  for (let i = 0; i < buf.length; i++) crc = _crc32Table[(crc ^ buf[i]) & 0xFF] ^ (crc >>> 8);
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+/* Pure-JS ZIP encoder. Takes { filename: Uint8Array, ... } and
+ * returns a Uint8Array containing a valid ZIP archive. No external
+ * deps — uses the well-defined ZIP format directly. STORED method
+ * only (no DEFLATE) — keeps the encoder simple and the resulting
+ * file is just as readable by any unzip tool. MPCDI bundles are
+ * small (XML + a few CSV files) so the ~zero compression penalty is
+ * fine. ZIP64 not used (4 GB / 64K caps still well above any
+ * realistic MPCDI payload). */
+function _writeZipArchive(files) {
+  const enc = new TextEncoder();
+  const entries = [];
+  let offset = 0;
+  // Per-entry: build local header, write data, record central-dir info.
+  const chunks = [];
+  for (const [name, data] of Object.entries(files)) {
+    const nameBytes = enc.encode(name);
+    const crc = _crc32(data);
+    const localHeader = new ArrayBuffer(30);
+    const lhView = new DataView(localHeader);
+    lhView.setUint32(0,  0x04034b50, true);    // signature
+    lhView.setUint16(4,  20,         true);    // version needed
+    lhView.setUint16(6,  0,          true);    // flags
+    lhView.setUint16(8,  0,          true);    // method (0 = STORED)
+    lhView.setUint16(10, 0,          true);    // mod time
+    lhView.setUint16(12, 0,          true);    // mod date
+    lhView.setUint32(14, crc,        true);    // CRC-32
+    lhView.setUint32(18, data.length, true);   // compressed size (== uncompressed for STORED)
+    lhView.setUint32(22, data.length, true);   // uncompressed size
+    lhView.setUint16(26, nameBytes.length, true);
+    lhView.setUint16(28, 0, true);             // extra field length
+    chunks.push(new Uint8Array(localHeader), nameBytes, data);
+    entries.push({ name: nameBytes, crc, size: data.length, offset });
+    offset += 30 + nameBytes.length + data.length;
+  }
+  // Central directory.
+  const cdStart = offset;
+  for (const e of entries) {
+    const cdHeader = new ArrayBuffer(46);
+    const cdView = new DataView(cdHeader);
+    cdView.setUint32(0,  0x02014b50, true);
+    cdView.setUint16(4,  20, true);            // version made by
+    cdView.setUint16(6,  20, true);            // version needed
+    cdView.setUint16(8,  0,  true);            // flags
+    cdView.setUint16(10, 0,  true);            // method
+    cdView.setUint16(12, 0,  true);            // mod time
+    cdView.setUint16(14, 0,  true);            // mod date
+    cdView.setUint32(16, e.crc, true);
+    cdView.setUint32(20, e.size, true);
+    cdView.setUint32(24, e.size, true);
+    cdView.setUint16(28, e.name.length, true);
+    cdView.setUint16(30, 0,  true);            // extra
+    cdView.setUint16(32, 0,  true);            // comment
+    cdView.setUint16(34, 0,  true);            // disk
+    cdView.setUint16(36, 0,  true);            // internal attrs
+    cdView.setUint32(38, 0,  true);            // external attrs
+    cdView.setUint32(42, e.offset, true);
+    chunks.push(new Uint8Array(cdHeader), e.name);
+    offset += 46 + e.name.length;
+  }
+  const cdEnd = offset;
+  // EOCD.
+  const eocd = new ArrayBuffer(22);
+  const eView = new DataView(eocd);
+  eView.setUint32(0,  0x06054b50, true);
+  eView.setUint16(4,  0, true);
+  eView.setUint16(6,  0, true);
+  eView.setUint16(8,  entries.length, true);
+  eView.setUint16(10, entries.length, true);
+  eView.setUint32(12, cdEnd - cdStart, true);
+  eView.setUint32(16, cdStart, true);
+  eView.setUint16(20, 0, true);
+  chunks.push(new Uint8Array(eocd));
+  // Concat.
+  let total = 0; for (const c of chunks) total += c.length;
+  const out = new Uint8Array(total);
+  let p = 0;
+  for (const c of chunks) { out.set(c, p); p += c.length; }
+  return out;
+}
+
+/* Serialize a Bourke warp mesh to text. Format:
+ *     2
+ *     N M
+ *     x y u v intensity            (per vertex, row-major)
+ *
+ * Six decimals on the floats — finer than any visible difference at
+ * 1080p, smaller than 16-byte floats but accurate enough to round-
+ * trip the editor's drag precision. */
+function _serializeBourkeMesh(mesh) {
+  if (!_validateWarpMesh(mesh)) throw new Error("invalid warp mesh");
+  const W = mesh.cols + 1, H = mesh.rows + 1;
+  const lines = ["2", W + " " + H];
+  for (let i = 0; i < W * H; i++) {
+    const o = i * 5;
+    lines.push(
+      mesh.verts[o + 0].toFixed(6) + " " +
+      mesh.verts[o + 1].toFixed(6) + " " +
+      mesh.verts[o + 2].toFixed(6) + " " +
+      mesh.verts[o + 3].toFixed(6) + " " +
+      mesh.verts[o + 4].toFixed(6)
+    );
+  }
+  return lines.join("\n") + "\n";
+}
+
+/* Generate a minimal MPCDI XML manifest describing the rig. Per-
+ * region warp/alpha file references are written as Bourke CSV
+ * filenames (our exporter writes CSVs into the bundle, not PFM).
+ * External tools that strictly expect PFM may reject these; that's
+ * a follow-on (6.6.3b). For round-trip with our own importer the
+ * output is correct. */
+function _serializeMpcdiXml(rig) {
+  const displays = rig && Array.isArray(rig.displays) ? rig.displays : [];
+  const parts = [];
+  parts.push('<?xml version="1.0" encoding="UTF-8"?>');
+  parts.push('<MPCDI version="2.0" profile="3d" geometric_unit="mm" date="' + new Date().toISOString().slice(0,10) + '" exporter="Gamma-Node-' + APP_VERSION + '">');
+  parts.push('  <display id="display1">');
+  parts.push('    <buffer id="buffer1" Xresolution="' + (rig.masterRes ? rig.masterRes[0] : 1920) + '" Yresolution="' + (rig.masterRes ? rig.masterRes[1] : 1080) + '">');
+  for (let i = 0; i < displays.length; i++) {
+    const d = displays[i];
+    if (!d) continue;
+    const pose = d.pose || { yaw: 0, pitch: 0, roll: 0 };
+    const fov  = d.fov  || { h: 90, v: 60 };
+    const id   = d.id   || ("region" + i);
+    const fname = id + "_warp.csv";
+    parts.push('      <region id="' + id + '" x="0" y="0" xsize="1" ysize="1">');
+    parts.push('        <frustum>');
+    parts.push('          <yaw>'   + pose.yaw   + '</yaw>');
+    parts.push('          <pitch>' + pose.pitch + '</pitch>');
+    parts.push('          <roll>'  + (pose.roll || 0) + '</roll>');
+    parts.push('          <rightAngle>' + ( fov.h * 0.5) + '</rightAngle>');
+    parts.push('          <leftAngle>'  + (-fov.h * 0.5) + '</leftAngle>');
+    parts.push('          <upAngle>'    + ( fov.v * 0.5) + '</upAngle>');
+    parts.push('          <downAngle>'  + (-fov.v * 0.5) + '</downAngle>');
+    parts.push('        </frustum>');
+    if (d.warpMesh) {
+      parts.push('        <files>');
+      parts.push('          <fileSet region="' + id + '">');
+      parts.push('            <geometryWarpFile>' + fname + '</geometryWarpFile>');
+      parts.push('          </fileSet>');
+      parts.push('        </files>');
+    }
+    parts.push('      </region>');
+  }
+  parts.push('    </buffer>');
+  parts.push('  </display>');
+  parts.push('</MPCDI>');
+  return parts.join("\n") + "\n";
+}
+
+/* Trigger a browser download of a Blob with the given filename. */
+function _downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => {
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }, 200);
+}
+
+/* User-facing: download a single display's warp mesh as a Bourke
+ * CSV file. Filename derives from the display's id + name. */
+function exportBourkeMeshForDisplay(displayIdx) {
+  const d = state.rig && state.rig.displays && state.rig.displays[displayIdx];
+  if (!d) return;
+  if (!_validateWarpMesh(d.warpMesh)) {
+    alert("Display " + displayIdx + " has no warp mesh to export.\n\nClick ✎ edit + drag a point to create one, or use Auto-blend rig.");
+    return;
+  }
+  try {
+    const text = _serializeBourkeMesh(d.warpMesh);
+    const safe = String(d.name || d.id || ("display" + displayIdx)).replace(/[^A-Za-z0-9_-]/g, "_");
+    _downloadBlob(new Blob([text], { type: "text/plain" }), safe + "_warp.csv");
+  } catch (e) {
+    alert("Could not export warp mesh:\n\n" + (e && e.message ? e.message : String(e)));
+  }
+}
+
+/* User-facing: download the whole rig as an MPCDI ZIP bundle. */
+function exportMpcdiBundle() {
+  if (!state.rig || !Array.isArray(state.rig.displays)) {
+    alert("No rig to export.");
+    return;
+  }
+  try {
+    const enc = new TextEncoder();
+    const files = {};
+    files["mpcdi.xml"] = enc.encode(_serializeMpcdiXml(state.rig));
+    let warpedCount = 0;
+    state.rig.displays.forEach((d, i) => {
+      if (!d || !_validateWarpMesh(d.warpMesh)) return;
+      const id = d.id || ("region" + i);
+      files[id + "_warp.csv"] = enc.encode(_serializeBourkeMesh(d.warpMesh));
+      warpedCount++;
+    });
+    const zip = _writeZipArchive(files);
+    const fname = (state.patchName || "rig") + ".mpcdi";
+    _downloadBlob(new Blob([zip], { type: "application/octet-stream" }), fname);
+    console.log("[mpcdi-export]", fname, "(" + state.rig.displays.length + " displays, " + warpedCount + " with warps)");
+  } catch (e) {
+    alert("Could not export MPCDI bundle:\n\n" + (e && e.message ? e.message : String(e)));
+  }
+}
+
 /* ------------ Phase 6.6.2 — MPCDI / Bourke CSV importers --------------- */
 
 /* Minimal in-browser ZIP reader. Uses the well-defined ZIP central
@@ -16384,6 +16612,9 @@ function renderRigPane() {
         <button class="rig-warp-edit-btn"
                 data-display-warp-import="${i}"
                 title="Import a Bourke-style warp mesh CSV (.csv) for this display. File format: header line, 'N M' grid dimensions, then N×M rows of 'x y u v intensity'.">⇪ import</button>
+        <button class="rig-warp-edit-btn"
+                data-display-warp-export="${i}"
+                title="Export this display's warp mesh as a Bourke .csv file. Round-trips with our importer; readable by VIOSO, Resolume, blendmesher, and any tool that consumes Bourke mesh files.">⇩ export</button>
       </span>
       <span class="rig-edit-cluster rig-edit-cluster-blend${isCustomBlend ? " rig-edit-cluster-custom" : ""}" title="Edge-blend params. γ = gamma compensation; lift = black-floor lift; pow = power-curve steepness on the intensity ramp.">
         <label>γ</label>
@@ -16432,6 +16663,8 @@ function renderRigPane() {
           <span class="rig-display-list-actions">
             <button class="rig-auto-blend-btn" id="btn-rig-mpcdi-import"
                     title="Import an MPCDI bundle (.mpcdi or .zip) — replaces the rig with the displays defined in the manifest. Geometry (pose/fov) imports now; per-display warp PFM + alpha-map PNG import ships in 6.6.2b.">Import MPCDI…</button>
+            <button class="rig-auto-blend-btn" id="btn-rig-mpcdi-export"
+                    title="Export the whole rig as an MPCDI ZIP bundle — mpcdi.xml + per-display Bourke warp CSVs. Round-trips with our importer; for full external compatibility (PFM warp output) wait for 6.6.3b.">Export MPCDI…</button>
             <button class="rig-auto-blend-btn" id="btn-rig-auto-blend"
                     title="Detect overlapping pose footprints across all displays and auto-generate intensity ramps so adjacent projectors blend seamlessly. Displays in isolation are left as-is.">Auto-blend rig</button>
           </span>
@@ -16604,11 +16837,28 @@ function wireRigPaneHandlers() {
     });
   });
 
+  // Phase 6.6.3 — per-display Bourke-CSV warp-mesh export.
+  document.querySelectorAll('[data-display-warp-export]').forEach(btn => {
+    btn.addEventListener("click", () => {
+      const i = parseInt(btn.dataset.displayWarpExport, 10);
+      if (!Number.isFinite(i)) return;
+      exportBourkeMeshForDisplay(i);
+    });
+  });
+
   // Phase 6.6.2 — whole-rig MPCDI bundle import.
   const mpcdiBtn = document.getElementById("btn-rig-mpcdi-import");
   if (mpcdiBtn) {
     mpcdiBtn.addEventListener("click", () => {
       importMpcdiBundle();
+    });
+  }
+
+  // Phase 6.6.3 — whole-rig MPCDI bundle export.
+  const mpcdiExpBtn = document.getElementById("btn-rig-mpcdi-export");
+  if (mpcdiExpBtn) {
+    mpcdiExpBtn.addEventListener("click", () => {
+      exportMpcdiBundle();
     });
   }
 
