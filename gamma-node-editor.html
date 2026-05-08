@@ -2165,6 +2165,11 @@
     border-color: rgba(127, 119, 221, 0.55);
     color: rgba(170, 162, 240, 0.95);
   }
+  .rig-warp-btn.rig-warp-custom {
+    border-color: rgba(200, 232, 90, 0.55);
+    color: rgba(220, 240, 130, 0.95);
+    background: rgba(200, 232, 90, 0.06);
+  }
 
   /* Phase 6.6.10 — edge-blend sub-cluster on each rig display row.
    * Visually identical to the pose/fov rig-edit-cluster (same
@@ -14362,11 +14367,14 @@ function _wireWarpEditor() {
         const offset = _warpEditor.draggedVertex * 5;
         d.warpMesh.verts[offset + 0] = ndc.mx;
         d.warpMesh.verts[offset + 1] = ndc.my;
-        // Editing makes the mesh "live" — drop the auto-flag so it
-        // reads as user-edited in the rig pane (warp pill turns
-        // identity-violet) and a re-run of Auto-blend won't overwrite.
+        // Editing makes the mesh "custom" — user-authored. Drop the
+        // auto-/test- flags so the rig pane's warp pill flips to
+        // "warp: custom" (red rim, doesn't get clobbered by pill
+        // cycle without confirm) and a re-run of Auto-blend leaves
+        // it alone.
         d.warpMesh._isAutoBlend = false;
         d.warpMesh._isTest      = false;
+        d.warpMesh._isCustom    = true;
         if (Visual && Visual._warpCache) Visual._warpCache.delete(d.id);
         _drawWarpEditor();
       } else {
@@ -14571,6 +14579,13 @@ function _applyAutoBlendToRig(opts) {
   if (!skipHistory) pushHistory("rig-auto-blend");
   state.rig.displays.forEach((d, i) => {
     if (!d) return;
+    // Phase 6.6.9 — custom (user-edited) meshes are sacred; auto-
+    // blend leaves them alone. Otherwise a re-run after editing
+    // would silently undo the user's hand-tuning.
+    if (d.warpMesh && d.warpMesh._isCustom) {
+      out.push({ displayIdx: i, bands: { left: 0, right: 0, top: 0, bottom: 0 }, applied: false, skipped: "custom" });
+      return;
+    }
     const bands = _computeOverlapBands(i, state.rig.displays);
     const overlapping = bands.left + bands.right + bands.top + bands.bottom;
     if (overlapping > 0.001) {
@@ -16325,12 +16340,14 @@ function renderRigPane() {
     const warpState = !d.warpMesh ? "off"
                      : (d.warpMesh._isTest      ? "test"
                      : (d.warpMesh._isAutoBlend ? "auto"
-                     : "identity"));
+                     : (d.warpMesh._isCustom    ? "custom"
+                     : "identity")));
     const warpLabel = ({
       off:      "warp: off",
       identity: "warp: identity",
       test:     "warp: test",
-      auto:     "warp: auto-blend"
+      auto:     "warp: auto-blend",
+      custom:   "warp: custom"
     })[warpState];
     // Phase 6.6.10 — per-display edge-blend inputs. γ / lift / pow
     // sit on a sub-row below the pose/fov line, kept visually
@@ -16482,18 +16499,29 @@ function wireRigPaneHandlers() {
       const i = parseInt(btn.dataset.displayWarpToggle, 10);
       const display = state.rig && state.rig.displays && state.rig.displays[i];
       if (!display) return;
-      pushHistory("rig-warp-toggle:" + i);
       const cur = !display.warpMesh ? "off"
                 : (display.warpMesh._isTest      ? "test"
                 : (display.warpMesh._isAutoBlend ? "auto"
-                : "identity"));
-      // Cycle: off → identity → test → off. Auto-blend lives outside
-      // this cycle (it's set by the global button); clicking the pill
-      // on an auto-blend display drops back to off so the user can
-      // override the auto-generated mesh manually.
+                : (display.warpMesh._isCustom    ? "custom"
+                : "identity")));
+      // Custom meshes hold the user's hand-editing work — we don't
+      // want a casual pill click to silently clobber them with a test
+      // bow. Confirm before discarding. User can also use the editor's
+      // Reset button (less ambiguous path).
+      if (cur === "custom") {
+        const ok = (typeof confirm === "function")
+          ? confirm("Discard your custom warp on display " + i + "?\n\nClick the ✎ edit pill instead if you want to keep editing.")
+          : true;
+        if (!ok) return;
+      }
+      pushHistory("rig-warp-toggle:" + i);
+      // Cycle: off → identity → test → off. Auto-blend / custom both
+      // live outside this cycle (set by other paths); clicking the pill
+      // on either drops back to off cleanly.
       const next = cur === "off"      ? "identity"
                  : cur === "identity" ? "test"
-                 : "off";
+                 : cur === "test"     ? "off"
+                 : "off";   // auto / custom both clear to off
       if (next === "off")           display.warpMesh = null;
       else if (next === "identity") display.warpMesh = _makeIdentityWarpMesh(8, 8);
       else                          display.warpMesh = _makeTestWarpMesh(8, 8);
