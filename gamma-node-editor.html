@@ -13098,6 +13098,26 @@ function makeNode(type, x, y, params) {
   if (!def) { console.warn("unknown type", type); return null; }
   const id = uid();
   const p = Object.assign({}, def.params || {}, params || {});
+  // Phase 6.5 — auto-assign display index for new VisualOutput nodes.
+  // Walk the rig's display list and pick the LOWEST unused index. Lets
+  // a user drop a 2nd VisualOutput on a "Side-by-side" rig and have it
+  // automatically land on the right display, no manual dropdown step.
+  // Caller can override by passing params.display explicitly. If all
+  // displays are already taken, fall back to 0 (duplicate); user gets
+  // a chance to fix via the props-pane dropdown.
+  if (type === "VisualOutput" && (!params || params.display === undefined)) {
+    const displays = (state.rig && state.rig.displays) || [];
+    if (displays.length > 0) {
+      const used = new Set(state.nodes
+        .filter(n => n.type === "VisualOutput" && n.params && typeof n.params.display === "number")
+        .map(n => n.params.display | 0));
+      let pick = -1;
+      for (let i = 0; i < displays.length; i++) {
+        if (!used.has(i)) { pick = i; break; }
+      }
+      p.display = pick >= 0 ? pick : 0;   // fallback when all are taken
+    }
+  }
   state.nodes.push({ id, type, x, y, params: p });
   // For nodes that declare autoExpose (e.g. KeyboardIn), seed
   // state.exposed so the props-panel checkbox shows the truth and
@@ -20160,7 +20180,7 @@ function _disposeShaderInstance(nodeId) {
  *   let world_uv = mix(u.u_world_uv.xy, u.u_world_uv.zw, in.uv);
  * Single-display rigs default to u_world_uv = (0,0,1,1) so existing
  * shaders that read in.uv directly behave identically. */
-function _writeShaderPreamble(scratch, dtSec, display) {
+function _writeShaderPreamble(scratch, dtSec, display, worldUvOverride) {
   const t = (performance.now() - Visual.startTime) * 0.001;
   scratch[0]  = Visual.fbWidth;
   scratch[1]  = Visual.fbHeight;
@@ -20176,7 +20196,11 @@ function _writeShaderPreamble(scratch, dtSec, display) {
   // still produce sensible u_world_uv = (0,0,1,1).
   const pose = (display && display.pose) || { yaw: 0, pitch: 0, roll: 0 };
   const fov  = (display && display.fov)  || { h: 90, v: 60 };
-  const wuv  = (display && display.worldUv) || { minU: 0, minV: 0, maxU: 1, maxV: 1 };
+  // worldUvOverride is the per-VO normalized slice computed from the
+  // shader's actual consumer set (see _renderWorldUvForVO). Falls back
+  // to the rig display's slice when no override given (which happens
+  // for non-shader-frag callers — there are none today, but safe).
+  const wuv = worldUvOverride || (display && display.worldUv) || { minU: 0, minV: 0, maxU: 1, maxV: 1 };
   scratch[8]  = pose.yaw   || 0;
   scratch[9]  = pose.pitch || 0;
   scratch[10] = pose.roll  || 0;
@@ -20185,6 +20209,82 @@ function _writeShaderPreamble(scratch, dtSec, display) {
   scratch[13] = wuv.minV != null ? wuv.minV : 0;
   scratch[14] = wuv.maxU != null ? wuv.maxU : 1;
   scratch[15] = wuv.maxV != null ? wuv.maxV : 1;
+}
+
+/* Find every VisualOutput in the patch that consumes the same shader
+ * source as `vo`. Returns the array including `vo` itself. Used by
+ * _renderWorldUvForVO to decide whether the shader is solo-consumed
+ * (full coverage) or shared across multiple displays (slice the
+ * shared canvas).
+ *
+ * Trade-off: O(N×E) per render frame for N nodes × E edges. Trivial
+ * for typical patches; could be cached on graph mutation if profiling
+ * ever shows it matters. */
+function _coConsumerVOs(currentVO, srcId) {
+  if (!state || !Array.isArray(state.nodes) || !Array.isArray(state.edges)) return [currentVO];
+  const out = [];
+  for (const candidate of state.nodes) {
+    if (candidate.type !== "VisualOutput") continue;
+    const incomingEdge = state.edges.find(e =>
+      e.to.node === candidate.id && e.to.port === "in"
+    );
+    if (!incomingEdge || incomingEdge.from.node !== srcId) continue;
+    out.push(candidate);
+  }
+  return out.length ? out : [currentVO];
+}
+
+/* Compute the per-VO render-time u_world_uv. Two regimes:
+ *
+ *   Solo consumer (this is the only VO wired to this shader source):
+ *     return (0, 0, 1, 1) — shader renders FULL coverage on this
+ *     display. A pinwheel sees a complete pinwheel; a gradient runs
+ *     edge-to-edge.
+ *
+ *   Shared consumer (≥ 2 VOs wired to the same shader source):
+ *     compute the bounding rect of all consumer displays' rig
+ *     worldUvs, then return THIS VO's display slice normalized to
+ *     that bbox so the union spans 0..1 across the consumers.
+ *     A pinwheel wired to both displays of side-by-side renders
+ *     once-per-display with its center exactly at the seam.
+ *
+ * The normalization step matters when consumers don't cover the
+ * full rig: e.g. on AlloSphere-like (16 displays), wiring a shader
+ * into VO0 + VO15 produces a "shared canvas" that's just those two
+ * displays' worldUv union; the in-between displays just don't
+ * receive the shader's output. */
+function _renderWorldUvForVO(currentVO, srcId) {
+  const displays = (state && state.rig && state.rig.displays) || [];
+  if (displays.length === 0) return { minU: 0, minV: 0, maxU: 1, maxV: 1 };
+  const consumers = _coConsumerVOs(currentVO, srcId);
+  // Solo consumer → full coverage on its display.
+  if (consumers.length <= 1) {
+    return { minU: 0, minV: 0, maxU: 1, maxV: 1 };
+  }
+  // Shared shader → compute bbox of consumer-display slices, then
+  // normalize this VO's slice to that bbox.
+  let minU = Infinity, minV = Infinity, maxU = -Infinity, maxV = -Infinity;
+  for (const otherVO of consumers) {
+    const idx = (otherVO.params && typeof otherVO.params.display === "number") ? (otherVO.params.display | 0) : 0;
+    const d = displays[Math.max(0, Math.min(idx, displays.length - 1))];
+    if (!d || !d.worldUv) continue;
+    if (d.worldUv.minU < minU) minU = d.worldUv.minU;
+    if (d.worldUv.minV < minV) minV = d.worldUv.minV;
+    if (d.worldUv.maxU > maxU) maxU = d.worldUv.maxU;
+    if (d.worldUv.maxV > maxV) maxV = d.worldUv.maxV;
+  }
+  if (!isFinite(minU)) return { minU: 0, minV: 0, maxU: 1, maxV: 1 };
+  const w = (maxU - minU) || 1;
+  const h = (maxV - minV) || 1;
+  const myIdx = (currentVO.params && typeof currentVO.params.display === "number") ? (currentVO.params.display | 0) : 0;
+  const myDisp = displays[Math.max(0, Math.min(myIdx, displays.length - 1))];
+  const wuv = (myDisp && myDisp.worldUv) || { minU: 0, minV: 0, maxU: 1, maxV: 1 };
+  return {
+    minU: (wuv.minU - minU) / w,
+    minV: (wuv.minV - minV) / h,
+    maxU: (wuv.maxU - minU) / w,
+    maxV: (wuv.maxV - minV) / h
+  };
 }
 
 /* Encode a shader-frag pass for one VisualOutput → its display layer.
@@ -20205,13 +20305,21 @@ function _encodeShaderFragPassForVO(enc, vo, src, def, dtSec, layerIdx) {
   const entry = inst.pipelineEntry;
   if (!entry || !entry.pipeline) return false;
 
-  // Pack uniforms — preamble (with this VO's display pose + worldUv)
-  // first, then the registry-declared writer for per-shader params.
-  // Note: writeUniforms receives the SOURCE node (the shader producer)
-  // since that's where the shader's params live; the VO is just the
-  // display routing target.
+  // Pack uniforms — preamble (with this VO's display pose + a
+  // per-consumer-set worldUv) first, then the registry-declared
+  // writer for per-shader params. Note: writeUniforms receives the
+  // SOURCE node (the shader producer) since that's where the
+  // shader's params live; the VO is just the display routing target.
+  //
+  // u_world_uv is computed from the SHADER'S CONSUMER SET, not the
+  // raw rig display slice. Solo consumer → (0,0,1,1) so the shader
+  // renders full coverage on its display (one pinwheel = one full
+  // pinwheel). Shared shader (multiple VOs wired to same source) →
+  // each VO gets its slice within the consumer-set bbox so the
+  // shader spans the connected displays correctly.
   const display = state.rig && state.rig.displays && state.rig.displays[layerIdx];
-  _writeShaderPreamble(inst.scratch, dtSec, display);
+  const renderWuv = _renderWorldUvForVO(vo, src.id);
+  _writeShaderPreamble(inst.scratch, dtSec, display, renderWuv);
   if (typeof def.writeUniforms === "function") {
     def.writeUniforms(src, inst.scratch);
   }
