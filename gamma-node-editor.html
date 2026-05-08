@@ -2041,6 +2041,16 @@
     color: var(--text);
     border-color: rgba(127, 119, 221, 0.4);
   }
+  .rig-surf-toggle-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    font-size: 11px;
+    color: var(--text-3);
+    font-family: var(--font-mono);
+  }
+  .rig-surf-toggle-label input { cursor: pointer; }
   .rig-grid > label {
     font-size: 11px;
     color: var(--text-2);
@@ -14058,6 +14068,13 @@ function defaultRig() {
     // cylinder → midpoint of axis, plane → offset away from screen.
     // Helper _deriveSweetSpot builds defaults; user can override.
     sweetSpot:  _deriveSweetSpot(surface),
+    // Phase 6.6.15 — when true, the screen surface is treated as a
+    // physical curved screen for auto-warp + gizmo visualization.
+    // When false, the rig is treated as flat monitors arranged at
+    // the display poses (common for VJ wraparound LED-wall installs).
+    // Default ON because most projection rigs do have a real screen;
+    // toggle off if you're driving an array of monitors.
+    surfaceVisible: true,
     displays:    [_makeDisplay("d0", "Display 1", {
       pose: { yaw: 0, pitch: 0, roll: 0 },
       fov:  { h: 90, v: 60 },
@@ -15742,6 +15759,238 @@ function _makeAutoBlendMesh(cols, rows, display, displays, displayIdx) {
  * any side) get cleared — there's no neighbor for them to blend
  * with. Returns an array of { displayIdx, bands, applied } for the
  * caller's status reporting. */
+/* ------------ Phase 6.6.15 — auto-warp from screen geometry ------------ */
+
+/* Following Raskar et al. §3.3 (Camera-to-Projector Transfer): given a
+ * known parametric screen surface + each projector's pose, compute
+ * a per-vertex warp mesh that pre-distorts source content so the
+ * audience at the sweet-spot sees a geometrically correct image.
+ *
+ * Math:
+ *   For each mesh vertex (i, j):
+ *     1. Compute projector ray from origin through framebuffer NDC,
+ *        oriented by display.pose.
+ *     2. Intersect with the screen surface → 3D point P.
+ *     3. From sweet-spot S, compute audience direction = P - S.
+ *     4. Convert audience direction to (yaw, pitch) angles → audience
+ *        UV via equirect projection.
+ *     5. Normalize into display.worldUv slice → mesh vertex's (mu, mv).
+ *
+ * For sphere-at-origin + sweet-spot-at-origin, this collapses to
+ * identity (projector ray and audience ray coincide). Non-trivial
+ * warp emerges when sweet-spot is offset from the projector position.
+ *
+ * Surface support:
+ *   sphere   — full math (audience equirect from sweet-spot)
+ *   cylinder — full math (cylindrical unwrap from axis)
+ *   plane    — falls through to identity (perspective-from-origin
+ *              already produces correct content for a flat screen
+ *              when projector + sweet-spot are co-located, and the
+ *              user can adjust if needed)
+ *   free     — identity (no analytic geometry to invert)
+ */
+const _DEG2RAD = Math.PI / 180;
+const _RAD2DEG = 180 / Math.PI;
+
+function _raySphereDistance(O, D, center, radius) {
+  const ox = O[0] - center[0], oy = O[1] - center[1], oz = O[2] - center[2];
+  const a = D[0]*D[0] + D[1]*D[1] + D[2]*D[2];
+  const b = 2 * (ox*D[0] + oy*D[1] + oz*D[2]);
+  const c = ox*ox + oy*oy + oz*oz - radius*radius;
+  const disc = b*b - 4*a*c;
+  if (disc < 0) return -1;
+  const sd = Math.sqrt(disc);
+  const t1 = (-b - sd) / (2*a);
+  const t2 = (-b + sd) / (2*a);
+  // Want positive distance — for camera/projector inside the sphere
+  // both roots are valid; outside, take the smaller positive.
+  if (t1 > 0.001) return t1;
+  if (t2 > 0.001) return t2;
+  return -1;
+}
+
+function _rayCylinderDistanceY(O, D, center, radius, length) {
+  // Cylinder axis assumed +Y for v1. Project ray onto XZ plane,
+  // intersect with circle of radius `radius` centered at (center.x,
+  // center.z). Then check that the hit's Y is within ±length/2 of
+  // center.y.
+  const ox = O[0] - center[0], oz = O[2] - center[2];
+  const a = D[0]*D[0] + D[2]*D[2];
+  if (a < 1e-9) return -1;        // ray parallel to axis — no XZ intersection
+  const b = 2 * (ox*D[0] + oz*D[2]);
+  const c = ox*ox + oz*oz - radius*radius;
+  const disc = b*b - 4*a*c;
+  if (disc < 0) return -1;
+  const sd = Math.sqrt(disc);
+  const t1 = (-b - sd) / (2*a);
+  const t2 = (-b + sd) / (2*a);
+  for (const t of [t1, t2]) {
+    if (t > 0.001) {
+      const py = O[1] + D[1] * t;
+      if (Math.abs(py - center[1]) <= length * 0.5 + 0.001) return t;
+    }
+  }
+  return -1;
+}
+
+/* Build a warp mesh for one display by ray-tracing each grid vertex
+ * onto the screen surface, then projecting back from the sweet-spot
+ * to find the audience-view UV. Returns identity mesh for free /
+ * plane surfaces (no analytic inversion implemented). */
+function _autoWarpMeshForDisplay(display, surface, sweetSpot, cols, rows) {
+  cols = cols || 8;
+  rows = rows || 8;
+  const mesh = _makeIdentityWarpMesh(cols, rows);
+  if (!surface || surface.type === "free" || surface.type === "plane") {
+    // Plane case: when the screen is flat AND projector/sweet-spot
+    // are co-located, perspective rendering is already correct.
+    // Off-axis sweet-spots on a plane could be auto-warped but it's
+    // rarely useful; user can hand-edit. Free has no analytic geometry.
+    return mesh;
+  }
+
+  const W = cols + 1, H = rows + 1;
+  const pose = display.pose || { yaw: 0, pitch: 0, roll: 0 };
+  const fov  = display.fov  || { h: 90, v: 60 };
+
+  // Display's local-to-world basis (yaw + pitch only; roll skipped
+  // for v1 — most templates leave it 0).
+  const yr = pose.yaw   * _DEG2RAD;
+  const pr = pose.pitch * _DEG2RAD;
+  const fx = Math.sin(yr) * Math.cos(pr);
+  const fy = Math.sin(pr);
+  const fz = Math.cos(yr) * Math.cos(pr);
+  // right = altUp × forward (matches the same convention used by
+  // _theaterViewProjMatrix + _buildTheaterMeshGeometry, so the warp's
+  // ray geometry stays consistent with what the gizmo + theater show).
+  let altUpX = 0, altUpY = 1, altUpZ = 0;
+  if (Math.abs(fy) > 0.95) { altUpX = 0; altUpY = 0; altUpZ = 1; }
+  let rx = altUpY * fz - altUpZ * fy;
+  let ry = altUpZ * fx - altUpX * fz;
+  let rz = altUpX * fy - altUpY * fx;
+  const rl = Math.hypot(rx, ry, rz) || 1;
+  rx /= rl; ry /= rl; rz /= rl;
+  const ux = fy * rz - fz * ry;
+  const uy = fz * rx - fx * rz;
+  const uz = fx * ry - fy * rx;
+
+  const tanH = Math.tan(fov.h * 0.5 * _DEG2RAD);
+  const tanV = Math.tan(fov.v * 0.5 * _DEG2RAD);
+
+  const slice = display.worldUv || { minU: 0, minV: 0, maxU: 1, maxV: 1 };
+  const sliceW = Math.max(0.0001, slice.maxU - slice.minU);
+  const sliceH = Math.max(0.0001, slice.maxV - slice.minV);
+
+  for (let r = 0; r < H; r++) {
+    for (let c = 0; c < W; c++) {
+      const u = c / cols;
+      const v = r / rows;
+      const ndcX = u * 2 - 1;
+      const ndcY = v * 2 - 1;     // bottom-up per the Bourke convention
+
+      // Local ray direction in display frame.
+      const lx = ndcX * tanH;
+      const ly = ndcY * tanV;
+      const lz = 1;
+
+      // Rotate to world frame.
+      const wx = rx*lx + ux*ly + fx*lz;
+      const wy = ry*lx + uy*ly + fy*lz;
+      const wz = rz*lx + uz*ly + fz*lz;
+
+      // Ray from rig origin through (wx, wy, wz). Intersect surface.
+      let t = -1;
+      if (surface.type === "sphere") {
+        t = _raySphereDistance([0,0,0], [wx,wy,wz], surface.center || [0,0,0], surface.radius || 5);
+      } else if (surface.type === "cylinder") {
+        t = _rayCylinderDistanceY([0,0,0], [wx,wy,wz], surface.center || [0,0,0],
+                                   surface.radius || 5, surface.length || 5);
+      }
+      if (t <= 0) {
+        // Ray missed the screen — keep identity mapping for this
+        // vertex. Only happens at the edges of cylinder/cube cases.
+        continue;
+      }
+
+      // Screen point P.
+      const Px = wx * t, Py = wy * t, Pz = wz * t;
+      // Audience direction from sweet-spot to P.
+      const adx = Px - sweetSpot[0];
+      const ady = Py - sweetSpot[1];
+      const adz = Pz - sweetSpot[2];
+      const adLen = Math.hypot(adx, ady, adz);
+      if (adLen < 0.001) continue;
+      const ax = adx / adLen, ay = ady / adLen, az = adz / adLen;
+
+      // Audience yaw/pitch in degrees. Yaw=0 looks +Z; +X is yaw=+90.
+      const audYawDeg   = Math.atan2(ax, az) * _RAD2DEG;
+      const audPitchDeg = Math.asin(Math.max(-1, Math.min(1, ay))) * _RAD2DEG;
+
+      // Equirect audience UV in rig master coords. yaw range
+      // [-180, +180] → u [0, 1]. pitch [-90, +90] → v: mapping with
+      // top-of-image = high pitch = audV near 0, so audV = (90 - pitch) / 180.
+      const audU = (audYawDeg + 180) / 360;
+      const audV = (90 - audPitchDeg) / 180;
+
+      // Normalize into the display's worldUv slice.
+      let mu = (audU - slice.minU) / sliceW;
+      let mv = (audV - slice.minV) / sliceH;
+      // Clamp tightly enough to remain inside [0, 1] so the warp
+      // pipeline samples valid texels; with proper rig calibration
+      // these should already be in range.
+      if (mu < 0) mu = 0; else if (mu > 1) mu = 1;
+      if (mv < 0) mv = 0; else if (mv > 1) mv = 1;
+
+      const off = (r * W + c) * 5;
+      mesh.verts[off + 0] = ndcX;
+      mesh.verts[off + 1] = ndcY;
+      mesh.verts[off + 2] = mu;
+      mesh.verts[off + 3] = mv;
+      mesh.verts[off + 4] = 1;
+    }
+  }
+  mesh._isAutoWarp = true;
+  return mesh;
+}
+
+/* Apply auto-warp across the rig. Skipped for "free"/"plane" surfaces
+ * + when surfaceVisible is OFF (user told us this is a monitor rig,
+ * not a curved screen). Custom (user-edited) meshes are preserved. */
+function _applyAutoWarpToRig(opts) {
+  if (!state.rig || !Array.isArray(state.rig.displays)) return [];
+  const surface = state.rig.surface;
+  if (!surface || !state.rig.surfaceVisible) {
+    if (!opts || !opts.silent) {
+      alert("Auto-warp needs a screen surface (Sphere or Cylinder) and Screen visibility ON in the rig pane.");
+    }
+    return [];
+  }
+  if (surface.type === "free" || surface.type === "plane") {
+    if (!opts || !opts.silent) {
+      alert("Auto-warp on " + surface.type + " surfaces collapses to identity (projector and sweet-spot are co-located on a flat / free-form screen). Use Sphere or Cylinder for analytic warp.");
+    }
+    return [];
+  }
+  const ss = state.rig.sweetSpot || [0, 0, 0];
+  const out = [];
+  if (!opts || !opts.skipHistory) pushHistory("rig-auto-warp");
+  state.rig.displays.forEach((d, i) => {
+    if (!d) return;
+    if (d.warpMesh && d.warpMesh._isCustom) {
+      out.push({ displayIdx: i, applied: false, skipped: "custom" });
+      return;
+    }
+    const mesh = _autoWarpMeshForDisplay(d, surface, ss, 8, 8);
+    d.warpMesh = mesh;
+    if (Visual && Visual._warpCache) Visual._warpCache.delete(d.id);
+    out.push({ displayIdx: i, applied: true });
+  });
+  if (state.rig && Object.keys(RIG_TEMPLATES).includes(state.rig.templateKey)) {
+    state.rig.templateKey = "custom";
+  }
+  return out;
+}
+
 function _applyAutoBlendToRig(opts) {
   if (!state.rig || !Array.isArray(state.rig.displays)) return [];
   const out = [];
@@ -17660,11 +17909,19 @@ function renderRigPane() {
             <input type="number" id="rig-surf-offset" class="rig-grid-input" value="${(+surf.offset).toFixed(2)}" step="0.5" min="0.5" />
           `;
         }
+        const surfVisible = rig.surfaceVisible !== false;
         return `
           <div class="rig-grid rig-grid-surface">
             <label for="rig-surface-type" title="Physical screen geometry. Used by theater preview for sweet-spot, and by 6.6.14+ auto-warp for analytic geometry correction.">Screen</label>
             <select id="rig-surface-type">${surfTypeOpts}</select>
             ${surfParamsHtml}
+            <label title="When ON, the rig is treated as a curved screen (auto-warp + gizmo viz active). When OFF, the rig is treated as flat monitors at the display poses (auto-warp falls through to identity, gizmo skips screen drawing). Default ON; toggle off for VJ wraparound LED-wall installs where each panel is its own monitor.">Screen on</label>
+            <span class="rig-surf-toggle">
+              <label class="rig-surf-toggle-label">
+                <input type="checkbox" id="rig-surface-visible"${surfVisible ? " checked" : ""}>
+                <span>${surfVisible ? "treating as physical screen" : "treating as monitors"}</span>
+              </label>
+            </span>
           </div>
           <div class="rig-grid rig-grid-sweet-spot">
             <label title="The audience-position the rig is calibrated for. Theater camera spawns here on rig change / patch load.">Sweet spot</label>
@@ -17686,6 +17943,8 @@ function renderRigPane() {
                     title="Import an MPCDI bundle (.mpcdi or .zip) — replaces the rig with the displays defined in the manifest. Geometry (pose/fov) imports now; per-display warp PFM + alpha-map PNG import ships in 6.6.2b.">Import MPCDI…</button>
             <button class="rig-auto-blend-btn" id="btn-rig-mpcdi-export"
                     title="Export the whole rig as an MPCDI ZIP bundle — mpcdi.xml + per-display Bourke warp CSVs. Round-trips with our importer; for full external compatibility (PFM warp output) wait for 6.6.3b.">Export MPCDI…</button>
+            <button class="rig-auto-blend-btn" id="btn-rig-auto-warp"
+                    title="Per Raskar §3.3 — analytically derive a per-display warp mesh from the rig's screen surface + sweet-spot. Sphere / cylinder surfaces only; flat / free fall through to identity. Custom (hand-edited) meshes are preserved.">Auto-warp screen</button>
             <button class="rig-auto-blend-btn" id="btn-rig-auto-blend"
                     title="Detect overlapping pose footprints across all displays and auto-generate intensity ramps so adjacent projectors blend seamlessly. Displays in isolation are left as-is.">Auto-blend rig</button>
           </span>
@@ -17827,6 +18086,43 @@ function wireRigPaneHandlers() {
         Visual.theaterCam.pos[2] = state.rig.sweetSpot[2];
         Visual.theaterCam.yaw   = 0;
         Visual.theaterCam.pitch = 0;
+      }
+    });
+  }
+
+  // Phase 6.6.15 — screen-visible toggle. When ON the rig is a
+  // curved screen (auto-warp + gizmo viz active). When OFF treat
+  // as flat monitors (auto-warp falls through, gizmo skips surface).
+  const surfVisCb = document.getElementById("rig-surface-visible");
+  if (surfVisCb) {
+    surfVisCb.addEventListener("change", () => {
+      pushHistory("rig-surface-visible:" + surfVisCb.checked);
+      if (!state.rig) state.rig = defaultRig();
+      state.rig.surfaceVisible = surfVisCb.checked;
+      renderProps && renderProps();
+      render();
+    });
+  }
+
+  // Phase 6.6.15 — Auto-warp screen button. Fires only when surface
+  // is sphere/cylinder + surfaceVisible is on. Custom meshes are
+  // preserved (same idiom as Auto-blend).
+  const autoWarpBtn = document.getElementById("btn-rig-auto-warp");
+  if (autoWarpBtn) {
+    autoWarpBtn.addEventListener("click", () => {
+      const results = _applyAutoWarpToRig();
+      if (results.length) {
+        const applied = results.filter(r => r.applied).length;
+        const skipped = results.length - applied;
+        autoWarpBtn.textContent = applied + " warped";
+        autoWarpBtn.disabled = true;
+        setTimeout(() => {
+          autoWarpBtn.textContent = "Auto-warp screen";
+          autoWarpBtn.disabled = false;
+        }, 900);
+        console.log("[auto-warp] applied to", applied, "displays;", skipped, "skipped (custom)");
+        renderProps && renderProps();
+        render();
       }
     });
   }
@@ -20633,6 +20929,8 @@ document.getElementById("file-input").addEventListener("change", ev => {
       if (!Array.isArray(state.rig.sweetSpot) || state.rig.sweetSpot.length !== 3) {
         state.rig.sweetSpot = _deriveSweetSpot(state.rig.surface);
       }
+      // Phase 6.6.15 — surfaceVisible toggle (default ON for old patches).
+      if (typeof state.rig.surfaceVisible !== "boolean") state.rig.surfaceVisible = true;
       // Phase 6.6 — synthesize calibration warp + edge-blend fields
       // on every display so the render path can read them without
       // null checks. Pre-6.6 patches get warpMesh=null (no warp) +
@@ -25971,12 +26269,18 @@ function _drawGizmoFrame() {
     return { x: cx + x * baseScale, y: cy - y * baseScale, z: z };
   }
 
-  // Wireframe sphere: latitude rings at every 30° of pitch +
-  // longitude meridians at every 30° of yaw. The equator is drawn
-  // brighter because it's the rig's reference horizon (where the
-  // AlloSphere catwalk lives). Every other line is faint enough not
-  // to compete with the frustum strokes — it's a backdrop, not a
-  // foreground element.
+  // Phase 6.6.15 — render the actual screen surface based on
+  // rig.surface (sphere / cylinder / plane / free). Shown only when
+  // rig.surfaceVisible is true; toggled off treats the rig as
+  // monitors and the gizmo just shows frustums + sweet-spot.
+  // Sphere is drawn at unit radius regardless of surface.radius
+  // because the gizmo uses normalized coords matching frustum
+  // corners; sweet-spot positions are scaled by 1/surface.radius
+  // so an audience at sphere-center renders at gizmo origin even
+  // for non-default radii.
+  const rigSurface = (state && state.rig && state.rig.surface) || null;
+  const surfVisibleNow = !!(state && state.rig && state.rig.surfaceVisible !== false);
+
   function drawLatRing(pitchDeg, color) {
     const py = pitchDeg * Math.PI / 180;
     const r = Math.cos(py);
@@ -25991,32 +26295,96 @@ function _drawGizmoFrame() {
     ctx.lineWidth = 1;
     ctx.stroke();
   }
-  // Faint latitude rings every 30°, equator (0°) brighter.
-  drawLatRing(-60, "rgba(200, 232, 90, 0.07)");
-  drawLatRing(-30, "rgba(200, 232, 90, 0.07)");
-  drawLatRing(  0, "rgba(200, 232, 90, 0.22)");   // equator / catwalk seam
-  drawLatRing( 30, "rgba(200, 232, 90, 0.07)");
-  drawLatRing( 60, "rgba(200, 232, 90, 0.07)");
-
-  // Longitude meridians every 30° (12 total) — denser than the old
-  // 4-meridian set so the partial-sphere shape reads from any orbit
-  // angle, not just the cardinal yaws.
-  for (let m = 0; m < 12; m++) {
-    const yaw0 = m * Math.PI / 6;     // 30° step
-    const isCardinal = (m % 3 === 0);  // 0, 90, 180, 270 a touch brighter
-    ctx.beginPath();
-    for (let i = -8; i <= 8; i++) {
-      const pitch = i / 8 * (Math.PI / 2 - 0.05);
-      const x = Math.sin(yaw0) * Math.cos(pitch);
-      const y = Math.sin(pitch);
-      const z = Math.cos(yaw0) * Math.cos(pitch);
-      const p = project([x, y, z]);
-      if (i === -8) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+  function drawMeridians(brightCardinal, dimRest) {
+    for (let m = 0; m < 12; m++) {
+      const yaw0 = m * Math.PI / 6;
+      const isCardinal = (m % 3 === 0);
+      ctx.beginPath();
+      for (let i = -8; i <= 8; i++) {
+        const pitch = i / 8 * (Math.PI / 2 - 0.05);
+        const x = Math.sin(yaw0) * Math.cos(pitch);
+        const y = Math.sin(pitch);
+        const z = Math.cos(yaw0) * Math.cos(pitch);
+        const p = project([x, y, z]);
+        if (i === -8) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+      }
+      ctx.strokeStyle = isCardinal ? brightCardinal : dimRest;
+      ctx.stroke();
     }
-    ctx.strokeStyle = isCardinal
-      ? "rgba(200, 232, 90, 0.12)"
-      : "rgba(200, 232, 90, 0.05)";
+  }
+  function drawCylinder(length, radius) {
+    const halfL = length * 0.5;
+    // Top + bottom rings
+    for (const y of [-halfL, halfL]) {
+      ctx.beginPath();
+      for (let i = 0; i <= 64; i++) {
+        const a = i / 64 * 2 * Math.PI;
+        const p = project([radius * Math.cos(a), y, radius * Math.sin(a)]);
+        if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+      }
+      ctx.strokeStyle = "rgba(200, 232, 90, 0.18)";
+      ctx.stroke();
+    }
+    // 12 vertical lines connecting top + bottom
+    for (let m = 0; m < 12; m++) {
+      const a = m * Math.PI / 6;
+      const x = radius * Math.cos(a), z = radius * Math.sin(a);
+      const top = project([x, halfL, z]);
+      const bot = project([x, -halfL, z]);
+      ctx.beginPath();
+      ctx.moveTo(top.x, top.y); ctx.lineTo(bot.x, bot.y);
+      ctx.strokeStyle = (m % 3 === 0)
+        ? "rgba(200, 232, 90, 0.12)"
+        : "rgba(200, 232, 90, 0.05)";
+      ctx.stroke();
+    }
+  }
+  function drawPlane(z, w, h) {
+    const halfW = w * 0.5, halfH = h * 0.5;
+    const corners = [
+      project([-halfW, -halfH, z]),
+      project([ halfW, -halfH, z]),
+      project([ halfW,  halfH, z]),
+      project([-halfW,  halfH, z])
+    ];
+    ctx.beginPath();
+    ctx.moveTo(corners[0].x, corners[0].y);
+    for (let i = 1; i < 4; i++) ctx.lineTo(corners[i].x, corners[i].y);
+    ctx.closePath();
+    ctx.strokeStyle = "rgba(200, 232, 90, 0.22)";
     ctx.stroke();
+    // Cross at center
+    ctx.beginPath();
+    ctx.moveTo(corners[0].x, corners[0].y); ctx.lineTo(corners[2].x, corners[2].y);
+    ctx.moveTo(corners[1].x, corners[1].y); ctx.lineTo(corners[3].x, corners[3].y);
+    ctx.strokeStyle = "rgba(200, 232, 90, 0.06)";
+    ctx.stroke();
+  }
+
+  if (surfVisibleNow && rigSurface) {
+    if (rigSurface.type === "sphere") {
+      drawLatRing(-60, "rgba(200, 232, 90, 0.07)");
+      drawLatRing(-30, "rgba(200, 232, 90, 0.07)");
+      drawLatRing(  0, "rgba(200, 232, 90, 0.22)");
+      drawLatRing( 30, "rgba(200, 232, 90, 0.07)");
+      drawLatRing( 60, "rgba(200, 232, 90, 0.07)");
+      drawMeridians("rgba(200, 232, 90, 0.12)", "rgba(200, 232, 90, 0.05)");
+    } else if (rigSurface.type === "cylinder") {
+      // Normalize cylinder dims so the rendered radius matches the
+      // frustum-corner unit sphere. length is scaled the same way.
+      const r = 1;
+      const L = (rigSurface.length || 5) / (rigSurface.radius || 5);
+      drawCylinder(L, r);
+    } else if (rigSurface.type === "plane") {
+      drawPlane(1, 1.5, 1.0);
+    } else {
+      // Free / unknown — faint orientation reference only.
+      drawLatRing(0, "rgba(200, 232, 90, 0.05)");
+    }
+  } else {
+    // Surface viz off — keep just the equator as a faint orientation
+    // ref so frustums still have a horizon to relate to.
+    drawLatRing(0, "rgba(200, 232, 90, 0.05)");
   }
 
   // RGB axes — X red, Y green, Z violet — labeled on the +ends.
@@ -26142,6 +26510,33 @@ function _drawGizmoFrame() {
     ctx.beginPath();
     ctx.arc(e.x, e.y, 3.5, 0, 2 * Math.PI);
     ctx.fill();
+  }
+
+  // Phase 6.6.15 — sweet-spot marker. Tiny accent circle at the
+  // sweet-spot's normalized 3D position so the user can see where
+  // the audience-view origin sits relative to displays + screen.
+  // Only drawn when the surface is visible AND the sweet-spot is
+  // explicitly off-origin (otherwise it's just a dot at canvas
+  // center, redundant with the axes).
+  if (surfVisibleNow && state && state.rig && Array.isArray(state.rig.sweetSpot)) {
+    const ss = state.rig.sweetSpot;
+    const refRadius = (rigSurface && (rigSurface.radius || rigSurface.offset)) || 5;
+    const sx = ss[0] / refRadius;
+    const sy = ss[1] / refRadius;
+    const sz = ss[2] / refRadius;
+    if (Math.hypot(sx, sy, sz) > 0.001) {
+      const sp = project([sx, sy, sz]);
+      ctx.beginPath();
+      ctx.arc(sp.x, sp.y, 3.5, 0, 2 * Math.PI);
+      ctx.fillStyle = "rgba(220, 240, 130, 0.95)";
+      ctx.fill();
+      ctx.strokeStyle = "rgba(8, 11, 16, 0.9)";
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+      ctx.fillStyle = "rgba(220, 240, 130, 0.85)";
+      ctx.font = "8px JetBrains Mono, monospace";
+      ctx.fillText("◉", sp.x + 5, sp.y - 3);
+    }
   }
 
   // Camera-orientation badge — corner pip showing roughly where
