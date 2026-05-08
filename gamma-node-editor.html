@@ -1835,11 +1835,33 @@
     margin-top: 16px;
   }
   .rig-display-list-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
     font-size: 10.5px;
     color: var(--text-3);
     margin-bottom: 6px;
     text-transform: uppercase;
     letter-spacing: 0.06em;
+  }
+  .rig-auto-blend-btn {
+    padding: 4px 10px;
+    height: 22px;
+    background: var(--surface-2);
+    border: 1px solid rgba(127, 119, 221, 0.45);
+    border-radius: 999px;
+    color: rgba(170, 162, 240, 0.95);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    cursor: pointer;
+    transition: background .12s, color .12s, border-color .12s;
+  }
+  .rig-auto-blend-btn:hover {
+    background: rgba(127, 119, 221, 0.10);
+    color: rgba(200, 195, 250, 1);
   }
   .rig-display-row {
     display: grid;
@@ -1930,6 +1952,10 @@
   .rig-warp-btn.rig-warp-test {
     border-color: rgba(226, 75, 74, 0.55);
     color: rgba(240, 130, 130, 0.95);
+  }
+  .rig-warp-btn.rig-warp-auto {
+    border-color: rgba(127, 119, 221, 0.55);
+    color: rgba(170, 162, 240, 0.95);
   }
 
   /* Phase 6.6.10 — edge-blend sub-cluster on each rig display row.
@@ -13179,6 +13205,182 @@ function _makeTestWarpMesh(cols, rows) {
   return m;
 }
 
+/* ------------ Phase 6.6.11 — auto-blend overlap detection -------------- */
+
+/* For display index i, compute how many degrees of pose-space it
+ * overlaps with each of its neighbors on the four sides. Returns
+ * { left, right, top, bottom } in degrees of yaw / pitch.
+ *
+ * Algorithm: each display has a footprint rectangle in (yaw, pitch)
+ * space:
+ *     yaw  ∈ [pose.yaw  - fov.h/2, pose.yaw  + fov.h/2]
+ *     pitch ∈ [pose.pitch - fov.v/2, pose.pitch + fov.v/2]
+ *
+ * For each OTHER display j whose pitch range overlaps this display's
+ * pitch range:
+ *   - if j sits to the left (j.yaw_max > my.yaw_min, j.yaw < my.yaw)
+ *     → left overlap = j.yaw_max - my.yaw_min, take max
+ *   - if j sits to the right → mirror
+ *
+ * Vertical overlaps (top / bottom) gated on yaw-range overlap.
+ *
+ * Yaw wrap-around (a 360° rig where the last display loops back to
+ * the first) is handled by trying both raw and ±360° offsets and
+ * picking the one with smallest absolute pose difference.
+ *
+ * Returns 0 on a side that has no neighbor overlapping it — used to
+ * decide which sides get an intensity ramp. */
+function _computeOverlapBands(i, displays) {
+  if (!displays || !displays[i]) return { left: 0, right: 0, top: 0, bottom: 0 };
+  const me = displays[i];
+  const myPose = me.pose || { yaw: 0, pitch: 0 };
+  const myFov  = me.fov  || { h: 90, v: 60 };
+  const myYawMin   = myPose.yaw   - myFov.h * 0.5;
+  const myYawMax   = myPose.yaw   + myFov.h * 0.5;
+  const myPitchMin = myPose.pitch - myFov.v * 0.5;
+  const myPitchMax = myPose.pitch + myFov.v * 0.5;
+
+  let left = 0, right = 0, top = 0, bottom = 0;
+
+  for (let j = 0; j < displays.length; j++) {
+    if (j === i) continue;
+    const o = displays[j];
+    if (!o) continue;
+    const oPose = o.pose || { yaw: 0, pitch: 0 };
+    const oFov  = o.fov  || { h: 90, v: 60 };
+
+    // Try yaw offsets of {-360, 0, +360} so 360° wraparound rigs detect
+    // the wrap-around neighbor. Pick the offset with the smallest yaw
+    // distance — that's the actual "nearest" instance of the neighbor.
+    let bestOPose = oPose;
+    let bestDist  = Math.abs(oPose.yaw - myPose.yaw);
+    for (const off of [-360, 360]) {
+      const d = Math.abs(oPose.yaw + off - myPose.yaw);
+      if (d < bestDist) { bestDist = d; bestOPose = { yaw: oPose.yaw + off, pitch: oPose.pitch }; }
+    }
+    const oYawMin   = bestOPose.yaw   - oFov.h * 0.5;
+    const oYawMax   = bestOPose.yaw   + oFov.h * 0.5;
+    const oPitchMin = bestOPose.pitch - oFov.v * 0.5;
+    const oPitchMax = bestOPose.pitch + oFov.v * 0.5;
+
+    // Pitch overlap is required to count as a horizontal neighbor.
+    const pitchOverlap = !(oPitchMax <= myPitchMin || oPitchMin >= myPitchMax);
+    const yawOverlap   = !(oYawMax   <= myYawMin   || oYawMin   >= myYawMax);
+
+    if (pitchOverlap) {
+      // j to the left of me, and j extends INTO my left edge?
+      if (bestOPose.yaw < myPose.yaw && oYawMax > myYawMin) {
+        const overlap = oYawMax - myYawMin;
+        if (overlap > left) left = overlap;
+      }
+      // j to the right of me?
+      if (bestOPose.yaw > myPose.yaw && oYawMin < myYawMax) {
+        const overlap = myYawMax - oYawMin;
+        if (overlap > right) right = overlap;
+      }
+    }
+    if (yawOverlap) {
+      // j above me?
+      if (bestOPose.pitch > myPose.pitch && oPitchMin < myPitchMax) {
+        const overlap = myPitchMax - oPitchMin;
+        if (overlap > top) top = overlap;
+      }
+      // j below me?
+      if (bestOPose.pitch < myPose.pitch && oPitchMax > myPitchMin) {
+        const overlap = oPitchMax - myPitchMin;
+        if (overlap > bottom) bottom = overlap;
+      }
+    }
+  }
+  return { left, right, top, bottom };
+}
+
+/* Build an identity warp mesh whose intensity values ramp at the
+ * overlapping edges. Non-overlapping vertices stay at intensity 1
+ * (full brightness, no blend); overlap regions ramp linearly from 0
+ * at the outer edge to 1 at the inner overlap boundary.
+ *
+ * The cooperating display's mirror ramp (computed by the same
+ * algorithm) crosses the same overlap zone in the opposite direction,
+ * so the sum of the two intensities at any point in the overlap is
+ * 1 (linearly). Combined with the WGSL power curve (default 2) the
+ * intensities sum to ≈1 in the overlap when both projectors fire,
+ * which is what edge-blend depends on.
+ *
+ * Geometry stays identity (no warp) — auto-blend only generates
+ * intensity ramps; geometric warp comes from MPCDI / hand-edited
+ * meshes (6.6.2 / 6.6.9). _isAutoBlend tags the mesh so the rig
+ * pane's pill cycle can recognize it. */
+function _makeAutoBlendMesh(cols, rows, display, displays, displayIdx) {
+  const m = _makeIdentityWarpMesh(cols, rows);
+  const fov = display.fov || { h: 90, v: 60 };
+  const bands = _computeOverlapBands(displayIdx, displays);
+
+  // Convert overlap band degrees → fractional U / V (normalized 0..1).
+  const leftU   = bands.left   > 0 ? Math.min(0.5, bands.left   / fov.h) : 0;
+  const rightU  = bands.right  > 0 ? Math.min(0.5, bands.right  / fov.h) : 0;
+  const topV    = bands.top    > 0 ? Math.min(0.5, bands.top    / fov.v) : 0;
+  const bottomV = bands.bottom > 0 ? Math.min(0.5, bands.bottom / fov.v) : 0;
+
+  const W = cols + 1, H = rows + 1;
+  for (let r = 0; r < H; r++) {
+    for (let c = 0; c < W; c++) {
+      const u = c / cols;
+      const v = r / rows;
+      let intensity = 1;
+      // Each ramp is linear from 0 at the outer edge to 1 at the inner
+      // overlap boundary; outside the overlap region intensity stays at 1.
+      // The min across all four sides handles corner overlaps gracefully
+      // (a corner that overlaps both its left and top neighbor takes the
+      // smaller intensity, which is correct for the symmetric blend).
+      if (leftU   > 0 && u < leftU)        intensity = Math.min(intensity, u / leftU);
+      if (rightU  > 0 && u > 1 - rightU)   intensity = Math.min(intensity, (1 - u) / rightU);
+      if (topV    > 0 && v > 1 - topV)     intensity = Math.min(intensity, (1 - v) / topV);
+      if (bottomV > 0 && v < bottomV)      intensity = Math.min(intensity, v / bottomV);
+      m.verts[(r * W + c) * 5 + 4] = intensity;
+    }
+  }
+  m._isAutoBlend = true;
+  m._overlapBands = bands;     // surfaced in tooltips / diagnostics
+  return m;
+}
+
+/* Apply auto-blend to every display in the rig that has at least
+ * one overlapping neighbor. Displays in isolation (no overlap on
+ * any side) get cleared — there's no neighbor for them to blend
+ * with. Returns an array of { displayIdx, bands, applied } for the
+ * caller's status reporting. */
+function _applyAutoBlendToRig() {
+  if (!state.rig || !Array.isArray(state.rig.displays)) return [];
+  const out = [];
+  pushHistory("rig-auto-blend");
+  state.rig.displays.forEach((d, i) => {
+    if (!d) return;
+    const bands = _computeOverlapBands(i, state.rig.displays);
+    const overlapping = bands.left + bands.right + bands.top + bands.bottom;
+    if (overlapping > 0.001) {
+      d.warpMesh = _makeAutoBlendMesh(8, 8, d, state.rig.displays, i);
+      // Drop cached GPU buffers so the next frame rebuilds with the
+      // new mesh — same idiom as the manual warp toggle.
+      if (Visual && Visual._warpCache) Visual._warpCache.delete(d.id);
+      out.push({ displayIdx: i, bands, applied: true });
+    } else {
+      // No overlap → no blend ramp needed. Leave any existing mesh
+      // alone (user might have a hand-edited geometric warp on this
+      // display); only clear if it was previously auto-blend.
+      if (d.warpMesh && d.warpMesh._isAutoBlend) {
+        d.warpMesh = null;
+        if (Visual && Visual._warpCache) Visual._warpCache.delete(d.id);
+      }
+      out.push({ displayIdx: i, bands, applied: false });
+    }
+  });
+  if (state.rig && Object.keys(RIG_TEMPLATES).includes(state.rig.templateKey)) {
+    state.rig.templateKey = "custom";
+  }
+  return out;
+}
+
 /* Quick validation for warpMesh objects loaded from .gpatch. Returns
  * true if the mesh has the expected shape and a vert array of the
  * correct length. Used in migrateDisplayShape to drop garbage meshes
@@ -14894,8 +15096,15 @@ function renderRigPane() {
     //   test (sinusoidal bow distortion, used to verify the warp pass
     //   ships pixels). Real per-vertex editing comes in 6.6.9.
     const warpState = !d.warpMesh ? "off"
-                     : (d.warpMesh._isTest ? "test" : "identity");
-    const warpLabel = ({ off: "warp: off", identity: "warp: identity", test: "warp: test" })[warpState];
+                     : (d.warpMesh._isTest      ? "test"
+                     : (d.warpMesh._isAutoBlend ? "auto"
+                     : "identity"));
+    const warpLabel = ({
+      off:      "warp: off",
+      identity: "warp: identity",
+      test:     "warp: test",
+      auto:     "warp: auto-blend"
+    })[warpState];
     // Phase 6.6.10 — per-display edge-blend inputs. γ / lift / pow
     // sit on a sub-row below the pose/fov line, kept visually
     // distinct from the geometric controls so the calibration
@@ -14962,7 +15171,11 @@ function renderRigPane() {
         <input type="number" id="rig-shader-pitch" class="rig-grid-input" value="${(+(rig.shaderCenterPitch || 0)).toFixed(0)}" step="1" />
       </div>
       <div class="rig-display-list">
-        <div class="rig-display-list-head">Displays (yaw / pitch / fov in degrees)</div>
+        <div class="rig-display-list-head">
+          <span>Displays (yaw / pitch / fov in degrees)</span>
+          <button class="rig-auto-blend-btn" id="btn-rig-auto-blend"
+                  title="Detect overlapping pose footprints across all displays and auto-generate intensity ramps so adjacent projectors blend seamlessly. Displays in isolation are left as-is.">Auto-blend rig</button>
+        </div>
         ${displayRows}
       </div>
       <p class="modal-note" style="margin-top: 14px;">
@@ -15032,8 +15245,17 @@ function wireRigPaneHandlers() {
       const display = state.rig && state.rig.displays && state.rig.displays[i];
       if (!display) return;
       pushHistory("rig-warp-toggle:" + i);
-      const cur = !display.warpMesh ? "off" : (display.warpMesh._isTest ? "test" : "identity");
-      const next = cur === "off" ? "identity" : (cur === "identity" ? "test" : "off");
+      const cur = !display.warpMesh ? "off"
+                : (display.warpMesh._isTest      ? "test"
+                : (display.warpMesh._isAutoBlend ? "auto"
+                : "identity"));
+      // Cycle: off → identity → test → off. Auto-blend lives outside
+      // this cycle (it's set by the global button); clicking the pill
+      // on an auto-blend display drops back to off so the user can
+      // override the auto-generated mesh manually.
+      const next = cur === "off"      ? "identity"
+                 : cur === "identity" ? "test"
+                 : "off";
       if (next === "off")           display.warpMesh = null;
       else if (next === "identity") display.warpMesh = _makeIdentityWarpMesh(8, 8);
       else                          display.warpMesh = _makeTestWarpMesh(8, 8);
@@ -15090,6 +15312,28 @@ function wireRigPaneHandlers() {
       render();
     });
   });
+
+  // Phase 6.6.11 — global "Auto-blend rig" button. Runs overlap
+  // detection across all displays + sets warpMesh to per-display
+  // auto-generated intensity ramps. Re-renders so the warp pills
+  // flip to "warp: auto-blend" on every affected display.
+  const autoBtn = document.getElementById("btn-rig-auto-blend");
+  if (autoBtn) {
+    autoBtn.addEventListener("click", () => {
+      const results = _applyAutoBlendToRig();
+      const applied = results.filter(r => r.applied).length;
+      const skipped = results.length - applied;
+      autoBtn.textContent = applied + " blended";
+      autoBtn.disabled = true;
+      setTimeout(() => {
+        autoBtn.textContent = "Auto-blend rig";
+        autoBtn.disabled = false;
+      }, 900);
+      console.log("[auto-blend] applied to", applied, "displays;", skipped, "left as-is (no overlap)");
+      renderProps && renderProps();
+      render();
+    });
+  }
 
   // Phase 6.6.10 — edge-blend reset button. Drops the display's
   // edgeBlend back to defaults (gamma 2.2, blackLift 0, power 2.0)
