@@ -13098,25 +13098,51 @@ function _makeIdentityWarpMesh(cols, rows) {
   return { cols, rows, verts };
 }
 
-/* Build a test-warp mesh: identity grid with sinusoidal bow on x.
- * Used by the rig pane's per-display "warp: test" toggle to verify
- * the warp pipeline ships pixels visibly without committing to a
- * full editor UX. The bow is symmetric so the four corners stay
- * pinned at the canvas edges; the middle of each row pushes inward
- * by ~12% — enough to read clearly, not so much that the content
- * leaves the tile. The _isTest flag lets the rig pane recognize a
- * test mesh so the toggle's three-state cycle works correctly. */
+/* Build a test-warp mesh: identity grid with sinusoidal bow on x +
+ * a horizontal intensity ramp on the left/right edges. Used by the
+ * rig pane's per-display "warp: test" toggle to verify the full
+ * Phase 6.6 pipeline (warp geometry + edge-blend intensity + gamma
+ * + power + black-lift) end-to-end without committing to a full
+ * editor UX.
+ *
+ * Effects baked in:
+ *   - Geometric bow: middle of each row pinches inward by 12%, top
+ *     + bottom rows untouched. Demonstrates the warp vertex pipeline.
+ *   - Edge intensity ramp: leftmost + rightmost ~20% of the mesh
+ *     fade from intensity 0.25 at the edge to 1.0 at the inner
+ *     bound. Demonstrates the intensity multiply, gamma correction,
+ *     power curve, and black-lift math from 6.6.5–6.6.8. With
+ *     blackLift > 0 you'll see the edges raise to a non-black floor
+ *     instead of fading to black. */
 function _makeTestWarpMesh(cols, rows) {
   const m = _makeIdentityWarpMesh(cols, rows);
   const W = cols + 1, H = rows + 1;
+  // Width of the intensity ramp: 20% of the mesh on each side.
+  const rampWidth = 0.2;
   for (let r = 0; r < H; r++) {
     for (let c = 0; c < W; c++) {
       const i = (r * W + c) * 5;
+      const u = c / cols;
       const v = r / rows;
-      // Pinch the middle of each row toward the center: scale x by
-      // (1 - 0.12 * sin(πv)). Top + bottom rows untouched (sin=0).
+      // Geometric: pinch x toward center on the equator row.
       const k = 1.0 - 0.12 * Math.sin(Math.PI * v);
       m.verts[i + 0] *= k;
+      // Intensity ramp: left edge rises from 0.25 → 1.0 across the
+      // first 20% of u; right edge mirrors. Smooth (Hermite) easing
+      // so the ramp reads as a soft fade, not a hard step.
+      let leftRamp  = 1.0;
+      let rightRamp = 1.0;
+      if (u < rampWidth) {
+        const t = u / rampWidth;
+        const smooth = t * t * (3 - 2 * t);
+        leftRamp = 0.25 + smooth * 0.75;
+      }
+      if (u > 1 - rampWidth) {
+        const t = (1 - u) / rampWidth;
+        const smooth = t * t * (3 - 2 * t);
+        rightRamp = 0.25 + smooth * 0.75;
+      }
+      m.verts[i + 4] = Math.min(leftRamp, rightRamp);
     }
   }
   m._isTest = true;
@@ -20470,10 +20496,54 @@ struct WarpU {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4f {
-  // Phase 6.6.4 — minimal fragment, just intensity multiply. Gamma /
-  // blackLift / power stay zero-effect here; 6.6.5–6.6.8 wire them.
-  let c = textureSampleLevel(fbTex, fbSampler, in.uv, u.layer, 0.0);
-  return vec4f(c.rgb * in.intensity, c.a);
+  // Phase 6.6.5–6.6.8 — full edge-blend math.
+  //
+  //   smoothI    : symmetric power-curve ramp [0,1].  At p=2 this is
+  //                a quadratic ease-in/out; at p=1 it's linear; higher
+  //                p gives a sharper crossover. Standard formula from
+  //                Resolume / domeprojection.com / Bourke notes:
+  //                  i ≤ 0.5 → 0.5 · (2i)^p
+  //                  i > 0.5 → 1 − 0.5 · (2(1−i))^p
+  //                Continuous, equals i at p=1, equals 0 at i=0 and 1
+  //                at i=1 for any p > 0. Sum across two complementary
+  //                ramps stays ≈ 1 in the overlap zone.
+  //
+  //   gamma      : converts to linear before the intensity multiply,
+  //                back to sRGB after.  At gamma=1.0 this is a no-op,
+  //                which means the blend happens in display space —
+  //                fine for purely synthetic content but slightly
+  //                wrong for photographic source. Default 2.2 matches
+  //                the standard sRGB → linear curve.
+  //
+  //   blackLift  : raises the black floor in non-overlap regions to
+  //                match the elevated black of overlap zones (where
+  //                two projectors' minimum-output black sums up). Lift
+  //                amount = blackLift · (1 − smoothI), so it's zero
+  //                at overlap centers (smoothI = 0.5 ish) and full at
+  //                full-intensity non-overlap (smoothI = 1).  Default
+  //                0 = no lift.
+  //
+  // Defaults (gamma=2.2, blackLift=0, power=2.0, intensity=1) yield
+  // bit-exact output equal to the source — the blend math is a no-op
+  // for a calibration that hasn't been hand-tuned.
+  let c = textureSampleLevel(fbTex, fbSampler, in.uv, u.layer, 0.0).rgb;
+  let i = clamp(in.intensity, 0.0, 1.0);
+  let p = max(u.power, 0.0001);
+  let g = max(u.gamma, 0.0001);
+  let inv_g = 1.0 / g;
+
+  let smoothI = select(
+    1.0 - 0.5 * pow(2.0 * (1.0 - i), p),
+    0.5 * pow(2.0 * i, p),
+    i <= 0.5
+  );
+
+  let cLin    = pow(c, vec3<f32>(g));
+  let cBlend  = cLin * smoothI;
+  let cLifted = cBlend + vec3<f32>(u.blackLift) * (1.0 - smoothI);
+  let cOut    = pow(max(cLifted, vec3<f32>(0.0)), vec3<f32>(inv_g));
+
+  return vec4f(cOut, 1.0);
 }
 `;
   const module = Visual.device.createShaderModule({ label: "warp-shader", code: wgsl });
