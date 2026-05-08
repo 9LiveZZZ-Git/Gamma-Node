@@ -1768,6 +1768,19 @@
     pointer-events: none;
   }
   body.live-mode #visual-overlay { z-index: 1; }
+
+  /* Phase 6.6.13 — theater preview mode. The visual canvas needs to
+   * accept click events so the user can engage pointer lock. In
+   * normal mode the editor chrome covers most of the canvas so the
+   * user clicks the visible corners; in Live Mode the entire canvas
+   * is exposed. ESC releases lock at any time. */
+  body.theater-mode #visual-bg {
+    pointer-events: auto;
+    cursor: crosshair;
+  }
+  body.theater-mode.theater-locked #visual-bg {
+    cursor: none;       /* native pointer-lock hides the cursor anyway */
+  }
   /* Everything in #app sits on top of the visual layer. */
   #app { position: relative; z-index: 1; }
 
@@ -13690,6 +13703,7 @@ function applyRigTemplate(key) {
     _rebuildBlitBindGroup();
     _rebuildRigCompositeBindGroup();
     _rebuildWarpBindGroup();
+    _rebuildTheaterBindGroup();
   }
   render();
   renderProps && renderProps();
@@ -15208,6 +15222,7 @@ function renderRigPane() {
           <option value="cylinder"${rig.previewMode === "cylinder" ? " selected" : ""}>Cylindrical unwrap</option>
           <option value="equirect"${rig.previewMode === "equirect" ? " selected" : ""}>Equirectangular</option>
           <option value="fisheye"${rig.previewMode === "fisheye" ? " selected" : ""}>Stereographic / fisheye</option>
+          <option value="theater"${rig.previewMode === "theater" ? " selected" : ""}>Theater (3D explorable)</option>
         </select>
         <label for="rig-shader-yaw" title="Where the shader's content center lands in world yaw degrees. 0 = no shift.">Center yaw</label>
         <input type="number" id="rig-shader-yaw" class="rig-grid-input" value="${(+(rig.shaderCenterYaw || 0)).toFixed(0)}" step="1" />
@@ -18036,6 +18051,10 @@ document.getElementById("file-input").addEventListener("change", ev => {
       undoStack.length = 0;
       redoStack.length = 0;
       resetView();
+      // Phase 6.6.13 — sync the projection pill + body classes after
+      // load so theater-mode pointer-events flip correctly when the
+      // patch comes in already in theater preview.
+      if (typeof _updateProjectionPill === "function") _updateProjectionPill();
       render();
     } catch (err) {
       alert("Could not load file: " + err.message);
@@ -20307,6 +20326,33 @@ const Visual = {
   warpUniformStride:      256,    // min uniform-buffer-binding alignment
   _warpCache:             new Map(),  // displayId → { vBuffer, iBuffer, indexCount, vCapacity, iCapacity, sig }
 
+  // Phase 6.6.13 — theater mode. 3D explorable view where each
+  // display is a quad in space and the user moves around with WASD
+  // + mouse-look. Used for VR-style rig auditing — see what the
+  // installation will physically look like before deploying.
+  theaterPipeline:        null,
+  theaterBindGroupLayout: null,
+  theaterBindGroup:       null,
+  theaterUniformBuffer:   null,   // 64 B viewProj matrix (mat4x4)
+  theaterVertexBuffer:    null,   // RIG_MAX_DISPLAYS × 4 verts × (vec3 pos + vec2 uv + u32 layer)
+  theaterIndexBuffer:     null,   // RIG_MAX_DISPLAYS × 6 indices (2 triangles per quad)
+  theaterDepthTexture:    null,   // depth buffer sized to canvas; reallocated on resize
+  theaterDepthView:       null,
+  theaterDepthW:          0,
+  theaterDepthH:          0,
+  theaterSampler:         null,   // anisotropic-filtered sampler for distance smoothing
+  theaterCam: {
+    pos:   [0, 0, 0],     // eye position in rig space (origin = rig center)
+    yaw:   0,             // radians; 0 looks toward -Z
+    pitch: 0,             // radians; clamped ±85°
+    fov:   60,            // degrees, vertical
+    speed: 2.0,           // units / second; Shift = 4× sprint
+    sensitivity: 0.0025,  // radians per pixel of mouse movement
+    pointerLocked: false,
+    keys: new Set()       // currently-held keys (lowercased)
+  },
+  theaterInputWired: false, // set once the document-level listeners are attached
+
   // Phase 6.1.5 — HUD state. `frozen` pauses the future rAF render
   // loop without touching audio. `fps` is updated each frame by
   // _tickFpsReadout (called from the rAF loop in 6.1.7+); for now
@@ -20424,10 +20470,13 @@ async function ensureGPUDevice() {
       _createBlitPipeline();
       _createRigCompositePipeline();
       _createWarpPipeline();
+      _createTheaterPipeline();
       _allocateFramebuffer();
       _rebuildBlitBindGroup();
       _rebuildRigCompositeBindGroup();
       _rebuildWarpBindGroup();
+      _rebuildTheaterBindGroup();
+      _wireTheaterInput();
       Visual.startTime  = performance.now();
       Visual.lastFrameT = 0;
       smokeClearVisual();
@@ -21156,6 +21205,485 @@ function _encodeWarpPasses(enc) {
   return drawn;
 }
 
+/* ----- Phase 6.6.13 — theater (3D explorable) preview pipeline -------- */
+
+/* The theater pipeline renders each display as a quad in 3D space.
+ * The user is at the rig center and looks outward with a perspective
+ * camera; WASD + mouse-look drive position and orientation. Quads
+ * face inward toward the rig center so the displays read like a
+ * planetarium of monitors hanging in space.
+ *
+ * Geometry: per display, 4 verts at the corners of the quad in world
+ * coords (computed in JS each frame from pose + fov + sphere radius).
+ * Each vert carries: vec3 position, vec2 uv, u32 layer. One indexed
+ * draw covers all displays.
+ *
+ * Background stays solid black — no skybox geometry, no environment
+ * math. "Compute friendly" the user asked for: ~52 triangles per
+ * frame for a 26-display AlloSphere, GPU does the rest.
+ *
+ * Distance smoothing comes from anisotropic sampling on the texture
+ * array (the only smooth-falloff option available without generating
+ * mipmaps; mipgen would touch the per-frame FBO write path which the
+ * user explicitly didn't want). At grazing angles + far quads the
+ * GPU's anisotropic filter takes more samples per pixel and stays
+ * sharp where mip-bias would alias.
+ *
+ * IMPORTANT FOLLOW-UP TICKET (carry into 6.6.9 work):
+ * Once shader-frag nodes can render their own 3D environment within
+ * a display's source layer, this theater camera's WASD + mouse-look
+ * will fight with the shader's controls. The fix is a per-display
+ * "controls owner" flag — if any active shader has its own camera,
+ * theater drops its WASD/mouse capture. Same applies to the planned
+ * shader-frag Text overlay (6.6.12 follow-on): when the text node
+ * lives in the GPU graph, the theater pipeline will sample its layer
+ * naturally. */
+function _createTheaterPipeline() {
+  if (!Visual.device || !Visual.presentationFormat) return;
+  const wgsl = /* wgsl */ `
+struct U {
+  viewProj: mat4x4<f32>,
+};
+
+struct VsIn {
+  @location(0) pos:   vec3<f32>,
+  @location(1) uv:    vec2<f32>,
+  @location(2) layer: u32,
+};
+
+struct VsOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) uv: vec2<f32>,
+  @location(1) @interpolate(flat) layer: u32,
+};
+
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbTex:    texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+@vertex
+fn vs_main(in: VsIn) -> VsOut {
+  var o: VsOut;
+  o.pos   = u.viewProj * vec4<f32>(in.pos, 1.0);
+  o.uv    = in.uv;
+  o.layer = in.layer;
+  return o;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+  // textureSampleLevel keeps fragment derivatives uniform — the
+  // layer index is provoking-vertex flat-interpolated so it's
+  // already constant per primitive, but using SampleLevel sidesteps
+  // any compiler quirks with arrays + non-uniform sampling.
+  let c = textureSampleLevel(fbTex, fbSampler, in.uv, in.layer, 0.0);
+  return vec4<f32>(c.rgb, 1.0);
+}
+`;
+  const module = Visual.device.createShaderModule({ label: "theater-shader", code: wgsl });
+
+  Visual.theaterBindGroupLayout = Visual.device.createBindGroupLayout({
+    label: "theater-bgl",
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
+      { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d-array" } },
+      { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } }
+    ]
+  });
+
+  Visual.theaterPipeline = Visual.device.createRenderPipeline({
+    label: "theater-pipeline",
+    layout: Visual.device.createPipelineLayout({
+      bindGroupLayouts: [Visual.theaterBindGroupLayout]
+    }),
+    vertex: {
+      module, entryPoint: "vs_main",
+      buffers: [{
+        arrayStride: 24,                            // vec3 (12) + vec2 (8) + u32 (4) = 24
+        attributes: [
+          { shaderLocation: 0, offset: 0,  format: "float32x3" }, // pos
+          { shaderLocation: 1, offset: 12, format: "float32x2" }, // uv
+          { shaderLocation: 2, offset: 20, format: "uint32"    }  // layer
+        ]
+      }]
+    },
+    fragment: {
+      module, entryPoint: "fs_main",
+      targets: [{ format: Visual.presentationFormat }]
+    },
+    primitive: {
+      topology: "triangle-list",
+      cullMode: "none"   // displays are inward-facing — no culling so we see all
+    },
+    depthStencil: {
+      format: "depth24plus",
+      depthWriteEnabled: true,
+      depthCompare: "less"
+    }
+  });
+
+  // Uniform buffer: 16 floats (mat4x4) = 64 bytes.
+  Visual.theaterUniformBuffer = Visual.device.createBuffer({
+    label: "theater-uniform",
+    size: 64,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+  });
+
+  // Vertex / index buffers — sized for max displays. Reupload each
+  // frame in tile mode (cheap; 32 displays × 4 verts × 24 B = 3 KB).
+  Visual.theaterVertexBuffer = Visual.device.createBuffer({
+    label: "theater-verts",
+    size: RIG_MAX_DISPLAYS * 4 * 24,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST
+  });
+  Visual.theaterIndexBuffer = Visual.device.createBuffer({
+    label: "theater-indices",
+    size: RIG_MAX_DISPLAYS * 6 * 2,                 // u16 indices
+    usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST
+  });
+  // Build the index buffer once — vertex order is consistent across
+  // displays (each display is its own quad with verts at [4i..4i+3]).
+  const idx = new Uint16Array(RIG_MAX_DISPLAYS * 6);
+  for (let i = 0; i < RIG_MAX_DISPLAYS; i++) {
+    const base = i * 4;
+    idx[i*6 + 0] = base + 0;
+    idx[i*6 + 1] = base + 1;
+    idx[i*6 + 2] = base + 2;
+    idx[i*6 + 3] = base + 0;
+    idx[i*6 + 4] = base + 2;
+    idx[i*6 + 5] = base + 3;
+  }
+  Visual.device.queue.writeBuffer(Visual.theaterIndexBuffer, 0, idx.buffer, idx.byteOffset, idx.byteLength);
+
+  // Anisotropic-filtered sampler for distance smoothing. maxAnisotropy
+  // is clamped to 16 by the WebGPU spec; 16 is plenty for the typical
+  // theater use case (looking around inside a sphere of monitors).
+  Visual.theaterSampler = Visual.device.createSampler({
+    label: "theater-sampler",
+    magFilter: "linear",
+    minFilter: "linear",
+    mipmapFilter: "linear",
+    addressModeU: "clamp-to-edge",
+    addressModeV: "clamp-to-edge",
+    maxAnisotropy: 16
+  });
+}
+
+/* Rebuild the theater bind group when the framebuffer texture array
+ * changes (display count or resolution). Same idiom as the rig
+ * composite bind group rebuild path. */
+function _rebuildTheaterBindGroup() {
+  if (!Visual.device || !Visual.framebufferArrayView ||
+      !Visual.theaterBindGroupLayout || !Visual.theaterSampler ||
+      !Visual.theaterUniformBuffer) return;
+  Visual.theaterBindGroup = Visual.device.createBindGroup({
+    label: "theater-bg",
+    layout: Visual.theaterBindGroupLayout,
+    entries: [
+      { binding: 0, resource: { buffer: Visual.theaterUniformBuffer } },
+      { binding: 1, resource: Visual.framebufferArrayView },
+      { binding: 2, resource: Visual.theaterSampler }
+    ]
+  });
+}
+
+/* Allocate (or reallocate) the theater depth texture sized to the
+ * current canvas. Called lazily on first theater render and again
+ * whenever the canvas size changes. */
+function _ensureTheaterDepthTexture() {
+  if (!Visual.device || !Visual.canvas) return false;
+  const w = Visual.canvas.width, h = Visual.canvas.height;
+  if (w <= 0 || h <= 0) return false;
+  if (Visual.theaterDepthTexture && Visual.theaterDepthW === w && Visual.theaterDepthH === h) return true;
+  if (Visual.theaterDepthTexture) {
+    try { Visual.theaterDepthTexture.destroy(); } catch (_) {}
+  }
+  Visual.theaterDepthTexture = Visual.device.createTexture({
+    label: "theater-depth",
+    size: [w, h, 1],
+    format: "depth24plus",
+    usage: GPUTextureUsage.RENDER_ATTACHMENT
+  });
+  Visual.theaterDepthView = Visual.theaterDepthTexture.createView();
+  Visual.theaterDepthW = w;
+  Visual.theaterDepthH = h;
+  return true;
+}
+
+/* Build the per-display vertex data. Each display's quad is placed
+ * on a unit sphere at its pose direction, sized by its FOV. Sphere
+ * radius is fixed at 5 units — gives the user enough room to walk
+ * around inside without quads being awkwardly close. */
+function _buildTheaterQuadVerts(displays) {
+  const R = 5.0;                    // sphere radius (world units)
+  const stride = 6;                 // vec3 + vec2 + u32 (= 6 floats / 24 B)
+  const layerCount = Math.min(displays.length, RIG_MAX_DISPLAYS);
+  const buf = new ArrayBuffer(layerCount * 4 * stride * 4);
+  const f32 = new Float32Array(buf);
+  const u32 = new Uint32Array(buf);
+
+  for (let i = 0; i < layerCount; i++) {
+    const d = displays[i] || {};
+    const pose = d.pose || { yaw: 0, pitch: 0 };
+    const fov  = d.fov  || { h: 90, v: 60 };
+    // Forward direction in world space (from rig center, aimed at
+    // display center). Same convention as _yawPitchToVec elsewhere.
+    const yr = pose.yaw   * Math.PI / 180;
+    const pr = pose.pitch * Math.PI / 180;
+    const fx = Math.sin(yr) * Math.cos(pr);
+    const fy = Math.sin(pr);
+    const fz = Math.cos(yr) * Math.cos(pr);
+
+    // Right/up basis. Reference up vector flips when forward is near
+    // the world poles (avoids singular cross product at pitch ±90°).
+    let altUpX = 0, altUpY = 1, altUpZ = 0;
+    if (Math.abs(fy) > 0.95) { altUpX = 0; altUpY = 0; altUpZ = 1; }
+    // right = normalize(cross(forward, altUp))
+    let rx = fy * altUpZ - fz * altUpY;
+    let ry = fz * altUpX - fx * altUpZ;
+    let rz = fx * altUpY - fy * altUpX;
+    let rl = Math.hypot(rx, ry, rz) || 1;
+    rx /= rl; ry /= rl; rz /= rl;
+    // up = cross(right, forward)
+    const ux = ry * fz - rz * fy;
+    const uy = rz * fx - rx * fz;
+    const uz = rx * fy - ry * fx;
+
+    const halfW = R * Math.tan(fov.h * Math.PI / 360);
+    const halfH = R * Math.tan(fov.v * Math.PI / 360);
+    const cx = R * fx, cy = R * fy, cz = R * fz;
+
+    // Quad corners — UV (0,0) at top-left of display content.
+    // Top-left:  center + right*(-w) + up*(+h)
+    // Top-right: center + right*(+w) + up*(+h)
+    // Bot-right: center + right*(+w) + up*(-h)
+    // Bot-left:  center + right*(-w) + up*(-h)
+    const corners = [
+      [cx - rx*halfW + ux*halfH, cy - ry*halfW + uy*halfH, cz - rz*halfW + uz*halfH, 0, 0],
+      [cx + rx*halfW + ux*halfH, cy + ry*halfW + uy*halfH, cz + rz*halfW + uz*halfH, 1, 0],
+      [cx + rx*halfW - ux*halfH, cy + ry*halfW - uy*halfH, cz + rz*halfW - uz*halfH, 1, 1],
+      [cx - rx*halfW - ux*halfH, cy - ry*halfW - uy*halfH, cz - rz*halfW - uz*halfH, 0, 1]
+    ];
+    for (let v = 0; v < 4; v++) {
+      const off = (i * 4 + v) * stride;
+      f32[off + 0] = corners[v][0];
+      f32[off + 1] = corners[v][1];
+      f32[off + 2] = corners[v][2];
+      f32[off + 3] = corners[v][3];
+      f32[off + 4] = corners[v][4];
+      u32[off + 5] = i;             // layer index
+    }
+  }
+  return { buf, vertCount: layerCount * 4, indexCount: layerCount * 6 };
+}
+
+/* Compute the view-projection matrix from the camera state. Returns
+ * a 16-float column-major mat4 ready to writeBuffer. WebGPU clip-
+ * space Z is [0, 1], so the projection matrix uses that convention.
+ *
+ * Camera basis matches the rig's display-pose convention so yaw=0
+ * looks toward +Z (where display 0 sits at default pose). yaw +90°
+ * looks toward +X; pitch +90° looks toward +Y zenith. This way the
+ * user spawns inside the rig facing display 0 — natural starting
+ * orientation for "explore the rig". */
+function _theaterViewProjMatrix(cam, aspect) {
+  const cy = Math.cos(cam.yaw),   sy = Math.sin(cam.yaw);
+  const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+
+  // forward = ( sin(yaw)*cos(pitch),  sin(pitch),  cos(yaw)*cos(pitch))
+  // right   = ( cos(yaw),             0,          -sin(yaw))
+  // up      = forward × right (so neutral pitch gives world-up +Y)
+  const fx = sy * cp, fy = sp, fz = cy * cp;
+  const rx = cy,      ry = 0,  rz = -sy;
+  const ux = fy * rz - fz * ry;
+  const uy = fz * rx - fx * rz;
+  const uz = fx * ry - fy * rx;
+
+  const px = cam.pos[0], py = cam.pos[1], pz = cam.pos[2];
+
+  // View matrix (col-major), inverse of camera transform:
+  //   col 0: right
+  //   col 1: up
+  //   col 2: -forward  (so view-space -Z is forward)
+  //   col 3: -dot(basis, eye)
+  const view = new Float32Array(16);
+  view[0]  = rx;  view[1]  = ux;  view[2]  = -fx; view[3]  = 0;
+  view[4]  = ry;  view[5]  = uy;  view[6]  = -fy; view[7]  = 0;
+  view[8]  = rz;  view[9]  = uz;  view[10] = -fz; view[11] = 0;
+  view[12] = -(rx*px + ry*py + rz*pz);
+  view[13] = -(ux*px + uy*py + uz*pz);
+  view[14] =  (fx*px + fy*py + fz*pz);
+  view[15] = 1;
+
+  // Perspective projection (col-major), WebGPU [0,1] clip Z.
+  const fovY = cam.fov * Math.PI / 180;
+  const f    = 1 / Math.tan(fovY * 0.5);
+  const near = 0.01, far = 100.0;
+  const nf   = 1 / (near - far);
+  const proj = new Float32Array(16);
+  proj[0]  = f / aspect;
+  proj[5]  = f;
+  proj[10] = far * nf;
+  proj[11] = -1;
+  proj[14] = near * far * nf;
+
+  // viewProj = proj * view (col-major: result[col][row] = sum proj[k][row]*view[col][k])
+  const vp = new Float32Array(16);
+  for (let c = 0; c < 4; c++) {
+    for (let r = 0; r < 4; r++) {
+      let s = 0;
+      for (let k = 0; k < 4; k++) s += proj[k * 4 + r] * view[c * 4 + k];
+      vp[c * 4 + r] = s;
+    }
+  }
+  return vp;
+}
+
+/* Update camera position from currently-held keys. Called once per
+ * frame from the render tick. dt is in seconds. Movement is in
+ * camera-relative space (W = forward, A = left, S = back, D = right,
+ * Q = down, E = up, Shift = sprint). */
+function _theaterStepCamera(dt) {
+  const cam = Visual.theaterCam;
+  if (cam.keys.size === 0) return;
+  const speed = cam.speed * (cam.keys.has("shift") ? 4 : 1) * dt;
+  const cy = Math.cos(cam.yaw),   sy = Math.sin(cam.yaw);
+  const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+  // World-space forward / right vectors at current orientation. Same
+  // convention as _theaterViewProjMatrix (yaw=0 looks toward +Z).
+  const fx = sy * cp, fy = sp, fz = cy * cp;
+  const rx = cy,      ry = 0,  rz = -sy;
+  let dx = 0, dy = 0, dz = 0;
+  if (cam.keys.has("w")) { dx += fx; dy += fy; dz += fz; }
+  if (cam.keys.has("s")) { dx -= fx; dy -= fy; dz -= fz; }
+  if (cam.keys.has("d")) { dx += rx; dy += ry; dz += rz; }
+  if (cam.keys.has("a")) { dx -= rx; dy -= ry; dz -= rz; }
+  if (cam.keys.has("e")) { dy += 1; }      // world-up regardless of pitch
+  if (cam.keys.has("q")) { dy -= 1; }
+  // Normalize so diagonals don't move faster than axes.
+  const l = Math.hypot(dx, dy, dz);
+  if (l > 0.0001) {
+    cam.pos[0] += (dx / l) * speed;
+    cam.pos[1] += (dy / l) * speed;
+    cam.pos[2] += (dz / l) * speed;
+  }
+}
+
+/* One-time event wiring for theater mode. Mouse-look uses pointer
+ * lock — click on the visual canvas to engage, ESC to release.
+ * Keyboard listeners live on document so they fire regardless of
+ * focus while in theater mode. All listeners gate on previewMode
+ * being "theater" so theater controls don't fire when the rig is
+ * showing a different preview.
+ *
+ * Critical follow-up for shader-frag environments (carry into 6.6.9):
+ * when shader nodes have their own 3D camera (e.g. raymarching
+ * scenes), they'll fight with theater's WASD/mouse capture. The
+ * intended fix is a "controls owner" registry — if any active shader
+ * has registered camera ownership, theater drops its capture in that
+ * frame. Stubs are flagged with TODO comments so the future ticket
+ * has clear edit points. */
+function _wireTheaterInput() {
+  if (Visual.theaterInputWired) return;
+  Visual.theaterInputWired = true;
+
+  const canvas = Visual.canvas;
+  if (canvas) {
+    canvas.addEventListener("click", () => {
+      if (state && state.rig && state.rig.previewMode === "theater") {
+        // TODO (6.6.9): defer to active shader-frag camera owner if any.
+        try { canvas.requestPointerLock(); } catch (_) {}
+      }
+    });
+  }
+  document.addEventListener("pointerlockchange", () => {
+    Visual.theaterCam.pointerLocked = (document.pointerLockElement === canvas);
+    document.body.classList.toggle("theater-locked", Visual.theaterCam.pointerLocked);
+  });
+  document.addEventListener("mousemove", (e) => {
+    if (!Visual.theaterCam.pointerLocked) return;
+    if (!state || !state.rig || state.rig.previewMode !== "theater") return;
+    // TODO (6.6.9): defer to active shader-frag camera owner if any.
+    Visual.theaterCam.yaw   -= e.movementX * Visual.theaterCam.sensitivity;
+    Visual.theaterCam.pitch -= e.movementY * Visual.theaterCam.sensitivity;
+    const lim = Math.PI * 0.49;     // ~88° to avoid singular vertical
+    if (Visual.theaterCam.pitch >  lim) Visual.theaterCam.pitch =  lim;
+    if (Visual.theaterCam.pitch < -lim) Visual.theaterCam.pitch = -lim;
+  });
+  document.addEventListener("keydown", (e) => {
+    if (!state || !state.rig || state.rig.previewMode !== "theater") return;
+    if (!Visual.theaterCam.pointerLocked) return;
+    // TODO (6.6.9): defer to active shader-frag camera owner if any.
+    const k = e.key.toLowerCase();
+    if (["w","a","s","d","q","e","shift"].includes(k)) {
+      Visual.theaterCam.keys.add(k);
+      e.preventDefault();
+    }
+  });
+  document.addEventListener("keyup", (e) => {
+    const k = e.key.toLowerCase();
+    Visual.theaterCam.keys.delete(k);
+  });
+  // Drop all held keys when pointer lock releases — otherwise a user
+  // who holds W and presses Esc has the camera drift forever.
+  document.addEventListener("pointerlockchange", () => {
+    if (!Visual.theaterCam.pointerLocked) Visual.theaterCam.keys.clear();
+  });
+}
+
+/* Encode the theater-mode render pass. Replaces _encodeRigComposite
+ * + _encodeWarpPasses for the frame when previewMode === "theater".
+ * Returns true if the pass was successfully encoded. */
+function _encodeTheaterPass(enc, dtSec) {
+  if (!Visual.device || !Visual.context || !Visual.theaterPipeline ||
+      !Visual.theaterBindGroup || !Visual.theaterUniformBuffer ||
+      !Visual.theaterVertexBuffer || !Visual.theaterIndexBuffer) return false;
+  if (!_ensureTheaterDepthTexture()) return false;
+
+  // Step the camera from currently-held keys before computing the
+  // matrix so the very next frame reflects the input.
+  _theaterStepCamera(dtSec || 0);
+
+  const displays = (state && state.rig && state.rig.displays) || [];
+  const layerCount = Math.min(displays.length, RIG_MAX_DISPLAYS);
+  if (layerCount === 0) return false;
+
+  // Vertex data + view-projection matrix.
+  const vd = _buildTheaterQuadVerts(displays);
+  Visual.device.queue.writeBuffer(Visual.theaterVertexBuffer, 0, vd.buf);
+  const cw = Visual.canvas.width, ch = Visual.canvas.height;
+  const aspect = (cw && ch) ? cw / ch : 1;
+  const vp = _theaterViewProjMatrix(Visual.theaterCam, aspect);
+  Visual.device.queue.writeBuffer(Visual.theaterUniformBuffer, 0, vp.buffer, vp.byteOffset, vp.byteLength);
+
+  let canvasView;
+  try { canvasView = Visual.context.getCurrentTexture().createView(); }
+  catch (e) { return false; }
+
+  const pass = enc.beginRenderPass({
+    label: "theater-pass",
+    colorAttachments: [{
+      view: canvasView,
+      clearValue: { r: 0, g: 0, b: 0, a: 1.0 },     // pure black, no skybox
+      loadOp: "clear",
+      storeOp: "store"
+    }],
+    depthStencilAttachment: {
+      view: Visual.theaterDepthView,
+      depthClearValue: 1.0,
+      depthLoadOp: "clear",
+      depthStoreOp: "discard"                       // depth not reused after pass
+    }
+  });
+  pass.setPipeline(Visual.theaterPipeline);
+  pass.setBindGroup(0, Visual.theaterBindGroup);
+  pass.setVertexBuffer(0, Visual.theaterVertexBuffer);
+  pass.setIndexBuffer(Visual.theaterIndexBuffer, "uint16");
+  pass.drawIndexed(vd.indexCount);
+  pass.end();
+  return true;
+}
+
 /* Rebuild the rig composite bind group when the framebuffer changes
  * (display count, resolution). Layout is fixed; the texture-array
  * view + sampler + uniform buffer get rebound. */
@@ -21356,6 +21884,7 @@ function setRenderResolution(key) {
     _rebuildBlitBindGroup();
     _rebuildRigCompositeBindGroup();
     _rebuildWarpBindGroup();
+    _rebuildTheaterBindGroup();
     smokeClearVisual();
   }
   _updateResolutionPill();
@@ -21383,14 +21912,30 @@ function _cycleRenderResolution() {
  * equirect → fisheye. Updates state.rig.previewMode (same field the
  * props-pane dropdown writes), syncs the dropdown, re-renders so
  * the next frame uses the new mode. */
-const _PREVIEW_MODES = ["tile", "cylinder", "equirect", "fisheye"];
-const _PREVIEW_LABELS = { tile: "Tile", cylinder: "Cylinder", equirect: "Equirect", fisheye: "Fisheye" };
+const _PREVIEW_MODES = ["tile", "cylinder", "equirect", "fisheye", "theater"];
+const _PREVIEW_LABELS = { tile: "Tile", cylinder: "Cylinder", equirect: "Equirect", fisheye: "Fisheye", theater: "Theater" };
 
 function _updateProjectionPill() {
   const pill = document.getElementById("proj-pill");
   if (!pill) return;
   const mode = (state && state.rig && state.rig.previewMode) || "tile";
   pill.textContent = _PREVIEW_LABELS[mode] || "Tile";
+  // Phase 6.6.13 — body class drives the theater-mode pointer-events
+  // flip on #visual-bg. Updated here so any code path that touches
+  // previewMode (dropdown / pill / loadPatch / applyRigTemplate)
+  // converges through the pill update and stays consistent.
+  document.body.classList.toggle("theater-mode", mode === "theater");
+  if (mode !== "theater") {
+    document.body.classList.remove("theater-locked");
+    // Drop any held movement keys so a mode switch mid-walk doesn't
+    // leave the camera drifting on next theater entry.
+    if (Visual && Visual.theaterCam) {
+      Visual.theaterCam.keys.clear();
+      if (Visual.theaterCam.pointerLocked && document.pointerLockElement) {
+        try { document.exitPointerLock(); } catch (_) {}
+      }
+    }
+  }
 }
 
 function _cycleProjectionMode() {
@@ -22088,6 +22633,53 @@ function _drawVisualOverlay() {
   for (const t of textNodes) {
     _drawTextOverlay(ctx2, t, displays, layerCount, vp, tileW, tileH, cols, mode);
   }
+
+  // Phase 6.6.13 — theater-mode entry hint. Visible when the rig is
+  // in theater preview but the user hasn't engaged pointer-lock yet.
+  // Hides itself once the camera is captured so it doesn't clutter
+  // the immersive view.
+  if (mode === "theater" && Visual.theaterCam && !Visual.theaterCam.pointerLocked) {
+    _drawTheaterHint(ctx2, vp);
+  }
+}
+
+/* Phase 6.6.13 — small instructional plate centered on the visual
+ * viewport when theater mode is awaiting user engagement. Once the
+ * pointer is locked the hint goes away. ESC releases lock and the
+ * hint reappears, so users always have a visible path back. */
+function _drawTheaterHint(ctx2, vp) {
+  const dpr = window.devicePixelRatio || 1;
+  const cx = vp.x + vp.w * 0.5;
+  const cy = vp.y + vp.h * 0.5;
+  const fontMain = Math.max(20 * dpr, vp.h * 0.04);
+  const fontSub  = fontMain * 0.55;
+  const lines = [
+    "Click to enter Theater control",
+    "W A S D move · Q E up/down · Shift sprint · Mouse look · ESC release"
+  ];
+  ctx2.textAlign = "center";
+  ctx2.textBaseline = "middle";
+
+  // Plate
+  ctx2.font = "700 " + fontMain + "px Inter, system-ui, sans-serif";
+  const w0 = ctx2.measureText(lines[0]).width;
+  ctx2.font = "500 " + fontSub  + "px Inter, system-ui, sans-serif";
+  const w1 = ctx2.measureText(lines[1]).width;
+  const plateW = Math.max(w0, w1) + fontMain * 1.4;
+  const plateH = fontMain + fontSub + fontMain * 1.2;
+  ctx2.fillStyle = "rgba(8, 11, 16, 0.78)";
+  ctx2.fillRect(cx - plateW/2, cy - plateH/2, plateW, plateH);
+  ctx2.strokeStyle = "rgba(127, 119, 221, 0.55)";
+  ctx2.lineWidth = Math.max(2, dpr);
+  ctx2.strokeRect(cx - plateW/2, cy - plateH/2, plateW, plateH);
+
+  // Lines
+  ctx2.fillStyle = "rgba(200, 232, 90, 0.95)";
+  ctx2.font = "700 " + fontMain + "px Inter, system-ui, sans-serif";
+  ctx2.fillText(lines[0], cx, cy - fontSub * 0.6);
+  ctx2.fillStyle = "rgba(200, 200, 220, 0.85)";
+  ctx2.font = "500 " + fontSub + "px Inter, system-ui, sans-serif";
+  ctx2.fillText(lines[1], cx, cy + fontMain * 0.55);
 }
 
 /* Phase 6.6.4b helper extracted for clarity — was inline in
@@ -22570,7 +23162,13 @@ function renderVisualFrame() {
 
   const rendered = _encodeVisualGraph(enc, dtSec);
 
-  if (rendered && Visual.rigCompositePipeline && Visual.rigCompositeBindGroup) {
+  const previewMode = (state && state.rig && state.rig.previewMode) || "tile";
+  if (rendered && previewMode === "theater" && Visual.theaterPipeline && Visual.theaterBindGroup) {
+    // Phase 6.6.13 — theater preview. Renders display quads in 3D
+    // space; bypasses rig composite + warp (those are tile/cylinder/
+    // equirect/fisheye-mode concepts).
+    _encodeTheaterPass(enc, dtSec);
+  } else if (rendered && Visual.rigCompositePipeline && Visual.rigCompositeBindGroup) {
     _encodeRigComposite(enc);
     // Phase 6.6.4 — overdraw warped tiles on top of the un-warped
     // composite. No-op when no display has a warpMesh or when the
