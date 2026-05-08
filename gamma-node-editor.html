@@ -12917,7 +12917,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     ],
     outs: [{ n: "out", t: "texture" }],
     params: {
-      size: 8,
+      size: 24,
       rA: 0.92, gA: 0.92, bA: 0.92,
       rB: 0.08, gB: 0.08, bB: 0.08
     },
@@ -12928,12 +12928,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   u_resolution: vec4f,
   u_time:       f32,
   u_dt:         f32,
-  _pad0:        vec2f,
-  u_view:       vec4f,
+  u_layer:      f32,
+  u_fov_v_deg:  f32,
+  u_view:       vec4f,    // (yaw, pitch, roll, fov_h_deg)
   u_world_uv:   vec4f,
   colorA:       vec4f,
   colorB:       vec4f,
-  sizeAndPad:   vec4f,    // x=size, yzw=_
+  sizeAndPad:   vec4f,    // x=size (cells around 360° azimuth), yzw=_
 };
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -12949,11 +12950,38 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
   return out;
 }
 
+// Convert a fragment's framebuffer UV to global (yaw, pitch) on the
+// rig sphere. Uses the inverse gnomonic projection of a perspective
+// projector at the rig center: a UV maps to a 3D ray, the ray's
+// (yaw, pitch) is its angular direction on the sphere. Linear-fov
+// approximation breaks down at large fov; atan() recovers the
+// correct angle from any fov (including 90° cube-face displays).
+fn frag_to_global_angles(uv: vec2f) -> vec2f {
+  let fov_h_rad = u.u_view.w   * 0.0174532925;
+  let fov_v_rad = u.u_fov_v_deg * 0.0174532925;
+  let local_x = (uv.x - 0.5) * 2.0 * tan(fov_h_rad * 0.5);
+  let local_y = (0.5 - uv.y) * 2.0 * tan(fov_v_rad * 0.5);
+  let yaw_off_rad   = atan(local_x);
+  let pitch_off_rad = atan(local_y);
+  // Convert back to degrees. 57.29577951 = 180 / PI.
+  return vec2f(
+    u.u_view.x + yaw_off_rad   * 57.29577951,
+    u.u_view.y + pitch_off_rad * 57.29577951
+  );
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4f {
-  let world_uv = mix(u.u_world_uv.xy, u.u_world_uv.zw, in.uv);
-  let cells = floor(world_uv * max(u.sizeAndPad.x, 1.0));
-  let parity = (i32(cells.x) + i32(cells.y)) & 1;
+  // Phase 6.4 polish — angular cell math. size = cells around 360°
+  // azimuth; vertical gets size/2 cells across 180° pitch so each
+  // cell occupies the same angular extent in both directions.
+  // Cells are EQUIANGULAR → appear roughly square on the curved
+  // screen and form continuous rings/wedges in spherical previews.
+  let ang = frag_to_global_angles(in.uv);
+  let size = max(u.sizeAndPad.x, 1.0);
+  let cellU = floor(ang.x / 360.0 * size);
+  let cellV = floor((ang.y + 90.0) / 180.0 * (size * 0.5));
+  let parity = (i32(cellU) + i32(cellV)) & 1;
   return select(u.colorB, u.colorA, parity == 0);
 }`,
     writeUniforms(node, scratch) {
@@ -12987,7 +13015,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       { n: "seed",          t: "param" }
     ],
     outs: [{ n: "out", t: "texture" }],
-    params: { density: 8, edgeThickness: 0.05, seed: 0.5 },
+    params: { density: 24, edgeThickness: 0.08, seed: 0.5 },
     methods: {},
     uniformBytes: 80,
     wgsl:
@@ -12995,10 +13023,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   u_resolution: vec4f,
   u_time:       f32,
   u_dt:         f32,
-  _pad0:        vec2f,
+  u_layer:      f32,
+  u_fov_v_deg:  f32,
   u_view:       vec4f,
   u_world_uv:   vec4f,
-  params:       vec4f,    // x=density, y=edgeThickness, z=seed, w=_
+  params:       vec4f,    // x=density (cells around 360°), y=edgeThickness, z=seed, w=_
 };
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -13019,10 +13048,27 @@ fn hash22(p: vec2f) -> vec2f {
   return fract(sin(h) * 43758.5453123);
 }
 
+fn frag_to_global_angles(uv: vec2f) -> vec2f {
+  let fov_h_rad = u.u_view.w   * 0.0174532925;
+  let fov_v_rad = u.u_fov_v_deg * 0.0174532925;
+  let local_x = (uv.x - 0.5) * 2.0 * tan(fov_h_rad * 0.5);
+  let local_y = (0.5 - uv.y) * 2.0 * tan(fov_v_rad * 0.5);
+  return vec2f(
+    u.u_view.x + atan(local_x) * 57.29577951,
+    u.u_view.y + atan(local_y) * 57.29577951
+  );
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4f {
-  let world_uv = mix(u.u_world_uv.xy, u.u_world_uv.zw, in.uv);
-  let scaled = world_uv * max(u.params.x, 1.0);
+  // Phase 6.4 polish — angular Voronoi. Cells are placed in spherical
+  // (yaw, pitch) space so they appear equiangular on the curved
+  // screen. Cell unit = 360° / density along yaw; the same cell-deg
+  // size applies to pitch so adjacent rig displays' cells line up
+  // continuously in 3D regardless of which direction they face.
+  let ang = frag_to_global_angles(in.uv);
+  let cellsize_deg = 360.0 / max(u.params.x, 1.0);
+  let scaled = vec2f(ang.x, ang.y) / cellsize_deg;
   let cell = floor(scaled);
   let frag = scaled - cell;
   let seed = vec2f(u.params.z, u.params.z * 1.7);
@@ -13070,7 +13116,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       { n: "seedY",   t: "param" }
     ],
     outs: [{ n: "out", t: "texture" }],
-    params: { scale: 4, octaves: 4, seedX: 0, seedY: 0 },
+    params: { scale: 8, octaves: 4, seedX: 0, seedY: 0 },
     methods: {},
     uniformBytes: 80,
     wgsl:
@@ -13078,10 +13124,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   u_resolution: vec4f,
   u_time:       f32,
   u_dt:         f32,
-  _pad0:        vec2f,
+  u_layer:      f32,
+  u_fov_v_deg:  f32,
   u_view:       vec4f,
   u_world_uv:   vec4f,
-  params:       vec4f,    // x=scale, y=octaves, z=seedX, w=seedY
+  params:       vec4f,    // x=scale (cycles around 360°), y=octaves, z=seedX, w=seedY
 };
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -13121,11 +13168,29 @@ fn snoise2(p: vec2f) -> f32 {
   return dot(n, vec3f(70.0));
 }
 
+fn frag_to_global_angles(uv: vec2f) -> vec2f {
+  let fov_h_rad = u.u_view.w   * 0.0174532925;
+  let fov_v_rad = u.u_fov_v_deg * 0.0174532925;
+  let local_x = (uv.x - 0.5) * 2.0 * tan(fov_h_rad * 0.5);
+  let local_y = (0.5 - uv.y) * 2.0 * tan(fov_v_rad * 0.5);
+  return vec2f(
+    u.u_view.x + atan(local_x) * 57.29577951,
+    u.u_view.y + atan(local_y) * 57.29577951
+  );
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4f {
-  let world_uv = mix(u.u_world_uv.xy, u.u_world_uv.zw, in.uv);
+  // Phase 6.4 polish — angular sampling. scale = noise cycles around
+  // 360° azimuth; same per 360° pitch (so cycles match in both
+  // directions, matching the equiangular cell convention used by
+  // Checkerboard / Voronoi). Each display reads from the SAME
+  // angular noise field as its neighbors so patterns continue
+  // smoothly across rig seams.
+  let ang = frag_to_global_angles(in.uv);
   let seed = vec2f(u.params.z, u.params.w);
-  let p = world_uv * max(u.params.x, 0.001) + seed;
+  let cycles_per_deg = max(u.params.x, 0.001) / 360.0;
+  let p = ang * cycles_per_deg + seed;
   let octaves = i32(clamp(u.params.y, 1.0, 8.0));
   var n: f32   = 0.0;
   var amp: f32 = 1.0;
@@ -24867,7 +24932,14 @@ function _disposeShaderInstance(nodeId) {
  *                                  Older shaders keep declaring `_pad0: vec2f`
  *                                  in their struct; layout is identical so they
  *                                  just don't reference the slot.
- *   float   7    / bytes 28-31  → _pad: f32 (always 0; reserved for future)
+ *   float   7    / bytes 28-31  → u_fov_v_deg: f32 (vertical fov of THIS
+ *                                  display in degrees — companion to
+ *                                  u_view.w which carries fov_h_deg).
+ *                                  Phase 6.4 polish added this so shaders
+ *                                  can compute global (yaw, pitch) for
+ *                                  angular-uniform cell math, vs. the
+ *                                  world_uv math which produces visibly
+ *                                  non-uniform cells on curved screens.
  *   floats  8-11 / bytes 32-47  → u_view: vec4f (yaw, pitch, roll, fov_h_deg) of THIS display
  *   floats 12-15 / bytes 48-63  → u_world_uv: vec4f (minU, minV, maxU, maxV) on rig master canvas
  *
@@ -24885,7 +24957,11 @@ function _writeShaderPreamble(scratch, dtSec, display, worldUvOverride, layerIdx
   scratch[4]  = t;
   scratch[5]  = dtSec;
   scratch[6]  = (typeof layerIdx === "number" && Number.isFinite(layerIdx)) ? layerIdx : 0;
-  scratch[7]  = 0;
+  // Phase 6.4 polish — u_fov_v_deg companion to u_view.w (fov_h).
+  // Lets shaders compute global angular position for uniform-on-sphere
+  // cell math (Checkerboard / Voronoi / NoiseShader). Defaults to 60°
+  // when no display info is available — matches the most common preset.
+  scratch[7]  = (display && display.fov && display.fov.v) || 60;
   // Defensive: missing display falls back to a single-display default
   // so the preamble is always well-formed. Same defaults make a new
   // editor with no rig (shouldn't happen, freshState provides one)
