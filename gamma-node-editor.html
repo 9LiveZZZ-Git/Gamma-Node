@@ -1752,6 +1752,22 @@
      * (see ensureGPUDevice). Default appearance is whatever body
      * background shows — invisible against the editor backdrop. */
   }
+
+  /* Phase 6.6.4b — visual overlay canvas. Sits on top of #visual-bg
+   * (same z-index, later in DOM order) so 2D HUD elements layer above
+   * the WebGPU output without blocking it. Active only when a
+   * RigGizmo node is in the patch — it draws labels on each display
+   * tile and highlights modulated by the optional audio "level" input.
+   * Live Mode bumps it to z-index 1 alongside the WebGPU canvas. */
+  #visual-overlay {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100vw;
+    height: 100vh;
+    z-index: 0;
+    pointer-events: none;
+  }
+  body.live-mode #visual-overlay { z-index: 1; }
   /* Everything in #app sits on top of the visual layer. */
   #app { position: relative; z-index: 1; }
 
@@ -5294,6 +5310,10 @@
      the node graph's pan/zoom state. WebGPU is configured against
      this canvas in ensureGPUDevice(); see Visual.* below. -->
 <canvas id="visual-bg"></canvas>
+<!-- Phase 6.6.4b — 2D overlay canvas for the RigGizmo node. Sits
+     directly on top of #visual-bg in DOM order so labels/highlights
+     layer above the WebGPU output. Inert (no pointer events). -->
+<canvas id="visual-overlay"></canvas>
 
 <!-- Live Mode overlay — visible only when body.live-mode is set.
      Floating "exit" affordance in the corner: discreet enough to
@@ -12107,6 +12127,39 @@ public:
     params:  { display: 0 },
     methods: { display: null },
     description: "Visual sink — wire a texture into in to drive the visual layer for the chosen display. Multiple VisualOutput nodes wired to the same shader render the SHARED image across the rig (the shader runs once per display with display-specific u_view + u_world_uv). Press L to enter Live Mode and see the rig fullscreen."
+  },
+
+  /* Phase 6.6.4b — RigGizmo. Patch-level overlay node that draws a
+   * 2D HUD on top of the visual canvas: labels on each display tile,
+   * warp / edge-blend status badges, and intensity highlight pulses
+   * driven by an optional audio "level" input. The node has no codegen
+   * — it's purely a UX surface that exists in the patch so the gizmo
+   * is per-patch toggleable + serializable. */
+  RigGizmo: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    ins:  [{ n: "level", t: "audio" }],
+    outs: [],
+    params:  {
+      // 0..1 — base highlight brightness. Audio level (when wired)
+      // multiplies into this, so intensity=0 keeps audio reactivity
+      // visible while intensity=1 stays bright even with silence.
+      intensity: 0.5,
+      // labels: "none" | "index" | "name". Index draws the array
+      // index (0, 1, 2…); name uses display.name from the rig.
+      labelMode: "index",
+      // toggle warp / blend badges in the overlay AND on the inset
+      // gizmo's frustums. Both default on so a freshly-dropped node
+      // shows everything; the user can hide what they don't want.
+      showWarp:  true,
+      showBlend: true,
+      // outline-tile rectangles. Off in audio-reactive setups where
+      // only the brightness pulse matters; on for QC of which tile
+      // is which.
+      outlineTiles: true
+    },
+    methods: { intensity: null, labelMode: null, showWarp: null, showBlend: null, outlineTiles: null },
+    description: "Patch-level rig HUD — overlays display tiles with labels (index/name), warp/blend status badges, and audio-reactive highlights. Drop one in the patch to enable; only the first RigGizmo's params take effect (the node is global). Tile preview only — non-tile modes hide the overlay."
   },
 
   /* Phase 6.2.x — first two shader-frag nodes. Both are kind:
@@ -20004,6 +20057,12 @@ function sizeVisualCanvas() {
     Visual.canvas.width  = w;
     Visual.canvas.height = h;
   }
+  // Keep the 2D overlay canvas in lockstep with the WebGPU one.
+  const ov = document.getElementById("visual-overlay");
+  if (ov && (ov.width !== w || ov.height !== h)) {
+    ov.width  = w;
+    ov.height = h;
+  }
 }
 window.addEventListener("resize", () => {
   sizeVisualCanvas();
@@ -21496,6 +21555,134 @@ function _rotateDisplayPoint(p, yawDeg, pitchDeg) {
   return [x, y, z];
 }
 
+/* Phase 6.6.4b — visual overlay (RigGizmo). Per-frame 2D pass that
+ * draws labels, outlines, warp/blend badges, and audio-reactive
+ * highlights on top of each display tile. Active only when the patch
+ * contains a RigGizmo node and the rig preview is in tile mode. The
+ * overlay is fully decorative — pointer-events:none on the canvas
+ * means the editor's pointer flow is unaffected.
+ *
+ * Audio reactivity: if previewState.analyserL/R are running (preview
+ * is playing), METER.smoothL/R is read as the current peak amplitude
+ * and added to the base intensity param. Wiring an audio source into
+ * the RigGizmo's "level" input is currently decorative — the routing
+ * is shown in the patch but the value comes from the master meter.
+ * Per-tap routing is its own ticket. */
+function _drawVisualOverlay() {
+  const ov = document.getElementById("visual-overlay");
+  if (!ov) return;
+  const ctx2 = ov.getContext("2d");
+  if (!ctx2) return;
+  const W = ov.width, H = ov.height;
+  ctx2.clearRect(0, 0, W, H);
+
+  // Find the first RigGizmo node — multiple are allowed in the patch
+  // but only one drives the overlay (the rest are silent).
+  const gizmoNode = (state && state.nodes || []).find(n => n && n.type === "RigGizmo");
+  if (!gizmoNode) return;
+
+  const mode = (state && state.rig && state.rig.previewMode) || "tile";
+  if (mode !== "tile") return;
+
+  const displays = (state && state.rig && state.rig.displays) || [];
+  if (displays.length === 0) return;
+
+  const params = gizmoNode.params || {};
+  const baseIntensity = (typeof params.intensity === "number") ? params.intensity : 0.5;
+  const labelMode  = params.labelMode || "index";
+  const showWarp   = params.showWarp  !== false;
+  const showBlend  = params.showBlend !== false;
+  const outlineTiles = params.outlineTiles !== false;
+
+  // Sample audio peak from the master meter when preview is running.
+  // Falls back to 0 (just the base intensity) when silent or stopped.
+  let audioLevel = 0;
+  if (typeof METER !== "undefined" && METER && Number.isFinite(METER.smoothL)) {
+    audioLevel = Math.max(METER.smoothL || 0, METER.smoothR || 0);
+  }
+  // Highlight pulse: combine base + audio. Cap at 1.0 to avoid solid
+  // overdraw on loud peaks.
+  const intensity = Math.min(1, baseIntensity + audioLevel * 0.7);
+
+  // Tile geometry — same math as the warp pass.
+  const layerCount = Math.min(displays.length, 16);
+  const { cols, rows } = _rigTileLayout(layerCount);
+  const masterAspect = _projectionMasterAspect();
+  const vp = _projectionViewportRect(masterAspect);
+  const tileW = vp.w / cols;
+  const tileH = vp.h / rows;
+
+  const defaultEB = _defaultEdgeBlend();
+  const isCustomBlend = (eb) => !eb ||
+    eb.gamma     !== defaultEB.gamma ||
+    eb.blackLift !== defaultEB.blackLift ||
+    eb.power     !== defaultEB.power;
+
+  for (let i = 0; i < layerCount; i++) {
+    const d = displays[i];
+    if (!d) continue;
+    const col = i % cols;
+    const row = Math.floor(i / cols);
+    const tx  = vp.x + col * tileW;
+    const ty  = vp.y + row * tileH;
+
+    // Highlight rectangle — semitransparent fill modulated by intensity.
+    if (intensity > 0.01) {
+      ctx2.fillStyle = "rgba(200, 232, 90, " + (0.06 + intensity * 0.18).toFixed(3) + ")";
+      ctx2.fillRect(tx, ty, tileW, tileH);
+    }
+
+    if (outlineTiles) {
+      ctx2.strokeStyle = "rgba(200, 232, 90, " + (0.35 + intensity * 0.45).toFixed(3) + ")";
+      ctx2.lineWidth = Math.max(2, 2 * (window.devicePixelRatio || 1));
+      ctx2.strokeRect(tx + 1, ty + 1, tileW - 2, tileH - 2);
+    }
+
+    // Label — index or display name. Sized to ~5% of tile height,
+    // clamped to a sane range so 16-tile layouts stay readable.
+    if (labelMode !== "none") {
+      const text = labelMode === "name"
+        ? (d.name || ("Display " + (i + 1)))
+        : String(i);
+      const fontPx = Math.max(14 * (window.devicePixelRatio || 1),
+                              Math.min(tileH * 0.10, 64 * (window.devicePixelRatio || 1)));
+      ctx2.font = "600 " + fontPx + "px JetBrains Mono, ui-monospace, monospace";
+      ctx2.textBaseline = "top";
+      const padX = fontPx * 0.5;
+      const padY = fontPx * 0.4;
+      // Plate behind text for readability against bright shaders.
+      const tw = ctx2.measureText(text).width;
+      ctx2.fillStyle = "rgba(8, 11, 16, 0.55)";
+      ctx2.fillRect(tx + padX - 4, ty + padY - 2, tw + 8, fontPx + 4);
+      ctx2.fillStyle = "rgba(200, 232, 90, 0.92)";
+      ctx2.fillText(text, tx + padX, ty + padY);
+
+      // Status badges — appended to the right of the label.
+      const badges = [];
+      if (showWarp && d.warpMesh) {
+        badges.push({ text: d.warpMesh._isTest ? "WARP•TEST" : "WARP", color: "rgba(127, 119, 221, 0.95)" });
+      }
+      if (showBlend && isCustomBlend(d.edgeBlend)) {
+        badges.push({ text: "BLEND", color: "rgba(226, 75, 74, 0.95)" });
+      }
+      if (badges.length) {
+        const badgeFont = Math.max(10 * (window.devicePixelRatio || 1), fontPx * 0.42);
+        ctx2.font = "500 " + badgeFont + "px JetBrains Mono, ui-monospace, monospace";
+        let bx = tx + padX + tw + 12;
+        const by = ty + padY + (fontPx - badgeFont) * 0.5;
+        for (const b of badges) {
+          const bw = ctx2.measureText(b.text).width;
+          ctx2.fillStyle = "rgba(8, 11, 16, 0.6)";
+          ctx2.fillRect(bx - 4, by - 2, bw + 8, badgeFont + 4);
+          ctx2.fillStyle = b.color;
+          ctx2.fillText(b.text, bx, by);
+          bx += bw + 12;
+        }
+      }
+    }
+  }
+}
+
 /* Per-frame gizmo render. Cheap — single 280×280 canvas, ~200
  * line segments at most. Hooked into the visual rAF loop so it
  * updates in lockstep with the visual canvas. */
@@ -21605,6 +21792,11 @@ function _drawGizmoFrame() {
   // Display frustums — z-sort by mean depth so back ones draw first
   // (preserves "closer wins" ordering in wireframe-painters fashion).
   const displays = (state && state.rig && state.rig.displays) || [];
+  const defaultEB = _defaultEdgeBlend();
+  const isCustomBlend = (eb) => !eb ||
+    eb.gamma     !== defaultEB.gamma ||
+    eb.blackLift !== defaultEB.blackLift ||
+    eb.power     !== defaultEB.power;
   const frustums = [];
   for (let i = 0; i < displays.length; i++) {
     const d = displays[i];
@@ -21623,14 +21815,34 @@ function _drawGizmoFrame() {
     const apex = project([0, 0, 0]);
     let zSum = 0;
     for (const c of corners) zSum += c.z;
-    frustums.push({ idx: i, corners, apex, meanZ: zSum / 4 });
+    frustums.push({
+      idx: i, corners, apex, meanZ: zSum / 4,
+      // Phase 6.6.4b — flag warp + blend so the frustum stroke can
+      // signal calibration state without an extra badge layer.
+      hasWarp:    !!d.warpMesh,
+      isTestWarp: !!(d.warpMesh && d.warpMesh._isTest),
+      hasBlend:   isCustomBlend(d.edgeBlend)
+    });
   }
   frustums.sort((a, b) => b.meanZ - a.meanZ);   // back to front
 
   for (const f of frustums) {
     const hue = (f.idx / Math.max(1, displays.length)) * 360;
-    const stroke = "hsla(" + hue + ", 70%, 65%, 0.92)";
-    const fill   = "hsla(" + hue + ", 70%, 55%, 0.18)";
+    // Calibration state changes the stroke style so warped / blended
+    // displays read at a glance. Test mesh = dashed violet; calibrated
+    // mesh = solid violet; non-default blend params = red rim.
+    let stroke = "hsla(" + hue + ", 70%, 65%, 0.92)";
+    let fill   = "hsla(" + hue + ", 70%, 55%, 0.18)";
+    if (f.hasWarp) {
+      stroke = f.isTestWarp
+        ? "rgba(170, 162, 240, 0.95)"
+        : "rgba(127, 119, 221, 0.95)";
+      fill   = "rgba(127, 119, 221, 0.16)";
+    }
+    if (f.hasBlend) {
+      stroke = "rgba(240, 130, 130, 0.95)";
+      fill   = "rgba(226, 75, 74, 0.16)";
+    }
     // Quad face at depth=1
     ctx.beginPath();
     ctx.moveTo(f.corners[0].x, f.corners[0].y);
@@ -21640,7 +21852,9 @@ function _drawGizmoFrame() {
     ctx.fill();
     ctx.strokeStyle = stroke;
     ctx.lineWidth = 1.2;
+    if (f.hasWarp && f.isTestWarp) ctx.setLineDash([3, 2]);
     ctx.stroke();
+    ctx.setLineDash([]);
     // Apex-to-corner edges
     ctx.beginPath();
     for (const c of f.corners) {
@@ -21648,13 +21862,18 @@ function _drawGizmoFrame() {
       ctx.lineTo(c.x, c.y);
     }
     ctx.stroke();
-    // Index label at frustum face center
+    // Index label at frustum face center, with W/B suffixes when the
+    // frustum is warped/blended. Color alone is not enough — the
+    // suffixes survive monochrome capture and color-blind viewing.
     let lx = 0, ly = 0;
     for (const c of f.corners) { lx += c.x; ly += c.y; }
     lx /= 4; ly /= 4;
     ctx.fillStyle = stroke;
     ctx.font = "bold 11px JetBrains Mono, monospace";
-    ctx.fillText(String(f.idx), lx - (f.idx >= 10 ? 7 : 3), ly + 4);
+    let label = String(f.idx);
+    if (f.hasWarp)  label += "·W";
+    if (f.hasBlend) label += "·B";
+    ctx.fillText(label, lx - (label.length * 3.2), ly + 4);
   }
 
   // Shader-center direction arrow — only drawn when the user has
@@ -21837,6 +22056,10 @@ function _visualRenderTick(t) {
   // Phase 6.5.16 — gizmo redraw. Cheap (single 280×280 canvas2d
   // pass, ~200 line segments) and only runs when the gizmo is open.
   if (_gizmoOpen) _drawGizmoFrame();
+  // Phase 6.6.4b — RigGizmo overlay on the visual canvas. The
+  // function early-outs when no RigGizmo node exists in the patch
+  // so this is effectively free for patches that don't use it.
+  _drawVisualOverlay();
   _visualRafHandle = requestAnimationFrame(_visualRenderTick);
 }
 
