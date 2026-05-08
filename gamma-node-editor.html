@@ -1910,6 +1910,70 @@
     box-shadow: 0 0 0 3px rgba(200, 232, 90, 0.12);
   }
 
+  /* ---------------- Phase 6.5.16 — 3D rig gizmo ----------------
+   * Floating overlay with a small 3D wireframe view of every display
+   * in the rig. Each frustum is color-coded by index; horizon ring +
+   * RGB axes orient the camera. Click-drag the canvas to orbit;
+   * mouse wheel zooms. Position is fixed bottom-right above the
+   * visual HUD stack so the canvas-tools / HUD pills stay
+   * accessible. Hidden by default — toggled via the ⬢ pill. */
+  .rig-gizmo {
+    position: fixed;
+    bottom: 100px;     /* above the view-hud (42) + visual-hud (10) stack */
+    right: 12px;
+    z-index: 50;
+    background: rgba(20, 24, 32, 0.85);
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    padding: 6px 6px 4px;
+    user-select: none;
+    -webkit-user-select: none;
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    box-shadow: 0 6px 24px rgba(0,0,0,0.5);
+  }
+  .rig-gizmo-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 4px 4px;
+    margin-bottom: 2px;
+  }
+  .rig-gizmo-title {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--text-3);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  .rig-gizmo-close {
+    background: none;
+    border: none;
+    color: var(--text-3);
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0 2px;
+    transition: color .12s;
+  }
+  .rig-gizmo-close:hover { color: var(--text); }
+  #rig-gizmo-canvas {
+    display: block;
+    cursor: grab;
+    touch-action: none;
+    border-radius: 4px;
+    background: rgba(0,0,0,0.35);
+  }
+  #rig-gizmo-canvas:active { cursor: grabbing; }
+  .rig-gizmo-hint {
+    margin-top: 4px;
+    padding: 0 2px;
+    font-size: 9.5px;
+    color: var(--text-3);
+    text-align: center;
+    font-family: var(--font-mono);
+  }
+
   /* ---------------- Live Mode ---------------- */
   /* Activated by toggleLiveMode() — sets body.live-mode. The whole
    * editor UI disappears via display:none on #app, leaving the
@@ -5232,6 +5296,19 @@
           title="Exit Live Mode (L or Esc)">↩ Exit Live</button>
 </div>
 
+<!-- Phase 6.5.16 — 3D rig wireframe gizmo. Toggleable overlay
+     showing each display in the rig as a wireframe frustum in 3D
+     space, color-coded by index. Click-drag to orbit camera, wheel
+     to zoom. Hidden by default; toggled via the ⬢ HUD pill. -->
+<div id="rig-gizmo" style="display: none;">
+  <div class="rig-gizmo-head">
+    <span class="rig-gizmo-title">Rig 3D</span>
+    <button class="rig-gizmo-close" id="btn-rig-gizmo-close" title="Close (toggle ⬢ in HUD to reopen)">×</button>
+  </div>
+  <canvas id="rig-gizmo-canvas" width="280" height="280"></canvas>
+  <div class="rig-gizmo-hint">drag to orbit · wheel to zoom · numbers = display indices</div>
+</div>
+
 <div id="app">
 
   <header>
@@ -5470,6 +5547,8 @@
                   title="Render resolution — click to cycle 1080p → 1440p → 4K → 8K. Affects framebuffer size, not browser window size.">1080p</button>
           <button class="visual-hud-pill" id="proj-pill" type="button"
                   title="Operator preview projection — click to cycle Tile-flat → Cylinder → Equirect → Fisheye. Same content, different unwrap of the multi-display rig onto your screen.">Tile</button>
+          <button class="visual-hud-pill visual-hud-icon" id="gizmo-pill" type="button"
+                  title="Toggle 3D rig wireframe overlay — see every display's frustum in 3D space, color-coded by index. Click-drag to orbit, wheel to zoom.">⬢</button>
           <span class="visual-hud-pill visual-hud-readout" id="fps-readout"
                 title="Frame rate (rAF cadence). Stays at — fps until shader nodes drive an animation loop in Phase 6.1.7+.">— fps</span>
           <button class="visual-hud-pill visual-hud-icon" id="freeze-btn" type="button"
@@ -20803,6 +20882,275 @@ function _encodeVisualGraph(enc, dtSec) {
   return true;   // VOs exist → composite runs
 }
 
+/* ----- Phase 6.5.16 — 3D rig wireframe gizmo ------------------------- */
+
+/* Orbit-camera state for the gizmo. yaw/pitch in degrees; scale is a
+ * multiplier on the orthographic projection (mouse-wheel zoom).
+ * Persisted only in memory — no .gpatch round-trip; the gizmo is a
+ * UX overlay, not patch state.
+ *
+ * Default: pitch=+20 so the camera looks DOWN at the rig from
+ * above. With matching display + camera pitch conventions (positive
+ * pitch lifts the rotation axis toward zenith), this puts +Y at
+ * canvas-top, +Z slightly upper-left at the default yaw=30, +X
+ * lower-right — the standard "above looking down" 3D-editor view. */
+const _gizmoCam = { yaw: 30, pitch: 20, scale: 1.0 };
+let _gizmoOpen = false;
+let _gizmoDrag = null;
+
+function _setGizmoOpen(on) {
+  on = !!on;
+  if (on === _gizmoOpen) return;
+  _gizmoOpen = on;
+  const overlay = document.getElementById("rig-gizmo");
+  if (overlay) overlay.style.display = on ? "block" : "none";
+  const pill = document.getElementById("gizmo-pill");
+  if (pill) pill.classList.toggle("active", on);
+}
+function toggleRigGizmo() { _setGizmoOpen(!_gizmoOpen); }
+
+/* Build a unit-vector "forward" direction from yaw / pitch in
+ * degrees. yaw=0 → +Z, yaw=+90 → +X, pitch=+90 → +Y (zenith). */
+function _yawPitchToVec(yawDeg, pitchDeg) {
+  const yr = yawDeg * Math.PI / 180;
+  const pr = pitchDeg * Math.PI / 180;
+  return [
+    Math.sin(yr) * Math.cos(pr),
+    Math.sin(pr),
+    Math.cos(yr) * Math.cos(pr)
+  ];
+}
+
+/* Apply display rotation (yaw + pitch) to a point in display-local
+ * space. Roll is supported via the registry but skipped here — most
+ * rig templates leave it 0 and the gizmo prioritizes legibility over
+ * pixel-exact pose match. Order: pitch around X, then yaw around Y.
+ *
+ * Convention: positive pitch = looks UP toward +Y zenith. So
+ * (0, 0, 1) rotated by pitch=+90 gives (0, 1, 0). Matches the
+ * spherical-projection math elsewhere in the editor. */
+function _rotateDisplayPoint(p, yawDeg, pitchDeg) {
+  let [x, y, z] = p;
+  const pr = pitchDeg * Math.PI / 180;
+  const cp = Math.cos(pr), sp = Math.sin(pr);
+  const y1 = y * cp + z * sp;       // +Z → +Y at pitch=+90 (looks up)
+  const z1 = -y * sp + z * cp;
+  y = y1; z = z1;
+  const yr = yawDeg * Math.PI / 180;
+  const cy = Math.cos(yr), sy = Math.sin(yr);
+  const x2 = x * cy + z * sy;
+  const z2 = -x * sy + z * cy;
+  x = x2; z = z2;
+  return [x, y, z];
+}
+
+/* Per-frame gizmo render. Cheap — single 280×280 canvas, ~200
+ * line segments at most. Hooked into the visual rAF loop so it
+ * updates in lockstep with the visual canvas. */
+function _drawGizmoFrame() {
+  if (!_gizmoOpen) return;
+  const canvas = document.getElementById("rig-gizmo-canvas");
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  const cx = W / 2, cy = H / 2;
+  const baseScale = Math.min(W, H) * 0.32 * _gizmoCam.scale;
+  const cyaw   = _gizmoCam.yaw   * Math.PI / 180;
+  const cpitch = _gizmoCam.pitch * Math.PI / 180;
+  const ccy = Math.cos(cyaw),  csy = Math.sin(cyaw);
+  const ccp = Math.cos(cpitch), csp = Math.sin(cpitch);
+
+  // Project a 3D world point into canvas coords. Returns z too so
+  // callers can sort / depth-cue. Orthographic projection — simpler
+  // and cleaner-looking than perspective for a tiny gizmo.
+  //
+  // Camera convention: positive pitch = camera elevated above the
+  // rig looking DOWN. Same matrix shape as the display rotation
+  // (y2 = y*cp + z*sp) so both pitch axes follow the same right-
+  // hand convention.
+  function project(p) {
+    let x = p[0], y = p[1], z = p[2];
+    // Camera yaw around Y
+    const x1 = x * ccy - z * csy;
+    const z1 = x * csy + z * ccy;
+    x = x1; z = z1;
+    // Camera pitch around X
+    const y2 = y * ccp + z * csp;
+    const z2 = -y * csp + z * ccp;
+    y = y2; z = z2;
+    return { x: cx + x * baseScale, y: cy - y * baseScale, z: z };
+  }
+
+  // Horizon ring at y=0 (rig's equator).
+  ctx.beginPath();
+  for (let i = 0; i <= 64; i++) {
+    const a = i / 64 * 2 * Math.PI;
+    const p = project([Math.cos(a), 0, Math.sin(a)]);
+    if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+  }
+  ctx.strokeStyle = "rgba(200, 232, 90, 0.18)";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // Vertical meridians at yaw 0 / 90 / 180 / 270 — give a sphere
+  // sense to the gizmo without drawing a full wireframe sphere.
+  for (let m = 0; m < 4; m++) {
+    const yaw0 = m * Math.PI / 2;
+    ctx.beginPath();
+    for (let i = -8; i <= 8; i++) {
+      const pitch = i / 8 * (Math.PI / 2 - 0.1);
+      const x = Math.sin(yaw0) * Math.cos(pitch);
+      const y = Math.sin(pitch);
+      const z = Math.cos(yaw0) * Math.cos(pitch);
+      const p = project([x, y, z]);
+      if (i === -8) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+    }
+    ctx.strokeStyle = "rgba(200, 232, 90, 0.10)";
+    ctx.stroke();
+  }
+
+  // RGB axes — X red, Y green, Z violet — labeled on the +ends.
+  function drawAxis(dir, color, label) {
+    const o = project([0, 0, 0]);
+    const e = project([dir[0] * 1.18, dir[1] * 1.18, dir[2] * 1.18]);
+    ctx.beginPath();
+    ctx.moveTo(o.x, o.y);
+    ctx.lineTo(e.x, e.y);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.fillStyle = color;
+    ctx.font = "10px JetBrains Mono, monospace";
+    ctx.fillText(label, e.x + 3, e.y - 2);
+  }
+  drawAxis([1, 0, 0], "rgba(226, 75, 74, 0.7)",  "X");
+  drawAxis([0, 1, 0], "rgba(29, 158, 117, 0.7)", "Y");
+  drawAxis([0, 0, 1], "rgba(127, 119, 221, 0.7)","Z");
+
+  // Display frustums — z-sort by mean depth so back ones draw first
+  // (preserves "closer wins" ordering in wireframe-painters fashion).
+  const displays = (state && state.rig && state.rig.displays) || [];
+  const frustums = [];
+  for (let i = 0; i < displays.length; i++) {
+    const d = displays[i];
+    if (!d) continue;
+    const pose = d.pose || { yaw: 0, pitch: 0, roll: 0 };
+    const fov  = d.fov  || { h: 90, v: 60 };
+    const hH = Math.tan(fov.h * Math.PI / 360);
+    const hV = Math.tan(fov.v * Math.PI / 360);
+    const r = (p) => _rotateDisplayPoint(p, pose.yaw, pose.pitch);
+    const corners = [
+      project(r([-hH,  hV, 1])),
+      project(r([ hH,  hV, 1])),
+      project(r([ hH, -hV, 1])),
+      project(r([-hH, -hV, 1]))
+    ];
+    const apex = project([0, 0, 0]);
+    let zSum = 0;
+    for (const c of corners) zSum += c.z;
+    frustums.push({ idx: i, corners, apex, meanZ: zSum / 4 });
+  }
+  frustums.sort((a, b) => b.meanZ - a.meanZ);   // back to front
+
+  for (const f of frustums) {
+    const hue = (f.idx / Math.max(1, displays.length)) * 360;
+    const stroke = "hsla(" + hue + ", 70%, 65%, 0.92)";
+    const fill   = "hsla(" + hue + ", 70%, 55%, 0.18)";
+    // Quad face at depth=1
+    ctx.beginPath();
+    ctx.moveTo(f.corners[0].x, f.corners[0].y);
+    for (let c = 1; c < 4; c++) ctx.lineTo(f.corners[c].x, f.corners[c].y);
+    ctx.closePath();
+    ctx.fillStyle = fill;
+    ctx.fill();
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+    // Apex-to-corner edges
+    ctx.beginPath();
+    for (const c of f.corners) {
+      ctx.moveTo(f.apex.x, f.apex.y);
+      ctx.lineTo(c.x, c.y);
+    }
+    ctx.stroke();
+    // Index label at frustum face center
+    let lx = 0, ly = 0;
+    for (const c of f.corners) { lx += c.x; ly += c.y; }
+    lx /= 4; ly /= 4;
+    ctx.fillStyle = stroke;
+    ctx.font = "bold 11px JetBrains Mono, monospace";
+    ctx.fillText(String(f.idx), lx - (f.idx >= 10 ? 7 : 3), ly + 4);
+  }
+
+  // Shader-center direction arrow — only drawn when the user has
+  // shifted the center off the rig's natural origin.
+  const sCY = (state.rig && state.rig.shaderCenterYaw)   || 0;
+  const sCP = (state.rig && state.rig.shaderCenterPitch) || 0;
+  if (sCY !== 0 || sCP !== 0) {
+    const dir = _yawPitchToVec(sCY, sCP);
+    const o = project([0, 0, 0]);
+    const e = project([dir[0] * 1.4, dir[1] * 1.4, dir[2] * 1.4]);
+    ctx.strokeStyle = "rgba(200, 232, 90, 0.95)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(o.x, o.y);
+    ctx.lineTo(e.x, e.y);
+    ctx.stroke();
+    ctx.fillStyle = "rgba(200, 232, 90, 0.95)";
+    ctx.beginPath();
+    ctx.arc(e.x, e.y, 3.5, 0, 2 * Math.PI);
+    ctx.fill();
+  }
+
+  // Camera-orientation badge — corner pip showing roughly where
+  // "north" (yaw 0) is on the canvas. Helps reorient after orbit.
+  const north = project([0, 0, 1.05]);
+  ctx.fillStyle = "rgba(200, 232, 90, 0.55)";
+  ctx.font = "9px JetBrains Mono, monospace";
+  ctx.fillText("N", north.x - 3, north.y);
+}
+
+/* Wire camera-orbit + zoom on the gizmo canvas. Set up once on
+ * first toggle-open via _wireGizmoCanvas; subsequent opens reuse
+ * the existing handlers. */
+let _gizmoWired = false;
+function _wireGizmoCanvas() {
+  if (_gizmoWired) return;
+  const canvas = document.getElementById("rig-gizmo-canvas");
+  if (!canvas) return;
+  canvas.addEventListener("pointerdown", (e) => {
+    canvas.setPointerCapture(e.pointerId);
+    _gizmoDrag = {
+      px: e.clientX, py: e.clientY,
+      yaw0: _gizmoCam.yaw, pitch0: _gizmoCam.pitch
+    };
+    e.preventDefault();
+  });
+  canvas.addEventListener("pointermove", (e) => {
+    if (!_gizmoDrag) return;
+    const dx = e.clientX - _gizmoDrag.px;
+    const dy = e.clientY - _gizmoDrag.py;
+    _gizmoCam.yaw   = _gizmoDrag.yaw0 + dx * 0.5;
+    _gizmoCam.pitch = Math.max(-85, Math.min(85, _gizmoDrag.pitch0 + dy * 0.5));
+  });
+  const endDrag = (e) => {
+    if (!_gizmoDrag) return;
+    try { canvas.releasePointerCapture(e.pointerId); } catch (_) {}
+    _gizmoDrag = null;
+  };
+  canvas.addEventListener("pointerup",     endDrag);
+  canvas.addEventListener("pointercancel", endDrag);
+  canvas.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    _gizmoCam.scale *= e.deltaY < 0 ? 1.12 : (1 / 1.12);
+    _gizmoCam.scale = Math.max(0.25, Math.min(4, _gizmoCam.scale));
+  }, { passive: false });
+  _gizmoWired = true;
+}
+
 /* ----- Phase 6.1.7 — render loop (rAF) -------------------------------- */
 
 /* The visual render loop. Starts when the WebGPU device is ready and
@@ -20910,6 +21258,9 @@ function _visualRenderTick(t) {
   }
   _tickFpsReadout(t);
   if (!Visual.frozen) renderVisualFrame();
+  // Phase 6.5.16 — gizmo redraw. Cheap (single 280×280 canvas2d
+  // pass, ~200 line segments) and only runs when the gizmo is open.
+  if (_gizmoOpen) _drawGizmoFrame();
   _visualRafHandle = requestAnimationFrame(_visualRenderTick);
 }
 
@@ -27760,6 +28111,19 @@ ensureGPUDevice();
   }
   if (freezeBtn) {
     freezeBtn.addEventListener("click", toggleVisualFreeze);
+  }
+  // Phase 6.5.16 — gizmo toggle pill + close button. Wires the
+  // canvas's orbit/zoom handlers on first toggle-open.
+  const gizmoPill = document.getElementById("gizmo-pill");
+  const gizmoClose = document.getElementById("btn-rig-gizmo-close");
+  if (gizmoPill) {
+    gizmoPill.addEventListener("click", () => {
+      toggleRigGizmo();
+      if (_gizmoOpen) _wireGizmoCanvas();
+    });
+  }
+  if (gizmoClose) {
+    gizmoClose.addEventListener("click", () => _setGizmoOpen(false));
   }
 }
 </script>
