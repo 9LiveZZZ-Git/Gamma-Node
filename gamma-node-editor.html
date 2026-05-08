@@ -1903,6 +1903,13 @@
     font-family: var(--font-mono);
     font-size: 11px;
   }
+  .warp-editor-tri {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    cursor: pointer;
+  }
+  .warp-editor-tri input { cursor: pointer; }
   .warp-editor-close {
     background: none;
     border: none;
@@ -5597,8 +5604,16 @@
           <select id="warp-editor-res">
             <option value="4">4 × 4</option>
             <option value="8" selected>8 × 8</option>
+            <option value="12">12 × 12</option>
             <option value="16">16 × 16</option>
+            <option value="24">24 × 24</option>
+            <option value="32">32 × 32</option>
+            <option value="custom">Custom…</option>
           </select>
+        </label>
+        <label class="warp-editor-tri" title="Offset alternate rows by half a cell so quads triangulate as equilateral-ish triangles instead of rectangles. Useful for warps that need diagonal flexibility.">
+          <input type="checkbox" id="warp-editor-triangular">
+          Triangular
         </label>
         <button class="btn warp-editor-reset" id="warp-editor-reset" title="Reset to identity (no warp)">Reset</button>
         <button class="warp-editor-close" id="warp-editor-close" title="Cancel (Esc)">×</button>
@@ -12694,6 +12709,119 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     description: "Linear gradient — interpolates colorA → colorB along an angle (radians). Default is dark teal → warm amber along +x. r/g/b each ∈ [0, 1]; angle wraps 0..2π. Wire into VisualOutput for a moving sunset backdrop (animate angle from a clock signal once 6.5's bridge nodes ship)."
   },
 
+  /* MeshTest — calibration grid pattern. White grid lines + center
+   * crosshair + colored corner quadrants (R / G / B / Y) so the
+   * operator can verify warp + projection orientation at a glance.
+   * Different from a generic checker pattern: every cell carries
+   * orientation info (which corner you're looking at), so during
+   * warp editing you can tell "the top-left of the source image
+   * lands HERE" without ambiguity. */
+  MeshTest: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    ins:  [
+      { n: "density",   t: "param" },   // grid lines per unit (1..32)
+      { n: "lineWidth", t: "param" },   // 0..0.05 in UV
+      { n: "brightness",t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    params: {
+      density:    8,
+      lineWidth:  0.006,
+      brightness: 1.0
+    },
+    methods: {},
+    uniformBytes: 80,
+    wgsl:
+`struct U {
+  u_resolution: vec4f,
+  u_time:       f32,
+  u_dt:         f32,
+  _pad0:        vec2f,
+  u_view:       vec4f,
+  u_world_uv:   vec4f,
+  params:       vec4f,    // x = density, y = lineWidth, z = brightness, w = _
+};
+@group(0) @binding(0) var<uniform> u: U;
+
+struct VsOut {
+  @builtin(position) pos: vec4f,
+  @location(0) uv: vec2f,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(
+    vec2f(-1.0, -1.0),
+    vec2f( 3.0, -1.0),
+    vec2f(-1.0,  3.0),
+  );
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  // Use world_uv so a SHARED-consumer MeshTest spans the whole rig
+  // continuously — same idiom as Gradient. Solo-consumer collapses
+  // world_uv to in.uv which fills one display.
+  let wuv = mix(u.u_world_uv.xy, u.u_world_uv.zw, in.uv);
+
+  let density    = max(u.params.x, 1.0);
+  let lineWidth  = clamp(u.params.y, 0.0001, 0.05);
+  let brightness = max(u.params.z, 0.0);
+
+  // Quadrant tinting — R top-left, G top-right, B bottom-left,
+  // Y bottom-right. Soft so the grid lines stay legible on top.
+  let leftHalf = step(wuv.x, 0.5);
+  let topHalf  = step(wuv.y, 0.5);
+  let tintR = vec3<f32>(0.55, 0.10, 0.10) * leftHalf       * topHalf;
+  let tintG = vec3<f32>(0.10, 0.55, 0.10) * (1.0-leftHalf) * topHalf;
+  let tintB = vec3<f32>(0.10, 0.10, 0.55) * leftHalf       * (1.0-topHalf);
+  let tintY = vec3<f32>(0.55, 0.50, 0.10) * (1.0-leftHalf) * (1.0-topHalf);
+  var col = tintR + tintG + tintB + tintY;
+
+  // Major grid lines: white, lit when fract(uv * density) is within
+  // lineWidth of an integer.
+  let g = fract(wuv * density);
+  let dist = min(g, 1.0 - g);
+  let line = smoothstep(lineWidth, 0.0, min(dist.x, dist.y));
+  col = mix(col, vec3<f32>(1.0), line * 0.85);
+
+  // Center crosshair (at world UV 0.5) drawn brighter so the user
+  // can find "true center" through warp deformation.
+  let cdist = abs(wuv - vec2<f32>(0.5));
+  let cross = step(min(cdist.x, cdist.y), lineWidth * 1.6);
+  col = mix(col, vec3<f32>(0.95, 1.0, 0.65), cross * 0.7);
+
+  // Edge frame so the display boundary reads even after warp.
+  let edge = max(
+    step(wuv.x, lineWidth) + step(1.0 - lineWidth, wuv.x),
+    step(wuv.y, lineWidth) + step(1.0 - lineWidth, wuv.y)
+  );
+  col = mix(col, vec3<f32>(1.0), clamp(edge, 0.0, 1.0));
+
+  return vec4<f32>(col * brightness, 1.0);
+}`,
+    writeUniforms(node, scratch) {
+      // 80-byte buffer = 20 f32 indices.
+      //   indices  0–7   → preamble
+      //   indices  8–11  → u_view
+      //   indices 12–15  → u_world_uv
+      //   indices 16–19  → params (density, lineWidth, brightness, _)
+      const p = node.params || {};
+      scratch[16] = (typeof p.density    === "number") ? p.density    : 8;
+      scratch[17] = (typeof p.lineWidth  === "number") ? p.lineWidth  : 0.006;
+      scratch[18] = (typeof p.brightness === "number") ? p.brightness : 1.0;
+      scratch[19] = 0;
+    },
+    description: "Calibration grid — colored corner quadrants (R/G/B/Y) + white grid lines + center crosshair + edge frame. Wire into VisualOutput to verify warp meshes, edge blends, and projection orientation. params: density (grid lines per unit, 1..32), lineWidth (UV thickness 0..0.05), brightness."
+  },
+
   /* ---- B1: Math, single-arg trig (cmath) ---- */
   Sin:    { category: "Math", color: COLOR.math, header: "cmath", cppType: "", ins: [{n:"in", t:"audio"}], outs: [{n:"out", t:"audio"}], params: {}, template: "sinf({in})",   description: "sin(x), x in radians" },
   Cos:    { category: "Math", color: COLOR.math, header: "cmath", cppType: "", ins: [{n:"in", t:"audio"}], outs: [{n:"out", t:"audio"}], params: {}, template: "cosf({in})",   description: "cos(x), x in radians" },
@@ -13442,6 +13570,36 @@ function _makeIdentityWarpMesh(cols, rows) {
   return { cols, rows, verts };
 }
 
+/* Triangular variant of the identity mesh — alternate rows are
+ * offset by half a cell width so the (cols)×(rows) quads triangulate
+ * into diamonds instead of axis-aligned rectangles. Useful when the
+ * physical screen has curvature that doesn't align with the grid
+ * axes; the diagonal edges give the warp more freedom in the
+ * direction the rectangular grid wouldn't.
+ *
+ * The offset is applied to mesh NDC x only (preserves V mapping +
+ * intensity = 1 everywhere). UVs follow the offset so source
+ * sampling stays correct after warp edits. Edge columns stay pinned
+ * at x = ±1 so the boundary doesn't poke outside the quad. */
+function _makeTriangularWarpMesh(cols, rows) {
+  const m = _makeIdentityWarpMesh(cols, rows);
+  const W = cols + 1, H = rows + 1;
+  const halfCell = 0.5 / cols;
+  for (let r = 0; r < H; r++) {
+    if ((r & 1) === 0) continue;     // even rows untouched
+    for (let c = 0; c < W; c++) {
+      const i = (r * W + c) * 5;
+      // Pinned edges so the quad's outer boundary stays a clean rectangle.
+      if (c === 0 || c === cols) continue;
+      // Shift x by half-cell-NDC; matching shift in u so the
+      // sampled source content stays aligned to the new vertex.
+      m.verts[i + 0] += halfCell * 2;
+      m.verts[i + 2] += halfCell;
+    }
+  }
+  return m;
+}
+
 /* Build a test-warp mesh: identity grid with sinusoidal bow on x +
  * a horizontal intensity ramp on the left/right edges. Used by the
  * rig pane's per-display "warp: test" toggle to verify the full
@@ -13593,7 +13751,21 @@ function openWarpEditor(displayIdx) {
   const title = document.getElementById("warp-editor-title");
   if (title) title.textContent = "Warp editor — Display " + displayIdx + " (" + (d.name || "") + ")";
   const resSel = document.getElementById("warp-editor-res");
-  if (resSel) resSel.value = String(d.warpMesh.cols);
+  if (resSel) {
+    // Match the dropdown to the mesh's current cols. Non-square or
+    // out-of-preset sizes show as "Custom…".
+    const presetCols = ["4", "8", "12", "16", "24", "32"];
+    const colsStr = String(d.warpMesh.cols);
+    if (d.warpMesh.cols === d.warpMesh.rows && presetCols.includes(colsStr)) {
+      resSel.value = colsStr;
+    } else {
+      resSel.value = "custom";
+    }
+  }
+  // Triangular checkbox starts unchecked since we can't reliably
+  // detect a triangular mesh after load (the offset is baked in).
+  const triCheck = document.getElementById("warp-editor-triangular");
+  if (triCheck) triCheck.checked = false;
   // Drop GPU cache so the next frame rebuilds with the live edits.
   if (Visual && Visual._warpCache) Visual._warpCache.delete(d.id);
   _drawWarpEditor();
@@ -13778,11 +13950,62 @@ function _wireWarpEditor() {
 
   if (resSel) {
     resSel.addEventListener("change", () => {
-      const newDim = parseInt(resSel.value, 10);
-      if (!Number.isFinite(newDim) || newDim < 2) return;
       const d = state.rig && state.rig.displays && state.rig.displays[_warpEditor.displayIdx];
       if (!d) return;
-      d.warpMesh = _resampleWarpMesh(d.warpMesh, newDim, newDim);
+      let newCols, newRows;
+      if (resSel.value === "custom") {
+        // Prompt for "cols × rows" — accepts "16x12", "16 12", "16",
+        // "16, 12". Any non-numeric falls back to the previous mesh
+        // dimensions. Capped at 64 to protect the GPU buffers.
+        const cur = d.warpMesh ? (d.warpMesh.cols + " × " + d.warpMesh.rows) : "8 × 8";
+        const ans = (typeof prompt === "function")
+          ? prompt("Mesh resolution (cols × rows, max 64):", cur)
+          : null;
+        if (!ans) {
+          // User canceled — restore the dropdown to the current mesh's
+          // dimensions so the UI stays consistent.
+          if (d.warpMesh) resSel.value = String(d.warpMesh.cols);
+          return;
+        }
+        const nums = ans.match(/\d+/g);
+        if (!nums || !nums.length) {
+          if (d.warpMesh) resSel.value = String(d.warpMesh.cols);
+          return;
+        }
+        newCols = Math.max(1, Math.min(64, parseInt(nums[0], 10)));
+        newRows = nums.length > 1
+          ? Math.max(1, Math.min(64, parseInt(nums[1], 10)))
+          : newCols;
+      } else {
+        const v = parseInt(resSel.value, 10);
+        if (!Number.isFinite(v) || v < 2) return;
+        newCols = newRows = v;
+      }
+      // Resample into the new dim. If triangular is on, regenerate
+      // from scratch (offset rows) — there's no useful interpretation
+      // of "preserve the warp + add row offset," so the toggle wins.
+      const triCheck = document.getElementById("warp-editor-triangular");
+      const triangular = !!(triCheck && triCheck.checked);
+      d.warpMesh = triangular
+        ? _makeTriangularWarpMesh(newCols, newRows)
+        : _resampleWarpMesh(d.warpMesh, newCols, newRows);
+      if (Visual && Visual._warpCache) Visual._warpCache.delete(d.id);
+      _drawWarpEditor();
+    });
+  }
+  const triCheckbox = document.getElementById("warp-editor-triangular");
+  if (triCheckbox) {
+    triCheckbox.addEventListener("change", () => {
+      const d = state.rig && state.rig.displays && state.rig.displays[_warpEditor.displayIdx];
+      if (!d || !d.warpMesh) return;
+      // Regenerate at the current dim — toggling triangular discards
+      // any in-progress hand-edits (sensible: the offset is a
+      // generation-time choice, not a per-vertex edit). The existing
+      // Bourke mesh format stores the offset baked into vert positions
+      // so once saved, it's just a normal mesh.
+      d.warpMesh = triCheckbox.checked
+        ? _makeTriangularWarpMesh(d.warpMesh.cols, d.warpMesh.rows)
+        : _makeIdentityWarpMesh(d.warpMesh.cols, d.warpMesh.rows);
       if (Visual && Visual._warpCache) Visual._warpCache.delete(d.id);
       _drawWarpEditor();
     });
@@ -13791,7 +14014,10 @@ function _wireWarpEditor() {
     resetBtn.addEventListener("click", () => {
       const d = state.rig && state.rig.displays && state.rig.displays[_warpEditor.displayIdx];
       if (!d || !d.warpMesh) return;
-      d.warpMesh = _makeIdentityWarpMesh(d.warpMesh.cols, d.warpMesh.rows);
+      const triangular = !!(triCheckbox && triCheckbox.checked);
+      d.warpMesh = triangular
+        ? _makeTriangularWarpMesh(d.warpMesh.cols, d.warpMesh.rows)
+        : _makeIdentityWarpMesh(d.warpMesh.cols, d.warpMesh.rows);
       if (Visual && Visual._warpCache) Visual._warpCache.delete(d.id);
       _drawWarpEditor();
     });
@@ -21877,11 +22103,12 @@ function _encodeWarpPasses(enc) {
  * naturally. */
 function _createTheaterPipeline() {
   if (!Visual.device || !Visual.presentationFormat) return;
-  // Cap mesh dim used in theater for buffer sizing. The default warp
-  // mesh is 8×8 = 81 verts/display; this caps at 16×16 = 289 verts
-  // so a hand-edited finer mesh (when 6.6.9 ships) doesn't blow the
-  // buffer. Total worst-case = 32 displays × 289 verts × 28 B ≈ 260 KB.
-  const MESH_CAP = 16;
+  // Cap mesh dim used in theater for buffer sizing. Set to 32 to
+  // match the warp-editor's 32×32 ceiling — total worst-case =
+  // 32 displays × 33² verts × 28 B ≈ 975 KB vertex buffer +
+  // 32 × 32² × 6 × 4 B ≈ 786 KB index buffer. Total ~1.7 MB GPU,
+  // comfortable on any WebGPU adapter.
+  const MESH_CAP = 32;
   const vertsPerDisplayCap   = (MESH_CAP + 1) * (MESH_CAP + 1);
   const indicesPerDisplayCap = MESH_CAP * MESH_CAP * 6;
   Visual._theaterMeshCap         = MESH_CAP;
@@ -23775,6 +24002,46 @@ function _drawTextOverlay(ctx2, node, displays, layerCount, vp, tileW, tileH, co
       const ty  = vp.y + row * tileH;
       const cx  = tx + tileW * x;
       const cy  = ty + tileH * y;
+      const label = text
+        .replace(/\{idx\}/g,  String(i))
+        .replace(/\{name\}/g, d.name || ("Display " + (i + 1)))
+        .replace(/\{n\}/g,    String(layerCount));
+      drawAt(cx, cy, label);
+    }
+  } else if (perDisplay && mode === "theater") {
+    // Phase 6.6.13 carry-over — in theater mode, project each
+    // display's 3D center to canvas space using the theater camera
+    // and draw the label there. Labels follow displays as the user
+    // walks around. Displays behind the camera are skipped (clip.w
+    // ≤ 0 means projecting through the near plane); displays
+    // outside the canvas (NDC out of [-1, 1]) are clipped naturally
+    // by drawAt landing offscreen — it's fine to overdraw the
+    // letterbox because the canvas2D clears each frame.
+    const ov = document.getElementById("visual-overlay");
+    if (!ov || !Visual || !Visual.theaterCam) return;
+    const cw = ov.width, ch = ov.height;
+    const aspect = (cw && ch) ? cw / ch : 1;
+    const vpMat = _theaterViewProjMatrix(Visual.theaterCam, aspect);
+    const R = 5.0;     // theater sphere radius (must match _buildTheaterMeshGeometry)
+    for (let i = 0; i < layerCount; i++) {
+      const d = displays[i];
+      if (!d) continue;
+      const pose = d.pose || { yaw: 0, pitch: 0 };
+      const yr = pose.yaw   * Math.PI / 180;
+      const pr = pose.pitch * Math.PI / 180;
+      // World-space display center on the rig sphere.
+      const wx = R * Math.sin(yr) * Math.cos(pr);
+      const wy = R * Math.sin(pr);
+      const wz = R * Math.cos(yr) * Math.cos(pr);
+      // Project: clip = vpMat * (wx, wy, wz, 1)
+      const c0 = vpMat[0]*wx + vpMat[4]*wy + vpMat[8]*wz  + vpMat[12];
+      const c1 = vpMat[1]*wx + vpMat[5]*wy + vpMat[9]*wz  + vpMat[13];
+      const c3 = vpMat[3]*wx + vpMat[7]*wy + vpMat[11]*wz + vpMat[15];
+      if (c3 <= 0.0001) continue;     // behind camera
+      const ndcX = c0 / c3;
+      const ndcY = c1 / c3;
+      const cx = vp.x + (ndcX * 0.5 + 0.5) * vp.w;
+      const cy = vp.y + (1 - (ndcY * 0.5 + 0.5)) * vp.h;
       const label = text
         .replace(/\{idx\}/g,  String(i))
         .replace(/\{name\}/g, d.name || ("Display " + (i + 1)))
