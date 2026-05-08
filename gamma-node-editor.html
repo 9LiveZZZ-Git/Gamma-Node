@@ -1781,6 +1781,59 @@
   body.theater-mode.theater-locked #visual-bg {
     cursor: none;       /* native pointer-lock hides the cursor anyway */
   }
+
+  /* Phase 6.6.13 — touch pads for theater navigation. Hidden by
+   * default; .theater-touch on body shows them. body.theater-touch
+   * is added by _wireTheaterInput when navigator.maxTouchPoints > 0
+   * AND the rig is in theater mode. Pads sit at the bottom corners
+   * with a generous tap target for thumb reach on a held tablet. */
+  .theater-pad {
+    display: none;
+    position: fixed;
+    bottom: 28px;
+    width: 130px;
+    height: 130px;
+    border-radius: 50%;
+    background: rgba(8, 11, 16, 0.45);
+    border: 2px solid rgba(127, 119, 221, 0.55);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    z-index: 90;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  body.theater-mode.theater-touch .theater-pad { display: block; }
+  #theater-pad-move { left: 28px; }
+  #theater-pad-look { right: 28px; }
+  .theater-pad-knob {
+    position: absolute;
+    top: 50%; left: 50%;
+    width: 50px;
+    height: 50px;
+    margin: -25px 0 0 -25px;
+    border-radius: 50%;
+    background: rgba(170, 162, 240, 0.45);
+    border: 1px solid rgba(170, 162, 240, 0.85);
+    pointer-events: none;
+    transition: background .12s;
+  }
+  .theater-pad.theater-pad-active .theater-pad-knob {
+    background: rgba(200, 232, 90, 0.55);
+    border-color: rgba(200, 232, 90, 0.95);
+  }
+  .theater-pad-label {
+    position: absolute;
+    bottom: 6px;
+    left: 0;
+    width: 100%;
+    text-align: center;
+    color: rgba(200, 195, 250, 0.85);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    pointer-events: none;
+  }
   /* Everything in #app sits on top of the visual layer. */
   #app { position: relative; z-index: 1; }
 
@@ -5383,6 +5436,20 @@
      directly on top of #visual-bg in DOM order so labels/highlights
      layer above the WebGPU output. Inert (no pointer events). -->
 <canvas id="visual-overlay"></canvas>
+
+<!-- Phase 6.6.13 — touch-screen pads for theater navigation. Visible
+     only when the rig is in theater preview AND the device reports
+     touch capability. Two analog "sticks" — left = move, right = look.
+     Use pointer events so iPad / Android / touch-laptop all hit the
+     same code path. -->
+<div id="theater-pad-move" class="theater-pad" data-pad="move">
+  <div class="theater-pad-knob"></div>
+  <div class="theater-pad-label">MOVE</div>
+</div>
+<div id="theater-pad-look" class="theater-pad" data-pad="look">
+  <div class="theater-pad-knob"></div>
+  <div class="theater-pad-label">LOOK</div>
+</div>
 
 <!-- Live Mode overlay — visible only when body.live-mode is set.
      Floating "exit" affordance in the corner: discreet enough to
@@ -20343,13 +20410,20 @@ const Visual = {
   theaterSampler:         null,   // anisotropic-filtered sampler for distance smoothing
   theaterCam: {
     pos:   [0, 0, 0],     // eye position in rig space (origin = rig center)
-    yaw:   0,             // radians; 0 looks toward -Z
-    pitch: 0,             // radians; clamped ±85°
+    yaw:   0,             // radians; 0 looks toward +Z (default display 0 direction)
+    pitch: 0,             // radians; clamped ±88°
     fov:   60,            // degrees, vertical
     speed: 2.0,           // units / second; Shift = 4× sprint
     sensitivity: 0.0025,  // radians per pixel of mouse movement
     pointerLocked: false,
-    keys: new Set()       // currently-held keys (lowercased)
+    keys: new Set(),      // currently-held keys (KeyboardEvent.key — case-sensitive)
+    // Touch-stick analog state. Set by the on-screen pads in
+    // _wireTouchPads; consumed in _theaterStepCamera. Each axis
+    // is in [-1, 1] (normalized stick deflection). Null when no
+    // touch is active so the keyboard path stays untouched on
+    // mouse-only setups.
+    touchMove: null,      // { fwd: -1..1, strafe: -1..1 }
+    touchLook: null       // { dx: rad/sec, dy: rad/sec }
   },
   theaterInputWired: false, // set once the document-level listeners are attached
 
@@ -21545,8 +21619,20 @@ function _theaterViewProjMatrix(cam, aspect) {
  * Q = down, E = up, Shift = sprint). */
 function _theaterStepCamera(dt) {
   const cam = Visual.theaterCam;
-  if (cam.keys.size === 0) return;
-  const speed = cam.speed * (cam.keys.has("shift") ? 4 : 1) * dt;
+  // Apply touch-stick look first (keyboard look comes from mouse-
+  // pointerlock movement events directly into yaw/pitch). Touch
+  // delivers a continuous "rate" while the finger is held, scaled
+  // by dt here so the same gesture distance gives consistent
+  // angular speed regardless of frame rate.
+  if (cam.touchLook) {
+    cam.yaw   -= cam.touchLook.dx * dt;
+    cam.pitch -= cam.touchLook.dy * dt;
+    const lim = Math.PI * 0.49;
+    if (cam.pitch >  lim) cam.pitch =  lim;
+    if (cam.pitch < -lim) cam.pitch = -lim;
+  }
+  if (cam.keys.size === 0 && !cam.touchMove) return;
+  const speed = cam.speed * (cam.keys.has("Shift") ? 4 : 1) * dt;
   const cy = Math.cos(cam.yaw),   sy = Math.sin(cam.yaw);
   const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
   // World-space forward / right vectors at current orientation. Same
@@ -21554,12 +21640,23 @@ function _theaterStepCamera(dt) {
   const fx = sy * cp, fy = sp, fz = cy * cp;
   const rx = cy,      ry = 0,  rz = -sy;
   let dx = 0, dy = 0, dz = 0;
-  if (cam.keys.has("w")) { dx += fx; dy += fy; dz += fz; }
-  if (cam.keys.has("s")) { dx -= fx; dy -= fy; dz -= fz; }
-  if (cam.keys.has("d")) { dx += rx; dy += ry; dz += rz; }
-  if (cam.keys.has("a")) { dx -= rx; dy -= ry; dz -= rz; }
-  if (cam.keys.has("e")) { dy += 1; }      // world-up regardless of pitch
-  if (cam.keys.has("q")) { dy -= 1; }
+  // Keyboard: arrow keys + PageUp/PageDown. Names match KeyboardEvent.key
+  // exactly so the lookups stay simple. Touch-stick deltas (set in
+  // _touchPad below) are added separately and don't go through this
+  // key set — they bypass the held-key logic since touch is already
+  // analog.
+  if (cam.keys.has("ArrowUp"))    { dx += fx; dy += fy; dz += fz; }
+  if (cam.keys.has("ArrowDown"))  { dx -= fx; dy -= fy; dz -= fz; }
+  if (cam.keys.has("ArrowRight")) { dx += rx; dy += ry; dz += rz; }
+  if (cam.keys.has("ArrowLeft"))  { dx -= rx; dy -= ry; dz -= rz; }
+  if (cam.keys.has("PageUp"))     { dy += 1; }   // world-up regardless of pitch
+  if (cam.keys.has("PageDown"))   { dy -= 1; }
+  // Touch-stick movement (analog from the on-screen pad).
+  if (cam.touchMove) {
+    dx += fx * cam.touchMove.fwd  + rx * cam.touchMove.strafe;
+    dy += fy * cam.touchMove.fwd  + ry * cam.touchMove.strafe;
+    dz += fz * cam.touchMove.fwd  + rz * cam.touchMove.strafe;
+  }
   // Normalize so diagonals don't move faster than axes.
   const l = Math.hypot(dx, dy, dz);
   if (l > 0.0001) {
@@ -21610,24 +21707,123 @@ function _wireTheaterInput() {
     if (Visual.theaterCam.pitch >  lim) Visual.theaterCam.pitch =  lim;
     if (Visual.theaterCam.pitch < -lim) Visual.theaterCam.pitch = -lim;
   });
+  // Theater movement keys deliberately AVOID the QWERTY musical
+  // keyboard map (W A S D E L… are mapped to MIDI notes) — using
+  // arrow keys + PageUp/PageDown means audio runtime can keep
+  // playing notes while the user moves around in theater mode.
+  // Shift is kept as the sprint modifier — Shift is harmless
+  // alongside note-playing (the keyboard reads bare keys).
   document.addEventListener("keydown", (e) => {
     if (!state || !state.rig || state.rig.previewMode !== "theater") return;
     if (!Visual.theaterCam.pointerLocked) return;
     // TODO (6.6.9): defer to active shader-frag camera owner if any.
-    const k = e.key.toLowerCase();
-    if (["w","a","s","d","q","e","shift"].includes(k)) {
+    const k = e.key;
+    const handled = ["ArrowUp","ArrowDown","ArrowLeft","ArrowRight","PageUp","PageDown","Shift"];
+    if (handled.includes(k)) {
       Visual.theaterCam.keys.add(k);
       e.preventDefault();
     }
   });
   document.addEventListener("keyup", (e) => {
-    const k = e.key.toLowerCase();
-    Visual.theaterCam.keys.delete(k);
+    Visual.theaterCam.keys.delete(e.key);
   });
   // Drop all held keys when pointer lock releases — otherwise a user
-  // who holds W and presses Esc has the camera drift forever.
+  // who holds an arrow key and presses Esc has the camera drift forever.
   document.addEventListener("pointerlockchange", () => {
     if (!Visual.theaterCam.pointerLocked) Visual.theaterCam.keys.clear();
+  });
+
+  // Touch-screen pads. Visible only when navigator.maxTouchPoints > 0
+  // AND the rig is in theater mode (gated by body.theater-touch +
+  // body.theater-mode classes set in _updateProjectionPill +
+  // _wireTouchPads).
+  if (navigator.maxTouchPoints > 0 || ("ontouchstart" in window)) {
+    document.body.classList.add("theater-touch-capable");
+    _wireTouchPads();
+  }
+}
+
+/* Phase 6.6.13 — virtual on-screen sticks for touch navigation.
+ * Each pad is a 130 px circle; touching + dragging moves the inner
+ * "knob" toward the touch point. The pad center represents zero
+ * deflection; the pad radius (knob can travel half-radius from
+ * center for clarity) maps to ±1 stick deflection.
+ *
+ * The knob position drives:
+ *   move pad → cam.touchMove = { fwd: -dy/maxR, strafe: dx/maxR }
+ *   look pad → cam.touchLook = { dx: dx/maxR * lookGain,
+ *                                 dy: dy/maxR * lookGain }
+ *
+ * touchLook is a RATE (radians/sec), so holding the look pad to one
+ * side keeps rotating; touchMove is a NORMAL (analog deflection), so
+ * holding the move pad to one side moves at constant speed. Same
+ * idiom as console game first-person controls. */
+function _wireTouchPads() {
+  const pads = document.querySelectorAll(".theater-pad");
+  pads.forEach(pad => {
+    const knob = pad.querySelector(".theater-pad-knob");
+    let active = null;   // pointerId currently controlling this pad
+    const updateKnob = (dx, dy, maxR) => {
+      const cl = Math.max(0, Math.min(1, Math.hypot(dx, dy) / maxR));
+      if (cl > 1) { dx = dx / cl; dy = dy / cl; }
+      const visualX = Math.max(-maxR/2, Math.min(maxR/2, dx));
+      const visualY = Math.max(-maxR/2, Math.min(maxR/2, dy));
+      knob.style.transform = "translate(" + visualX + "px, " + visualY + "px)";
+    };
+    const reset = () => {
+      knob.style.transform = "";
+      pad.classList.remove("theater-pad-active");
+      if (pad.dataset.pad === "move") Visual.theaterCam.touchMove = null;
+      else                             Visual.theaterCam.touchLook = null;
+    };
+    pad.addEventListener("pointerdown", (e) => {
+      if (active !== null) return;        // one finger per pad
+      active = e.pointerId;
+      try { pad.setPointerCapture(e.pointerId); } catch (_) {}
+      pad.classList.add("theater-pad-active");
+      e.preventDefault();
+    });
+    pad.addEventListener("pointermove", (e) => {
+      if (e.pointerId !== active) return;
+      const r = pad.getBoundingClientRect();
+      const cx = r.left + r.width  * 0.5;
+      const cy = r.top  + r.height * 0.5;
+      const maxR = r.width * 0.5;
+      let dx = e.clientX - cx;
+      let dy = e.clientY - cy;
+      // Clamp deflection magnitude to maxR so analog signal saturates
+      // at ±1; the knob still moves to the edge but doesn't overshoot
+      // the visual ring.
+      const len = Math.hypot(dx, dy);
+      if (len > maxR) { dx = dx * maxR / len; dy = dy * maxR / len; }
+      updateKnob(dx, dy, maxR);
+      const nx = dx / maxR;       // normalized -1..1
+      const ny = dy / maxR;
+      // Apply a small dead zone to prevent drift from a slightly-off-
+      // center resting touch.
+      const dead = 0.08;
+      const m = Math.hypot(nx, ny);
+      const scale = m > dead ? (m - dead) / (1 - dead) / m : 0;
+      const sx = nx * scale, sy = ny * scale;
+      if (pad.dataset.pad === "move") {
+        // Up on the pad = forward (positive forward axis).
+        Visual.theaterCam.touchMove = { fwd: -sy, strafe: sx };
+      } else {
+        // Look pad delivers a RATE: stick deflection × lookGain rad/s.
+        // 2 rad/s at full stick gives ~115°/s — comfortable for
+        // looking around without dizzy.
+        const lookGain = 2.0;
+        Visual.theaterCam.touchLook = { dx: sx * lookGain, dy: sy * lookGain };
+      }
+    });
+    const end = (e) => {
+      if (e.pointerId !== active) return;
+      try { pad.releasePointerCapture(e.pointerId); } catch (_) {}
+      active = null;
+      reset();
+    };
+    pad.addEventListener("pointerup",     end);
+    pad.addEventListener("pointercancel", end);
   });
 }
 
@@ -21925,12 +22121,22 @@ function _updateProjectionPill() {
   // previewMode (dropdown / pill / loadPatch / applyRigTemplate)
   // converges through the pill update and stays consistent.
   document.body.classList.toggle("theater-mode", mode === "theater");
+  // Phase 6.6.13 — show touch pads when in theater mode AND device
+  // is touch-capable. theater-touch-capable is set once at device-
+  // init time in _wireTheaterInput; it persists. theater-touch is
+  // the runtime gate.
+  document.body.classList.toggle(
+    "theater-touch",
+    mode === "theater" && document.body.classList.contains("theater-touch-capable")
+  );
   if (mode !== "theater") {
     document.body.classList.remove("theater-locked");
-    // Drop any held movement keys so a mode switch mid-walk doesn't
-    // leave the camera drifting on next theater entry.
+    // Drop any held movement keys / touch sticks so a mode switch
+    // mid-walk doesn't leave the camera drifting on next theater entry.
     if (Visual && Visual.theaterCam) {
       Visual.theaterCam.keys.clear();
+      Visual.theaterCam.touchMove = null;
+      Visual.theaterCam.touchLook = null;
       if (Visual.theaterCam.pointerLocked && document.pointerLockElement) {
         try { document.exitPointerLock(); } catch (_) {}
       }
@@ -22637,26 +22843,36 @@ function _drawVisualOverlay() {
   // Phase 6.6.13 — theater-mode entry hint. Visible when the rig is
   // in theater preview but the user hasn't engaged pointer-lock yet.
   // Hides itself once the camera is captured so it doesn't clutter
-  // the immersive view.
-  if (mode === "theater" && Visual.theaterCam && !Visual.theaterCam.pointerLocked) {
-    _drawTheaterHint(ctx2, vp);
+  // the immersive view. On touch devices the pads are always live, so
+  // the hint reads as touch instructions instead of the pointer-lock
+  // gesture.
+  const isTouch = document.body.classList.contains("theater-touch-capable");
+  if (mode === "theater" && Visual.theaterCam && !Visual.theaterCam.pointerLocked && !isTouch) {
+    _drawTheaterHint(ctx2, vp, false);
+  }
+  if (mode === "theater" && isTouch && Visual.theaterCam && !Visual.theaterCam.touchMove && !Visual.theaterCam.touchLook) {
+    _drawTheaterHint(ctx2, vp, true);
   }
 }
 
 /* Phase 6.6.13 — small instructional plate centered on the visual
  * viewport when theater mode is awaiting user engagement. Once the
- * pointer is locked the hint goes away. ESC releases lock and the
- * hint reappears, so users always have a visible path back. */
-function _drawTheaterHint(ctx2, vp) {
+ * pointer is locked (or any pad is active) the hint goes away. */
+function _drawTheaterHint(ctx2, vp, isTouch) {
   const dpr = window.devicePixelRatio || 1;
   const cx = vp.x + vp.w * 0.5;
   const cy = vp.y + vp.h * 0.5;
   const fontMain = Math.max(20 * dpr, vp.h * 0.04);
   const fontSub  = fontMain * 0.55;
-  const lines = [
-    "Click to enter Theater control",
-    "W A S D move · Q E up/down · Shift sprint · Mouse look · ESC release"
-  ];
+  const lines = isTouch
+    ? [
+        "Theater mode",
+        "Drag the LEFT pad to move · Drag the RIGHT pad to look around"
+      ]
+    : [
+        "Click to enter Theater control",
+        "Arrows move · PgUp/PgDn up/down · Shift sprint · Mouse look · ESC release"
+      ];
   ctx2.textAlign = "center";
   ctx2.textBaseline = "middle";
 
@@ -30052,6 +30268,11 @@ ensureGPUDevice();
       // safe-to-toggle because in live-mode there are no text inputs
       // visible — #app is display:none — so this branch wins.
       if (!isLiveMode() && isTextInput(document.activeElement)) return;
+      // Audio runtime takes priority — L is mapped to a MIDI note
+      // (D5 in QWERTY_TO_MIDI). When the preview is playing, "L"
+      // should ring out a note, not flip the editor mode. Once the
+      // user stops audio, L resumes its mode-toggle role.
+      if (typeof previewState !== "undefined" && previewState && previewState.state === "playing") return;
       e.preventDefault();
       toggleLiveMode();
       return;
