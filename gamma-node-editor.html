@@ -1888,6 +1888,34 @@
   }
   .rig-edit-input { appearance: textfield; -moz-appearance: textfield; }
 
+  /* Phase 6.6.4 — warp toggle pill on each display row. Three states
+   * (off / identity / test) get distinct accent colors so the rig
+   * pane reads at a glance. Click cycles through. Replaced by the
+   * full mesh editor in 6.6.9. */
+  .rig-warp-btn {
+    margin-left: 6px;
+    padding: 0 8px;
+    height: 22px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    color: var(--text-3);
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+    transition: background .12s, color .12s, border-color .12s;
+  }
+  .rig-warp-btn:hover { background: var(--surface-3); color: var(--text); }
+  .rig-warp-btn.rig-warp-identity {
+    border-color: rgba(127, 119, 221, 0.45);
+    color: rgba(170, 162, 240, 0.95);
+  }
+  .rig-warp-btn.rig-warp-test {
+    border-color: rgba(226, 75, 74, 0.55);
+    color: rgba(240, 130, 130, 0.95);
+  }
+
   /* Shader-center yaw/pitch inputs in the .rig-grid use the same
    * 28px height as the dropdowns so the rows align. */
   .rig-grid > .rig-grid-input {
@@ -13017,6 +13045,31 @@ function _makeIdentityWarpMesh(cols, rows) {
   return { cols, rows, verts };
 }
 
+/* Build a test-warp mesh: identity grid with sinusoidal bow on x.
+ * Used by the rig pane's per-display "warp: test" toggle to verify
+ * the warp pipeline ships pixels visibly without committing to a
+ * full editor UX. The bow is symmetric so the four corners stay
+ * pinned at the canvas edges; the middle of each row pushes inward
+ * by ~12% — enough to read clearly, not so much that the content
+ * leaves the tile. The _isTest flag lets the rig pane recognize a
+ * test mesh so the toggle's three-state cycle works correctly. */
+function _makeTestWarpMesh(cols, rows) {
+  const m = _makeIdentityWarpMesh(cols, rows);
+  const W = cols + 1, H = rows + 1;
+  for (let r = 0; r < H; r++) {
+    for (let c = 0; c < W; c++) {
+      const i = (r * W + c) * 5;
+      const v = r / rows;
+      // Pinch the middle of each row toward the center: scale x by
+      // (1 - 0.12 * sin(πv)). Top + bottom rows untouched (sin=0).
+      const k = 1.0 - 0.12 * Math.sin(Math.PI * v);
+      m.verts[i + 0] *= k;
+    }
+  }
+  m._isTest = true;
+  return m;
+}
+
 /* Quick validation for warpMesh objects loaded from .gpatch. Returns
  * true if the mesh has the expected shape and a vert array of the
  * correct length. Used in migrateDisplayShape to drop garbage meshes
@@ -13281,6 +13334,7 @@ function applyRigTemplate(key) {
     _allocateFramebuffer();
     _rebuildBlitBindGroup();
     _rebuildRigCompositeBindGroup();
+    _rebuildWarpBindGroup();
   }
   render();
   renderProps && renderProps();
@@ -14725,6 +14779,13 @@ function renderRigPane() {
   const displayRows = rig.displays.map((d, i) => {
     const pose = d.pose || { yaw: 0, pitch: 0, roll: 0 };
     const fov  = d.fov  || { h: 90, v: 60 };
+    // Phase 6.6.4 — warp state pill. Three states cycle on click:
+    //   off (no warp) → identity (mesh exists but no distortion) →
+    //   test (sinusoidal bow distortion, used to verify the warp pass
+    //   ships pixels). Real per-vertex editing comes in 6.6.9.
+    const warpState = !d.warpMesh ? "off"
+                     : (d.warpMesh._isTest ? "test" : "identity");
+    const warpLabel = ({ off: "warp: off", identity: "warp: identity", test: "warp: test" })[warpState];
     return `<div class="rig-display-row rig-display-row-edit" data-display-index="${i}">
       <span class="rig-display-idx">${i}</span>
       <span class="rig-display-name">${escapeText(d.name || ("Display " + (i + 1)))}</span>
@@ -14737,6 +14798,9 @@ function renderRigPane() {
         <input type="number" class="rig-edit-input" data-field="fov.h"      value="${(+fov.h).toFixed(0)}" step="1" min="1" max="360" />
         <label>fovV</label>
         <input type="number" class="rig-edit-input" data-field="fov.v"      value="${(+fov.v).toFixed(0)}" step="1" min="1" max="180" />
+        <button class="rig-warp-btn rig-warp-${warpState}"
+                data-display-warp-toggle="${i}"
+                title="Cycle warp state (off → identity → test). Phase 6.6.4 placeholder for the warp editor.">${warpLabel}</button>
       </span>
     </div>`;
   }).join("");
@@ -14824,6 +14888,32 @@ function wireRigPaneHandlers() {
   // No re-render of the rig pane on every keystroke (would steal
   // focus from the input mid-edit) — just call render() to repaint
   // the visual canvas. The pane re-renders on next deselection.
+  // Phase 6.6.4 — warp-state toggle on each display row.
+  // Cycle: off (null) → identity → test (sin-bow) → off …
+  document.querySelectorAll('[data-display-warp-toggle]').forEach(btn => {
+    btn.addEventListener("click", () => {
+      const i = parseInt(btn.dataset.displayWarpToggle, 10);
+      const display = state.rig && state.rig.displays && state.rig.displays[i];
+      if (!display) return;
+      pushHistory("rig-warp-toggle:" + i);
+      const cur = !display.warpMesh ? "off" : (display.warpMesh._isTest ? "test" : "identity");
+      const next = cur === "off" ? "identity" : (cur === "identity" ? "test" : "off");
+      if (next === "off")           display.warpMesh = null;
+      else if (next === "identity") display.warpMesh = _makeIdentityWarpMesh(8, 8);
+      else                          display.warpMesh = _makeTestWarpMesh(8, 8);
+      // Drop the cached GPU buffers so the next frame rebuilds with
+      // the new mesh dimensions / contents.
+      if (Visual && Visual._warpCache) Visual._warpCache.delete(display.id);
+      // Mark as customized so the template dropdown doesn't pretend
+      // we're still on the preset.
+      if (state.rig && Object.keys(RIG_TEMPLATES).includes(state.rig.templateKey)) {
+        state.rig.templateKey = "custom";
+      }
+      renderProps && renderProps();
+      render();
+    });
+  });
+
   document.querySelectorAll('.rig-edit-input').forEach(input => {
     input.addEventListener("input", () => {
       const row = input.closest(".rig-display-row");
@@ -19730,6 +19820,20 @@ const Visual = {
   rigCompositeUniformBuffer: null, // 32 B uniform: layer_count, cols, rows, mode + azim/pitch ranges
   rigDisplaysBuffer:      null, // 256 B uniform array of (yaw, pitch, fov_h, fov_v) — one vec4 per display, max 16
 
+  // Phase 6.6.4 — calibration warp pass. Runs after the rig composite
+  // in tile mode for displays with a non-null warpMesh. Overdraws each
+  // warped display's tile with a Bourke-mesh-warped sample of its
+  // source layer; non-warped displays show the un-warped composite
+  // result through. One shared pipeline + dynamic-offset uniform
+  // buffer (16 slots × 256 B) so per-display draws don't need their
+  // own bind groups.
+  warpPipeline:           null,
+  warpBindGroupLayout:    null,
+  warpBindGroup:          null,   // rebuilt when framebuffer changes; uses dynamic offset
+  warpUniformBuffer:      null,   // 16 × 256 = 4096 B; per-display layer + edge-blend params
+  warpUniformStride:      256,    // min uniform-buffer-binding alignment
+  _warpCache:             new Map(),  // displayId → { vBuffer, iBuffer, indexCount, vCapacity, iCapacity, sig }
+
   // Phase 6.1.5 — HUD state. `frozen` pauses the future rAF render
   // loop without touching audio. `fps` is updated each frame by
   // _tickFpsReadout (called from the rAF loop in 6.1.7+); for now
@@ -19846,9 +19950,11 @@ async function ensureGPUDevice() {
       // group references.
       _createBlitPipeline();
       _createRigCompositePipeline();
+      _createWarpPipeline();
       _allocateFramebuffer();
       _rebuildBlitBindGroup();
       _rebuildRigCompositeBindGroup();
+      _rebuildWarpBindGroup();
       Visual.startTime  = performance.now();
       Visual.lastFrameT = 0;
       smokeClearVisual();
@@ -20231,6 +20337,299 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     size: 256,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
   });
+}
+
+/* ----- Phase 6.6.4 — calibration warp pipeline ------------------------ */
+
+/* The warp pipeline draws one Bourke mesh per display as triangle
+ * strips, sampling the display's source array layer at each vertex's
+ * (u, v) and positioning the output at the vertex's (x, y) NDC. Edge-
+ * blend intensity is multiplied into the fragment color so overlap
+ * regions can fade between projectors.
+ *
+ * Architecture:
+ *   - Vertex layout matches the Bourke 5-float-per-vertex format:
+ *     stride 20 B; @location(0) = pos.xy, @location(1) = uv.xy,
+ *     @location(2) = intensity. No conversion needed at upload — the
+ *     in-memory plain Array maps 1:1 to a Float32Array view.
+ *   - One shared bind group + uniform buffer, with dynamic offset
+ *     selecting a per-display slot (16 × 256 B = 4096 B). Each slot
+ *     packs (layer u32, gamma f32, blackLift f32, power f32) — the
+ *     edge-blend params get consumed in 6.6.5+; layer is the array
+ *     index of the display's framebuffer layer.
+ *   - Per-display vertex/index buffers cached in Visual._warpCache.
+ *     Re-allocated only when mesh dimensions change; otherwise the
+ *     existing buffer is overwritten in place. Mesh signatures are
+ *     just "cols×rows" — sufficient because the mesh editor (6.6.9)
+ *     will swap reference on dimension change but mutate-in-place
+ *     for vertex-position edits, and we want the in-place edits to
+ *     pick up automatically.
+ *
+ * Render rules:
+ *   - Only runs in tile preview mode. Non-tile modes (cylinder/
+ *     equirect/fisheye) show the audience-perspective unwrap, where
+ *     per-projector warp doesn't apply — the warp pass is silently
+ *     skipped.
+ *   - Pass is loaded (not cleared) so non-warped displays' un-warped
+ *     composite output remains visible.
+ *   - One render pass per warped display so the viewport can be set
+ *     to that display's tile. Cheap — at 16 displays × 8×8 mesh =
+ *     ~1300 verts and 16 draw calls per frame, well below GPU budget.
+ */
+function _createWarpPipeline() {
+  if (!Visual.device || !Visual.presentationFormat) return;
+  const wgsl = /* wgsl */ `
+struct VsOut {
+  @builtin(position) pos: vec4f,
+  @location(0) uv: vec2f,
+  @location(1) intensity: f32,
+};
+
+@vertex
+fn vs_main(
+  @location(0) inPos:       vec2f,
+  @location(1) inUv:        vec2f,
+  @location(2) inIntensity: f32
+) -> VsOut {
+  var o: VsOut;
+  o.pos       = vec4f(inPos, 0.0, 1.0);
+  o.uv        = inUv;
+  o.intensity = inIntensity;
+  return o;
+}
+
+struct WarpU {
+  layer:      u32,
+  gamma:      f32,
+  blackLift:  f32,
+  power:      f32,
+};
+
+@group(0) @binding(0) var fbTex:    texture_2d_array<f32>;
+@group(0) @binding(1) var fbSampler: sampler;
+@group(0) @binding(2) var<uniform> u: WarpU;
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  // Phase 6.6.4 — minimal fragment, just intensity multiply. Gamma /
+  // blackLift / power stay zero-effect here; 6.6.5–6.6.8 wire them.
+  let c = textureSampleLevel(fbTex, fbSampler, in.uv, u.layer, 0.0);
+  return vec4f(c.rgb * in.intensity, c.a);
+}
+`;
+  const module = Visual.device.createShaderModule({ label: "warp-shader", code: wgsl });
+
+  Visual.warpBindGroupLayout = Visual.device.createBindGroupLayout({
+    label: "warp-bgl",
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d-array" } },
+      { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+      { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: 16 } }
+    ]
+  });
+
+  Visual.warpPipeline = Visual.device.createRenderPipeline({
+    label: "warp-pipeline",
+    layout: Visual.device.createPipelineLayout({
+      bindGroupLayouts: [Visual.warpBindGroupLayout]
+    }),
+    vertex: {
+      module, entryPoint: "vs_main",
+      buffers: [{
+        arrayStride: 20,                      // 5 floats × 4 bytes
+        attributes: [
+          { shaderLocation: 0, offset: 0,  format: "float32x2" }, // x, y
+          { shaderLocation: 1, offset: 8,  format: "float32x2" }, // u, v
+          { shaderLocation: 2, offset: 16, format: "float32"   }  // intensity
+        ]
+      }]
+    },
+    fragment: {
+      module, entryPoint: "fs_main",
+      targets: [{ format: Visual.presentationFormat }]
+    },
+    primitive: { topology: "triangle-list" }
+  });
+
+  // 16 slots × 256 B alignment = 4096 B. Each slot = 16 B used:
+  //   offset 0:  layer u32
+  //   offset 4:  gamma f32
+  //   offset 8:  blackLift f32
+  //   offset 12: power f32
+  Visual.warpUniformBuffer = Visual.device.createBuffer({
+    label: "warp-uniform",
+    size: 16 * Visual.warpUniformStride,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+  });
+}
+
+/* Rebuild the warp bind group when the framebuffer texture array
+ * changes (display count or resolution change re-allocates the FBO).
+ * Same shape as the rig composite bind group rebuild — fixed layout,
+ * texture array view + sampler + uniform get re-bound. The uniform
+ * binding sets size to 16 (one slot) so dynamic offsets address one
+ * slot at a time. */
+function _rebuildWarpBindGroup() {
+  if (!Visual.device || !Visual.framebufferArrayView ||
+      !Visual.warpBindGroupLayout || !Visual.blitSampler ||
+      !Visual.warpUniformBuffer) return;
+  Visual.warpBindGroup = Visual.device.createBindGroup({
+    label: "warp-bg",
+    layout: Visual.warpBindGroupLayout,
+    entries: [
+      { binding: 0, resource: Visual.framebufferArrayView },
+      { binding: 1, resource: Visual.blitSampler },
+      { binding: 2, resource: { buffer: Visual.warpUniformBuffer, offset: 0, size: 16 } }
+    ]
+  });
+}
+
+/* Build (or update in place) the per-display vertex + index buffers
+ * for a display's warpMesh. Returns the cache entry on success or
+ * null on failure (invalid mesh, no device). Buffers are allocated
+ * lazily — first frame after a mesh appears is the only frame that
+ * pays the GPUBuffer-create cost; subsequent frames reuse the buffer
+ * and just writeBuffer the new vert data.
+ *
+ * Cache key is the display.id string. Re-allocates the GPU buffer
+ * only when the mesh's vertex / index count changes (the cached
+ * "sig" is "cols×rows"); position-only edits of the same-size mesh
+ * are an in-place writeBuffer. */
+function _buildOrUpdateWarpMeshBuffers(display) {
+  if (!Visual.device || !display || !_validateWarpMesh(display.warpMesh)) return null;
+  const mesh = display.warpMesh;
+  const W = mesh.cols + 1, H = mesh.rows + 1;
+  const vertCount = W * H;
+  const idxCount  = mesh.cols * mesh.rows * 6;
+  const sig = mesh.cols + "x" + mesh.rows;
+
+  let entry = Visual._warpCache.get(display.id);
+  if (!entry) {
+    entry = { vBuffer: null, iBuffer: null, indexCount: 0, vCapacity: 0, iCapacity: 0, sig: "" };
+    Visual._warpCache.set(display.id, entry);
+  }
+
+  // Re-allocate GPU buffers if mesh dimensions changed.
+  if (entry.sig !== sig) {
+    if (entry.vBuffer) entry.vBuffer.destroy();
+    if (entry.iBuffer) entry.iBuffer.destroy();
+    // Round size up to multiple of 4 (WebGPU buffer requirement).
+    const vBytes = Math.ceil(vertCount * 5 * 4 / 4) * 4;
+    const iBytes = Math.ceil(idxCount  * 2     / 4) * 4;
+    entry.vBuffer = Visual.device.createBuffer({
+      label: "warp-verts:" + display.id,
+      size: vBytes,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST
+    });
+    entry.iBuffer = Visual.device.createBuffer({
+      label: "warp-indices:" + display.id,
+      size: iBytes,
+      usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST
+    });
+    entry.vCapacity = vertCount;
+    entry.iCapacity = idxCount;
+    entry.sig = sig;
+    // Index buffer: build once, write once. Order is consistent
+    // across same-dim meshes so subsequent updates skip this.
+    const indices = new Uint16Array(idxCount);
+    let k = 0;
+    for (let r = 0; r < mesh.rows; r++) {
+      for (let c = 0; c < mesh.cols; c++) {
+        const tl =  r      * W + c;
+        const tr = tl + 1;
+        const bl = (r + 1) * W + c;
+        const br = bl + 1;
+        // Triangle 1: tl, bl, tr; Triangle 2: tr, bl, br.
+        // Counter-clockwise winding when y is up; primitive face
+        // culling is off in our pipeline so winding is moot anyway.
+        indices[k++] = tl; indices[k++] = bl; indices[k++] = tr;
+        indices[k++] = tr; indices[k++] = bl; indices[k++] = br;
+      }
+    }
+    Visual.device.queue.writeBuffer(entry.iBuffer, 0, indices.buffer, indices.byteOffset, indices.byteLength);
+  }
+
+  // Always write fresh vertex data — handles in-place position edits
+  // from the warp editor without needing change-detection plumbing.
+  // For the typical 8×8 mesh that's 1620 B/frame at most — negligible.
+  const verts = new Float32Array(mesh.verts);
+  Visual.device.queue.writeBuffer(entry.vBuffer, 0, verts.buffer, verts.byteOffset, verts.byteLength);
+  entry.indexCount = idxCount;
+  return entry;
+}
+
+/* Encode the warp passes — one render pass per warped display, each
+ * setting a viewport on its tile and drawing the cached mesh. Loaded
+ * (not cleared) so the un-warped composite remains visible behind /
+ * around the warped tiles. Returns the number of warped displays
+ * drawn. Skips entirely in non-tile preview modes. */
+function _encodeWarpPasses(enc) {
+  if (!Visual.device || !Visual.context || !Visual.warpPipeline ||
+      !Visual.warpBindGroup || !Visual.warpUniformBuffer) return 0;
+  const mode = (state && state.rig && state.rig.previewMode) || "tile";
+  if (mode !== "tile") return 0;
+  const displays = (state && state.rig && state.rig.displays) || [];
+  const layerCount = Math.min(Visual.framebufferLayerViews.length || 0, displays.length, 16);
+  if (layerCount === 0) return 0;
+
+  // Viewport math — same tile layout as the composite.
+  const { cols, rows } = _rigTileLayout(layerCount);
+  const masterAspect = _projectionMasterAspect();
+  const vp = _projectionViewportRect(masterAspect);
+  const tileW = vp.w / cols;
+  const tileH = vp.h / rows;
+
+  // Pre-pack the per-display uniform slots and write the whole buffer
+  // once. Each slot = (layer u32, gamma f32, blackLift f32, power f32);
+  // remaining bytes per 256 B slot stay zero.
+  const slotF = Visual.warpUniformStride / 4;        // floats per slot
+  const ubuf  = new ArrayBuffer(layerCount * Visual.warpUniformStride);
+  const ubF32 = new Float32Array(ubuf);
+  const ubU32 = new Uint32Array(ubuf);
+  for (let i = 0; i < layerCount; i++) {
+    const d = displays[i] || {};
+    const eb = d.edgeBlend || _defaultEdgeBlend();
+    ubU32[i * slotF + 0] = i;
+    ubF32[i * slotF + 1] = eb.gamma;
+    ubF32[i * slotF + 2] = eb.blackLift;
+    ubF32[i * slotF + 3] = eb.power;
+  }
+  Visual.device.queue.writeBuffer(Visual.warpUniformBuffer, 0, ubuf);
+
+  let canvasView;
+  try { canvasView = Visual.context.getCurrentTexture().createView(); }
+  catch (e) { return 0; }
+
+  let drawn = 0;
+  for (let i = 0; i < layerCount; i++) {
+    const d = displays[i];
+    if (!d || !d.warpMesh) continue;            // un-warped: skip
+    const entry = _buildOrUpdateWarpMeshBuffers(d);
+    if (!entry) continue;
+
+    const col = i % cols;
+    const row = Math.floor(i / cols);
+    const tx  = vp.x + col * tileW;
+    const ty  = vp.y + row * tileH;
+
+    const pass = enc.beginRenderPass({
+      label: "warp:" + d.id,
+      colorAttachments: [{
+        view: canvasView,
+        loadOp: "load",
+        storeOp: "store"
+      }]
+    });
+    pass.setPipeline(Visual.warpPipeline);
+    pass.setBindGroup(0, Visual.warpBindGroup, [i * Visual.warpUniformStride]);
+    pass.setVertexBuffer(0, entry.vBuffer);
+    pass.setIndexBuffer(entry.iBuffer, "uint16");
+    pass.setViewport(tx, ty, tileW, tileH, 0, 1);
+    pass.drawIndexed(entry.indexCount);
+    pass.end();
+    drawn++;
+  }
+  return drawn;
 }
 
 /* Rebuild the rig composite bind group when the framebuffer changes
@@ -21381,6 +21780,10 @@ function renderVisualFrame() {
 
   if (rendered && Visual.rigCompositePipeline && Visual.rigCompositeBindGroup) {
     _encodeRigComposite(enc);
+    // Phase 6.6.4 — overdraw warped tiles on top of the un-warped
+    // composite. No-op when no display has a warpMesh or when the
+    // preview is in a non-tile mode.
+    _encodeWarpPasses(enc);
   } else {
     // No VisualOutputs / nothing renderable → smoke-clear path. Clears
     // layer 0 + blits via the original single-texture pipeline so the
