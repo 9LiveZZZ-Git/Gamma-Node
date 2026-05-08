@@ -13187,14 +13187,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     uniformBytes: 96,
     wgsl:
 `struct U {
-  u_resolution: vec4f,
-  u_time:       f32,
-  u_dt:         f32,
-  _pad0:        vec2f,
-  u_view:       vec4f,
-  u_world_uv:   vec4f,
-  params:       vec4f,    // x=decay, y=tintR, z=tintG, w=tintB
-  speedAndPad:  vec4f,    // x=speed, yzw=_
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,    // (Phase 6.3.2) array-layer index of this shader's
+  _pad0:         f32,    //   framebuffer write target — i.e. THIS display.
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=decay, y=tintR, z=tintG, w=tintB
+  speedAndPad:   vec4f,    // x=speed, yzw=_
 };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
@@ -13221,10 +13222,10 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4f {
-  // Sample the previous frame at this fragment's UV. Layer index 0
-  // is fine for the global-history MVP — proper per-display feedback
-  // arrives with per-node intermediates in 6.3.4.
-  let prev = textureSampleLevel(fbHistory, fbSampler, in.uv, 0, 0.0);
+  // Sample THIS display's previous frame from the per-layer history
+  // texture. u.u_layer is the framebuffer array-layer index that this
+  // shader's pass writes to — same layer to read history from.
+  let prev = textureSampleLevel(fbHistory, fbSampler, in.uv, u32(u.u_layer), 0.0);
 
   // Generative seed: a moving radial pattern so there's something
   // to "trail." Without a seed signal the feedback fades to black
@@ -24857,7 +24858,16 @@ function _disposeShaderInstance(nodeId) {
  *   floats  0-3  / bytes  0-15  → u_resolution: vec4f (w, h, 1/w, 1/h)
  *   float   4    / bytes 16-19  → u_time: f32 (seconds since device acquired)
  *   float   5    / bytes 20-23  → u_dt: f32 (seconds since previous frame)
- *   floats  6-7  / bytes 24-31  → _pad0: vec2f (always 0)
+ *   float   6    / bytes 24-27  → u_layer: f32 (the array-layer index of
+ *                                  the framebuffer this shader writes to —
+ *                                  i.e. THIS display's index in state.rig.displays).
+ *                                  Phase 6.3.2 added this so feedback /
+ *                                  composition shaders can sample the right
+ *                                  layer of feedback / intermediate textures.
+ *                                  Older shaders keep declaring `_pad0: vec2f`
+ *                                  in their struct; layout is identical so they
+ *                                  just don't reference the slot.
+ *   float   7    / bytes 28-31  → _pad: f32 (always 0; reserved for future)
  *   floats  8-11 / bytes 32-47  → u_view: vec4f (yaw, pitch, roll, fov_h_deg) of THIS display
  *   floats 12-15 / bytes 48-63  → u_world_uv: vec4f (minU, minV, maxU, maxV) on rig master canvas
  *
@@ -24866,7 +24876,7 @@ function _disposeShaderInstance(nodeId) {
  *   let world_uv = mix(u.u_world_uv.xy, u.u_world_uv.zw, in.uv);
  * Single-display rigs default to u_world_uv = (0,0,1,1) so existing
  * shaders that read in.uv directly behave identically. */
-function _writeShaderPreamble(scratch, dtSec, display, worldUvOverride) {
+function _writeShaderPreamble(scratch, dtSec, display, worldUvOverride, layerIdx) {
   const t = (performance.now() - Visual.startTime) * 0.001;
   scratch[0]  = Visual.fbWidth;
   scratch[1]  = Visual.fbHeight;
@@ -24874,7 +24884,7 @@ function _writeShaderPreamble(scratch, dtSec, display, worldUvOverride) {
   scratch[3]  = 1.0 / Visual.fbHeight;
   scratch[4]  = t;
   scratch[5]  = dtSec;
-  scratch[6]  = 0;
+  scratch[6]  = (typeof layerIdx === "number" && Number.isFinite(layerIdx)) ? layerIdx : 0;
   scratch[7]  = 0;
   // Defensive: missing display falls back to a single-display default
   // so the preamble is always well-formed. Same defaults make a new
@@ -25056,7 +25066,7 @@ function _encodeShaderFragPassForVO(enc, vo, src, def, dtSec, layerIdx) {
   // shader spans the connected displays correctly.
   const display = state.rig && state.rig.displays && state.rig.displays[layerIdx];
   const renderWuv = _renderWorldUvForVO(vo, src.id);
-  _writeShaderPreamble(inst.scratch, dtSec, display, renderWuv);
+  _writeShaderPreamble(inst.scratch, dtSec, display, renderWuv, layerIdx);
   if (typeof def.writeUniforms === "function") {
     def.writeUniforms(src, inst.scratch);
   }
