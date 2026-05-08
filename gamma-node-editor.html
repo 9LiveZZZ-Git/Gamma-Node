@@ -12956,6 +12956,111 @@ function defaultRig() {
   };
 }
 
+/* ---------- Phase 6.6 — calibration & warp data layer ---------- */
+
+/* A "Bourke mesh" is the calibration warp format introduced by Paul
+ * Bourke for dome / panoramic projection rigs. Each vertex carries 5
+ * floats:
+ *
+ *     (x, y,   u, v,   intensity)
+ *      └────┘  └────┘  └───────┘
+ *      output  source  edge-blend
+ *      NDC     UV      multiplier
+ *
+ * The mesh is a regular (cols+1) × (rows+1) grid of vertices, forming
+ * cols × rows quads. The render path (Phase 6.6.4) uploads the verts
+ * as a vertex buffer and draws the grid as triangle strips, sampling
+ * the display's source layer at (u, v) and writing to (x, y) on the
+ * projector's framebuffer. The intensity is multiplied into the
+ * fragment color so overlap regions can fade between projectors.
+ *
+ *   x, y       — output position in normalized device coords [-1, 1].
+ *                Default identity grid: x = u*2 - 1, y = v*2 - 1.
+ *                Calibration shifts these to compensate for screen
+ *                curvature, projector keystoning, and lens distortion.
+ *
+ *   u, v       — source texture coords in [0, 1]. Default identity:
+ *                u = c / cols, v = r / rows. Adjusting these is rare
+ *                — calibration usually moves x/y, not u/v — but the
+ *                format supports it so one display can preview a
+ *                sub-region of its source layer if useful.
+ *
+ *   intensity  — edge-blend multiplier in [0, 1]. Default 1 (no blend).
+ *                Auto-blend (Phase 6.6.11) generates ramps so adjacent
+ *                projectors' intensities sum to ~1 in the overlap.
+ *
+ * In-memory representation: plain Array of length (cols+1)*(rows+1)*5
+ * so it round-trips through JSON.stringify in .gpatch saves without
+ * loss. Float32Array conversion happens at GPU upload time, not before.
+ *
+ * A warpMesh of `null` means "no warp" — the render path falls back to
+ * the fullscreen-triangle pipeline, which is what every patch saved
+ * before Phase 6.6 has. Identity warp meshes (built via
+ * _makeIdentityWarpMesh) are functionally equivalent to null but allow
+ * subsequent calibration edits without re-allocating the mesh. */
+function _makeIdentityWarpMesh(cols, rows) {
+  cols = Math.max(1, cols | 0); rows = Math.max(1, rows | 0);
+  const W = cols + 1, H = rows + 1;
+  const verts = new Array(W * H * 5);
+  for (let r = 0; r < H; r++) {
+    for (let c = 0; c < W; c++) {
+      const u = c / cols;
+      const v = r / rows;
+      const i = (r * W + c) * 5;
+      verts[i + 0] = u * 2 - 1;     // x in NDC
+      verts[i + 1] = v * 2 - 1;     // y in NDC
+      verts[i + 2] = u;              // u in source UV
+      verts[i + 3] = v;              // v in source UV
+      verts[i + 4] = 1;              // intensity (no blend)
+    }
+  }
+  return { cols, rows, verts };
+}
+
+/* Quick validation for warpMesh objects loaded from .gpatch. Returns
+ * true if the mesh has the expected shape and a vert array of the
+ * correct length. Used in migrateDisplayShape to drop garbage meshes
+ * silently — better to fall back to no-warp than render glitched
+ * output from a malformed mesh. */
+function _validateWarpMesh(m) {
+  if (!m || typeof m !== "object") return false;
+  if (!Number.isInteger(m.cols) || m.cols < 1) return false;
+  if (!Number.isInteger(m.rows) || m.rows < 1) return false;
+  if (!Array.isArray(m.verts))                 return false;
+  const expected = (m.cols + 1) * (m.rows + 1) * 5;
+  if (m.verts.length !== expected) return false;
+  for (let i = 0; i < m.verts.length; i++) {
+    if (!Number.isFinite(m.verts[i])) return false;
+  }
+  return true;
+}
+
+/* Edge-blend parameter defaults. These are the values applied by the
+ * blend WGSL pass (Phase 6.6.5–6.6.8). Gamma 2.2 matches the standard
+ * sRGB → linear gamma — applying it before blending and reversing
+ * after gives perceptually-uniform brightness across the overlap.
+ * blackLift and power start at "no perceptual effect" so a default-
+ * configured rig that hasn't been hand-tuned simply renders the
+ * identity blend. */
+function _defaultEdgeBlend() {
+  return { gamma: 2.2, blackLift: 0, power: 2.0 };
+}
+
+/* Validate edge-blend params loaded from .gpatch. Numbers must be
+ * finite; gamma > 0 (avoid divide-by-zero); blackLift in [0, 1];
+ * power > 0. Returns a clean object with any invalid fields replaced
+ * by defaults. */
+function _migrateEdgeBlend(eb) {
+  const def = _defaultEdgeBlend();
+  if (!eb || typeof eb !== "object") return def;
+  const out = {
+    gamma:     Number.isFinite(eb.gamma)     && eb.gamma     > 0 ? eb.gamma     : def.gamma,
+    blackLift: Number.isFinite(eb.blackLift) && eb.blackLift >= 0 && eb.blackLift <= 1 ? eb.blackLift : def.blackLift,
+    power:     Number.isFinite(eb.power)     && eb.power     > 0 ? eb.power     : def.power
+  };
+  return out;
+}
+
 function _makeDisplay(id, name, overrides) {
   return Object.assign({
     id,
@@ -12964,6 +13069,11 @@ function _makeDisplay(id, name, overrides) {
     fov:       { h: 90, v: 60 },
     aspect:    16 / 9,
     curvature: 0,
+    // Phase 6.6 — calibration warp + edge blend. null = no warp,
+    // fullscreen-triangle pipeline. Becomes a Bourke mesh once the
+    // user runs the warp editor (6.6.9) or imports MPCDI (6.6.2).
+    warpMesh:  null,
+    edgeBlend: _defaultEdgeBlend(),
     worldUv:   { minU: 0, minV: 0, maxU: 1, maxV: 1 }
   }, overrides);
 }
@@ -17350,6 +17460,17 @@ document.getElementById("file-input").addEventListener("change", ev => {
       // Phase 6.5.15+ — synthesize shader-center fields for older rigs.
       if (typeof state.rig.shaderCenterYaw   !== "number") state.rig.shaderCenterYaw   = 0;
       if (typeof state.rig.shaderCenterPitch !== "number") state.rig.shaderCenterPitch = 0;
+      // Phase 6.6 — synthesize calibration warp + edge-blend fields
+      // on every display so the render path can read them without
+      // null checks. Pre-6.6 patches get warpMesh=null (no warp) +
+      // default edgeBlend. Garbage meshes (validation fails) silently
+      // drop to null rather than crashing the warp pass.
+      state.rig.displays.forEach(d => {
+        if (!("warpMesh" in d) || (d.warpMesh !== null && !_validateWarpMesh(d.warpMesh))) {
+          d.warpMesh = null;
+        }
+        d.edgeBlend = _migrateEdgeBlend(d.edgeBlend);
+      });
       state.nodes.forEach(n => {
         if (n.type === "VisualOutput") {
           if (!n.params) n.params = {};
