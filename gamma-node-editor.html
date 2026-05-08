@@ -5159,7 +5159,7 @@
      stay out of the visual content, obvious enough that the user
      can find their way back. Auto-fades after a few seconds of
      mouse stillness; reappears on any pointer movement. -->
-<div id="live-mode-overlay" aria-hidden="true">
+<div id="live-mode-overlay">
   <button class="btn live-exit" id="btn-live-exit" type="button"
           title="Exit Live Mode (L or Esc)">↩ Exit Live</button>
 </div>
@@ -12072,10 +12072,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   _pad0:        vec2f,
   u_view:       vec4f,
   u_world_uv:   vec4f,
-  angle:        f32,
-  _pad1:        vec3f,
   colorA:       vec4f,
   colorB:       vec4f,
+  angleAndPad:  vec4f,    // x = angle (radians); yzw unused
 };
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -12107,38 +12106,40 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   // rig, with the seam landing wherever displays meet on the
   // master canvas.
   let world_uv = mix(u.u_world_uv.xy, u.u_world_uv.zw, in.uv);
-  let dir = vec2f(cos(u.angle), sin(u.angle));
+  let angle = u.angleAndPad.x;
+  let dir = vec2f(cos(angle), sin(angle));
   let centered = world_uv - vec2f(0.5);
   let t = clamp(dot(centered, dir) + 0.5, 0.0, 1.0);
   return mix(u.colorA, u.colorB, t);
 }`,
     writeUniforms(node, scratch) {
-      // 112-byte buffer = 28 f32 indices. WGSL struct alignment puts
-      // vec4 fields on 16-byte boundaries and vec3 on 16-byte too
-      // (vec3 reserves its 4-aligned slot). Layout:
-      //   bytes  0–15  / indices  0–3   → u_resolution     (preamble)
-      //   bytes 16–19  / index    4     → u_time            (preamble)
-      //   bytes 20–23  / index    5     → u_dt              (preamble)
-      //   bytes 24–31  / indices  6–7   → _pad0             (preamble)
-      //   bytes 32–47  / indices  8–11  → u_view            (preamble)
-      //   bytes 48–63  / indices 12–15  → u_world_uv        (preamble)
-      //   bytes 64–67  / index   16     → angle             (user)
-      //   bytes 68–79  / indices 17–19  → _pad1             (alignment)
-      //   bytes 80–95  / indices 20–23  → colorA            (user)
-      //   bytes 96–111 / indices 24–27  → colorB            (user)
+      // 112-byte buffer = 28 f32 indices. WGSL struct alignment with
+      // angleAndPad as the trailing vec4 (instead of a stray vec3
+      // after a scalar — vec3 has align 16 in WGSL even though it
+      // only carries 12 bytes, which would balloon the struct to 128
+      // and mismatch the buffer size).
+      //   bytes  0–15  / indices  0–3   → u_resolution    (preamble)
+      //   bytes 16–19  / index    4     → u_time          (preamble)
+      //   bytes 20–23  / index    5     → u_dt            (preamble)
+      //   bytes 24–31  / indices  6–7   → _pad0           (preamble)
+      //   bytes 32–47  / indices  8–11  → u_view          (preamble)
+      //   bytes 48–63  / indices 12–15  → u_world_uv      (preamble)
+      //   bytes 64–79  / indices 16–19  → colorA          (user)
+      //   bytes 80–95  / indices 20–23  → colorB          (user)
+      //   bytes 96–111 / indices 24–27  → angleAndPad     (user; .x = angle)
       const p = node.params || {};
-      scratch[16] = (typeof p.angle === "number") ? p.angle : 0.0;
-      // scratch[17..19] = 0 (alignment pad — preamble already zeroed
-      // _pad0; this _pad1 is fresh territory but Float32Array init
-      // zero-fills the whole buffer, and we never write here).
-      scratch[20] = (typeof p.rA === "number") ? p.rA : 0.05;
-      scratch[21] = (typeof p.gA === "number") ? p.gA : 0.10;
-      scratch[22] = (typeof p.bA === "number") ? p.bA : 0.20;
+      scratch[16] = (typeof p.rA === "number") ? p.rA : 0.05;
+      scratch[17] = (typeof p.gA === "number") ? p.gA : 0.10;
+      scratch[18] = (typeof p.bA === "number") ? p.bA : 0.20;
+      scratch[19] = 1.0;
+      scratch[20] = (typeof p.rB === "number") ? p.rB : 0.85;
+      scratch[21] = (typeof p.gB === "number") ? p.gB : 0.55;
+      scratch[22] = (typeof p.bB === "number") ? p.bB : 0.20;
       scratch[23] = 1.0;
-      scratch[24] = (typeof p.rB === "number") ? p.rB : 0.85;
-      scratch[25] = (typeof p.gB === "number") ? p.gB : 0.55;
-      scratch[26] = (typeof p.bB === "number") ? p.bB : 0.20;
-      scratch[27] = 1.0;
+      scratch[24] = (typeof p.angle === "number") ? p.angle : 0.0;
+      scratch[25] = 0;
+      scratch[26] = 0;
+      scratch[27] = 0;
     },
     description: "Linear gradient — interpolates colorA → colorB along an angle (radians). Default is dark teal → warm amber along +x. r/g/b each ∈ [0, 1]; angle wraps 0..2π. Wire into VisualOutput for a moving sunset backdrop (animate angle from a clock signal once 6.5's bridge nodes ship)."
   },
@@ -19675,6 +19676,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   // layer scaled to fit. Cells past the layer count (e.g. n=5 in a
   // 3×2 grid leaves one empty cell) render solid black so the
   // operator can see a missing slot.
+  //
+  // textureSampleLevel (not textureSample) — the cell-index branch
+  // below makes control flow non-uniform across pixels, which
+  // textureSample (with implicit derivatives) prohibits. Sampling at
+  // mip level 0 explicitly is fine; we don't need derivatives anyway
+  // for a fullscreen blit.
   if (rigU.mode == 0u || rigU.mode > 3u) {
     let cx = floor(in.uv.x * f32(rigU.cols));
     let ry = floor(in.uv.y * f32(rigU.rows));
@@ -19686,11 +19693,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       fract(in.uv.x * f32(rigU.cols)),
       fract(in.uv.y * f32(rigU.rows))
     );
-    return textureSample(fbTex, fbSampler, local_uv, idx);
+    return textureSampleLevel(fbTex, fbSampler, local_uv, idx, 0.0);
   }
   // Placeholder: cylinder / equirect / fisheye fall back to layer 0
   // sampled across the canvas until 6.5.11-13 ship the real math.
-  return textureSample(fbTex, fbSampler, in.uv, 0);
+  return textureSampleLevel(fbTex, fbSampler, in.uv, 0u, 0.0);
 }
 `;
   const module = Visual.device.createShaderModule({ label: "rig-composite-shader", code: wgsl });
