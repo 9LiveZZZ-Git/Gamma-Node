@@ -5400,6 +5400,8 @@
         <div class="visual-hud" id="visual-hud">
           <button class="visual-hud-pill" id="res-pill" type="button"
                   title="Render resolution — click to cycle 1080p → 1440p → 4K → 8K. Affects framebuffer size, not browser window size.">1080p</button>
+          <button class="visual-hud-pill" id="proj-pill" type="button"
+                  title="Operator preview projection — click to cycle Tile-flat → Cylinder → Equirect → Fisheye. Same content, different unwrap of the multi-display rig onto your screen.">Tile</button>
           <span class="visual-hud-pill visual-hud-readout" id="fps-readout"
                 title="Frame rate (rAF cadence). Stays at — fps until shader nodes drive an animation loop in Phase 6.1.7+.">— fps</span>
           <button class="visual-hud-pill visual-hud-icon" id="freeze-btn" type="button"
@@ -14464,8 +14466,9 @@ function wireRigPaneHandlers() {
       pushHistory("rig-preview:" + pv.value);
       if (!state.rig) state.rig = defaultRig();
       state.rig.previewMode = pv.value;
-      // The actual preview-mode-aware compositor lands in 6.5.10–6.5.13.
-      // For now this just persists the user's choice in the .gpatch.
+      // Keep the visual HUD's projection pill in sync with this
+      // dropdown — the two control the same state.
+      if (typeof _updateProjectionPill === "function") _updateProjectionPill();
       render();
     });
   }
@@ -19334,7 +19337,8 @@ const Visual = {
   rigCompositePipeline:   null, // pipeline for the tile-flat / equirect / etc. composite
   rigCompositeBindGroupLayout: null,
   rigCompositeBindGroup:  null, // rebuilt when framebuffer / layer count changes
-  rigCompositeUniformBuffer: null, // small uniform: layer_count, cols, rows, mode
+  rigCompositeUniformBuffer: null, // 32 B uniform: layer_count, cols, rows, mode + azim/pitch ranges
+  rigDisplaysBuffer:      null, // 256 B uniform array of (yaw, pitch, fov_h, fov_v) — one vec4 per display, max 16
 
   // Phase 6.1.5 — HUD state. `frozen` pauses the future rAF render
   // loop without touching audio. `fps` is updated each frame by
@@ -19679,30 +19683,64 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
   return out;
 }
 
+const PI: f32 = 3.14159265359;
+
 struct RigU {
   layer_count: u32,
   cols:        u32,
   rows:        u32,
-  mode:        u32,   // 0=tile, 1=cylinder, 2=equirect, 3=fisheye (1-3 placeholder = fall through to tile)
+  mode:        u32,    // 0 = tile-flat, 1 = cylinder, 2 = equirect, 3 = fisheye
+  azim_range:  vec2f,  // (min, max) yaw degrees — cylinder mode bounds
+  pitch_range: vec2f,  // (min, max) pitch degrees — cylinder mode bounds
 };
+
+// Per-display orientation for spherical-projection modes. Each entry:
+//   .x = yaw degrees (azimuth)
+//   .y = pitch degrees (elevation)
+//   .z = horizontal FOV degrees
+//   .w = vertical FOV degrees
+// MAX 16 entries; layer_count limits the loop in pickDisplay.
+struct RigDisplays {
+  d: array<vec4f, 16>,
+};
+
 @group(0) @binding(0) var fbTex:    texture_2d_array<f32>;
 @group(0) @binding(1) var fbSampler: sampler;
 @group(0) @binding(2) var<uniform> rigU: RigU;
+@group(0) @binding(3) var<uniform> rigDisplays: RigDisplays;
+
+// Find which display covers a (yaw, pitch) direction. Returns
+// vec3(local_u, local_v, layer_index_as_f32), or layer < 0 when
+// no display covers this direction. First-match-wins iteration
+// order — overlapping displays in the rig get resolved by the
+// earlier-indexed one taking the pixel. Phase 6.6 will revisit
+// this with edge-blend alpha + warp meshes.
+fn pickDisplay(yaw_deg: f32, pitch_deg: f32) -> vec3f {
+  for (var i: u32 = 0u; i < rigU.layer_count; i = i + 1u) {
+    let info = rigDisplays.d[i];
+    let d_yaw   = info.x;
+    let d_pitch = info.y;
+    let d_fovH  = info.z;
+    let d_fovV  = info.w;
+    // Wrap yaw delta into [-180, +180] so wrap-around at the dateline
+    // doesn't cause a false miss for displays straddling ±180°.
+    var dy = yaw_deg - d_yaw;
+    dy = dy - 360.0 * floor((dy + 180.0) / 360.0);
+    let dp = pitch_deg - d_pitch;
+    if (abs(dy) <= d_fovH * 0.5 && abs(dp) <= d_fovV * 0.5) {
+      let u = dy / d_fovH + 0.5;
+      let v = -dp / d_fovV + 0.5;   // flip v: pitch-up = canvas-up
+      return vec3f(u, v, f32(i));
+    }
+  }
+  return vec3f(0.0, 0.0, -1.0);
+}
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4f {
-  // Tile-flat compositor. The visible canvas is divided into a
-  // cols × rows grid; each cell shows one display's framebuffer
-  // layer scaled to fit. Cells past the layer count (e.g. n=5 in a
-  // 3×2 grid leaves one empty cell) render solid black so the
-  // operator can see a missing slot.
-  //
-  // textureSampleLevel (not textureSample) — the cell-index branch
-  // below makes control flow non-uniform across pixels, which
-  // textureSample (with implicit derivatives) prohibits. Sampling at
-  // mip level 0 explicitly is fine; we don't need derivatives anyway
-  // for a fullscreen blit.
-  if (rigU.mode == 0u || rigU.mode > 3u) {
+  // Mode 0 = tile-flat. Pure 2D layout, ignores pose/fov; uses cell
+  // index → array layer. Useful for QC during patching.
+  if (rigU.mode == 0u) {
     let cx = floor(in.uv.x * f32(rigU.cols));
     let ry = floor(in.uv.y * f32(rigU.rows));
     let idx = u32(ry) * rigU.cols + u32(cx);
@@ -19715,9 +19753,51 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     );
     return textureSampleLevel(fbTex, fbSampler, local_uv, idx, 0.0);
   }
-  // Placeholder: cylinder / equirect / fisheye fall back to layer 0
-  // sampled across the canvas until 6.5.11-13 ship the real math.
-  return textureSampleLevel(fbTex, fbSampler, in.uv, 0u, 0.0);
+
+  // Modes 1/2/3 — angular projection. Each translates a canvas pixel
+  // to a (yaw, pitch) direction; pickDisplay finds the covering
+  // display and returns local UV + layer for sampling. Pixels not
+  // covered by any display render solid black ("no signal").
+  var yaw_deg: f32 = 0.0;
+  var pitch_deg: f32 = 0.0;
+  var valid: bool = true;
+
+  if (rigU.mode == 1u) {
+    // Cylindrical unwrap — canvas u → yaw across rig's azimuth
+    // bounding range; canvas v → pitch across rig's pitch range
+    // (top of canvas = highest pitch). Best for ≤180° wraparound
+    // rigs where vertical coverage is narrow.
+    yaw_deg   = mix(rigU.azim_range.x,  rigU.azim_range.y,  in.uv.x);
+    pitch_deg = mix(rigU.pitch_range.y, rigU.pitch_range.x, in.uv.y);
+  } else if (rigU.mode == 2u) {
+    // Equirectangular — full 360° H × 180° V. The "AlloSphere
+    // panoramic" view: projects the entire sphere into a 2:1
+    // image. Top of canvas = +90° pitch (zenith), bottom = -90°.
+    // Use this with rig templates that fill ≥180° H or full 360°.
+    yaw_deg   = (in.uv.x - 0.5) * 360.0;
+    pitch_deg = (0.5 - in.uv.y) * 180.0;
+  } else if (rigU.mode == 3u) {
+    // Stereographic / fisheye — equiangular dome projection from
+    // sphere center looking up. Canvas center = zenith (+Y up,
+    // pitch +90°); canvas edge = horizon (pitch 0°). Beyond the
+    // unit circle is unreachable on the dome and renders black.
+    let centered = (in.uv - vec2f(0.5)) * 2.0;
+    let r = length(centered);
+    if (r > 1.0) {
+      valid = false;
+    } else {
+      // theta=0 at canvas-up, increasing clockwise from above
+      let theta = atan2(centered.x, -centered.y);
+      let phi_deg = r * 90.0;   // zenith angle from +Y
+      yaw_deg = degrees(theta);
+      pitch_deg = 90.0 - phi_deg;
+    }
+  }
+
+  if (!valid) { return vec4f(0.0, 0.0, 0.0, 1.0); }
+  let pick = pickDisplay(yaw_deg, pitch_deg);
+  if (pick.z < 0.0) { return vec4f(0.0, 0.0, 0.0, 1.0); }
+  return textureSampleLevel(fbTex, fbSampler, pick.xy, u32(pick.z), 0.0);
 }
 `;
   const module = Visual.device.createShaderModule({ label: "rig-composite-shader", code: wgsl });
@@ -19727,7 +19807,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     entries: [
       { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d-array" } },
       { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
-      { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } }
+      { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+      { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } }
     ]
   });
 
@@ -19744,11 +19825,20 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     primitive: { topology: "triangle-list" }
   });
 
-  // Small uniform buffer for cols/rows/layer_count/mode (16 B). Updated
-  // each frame from _encodeRigComposite — cheap, no need to cache.
+  // 32 B uniform: layer_count, cols, rows, mode (16 B) + azim_range
+  // + pitch_range (16 B). Updated each frame in _encodeRigComposite.
   Visual.rigCompositeUniformBuffer = Visual.device.createBuffer({
     label: "rig-composite-uniform",
-    size: 16,
+    size: 32,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+  });
+  // 256 B uniform array — 16 vec4f display info entries (yaw, pitch,
+  // fov_h, fov_v in degrees). Used by spherical-projection modes
+  // (cylinder/equirect/fisheye) to find which display covers a given
+  // direction. Tile mode ignores it. Allocated once at device init.
+  Visual.rigDisplaysBuffer = Visual.device.createBuffer({
+    label: "rig-displays-uniform",
+    size: 256,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
   });
 }
@@ -19759,14 +19849,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
 function _rebuildRigCompositeBindGroup() {
   if (!Visual.device || !Visual.framebufferArrayView ||
       !Visual.rigCompositeBindGroupLayout || !Visual.blitSampler ||
-      !Visual.rigCompositeUniformBuffer) return;
+      !Visual.rigCompositeUniformBuffer || !Visual.rigDisplaysBuffer) return;
   Visual.rigCompositeBindGroup = Visual.device.createBindGroup({
     label: "rig-composite-bg",
     layout: Visual.rigCompositeBindGroupLayout,
     entries: [
       { binding: 0, resource: Visual.framebufferArrayView },
       { binding: 1, resource: Visual.blitSampler },
-      { binding: 2, resource: { buffer: Visual.rigCompositeUniformBuffer } }
+      { binding: 2, resource: { buffer: Visual.rigCompositeUniformBuffer } },
+      { binding: 3, resource: { buffer: Visual.rigDisplaysBuffer } }
     ]
   });
 }
@@ -19832,14 +19923,64 @@ function _projectionViewportRect(masterAspect) {
  * layout + mode. */
 function _encodeRigComposite(enc) {
   if (!Visual.device || !Visual.context || !Visual.rigCompositePipeline ||
-      !Visual.rigCompositeBindGroup || !Visual.rigCompositeUniformBuffer) return false;
+      !Visual.rigCompositeBindGroup || !Visual.rigCompositeUniformBuffer ||
+      !Visual.rigDisplaysBuffer) return false;
   const layerCount = Visual.framebufferLayerViews.length || 1;
   const mode = (state && state.rig && state.rig.previewMode) || "tile";
   const modeIdx = ({ tile: 0, cylinder: 1, equirect: 2, fisheye: 3 })[mode] || 0;
   const { cols, rows } = _rigTileLayout(layerCount);
-  // Pack the 16-byte uniform (4 u32s).
-  const u32 = new Uint32Array([layerCount, cols, rows, modeIdx]);
-  Visual.device.queue.writeBuffer(Visual.rigCompositeUniformBuffer, 0, u32.buffer, u32.byteOffset, u32.byteLength);
+
+  // Compute rig bounding angles for cylinder mode. Equirect uses a
+  // fixed full sphere; fisheye uses a fixed dome — only cylinder
+  // adapts to the rig's actual coverage so narrow rigs (e.g. 2-flat
+  // side-by-side) don't waste 90% of the canvas on empty space.
+  let azMin =  Infinity, azMax = -Infinity;
+  let pMin  =  Infinity, pMax  = -Infinity;
+  const displays = (state && state.rig && state.rig.displays) || [];
+  for (let i = 0; i < layerCount && i < displays.length; i++) {
+    const d = displays[i] || {};
+    const pose = d.pose || { yaw: 0, pitch: 0 };
+    const fov  = d.fov  || { h: 90, v: 60 };
+    const azL = pose.yaw   - fov.h * 0.5;
+    const azR = pose.yaw   + fov.h * 0.5;
+    const pT  = pose.pitch - fov.v * 0.5;
+    const pB  = pose.pitch + fov.v * 0.5;
+    if (azL < azMin) azMin = azL;
+    if (azR > azMax) azMax = azR;
+    if (pT  < pMin)  pMin  = pT;
+    if (pB  > pMax)  pMax  = pB;
+  }
+  if (!isFinite(azMin)) { azMin = -180; azMax = 180; pMin = -90; pMax = 90; }
+
+  // Pack the 32-byte rigU uniform: 4 u32 + 4 f32. Use one
+  // ArrayBuffer with two views to avoid writeBuffer-per-half.
+  const buf = new ArrayBuffer(32);
+  const ub = new Uint32Array(buf);
+  const fb = new Float32Array(buf);
+  ub[0] = layerCount;
+  ub[1] = cols;
+  ub[2] = rows;
+  ub[3] = modeIdx;
+  fb[4] = azMin;
+  fb[5] = azMax;
+  fb[6] = pMin;
+  fb[7] = pMax;
+  Visual.device.queue.writeBuffer(Visual.rigCompositeUniformBuffer, 0, buf);
+
+  // Pack the 256-byte rigDisplays uniform array: 16 vec4f entries
+  // each (yaw, pitch, fov_h, fov_v). Unused slots stay zero so
+  // pickDisplay's loop (bounded by layer_count) never reads them.
+  const dbuf = new Float32Array(64);   // 16 × 4 = 64 floats
+  for (let i = 0; i < layerCount && i < displays.length && i < 16; i++) {
+    const d = displays[i] || {};
+    const pose = d.pose || { yaw: 0, pitch: 0 };
+    const fov  = d.fov  || { h: 90, v: 60 };
+    dbuf[i*4 + 0] = pose.yaw;
+    dbuf[i*4 + 1] = pose.pitch;
+    dbuf[i*4 + 2] = fov.h;
+    dbuf[i*4 + 3] = fov.v;
+  }
+  Visual.device.queue.writeBuffer(Visual.rigDisplaysBuffer, 0, dbuf.buffer, dbuf.byteOffset, dbuf.byteLength);
 
   let canvasView;
   try { canvasView = Visual.context.getCurrentTexture().createView(); }
@@ -19905,6 +20046,35 @@ function _cycleRenderResolution() {
   const i = Visual.RESOLUTIONS.findIndex(r => r.key === Visual.resolutionKey);
   const next = Visual.RESOLUTIONS[(i + 1) % Visual.RESOLUTIONS.length];
   setRenderResolution(next.key);
+}
+
+/* Phase 6.5.14 — projection-mode HUD pill. Cycles tile → cylinder →
+ * equirect → fisheye. Updates state.rig.previewMode (same field the
+ * props-pane dropdown writes), syncs the dropdown, re-renders so
+ * the next frame uses the new mode. */
+const _PREVIEW_MODES = ["tile", "cylinder", "equirect", "fisheye"];
+const _PREVIEW_LABELS = { tile: "Tile", cylinder: "Cylinder", equirect: "Equirect", fisheye: "Fisheye" };
+
+function _updateProjectionPill() {
+  const pill = document.getElementById("proj-pill");
+  if (!pill) return;
+  const mode = (state && state.rig && state.rig.previewMode) || "tile";
+  pill.textContent = _PREVIEW_LABELS[mode] || "Tile";
+}
+
+function _cycleProjectionMode() {
+  if (!state.rig) state.rig = defaultRig();
+  const cur = state.rig.previewMode || "tile";
+  const i = _PREVIEW_MODES.indexOf(cur);
+  const next = _PREVIEW_MODES[(i + 1) % _PREVIEW_MODES.length];
+  pushHistory("rig-preview:" + next);
+  state.rig.previewMode = next;
+  _updateProjectionPill();
+  // If the rig pane is open (nothing selected), refresh it so the
+  // dropdown reflects the new mode. Otherwise the next render still
+  // picks up the change from state.rig.previewMode.
+  renderProps && renderProps();
+  render();
 }
 
 /* Toggle the freeze flag. The future rAF loop (lands with 6.1.7's
@@ -27368,10 +27538,15 @@ ensureGPUDevice();
  * pill text reflects the default resolution captured at Visual init. */
 {
   const resPill   = document.getElementById("res-pill");
+  const projPill  = document.getElementById("proj-pill");
   const freezeBtn = document.getElementById("freeze-btn");
   if (resPill) {
     _updateResolutionPill();
     resPill.addEventListener("click", _cycleRenderResolution);
+  }
+  if (projPill) {
+    _updateProjectionPill();
+    projPill.addEventListener("click", _cycleProjectionMode);
   }
   if (freezeBtn) {
     freezeBtn.addEventListener("click", toggleVisualFreeze);
