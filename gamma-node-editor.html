@@ -21044,7 +21044,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   // Defaults (gamma=2.2, blackLift=0, power=2.0, intensity=1) yield
   // bit-exact output equal to the source — the blend math is a no-op
   // for a calibration that hasn't been hand-tuned.
-  let c = textureSampleLevel(fbTex, fbSampler, in.uv, u.layer, 0.0).rgb;
+  // Bourke mesh UV uses +y up (v=0 at bottom); WebGPU samples with
+  // v=0 at top. Invert V here so the convention lives in one place
+  // and asymmetric source content (text, images) renders right-side-
+  // up. Symmetric test patterns are unchanged by this.
+  let sampleUv = vec2<f32>(in.uv.x, 1.0 - in.uv.y);
+  let c = textureSampleLevel(fbTex, fbSampler, sampleUv, u.layer, 0.0).rgb;
   let i = clamp(in.intensity, 0.0, 1.0);
   let p = max(u.power, 0.0001);
   let g = max(u.gamma, 0.0001);
@@ -21385,7 +21390,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     i <= 0.5
   );
 
-  let c       = textureSampleLevel(fbTex, fbSampler, in.uv, in.layer, 0.0).rgb;
+  // Bourke-mesh UV uses +y up (v=0 at the bottom of source content);
+  // WebGPU texture sampling has v=0 at the top of the image. Invert
+  // V here so the conversion lives in one place — matches the same
+  // flip done in the 2D warp pipeline below.
+  let sampleUv = vec2<f32>(in.uv.x, 1.0 - in.uv.y);
+  let c       = textureSampleLevel(fbTex, fbSampler, sampleUv, in.layer, 0.0).rgb;
   let cLin    = pow(c, vec3<f32>(g));
   let cBlend  = cLin * smoothI;
   let cLifted = cBlend + vec3<f32>(bl) * (1.0 - smoothI);
@@ -21611,26 +21621,17 @@ function _buildTheaterMeshGeometry(displays) {
       meshRows  = wm.rows;
       meshVerts = wm.verts;
     } else {
-      // Identity 1×1 grid — 4 verts at the display's corners with
-      // intensity=1 everywhere. Same shape as the Bourke format so
-      // the inner loop can consume both paths uniformly.
-      meshCols = 1;
-      meshRows = 1;
-      meshVerts = [
-        -1, -1, 0, 1, 1,    // bottom-left  (mx=-1, my=-1, uv=(0,1))
-         1, -1, 1, 1, 1,    // bottom-right
-         1,  1, 1, 0, 1,    // top-right
-        -1,  1, 0, 0, 1     // top-left
-      ];
-      // Bourke convention: (mx, my) in [-1, 1] NDC of projector
-      // framebuffer. Source UV mapping: u maps left→right, v maps
-      // top→bottom (top of the texture has v=0 in WebGPU's image
-      // convention). For identity, we map the 4 corners so the
-      // display's source content fills the quad correctly:
-      //   bottom-left of mesh (my=-1)  → bottom of display content (v=1)
-      //   top-left   of mesh (my=+1)   → top    of display content (v=0)
-      // The Bourke-mesh path (useMesh==true) uses whatever the user's
-      // mesh defined for u/v at each vertex, so it stays accurate.
+      // Identity 1×1 grid via the canonical helper so the layout
+      // exactly matches what every Bourke-warped display gets. Earlier
+      // take used a hand-rolled perimeter order (BL, BR, TR, TL) which
+      // index math interpreted as row-major and produced bowtie quads
+      // — two triangles that only covered half the rectangle each.
+      // Using the helper means there's only one mesh layout in the
+      // codebase, full stop.
+      const idMesh = _makeIdentityWarpMesh(1, 1);
+      meshCols  = idMesh.cols;
+      meshRows  = idMesh.rows;
+      meshVerts = idMesh.verts;
     }
 
     const W = meshCols + 1, H = meshRows + 1;
