@@ -12831,6 +12831,113 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     description: "Calibration grid — colored corner quadrants (R/G/B/Y) + white grid lines + center crosshair + edge frame. Wire into VisualOutput to verify warp meshes, edge blends, and projection orientation. params: density (grid lines per unit, 1..32), lineWidth (UV thickness 0..0.05), brightness."
   },
 
+  /* Phase 6.3.2 — FeedbackShader (visual Delay1). The "ping-pong"
+   * shader that reads its own previous frame and blends it with a
+   * generative pattern. Used for trails, reaction-diffusion, decay
+   * visualizers. bindLayout: "feedback" gets it the second pipeline
+   * cache key + a different bind-group layout (uniform + sampled
+   * 2D-array texture + sampler).
+   *
+   * The texture binding samples Visual.feedbackArray which is
+   * populated by an end-of-frame copyTextureToTexture from the
+   * framebuffer. So FeedbackShader sees what the WHOLE composite
+   * output was last frame — including itself + any other shaders
+   * that wrote to other display layers. Per-display isolation +
+   * proper chain-aware feedback ships in 6.3.4 with per-node
+   * intermediate textures.
+   *
+   * Built-in pattern: a sin-time generator wobbles around the canvas
+   * to give the feedback something to "trail." User params control
+   * decay (how much of last frame survives) + tint + speed. */
+  FeedbackShader: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "feedback",
+    ins:  [
+      { n: "decay",  t: "param" },
+      { n: "tintR",  t: "param" },
+      { n: "tintG",  t: "param" },
+      { n: "tintB",  t: "param" },
+      { n: "speed",  t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    params: { decay: 0.94, tintR: 1.0, tintG: 1.0, tintB: 1.0, speed: 0.6 },
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution: vec4f,
+  u_time:       f32,
+  u_dt:         f32,
+  _pad0:        vec2f,
+  u_view:       vec4f,
+  u_world_uv:   vec4f,
+  params:       vec4f,    // x=decay, y=tintR, z=tintG, w=tintB
+  speedAndPad:  vec4f,    // x=speed, yzw=_
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut {
+  @builtin(position) pos: vec4f,
+  @location(0) uv: vec2f,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(
+    vec2f(-1.0, -1.0),
+    vec2f( 3.0, -1.0),
+    vec2f(-1.0,  3.0),
+  );
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  // Sample the previous frame at this fragment's UV. Layer index 0
+  // is fine for the global-history MVP — proper per-display feedback
+  // arrives with per-node intermediates in 6.3.4.
+  let prev = textureSampleLevel(fbHistory, fbSampler, in.uv, 0, 0.0);
+
+  // Generative seed: a moving radial pattern so there's something
+  // to "trail." Without a seed signal the feedback fades to black
+  // (which is also fine — that's a pure decay visualizer).
+  let world_uv = mix(u.u_world_uv.xy, u.u_world_uv.zw, in.uv);
+  let centered = world_uv - vec2f(0.5);
+  let angle    = atan2(centered.y, centered.x) + u.u_time * u.speedAndPad.x;
+  let radius   = length(centered);
+  let pulse    = max(0.0, 0.5 + 0.5 * cos(angle * 6.0 - radius * 12.0 - u.u_time * 2.0));
+  let seedColor = pulse * vec3f(u.params.y, u.params.z, u.params.w) * (1.0 - smoothstep(0.4, 0.5, radius));
+
+  let decay = clamp(u.params.x, 0.0, 0.999);
+  let blended = prev.rgb * decay + seedColor * (1.0 - decay * 0.85);
+  return vec4f(blended, 1.0);
+}`,
+    writeUniforms(node, scratch) {
+      // 96-byte buffer = 24 f32 indices:
+      //   indices  0–7   → preamble (u_resolution, u_time, u_dt, pad)
+      //   indices  8–11  → u_view
+      //   indices 12–15  → u_world_uv
+      //   indices 16–19  → params (decay, tintR, tintG, tintB)
+      //   indices 20–23  → speedAndPad (speed, 0, 0, 0)
+      const p = node.params || {};
+      scratch[16] = (typeof p.decay === "number") ? p.decay : 0.94;
+      scratch[17] = (typeof p.tintR === "number") ? p.tintR : 1.0;
+      scratch[18] = (typeof p.tintG === "number") ? p.tintG : 1.0;
+      scratch[19] = (typeof p.tintB === "number") ? p.tintB : 1.0;
+      scratch[20] = (typeof p.speed === "number") ? p.speed : 0.6;
+      scratch[21] = 0; scratch[22] = 0; scratch[23] = 0;
+    },
+    description: "Feedback shader (visual Delay1) — samples its own previous frame, blends with a generative seed pattern. Use for trails / reaction-diffusion / decay visualizers. params: decay (0..1, how much of last frame survives), tintR/G/B (seed color), speed (rotation rate). Wire into VisualOutput. PHASE 6.3.2 NOTE: this MVP uses a global previous-frame texture (whole composite output last frame, layer 0 only); per-display + chain-aware feedback ships in 6.3.4 with per-node intermediates."
+  },
+
   /* ---- B1: Math, single-arg trig (cmath) ---- */
   Sin:    { category: "Math", color: COLOR.math, header: "cmath", cppType: "", ins: [{n:"in", t:"audio"}], outs: [{n:"out", t:"audio"}], params: {}, template: "sinf({in})",   description: "sin(x), x in radians" },
   Cos:    { category: "Math", color: COLOR.math, header: "cmath", cppType: "", ins: [{n:"in", t:"audio"}], outs: [{n:"out", t:"audio"}], params: {}, template: "cosf({in})",   description: "cos(x), x in radians" },
@@ -22202,6 +22309,18 @@ const Visual = {
   shaderPipelineCache: new Map(),
   standardShaderBgl: null,
   standardShaderPipelineLayout: null,
+  // Phase 6.3.2 — feedback shader-frag layout (uniform + texture +
+  // sampler). Used by FeedbackShader and any future composition
+  // node that needs sampled-texture access without the full per-
+  // node intermediate machinery (which lands when chains ship).
+  feedbackShaderBgl: null,
+  feedbackShaderPipelineLayout: null,
+  // Global "previous frame" history texture. Same shape as the
+  // framebuffer texture array; populated by an end-of-frame
+  // copyTextureToTexture so the next frame's feedback shaders read
+  // last frame's composite output.
+  feedbackArray:     null,
+  feedbackArrayView: null,
 
   // Per-node-instance render state. Map<nodeId, { uniformBuffer,
   // bindGroup, scratch }>. uniformBuffer is the GPU-side state that
@@ -22384,13 +22503,16 @@ function _allocateFramebuffer() {
   if (Visual.framebuffer) {
     try { Visual.framebuffer.destroy(); } catch (_) {}
   }
+  if (Visual.feedbackArray) {
+    try { Visual.feedbackArray.destroy(); } catch (_) {}
+  }
   const layerCount = Math.max(1, (state && state.rig && Array.isArray(state.rig.displays) && state.rig.displays.length) || 1);
   Visual.framebuffer = Visual.device.createTexture({
     label: "visual-framebuffer-array-" + layerCount + "x-" + Visual.resolutionKey,
     size: [Visual.fbWidth, Visual.fbHeight, layerCount],
     dimension: "2d",            // 2d arrays are still dimension "2d" with depth >1
     format: Visual.fbFormat,
-    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC
   });
   Visual.framebufferLayerViews = [];
   for (let i = 0; i < layerCount; i++) {
@@ -22405,10 +22527,28 @@ function _allocateFramebuffer() {
     label: "fb-array",
     dimension: "2d-array"
   });
-  // Backwards-compat single-layer view for the existing 1-display blit
-  // pipeline. Points at layer 0; used only when the rig has exactly
-  // 1 display (or as a fallback during the smoke clear path).
   Visual.framebufferView = Visual.framebufferLayerViews[0];
+
+  // Phase 6.3.2 — feedback / "previous frame" texture array. Same
+  // dimensions as the framebuffer, COPY_DST so we can blit into it
+  // each frame's end + TEXTURE_BINDING so feedback shaders can sample
+  // it. Initial content is undefined; first frame's FeedbackShader
+  // sees zero (the implicit clear via copyTextureToTexture from a
+  // freshly-cleared framebuffer).
+  Visual.feedbackArray = Visual.device.createTexture({
+    label: "visual-feedback-array-" + layerCount + "x-" + Visual.resolutionKey,
+    size: [Visual.fbWidth, Visual.fbHeight, layerCount],
+    dimension: "2d",
+    format: Visual.fbFormat,
+    usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING
+  });
+  Visual.feedbackArrayView = Visual.feedbackArray.createView({
+    label: "feedback-array",
+    dimension: "2d-array"
+  });
+  // Drop any cached shader instances since their feedback bind groups
+  // reference the now-destroyed view; they'll rebuild on next render.
+  Visual.shaderInstances.clear();
 }
 
 /* Build the fullscreen-triangle blit pipeline once at device init.
@@ -24239,16 +24379,44 @@ function _ensureStandardShaderLayout() {
   });
 }
 
+/* Phase 6.3.2 — bind-group layout for feedback shader-frag nodes.
+ * Adds a sampled texture_2d_array binding (the global feedback /
+ * history texture, populated by an end-of-frame
+ * copyTextureToTexture from the framebuffer) plus a sampler.
+ * Pipeline cache keys disambiguate between standard / feedback by
+ * appending the layout tag to the WGSL hash. */
+function _ensureFeedbackShaderLayout() {
+  if (Visual.feedbackShaderBgl) return;
+  Visual.feedbackShaderBgl = Visual.device.createBindGroupLayout({
+    label: "shader-frag-feedback-bgl",
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+      { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d-array" } },
+      { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } }
+    ]
+  });
+  Visual.feedbackShaderPipelineLayout = Visual.device.createPipelineLayout({
+    label: "shader-frag-feedback-pl",
+    bindGroupLayouts: [Visual.feedbackShaderBgl]
+  });
+}
+
 /* Get-or-create a render pipeline for a WGSL body. Returns the cache
  * entry: { promise, pipeline, error }. First call kicks off async
  * compile; subsequent calls share the promise. Renderer reads
  * .pipeline directly — null means "not ready yet, skip this frame
  * gracefully". */
-function _getShaderPipeline(wgsl) {
+function _getShaderPipeline(wgsl, bindLayout) {
+  bindLayout = bindLayout || "standard";
   _ensureStandardShaderLayout();
-  const key = _fnv1a(wgsl);
+  if (bindLayout === "feedback") _ensureFeedbackShaderLayout();
+  const key = _fnv1a(wgsl) + "@" + bindLayout;
   let entry = Visual.shaderPipelineCache.get(key);
   if (entry) return entry;
+
+  const pipelineLayout = bindLayout === "feedback"
+    ? Visual.feedbackShaderPipelineLayout
+    : Visual.standardShaderPipelineLayout;
 
   entry = { key, promise: null, pipeline: null, error: null };
   entry.promise = (async () => {
@@ -24259,7 +24427,7 @@ function _getShaderPipeline(wgsl) {
       });
       const pipeline = await Visual.device.createRenderPipelineAsync({
         label: "shader-frag-pipeline-" + key,
-        layout: Visual.standardShaderPipelineLayout,
+        layout: pipelineLayout,
         vertex:   { module, entryPoint: "vs_main" },
         fragment: { module, entryPoint: "fs_main", targets: [{ format: Visual.fbFormat }] },
         primitive: { topology: "triangle-list" }
@@ -24292,11 +24460,17 @@ function _getShaderPipeline(wgsl) {
  *     fresh bind group is built. Pipeline entry is also re-checked. */
 function _ensureShaderInstance(nodeId, def) {
   let inst = Visual.shaderInstances.get(nodeId);
-  const desiredEntry = _getShaderPipeline(def.wgsl);
+  const bindLayout = def.bindLayout || "standard";
+  const desiredEntry = _getShaderPipeline(def.wgsl, bindLayout);
 
-  // Reallocate when the buffer size doesn't match (fresh node, or
-  // user edited @gdsp-input list and parameters changed).
-  if (!inst || inst._uniformBytes !== def.uniformBytes) {
+  // Reallocate when the buffer size, bindLayout, or feedback array
+  // ref doesn't match (fresh node, user edited params, framebuffer
+  // resized so feedbackArray's view is stale, etc).
+  const feedbackView = bindLayout === "feedback" ? Visual.feedbackArrayView : null;
+  const feedbackSampler = bindLayout === "feedback" ? Visual.blitSampler : null;
+  const layoutMismatch = inst && inst._bindLayout !== bindLayout;
+  const feedbackViewStale = inst && bindLayout === "feedback" && inst._feedbackView !== feedbackView;
+  if (!inst || inst._uniformBytes !== def.uniformBytes || layoutMismatch || feedbackViewStale) {
     if (inst && inst.uniformBuffer) {
       try { inst.uniformBuffer.destroy(); } catch (_) {}
     }
@@ -24306,17 +24480,32 @@ function _ensureShaderInstance(nodeId, def) {
       size:  bytes,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
     });
-    const bg = Visual.device.createBindGroup({
-      label: "shader-frag-bg-" + nodeId,
-      layout: Visual.standardShaderBgl,
-      entries: [{ binding: 0, resource: { buffer: buf } }]
-    });
+    let bg;
+    if (bindLayout === "feedback" && feedbackView && feedbackSampler) {
+      bg = Visual.device.createBindGroup({
+        label: "shader-frag-feedback-bg-" + nodeId,
+        layout: Visual.feedbackShaderBgl,
+        entries: [
+          { binding: 0, resource: { buffer: buf } },
+          { binding: 1, resource: feedbackView },
+          { binding: 2, resource: feedbackSampler }
+        ]
+      });
+    } else {
+      bg = Visual.device.createBindGroup({
+        label: "shader-frag-bg-" + nodeId,
+        layout: Visual.standardShaderBgl,
+        entries: [{ binding: 0, resource: { buffer: buf } }]
+      });
+    }
     inst = {
-      uniformBuffer: buf,
-      bindGroup:     bg,
-      scratch:       new Float32Array(bytes / 4),
-      _uniformBytes: bytes,
-      pipelineEntry: desiredEntry
+      uniformBuffer:  buf,
+      bindGroup:      bg,
+      scratch:        new Float32Array(bytes / 4),
+      _uniformBytes:  bytes,
+      _bindLayout:    bindLayout,
+      _feedbackView:  feedbackView,
+      pipelineEntry:  desiredEntry
     };
     Visual.shaderInstances.set(nodeId, inst);
     return inst;
@@ -25390,6 +25579,21 @@ function renderVisualFrame() {
       blit.draw(3);
       blit.end();
     }
+  }
+
+  // Phase 6.3.2 — capture this frame's framebuffer into the feedback
+  // array so next frame's FeedbackShader sees it as "previous." The
+  // copy queues after every render pass that writes the framebuffer
+  // (shader-frag passes only — the composite/theater write to the
+  // canvas, not to the framebuffer). Cheap GPU copy: ~8 MB at 1080p
+  // × 32 layers, single submit-side cost.
+  if (Visual.feedbackArray && Visual.framebuffer && Visual.framebufferLayerViews.length > 0) {
+    const layerCount = Visual.framebufferLayerViews.length;
+    enc.copyTextureToTexture(
+      { texture: Visual.framebuffer,   origin: { x: 0, y: 0, z: 0 } },
+      { texture: Visual.feedbackArray, origin: { x: 0, y: 0, z: 0 } },
+      [Visual.fbWidth, Visual.fbHeight, layerCount]
+    );
   }
 
   Visual.device.queue.submit([enc.finish()]);
