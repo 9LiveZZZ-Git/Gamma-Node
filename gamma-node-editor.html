@@ -19854,6 +19854,20 @@ document.addEventListener("keydown", e => {
  *   6.7.x — Editor controls (capture, perf overlay, Live Mode)
  * ======================================================================== */
 
+/* Phase 6.6 — maximum supported displays in a single rig. The WGSL
+ * composite shader's RigDisplays array, the rig-displays uniform
+ * buffer, the warp uniform buffer's slot count, and every JS loop
+ * bound that touches "all displays" use this constant.
+ *
+ * Sized at 32 to fit the real AlloSphere (26 projectors) with
+ * headroom for the next-gen install + experimental rigs. WebGPU's
+ * texture_2d_array max layer count is typically 256, and a uniform
+ * buffer of 32 × vec4f = 512 B is well under the 64 KB binding
+ * limit, so 32 is comfortable. Bumping further would require
+ * checking adapter limits (maxStorageBufferBindingSize for the
+ * uniform array if we ever switch to storage buffers). */
+const RIG_MAX_DISPLAYS = 32;
+
 const Visual = {
   // null = unprobed; true = device acquired; false = unavailable / errored
   available: null,
@@ -19897,19 +19911,19 @@ const Visual = {
   rigCompositeBindGroupLayout: null,
   rigCompositeBindGroup:  null, // rebuilt when framebuffer / layer count changes
   rigCompositeUniformBuffer: null, // 32 B uniform: layer_count, cols, rows, mode + azim/pitch ranges
-  rigDisplaysBuffer:      null, // 256 B uniform array of (yaw, pitch, fov_h, fov_v) — one vec4 per display, max 16
+  rigDisplaysBuffer:      null, // RIG_MAX_DISPLAYS × 16 B uniform array of (yaw, pitch, fov_h, fov_v) — one vec4 per display
 
   // Phase 6.6.4 — calibration warp pass. Runs after the rig composite
   // in tile mode for displays with a non-null warpMesh. Overdraws each
   // warped display's tile with a Bourke-mesh-warped sample of its
   // source layer; non-warped displays show the un-warped composite
   // result through. One shared pipeline + dynamic-offset uniform
-  // buffer (16 slots × 256 B) so per-display draws don't need their
-  // own bind groups.
+  // buffer (RIG_MAX_DISPLAYS slots × 256 B) so per-display draws
+  // don't need their own bind groups.
   warpPipeline:           null,
   warpBindGroupLayout:    null,
   warpBindGroup:          null,   // rebuilt when framebuffer changes; uses dynamic offset
-  warpUniformBuffer:      null,   // 16 × 256 = 4096 B; per-display layer + edge-blend params
+  warpUniformBuffer:      null,   // RIG_MAX_DISPLAYS × 256 B; per-display layer + edge-blend params
   warpUniformStride:      256,    // min uniform-buffer-binding alignment
   _warpCache:             new Map(),  // displayId → { vBuffer, iBuffer, indexCount, vCapacity, iCapacity, sig }
 
@@ -20280,9 +20294,10 @@ struct RigU {
 //   .y = pitch degrees (elevation)
 //   .z = horizontal FOV degrees
 //   .w = vertical FOV degrees
-// MAX 16 entries; layer_count limits the loop in pickDisplay.
+// Capacity = RIG_MAX_DISPLAYS (interpolated from JS); layer_count
+// limits the loop in pickDisplay so unused slots stay untouched.
 struct RigDisplays {
-  d: array<vec4f, 16>,
+  d: array<vec4f, ${RIG_MAX_DISPLAYS}>,
 };
 
 @group(0) @binding(0) var fbTex:    texture_2d_array<f32>;
@@ -20413,13 +20428,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     size: 32,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
   });
-  // 256 B uniform array — 16 vec4f display info entries (yaw, pitch,
-  // fov_h, fov_v in degrees). Used by spherical-projection modes
-  // (cylinder/equirect/fisheye) to find which display covers a given
-  // direction. Tile mode ignores it. Allocated once at device init.
+  // RIG_MAX_DISPLAYS × 16 B uniform array of display-info vec4fs
+  // (yaw, pitch, fov_h, fov_v in degrees). Used by spherical-projection
+  // modes (cylinder/equirect/fisheye) to find which display covers a
+  // given direction. Tile mode ignores it. Allocated once at device init.
   Visual.rigDisplaysBuffer = Visual.device.createBuffer({
     label: "rig-displays-uniform",
-    size: 256,
+    size: RIG_MAX_DISPLAYS * 16,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
   });
 }
@@ -20580,14 +20595,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     primitive: { topology: "triangle-list" }
   });
 
-  // 16 slots × 256 B alignment = 4096 B. Each slot = 16 B used:
+  // RIG_MAX_DISPLAYS slots × 256 B alignment. Each slot = 16 B used:
   //   offset 0:  layer u32
   //   offset 4:  gamma f32
   //   offset 8:  blackLift f32
   //   offset 12: power f32
   Visual.warpUniformBuffer = Visual.device.createBuffer({
     label: "warp-uniform",
-    size: 16 * Visual.warpUniformStride,
+    size: RIG_MAX_DISPLAYS * Visual.warpUniformStride,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
   });
 }
@@ -20698,7 +20713,7 @@ function _encodeWarpPasses(enc) {
   const mode = (state && state.rig && state.rig.previewMode) || "tile";
   if (mode !== "tile") return 0;
   const displays = (state && state.rig && state.rig.displays) || [];
-  const layerCount = Math.min(Visual.framebufferLayerViews.length || 0, displays.length, 16);
+  const layerCount = Math.min(Visual.framebufferLayerViews.length || 0, displays.length, RIG_MAX_DISPLAYS);
   if (layerCount === 0) return 0;
 
   // Viewport math — same tile layout as the composite.
@@ -20793,6 +20808,13 @@ function _rigTileLayout(n) {
   if (n === 8) return { cols: 4, rows: 2 };
   if (n === 12) return { cols: 4, rows: 3 };
   if (n === 16) return { cols: 4, rows: 4 };
+  if (n === 20) return { cols: 5, rows: 4 };
+  if (n === 24) return { cols: 6, rows: 4 };
+  // 26 = AlloSphere real layout. 7×4 wastes 2 cells but groups by
+  // the rig's 4 elevation rings (5 + 9 + 8 + 4 displays per ring),
+  // which is more legible than a 6×5 lat/lon-style grid.
+  if (n === 26) return { cols: 7, rows: 4 };
+  if (n === 32) return { cols: 8, rows: 4 };
   // Generic: closest-to-square layout that fits N.
   const cols = Math.ceil(Math.sqrt(n));
   const rows = Math.ceil(n / cols);
@@ -20885,11 +20907,11 @@ function _encodeRigComposite(enc) {
   fb[7] = pMax;
   Visual.device.queue.writeBuffer(Visual.rigCompositeUniformBuffer, 0, buf);
 
-  // Pack the 256-byte rigDisplays uniform array: 16 vec4f entries
-  // each (yaw, pitch, fov_h, fov_v). Unused slots stay zero so
-  // pickDisplay's loop (bounded by layer_count) never reads them.
-  const dbuf = new Float32Array(64);   // 16 × 4 = 64 floats
-  for (let i = 0; i < layerCount && i < displays.length && i < 16; i++) {
+  // Pack the rigDisplays uniform array: RIG_MAX_DISPLAYS × vec4f
+  // entries each (yaw, pitch, fov_h, fov_v). Unused slots stay zero
+  // so pickDisplay's loop (bounded by layer_count) never reads them.
+  const dbuf = new Float32Array(RIG_MAX_DISPLAYS * 4);
+  for (let i = 0; i < layerCount && i < displays.length && i < RIG_MAX_DISPLAYS; i++) {
     const d = displays[i] || {};
     const pose = d.pose || { yaw: 0, pitch: 0 };
     const fov  = d.fov  || { h: 90, v: 60 };
@@ -21675,7 +21697,7 @@ function _drawVisualOverlay() {
   const intensity = Math.min(1, baseIntensity + audioLevel * 0.7);
 
   // Tile geometry — same math as the warp pass.
-  const layerCount = Math.min(displays.length, 16);
+  const layerCount = Math.min(displays.length, RIG_MAX_DISPLAYS);
   const { cols, rows } = _rigTileLayout(layerCount);
   const masterAspect = _projectionMasterAspect();
   const vp = _projectionViewportRect(masterAspect);
