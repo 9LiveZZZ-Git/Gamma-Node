@@ -2067,6 +2067,10 @@
     background: rgba(127, 119, 221, 0.10);
     color: rgba(200, 195, 250, 1);
   }
+  .rig-display-list-actions {
+    display: inline-flex;
+    gap: 6px;
+  }
   .rig-display-row {
     display: grid;
     grid-template-columns: 22px 80px 1fr;
@@ -13651,6 +13655,317 @@ function _makeTestWarpMesh(cols, rows) {
   return m;
 }
 
+/* ------------ Phase 6.6.2 — MPCDI / Bourke CSV importers --------------- */
+
+/* Minimal in-browser ZIP reader. Uses the well-defined ZIP central
+ * directory format + browser's DecompressionStream("deflate-raw")
+ * for DEFLATE-compressed entries. No external dependencies — saves
+ * the single-HTML-file invariant.
+ *
+ * Returns { "filename.ext": Uint8Array, ... } for every entry in
+ * the archive. STORED (uncompressed) and DEFLATE methods are
+ * supported; everything else throws. ZIP64 is not supported (4 GB
+ * cap on individual files, 64K cap on entry count) — fine for any
+ * realistic MPCDI bundle.
+ *
+ * The EOCD scan walks backward up to 65535 bytes from end of file
+ * (max comment length per the spec). Most ZIPs have EOCD in the
+ * last 22 bytes so the loop is fast in practice. */
+async function _readZipArchive(buffer) {
+  const u8 = new Uint8Array(buffer);
+  const view = new DataView(buffer);
+  const len = view.byteLength;
+  let eocd = -1;
+  for (let i = len - 22; i >= Math.max(0, len - 65535 - 22); i--) {
+    if (view.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error("ZIP: EOCD signature not found — file may not be a valid ZIP");
+
+  const numEntries = view.getUint16(eocd + 10, true);
+  const cdOffset   = view.getUint32(eocd + 16, true);
+
+  const files = {};
+  let p = cdOffset;
+  for (let i = 0; i < numEntries; i++) {
+    if (view.getUint32(p, true) !== 0x02014b50) {
+      throw new Error("ZIP: bad central directory entry at offset " + p);
+    }
+    const method     = view.getUint16(p + 10, true);
+    const compSize   = view.getUint32(p + 20, true);
+    const nameLen    = view.getUint16(p + 28, true);
+    const extraLen   = view.getUint16(p + 30, true);
+    const commentLen = view.getUint16(p + 32, true);
+    const localOff   = view.getUint32(p + 42, true);
+    const name = new TextDecoder("utf-8", { fatal: false }).decode(u8.subarray(p + 46, p + 46 + nameLen));
+    p += 46 + nameLen + extraLen + commentLen;
+
+    // Read local file header to skip to actual data.
+    if (view.getUint32(localOff, true) !== 0x04034b50) {
+      throw new Error("ZIP: bad local header for " + name);
+    }
+    const lfhNameLen  = view.getUint16(localOff + 26, true);
+    const lfhExtraLen = view.getUint16(localOff + 28, true);
+    const dataOff = localOff + 30 + lfhNameLen + lfhExtraLen;
+    const compData = u8.subarray(dataOff, dataOff + compSize);
+
+    if (method === 0) {
+      // Stored — copy out so caller can keep the slice past archive lifetime.
+      files[name] = new Uint8Array(compData);
+    } else if (method === 8) {
+      // DEFLATE — pipe through the browser's decompressor.
+      const ds = new DecompressionStream("deflate-raw");
+      const stream = new Blob([compData]).stream().pipeThrough(ds);
+      const chunks = [];
+      const reader = stream.getReader();
+      let total = 0;
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        total += value.length;
+      }
+      const out = new Uint8Array(total);
+      let off = 0;
+      for (const c of chunks) { out.set(c, off); off += c.length; }
+      files[name] = out;
+    } else {
+      throw new Error("ZIP: unsupported compression method " + method + " for " + name + " (only STORED + DEFLATE)");
+    }
+  }
+  return files;
+}
+
+/* Parse a Paul-Bourke-style warp mesh CSV.
+ *
+ * Format (Bourke "MeshFile2"):
+ *   line 1: format version — usually "2" for the standard format,
+ *           sometimes "MESH" or omitted; we just consume it.
+ *   line 2: N M — grid dimensions (number of vertices wide × tall)
+ *   lines 3..N*M+2: x y u v intensity   (whitespace-separated floats)
+ *
+ * Tolerates: leading/trailing whitespace, comment lines (#…),
+ * multiple whitespace types between tokens, optional "MESH" or
+ * "v2" magic on line 1.
+ *
+ * Note on dimensions: Bourke's "N nodes" = our (cols + 1). Output
+ * mesh has cols = N - 1, rows = M - 1. */
+function _parseBourkeMeshCsv(text) {
+  const stripped = text.replace(/\r/g, "").split("\n")
+    .map(l => l.replace(/#.*$/, "").trim())
+    .filter(l => l.length > 0);
+  if (stripped.length < 2) throw new Error("Bourke mesh: too few lines");
+  // Magic: "2" or "MESH" or "v2" or just version
+  let cursor = 0;
+  if (/^[a-zA-Z]/.test(stripped[0]) || stripped[0].length <= 3) cursor = 1;
+  // Grid dimensions
+  const dimTokens = stripped[cursor].split(/\s+/);
+  if (dimTokens.length < 2) throw new Error("Bourke mesh: missing N M dimensions");
+  const N = parseInt(dimTokens[0], 10);
+  const M = parseInt(dimTokens[1], 10);
+  if (!Number.isFinite(N) || !Number.isFinite(M) || N < 2 || M < 2) {
+    throw new Error("Bourke mesh: invalid dimensions " + N + "×" + M);
+  }
+  cursor++;
+  const expected = N * M;
+  const verts = new Array(expected * 5);
+  let written = 0;
+  for (let i = cursor; i < stripped.length && written < expected; i++) {
+    const tokens = stripped[i].split(/\s+/);
+    if (tokens.length < 5) continue;       // tolerate stray non-vertex lines
+    const x = parseFloat(tokens[0]);
+    const y = parseFloat(tokens[1]);
+    const u = parseFloat(tokens[2]);
+    const v = parseFloat(tokens[3]);
+    const int = parseFloat(tokens[4]);
+    if (![x,y,u,v,int].every(Number.isFinite)) continue;
+    const off = written * 5;
+    verts[off + 0] = x;
+    verts[off + 1] = y;
+    verts[off + 2] = u;
+    verts[off + 3] = v;
+    verts[off + 4] = int;
+    written++;
+  }
+  if (written !== expected) {
+    throw new Error("Bourke mesh: expected " + expected + " vertices, got " + written);
+  }
+  return { cols: N - 1, rows: M - 1, verts };
+}
+
+/* Parse an MPCDI XML manifest for rig geometry.
+ *
+ * VESA MPCDI 2.0 schema is large; we only consume the geometry-
+ * essential subset:
+ *   <MPCDI><display><buffer><region><frustum>
+ *      <yaw>, <pitch>, <roll>
+ *      <rightAngle>, <leftAngle>, <upAngle>, <downAngle>
+ *
+ * fov.h = rightAngle - leftAngle (typically ~symmetric)
+ * fov.v = upAngle    - downAngle
+ * pose  = (yaw, pitch, roll)
+ *
+ * Returns an array of partial Display objects ready for
+ * _makeDisplay overrides. Warp / alpha file references are captured
+ * but the binary parsers (PFM, PNG) ship in 6.6.2b — for now we
+ * surface them as warpFileRef / alphaFileRef on the display so a
+ * future ticket can wire them up. */
+function _parseMpcdiXml(xmlText) {
+  const dom = new DOMParser().parseFromString(xmlText, "application/xml");
+  const parseErr = dom.querySelector("parsererror");
+  if (parseErr) throw new Error("MPCDI XML: " + (parseErr.textContent || "parse failed"));
+  const root = dom.documentElement;
+  if (!root || root.nodeName.toUpperCase() !== "MPCDI") {
+    throw new Error("MPCDI XML: root element should be <MPCDI>, got <" + (root && root.nodeName) + ">");
+  }
+
+  const displays = [];
+  let idx = 0;
+  for (const buffer of root.querySelectorAll("display buffer")) {
+    for (const region of buffer.querySelectorAll("region")) {
+      const frustum = region.querySelector("frustum");
+      const f = (sel) => {
+        const el = frustum && frustum.querySelector(sel);
+        const v = el ? parseFloat(el.textContent) : 0;
+        return Number.isFinite(v) ? v : 0;
+      };
+      const yaw   = f("yaw");
+      const pitch = f("pitch");
+      const roll  = f("roll");
+      const rA = f("rightAngle"), lA = f("leftAngle");
+      const uA = f("upAngle"),    dA = f("downAngle");
+      const fovH = Math.max(1, Math.abs(rA - lA));
+      const fovV = Math.max(1, Math.abs(uA - dA));
+      const id = region.getAttribute("id") || ("region" + idx);
+
+      const fileSet = region.querySelector("fileSet");
+      const warpFile  = fileSet && fileSet.querySelector("geometryWarpFile");
+      const alphaFile = fileSet && fileSet.querySelector("alphaMap");
+
+      displays.push({
+        id: id,
+        name: id,
+        pose: { yaw, pitch, roll },
+        fov:  { h: fovH, v: fovV },
+        worldUv: { minU: idx / 4, minV: 0, maxU: (idx + 1) / 4, maxV: 1 }, // placeholder; replaced after we know count
+        warpFileRef:  warpFile  ? warpFile.textContent.trim()  : null,
+        alphaFileRef: alphaFile ? alphaFile.textContent.trim() : null
+      });
+      idx++;
+    }
+  }
+
+  if (displays.length === 0) {
+    throw new Error("MPCDI XML: no <region> elements found inside <buffer>s");
+  }
+  // Re-stripe worldUv evenly across the imported displays. Users can
+  // tweak per-display worldUv after import; this gives a reasonable
+  // default that matches what the rig templates produce.
+  const n = displays.length;
+  for (let i = 0; i < n; i++) {
+    displays[i].worldUv = { minU: i / n, minV: 0, maxU: (i + 1) / n, maxV: 1 };
+  }
+  return displays;
+}
+
+/* User-facing: pop a file picker for a Bourke CSV warp file, parse,
+ * apply to the given display. Surfaces parse errors via alert so
+ * the user knows what went wrong with a mis-formatted file. Drops
+ * GPU cache so the next frame rebuilds with the new mesh. */
+function importBourkeMeshForDisplay(displayIdx) {
+  const d = state.rig && state.rig.displays && state.rig.displays[displayIdx];
+  if (!d) return;
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = ".csv,.txt,.data";
+  input.onchange = async (ev) => {
+    const file = ev.target.files && ev.target.files[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const mesh = _parseBourkeMeshCsv(text);
+      if (!_validateWarpMesh(mesh)) throw new Error("Parsed mesh failed validation");
+      pushHistory("warp-import:" + d.id);
+      d.warpMesh = mesh;
+      if (Visual && Visual._warpCache) Visual._warpCache.delete(d.id);
+      if (state.rig && Object.keys(RIG_TEMPLATES).includes(state.rig.templateKey)) {
+        state.rig.templateKey = "custom";
+      }
+      renderProps && renderProps();
+      render();
+      console.log("[warp-import]", file.name, "→ display", displayIdx, ":", mesh.cols + "×" + mesh.rows);
+    } catch (e) {
+      alert("Could not import warp mesh:\n\n" + (e && e.message ? e.message : String(e)));
+    }
+  };
+  input.click();
+}
+
+/* User-facing: pop a file picker for an MPCDI bundle (.mpcdi or
+ * .zip). Reads the ZIP, parses mpcdi.xml, replaces the rig with
+ * the imported display set. Warp + blend file references are
+ * captured but their binary parsers (PFM, PNG) ship in 6.6.2b —
+ * the rig geometry alone is meaningful (correct poses + FOVs +
+ * display count) and the user can always run "Auto-blend rig"
+ * afterward to populate intensity ramps. */
+function importMpcdiBundle() {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = ".mpcdi,.zip";
+  input.onchange = async (ev) => {
+    const file = ev.target.files && ev.target.files[0];
+    if (!file) return;
+    try {
+      const buf = await file.arrayBuffer();
+      const archive = await _readZipArchive(buf);
+      // Find mpcdi.xml — case-insensitive, in archive root or any
+      // subdirectory. Fall back to any .xml file if the canonical
+      // name isn't present (some bundles rename it).
+      const xmlName = Object.keys(archive).find(n => /(^|\/)mpcdi\.xml$/i.test(n))
+                    || Object.keys(archive).find(n => /\.xml$/i.test(n));
+      if (!xmlName) throw new Error("No mpcdi.xml (or any .xml) found in archive");
+      const xmlText = new TextDecoder("utf-8").decode(archive[xmlName]);
+      const imported = _parseMpcdiXml(xmlText);
+      if (!state.rig) state.rig = defaultRig();
+      pushHistory("mpcdi-import:" + file.name);
+      state.rig.templateKey = "custom";
+      state.rig.displays    = imported.map((d, i) => _makeDisplay(d.id, d.name, {
+        pose: d.pose,
+        fov:  d.fov,
+        worldUv: d.worldUv
+      }));
+      // Validate VisualOutput display-index pointers against new count.
+      const max = state.rig.displays.length - 1;
+      state.nodes.forEach(n => {
+        if (n.type === "VisualOutput" && n.params && typeof n.params.display === "number") {
+          if (n.params.display > max) n.params.display = max;
+        }
+      });
+      // Reallocate FBO + rebuild bind groups since display count changed.
+      if (Visual.device) {
+        _allocateFramebuffer();
+        _rebuildBlitBindGroup();
+        _rebuildRigCompositeBindGroup();
+        _rebuildWarpBindGroup();
+        _rebuildTheaterBindGroup();
+      }
+      // Auto-blend the imported rig — overlap detection generates
+      // intensity ramps so the user gets seamless content for free.
+      _applyAutoBlendToRig({ skipHistory: true, keepTemplate: true });
+      const refsMissing = imported.filter(d => d.warpFileRef || d.alphaFileRef).length;
+      const msg = "Imported " + imported.length + " displays from " + file.name +
+                  (refsMissing ? "\n\n" + refsMissing + " display(s) reference warp/alpha files. " +
+                   "Per-pixel calibration import (PFM warp + PNG blend) ships in 6.6.2b — for now the geometry is in place + auto-blend has applied intensity ramps." : "");
+      console.log("[mpcdi-import]", msg);
+      renderProps && renderProps();
+      render();
+      alert(msg);
+    } catch (e) {
+      alert("Could not import MPCDI bundle:\n\n" + (e && e.message ? e.message : String(e)));
+    }
+  };
+  input.click();
+}
+
 /* ------------ Phase 6.6.9 — mesh warp editor state + helpers ----------- */
 
 /* Editor state. Mesh edits mutate display.warpMesh.verts in place
@@ -16044,6 +16359,9 @@ function renderRigPane() {
         <button class="rig-warp-edit-btn"
                 data-display-warp-edit="${i}"
                 title="Open the mesh warp editor — drag control points to deform the calibration.">✎ edit</button>
+        <button class="rig-warp-edit-btn"
+                data-display-warp-import="${i}"
+                title="Import a Bourke-style warp mesh CSV (.csv) for this display. File format: header line, 'N M' grid dimensions, then N×M rows of 'x y u v intensity'.">⇪ import</button>
       </span>
       <span class="rig-edit-cluster rig-edit-cluster-blend${isCustomBlend ? " rig-edit-cluster-custom" : ""}" title="Edge-blend params. γ = gamma compensation; lift = black-floor lift; pow = power-curve steepness on the intensity ramp.">
         <label>γ</label>
@@ -16089,8 +16407,12 @@ function renderRigPane() {
       <div class="rig-display-list">
         <div class="rig-display-list-head">
           <span>Displays (yaw / pitch / fov in degrees)</span>
-          <button class="rig-auto-blend-btn" id="btn-rig-auto-blend"
-                  title="Detect overlapping pose footprints across all displays and auto-generate intensity ramps so adjacent projectors blend seamlessly. Displays in isolation are left as-is.">Auto-blend rig</button>
+          <span class="rig-display-list-actions">
+            <button class="rig-auto-blend-btn" id="btn-rig-mpcdi-import"
+                    title="Import an MPCDI bundle (.mpcdi or .zip) — replaces the rig with the displays defined in the manifest. Geometry (pose/fov) imports now; per-display warp PFM + alpha-map PNG import ships in 6.6.2b.">Import MPCDI…</button>
+            <button class="rig-auto-blend-btn" id="btn-rig-auto-blend"
+                    title="Detect overlapping pose footprints across all displays and auto-generate intensity ramps so adjacent projectors blend seamlessly. Displays in isolation are left as-is.">Auto-blend rig</button>
+          </span>
         </div>
         ${displayRows}
       </div>
@@ -16239,6 +16561,23 @@ function wireRigPaneHandlers() {
       openWarpEditor(i);
     });
   });
+
+  // Phase 6.6.2 — per-display Bourke-CSV warp-mesh import.
+  document.querySelectorAll('[data-display-warp-import]').forEach(btn => {
+    btn.addEventListener("click", () => {
+      const i = parseInt(btn.dataset.displayWarpImport, 10);
+      if (!Number.isFinite(i)) return;
+      importBourkeMeshForDisplay(i);
+    });
+  });
+
+  // Phase 6.6.2 — whole-rig MPCDI bundle import.
+  const mpcdiBtn = document.getElementById("btn-rig-mpcdi-import");
+  if (mpcdiBtn) {
+    mpcdiBtn.addEventListener("click", () => {
+      importMpcdiBundle();
+    });
+  }
 
   // Phase 6.6.11 — global "Auto-blend rig" button. Runs overlap
   // detection across all displays + sets warpMesh to per-display
