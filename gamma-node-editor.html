@@ -2001,6 +2001,46 @@
     align-items: center;
     margin-bottom: 4px;
   }
+  /* Phase 6.6.14 — sweet-spot row needs three short inputs + 2 small
+   * buttons in the value column. Custom layout so 3 floats fit
+   * comfortably without each one feeling cramped. */
+  .rig-sweet-spot-inputs {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: wrap;
+  }
+  .rig-sweet-spot-inputs > input {
+    width: 56px;
+    height: 26px;
+    padding: 0 6px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    outline: none;
+  }
+  .rig-sweet-spot-btn {
+    margin-left: 2px;
+    padding: 0 8px;
+    height: 26px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    color: var(--text-3);
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+    transition: background .12s, color .12s, border-color .12s;
+  }
+  .rig-sweet-spot-btn:hover {
+    background: var(--surface-3);
+    color: var(--text);
+    border-color: rgba(127, 119, 221, 0.4);
+  }
   .rig-grid > label {
     font-size: 11px;
     color: var(--text-2);
@@ -6561,7 +6601,7 @@
  * Pages deploy workflow (.github/workflows/pages.yml). The string
  * after the equals sign is what the workflow's sed targets — don't
  * change the format of this line. */
-const APP_VERSION = "0.1.59";
+const APP_VERSION = "0.1.60";
 
 /* =========================================================================
  * Node type registry — covers ~55 Gamma DSP classes
@@ -13990,6 +14030,7 @@ function freshState() {
  * with VisualOutput's display param defaulting to 0, the editor's
  * pre-Phase-6.5 single-display behavior is preserved exactly. */
 function defaultRig() {
+  const surface = { type: "plane", normal: [0, 0, 1], offset: 5 };
   return {
     templateKey: "single",
     masterRes:   [1920, 1080],
@@ -14003,12 +14044,92 @@ function defaultRig() {
     // (denominated by consumer set's azim range).
     shaderCenterYaw:   0,
     shaderCenterPitch: 0,
+    // Phase 6.6.14 — physical screen geometry. Closes the gap with
+    // Raskar et al.'s quadric-transfer math: knowing the screen as a
+    // parametric surface (sphere/cylinder/plane/free) unlocks
+    // analytic auto-warp (#3, next ticket) + screen-overlap-based
+    // edge-blend (#4) without needing camera-feedback calibration.
+    // Each template provides its own surface; the default rig is a
+    // single flat display, which corresponds to a plane at z=offset.
+    surface:    surface,
+    // Phase 6.6.14 — sweet-spot, the audience-position the rig is
+    // calibrated for. Theater-mode camera spawns there on rig
+    // template apply / patch load. Per Raskar §4.1, sphere → center,
+    // cylinder → midpoint of axis, plane → offset away from screen.
+    // Helper _deriveSweetSpot builds defaults; user can override.
+    sweetSpot:  _deriveSweetSpot(surface),
     displays:    [_makeDisplay("d0", "Display 1", {
       pose: { yaw: 0, pitch: 0, roll: 0 },
       fov:  { h: 90, v: 60 },
       worldUv: { minU: 0, minV: 0, maxU: 1, maxV: 1 }
     })]
   };
+}
+
+/* Derive a default sweet-spot from a screen-surface descriptor.
+ * Follows Raskar §4.1 conventions:
+ *   sphere   → sphere center (origin or surface.center)
+ *   cylinder → midpoint of axis
+ *   plane    → on the audience side at distance = surface.offset
+ *              (negative along the normal so audience sits where the
+ *              screen normal points TOWARD them)
+ *   free     → origin (no analytic answer; user sets manually)
+ *
+ * Always returns a fresh array so callers can mutate without aliasing. */
+function _deriveSweetSpot(surface) {
+  if (!surface || !surface.type) return [0, 0, 0];
+  if (surface.type === "sphere") {
+    const c = surface.center || [0, 0, 0];
+    return [c[0], c[1], c[2]];
+  }
+  if (surface.type === "cylinder") {
+    const c = surface.center || [0, 0, 0];
+    return [c[0], c[1], c[2]];
+  }
+  if (surface.type === "plane") {
+    const n = surface.normal || [0, 0, 1];
+    const d = surface.offset || 5;
+    // Sweet-spot on the OPPOSITE side of the plane from where the
+    // surface "extends" — for a screen at z=+d facing the viewer,
+    // audience sits at z=0 looking toward +z. So sweet-spot is at
+    // origin (the plane's normal points back toward the audience).
+    return [0, 0, 0];
+  }
+  return [0, 0, 0];
+}
+
+/* Validate a screen-surface object loaded from .gpatch / templates.
+ * Returns a sanitized copy (with defaults filled in for missing
+ * fields). Garbage input falls back to "free" surface so the rig
+ * stays renderable even with corrupted data. */
+function _migrateRigSurface(s) {
+  if (!s || typeof s !== "object" || !s.type) {
+    return { type: "free" };
+  }
+  if (s.type === "sphere") {
+    return {
+      type: "sphere",
+      radius: Number.isFinite(s.radius) ? s.radius : 5,
+      center: Array.isArray(s.center) && s.center.length === 3 ? s.center.slice() : [0, 0, 0]
+    };
+  }
+  if (s.type === "cylinder") {
+    return {
+      type: "cylinder",
+      radius: Number.isFinite(s.radius) ? s.radius : 5,
+      axis:   Array.isArray(s.axis)   && s.axis.length   === 3 ? s.axis.slice()   : [0, 1, 0],
+      length: Number.isFinite(s.length) ? s.length : 5,
+      center: Array.isArray(s.center) && s.center.length === 3 ? s.center.slice() : [0, 0, 0]
+    };
+  }
+  if (s.type === "plane") {
+    return {
+      type: "plane",
+      normal: Array.isArray(s.normal) && s.normal.length === 3 ? s.normal.slice() : [0, 0, 1],
+      offset: Number.isFinite(s.offset) ? s.offset : 5
+    };
+  }
+  return { type: "free" };
 }
 
 /* ---------- Phase 6.6 — calibration & warp data layer ---------- */
@@ -15745,6 +15866,7 @@ function _makeDisplay(id, name, overrides) {
 const RIG_TEMPLATES = {
   single: {
     label: "Single (1 display)",
+    surface: { type: "plane", normal: [0, 0, 1], offset: 5 },
     build: () => [_makeDisplay("d0", "Display 1", {
       pose: { yaw: 0, pitch: 0, roll: 0 },
       fov:  { h: 90, v: 60 },
@@ -15753,6 +15875,7 @@ const RIG_TEMPLATES = {
   },
   "side-by-side": {
     label: "Side-by-side (2 flat)",
+    surface: { type: "plane", normal: [0, 0, 1], offset: 5 },
     build: () => [
       _makeDisplay("d0", "Left", {
         pose: { yaw: -45, pitch: 0, roll: 0 },
@@ -15768,18 +15891,25 @@ const RIG_TEMPLATES = {
   },
   "quarter-wrap": {
     label: "Quarter-wrap (4 flat, 90°)",
+    surface: { type: "cylinder", radius: 5, axis: [0, 1, 0], length: 5, center: [0, 0, 0] },
     build: () => _evenAzimuthRing(4, 90, "Q")
   },
   "half-wrap": {
     label: "Half-wrap (8 flat, 180°)",
+    surface: { type: "cylinder", radius: 5, axis: [0, 1, 0], length: 5, center: [0, 0, 0] },
     build: () => _evenAzimuthRing(8, 180, "H")
   },
   "full-wrap-16": {
     label: "Full-wrap (16 flat, 360°)",
+    surface: { type: "cylinder", radius: 5, axis: [0, 1, 0], length: 5, center: [0, 0, 0] },
     build: () => _evenAzimuthRing(16, 360, "F")
   },
   cube: {
     label: "Cube (6 faces)",
+    // Cube isn't a quadric — surface is a 6-faced polyhedron, marked
+    // "free" so auto-warp falls back to identity. Sweet-spot defaults
+    // to origin (cube center).
+    surface: { type: "free" },
     build: () => {
       const pose = (yaw, pitch) => ({ yaw, pitch, roll: 0 });
       // Standard cubemap unfold: 4 sides + top + bottom in a 4×3 layout
@@ -15799,6 +15929,7 @@ const RIG_TEMPLATES = {
   },
   "allosphere-like": {
     label: "AlloSphere-like (16 partial sphere)",
+    surface: { type: "sphere", radius: 5, center: [0, 0, 0] },
     build: () => {
       // 4 columns × 4 rows on a partial sphere. Vertical FOV ≈ 150°
       // (bisected sphere), horizontal 360°. Each cell is one display.
@@ -15830,6 +15961,7 @@ const RIG_TEMPLATES = {
   },
   "allosphere-real": {
     label: "AlloSphere (real 26-projector layout)",
+    surface: { type: "sphere", radius: 5, center: [0, 0, 0] },
     build: () => {
       // The real UCSB AlloSphere has 26 projectors arranged
       // asymmetrically across two listening hemispheres separated by
@@ -15912,6 +16044,25 @@ function applyRigTemplate(key) {
   if (!state.rig) state.rig = defaultRig();
   state.rig.templateKey = key;
   state.rig.displays    = t.build();
+  // Phase 6.6.14 — propagate the template's screen-surface descriptor
+  // and re-derive the sweet-spot. Templates without an explicit surface
+  // get a "free" default so auto-warp falls through to identity. The
+  // sweet-spot is freshly derived because the user picking a new
+  // template implies they want the canonical viewing position for
+  // that geometry; if they tweak it after, their override persists
+  // until the next template change.
+  state.rig.surface   = _migrateRigSurface(t.surface || { type: "free" });
+  state.rig.sweetSpot = _deriveSweetSpot(state.rig.surface);
+  // Reset the theater camera to the new sweet-spot so the next
+  // entry to theater preview spawns the user at the canonical
+  // viewing position. Yaw/pitch keep their last orientation —
+  // changing positions but staying "facing" the same way is less
+  // disorienting than a full reset.
+  if (Visual && Visual.theaterCam) {
+    Visual.theaterCam.pos[0] = state.rig.sweetSpot[0];
+    Visual.theaterCam.pos[1] = state.rig.sweetSpot[1];
+    Visual.theaterCam.pos[2] = state.rig.sweetSpot[2];
+  }
   // Validate that any VisualOutput nodes still point at a valid
   // display index. Anything pointing past the new display count gets
   // clamped to the last available display.
@@ -17478,6 +17629,55 @@ function renderRigPane() {
         <label for="rig-shader-pitch" title="Where the shader's content center lands in world pitch degrees. 0 = no shift.">Center pitch</label>
         <input type="number" id="rig-shader-pitch" class="rig-grid-input" value="${(+(rig.shaderCenterPitch || 0)).toFixed(0)}" step="1" />
       </div>
+      ${(() => {
+        // Phase 6.6.14 — screen surface + sweet-spot UI. Type dropdown
+        // changes which params show below; sweet-spot is always 3 inputs
+        // with a "from surface" reset button.
+        const surf = rig.surface || { type: "free" };
+        const ss   = Array.isArray(rig.sweetSpot) ? rig.sweetSpot : [0, 0, 0];
+        const surfTypeOpts = [
+          ["sphere",   "Sphere"],
+          ["cylinder", "Cylinder"],
+          ["plane",    "Plane"],
+          ["free",     "Free / Custom"]
+        ].map(([k, l]) => `<option value="${k}"${surf.type === k ? " selected" : ""}>${l}</option>`).join("");
+        let surfParamsHtml = "";
+        if (surf.type === "sphere") {
+          surfParamsHtml = `
+            <label title="Sphere radius — the audience sits inside; theater camera spawns at the center.">Radius</label>
+            <input type="number" id="rig-surf-radius" class="rig-grid-input" value="${(+surf.radius).toFixed(2)}" step="0.5" min="0.5" />
+          `;
+        } else if (surf.type === "cylinder") {
+          surfParamsHtml = `
+            <label title="Cylinder radius (horizontal extent of curve).">Radius</label>
+            <input type="number" id="rig-surf-radius" class="rig-grid-input" value="${(+surf.radius).toFixed(2)}" step="0.5" min="0.5" />
+            <label title="Cylinder length along its axis.">Length</label>
+            <input type="number" id="rig-surf-length" class="rig-grid-input" value="${(+surf.length).toFixed(2)}" step="0.5" min="0.5" />
+          `;
+        } else if (surf.type === "plane") {
+          surfParamsHtml = `
+            <label title="Distance from the audience to the screen along the plane normal.">Offset</label>
+            <input type="number" id="rig-surf-offset" class="rig-grid-input" value="${(+surf.offset).toFixed(2)}" step="0.5" min="0.5" />
+          `;
+        }
+        return `
+          <div class="rig-grid rig-grid-surface">
+            <label for="rig-surface-type" title="Physical screen geometry. Used by theater preview for sweet-spot, and by 6.6.14+ auto-warp for analytic geometry correction.">Screen</label>
+            <select id="rig-surface-type">${surfTypeOpts}</select>
+            ${surfParamsHtml}
+          </div>
+          <div class="rig-grid rig-grid-sweet-spot">
+            <label title="The audience-position the rig is calibrated for. Theater camera spawns here on rig change / patch load.">Sweet spot</label>
+            <span class="rig-sweet-spot-inputs">
+              <input type="number" id="rig-sweet-spot-x" class="rig-grid-input" value="${(+ss[0]).toFixed(2)}" step="0.1" title="X" />
+              <input type="number" id="rig-sweet-spot-y" class="rig-grid-input" value="${(+ss[1]).toFixed(2)}" step="0.1" title="Y" />
+              <input type="number" id="rig-sweet-spot-z" class="rig-grid-input" value="${(+ss[2]).toFixed(2)}" step="0.1" title="Z" />
+              <button class="rig-sweet-spot-btn" id="btn-rig-sweet-from-surface" title="Re-derive the sweet-spot from the current screen surface (sphere center / cylinder midpoint / plane offset).">↻ from surface</button>
+              <button class="rig-sweet-spot-btn" id="btn-rig-camera-reset" title="Reset the theater-mode camera to the current sweet-spot position.">⟲ camera</button>
+            </span>
+          </div>
+        `;
+      })()}
       <div class="rig-display-list">
         <div class="rig-display-list-head">
           <span>Displays (yaw / pitch / fov in degrees)</span>
@@ -17540,6 +17740,94 @@ function wireRigPaneHandlers() {
       if (!state.rig) state.rig = defaultRig();
       state.rig.shaderCenterPitch = v;
       render();
+    });
+  }
+
+  // Phase 6.6.14 — screen surface type dropdown + per-type params.
+  // Type change rebuilds the surface object with sensible defaults
+  // for that type (and re-renders the pane so the param inputs
+  // match). Param changes mutate in place + render().
+  const surfType = document.getElementById("rig-surface-type");
+  if (surfType) {
+    surfType.addEventListener("change", () => {
+      pushHistory("rig-surface-type:" + surfType.value);
+      if (!state.rig) state.rig = defaultRig();
+      const t = surfType.value;
+      if (t === "sphere")        state.rig.surface = { type: "sphere",   radius: 5,    center: [0, 0, 0] };
+      else if (t === "cylinder") state.rig.surface = { type: "cylinder", radius: 5,    axis: [0, 1, 0], length: 5, center: [0, 0, 0] };
+      else if (t === "plane")    state.rig.surface = { type: "plane",    normal: [0, 0, 1], offset: 5 };
+      else                       state.rig.surface = { type: "free" };
+      state.rig.sweetSpot = _deriveSweetSpot(state.rig.surface);
+      renderProps && renderProps();
+      render();
+    });
+  }
+  const surfRadius = document.getElementById("rig-surf-radius");
+  if (surfRadius) {
+    surfRadius.addEventListener("input", () => {
+      const v = parseFloat(surfRadius.value);
+      if (!isFinite(v) || v <= 0) return;
+      pushHistory("rig-surface-radius");
+      if (state.rig && state.rig.surface) state.rig.surface.radius = v;
+      render();
+    });
+  }
+  const surfLength = document.getElementById("rig-surf-length");
+  if (surfLength) {
+    surfLength.addEventListener("input", () => {
+      const v = parseFloat(surfLength.value);
+      if (!isFinite(v) || v <= 0) return;
+      pushHistory("rig-surface-length");
+      if (state.rig && state.rig.surface) state.rig.surface.length = v;
+      render();
+    });
+  }
+  const surfOffset = document.getElementById("rig-surf-offset");
+  if (surfOffset) {
+    surfOffset.addEventListener("input", () => {
+      const v = parseFloat(surfOffset.value);
+      if (!isFinite(v) || v <= 0) return;
+      pushHistory("rig-surface-offset");
+      if (state.rig && state.rig.surface) state.rig.surface.offset = v;
+      render();
+    });
+  }
+
+  // Phase 6.6.14 — sweet-spot manual edit (X/Y/Z) + the two action
+  // pills (re-derive from surface, reset theater camera).
+  ["x", "y", "z"].forEach((axis, i) => {
+    const inp = document.getElementById("rig-sweet-spot-" + axis);
+    if (!inp) return;
+    inp.addEventListener("input", () => {
+      const v = parseFloat(inp.value);
+      if (!isFinite(v)) return;
+      pushHistory("rig-sweet-spot");
+      if (!state.rig) state.rig = defaultRig();
+      if (!Array.isArray(state.rig.sweetSpot)) state.rig.sweetSpot = [0, 0, 0];
+      state.rig.sweetSpot[i] = v;
+      render();
+    });
+  });
+  const fromSurfBtn = document.getElementById("btn-rig-sweet-from-surface");
+  if (fromSurfBtn) {
+    fromSurfBtn.addEventListener("click", () => {
+      pushHistory("rig-sweet-from-surface");
+      if (!state.rig) state.rig = defaultRig();
+      state.rig.sweetSpot = _deriveSweetSpot(state.rig.surface || { type: "free" });
+      renderProps && renderProps();
+      render();
+    });
+  }
+  const camResetBtn = document.getElementById("btn-rig-camera-reset");
+  if (camResetBtn) {
+    camResetBtn.addEventListener("click", () => {
+      if (Visual && Visual.theaterCam && state.rig && Array.isArray(state.rig.sweetSpot)) {
+        Visual.theaterCam.pos[0] = state.rig.sweetSpot[0];
+        Visual.theaterCam.pos[1] = state.rig.sweetSpot[1];
+        Visual.theaterCam.pos[2] = state.rig.sweetSpot[2];
+        Visual.theaterCam.yaw   = 0;
+        Visual.theaterCam.pitch = 0;
+      }
     });
   }
 
@@ -20335,6 +20623,16 @@ document.getElementById("file-input").addEventListener("change", ev => {
       // Phase 6.5.15+ — synthesize shader-center fields for older rigs.
       if (typeof state.rig.shaderCenterYaw   !== "number") state.rig.shaderCenterYaw   = 0;
       if (typeof state.rig.shaderCenterPitch !== "number") state.rig.shaderCenterPitch = 0;
+      // Phase 6.6.14 — synthesize screen-surface + sweet-spot for
+      // pre-6.6.14 rigs. Pull the surface from the patch's
+      // templateKey if it matches a known template; otherwise fall
+      // back to "free" surface and origin sweet-spot.
+      state.rig.surface = _migrateRigSurface(state.rig.surface
+        || (RIG_TEMPLATES[state.rig.templateKey] && RIG_TEMPLATES[state.rig.templateKey].surface)
+        || null);
+      if (!Array.isArray(state.rig.sweetSpot) || state.rig.sweetSpot.length !== 3) {
+        state.rig.sweetSpot = _deriveSweetSpot(state.rig.surface);
+      }
       // Phase 6.6 — synthesize calibration warp + edge-blend fields
       // on every display so the render path can read them without
       // null checks. Pre-6.6 patches get warpMesh=null (no warp) +
@@ -20366,6 +20664,15 @@ document.getElementById("file-input").addEventListener("change", ev => {
       // load so theater-mode pointer-events flip correctly when the
       // patch comes in already in theater preview.
       if (typeof _updateProjectionPill === "function") _updateProjectionPill();
+      // Phase 6.6.14 — spawn the theater camera at the rig's sweet
+      // spot. Patch authors may have intended a specific viewing
+      // position; re-loading should put the user there before they
+      // start exploring.
+      if (Visual && Visual.theaterCam && state.rig && Array.isArray(state.rig.sweetSpot)) {
+        Visual.theaterCam.pos[0] = state.rig.sweetSpot[0];
+        Visual.theaterCam.pos[1] = state.rig.sweetSpot[1];
+        Visual.theaterCam.pos[2] = state.rig.sweetSpot[2];
+      }
       render();
     } catch (err) {
       alert("Could not load file: " + err.message);
