@@ -13016,6 +13016,10 @@ const RIG_TEMPLATES = {
     label: "Half-wrap (8 flat, 180°)",
     build: () => _evenAzimuthRing(8, 180, "H")
   },
+  "full-wrap-16": {
+    label: "Full-wrap (16 flat, 360°)",
+    build: () => _evenAzimuthRing(16, 360, "F")
+  },
   cube: {
     label: "Cube (6 faces)",
     build: () => {
@@ -13061,6 +13065,57 @@ const RIG_TEMPLATES = {
               maxU: (c + 1) * cellW, maxV: (r + 1) * cellH
             }
           }));
+        }
+      }
+      return out;
+    }
+  },
+  "allosphere-real": {
+    label: "AlloSphere (real 26-projector layout)",
+    build: () => {
+      // The real UCSB AlloSphere has 26 projectors arranged
+      // asymmetrically across two listening hemispheres separated by
+      // a catwalk seam at the equator. Ring counts approximate the
+      // published "14 upper / 12 lower" channel split: more density
+      // near the catwalk (where projector mounts have line-of-sight)
+      // and sparser near the poles (which need wider-FOV optics).
+      //
+      // Rings (top → bottom):
+      //   +60°: 5 projectors  ┐
+      //   +20°: 9 projectors  ┘ 14 upper hemisphere
+      //   ---  catwalk gap (no projectors near 0°)  ---
+      //   -20°: 8 projectors  ┐
+      //   -60°: 4 projectors  ┘ 12 lower hemisphere
+      //
+      // FOVs are sized to overlap slightly within each ring (azimuth
+      // step + ~10% bleed) and to bridge between rings (~50° vertical
+      // FOV per projector). worldUv tiles the equirect master in a
+      // ring-by-ring band layout: top band 0..1/4 V, mid-top 1/4..2/4,
+      // mid-bot 2/4..3/4, bottom 3/4..1.
+      const rings = [
+        { pitch:  60, count: 5, vBand: [0,    0.22] },
+        { pitch:  20, count: 9, vBand: [0.22, 0.50] },
+        { pitch: -20, count: 8, vBand: [0.50, 0.78] },
+        { pitch: -60, count: 4, vBand: [0.78, 1.00] }
+      ];
+      const out = [];
+      let idx = 0;
+      for (const ring of rings) {
+        const fovH = (360 / ring.count) * 1.10;     // 10% azimuth bleed
+        const fovV = 50;
+        const cellU = 1 / ring.count;
+        for (let i = 0; i < ring.count; i++) {
+          const yaw = -180 + (i + 0.5) * (360 / ring.count);
+          out.push(_makeDisplay("ar" + idx, "Allo-" + (idx + 1), {
+            pose: { yaw, pitch: ring.pitch, roll: 0 },
+            fov:  { h: fovH, v: fovV },
+            curvature: 30,   // sphere screen curve, dome-projection style
+            worldUv: {
+              minU:  i      * cellU, minV: ring.vBand[0],
+              maxU: (i + 1) * cellU, maxV: ring.vBand[1]
+            }
+          }));
+          idx++;
         }
       }
       return out;
@@ -20865,12 +20920,13 @@ function _encodeVisualGraph(enc, dtSec) {
  * Persisted only in memory — no .gpatch round-trip; the gizmo is a
  * UX overlay, not patch state.
  *
- * Default: pitch=+20 so the camera looks DOWN at the rig from
- * above. With matching display + camera pitch conventions (positive
- * pitch lifts the rotation axis toward zenith), this puts +Y at
- * canvas-top, +Z slightly upper-left at the default yaw=30, +X
- * lower-right — the standard "above looking down" 3D-editor view. */
-const _gizmoCam = { yaw: 30, pitch: 20, scale: 1.0 };
+ * Default: pitch=+35 so the camera looks DOWN at the rig from
+ * above at a moderately steep angle — steep enough that the four
+ * elevation rings of the AlloSphere templates read as separate
+ * latitudes, not concentric vertical bars. Combined with the
+ * wireframe sphere drawn behind the frustums, this gives an
+ * unambiguous "looking down into a sphere" read on first open. */
+const _gizmoCam = { yaw: 30, pitch: 35, scale: 1.0 };
 let _gizmoOpen = false;
 let _gizmoDrag = null;
 
@@ -20960,31 +21016,51 @@ function _drawGizmoFrame() {
     return { x: cx + x * baseScale, y: cy - y * baseScale, z: z };
   }
 
-  // Horizon ring at y=0 (rig's equator).
-  ctx.beginPath();
-  for (let i = 0; i <= 64; i++) {
-    const a = i / 64 * 2 * Math.PI;
-    const p = project([Math.cos(a), 0, Math.sin(a)]);
-    if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+  // Wireframe sphere: latitude rings at every 30° of pitch +
+  // longitude meridians at every 30° of yaw. The equator is drawn
+  // brighter because it's the rig's reference horizon (where the
+  // AlloSphere catwalk lives). Every other line is faint enough not
+  // to compete with the frustum strokes — it's a backdrop, not a
+  // foreground element.
+  function drawLatRing(pitchDeg, color) {
+    const py = pitchDeg * Math.PI / 180;
+    const r = Math.cos(py);
+    const y = Math.sin(py);
+    ctx.beginPath();
+    for (let i = 0; i <= 64; i++) {
+      const a = i / 64 * 2 * Math.PI;
+      const p = project([r * Math.cos(a), y, r * Math.sin(a)]);
+      if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+    }
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1;
+    ctx.stroke();
   }
-  ctx.strokeStyle = "rgba(200, 232, 90, 0.18)";
-  ctx.lineWidth = 1;
-  ctx.stroke();
+  // Faint latitude rings every 30°, equator (0°) brighter.
+  drawLatRing(-60, "rgba(200, 232, 90, 0.07)");
+  drawLatRing(-30, "rgba(200, 232, 90, 0.07)");
+  drawLatRing(  0, "rgba(200, 232, 90, 0.22)");   // equator / catwalk seam
+  drawLatRing( 30, "rgba(200, 232, 90, 0.07)");
+  drawLatRing( 60, "rgba(200, 232, 90, 0.07)");
 
-  // Vertical meridians at yaw 0 / 90 / 180 / 270 — give a sphere
-  // sense to the gizmo without drawing a full wireframe sphere.
-  for (let m = 0; m < 4; m++) {
-    const yaw0 = m * Math.PI / 2;
+  // Longitude meridians every 30° (12 total) — denser than the old
+  // 4-meridian set so the partial-sphere shape reads from any orbit
+  // angle, not just the cardinal yaws.
+  for (let m = 0; m < 12; m++) {
+    const yaw0 = m * Math.PI / 6;     // 30° step
+    const isCardinal = (m % 3 === 0);  // 0, 90, 180, 270 a touch brighter
     ctx.beginPath();
     for (let i = -8; i <= 8; i++) {
-      const pitch = i / 8 * (Math.PI / 2 - 0.1);
+      const pitch = i / 8 * (Math.PI / 2 - 0.05);
       const x = Math.sin(yaw0) * Math.cos(pitch);
       const y = Math.sin(pitch);
       const z = Math.cos(yaw0) * Math.cos(pitch);
       const p = project([x, y, z]);
       if (i === -8) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
     }
-    ctx.strokeStyle = "rgba(200, 232, 90, 0.10)";
+    ctx.strokeStyle = isCardinal
+      ? "rgba(200, 232, 90, 0.12)"
+      : "rgba(200, 232, 90, 0.05)";
     ctx.stroke();
   }
 
