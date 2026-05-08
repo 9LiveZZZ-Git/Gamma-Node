@@ -20341,11 +20341,38 @@ function _encodeShaderFragPassForVO(enc, vo, src, def, dtSec, layerIdx) {
   return true;
 }
 
+/* Encode a bare render pass that clears one framebuffer layer to
+ * solid black. Used for layers that don't get a shader pass this
+ * frame — either no VisualOutput targets them (orphan layers in a
+ * multi-display rig with fewer VOs than displays) or the targeting
+ * VO has no valid source (just disconnected, or source isn't a
+ * shader-frag, or the pipeline is still compiling). Without this,
+ * GPU texture memory persists across frames and the compositor
+ * samples stale content — visible as "frozen on last input" after
+ * disconnect. */
+function _encodeLayerClear(enc, layerIdx) {
+  const layerView = Visual.framebufferLayerViews[layerIdx];
+  if (!layerView) return;
+  enc.beginRenderPass({
+    label: "fbo-layer-clear-" + layerIdx,
+    colorAttachments: [{
+      view: layerView,
+      clearValue: { r: 0, g: 0, b: 0, a: 1.0 },
+      loadOp: "clear",
+      storeOp: "store"
+    }]
+  }).end();
+}
+
 /* Walk every VisualOutput in the patch and encode a render pass for
- * each that has a wired shader-frag source. Returns true if AT LEAST
- * ONE pass landed (so the compositor knows the framebuffer has
- * content to assemble); false if no VisualOutputs exist or none had
- * renderable inputs.
+ * each that has a wired shader-frag source. ALSO clears any layer
+ * that didn't receive a shader pass this frame (orphan layers OR
+ * unsourced VOs) so disconnect-then-reconnect doesn't leak stale
+ * content. Returns true whenever there's ≥ 1 VisualOutput in the
+ * patch — composite runs in that case to show the rig grid with
+ * black cells where appropriate. Returns false only when the patch
+ * has zero VOs, in which case the legacy smoke-clear fallback path
+ * takes over.
  *
  * Phase 6.5.6: same shader feeding multiple VOs runs N times, each
  * with display-specific uniforms. Pipeline cache hashes by WGSL so
@@ -20364,23 +20391,36 @@ function _encodeVisualGraph(enc, dtSec) {
   const visualOutputs = state.nodes.filter(n => n.type === "VisualOutput");
   if (visualOutputs.length === 0) return false;
   const layerCount = Visual.framebufferLayerViews.length || 1;
-  let renderedAny = false;
+  const renderedLayers = new Set();
   for (const vo of visualOutputs) {
-    const incomingEdge = state.edges.find(e =>
-      e.to.node === vo.id && e.to.port === "in"
-    );
-    if (!incomingEdge) continue;
-    const src = state.nodes.find(n => n.id === incomingEdge.from.node);
-    if (!src) continue;
-    const def = TYPES[src.type];
-    if (!def || def.kind !== "shader-frag" || typeof def.wgsl !== "string") continue;
     let layerIdx = (vo.params && typeof vo.params.display === "number") ? (vo.params.display | 0) : 0;
     if (layerIdx < 0)            layerIdx = 0;
     if (layerIdx >= layerCount)  layerIdx = layerCount - 1;
-    const ok = _encodeShaderFragPassForVO(enc, vo, src, def, dtSec, layerIdx);
-    if (ok) renderedAny = true;
+    const incomingEdge = state.edges.find(e =>
+      e.to.node === vo.id && e.to.port === "in"
+    );
+    let ok = false;
+    if (incomingEdge) {
+      const src = state.nodes.find(n => n.id === incomingEdge.from.node);
+      if (src) {
+        const def = TYPES[src.type];
+        if (def && def.kind === "shader-frag" && typeof def.wgsl === "string") {
+          ok = _encodeShaderFragPassForVO(enc, vo, src, def, dtSec, layerIdx);
+        }
+      }
+    }
+    if (ok) renderedLayers.add(layerIdx);
   }
-  return renderedAny;
+  // Clear every layer that didn't get a shader pass this frame —
+  // covers (a) unwired or invalid-source VOs (which would otherwise
+  // freeze on the last good frame), (b) orphan layers with no VO
+  // targeting them at all (which would freeze on whatever a deleted
+  // VO last drew there), and (c) VOs whose pipeline is still
+  // compiling on the first drop of a fresh shader-frag node.
+  for (let i = 0; i < layerCount; i++) {
+    if (!renderedLayers.has(i)) _encodeLayerClear(enc, i);
+  }
+  return true;   // VOs exist → composite runs
 }
 
 /* ----- Phase 6.1.7 — render loop (rAF) -------------------------------- */
