@@ -11988,13 +11988,15 @@ public:
     outs: [{ n: "out", t: "texture" }],
     params: { r: 0.20, g: 0.55, b: 0.85 },
     methods: { r: null, g: null, b: null },   // no audio codegen — params live entirely on the GPU
-    uniformBytes: 48,
+    uniformBytes: 80,
     wgsl:
 `struct U {
   u_resolution: vec4f,
   u_time:       f32,
   u_dt:         f32,
-  _pad:         vec2f,
+  _pad0:        vec2f,
+  u_view:       vec4f,
+  u_world_uv:   vec4f,
   color:        vec4f,
 };
 @group(0) @binding(0) var<uniform> u: U;
@@ -12023,14 +12025,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   return u.color;
 }`,
     writeUniforms(node, scratch) {
-      // scratch is Float32Array of (uniformBytes/4) = 12 floats.
-      // Offsets [0..7] are the preamble (resolution, time, dt, pad).
-      // We fill [8..11] with the color.
+      // scratch = 20 floats (80 B). Preamble fills [0..15] (incl.
+      // u_view at [8..11], u_world_uv at [12..15]). User color fills
+      // [16..19]. SolidColor doesn't use UV/world_uv → it ignores
+      // those and just outputs a flat color across whichever display
+      // it's assigned to (same color on every display).
       const p = node.params || {};
-      scratch[8]  = (typeof p.r === "number") ? p.r : 0.5;
-      scratch[9]  = (typeof p.g === "number") ? p.g : 0.5;
-      scratch[10] = (typeof p.b === "number") ? p.b : 0.5;
-      scratch[11] = 1.0;   // alpha — opaque always
+      scratch[16] = (typeof p.r === "number") ? p.r : 0.5;
+      scratch[17] = (typeof p.g === "number") ? p.g : 0.5;
+      scratch[18] = (typeof p.b === "number") ? p.b : 0.5;
+      scratch[19] = 1.0;   // alpha — opaque always
     },
     description: "Flat color fill — outputs a uniform RGB color across the entire framebuffer. r/g/b each ∈ [0, 1]. Wire into VisualOutput.in for a solid backdrop, or into BlendShader (Phase 6.4) as one of its inputs."
   },
@@ -12059,14 +12063,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       rB: 0.85, gB: 0.55, bB: 0.20
     },
     methods: {},
-    uniformBytes: 64,
+    uniformBytes: 112,
     wgsl:
 `struct U {
   u_resolution: vec4f,
   u_time:       f32,
   u_dt:         f32,
+  _pad0:        vec2f,
+  u_view:       vec4f,
+  u_world_uv:   vec4f,
   angle:        f32,
-  _pad0:        f32,
+  _pad1:        vec3f,
   colorA:       vec4f,
   colorB:       vec4f,
 };
@@ -12093,36 +12100,45 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4f {
-  // Project the centered uv onto the angle direction; remap to [0,1]
-  // and clamp so the gradient stays visible regardless of angle.
+  // Map local uv [0,1] into the rig's master canvas via this
+  // display's u_world_uv slice. For single-display rigs world_uv
+  // == in.uv (slice covers [0,1]); for multi-display rigs the
+  // gradient renders as ONE continuous gradient across the whole
+  // rig, with the seam landing wherever displays meet on the
+  // master canvas.
+  let world_uv = mix(u.u_world_uv.xy, u.u_world_uv.zw, in.uv);
   let dir = vec2f(cos(u.angle), sin(u.angle));
-  let centered = in.uv - vec2f(0.5);
-  // dot range over uv∈[0,1] is [-0.707, 0.707] (worst case 45°),
-  // but along the cardinal axes it's [-0.5, 0.5]. Add 0.5 + saturate.
+  let centered = world_uv - vec2f(0.5);
   let t = clamp(dot(centered, dir) + 0.5, 0.0, 1.0);
   return mix(u.colorA, u.colorB, t);
 }`,
     writeUniforms(node, scratch) {
-      // 64-byte buffer = 16 f32 indices. WGSL struct alignment puts
-      // vec4 fields on 16-byte boundaries, so the layout is:
-      //   bytes  0–15  / indices  0–3  → u_resolution  (preamble)
-      //   bytes 16–19  / index    4    → u_time         (preamble)
-      //   bytes 20–23  / index    5    → u_dt           (preamble)
-      //   bytes 24–27  / index    6    → angle          (we overwrite preamble pad here)
-      //   bytes 28–31  / index    7    → _pad0          (leave 0)
-      //   bytes 32–47  / indices 8–11  → colorA  (rA, gA, bA, αA)
-      //   bytes 48–63  / indices 12–15 → colorB  (rB, gB, bB, αB)
+      // 112-byte buffer = 28 f32 indices. WGSL struct alignment puts
+      // vec4 fields on 16-byte boundaries and vec3 on 16-byte too
+      // (vec3 reserves its 4-aligned slot). Layout:
+      //   bytes  0–15  / indices  0–3   → u_resolution     (preamble)
+      //   bytes 16–19  / index    4     → u_time            (preamble)
+      //   bytes 20–23  / index    5     → u_dt              (preamble)
+      //   bytes 24–31  / indices  6–7   → _pad0             (preamble)
+      //   bytes 32–47  / indices  8–11  → u_view            (preamble)
+      //   bytes 48–63  / indices 12–15  → u_world_uv        (preamble)
+      //   bytes 64–67  / index   16     → angle             (user)
+      //   bytes 68–79  / indices 17–19  → _pad1             (alignment)
+      //   bytes 80–95  / indices 20–23  → colorA            (user)
+      //   bytes 96–111 / indices 24–27  → colorB            (user)
       const p = node.params || {};
-      scratch[6]  = (typeof p.angle === "number") ? p.angle : 0.0;
-      // scratch[7] = 0 — already zeroed by preamble.
-      scratch[8]  = (typeof p.rA === "number") ? p.rA : 0.05;
-      scratch[9]  = (typeof p.gA === "number") ? p.gA : 0.10;
-      scratch[10] = (typeof p.bA === "number") ? p.bA : 0.20;
-      scratch[11] = 1.0;
-      scratch[12] = (typeof p.rB === "number") ? p.rB : 0.85;
-      scratch[13] = (typeof p.gB === "number") ? p.gB : 0.55;
-      scratch[14] = (typeof p.bB === "number") ? p.bB : 0.20;
-      scratch[15] = 1.0;
+      scratch[16] = (typeof p.angle === "number") ? p.angle : 0.0;
+      // scratch[17..19] = 0 (alignment pad — preamble already zeroed
+      // _pad0; this _pad1 is fresh territory but Float32Array init
+      // zero-fills the whole buffer, and we never write here).
+      scratch[20] = (typeof p.rA === "number") ? p.rA : 0.05;
+      scratch[21] = (typeof p.gA === "number") ? p.gA : 0.10;
+      scratch[22] = (typeof p.bA === "number") ? p.bA : 0.20;
+      scratch[23] = 1.0;
+      scratch[24] = (typeof p.rB === "number") ? p.rB : 0.85;
+      scratch[25] = (typeof p.gB === "number") ? p.gB : 0.55;
+      scratch[26] = (typeof p.bB === "number") ? p.bB : 0.20;
+      scratch[27] = 1.0;
     },
     description: "Linear gradient — interpolates colorA → colorB along an angle (radians). Default is dark teal → warm amber along +x. r/g/b each ∈ [0, 1]; angle wraps 0..2π. Wire into VisualOutput for a moving sunset backdrop (animate angle from a clock signal once 6.5's bridge nodes ship)."
   },
@@ -12336,25 +12352,26 @@ function buildUserDspDef(source) {
       }
     }
 
-    // Uniform-buffer size: 32-byte standard preamble (resolution +
-    // time + dt + vec2f pad) + N × 4 B for params, rounded up to a
-    // 16-byte boundary so vec4 fields the user might add later still
-    // align cleanly. Floor at 48 bytes (the SolidColor case) so the
-    // smallest shader still gets a comfortable buffer.
+    // Uniform-buffer size: 64-byte standard preamble (resolution,
+    // time, dt, _pad, u_view, u_world_uv) + N × 4 B for params,
+    // rounded up to a 16-byte boundary so vec4 fields the user might
+    // add later still align cleanly. Floor at 80 bytes (the
+    // SolidColor case: 64 preamble + 16 vec4 color) so the smallest
+    // shader still gets a comfortable buffer.
     const N = paramOrder.length;
-    def.uniformBytes = Math.max(48, 32 + Math.ceil((N * 4) / 16) * 16);
+    def.uniformBytes = Math.max(80, 64 + Math.ceil((N * 4) / 16) * 16);
 
     // writeUniforms — pack params as f32 in declaration order, starting
-    // at scratch[8] (= byte offset 32, immediately after the preamble).
-    // The user's WGSL struct must declare matching f32 fields in the
-    // same order; see gdspFormatSpec for the convention + a worked
-    // example.
+    // at scratch[16] (= byte offset 64, immediately after the
+    // 64-byte standard preamble). The user's WGSL struct must declare
+    // matching f32 fields in the same order; see gdspFormatSpec for
+    // the convention + a worked example.
     def.writeUniforms = function (node, scratch) {
       const p = node.params || {};
       for (let i = 0; i < paramOrder.length; i++) {
         const name = paramOrder[i];
         const v = p[name];
-        scratch[8 + i] = (typeof v === "number") ? v : 0;
+        scratch[16 + i] = (typeof v === "number") ? v : 0;
       }
     };
 
@@ -12956,6 +12973,15 @@ function applyRigTemplate(key) {
       if (n.params.display > max) n.params.display = max;
     }
   });
+  // Phase 6.5.5 — display count changed → reallocate the texture array
+  // + rebuild bind groups so subsequent renders target the new layer
+  // count. Skips silently if the GPU device hasn't acquired yet
+  // (ensureGPUDevice will run the alloc when it does).
+  if (Visual.device) {
+    _allocateFramebuffer();
+    _rebuildBlitBindGroup();
+    _rebuildRigCompositeBindGroup();
+  }
   render();
   renderProps && renderProps();
 }
@@ -17567,22 +17593,36 @@ WGSL conventions:
     the canonical pattern — three positions, derive uv from clip pos
     with v flipped).
   - Bind your uniform struct at @group(0) @binding(0). The struct must
-    start with the standard preamble:
-        u_resolution: vec4f,   // (w, h, 1/w, 1/h)
+    start with the standard 64-byte preamble:
+        u_resolution: vec4f,   // (w, h, 1/w, 1/h) of THIS display
         u_time:       f32,     // seconds since the GPU device acquired
         u_dt:         f32,     // seconds since the previous frame
-        _pad:         vec2f,   // 8 B → next vec4 aligns to 16
+        _pad0:        vec2f,   // 8 B (always zero)
+        u_view:       vec4f,   // (yaw, pitch, roll, fov_h_deg) of this display
+        u_world_uv:   vec4f,   // (minU, minV, maxU, maxV) on rig's master canvas
     Then your @gdsp-input params follow as f32 fields IN DECLARATION
     ORDER (each param = 4 B). For non-trivial layouts (vec3, vec4)
     interleave manual padding so 16-byte-aligned types start on
     16-byte offsets — same rules as WGSL struct alignment in general.
 
-A complete shader-frag example:
+  - Display awareness — when one shader is wired into multiple
+    VisualOutput nodes (e.g. for a multi-projector dome), each
+    display's render pass receives a different u_world_uv slice. Map
+    your local uv [0,1] into the rig's shared master canvas with:
+        let world_uv = mix(u.u_world_uv.xy, u.u_world_uv.zw, in.uv);
+    For single-display rigs world_uv == in.uv (the slice is the full
+    [0,0]→[1,1]), so shaders that don't bother with world_uv still
+    work — they just tile their output independently per display
+    rather than spanning across them.
+
+A complete shader-frag example (display-aware Pinwheel — center
+sits at the rig's master center, so a 2-display side-by-side rig
+shows the pinwheel split across them with the center on the seam):
 
 // @gdsp-kind        shader-frag
 // @gdsp-name        Pinwheel
 // @gdsp-category    Visual
-// @gdsp-description Rotating radial sweep
+// @gdsp-description Rotating radial sweep, spans the rig's master canvas
 // @gdsp-input       speed  param  1.0
 // @gdsp-input       arms   param  6.0
 // @gdsp-output      out    texture
@@ -17591,7 +17631,9 @@ struct U {
   u_resolution: vec4f,
   u_time:       f32,
   u_dt:         f32,
-  _pad:         vec2f,
+  _pad0:        vec2f,
+  u_view:       vec4f,
+  u_world_uv:   vec4f,
   speed:        f32,
   arms:         f32,
 };
@@ -17618,7 +17660,8 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4f {
-  let p = in.uv - vec2f(0.5);
+  let world_uv = mix(u.u_world_uv.xy, u.u_world_uv.zw, in.uv);
+  let p = world_uv - vec2f(0.5);
   let a = atan2(p.y, p.x) + u.u_time * u.speed;
   let s = 0.5 + 0.5 * sin(a * u.arms);
   return vec4f(s, s, s, 1.0);
@@ -19255,10 +19298,22 @@ const Visual = {
     { key: "4K",    w: 3840, h: 2160 },
     { key: "8K",    w: 7680, h: 4320 }
   ],
-  blitPipeline: null,           // GPURenderPipeline — fullscreen triangle
+  blitPipeline: null,           // GPURenderPipeline — fullscreen triangle (1-display fallback)
   blitBindGroupLayout: null,    // GPUBindGroupLayout — texture + sampler
   blitBindGroup: null,          // GPUBindGroup (rebuilt when FBO changes)
   blitSampler: null,            // GPUSampler — linear / clamp-to-edge
+
+  // Phase 6.5.5–6.5.10 — multi-display texture array + rig composite
+  // pipeline. The framebuffer is now a 2d-array texture with one
+  // layer per display. Each VisualOutput renders into its display's
+  // layer; the rig composite pipeline reads the array and tiles the
+  // layers onto the visible canvas using the rig's previewMode.
+  framebufferLayerViews:  [],   // GPUTextureView per layer (for render pass attachment)
+  framebufferArrayView:   null, // 2d-array view (for compositor binding)
+  rigCompositePipeline:   null, // pipeline for the tile-flat / equirect / etc. composite
+  rigCompositeBindGroupLayout: null,
+  rigCompositeBindGroup:  null, // rebuilt when framebuffer / layer count changes
+  rigCompositeUniformBuffer: null, // small uniform: layer_count, cols, rows, mode
 
   // Phase 6.1.5 — HUD state. `frozen` pauses the future rAF render
   // loop without touching audio. `fps` is updated each frame by
@@ -19375,8 +19430,10 @@ async function ensureGPUDevice() {
       // bind group; createBlitPipeline creates the layout that bind
       // group references.
       _createBlitPipeline();
+      _createRigCompositePipeline();
       _allocateFramebuffer();
       _rebuildBlitBindGroup();
+      _rebuildRigCompositeBindGroup();
       Visual.startTime  = performance.now();
       Visual.lastFrameT = 0;
       smokeClearVisual();
@@ -19434,26 +19491,50 @@ window.addEventListener("resize", () => {
 
 /* ----- Phase 6.1.4 — render-target framebuffer + blit pipeline -------- */
 
-/* Allocate (or reallocate) the offscreen framebuffer texture at the
- * current Visual.fbWidth × Visual.fbHeight. Shader nodes will render
- * into this; the blit pipeline reads it onto the visible canvas. The
- * texture is rgba8unorm (matches preferred canvas format, no extra
- * conversion at blit time) with both RENDER_ATTACHMENT and
- * TEXTURE_BINDING usage. Old texture is destroyed before the new one
- * is allocated to free the GPU memory immediately rather than waiting
- * for GC. */
+/* Allocate (or reallocate) the offscreen framebuffer as a 2d-array
+ * texture with one layer per display in the current rig. Shader-frag
+ * nodes render into specific layers via the per-layer views; the rig
+ * composite pipeline samples the full array to assemble the operator
+ * preview. Format is rgba8unorm (matches preferred canvas format —
+ * no conversion at composite time) with RENDER_ATTACHMENT +
+ * TEXTURE_BINDING. Old texture destroyed eagerly to release GPU
+ * memory before the new one allocates (matters for 8K → 1080p where
+ * ~125 MB is at stake).
+ *
+ * Phase 6.5.5: layer count tracks state.rig.displays.length, so a
+ * template swap reallocates here. Per-layer views are created up
+ * front so render passes can target them by index without
+ * recreating the view object every frame. */
 function _allocateFramebuffer() {
   if (!Visual.device) return;
   if (Visual.framebuffer) {
     try { Visual.framebuffer.destroy(); } catch (_) {}
   }
+  const layerCount = Math.max(1, (state && state.rig && Array.isArray(state.rig.displays) && state.rig.displays.length) || 1);
   Visual.framebuffer = Visual.device.createTexture({
-    label: "visual-framebuffer-" + Visual.resolutionKey,
-    size: [Visual.fbWidth, Visual.fbHeight, 1],
+    label: "visual-framebuffer-array-" + layerCount + "x-" + Visual.resolutionKey,
+    size: [Visual.fbWidth, Visual.fbHeight, layerCount],
+    dimension: "2d",            // 2d arrays are still dimension "2d" with depth >1
     format: Visual.fbFormat,
     usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
   });
-  Visual.framebufferView = Visual.framebuffer.createView();
+  Visual.framebufferLayerViews = [];
+  for (let i = 0; i < layerCount; i++) {
+    Visual.framebufferLayerViews.push(Visual.framebuffer.createView({
+      label: "fb-layer-" + i,
+      dimension: "2d",
+      baseArrayLayer: i,
+      arrayLayerCount: 1
+    }));
+  }
+  Visual.framebufferArrayView = Visual.framebuffer.createView({
+    label: "fb-array",
+    dimension: "2d-array"
+  });
+  // Backwards-compat single-layer view for the existing 1-display blit
+  // pipeline. Points at layer 0; used only when the rig has exactly
+  // 1 display (or as a fallback during the smoke clear path).
+  Visual.framebufferView = Visual.framebufferLayerViews[0];
 }
 
 /* Build the fullscreen-triangle blit pipeline once at device init.
@@ -19542,6 +19623,219 @@ function _rebuildBlitBindGroup() {
       { binding: 1, resource: Visual.blitSampler }
     ]
   });
+}
+
+/* ----- Phase 6.5.9 / 6.5.10 — rig composite pipeline ------------------ */
+
+/* Build the rig composite pipeline once at device init. Reads the
+ * framebuffer texture array + a small uniform (layer count, cols,
+ * rows, mode) and assembles the layers onto the visible canvas via
+ * a fullscreen-triangle WGSL shader.
+ *
+ * Currently implements MODE = 0 (tile-flat) only. Modes 1/2/3
+ * (cylinder / equirect / fisheye) are sketched in the WGSL switch
+ * but fall back to tile until 6.5.11–6.5.13 ship the full
+ * projection math. */
+function _createRigCompositePipeline() {
+  if (!Visual.device || !Visual.presentationFormat) return;
+  const wgsl = /* wgsl */ `
+struct VsOut {
+  @builtin(position) pos: vec4f,
+  @location(0) uv: vec2f,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(
+    vec2f(-1.0, -1.0),
+    vec2f( 3.0, -1.0),
+    vec2f(-1.0,  3.0),
+  );
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+struct RigU {
+  layer_count: u32,
+  cols:        u32,
+  rows:        u32,
+  mode:        u32,   // 0=tile, 1=cylinder, 2=equirect, 3=fisheye (1-3 placeholder = fall through to tile)
+};
+@group(0) @binding(0) var fbTex:    texture_2d_array<f32>;
+@group(0) @binding(1) var fbSampler: sampler;
+@group(0) @binding(2) var<uniform> rigU: RigU;
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  // Tile-flat compositor. The visible canvas is divided into a
+  // cols × rows grid; each cell shows one display's framebuffer
+  // layer scaled to fit. Cells past the layer count (e.g. n=5 in a
+  // 3×2 grid leaves one empty cell) render solid black so the
+  // operator can see a missing slot.
+  if (rigU.mode == 0u || rigU.mode > 3u) {
+    let cx = floor(in.uv.x * f32(rigU.cols));
+    let ry = floor(in.uv.y * f32(rigU.rows));
+    let idx = u32(ry) * rigU.cols + u32(cx);
+    if (idx >= rigU.layer_count) {
+      return vec4f(0.0, 0.0, 0.0, 1.0);
+    }
+    let local_uv = vec2f(
+      fract(in.uv.x * f32(rigU.cols)),
+      fract(in.uv.y * f32(rigU.rows))
+    );
+    return textureSample(fbTex, fbSampler, local_uv, idx);
+  }
+  // Placeholder: cylinder / equirect / fisheye fall back to layer 0
+  // sampled across the canvas until 6.5.11-13 ship the real math.
+  return textureSample(fbTex, fbSampler, in.uv, 0);
+}
+`;
+  const module = Visual.device.createShaderModule({ label: "rig-composite-shader", code: wgsl });
+
+  Visual.rigCompositeBindGroupLayout = Visual.device.createBindGroupLayout({
+    label: "rig-composite-bgl",
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d-array" } },
+      { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+      { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } }
+    ]
+  });
+
+  Visual.rigCompositePipeline = Visual.device.createRenderPipeline({
+    label: "rig-composite-pipeline",
+    layout: Visual.device.createPipelineLayout({
+      bindGroupLayouts: [Visual.rigCompositeBindGroupLayout]
+    }),
+    vertex:   { module, entryPoint: "vs_main" },
+    fragment: {
+      module, entryPoint: "fs_main",
+      targets: [{ format: Visual.presentationFormat }]
+    },
+    primitive: { topology: "triangle-list" }
+  });
+
+  // Small uniform buffer for cols/rows/layer_count/mode (16 B). Updated
+  // each frame from _encodeRigComposite — cheap, no need to cache.
+  Visual.rigCompositeUniformBuffer = Visual.device.createBuffer({
+    label: "rig-composite-uniform",
+    size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+  });
+}
+
+/* Rebuild the rig composite bind group when the framebuffer changes
+ * (display count, resolution). Layout is fixed; the texture-array
+ * view + sampler + uniform buffer get rebound. */
+function _rebuildRigCompositeBindGroup() {
+  if (!Visual.device || !Visual.framebufferArrayView ||
+      !Visual.rigCompositeBindGroupLayout || !Visual.blitSampler ||
+      !Visual.rigCompositeUniformBuffer) return;
+  Visual.rigCompositeBindGroup = Visual.device.createBindGroup({
+    label: "rig-composite-bg",
+    layout: Visual.rigCompositeBindGroupLayout,
+    entries: [
+      { binding: 0, resource: Visual.framebufferArrayView },
+      { binding: 1, resource: Visual.blitSampler },
+      { binding: 2, resource: { buffer: Visual.rigCompositeUniformBuffer } }
+    ]
+  });
+}
+
+/* Pick a sensible rectangular tile layout for N displays. Hand-tuned
+ * for the common cases (1/2/3/4/6/8/16 — covers all built-in
+ * templates), generic fallback for arbitrary counts (e.g. MPCDI
+ * imports). */
+function _rigTileLayout(n) {
+  if (n <= 1) return { cols: 1, rows: 1 };
+  if (n === 2) return { cols: 2, rows: 1 };
+  if (n === 3) return { cols: 3, rows: 1 };
+  if (n === 4) return { cols: 4, rows: 1 };
+  if (n === 6) return { cols: 3, rows: 2 };
+  if (n === 8) return { cols: 4, rows: 2 };
+  if (n === 12) return { cols: 4, rows: 3 };
+  if (n === 16) return { cols: 4, rows: 4 };
+  // Generic: closest-to-square layout that fits N.
+  const cols = Math.ceil(Math.sqrt(n));
+  const rows = Math.ceil(n / cols);
+  return { cols, rows };
+}
+
+/* Compute master canvas aspect for the current preview mode + rig.
+ * Used by _projectionViewportRect to pick a letterbox/pillarbox-
+ * correct viewport on the visible canvas. */
+function _projectionMasterAspect() {
+  const mode = (state && state.rig && state.rig.previewMode) || "tile";
+  const n = (state && state.rig && state.rig.displays && state.rig.displays.length) || 1;
+  const fbAspect = Visual.fbWidth / Visual.fbHeight;
+  if (mode === "tile") {
+    const { cols, rows } = _rigTileLayout(n);
+    return (cols * fbAspect) / rows;
+  }
+  if (mode === "equirect") return 2.0;     // 2:1 standard
+  if (mode === "cylinder") return 3.0;     // wide arc
+  if (mode === "fisheye")  return 1.0;     // square
+  return fbAspect;
+}
+
+/* Aspect-correct viewport rect on the visible canvas (object-fit:
+ * contain). Returns coords in physical pixels. */
+function _projectionViewportRect(masterAspect) {
+  const cw = (Visual.canvas && Visual.canvas.width)  || 1;
+  const ch = (Visual.canvas && Visual.canvas.height) || 1;
+  const canvasAspect = cw / ch;
+  let vpW, vpH;
+  if (masterAspect > canvasAspect) {
+    vpW = cw;
+    vpH = Math.max(1, Math.floor(cw / masterAspect));
+  } else {
+    vpH = ch;
+    vpW = Math.max(1, Math.floor(ch * masterAspect));
+  }
+  const vpX = Math.floor((cw - vpW) / 2);
+  const vpY = Math.floor((ch - vpH) / 2);
+  return { x: vpX, y: vpY, w: vpW, h: vpH };
+}
+
+/* Encode the rig composite pass — reads the framebuffer texture
+ * array, writes to the visible canvas at the projection-mode-correct
+ * viewport. Updates the rig uniform with current layer count + tile
+ * layout + mode. */
+function _encodeRigComposite(enc) {
+  if (!Visual.device || !Visual.context || !Visual.rigCompositePipeline ||
+      !Visual.rigCompositeBindGroup || !Visual.rigCompositeUniformBuffer) return false;
+  const layerCount = Visual.framebufferLayerViews.length || 1;
+  const mode = (state && state.rig && state.rig.previewMode) || "tile";
+  const modeIdx = ({ tile: 0, cylinder: 1, equirect: 2, fisheye: 3 })[mode] || 0;
+  const { cols, rows } = _rigTileLayout(layerCount);
+  // Pack the 16-byte uniform (4 u32s).
+  const u32 = new Uint32Array([layerCount, cols, rows, modeIdx]);
+  Visual.device.queue.writeBuffer(Visual.rigCompositeUniformBuffer, 0, u32.buffer, u32.byteOffset, u32.byteLength);
+
+  let canvasView;
+  try { canvasView = Visual.context.getCurrentTexture().createView(); }
+  catch (e) { console.warn("[visual] canvas getCurrentTexture failed:", e); return false; }
+
+  const masterAspect = _projectionMasterAspect();
+  const vp = _projectionViewportRect(masterAspect);
+
+  const pass = enc.beginRenderPass({
+    label: "rig-composite",
+    colorAttachments: [{
+      view: canvasView,
+      clearValue: { r: 0, g: 0, b: 0, a: 1.0 },   // letterbox bars
+      loadOp: "clear",
+      storeOp: "store"
+    }]
+  });
+  pass.setPipeline(Visual.rigCompositePipeline);
+  pass.setBindGroup(0, Visual.rigCompositeBindGroup);
+  pass.setViewport(vp.x, vp.y, vp.w, vp.h, 0, 1);
+  pass.draw(3);
+  pass.end();
+  return true;
 }
 
 /* Public API: change render resolution. Driven by the resolution
@@ -19843,56 +20137,83 @@ function _disposeShaderInstance(nodeId) {
   Visual.shaderInstances.delete(nodeId);
 }
 
-/* Standard uniform-buffer preamble: 32 bytes laid out as
- *   [u_resolution: vec4f]  (fb width, height, 1/width, 1/height)
- *   [u_time: f32]
- *   [u_dt: f32]
- *   [_pad: vec2f]    (round preamble to 32 = next 16-aligned offset)
- * Each shader's writeUniforms(node, scratch, offset) function is
- * called with offset = 8 (in float-words, = 32 bytes), so the user
- * params land directly after the preamble.
+/* Standard uniform-buffer preamble. Phase 6.5.7 grew this from 32 to
+ * 64 bytes to add per-display awareness (u_view + u_world_uv). The
+ * full layout (16 floats = 64 bytes):
  *
- * scratch is the Float32Array view of the per-instance buffer; we
- * write into it then queue.writeBuffer the whole thing. */
-function _writeShaderPreamble(scratch, dtSec) {
+ *   floats  0-3  / bytes  0-15  → u_resolution: vec4f (w, h, 1/w, 1/h)
+ *   float   4    / bytes 16-19  → u_time: f32 (seconds since device acquired)
+ *   float   5    / bytes 20-23  → u_dt: f32 (seconds since previous frame)
+ *   floats  6-7  / bytes 24-31  → _pad0: vec2f (always 0)
+ *   floats  8-11 / bytes 32-47  → u_view: vec4f (yaw, pitch, roll, fov_h_deg) of THIS display
+ *   floats 12-15 / bytes 48-63  → u_world_uv: vec4f (minU, minV, maxU, maxV) on rig master canvas
+ *
+ * User shader params start at byte 64 (float index 16). Shaders that
+ * want to span multiple displays sample their content using
+ *   let world_uv = mix(u.u_world_uv.xy, u.u_world_uv.zw, in.uv);
+ * Single-display rigs default to u_world_uv = (0,0,1,1) so existing
+ * shaders that read in.uv directly behave identically. */
+function _writeShaderPreamble(scratch, dtSec, display) {
   const t = (performance.now() - Visual.startTime) * 0.001;
-  scratch[0] = Visual.fbWidth;
-  scratch[1] = Visual.fbHeight;
-  scratch[2] = 1.0 / Visual.fbWidth;
-  scratch[3] = 1.0 / Visual.fbHeight;
-  scratch[4] = t;
-  scratch[5] = dtSec;
-  scratch[6] = 0;
-  scratch[7] = 0;
+  scratch[0]  = Visual.fbWidth;
+  scratch[1]  = Visual.fbHeight;
+  scratch[2]  = 1.0 / Visual.fbWidth;
+  scratch[3]  = 1.0 / Visual.fbHeight;
+  scratch[4]  = t;
+  scratch[5]  = dtSec;
+  scratch[6]  = 0;
+  scratch[7]  = 0;
+  // Defensive: missing display falls back to a single-display default
+  // so the preamble is always well-formed. Same defaults make a new
+  // editor with no rig (shouldn't happen, freshState provides one)
+  // still produce sensible u_world_uv = (0,0,1,1).
+  const pose = (display && display.pose) || { yaw: 0, pitch: 0, roll: 0 };
+  const fov  = (display && display.fov)  || { h: 90, v: 60 };
+  const wuv  = (display && display.worldUv) || { minU: 0, minV: 0, maxU: 1, maxV: 1 };
+  scratch[8]  = pose.yaw   || 0;
+  scratch[9]  = pose.pitch || 0;
+  scratch[10] = pose.roll  || 0;
+  scratch[11] = fov.h      || 90;
+  scratch[12] = wuv.minU != null ? wuv.minU : 0;
+  scratch[13] = wuv.minV != null ? wuv.minV : 0;
+  scratch[14] = wuv.maxU != null ? wuv.maxU : 1;
+  scratch[15] = wuv.maxV != null ? wuv.maxV : 1;
 }
 
-/* Encode a single shader-frag pass that renders the node's output
- * into Visual.framebuffer. Returns true if a pass was actually
- * encoded (pipeline ready, instance built); false if the pipeline
- * is still compiling or some prerequisite is missing.
+/* Encode a shader-frag pass for one VisualOutput → its display layer.
+ * The instance is keyed by VO node id (not source shader) because
+ * different VOs targeting the same shader still need their OWN
+ * uniform buffer to hold their display-specific u_view + u_world_uv.
+ * The pipeline cache key is the WGSL hash, so all instances of the
+ * same shader share one compiled pipeline regardless of how many
+ * VOs they feed.
  *
- * The pipeline used is the one stored on the per-node instance —
- * which during a hot-reload may still be the OLD pipeline while the
- * new one is mid-compile. _ensureShaderInstance handles the swap-
- * when-ready dance so this function just renders whichever pipeline
- * the instance currently holds. */
-function _encodeShaderFragPass(enc, node, def, dtSec) {
-  const inst = _ensureShaderInstance(node.id, def);
+ * Returns true if a pass was actually encoded (pipeline ready,
+ * instance built, layer view exists); false if any prerequisite
+ * is missing — caller falls back gracefully. */
+function _encodeShaderFragPassForVO(enc, vo, src, def, dtSec, layerIdx) {
+  const layerView = Visual.framebufferLayerViews[layerIdx];
+  if (!layerView) return false;
+  const inst = _ensureShaderInstance(vo.id, def);
   const entry = inst.pipelineEntry;
   if (!entry || !entry.pipeline) return false;
 
-  // Pack uniforms — preamble first, then the registry-declared
-  // writer for the per-node params.
-  _writeShaderPreamble(inst.scratch, dtSec);
+  // Pack uniforms — preamble (with this VO's display pose + worldUv)
+  // first, then the registry-declared writer for per-shader params.
+  // Note: writeUniforms receives the SOURCE node (the shader producer)
+  // since that's where the shader's params live; the VO is just the
+  // display routing target.
+  const display = state.rig && state.rig.displays && state.rig.displays[layerIdx];
+  _writeShaderPreamble(inst.scratch, dtSec, display);
   if (typeof def.writeUniforms === "function") {
-    def.writeUniforms(node, inst.scratch);
+    def.writeUniforms(src, inst.scratch);
   }
   Visual.device.queue.writeBuffer(inst.uniformBuffer, 0, inst.scratch.buffer, inst.scratch.byteOffset, inst.scratch.byteLength);
 
   const pass = enc.beginRenderPass({
-    label: "shader-frag-" + node.type + "-" + node.id,
+    label: "shader-frag-" + def.kind + "-" + src.type + "-vo-" + vo.id + "-layer-" + layerIdx,
     colorAttachments: [{
-      view: Visual.framebufferView,
+      view: layerView,
       clearValue: { r: 0, g: 0, b: 0, a: 1 },
       loadOp: "clear",
       storeOp: "store"
@@ -19900,37 +20221,51 @@ function _encodeShaderFragPass(enc, node, def, dtSec) {
   });
   pass.setPipeline(entry.pipeline);
   pass.setBindGroup(0, inst.bindGroup);
-  pass.draw(3);   // fullscreen triangle (vs_main hardcodes the 3 verts)
+  pass.draw(3);
   pass.end();
   return true;
 }
 
-/* Walk the visual subgraph from VisualOutput backward + encode
- * shader passes. Returns true if we rendered something into the FBO,
- * false if no graph or nothing renderable.
+/* Walk every VisualOutput in the patch and encode a render pass for
+ * each that has a wired shader-frag source. Returns true if AT LEAST
+ * ONE pass landed (so the compositor knows the framebuffer has
+ * content to assemble); false if no VisualOutputs exist or none had
+ * renderable inputs.
  *
- * Today's strict shape — the smallest demo of the chain:
- *   [shader-frag node] --(texture)--> [VisualOutput]
+ * Phase 6.5.6: same shader feeding multiple VOs runs N times, each
+ * with display-specific uniforms. Pipeline cache hashes by WGSL so
+ * all N share one compiled pipeline; only the bind groups + uniform
+ * buffers differ. The user-confirmed "pinwheel spans two displays"
+ * behavior comes from each shader pass reading its display's
+ * u_world_uv slice and outputting the corresponding portion of the
+ * shared world.
  *
- * Multi-stage chains (Gradient → Blur → VisualOutput) require
- * intermediate textures and ping-pong FBO management which lands
- * in 6.3.2. For now: VisualOutput's input must come directly from a
- * shader-frag node, and that node renders straight into the
- * shared framebuffer. */
+ * Multi-stage chains (Gradient → Blur → VisualOutput) still need
+ * intermediate textures + ping-pong FBO management — that's 6.3.2.
+ * Today: VisualOutput.in must come directly from a shader-frag
+ * source. */
 function _encodeVisualGraph(enc, dtSec) {
   if (typeof state === "undefined" || !state || !Array.isArray(state.nodes)) return false;
-  const sinks = state.nodes.filter(n => n.type === "VisualOutput");
-  if (sinks.length === 0) return false;
-  const sink = sinks[0];   // one canonical sink for now; multi-output is a future ticket
-  const sinkEdge = state.edges.find(e =>
-    e.to.node === sink.id && e.to.port === "in"
-  );
-  if (!sinkEdge) return false;
-  const src = state.nodes.find(n => n.id === sinkEdge.from.node);
-  if (!src) return false;
-  const def = TYPES[src.type];
-  if (!def || def.kind !== "shader-frag" || typeof def.wgsl !== "string") return false;
-  return _encodeShaderFragPass(enc, src, def, dtSec);
+  const visualOutputs = state.nodes.filter(n => n.type === "VisualOutput");
+  if (visualOutputs.length === 0) return false;
+  const layerCount = Visual.framebufferLayerViews.length || 1;
+  let renderedAny = false;
+  for (const vo of visualOutputs) {
+    const incomingEdge = state.edges.find(e =>
+      e.to.node === vo.id && e.to.port === "in"
+    );
+    if (!incomingEdge) continue;
+    const src = state.nodes.find(n => n.id === incomingEdge.from.node);
+    if (!src) continue;
+    const def = TYPES[src.type];
+    if (!def || def.kind !== "shader-frag" || typeof def.wgsl !== "string") continue;
+    let layerIdx = (vo.params && typeof vo.params.display === "number") ? (vo.params.display | 0) : 0;
+    if (layerIdx < 0)            layerIdx = 0;
+    if (layerIdx >= layerCount)  layerIdx = layerCount - 1;
+    const ok = _encodeShaderFragPassForVO(enc, vo, src, def, dtSec, layerIdx);
+    if (ok) renderedAny = true;
+  }
+  return renderedAny;
 }
 
 /* ----- Phase 6.1.7 — render loop (rAF) -------------------------------- */
@@ -19964,16 +20299,21 @@ function _encodeVisualGraph(enc, dtSec) {
  * re-arming rAF — loop terminates cleanly. */
 let _visualRafHandle = null;
 
-/* Per-frame render entry point. Walks the visual subgraph and encodes
- * shader passes into the framebuffer, then a single blit pass copies
- * the framebuffer onto the visible canvas with letterbox math.
- * Falls back to a smoke clear when there's nothing renderable
- * (no VisualOutput, unwired, source isn't a shader-frag, or pipeline
- * still compiling). All passes share one command encoder + one
- * queue.submit so the GPU sees them as one frame. */
+/* Per-frame render entry point.
+ *
+ * Phase 6.5 architecture:
+ *   1. Walk every VisualOutput in the patch + encode shader-frag
+ *      passes targeting their respective display layers.
+ *   2. If at least one pass was encoded → run the rig composite
+ *      pass, which samples the texture array + lays the layers onto
+ *      the visible canvas using the rig's previewMode (tile / etc).
+ *   3. If nothing was renderable → fall back to the legacy single-
+ *      layer smoke clear + blit so the canvas isn't undefined garbage.
+ *
+ * All passes share one command encoder + one queue.submit so the GPU
+ * sees them as one coherent frame.  */
 function renderVisualFrame() {
-  if (!Visual.device || !Visual.context || !Visual.framebufferView ||
-      !Visual.blitPipeline || !Visual.blitBindGroup) return;
+  if (!Visual.device || !Visual.context) return;
 
   const now = performance.now();
   const dtSec = Visual.lastFrameT > 0 ? (now - Visual.lastFrameT) * 0.001 : 0;
@@ -19981,46 +20321,46 @@ function renderVisualFrame() {
 
   const enc = Visual.device.createCommandEncoder({ label: "visual-frame" });
 
-  // Step 1: render the visual graph into the framebuffer.
   const rendered = _encodeVisualGraph(enc, dtSec);
 
-  // Step 2: if no graph rendered (no VisualOutput, unwired, or shader
-  // pipeline still compiling), clear the FBO to the smoke debug color
-  // so the canvas isn't garbage from a previous frame's pass.
-  if (!rendered) {
-    enc.beginRenderPass({
-      label: "fbo-empty-clear",
-      colorAttachments: [{
-        view: Visual.framebufferView,
-        clearValue: { r: 10/255, g: 14/255, b: 22/255, a: 1.0 },
-        loadOp: "clear",
-        storeOp: "store"
-      }]
-    }).end();
+  if (rendered && Visual.rigCompositePipeline && Visual.rigCompositeBindGroup) {
+    _encodeRigComposite(enc);
+  } else {
+    // No VisualOutputs / nothing renderable → smoke-clear path. Clears
+    // layer 0 + blits via the original single-texture pipeline so the
+    // canvas falls back to the dark backdrop instead of stale frames.
+    if (Visual.framebufferLayerViews[0]) {
+      enc.beginRenderPass({
+        label: "fbo-smoke-clear",
+        colorAttachments: [{
+          view: Visual.framebufferLayerViews[0],
+          clearValue: { r: 10/255, g: 14/255, b: 22/255, a: 1.0 },
+          loadOp: "clear",
+          storeOp: "store"
+        }]
+      }).end();
+    }
+    if (Visual.blitPipeline && Visual.blitBindGroup) {
+      let canvasView;
+      try { canvasView = Visual.context.getCurrentTexture().createView(); }
+      catch (e) { console.warn("[visual] canvas getCurrentTexture failed:", e); Visual.device.queue.submit([enc.finish()]); return; }
+      const vp = _blitViewport();
+      const blit = enc.beginRenderPass({
+        label: "fbo-blit-fallback",
+        colorAttachments: [{
+          view: canvasView,
+          clearValue: { r: 0, g: 0, b: 0, a: 1.0 },
+          loadOp: "clear",
+          storeOp: "store"
+        }]
+      });
+      blit.setPipeline(Visual.blitPipeline);
+      blit.setBindGroup(0, Visual.blitBindGroup);
+      blit.setViewport(vp.x, vp.y, vp.w, vp.h, 0, 1);
+      blit.draw(3);
+      blit.end();
+    }
   }
-
-  // Step 3: blit FBO to visible canvas with object-fit: contain bars.
-  let canvasView;
-  try { canvasView = Visual.context.getCurrentTexture().createView(); }
-  catch (e) {
-    console.warn("[visual] canvas getCurrentTexture failed:", e);
-    return;
-  }
-  const vp = _blitViewport();
-  const blit = enc.beginRenderPass({
-    label: "fbo-blit",
-    colorAttachments: [{
-      view: canvasView,
-      clearValue: { r: 0, g: 0, b: 0, a: 1.0 },
-      loadOp: "clear",
-      storeOp: "store"
-    }]
-  });
-  blit.setPipeline(Visual.blitPipeline);
-  blit.setBindGroup(0, Visual.blitBindGroup);
-  blit.setViewport(vp.x, vp.y, vp.w, vp.h, 0, 1);
-  blit.draw(3);
-  blit.end();
 
   Visual.device.queue.submit([enc.finish()]);
 }
