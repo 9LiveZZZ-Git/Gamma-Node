@@ -20011,6 +20011,67 @@ function wirePath(x1, y1, x2, y2) {
   return `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
 }
 
+/* Phase 6.6.20.11 — multi-target wire fan-out.
+ *
+ * If the user has multiple nodes selected and drops a wire onto one
+ * of them, fan the connection out to every selected node that has
+ * a matching input port. "Matching" = same port name + compatible
+ * type. Lets the user wire 26 VisualOutputs in one drag (select all
+ * 26, drop the wire on any one's input → all 26 connect).
+ *
+ * Returns an array of {node, port} targets. Always includes the
+ * dropped port; adds extras only when the dropped port's node is
+ * itself part of a multi-node selection AND the other selected
+ * nodes have a same-named, type-compatible input.
+ *
+ * If the dropped port's node isn't in the selection, behaves
+ * exactly as the legacy 1-target connect — selection is irrelevant. */
+function _expandConnectionToSelection(targetNodeId, targetPortName, sourcePortType) {
+  const fallback = [{ node: targetNodeId, port: targetPortName }];
+  if (!selectedSet || selectedSet.size <= 1) return fallback;
+  if (!selectedSet.has(targetNodeId)) return fallback;
+  const out = [];
+  for (const id of selectedSet) {
+    const node = state.nodes.find(n => n.id === id);
+    if (!node) continue;
+    const def = TYPES[node.type];
+    if (!def || !Array.isArray(def.ins)) continue;
+    const port = def.ins.find(p => p.n === targetPortName && portsCompatible(sourcePortType, p.t));
+    if (port) out.push({ node: id, port: port.n });
+  }
+  return out.length > 0 ? out : fallback;
+}
+
+/* Single entry point for committing a wire to one or more inputs.
+ * Used by both pointerup and pointercancel handlers — there's no
+ * difference between the two paths once the destination port has
+ * been resolved. */
+function _commitWireConnection(wire, port) {
+  if (!wire || !port) return false;
+  if (port.dataset.dir !== "in" || port.dataset.node === wire.fromNode) return false;
+  if (!portsCompatible(wire.fromType, port.dataset.type)) {
+    flashRejectPort(port);
+    return false;
+  }
+  pushHistory("connect");
+  const targets = _expandConnectionToSelection(port.dataset.node, port.dataset.port, wire.fromType);
+  let added = 0;
+  for (const t of targets) {
+    if (t.node === wire.fromNode) continue;       // safety: don't loop back
+    state.edges = state.edges.filter(ed => !(ed.to.node === t.node && ed.to.port === t.port));
+    state.edges.push({
+      from: { node: wire.fromNode, port: wire.fromPort },
+      to:   { node: t.node, port: t.port }
+    });
+    added++;
+  }
+  if (added > 1) {
+    console.log("[wire] fan-out:", added, "connections from", wire.fromNode + "." + wire.fromPort,
+                "to", targets.map(t => t.node + "." + t.port).join(", "));
+  }
+  return true;
+}
+
 function renderWires(temp) {
   let html = "";
   state.edges.forEach(e => {
@@ -22927,21 +22988,7 @@ document.addEventListener("pointerup", e => {
                 " D=" + fmt(targetD) +
                 " → " + fmt(port));
     _clearWireSnap();
-    if (port && port.dataset.dir === "in" && port.dataset.node !== wire.fromNode) {
-      // Legality check — see portsCompatible() above. A reject just
-      // flashes the destination port red and drops the wire; no edge
-      // mutation, no history push.
-      if (!portsCompatible(wire.fromType, port.dataset.type)) {
-        flashRejectPort(port);
-      } else {
-        pushHistory("connect");
-        state.edges = state.edges.filter(ed => !(ed.to.node === port.dataset.node && ed.to.port === port.dataset.port));
-        state.edges.push({
-          from: { node: wire.fromNode, port: wire.fromPort },
-          to:   { node: port.dataset.node, port: port.dataset.port }
-        });
-      }
-    }
+    _commitWireConnection(wire, port);
     wire = null;
     render();
   }
@@ -22993,18 +23040,7 @@ document.addEventListener("pointercancel", e => {
               " D=" + fmt(targetD) +
               " → " + fmt(port));
   _clearWireSnap();
-  if (port && port.dataset.dir === "in" && port.dataset.node !== wire.fromNode) {
-    if (!portsCompatible(wire.fromType, port.dataset.type)) {
-      flashRejectPort(port);
-    } else {
-      pushHistory("connect");
-      state.edges = state.edges.filter(ed => !(ed.to.node === port.dataset.node && ed.to.port === port.dataset.port));
-      state.edges.push({
-        from: { node: wire.fromNode, port: wire.fromPort },
-        to:   { node: port.dataset.node, port: port.dataset.port }
-      });
-    }
-  }
+  _commitWireConnection(wire, port);
   wire = null;
   render();
 });
