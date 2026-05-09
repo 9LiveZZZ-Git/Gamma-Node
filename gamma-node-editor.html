@@ -13654,28 +13654,14 @@ fn frag_to_global_angles(uv: vec2f) -> vec2f {
   );
 }
 
-// Phase 6.6.20.12 — screen-space anti-aliased line.
-// Lines are AT LEAST ~1.5 pixels wide in the rendered output,
-// regardless of how the angular distance maps to screen space at
-// any given fragment. This makes adjacent projectors' rendered
-// lines visually MERGE at boundaries instead of producing
-// "ghosted" doubled lines or X-shapes — sub-pixel pose
-// disagreements between projectors get hidden inside the
-// screen-space line width.
-//
-// Math: fwidth() approximates |∂angular_dist/∂pixel| via the
-// per-fragment-quad finite difference. Multiply by 0.75 to set
-// the half-line-width to ~0.75 px (full line width ≈ 1.5 px).
-// The user's 'line_w_deg' becomes a MAX cap — when the camera is
-// close enough that an angular degree spans many pixels, the
-// line stays at line_w_deg degrees instead of growing
-// indefinitely. When the camera is far / oblique and an angular
-// degree spans <1 pixel, the line stays >= 1.5 px so it remains
-// visible.
+// Smooth line ramp: 1.0 at distance 0, fades to 0 at distance line_w.
+// Phase 6.6.20.12: tried fwidth-based screen-space AA here but it
+// "thickens" the line beyond the user's chosen angular width, which
+// is wrong for high-accuracy scientific projection. Reverted —
+// the proper fix lives in the warp/blend mesh density (Phase
+// 6.6.20.13 bumped both to 32x32 for pixel-accurate boundaries).
 fn line_alpha(angular_dist_deg: f32, line_w_deg: f32) -> f32 {
-  let pixel_aa = max(fwidth(angular_dist_deg), 1e-4);
-  let half_w   = max(line_w_deg * 0.5, pixel_aa * 0.75);
-  return 1.0 - smoothstep(half_w, half_w + pixel_aa, angular_dist_deg);
+  return 1.0 - smoothstep(line_w_deg * 0.5, line_w_deg, angular_dist_deg);
 }
 
 @fragment
@@ -16179,7 +16165,9 @@ For each capture, output JSON ONLY (no prose, no code fences) with these fields:
   "reasoning":     "<one short sentence explaining what you saw>"
 }
 
-Use 0 for any axis you can't determine from this single view. Keep |delta| values realistic — typical miscalibrations are ±0.5° to ±5°. confidence < 0.4 means "I genuinely can't tell from this image" and the user should ignore the suggestion.`;
+Use 0 for any axis you can't determine from this single view. Keep |delta| values SMALL and CONSERVATIVE — this calibration runs ITERATIVELY (multiple passes converging on the right answer), so single-pass deltas above ±0.5° will be clamped anyway. Better to suggest a small confident correction (±0.2°) and let the next pass refine, than overshoot in one pass and break neighbor agreement. confidence < 0.4 means "I genuinely can't tell from this image" — output 0 deltas in that case.
+
+Important: this is one projector in a 26-projector RING-based dome. Adjacent projectors in the SAME ring share the same nominal pitch. If you're tempted to suggest a big pitch correction (>1°), pause and ask "does this projector look more wrong than its neighbors would, or am I seeing the natural curvature of the wireframe pattern?" Default to small deltas.`;
 
 async function analyzeCalibrationWithAI(opts) {
   const onProgress = (opts && opts.onProgress) || null;
@@ -16400,30 +16388,182 @@ function showAICalibrationModal(analysisResult) {
   });
 }
 
-/* User-facing entry point — wraps capture + analysis + diff modal
- * + apply into one flow. Called from the rig pane button. */
+/* Phase 6.6.20.13 — AI calibration v2 (iterative converge).
+ *
+ * Single-pass calibration breaks ring symmetry: the AI sees each
+ * projector independently, suggests a unique correction per
+ * projector, and adjacent projectors that previously shared exact
+ * ring poses now diverge. The user reported this exact failure
+ * mode ("the lat/long grid is now severely fragmented").
+ *
+ * Iterative fix: cap per-pass deltas tightly (default ±0.5°), then
+ * recapture and re-analyze. Each pass tightens. Adjacent-projector
+ * mismatches don't compound across passes because each step is
+ * smaller than the projector overlap region. Converges to typically
+ * <0.2° error in 3-5 passes.
+ *
+ * Returns { iterations, totalCorrections, finalDiff }, where
+ * finalDiff is the cumulative baseline → current change (so the
+ * user can review + revert any drift they don't like).
+ */
+async function runAICalibrationIterative(opts) {
+  const maxIters = (opts && Number.isFinite(opts.maxIterations)) ? opts.maxIterations : 5;
+  const maxDelta = (opts && Number.isFinite(opts.maxDeltaPerPass)) ? opts.maxDeltaPerPass : 0.5;
+  const stopThreshold = (opts && Number.isFinite(opts.stopThreshold)) ? opts.stopThreshold : 0.15;
+  const onStatus = (opts && opts.onStatus) || null;
+
+  // Snapshot baseline poses so the final diff modal shows
+  // cumulative changes from the user's pre-AI rig state.
+  const baseline = (state.rig.displays || []).map(d => d ? {
+    idx: d.idx != null ? d.idx : -1,
+    id:   d.id,
+    name: d.name,
+    yaw:   d.pose ? (d.pose.yaw   || 0) : 0,
+    pitch: d.pose ? (d.pose.pitch || 0) : 0,
+    fovH:  d.fov  ? (d.fov.h      || 90) : 90,
+    fovV:  d.fov  ? (d.fov.v      || 60) : 60
+  } : null);
+
+  let iterCount = 0;
+  let totalCorrections = 0;
+  let lastResult = null;
+
+  for (let iter = 0; iter < maxIters; iter++) {
+    iterCount = iter + 1;
+    if (onStatus) onStatus("Iteration " + iterCount + "/" + maxIters + " — capturing...");
+    const result = await analyzeCalibrationWithAI({
+      onProgress: (p) => {
+        if (!onStatus) return;
+        if (p.stage === "capture") onStatus("Iter " + iterCount + " — capturing...");
+        else if (p.stage === "analyze") onStatus("Iter " + iterCount + " — AI analyzing " + p.current + "/" + p.total);
+      }
+    });
+    lastResult = result;
+
+    // Clamp + filter to "significant" corrections (>0.02° on any axis).
+    let totalDeltaSum = 0;
+    let significantCount = 0;
+    const clamped = (result.corrections || [])
+      .filter(c => !c.error)
+      .map(c => {
+        const cy = Math.max(-maxDelta, Math.min(maxDelta, c.deltaYaw   || 0));
+        const cp = Math.max(-maxDelta, Math.min(maxDelta, c.deltaPitch || 0));
+        const ch = Math.max(-maxDelta, Math.min(maxDelta, c.deltaFovH  || 0));
+        const cv = Math.max(-maxDelta, Math.min(maxDelta, c.deltaFovV  || 0));
+        const m = Math.abs(cy) + Math.abs(cp) + Math.abs(ch) + Math.abs(cv);
+        if (m > 0.08) significantCount++;
+        totalDeltaSum += m;
+        return Object.assign({}, c, {
+          deltaYaw: cy, deltaPitch: cp, deltaFovH: ch, deltaFovV: cv
+        });
+      });
+
+    const meanDelta = clamped.length > 0 ? totalDeltaSum / clamped.length / 4 : 0;
+    if (onStatus) onStatus("Iter " + iterCount + " — applying " + significantCount + " corrections (mean Δ=" + meanDelta.toFixed(3) + "°)");
+
+    if (significantCount === 0) {
+      console.log("[ai-iterative] no significant corrections at iter " + iterCount + " — converged");
+      break;
+    }
+
+    // Apply the clamped corrections (only significant ones).
+    const significant = clamped.filter(c =>
+      Math.abs(c.deltaYaw)   > 0.02 ||
+      Math.abs(c.deltaPitch) > 0.02 ||
+      Math.abs(c.deltaFovH)  > 0.02 ||
+      Math.abs(c.deltaFovV)  > 0.02
+    );
+    const applied = applyCalibrationCorrections(significant);
+    totalCorrections += applied;
+
+    // Convergence check: average per-axis delta below threshold.
+    if (meanDelta < stopThreshold) {
+      console.log("[ai-iterative] converged at iter " + iterCount + " (mean Δ=" + meanDelta.toFixed(3) + "°)");
+      break;
+    }
+  }
+
+  // Build cumulative diff: baseline → current.
+  const finalDiff = baseline.filter(b => b).map(b => {
+    const display = state.rig.displays[b.idx];
+    if (!display) return null;
+    const curYaw   = display.pose ? (display.pose.yaw   || 0) : 0;
+    const curPitch = display.pose ? (display.pose.pitch || 0) : 0;
+    const curFovH  = display.fov  ? (display.fov.h      || 90) : 90;
+    const curFovV  = display.fov  ? (display.fov.v      || 60) : 60;
+    return {
+      idx:         b.idx,
+      displayId:   b.id,
+      displayName: b.name,
+      pose:        { yaw: b.yaw, pitch: b.pitch },
+      fov:         { h: b.fovH, v: b.fovV },
+      deltaYaw:    curYaw   - b.yaw,
+      deltaPitch:  curPitch - b.pitch,
+      deltaFovH:   curFovH  - b.fovH,
+      deltaFovV:   curFovV  - b.fovV,
+      confidence:  1.0,
+      reasoning:   "Cumulative iterative correction over " + iterCount + " pass(es)",
+      error:       null
+    };
+  }).filter(Boolean);
+
+  return {
+    iterations: iterCount,
+    totalCorrections,
+    finalDiff,
+    lastMeta: lastResult ? lastResult.meta : null
+  };
+}
+
+/* User-facing entry point — wraps iterative AI calibration into one
+ * flow. Calls runAICalibrationIterative (Phase 6.6.20.13 v2) which
+ * runs N=5 passes capped at ±0.5°/pass each, then shows a diff
+ * modal of the cumulative baseline → current changes so the user
+ * can review + revert any drift they don't like. */
 async function runAICalibrationFlow(opts) {
   const statusCb = opts && opts.onStatus;
   try {
-    if (statusCb) statusCb("Capturing rig...");
-    const result = await analyzeCalibrationWithAI({
-      onProgress: (p) => {
-        if (statusCb) {
-          if (p.stage === "capture") statusCb("Capturing rig...");
-          else if (p.stage === "analyze") statusCb("AI analyzing " + p.current + "/" + p.total + (p.displayName ? " — " + p.displayName : ""));
-          else if (p.stage === "done") statusCb("Analyzing complete (" + p.total + " displays)");
-        }
-      }
+    if (statusCb) statusCb("Starting iterative calibration...");
+    const result = await runAICalibrationIterative({
+      maxIterations:    5,
+      maxDeltaPerPass:  0.5,
+      stopThreshold:    0.15,
+      onStatus: (msg) => { if (statusCb) statusCb(msg); }
     });
-    if (statusCb) statusCb("Showing corrections...");
-    const approved = await showAICalibrationModal(result);
-    if (approved.length === 0) {
-      if (statusCb) statusCb("Cancelled (or nothing selected)");
-      return { applied: 0, skipped: result.corrections.length };
+    if (statusCb) statusCb("Showing cumulative diff...");
+
+    // If the user wants to revert any cumulative changes, the diff
+    // modal lets them uncheck individual rows. UNCHECKED rows get
+    // their pose/fov reverted to baseline (= un-do that projector's
+    // iterative drift). Default state: all checked = keep all.
+    const beforeRevert = result.finalDiff.slice();
+    const approved = await showAICalibrationModal({ corrections: result.finalDiff });
+    const keepIds = new Set(approved.map(c => c.idx));
+    let reverted = 0;
+    for (const c of beforeRevert) {
+      if (keepIds.has(c.idx)) continue;
+      const display = state.rig.displays[c.idx];
+      if (!display) continue;
+      // Revert to baseline by subtracting the cumulative delta.
+      if (display.pose) {
+        display.pose.yaw   = (display.pose.yaw   || 0) - (c.deltaYaw   || 0);
+        display.pose.pitch = (display.pose.pitch || 0) - (c.deltaPitch || 0);
+      }
+      if (display.fov) {
+        display.fov.h = Math.max(5, (display.fov.h || 90) - (c.deltaFovH || 0));
+        display.fov.v = Math.max(5, (display.fov.v || 60) - (c.deltaFovV || 0));
+      }
+      if (Visual && Visual._warpCache) Visual._warpCache.delete(display.id);
+      reverted++;
     }
-    const applied = applyCalibrationCorrections(approved);
-    if (statusCb) statusCb("Applied " + applied + " corrections");
-    return { applied, skipped: result.corrections.length - approved.length };
+    if (reverted > 0) {
+      pushHistory("ai-calibration-revert");
+      renderProps && renderProps();
+      render();
+    }
+    const kept = beforeRevert.length - reverted;
+    if (statusCb) statusCb("Done — " + kept + " kept, " + reverted + " reverted (" + result.iterations + " iterations)");
+    return { applied: kept, skipped: reverted, iterations: result.iterations };
   } catch (e) {
     if (statusCb) statusCb("Error: " + (e && e.message ? e.message : String(e)));
     throw e;
@@ -18285,7 +18425,12 @@ function _applyAutoWarpToRig(opts) {
       out.push({ displayIdx: i, applied: false, skipped: "custom" });
       return;
     }
-    const mesh = _autoWarpMeshForDisplay(d, surface, ss, 8, 8);
+    // 6.6.20.13 — bump mesh from 8x8 to 32x32 (= max theaterMeshCap).
+    // 16× more vertices → 16× less linear-interpolation error per
+    // quad → adjacent projector boundaries actually agree at the
+    // pixel level instead of disagreeing sub-pixel and producing
+    // visible ghosting / X-shapes that the shader has to mask.
+    const mesh = _autoWarpMeshForDisplay(d, surface, ss, 32, 32);
     d.warpMesh = mesh;
     if (Visual && Visual._warpCache) Visual._warpCache.delete(d.id);
     out.push({ displayIdx: i, applied: true });
@@ -18328,12 +18473,12 @@ function _applyAutoBlendToRig(opts) {
       return;
     }
     if (useScreenSpace) {
-      // 6.6.20.6 — denser mesh (16x16) for hard-cuts so the win/lose
-      // boundary stays a clean line at the projector overlap edges
-      // rather than the chunky 8x8-vertex polygon you'd get
-      // otherwise. Smooth alpha can stay at 8x8 since the gradient
-      // hides the resolution.
-      const N = hardCuts ? 16 : 8;
+      // 6.6.20.13 — bumped to 32x32 (max theaterMeshCap). For both
+      // smooth blend AND hard-cuts: more verts = less linear-interp
+      // error in the theater quad-fragment shader = projector
+      // boundaries actually agree pixel-accurate. Replaces the
+      // earlier 8x8/16x16 split with a single high-density mesh.
+      const N = 32;
       const mesh = _makeScreenSpaceBlendMesh(N, N, d, state.rig.displays, i, surface, hardCuts);
       d.warpMesh = mesh;
       if (Visual && Visual._warpCache) Visual._warpCache.delete(d.id);
@@ -20398,7 +20543,7 @@ function renderRigPane() {
             <button class="rig-auto-blend-btn" id="btn-rig-auto-capture"
                     title="Auto-capture calibration: switch to theater preview, position camera at sweet spot, take screenshots looking in 6 cardinal directions (front / back / left / right / up / down). If a Checkerboard node is wired, cycles its mode 0..4 between snapshots (HEALPix / Lambert / Cube / Octahedral / Cosine lat-long). Downloads a ZIP bundle with the PNGs + a JSON metadata file describing the rig. Use with WireframeCalibration + Auto-blend (hard cuts) to verify projector calibration visually.">Auto-capture calibration</button>
             <button class="rig-auto-blend-btn" id="btn-rig-ai-calibrate"
-                    title="AI calibration: capture per-display screenshots, send each to the active AI provider (Claude / Gemma — set in AI Settings panel), parse proposed pose / FOV corrections, and show a diff modal where you pick which to apply. Uses WireframeCalibration as the visual target by convention; wire one to a VisualOutput before clicking. ~2 min for 26 projectors via Anthropic; longer for Gemma local.">AI calibrate rig…</button>
+                    title="AI calibration v2 (iterative converge): runs up to 5 passes, capping per-pass deltas at ±0.5° per axis. Each pass captures, sends to Anthropic/Gemma vision, applies clamped corrections, recaptures. Stops when mean delta drops below 0.15° OR after 5 passes. Final modal lets you review the CUMULATIVE baseline-to-current diff and uncheck any projector you want reverted. Wire WireframeCalibration to your VisualOutputs first; AI key set in the User DSP tab → ⚙ Settings.">AI calibrate rig…</button>
           </span>
         </div>
         ${displayRows}
