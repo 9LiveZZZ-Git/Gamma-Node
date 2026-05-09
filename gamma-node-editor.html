@@ -15561,6 +15561,252 @@ function exportMpcdiBundle() {
   }
 }
 
+/* ------------ Phase 6.6.20.8 — Auto-capture calibration ---------------- *
+ *
+ * Walks through the theater preview from the rig's sweet-spot in 6
+ * cardinal directions (front/back/left/right/up/down), optionally
+ * cycling Checkerboard.mode 0..4 between snapshots, and packages the
+ * resulting PNGs into a downloadable ZIP bundle along with a JSON
+ * metadata file describing the rig + capture parameters.
+ *
+ * Use case: visually verify projector calibration. Pair with the
+ * WireframeCalibration shader-frag (6.6.20.7) — wireframe lines
+ * should connect smoothly across projector boundaries; any
+ * shift/break diagnoses bad calibration. The capture ZIP also
+ * documents the rig state at calibration time, ready to feed to
+ * Claude API / Gemma 4 vision in a future phase for automatic
+ * misalignment scoring + auto-correction of pose/FOV/warp params. */
+
+/* Helper — wait for N rAF ticks. Lets us settle WebGPU pipeline
+ * before reading back the canvas via toBlob (which the browser
+ * gates on GPU work completion, but we still need at least one
+ * frame to commit the new uniforms). */
+function _waitForFrames(n) {
+  return new Promise(resolve => {
+    let count = 0;
+    const tick = () => {
+      count++;
+      if (count >= n) resolve();
+      else requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  });
+}
+
+async function autoCaptureCalibration(opts) {
+  if (!Visual || !Visual.canvas) {
+    throw new Error("Visual canvas not initialized");
+  }
+  if (!Visual.theaterCam) {
+    throw new Error("Theater camera not initialized");
+  }
+  if (!state.rig || !Array.isArray(state.rig.displays)) {
+    throw new Error("Rig not configured");
+  }
+  const onProgress = (opts && opts.onProgress) || null;
+
+  // Snapshot every piece of state we mutate so finally{} can put
+  // everything back exactly. The user shouldn't lose their pose /
+  // shader settings just because they ran a capture.
+  const prevPreviewMode = state.rig.previewMode;
+  const prevCam = {
+    pos:   Visual.theaterCam.pos.slice(),
+    yaw:   Visual.theaterCam.yaw,
+    pitch: Visual.theaterCam.pitch
+  };
+
+  // Find every Checkerboard node so we can cycle their .mode through
+  // 0..4 (HEALPix / Lambert / Cube / Octahedral / Cosine-corrected
+  // lat/long) for side-by-side comparison.
+  const checkerNodes = (state.nodes || []).filter(n => n.type === "Checkerboard");
+  const prevCheckerModes = checkerNodes.map(n => (n.params && n.params.mode));
+
+  const restoreState = () => {
+    state.rig.previewMode = prevPreviewMode;
+    Visual.theaterCam.pos[0] = prevCam.pos[0];
+    Visual.theaterCam.pos[1] = prevCam.pos[1];
+    Visual.theaterCam.pos[2] = prevCam.pos[2];
+    Visual.theaterCam.yaw   = prevCam.yaw;
+    Visual.theaterCam.pitch = prevCam.pitch;
+    checkerNodes.forEach((n, i) => {
+      if (n.params && prevCheckerModes[i] !== undefined) {
+        n.params.mode = prevCheckerModes[i];
+      }
+    });
+    if (typeof _updateProjectionPill === "function") _updateProjectionPill();
+    render();
+  };
+
+  try {
+    // Switch to theater + position camera at sweet spot.
+    state.rig.previewMode = "theater";
+    if (typeof _updateProjectionPill === "function") _updateProjectionPill();
+    const ss = Array.isArray(state.rig.sweetSpot) ? state.rig.sweetSpot : [0, 0, 0];
+    Visual.theaterCam.pos[0] = ss[0];
+    Visual.theaterCam.pos[1] = ss[1];
+    Visual.theaterCam.pos[2] = ss[2];
+
+    // Six cardinal directions in radians. Up/down stop just shy of
+    // the zenith / nadir to avoid the gimbal-lock numerical
+    // degeneracy that the theater view's matrix has at exactly
+    // ±π/2 pitch.
+    const directions = [
+      { name: "front", yaw: 0,             pitch:  0 },
+      { name: "right", yaw:  Math.PI / 2,  pitch:  0 },
+      { name: "back",  yaw:  Math.PI,      pitch:  0 },
+      { name: "left",  yaw: -Math.PI / 2,  pitch:  0 },
+      { name: "up",    yaw: 0,             pitch:  Math.PI / 2 - 0.01 },
+      { name: "down",  yaw: 0,             pitch: -Math.PI / 2 + 0.01 }
+    ];
+
+    // Build the capture-config list. If a Checkerboard node is wired
+    // into the rendered output, cycle its mode 0..4. If only
+    // WireframeCalibration / other shaders are wired, capture the
+    // current state once per direction. Either way, 6×N captures.
+    const configs = [];
+    if (checkerNodes.length > 0) {
+      const modeLabels = ["healpix", "lambert", "cube", "octahedral", "lat-long"];
+      for (let mode = 0; mode <= 4; mode++) {
+        configs.push({
+          label: "checker-" + modeLabels[mode] + "-m" + mode,
+          apply: () => checkerNodes.forEach(n => {
+            if (n.params) n.params.mode = mode;
+          })
+        });
+      }
+    } else {
+      configs.push({ label: "current", apply: () => {} });
+    }
+
+    const total = directions.length * configs.length;
+    let captured = 0;
+    const captures = [];
+
+    for (const cfg of configs) {
+      cfg.apply();
+      for (const dir of directions) {
+        Visual.theaterCam.yaw   = dir.yaw;
+        Visual.theaterCam.pitch = dir.pitch;
+        // Trigger a render and let the GPU pipeline settle.
+        // 3 frames is overkill but capture is one-shot — speed
+        // doesn't matter, robustness does.
+        render();
+        await _waitForFrames(3);
+        const blob = await new Promise((resolve, reject) => {
+          Visual.canvas.toBlob((b) => {
+            if (b) resolve(b);
+            else  reject(new Error("canvas.toBlob returned null"));
+          }, "image/png");
+        });
+        captures.push({ filename: cfg.label + "_" + dir.name + ".png", blob });
+        captured++;
+        if (onProgress) onProgress(captured, total);
+      }
+    }
+
+    // Build ZIP via the existing pure-JS ZIP encoder (also used by
+    // MPCDI export). Each entry is a Uint8Array.
+    const files = {};
+    for (const c of captures) {
+      const buf = await c.blob.arrayBuffer();
+      files[c.filename] = new Uint8Array(buf);
+    }
+
+    // Metadata JSON. Useful for documentation and for a future
+    // Claude/Gemma vision pipeline that scores misalignment.
+    const meta = {
+      app: "Gamma Node",
+      version: APP_VERSION,
+      timestamp: new Date().toISOString(),
+      rig: {
+        templateKey: state.rig.templateKey,
+        surface:     state.rig.surface,
+        surfaceVisible: state.rig.surfaceVisible !== false,
+        sweetSpot:   ss.slice(),
+        displayCount: state.rig.displays.length,
+        previewMode: prevPreviewMode,
+        shaderCenterYaw:   state.rig.shaderCenterYaw   || 0,
+        shaderCenterPitch: state.rig.shaderCenterPitch || 0
+      },
+      directions: directions.map(d => ({
+        name: d.name,
+        yawDeg:   d.yaw   * 180 / Math.PI,
+        pitchDeg: d.pitch * 180 / Math.PI
+      })),
+      captureConfigs: configs.map(c => c.label),
+      checkerNodeCount: checkerNodes.length,
+      // Per-display poses + FOVs so a future analyzer can correlate
+      // visible misalignments with the rig's parameters.
+      displays: state.rig.displays.map((d, i) => d ? {
+        idx: i,
+        id:  d.id,
+        name: d.name,
+        pose: d.pose || { yaw: 0, pitch: 0, roll: 0 },
+        fov:  d.fov  || { h: 90, v: 60 },
+        worldUv: d.worldUv,
+        edgeBlend: d.edgeBlend,
+        warpKind: !d.warpMesh ? "none"
+                  : d.warpMesh._isTest      ? "test"
+                  : d.warpMesh._isHardCuts  ? "auto-blend-hardcuts"
+                  : d.warpMesh._isAutoBlend ? "auto-blend"
+                  : d.warpMesh._isCustom    ? "custom"
+                  : d.warpMesh._bezier      ? "bezier"
+                  : "identity"
+      } : null)
+    };
+    files["calibration-meta.json"] = new TextEncoder().encode(
+      JSON.stringify(meta, null, 2)
+    );
+    // README so users know what they're looking at.
+    files["README.md"] = new TextEncoder().encode(
+`# Gamma Node — auto-capture calibration bundle
+
+Generated ${meta.timestamp} by Gamma Node v${APP_VERSION}.
+
+## Files
+
+- \`*_<direction>.png\` — theater-view screenshots from the rig's
+  sweet-spot looking in the named cardinal direction.
+- \`calibration-meta.json\` — full rig configuration at capture
+  time (surface, displays, poses, warp kinds).
+
+## Directions captured (6)
+
+${meta.directions.map(d => "- **" + d.name + "** — yaw " + d.yawDeg.toFixed(1) + "°, pitch " + d.pitchDeg.toFixed(1) + "°").join("\n")}
+
+## Capture configurations (${configs.length})
+
+${configs.map(c => "- " + c.label).join("\n")}
+
+## How to read
+
+Look at each direction × config pair. Calibration verification
+guidelines:
+
+- **Lines should connect across projector boundaries.** A clean
+  edge means good calibration; shift/break means a projector's
+  pose, FOV, or warp is off.
+- **Beacon circles should center on cardinal axes** (red on +X,
+  green on +Y, blue on +Z if WireframeCalibration is the source).
+- **Cell parity should alternate evenly across the entire frame**
+  if Checkerboard is the source.
+
+A future Gamma Node release will wire this bundle to a Claude
+API / Gemma 4 vision endpoint for automatic misalignment scoring.
+`
+    );
+
+    const zip = _writeZipArchive(files);
+    const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const fname = "gamma-calibration-" + ts + ".zip";
+    _downloadBlob(new Blob([zip], { type: "application/zip" }), fname);
+    console.log("[auto-capture] saved", fname, "(" + captures.length + " PNGs)");
+    return { captured, total, filename: fname };
+  } finally {
+    restoreState();
+  }
+}
+
 /* ------------ Phase 6.6.2 — MPCDI / Bourke CSV importers --------------- */
 
 /* Minimal in-browser ZIP reader. Uses the well-defined ZIP central
@@ -19461,6 +19707,8 @@ function renderRigPane() {
                     title="Auto-generate intensity ramps so adjacent projectors blend seamlessly. Two algorithms used depending on rig: angular bands (when surface is plane / free / off — fast, works for flat tile rigs) and Raskar §4.4 screen-space alpha-blend (when surface is sphere / cylinder + visible ON — α sums to 1.0 across overlapping projectors at every screen point, correct for curved screens).">Auto-blend rig</button>
             <button class="rig-auto-blend-btn" id="btn-rig-auto-blend-hardcuts"
                     title="Hard-cut blend (no smooth ramps): each screen pixel comes from EXACTLY ONE projector — the one whose framebuffer puts that pixel furthest from its frame edge. Voronoi-style assignment in screen space. Useful for calibration debugging (you can see which projector covers what), and for installations where smooth blending isn't possible (sharp masks, hard-edge LED panels). Requires curved screen surface (sphere/cylinder/swept) with surfaceVisible ON.">Auto-blend (hard cuts)</button>
+            <button class="rig-auto-blend-btn" id="btn-rig-auto-capture"
+                    title="Auto-capture calibration: switch to theater preview, position camera at sweet spot, take screenshots looking in 6 cardinal directions (front / back / left / right / up / down). If a Checkerboard node is wired, cycles its mode 0..4 between snapshots (HEALPix / Lambert / Cube / Octahedral / Cosine lat-long). Downloads a ZIP bundle with the PNGs + a JSON metadata file describing the rig. Use with WireframeCalibration + Auto-blend (hard cuts) to verify projector calibration visually. Future: feed the ZIP to a Claude/Gemma vision endpoint for automatic misalignment scoring.">Auto-capture calibration</button>
           </span>
         </div>
         ${displayRows}
@@ -19897,6 +20145,36 @@ function wireRigPaneHandlers() {
       console.log("[auto-blend] applied to", applied, "displays;", skipped, "left as-is (no overlap)");
       renderProps && renderProps();
       render();
+    });
+  }
+
+  // Phase 6.6.20.8 — auto-capture calibration button. Walks 6
+  // cardinal directions in theater mode, optionally cycles
+  // Checkerboard.mode, downloads ZIP bundle of PNGs + metadata.
+  const captureBtn = document.getElementById("btn-rig-auto-capture");
+  if (captureBtn) {
+    captureBtn.addEventListener("click", async () => {
+      if (captureBtn.disabled) return;
+      const origLabel = captureBtn.textContent;
+      captureBtn.disabled = true;
+      captureBtn.textContent = "Capturing 0/?...";
+      try {
+        const result = await autoCaptureCalibration({
+          onProgress: (cur, total) => {
+            captureBtn.textContent = "Capturing " + cur + "/" + total + "...";
+          }
+        });
+        captureBtn.textContent = "Saved (" + result.captured + ")";
+      } catch (e) {
+        console.error("[auto-capture] failed:", e);
+        captureBtn.textContent = "Failed";
+        alert("Auto-capture failed:\n\n" + (e && e.message ? e.message : String(e)));
+      } finally {
+        setTimeout(() => {
+          captureBtn.textContent = origLabel;
+          captureBtn.disabled = false;
+        }, 1800);
+      }
     });
   }
 
