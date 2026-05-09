@@ -16165,9 +16165,13 @@ For each capture, output JSON ONLY (no prose, no code fences) with these fields:
   "reasoning":     "<one short sentence explaining what you saw>"
 }
 
-Use 0 for any axis you can't determine from this single view. Keep |delta| values SMALL and CONSERVATIVE — this calibration runs ITERATIVELY (multiple passes converging on the right answer), so single-pass deltas above ±0.5° will be clamped anyway. Better to suggest a small confident correction (±0.2°) and let the next pass refine, than overshoot in one pass and break neighbor agreement. confidence < 0.4 means "I genuinely can't tell from this image" — output 0 deltas in that case.
+Use 0 for any axis you can't determine from this single view. Keep |delta| values SMALL and CONSERVATIVE — this calibration runs ITERATIVELY (multiple passes converging on the right answer), so single-pass deltas above ±0.5° will be clamped anyway. Better to suggest a small confident correction (±0.2°) and let the next pass refine, than overshoot in one pass and break neighbor agreement.
 
-Important: this is one projector in a 26-projector RING-based dome. Adjacent projectors in the SAME ring share the same nominal pitch. If you're tempted to suggest a big pitch correction (>1°), pause and ask "does this projector look more wrong than its neighbors would, or am I seeing the natural curvature of the wireframe pattern?" Default to small deltas.`;
+This is one projector in a 26-projector RING-based dome. Adjacent projectors in the SAME ring share the same nominal pitch. If you're tempted to suggest a big pitch correction (>1°), pause and ask "does this projector look more wrong than its neighbors would, or am I seeing the natural curvature of the wireframe pattern?" Default to small deltas.
+
+SCOPE: this version of the calibration AI only proposes pose+FOV corrections — it does NOT edit warp meshes or Bezier patches. If you see visible artifacts that are NOT pose/FOV related (ghost-doubled great circles from warp-mesh interpolation drift, X-shapes at projector corners from quad-fragment aliasing, blurry boundaries from low-density warp meshes), output 0 deltas and explain in the reasoning field that "this artifact is mesh-related, not pose-related — user should bump WARP_MESH_DENSITY or hand-edit the warp mesh." Don't propose pose corrections to mask non-pose artifacts; that breaks neighbor agreement.
+
+Even when proposing 0 deltas, the reasoning field should describe any visible artifacts you saw and explain why no pose correction is needed (calibration looks fine vs. artifacts are out of scope).`;
 
 async function analyzeCalibrationWithAI(opts) {
   const onProgress = (opts && opts.onProgress) || null;
@@ -16563,20 +16567,42 @@ async function runAICalibrationFlow(opts) {
     }
 
     if (!hasChanges) {
-      // AI ran successfully but proposed nothing significant. Could
-      // mean (a) calibration was already optimal, (b) AI is being
-      // overly conservative, or (c) some calls errored and the
-      // remaining ones returned zeros. Surface all three as a
-      // toast-style alert so the user knows what happened.
+      // 6.6.20.15 — be honest about scope. AI v2 only does pose+FOV;
+      // it doesn't edit warp meshes or Bezier patches. Most visible
+      // boundary artifacts (ghosting, X-shapes, blurring) are mesh-
+      // related, not pose-related, so the AI returning "0 deltas"
+      // doesn't mean the rig looks perfect — it means there's
+      // nothing AI v2 can fix. Surface the AI's REASONING per
+      // display so user sees what the model actually saw.
       const erroredCount = errored.length;
-      const sample = erroredCount > 0
+      const reasoningSamples = lastCorrections
+        .filter(c => !c.error && c.reasoning)
+        .slice(0, 3)
+        .map(c => "  • Display " + c.idx + " (" + (c.displayName || c.displayId) + "): " + c.reasoning);
+      const reasonBlock = reasoningSamples.length
+        ? "\n\nWhat the AI reported seeing (sample):\n" + reasoningSamples.join("\n")
+        : "";
+      const errorBlock = erroredCount > 0
         ? "\n\n" + erroredCount + " API call(s) errored:\n  " +
           errored.slice(0, 2).map(e => "Display " + e.idx + ": " + e.error).join("\n  ")
         : "";
-      const msg = "AI confirmed calibration is already optimal — no significant changes proposed " +
-                  "(" + result.iterations + " iteration" + (result.iterations === 1 ? "" : "s") + ", " +
-                  "max delta < threshold)." + sample;
-      if (statusCb) statusCb("AI confirms calibration optimal");
+      const msg =
+        "AI v2 (pose+FOV only) proposed no significant pose/FOV changes after " +
+        result.iterations + " iteration" + (result.iterations === 1 ? "" : "s") + ".\n\n" +
+        "What this means:\n" +
+        "  1. Projector POSES are likely already correctly placed.\n" +
+        "  2. Visible artifacts you still see (ghosting on great circles, X-shapes at corners, " +
+        "blurry projector boundaries) are MESH-related, not pose-related — beyond AI v2's scope.\n\n" +
+        "Three things to try if artifacts remain:\n" +
+        "  a) Re-run Auto-warp + Auto-blend (hard cuts). Defaults bumped to 128×128 mesh in " +
+        "v0.1.83 (was 8×8 before v0.1.81), which is the proper fix for sub-pixel boundary " +
+        "disagreement. The auto-prep step does this for you each AI pass.\n" +
+        "  b) Hand-edit the warp on a problem display: open the warp editor, switch to Bezier " +
+        "mode, adjust corner control points. AI v2 does NOT edit warp meshes — that's manual.\n" +
+        "  c) If you've stacked multiple AI calibration runs, undo (Ctrl+Z) the older ones — " +
+        "accumulated per-projector drift from previous passes can outlast convergence." +
+        reasonBlock + errorBlock;
+      if (statusCb) statusCb("AI v2 done — see dialog for next steps");
       alert(msg);
       return { applied: 0, skipped: 0, iterations: result.iterations, errors: erroredCount };
     }
@@ -18111,8 +18137,23 @@ function _projectorFramebufferUV(P, display) {
  * vs. the angular-band approximation (_makeAutoBlendMesh): correct
  * for curved screens where neighbors don't share simple yaw/pitch
  * extents. Identical in the simple flat-tangent-plane case. */
-function _makeScreenSpaceBlendMesh(cols, rows, display, displays, displayIdx, surface, hardCuts) {
-  const m = _makeIdentityWarpMesh(cols, rows);
+function _makeScreenSpaceBlendMesh(cols, rows, display, displays, displayIdx, surface, hardCuts, existingMesh) {
+  // 6.6.20.15 — preserve auto-warp NDC positions if an existing
+  // warp mesh is passed in (and matches dimensions). Without this,
+  // _applyAutoBlendToRig overwrote auto-warp's positions with
+  // identity and the chain "auto-warp → auto-blend" effectively
+  // discarded the warp step. Now both stack: positions from
+  // auto-warp, alphas from auto-blend.
+  let m;
+  if (existingMesh && _validateWarpMesh(existingMesh) &&
+      existingMesh.cols === cols && existingMesh.rows === rows) {
+    m = _cloneWarpMesh(existingMesh);
+    // Reset alphas to 1 — we'll recompute below.
+    const W0 = cols + 1, H0 = rows + 1;
+    for (let i = 0; i < W0 * H0; i++) m.verts[i * 5 + 4] = 1;
+  } else {
+    m = _makeIdentityWarpMesh(cols, rows);
+  }
   if (!surface || surface.type === "free") return m;
 
   const W = cols + 1, H = rows + 1;
@@ -18139,8 +18180,13 @@ function _makeScreenSpaceBlendMesh(cols, rows, display, displays, displayIdx, su
 
   for (let r = 0; r < H; r++) {
     for (let c = 0; c < W; c++) {
-      const ndcX = (c / cols) * 2 - 1;
-      const ndcY = (r / rows) * 2 - 1;
+      // 6.6.20.15 — use the vertex's CURRENT NDC (which may already
+      // be auto-warped) instead of identity grid. Beam direction
+      // and screen point P are then correct for whatever warp the
+      // mesh already has applied.
+      const off = (r * W + c) * 5;
+      const ndcX = m.verts[off + 0];
+      const ndcY = m.verts[off + 1];
       const lx = ndcX * tanH, ly = ndcY * tanV, lz = 1;
       const wx = rx*lx + ux*ly + fx*lz;
       const wy = ry*lx + uy*ly + fy*lz;
@@ -18472,12 +18518,12 @@ function _applyAutoWarpToRig(opts) {
       out.push({ displayIdx: i, applied: false, skipped: "custom" });
       return;
     }
-    // 6.6.20.14 — auto-warp default density is 64. MESH_CAP = 128
-    // is the absolute ceiling for scientific work; 64 is the
-    // default sweet spot (5x more accurate than the old 32 with
-    // ~4x compute time, still <500ms per click for 26 displays).
-    // For 128² scientific-grade accuracy edit this constant.
-    const WARP_MESH_DENSITY = 64;
+    // 6.6.20.15 — auto-warp default density is 128 (MESH_CAP) for
+    // scientific-grade pixel-accuracy. Auto-blend below uses the
+    // same density so the chain stays consistent. ~10s build time
+    // for 26 displays at 128² — slow but worth it for the
+    // pixel-accurate boundary alignment scientific work needs.
+    const WARP_MESH_DENSITY = 128;
     const mesh = _autoWarpMeshForDisplay(d, surface, ss, WARP_MESH_DENSITY, WARP_MESH_DENSITY);
     d.warpMesh = mesh;
     if (Visual && Visual._warpCache) Visual._warpCache.delete(d.id);
@@ -18521,13 +18567,22 @@ function _applyAutoBlendToRig(opts) {
       return;
     }
     if (useScreenSpace) {
-      // 6.6.20.14 — auto-blend default density is 64. Scales
-      // identically to auto-warp; 128² is the cap (MESH_CAP) for
-      // scientific work but compute is O(N² × num_displays_for_
-      // blend_check) so 64 is the sweet spot for interactive use.
-      // Edit BLEND_MESH_DENSITY for 128² scientific-grade.
-      const BLEND_MESH_DENSITY = 64;
-      const mesh = _makeScreenSpaceBlendMesh(BLEND_MESH_DENSITY, BLEND_MESH_DENSITY, d, state.rig.displays, i, surface, hardCuts);
+      // 6.6.20.15 — default density is 128 (the MESH_CAP) for
+      // scientific-grade pixel-accurate boundaries. Compute scales
+      // O(N² × num_displays_for_blend_check); at 128² × 26 displays
+      // a single click takes ~5-10s. For faster interactive use,
+      // drop this to 64 (5x faster, ~3x more accurate than the
+      // pre-6.6.20.14 default of 32).
+      //
+      // 6.6.20.15 — also preserves existing auto-warp positions
+      // when chaining (auto-prep does auto-warp → auto-blend, and
+      // we want to keep the warp positions from step 1).
+      const BLEND_MESH_DENSITY = 128;
+      const existingWarp = (d.warpMesh && d.warpMesh._isAutoWarp &&
+                            d.warpMesh.cols === BLEND_MESH_DENSITY &&
+                            d.warpMesh.rows === BLEND_MESH_DENSITY) ? d.warpMesh : null;
+      const mesh = _makeScreenSpaceBlendMesh(BLEND_MESH_DENSITY, BLEND_MESH_DENSITY,
+        d, state.rig.displays, i, surface, hardCuts, existingWarp);
       d.warpMesh = mesh;
       if (Visual && Visual._warpCache) Visual._warpCache.delete(d.id);
       out.push({ displayIdx: i, applied: true, mode: hardCuts ? "screen-space-hardcuts" : "screen-space" });
