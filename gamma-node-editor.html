@@ -16511,6 +16511,7 @@ async function runAICalibrationIterative(opts) {
     iterations: iterCount,
     totalCorrections,
     finalDiff,
+    lastResult,                              // last analyzeCalibrationWithAI return — has per-display errors
     lastMeta: lastResult ? lastResult.meta : null
   };
 }
@@ -16530,12 +16531,59 @@ async function runAICalibrationFlow(opts) {
       stopThreshold:    0.15,
       onStatus: (msg) => { if (statusCb) statusCb(msg); }
     });
-    if (statusCb) statusCb("Showing cumulative diff...");
 
-    // If the user wants to revert any cumulative changes, the diff
-    // modal lets them uncheck individual rows. UNCHECKED rows get
-    // their pose/fov reverted to baseline (= un-do that projector's
-    // iterative drift). Default state: all checked = keep all.
+    // 6.6.20.14 — better UX for the three "nothing happened" cases.
+    // The previous flow always showed the modal even when there
+    // were no actual changes, leaving the user wondering whether
+    // the AI even ran.
+    const cumDelta = result.finalDiff.reduce(
+      (s, c) => s + Math.abs(c.deltaYaw) + Math.abs(c.deltaPitch) +
+                    Math.abs(c.deltaFovH) + Math.abs(c.deltaFovV), 0);
+    const hasChanges = cumDelta > 0.005;
+
+    // Pull last iteration's per-display errors for diagnostics.
+    const lastCorrections = (result.lastResult && Array.isArray(result.lastResult.corrections))
+      ? result.lastResult.corrections : [];
+    const errored = lastCorrections.filter(c => c.error);
+    const allErrored = lastCorrections.length > 0 &&
+                       errored.length === lastCorrections.length;
+
+    if (allErrored) {
+      const sample = errored.slice(0, 3)
+        .map(e => "  • Display " + e.idx + " (" + (e.displayName || e.displayId) + "): " + e.error)
+        .join("\n");
+      const more = errored.length > 3 ? "\n  ... and " + (errored.length - 3) + " more" : "";
+      const msg = "AI calibration: every API call failed (" + errored.length + " of " +
+                  lastCorrections.length + ").\n\nFirst few errors:\n" + sample + more +
+                  "\n\nLikely fix: open the User DSP tab, click the ⚙ button next to the model badge, " +
+                  "and check your provider + API key. For Anthropic the key starts with sk-ant-.";
+      if (statusCb) statusCb("All " + errored.length + " AI calls failed");
+      alert(msg);
+      return { applied: 0, skipped: 0, iterations: result.iterations, errors: errored.length };
+    }
+
+    if (!hasChanges) {
+      // AI ran successfully but proposed nothing significant. Could
+      // mean (a) calibration was already optimal, (b) AI is being
+      // overly conservative, or (c) some calls errored and the
+      // remaining ones returned zeros. Surface all three as a
+      // toast-style alert so the user knows what happened.
+      const erroredCount = errored.length;
+      const sample = erroredCount > 0
+        ? "\n\n" + erroredCount + " API call(s) errored:\n  " +
+          errored.slice(0, 2).map(e => "Display " + e.idx + ": " + e.error).join("\n  ")
+        : "";
+      const msg = "AI confirmed calibration is already optimal — no significant changes proposed " +
+                  "(" + result.iterations + " iteration" + (result.iterations === 1 ? "" : "s") + ", " +
+                  "max delta < threshold)." + sample;
+      if (statusCb) statusCb("AI confirms calibration optimal");
+      alert(msg);
+      return { applied: 0, skipped: 0, iterations: result.iterations, errors: erroredCount };
+    }
+
+    if (statusCb) statusCb("Showing cumulative diff (" + result.iterations + " iterations)...");
+
+    // Has changes — show diff modal. Unchecked rows get reverted.
     const beforeRevert = result.finalDiff.slice();
     const approved = await showAICalibrationModal({ corrections: result.finalDiff });
     const keepIds = new Set(approved.map(c => c.idx));
@@ -16544,7 +16592,6 @@ async function runAICalibrationFlow(opts) {
       if (keepIds.has(c.idx)) continue;
       const display = state.rig.displays[c.idx];
       if (!display) continue;
-      // Revert to baseline by subtracting the cumulative delta.
       if (display.pose) {
         display.pose.yaw   = (display.pose.yaw   || 0) - (c.deltaYaw   || 0);
         display.pose.pitch = (display.pose.pitch || 0) - (c.deltaPitch || 0);
@@ -16562,7 +16609,7 @@ async function runAICalibrationFlow(opts) {
       render();
     }
     const kept = beforeRevert.length - reverted;
-    if (statusCb) statusCb("Done — " + kept + " kept, " + reverted + " reverted (" + result.iterations + " iterations)");
+    if (statusCb) statusCb("Done — " + kept + " kept, " + reverted + " reverted (" + result.iterations + " iter)");
     return { applied: kept, skipped: reverted, iterations: result.iterations };
   } catch (e) {
     if (statusCb) statusCb("Error: " + (e && e.message ? e.message : String(e)));
@@ -18425,12 +18472,13 @@ function _applyAutoWarpToRig(opts) {
       out.push({ displayIdx: i, applied: false, skipped: "custom" });
       return;
     }
-    // 6.6.20.13 — bump mesh from 8x8 to 32x32 (= max theaterMeshCap).
-    // 16× more vertices → 16× less linear-interpolation error per
-    // quad → adjacent projector boundaries actually agree at the
-    // pixel level instead of disagreeing sub-pixel and producing
-    // visible ghosting / X-shapes that the shader has to mask.
-    const mesh = _autoWarpMeshForDisplay(d, surface, ss, 32, 32);
+    // 6.6.20.14 — auto-warp default density is 64. MESH_CAP = 128
+    // is the absolute ceiling for scientific work; 64 is the
+    // default sweet spot (5x more accurate than the old 32 with
+    // ~4x compute time, still <500ms per click for 26 displays).
+    // For 128² scientific-grade accuracy edit this constant.
+    const WARP_MESH_DENSITY = 64;
+    const mesh = _autoWarpMeshForDisplay(d, surface, ss, WARP_MESH_DENSITY, WARP_MESH_DENSITY);
     d.warpMesh = mesh;
     if (Visual && Visual._warpCache) Visual._warpCache.delete(d.id);
     out.push({ displayIdx: i, applied: true });
@@ -18473,13 +18521,13 @@ function _applyAutoBlendToRig(opts) {
       return;
     }
     if (useScreenSpace) {
-      // 6.6.20.13 — bumped to 32x32 (max theaterMeshCap). For both
-      // smooth blend AND hard-cuts: more verts = less linear-interp
-      // error in the theater quad-fragment shader = projector
-      // boundaries actually agree pixel-accurate. Replaces the
-      // earlier 8x8/16x16 split with a single high-density mesh.
-      const N = 32;
-      const mesh = _makeScreenSpaceBlendMesh(N, N, d, state.rig.displays, i, surface, hardCuts);
+      // 6.6.20.14 — auto-blend default density is 64. Scales
+      // identically to auto-warp; 128² is the cap (MESH_CAP) for
+      // scientific work but compute is O(N² × num_displays_for_
+      // blend_check) so 64 is the sweet spot for interactive use.
+      // Edit BLEND_MESH_DENSITY for 128² scientific-grade.
+      const BLEND_MESH_DENSITY = 64;
+      const mesh = _makeScreenSpaceBlendMesh(BLEND_MESH_DENSITY, BLEND_MESH_DENSITY, d, state.rig.displays, i, surface, hardCuts);
       d.warpMesh = mesh;
       if (Visual && Visual._warpCache) Visual._warpCache.delete(d.id);
       out.push({ displayIdx: i, applied: true, mode: hardCuts ? "screen-space-hardcuts" : "screen-space" });
@@ -26946,12 +26994,20 @@ function _encodeWarpPasses(enc) {
  * naturally. */
 function _createTheaterPipeline() {
   if (!Visual.device || !Visual.presentationFormat) return;
-  // Cap mesh dim used in theater for buffer sizing. Set to 32 to
-  // match the warp-editor's 32×32 ceiling — total worst-case =
-  // 32 displays × 33² verts × 28 B ≈ 975 KB vertex buffer +
-  // 32 × 32² × 6 × 4 B ≈ 786 KB index buffer. Total ~1.7 MB GPU,
-  // comfortable on any WebGPU adapter.
-  const MESH_CAP = 32;
+  // Phase 6.6.20.14 — bumped from 32 to 128 for scientific-grade
+  // projector calibration accuracy. Worst case at 32 displays
+  // ×128² mesh:
+  //   vertex buf: 32 × 129² × 28 B ≈ 14.9 MB
+  //   index buf:  32 × 128² × 6 × 4 B ≈ 12.6 MB
+  //   total ≈ 27 MB GPU — fine on any modern WebGPU adapter.
+  // Auto-warp / auto-blend currently uses 64 by default (4225
+  // verts / display) which gives ~5x more accuracy than the
+  // previous 32×32 with proportional compute cost. Users who
+  // need 128² scientific accuracy can edit BLEND_MESH_DENSITY in
+  // _applyAutoBlendToRig. 512×512 / 1080×1080 require the
+  // distributed-rig pipeline (one machine per display) since
+  // single-machine compute scales O(N² × num_displays).
+  const MESH_CAP = 128;
   const vertsPerDisplayCap   = (MESH_CAP + 1) * (MESH_CAP + 1);
   const indicesPerDisplayCap = MESH_CAP * MESH_CAP * 6;
   Visual._theaterMeshCap         = MESH_CAP;
