@@ -16161,9 +16161,42 @@ For each capture, output JSON ONLY (no prose, no code fences) with these fields:
   "deltaPitchDeg": <degrees, + = projector should tilt up>,
   "deltaFovHDeg":  <degrees, + = wider horizontal FOV>,
   "deltaFovVDeg":  <degrees, + = wider vertical FOV>,
+  "keystone": {
+    "tlx": <NDC dx for top-left corner>,
+    "tly": <NDC dy>,
+    "trx": <NDC dx for top-right>,
+    "try":  <NDC dy>,
+    "blx": <NDC dx for bottom-left>,
+    "bly": <NDC dy>,
+    "brx": <NDC dx for bottom-right>,
+    "bry": <NDC dy>
+  },
   "confidence":    <0..1, your certainty in these corrections>,
   "reasoning":     "<one short sentence explaining what you saw>"
 }
+
+KEYSTONE CORNERS (AI v3): each corner of THIS projector's warp mesh
+can shift by a small NDC offset (range ±2.0 covers the whole
+framebuffer; ±0.02 is typical = ~1% of framebuffer = ~5 px at
+1080p). Use keystone deltas to FIX MESH-LEVEL ALIGNMENT that pose
++ FOV alone can't:
+
+  - If the wireframe lines on this projector's edge don't meet the
+    next projector's edge cleanly (e.g., top edge lines are shifted
+    right relative to the projector above), propose a small dx/dy
+    shift for the top-left + top-right corners to align them.
+
+  - If the projector's quad looks rotated relative to its
+    neighbors (parallelogram / trapezoid), opposite corners need
+    opposite shifts — e.g. tlx +0.005 and brx -0.005 rotates the
+    quad slightly clockwise.
+
+  - If pose+FOV deltas are 0 but you still see boundary artifacts,
+    those are usually mesh-level — propose small keystone deltas.
+    Don't propose pose to mask mesh issues.
+
+Per-pass clamp: each keystone delta is clamped to ±0.02 NDC by the
+iterative loop. So output realistic values in [-0.02, 0.02].
 
 Use 0 for any axis you can't determine from this single view. Keep |delta| values SMALL and CONSERVATIVE — this calibration runs ITERATIVELY (multiple passes converging on the right answer), so single-pass deltas above ±0.5° will be clamped anyway. Better to suggest a small confident correction (±0.2°) and let the next pass refine, than overshoot in one pass and break neighbor agreement.
 
@@ -16234,6 +16267,8 @@ async function analyzeCalibrationWithAI(opts) {
       pose:        display.pose,
       fov:         display.fov,
       deltaYaw:   0, deltaPitch: 0, deltaFovH: 0, deltaFovV: 0,
+      // Phase 6.6.20.16 — AI v3 keystone corner deltas (NDC).
+      keystone:   { tlx: 0, tly: 0, trx: 0, try_: 0, blx: 0, bly: 0, brx: 0, bry: 0 },
       confidence: 0, reasoning: "", error: null
     };
 
@@ -16265,6 +16300,19 @@ The capture below shows what this projector's coverage region looks like when vi
       resultEntry.deltaPitch = Number.isFinite(parsed.deltaPitchDeg) ? parsed.deltaPitchDeg : 0;
       resultEntry.deltaFovH  = Number.isFinite(parsed.deltaFovHDeg)  ? parsed.deltaFovHDeg  : 0;
       resultEntry.deltaFovV  = Number.isFinite(parsed.deltaFovVDeg)  ? parsed.deltaFovVDeg  : 0;
+      // Phase 6.6.20.16 — extract keystone corner deltas (AI v3).
+      // Note: AI uses "try" but JS uses "try_" because try is a
+      // reserved word — translate either spelling on parse.
+      const ks = parsed.keystone || {};
+      resultEntry.keystone.tlx  = Number.isFinite(ks.tlx)  ? ks.tlx  : 0;
+      resultEntry.keystone.tly  = Number.isFinite(ks.tly)  ? ks.tly  : 0;
+      resultEntry.keystone.trx  = Number.isFinite(ks.trx)  ? ks.trx  : 0;
+      resultEntry.keystone.try_ = Number.isFinite(ks.try_) ? ks.try_
+                               : Number.isFinite(ks.try)  ? ks.try   : 0;
+      resultEntry.keystone.blx  = Number.isFinite(ks.blx)  ? ks.blx  : 0;
+      resultEntry.keystone.bly  = Number.isFinite(ks.bly)  ? ks.bly  : 0;
+      resultEntry.keystone.brx  = Number.isFinite(ks.brx)  ? ks.brx  : 0;
+      resultEntry.keystone.bry  = Number.isFinite(ks.bry)  ? ks.bry  : 0;
       resultEntry.confidence = Number.isFinite(parsed.confidence)    ? Math.max(0, Math.min(1, parsed.confidence)) : 0.5;
       resultEntry.reasoning  = (typeof parsed.reasoning === "string") ? parsed.reasoning : "";
     } catch (e) {
@@ -16297,6 +16345,24 @@ function applyCalibrationCorrections(corrections) {
     if (display.fov) {
       display.fov.h = Math.max(5, (display.fov.h || 90) + (c.deltaFovH || 0));
       display.fov.v = Math.max(5, (display.fov.v || 60) + (c.deltaFovV || 0));
+    }
+    // Phase 6.6.20.16 — keystone corner deltas accumulate into the
+    // display's persistent keystoneCorners field. Auto-prep on the
+    // next iteration applies them after auto-warp + auto-blend so
+    // they survive the regenerate.
+    if (c.keystone) {
+      if (!display.keystoneCorners) {
+        display.keystoneCorners = { tlx: 0, tly: 0, trx: 0, try_: 0, blx: 0, bly: 0, brx: 0, bry: 0 };
+      }
+      const k = display.keystoneCorners;
+      k.tlx  = (k.tlx  || 0) + (c.keystone.tlx  || 0);
+      k.tly  = (k.tly  || 0) + (c.keystone.tly  || 0);
+      k.trx  = (k.trx  || 0) + (c.keystone.trx  || 0);
+      k.try_ = (k.try_ || 0) + (c.keystone.try_ || 0);
+      k.blx  = (k.blx  || 0) + (c.keystone.blx  || 0);
+      k.bly  = (k.bly  || 0) + (c.keystone.bly  || 0);
+      k.brx  = (k.brx  || 0) + (c.keystone.brx  || 0);
+      k.bry  = (k.bry  || 0) + (c.keystone.bry  || 0);
     }
     if (Visual && Visual._warpCache) Visual._warpCache.delete(display.id);
     applied++;
@@ -16334,9 +16400,17 @@ function showAICalibrationModal(analysisResult) {
                       : conf > 0.8 ? "rgba(100, 220, 130, 1)"
                       : conf > 0.5 ? "rgba(220, 200, 100, 1)"
                       :              "rgba(220, 130, 100, 1)";
+      // 6.6.20.16 — keystone deltas (NDC) also count toward
+      // "significant" for pre-checking the row.
+      const k = c.keystone || {};
+      const ksSum = Math.abs(k.tlx || 0) + Math.abs(k.tly || 0) +
+                    Math.abs(k.trx || 0) + Math.abs(k.try_ || 0) +
+                    Math.abs(k.blx || 0) + Math.abs(k.bly || 0) +
+                    Math.abs(k.brx || 0) + Math.abs(k.bry || 0);
       const significant = !hasError &&
         (Math.abs(c.deltaYaw)   > 0.05 || Math.abs(c.deltaPitch) > 0.05 ||
-         Math.abs(c.deltaFovH)  > 0.05 || Math.abs(c.deltaFovV)  > 0.05);
+         Math.abs(c.deltaFovH)  > 0.05 || Math.abs(c.deltaFovV)  > 0.05 ||
+         ksSum > 0.001);
       const checked = significant && conf >= 0.5 ? " checked" : "";
       const fmtDelta = (x, label) => {
         const v = (x || 0);
@@ -16345,6 +16419,21 @@ function showAICalibrationModal(analysisResult) {
         return ' <span class="ai-calib-delta" data-label="' + label + '">' +
                sign + v.toFixed(2) + "° " + label + "</span>";
       };
+      const fmtKs = (x, label) => {
+        const v = (x || 0);
+        if (Math.abs(v) < 0.0005) return "";
+        const sign = v > 0 ? "+" : "";
+        return ' <span class="ai-calib-delta" data-label="' + label + '">' +
+               sign + v.toFixed(4) + " " + label + "</span>";
+      };
+      const ksLine = ksSum > 0.0005
+        ? '<div class="ai-calib-deltas" style="opacity:0.85">keystone:' +
+            fmtKs(k.tlx, "TLx") + fmtKs(k.tly, "TLy") +
+            fmtKs(k.trx, "TRx") + fmtKs(k.try_, "TRy") +
+            fmtKs(k.blx, "BLx") + fmtKs(k.bly, "BLy") +
+            fmtKs(k.brx, "BRx") + fmtKs(k.bry, "BRy") +
+          '</div>'
+        : "";
       const beforeAfterPose = "yaw " + (c.pose ? c.pose.yaw.toFixed(2) : "?") +
                               "° → " + ((c.pose ? c.pose.yaw : 0) + (c.deltaYaw || 0)).toFixed(2) +
                               "°&nbsp;&nbsp;|&nbsp;&nbsp;pitch " +
@@ -16360,6 +16449,7 @@ function showAICalibrationModal(analysisResult) {
   <span class="ai-calib-display-name">Display ${c.idx} (${escapeText(c.displayName || "")})</span>
 </label>
 <div class="ai-calib-deltas">${fmtDelta(c.deltaYaw, "yaw")}${fmtDelta(c.deltaPitch, "pitch")}${fmtDelta(c.deltaFovH, "fovH")}${fmtDelta(c.deltaFovV, "fovV")}${significant ? "" : ' <span class="ai-calib-delta">(no change proposed)</span>'}</div>
+${ksLine}
 <div class="ai-calib-detail">${beforeAfterPose}<br>${beforeAfterFov}</div>
 <div class="ai-calib-confidence" style="color: ${confColor}">${hasError ? "ERROR: " + escapeText(c.error) : ("Confidence " + (conf * 100).toFixed(0) + "% — " + escapeText(c.reasoning || "(no reasoning)"))}</div>`;
       list.appendChild(row);
@@ -16416,16 +16506,23 @@ async function runAICalibrationIterative(opts) {
   const stopThreshold = (opts && Number.isFinite(opts.stopThreshold)) ? opts.stopThreshold : 0.15;
   const onStatus = (opts && opts.onStatus) || null;
 
-  // Snapshot baseline poses so the final diff modal shows
-  // cumulative changes from the user's pre-AI rig state.
-  const baseline = (state.rig.displays || []).map(d => d ? {
-    idx: d.idx != null ? d.idx : -1,
+  // Snapshot baseline poses + keystone so the final diff modal
+  // shows cumulative changes from the user's pre-AI rig state.
+  const cloneKC = (k) => (k ? {
+    tlx: k.tlx || 0, tly: k.tly || 0,
+    trx: k.trx || 0, try_: k.try_ || 0,
+    blx: k.blx || 0, bly: k.bly || 0,
+    brx: k.brx || 0, bry: k.bry || 0
+  } : { tlx: 0, tly: 0, trx: 0, try_: 0, blx: 0, bly: 0, brx: 0, bry: 0 });
+  const baseline = (state.rig.displays || []).map((d, idx) => d ? {
+    idx,
     id:   d.id,
     name: d.name,
     yaw:   d.pose ? (d.pose.yaw   || 0) : 0,
     pitch: d.pose ? (d.pose.pitch || 0) : 0,
     fovH:  d.fov  ? (d.fov.h      || 90) : 90,
-    fovV:  d.fov  ? (d.fov.v      || 60) : 60
+    fovV:  d.fov  ? (d.fov.v      || 60) : 60,
+    keystoneCorners: cloneKC(d.keystoneCorners)
   } : null);
 
   let iterCount = 0;
@@ -16444,21 +16541,42 @@ async function runAICalibrationIterative(opts) {
     });
     lastResult = result;
 
-    // Clamp + filter to "significant" corrections (>0.02° on any axis).
+    // Clamp + filter to "significant" corrections.
+    // Pose/FOV deltas: ±maxDelta degrees (default 0.5°).
+    // Keystone deltas: ±keystoneMaxDelta NDC (default 0.02 = ~5 px @ 1080p).
+    const keystoneMaxDelta = 0.02;
     let totalDeltaSum = 0;
     let significantCount = 0;
+    const clamp = (v, m) => Math.max(-m, Math.min(m, v || 0));
     const clamped = (result.corrections || [])
       .filter(c => !c.error)
       .map(c => {
-        const cy = Math.max(-maxDelta, Math.min(maxDelta, c.deltaYaw   || 0));
-        const cp = Math.max(-maxDelta, Math.min(maxDelta, c.deltaPitch || 0));
-        const ch = Math.max(-maxDelta, Math.min(maxDelta, c.deltaFovH  || 0));
-        const cv = Math.max(-maxDelta, Math.min(maxDelta, c.deltaFovV  || 0));
-        const m = Math.abs(cy) + Math.abs(cp) + Math.abs(ch) + Math.abs(cv);
+        const cy = clamp(c.deltaYaw,   maxDelta);
+        const cp = clamp(c.deltaPitch, maxDelta);
+        const ch = clamp(c.deltaFovH,  maxDelta);
+        const cv = clamp(c.deltaFovV,  maxDelta);
+        const ks = c.keystone || {};
+        const k = {
+          tlx:  clamp(ks.tlx,  keystoneMaxDelta),
+          tly:  clamp(ks.tly,  keystoneMaxDelta),
+          trx:  clamp(ks.trx,  keystoneMaxDelta),
+          try_: clamp(ks.try_, keystoneMaxDelta),
+          blx:  clamp(ks.blx,  keystoneMaxDelta),
+          bly:  clamp(ks.bly,  keystoneMaxDelta),
+          brx:  clamp(ks.brx,  keystoneMaxDelta),
+          bry:  clamp(ks.bry,  keystoneMaxDelta)
+        };
+        // Magnitude scoring: pose deltas count more than keystone (degrees vs
+        // NDC), so weight keystone by 100× to be in degree-equivalent units.
+        const poseMag = Math.abs(cy) + Math.abs(cp) + Math.abs(ch) + Math.abs(cv);
+        const ksMag = (Math.abs(k.tlx) + Math.abs(k.tly) + Math.abs(k.trx) + Math.abs(k.try_) +
+                       Math.abs(k.blx) + Math.abs(k.bly) + Math.abs(k.brx) + Math.abs(k.bry)) * 100;
+        const m = poseMag + ksMag;
         if (m > 0.08) significantCount++;
         totalDeltaSum += m;
         return Object.assign({}, c, {
-          deltaYaw: cy, deltaPitch: cp, deltaFovH: ch, deltaFovV: cv
+          deltaYaw: cy, deltaPitch: cp, deltaFovH: ch, deltaFovV: cv,
+          keystone: k
         });
       });
 
@@ -16471,12 +16589,19 @@ async function runAICalibrationIterative(opts) {
     }
 
     // Apply the clamped corrections (only significant ones).
-    const significant = clamped.filter(c =>
-      Math.abs(c.deltaYaw)   > 0.02 ||
-      Math.abs(c.deltaPitch) > 0.02 ||
-      Math.abs(c.deltaFovH)  > 0.02 ||
-      Math.abs(c.deltaFovV)  > 0.02
-    );
+    // Pose threshold: 0.02°. Keystone threshold: 0.0005 NDC (~0.25 px).
+    const significant = clamped.filter(c => {
+      if (Math.abs(c.deltaYaw)   > 0.02) return true;
+      if (Math.abs(c.deltaPitch) > 0.02) return true;
+      if (Math.abs(c.deltaFovH)  > 0.02) return true;
+      if (Math.abs(c.deltaFovV)  > 0.02) return true;
+      const k = c.keystone;
+      if (!k) return false;
+      return Math.abs(k.tlx)  > 5e-4 || Math.abs(k.tly)  > 5e-4 ||
+             Math.abs(k.trx)  > 5e-4 || Math.abs(k.try_) > 5e-4 ||
+             Math.abs(k.blx)  > 5e-4 || Math.abs(k.bly)  > 5e-4 ||
+             Math.abs(k.brx)  > 5e-4 || Math.abs(k.bry)  > 5e-4;
+    });
     const applied = applyCalibrationCorrections(significant);
     totalCorrections += applied;
 
@@ -16495,6 +16620,8 @@ async function runAICalibrationIterative(opts) {
     const curPitch = display.pose ? (display.pose.pitch || 0) : 0;
     const curFovH  = display.fov  ? (display.fov.h      || 90) : 90;
     const curFovV  = display.fov  ? (display.fov.v      || 60) : 60;
+    const curKC = display.keystoneCorners || {};
+    const baseKC = b.keystoneCorners || {};
     return {
       idx:         b.idx,
       displayId:   b.id,
@@ -16505,6 +16632,16 @@ async function runAICalibrationIterative(opts) {
       deltaPitch:  curPitch - b.pitch,
       deltaFovH:   curFovH  - b.fovH,
       deltaFovV:   curFovV  - b.fovV,
+      keystone: {
+        tlx:  (curKC.tlx  || 0) - (baseKC.tlx  || 0),
+        tly:  (curKC.tly  || 0) - (baseKC.tly  || 0),
+        trx:  (curKC.trx  || 0) - (baseKC.trx  || 0),
+        try_: (curKC.try_ || 0) - (baseKC.try_ || 0),
+        blx:  (curKC.blx  || 0) - (baseKC.blx  || 0),
+        bly:  (curKC.bly  || 0) - (baseKC.bly  || 0),
+        brx:  (curKC.brx  || 0) - (baseKC.brx  || 0),
+        bry:  (curKC.bry  || 0) - (baseKC.bry  || 0)
+      },
       confidence:  1.0,
       reasoning:   "Cumulative iterative correction over " + iterCount + " pass(es)",
       error:       null
@@ -16537,12 +16674,18 @@ async function runAICalibrationFlow(opts) {
     });
 
     // 6.6.20.14 — better UX for the three "nothing happened" cases.
-    // The previous flow always showed the modal even when there
-    // were no actual changes, leaving the user wondering whether
-    // the AI even ran.
-    const cumDelta = result.finalDiff.reduce(
-      (s, c) => s + Math.abs(c.deltaYaw) + Math.abs(c.deltaPitch) +
-                    Math.abs(c.deltaFovH) + Math.abs(c.deltaFovV), 0);
+    // 6.6.20.16 — also count keystone corner deltas (NDC) toward
+    // hasChanges, since AI v3 may propose only keystone with no pose.
+    const cumDelta = result.finalDiff.reduce((s, c) => {
+      let m = Math.abs(c.deltaYaw) + Math.abs(c.deltaPitch) +
+              Math.abs(c.deltaFovH) + Math.abs(c.deltaFovV);
+      if (c.keystone) {
+        const k = c.keystone;
+        m += (Math.abs(k.tlx) + Math.abs(k.tly) + Math.abs(k.trx) + Math.abs(k.try_) +
+              Math.abs(k.blx) + Math.abs(k.bly) + Math.abs(k.brx) + Math.abs(k.bry)) * 100;
+      }
+      return s + m;
+    }, 0);
     const hasChanges = cumDelta > 0.005;
 
     // Pull last iteration's per-display errors for diagnostics.
@@ -16625,6 +16768,21 @@ async function runAICalibrationFlow(opts) {
       if (display.fov) {
         display.fov.h = Math.max(5, (display.fov.h || 90) - (c.deltaFovH || 0));
         display.fov.v = Math.max(5, (display.fov.v || 60) - (c.deltaFovV || 0));
+      }
+      // 6.6.20.16 — revert keystone deltas if present.
+      if (c.keystone) {
+        if (!display.keystoneCorners) {
+          display.keystoneCorners = { tlx: 0, tly: 0, trx: 0, try_: 0, blx: 0, bly: 0, brx: 0, bry: 0 };
+        }
+        const k = display.keystoneCorners;
+        k.tlx  -= (c.keystone.tlx  || 0);
+        k.tly  -= (c.keystone.tly  || 0);
+        k.trx  -= (c.keystone.trx  || 0);
+        k.try_ -= (c.keystone.try_ || 0);
+        k.blx  -= (c.keystone.blx  || 0);
+        k.bly  -= (c.keystone.bly  || 0);
+        k.brx  -= (c.keystone.brx  || 0);
+        k.bry  -= (c.keystone.bry  || 0);
       }
       if (Visual && Visual._warpCache) Visual._warpCache.delete(display.id);
       reverted++;
@@ -17350,7 +17508,8 @@ function _cloneWarpMesh(m) {
     verts: m.verts.slice(),
     _isAutoBlend: m._isAutoBlend,
     _isTest: m._isTest,
-    _isCustom: m._isCustom
+    _isCustom: m._isCustom,
+    _hasKeystone: m._hasKeystone   // 6.6.20.16 — idempotency flag
   };
   // 6.6.19: preserve Bezier control grid through the editor's
   // Cancel-restore snapshot so undo doesn't silently downgrade
@@ -18491,6 +18650,49 @@ function _autoWarpMeshForDisplay(display, surface, sweetSpot, cols, rows) {
   return mesh;
 }
 
+/* Phase 6.6.20.16 — apply per-display keystone corner deltas to a
+ * mesh, BILINEARLY blended across all vertices. Each corner shift
+ * propagates through the mesh interior with weight (1-u)(1-v),
+ * u(1-v), (1-u)v, uv per corner. The 4 corner verts get exactly
+ * their proposed deltas; the center vert gets the average; mesh
+ * stays smooth, no discontinuities.
+ *
+ * Called by _applyAutoWarpToRig + _applyAutoBlendToRig after they
+ * generate a fresh mesh. Allows AI v3 to propose corner-level
+ * keystone corrections that persist across iterations even though
+ * the underlying mesh gets regenerated each auto-prep pass.
+ *
+ * NDC delta units: ±0.02 is typical (1% of framebuffer ≈ 5 px at
+ * 1080p). Larger deltas warp aggressively. Per-pass clamp in the
+ * iterative AI loop is ±0.02. */
+function _applyKeystoneCornersToMesh(mesh, kc) {
+  if (!mesh || !_validateWarpMesh(mesh) || !kc) return;
+  if (mesh._hasKeystone) return;     // idempotent — already applied
+  // Skip cheap if all zeros — most displays have no keystone applied.
+  const sum = Math.abs(kc.tlx) + Math.abs(kc.tly) +
+              Math.abs(kc.trx) + Math.abs(kc.try_) +
+              Math.abs(kc.blx) + Math.abs(kc.bly) +
+              Math.abs(kc.brx) + Math.abs(kc.bry);
+  if (sum < 1e-6) return;
+  const cols = mesh.cols, rows = mesh.rows;
+  const W = cols + 1, H = rows + 1;
+  for (let r = 0; r < H; r++) {
+    for (let c = 0; c < W; c++) {
+      const u = c / cols;
+      const v = r / rows;
+      const wTL = (1 - u) * (1 - v);
+      const wTR = u       * (1 - v);
+      const wBL = (1 - u) * v;
+      const wBR = u       * v;
+      const dx = wTL * kc.tlx + wTR * kc.trx + wBL * kc.blx + wBR * kc.brx;
+      const dy = wTL * kc.tly + wTR * kc.try_ + wBL * kc.bly + wBR * kc.bry;
+      const i = (r * W + c) * 5;
+      mesh.verts[i + 0] += dx;
+      mesh.verts[i + 1] += dy;
+    }
+  }
+}
+
 /* Apply auto-warp across the rig. Skipped for "free"/"plane" surfaces
  * + when surfaceVisible is OFF (user told us this is a monitor rig,
  * not a curved screen). Custom (user-edited) meshes are preserved. */
@@ -18525,6 +18727,12 @@ function _applyAutoWarpToRig(opts) {
     // pixel-accurate boundary alignment scientific work needs.
     const WARP_MESH_DENSITY = 128;
     const mesh = _autoWarpMeshForDisplay(d, surface, ss, WARP_MESH_DENSITY, WARP_MESH_DENSITY);
+    // Phase 6.6.20.16 — apply keystone corner deltas (AI v3) so they
+    // persist through this regeneration. Idempotent: marks the mesh
+    // _hasKeystone after applying so downstream auto-blend doesn't
+    // double-apply.
+    _applyKeystoneCornersToMesh(mesh, d.keystoneCorners);
+    mesh._hasKeystone = true;
     d.warpMesh = mesh;
     if (Visual && Visual._warpCache) Visual._warpCache.delete(d.id);
     out.push({ displayIdx: i, applied: true });
@@ -18583,6 +18791,11 @@ function _applyAutoBlendToRig(opts) {
                             d.warpMesh.rows === BLEND_MESH_DENSITY) ? d.warpMesh : null;
       const mesh = _makeScreenSpaceBlendMesh(BLEND_MESH_DENSITY, BLEND_MESH_DENSITY,
         d, state.rig.displays, i, surface, hardCuts, existingWarp);
+      // Phase 6.6.20.16 — keystone corners. _applyKeystoneCornersToMesh
+      // is no-op when mesh._hasKeystone is true (auto-warp already
+      // applied), so chained warp→blend doesn't double-apply.
+      _applyKeystoneCornersToMesh(mesh, d.keystoneCorners);
+      mesh._hasKeystone = true;
       d.warpMesh = mesh;
       if (Visual && Visual._warpCache) Visual._warpCache.delete(d.id);
       out.push({ displayIdx: i, applied: true, mode: hardCuts ? "screen-space-hardcuts" : "screen-space" });
@@ -18668,6 +18881,12 @@ function _makeDisplay(id, name, overrides) {
     // user runs the warp editor (6.6.9) or imports MPCDI (6.6.2).
     warpMesh:  null,
     edgeBlend: _defaultEdgeBlend(),
+    // Phase 6.6.20.16 — AI v3 keystone corner offsets. 8 floats in
+    // NDC space (~ ±2 unit framebuffer). Applied AFTER auto-warp +
+    // auto-blend as a bilinear shift across the mesh, so they
+    // persist across auto-prep regenerations. Default 0; AI v3
+    // proposes deltas during iterative calibration.
+    keystoneCorners: { tlx: 0, tly: 0, trx: 0, try_: 0, blx: 0, bly: 0, brx: 0, bry: 0 },
     worldUv:   { minU: 0, minV: 0, maxU: 1, maxV: 1 }
   }, overrides);
 }
@@ -23790,6 +24009,20 @@ document.getElementById("file-input").addEventListener("change", ev => {
           d.warpMesh = null;
         }
         d.edgeBlend = _migrateEdgeBlend(d.edgeBlend);
+        // Phase 6.6.20.16 — keystoneCorners backfill for old patches
+        // that pre-date AI v3. Default all zeros.
+        if (!d.keystoneCorners || typeof d.keystoneCorners !== "object") {
+          d.keystoneCorners = { tlx: 0, tly: 0, trx: 0, try_: 0, blx: 0, bly: 0, brx: 0, bry: 0 };
+        } else {
+          d.keystoneCorners.tlx  = +(d.keystoneCorners.tlx)  || 0;
+          d.keystoneCorners.tly  = +(d.keystoneCorners.tly)  || 0;
+          d.keystoneCorners.trx  = +(d.keystoneCorners.trx)  || 0;
+          d.keystoneCorners.try_ = +(d.keystoneCorners.try_) || 0;
+          d.keystoneCorners.blx  = +(d.keystoneCorners.blx)  || 0;
+          d.keystoneCorners.bly  = +(d.keystoneCorners.bly)  || 0;
+          d.keystoneCorners.brx  = +(d.keystoneCorners.brx)  || 0;
+          d.keystoneCorners.bry  = +(d.keystoneCorners.bry)  || 0;
+        }
       });
       state.nodes.forEach(n => {
         if (n.type === "VisualOutput") {
