@@ -5659,7 +5659,13 @@
     <div class="warp-editor-head">
       <span class="warp-editor-title" id="warp-editor-title">Warp editor — Display 0</span>
       <span class="warp-editor-tools">
-        <label>Resolution
+        <label title="Mesh = drag every grid vertex (max local control). Bezier = drag a small control polygon for smooth C^∞ warps (Sajadi & Majumder 2012).">Mode
+          <select id="warp-editor-mode">
+            <option value="mesh" selected>Mesh</option>
+            <option value="bezier">Bezier</option>
+          </select>
+        </label>
+        <label id="warp-editor-res-label">Resolution
           <select id="warp-editor-res">
             <option value="4">4 × 4</option>
             <option value="8" selected>8 × 8</option>
@@ -5670,7 +5676,15 @@
             <option value="custom">Custom…</option>
           </select>
         </label>
-        <label class="warp-editor-tri" title="Offset alternate rows by half a cell so quads triangulate as equilateral-ish triangles instead of rectangles. Useful for warps that need diagonal flexibility.">
+        <label id="warp-editor-degree-label" style="display: none;" title="Bezier control-grid size. Higher = more local control but more points to drag. AlloSphere-class warps need 5×5 or 7×7.">Degree
+          <select id="warp-editor-degree">
+            <option value="3">3 × 3 (cubic)</option>
+            <option value="4" selected>5 × 5 (quartic)</option>
+            <option value="6">7 × 7 (sextic)</option>
+            <option value="8">9 × 9 (octic)</option>
+          </select>
+        </label>
+        <label class="warp-editor-tri" id="warp-editor-tri-label" title="Offset alternate rows by half a cell so quads triangulate as equilateral-ish triangles instead of rectangles. Useful for warps that need diagonal flexibility.">
           <input type="checkbox" id="warp-editor-triangular">
           Triangular
         </label>
@@ -5680,7 +5694,7 @@
     </div>
     <canvas id="warp-editor-canvas" width="1024" height="768"></canvas>
     <div class="warp-editor-foot">
-      <span class="warp-editor-hint">Drag a point to warp · Right-click resets one point · × or Save commits · Esc / Cancel discards · Live preview visible behind</span>
+      <span class="warp-editor-hint" id="warp-editor-hint">Drag a point to warp · Right-click resets one point · × or Save commits · Esc / Cancel discards · Live preview visible behind</span>
       <span class="warp-editor-actions">
         <button class="btn" id="warp-editor-cancel">Cancel</button>
         <button class="btn primary" id="warp-editor-save">Save</button>
@@ -14342,6 +14356,149 @@ function _makeTestWarpMesh(cols, rows) {
   return m;
 }
 
+/* ------------ Phase 6.6.19 — Bezier-patch warp authoring -------------- *
+ *
+ * Inspired by Sajadi & Majumder, "Autocalibration of Multiprojector
+ * CAVE-Like Immersive Environments" (IEEE TVCG 2012, doc 6060818).
+ *
+ * The paper represents a projector→display warp as a single rational
+ * Bezier patch BX,BY (and BZ for full 3D, but our 2D pipeline only
+ * needs BX,BY). For our authoring use case we use a *non*-rational
+ * Bezier (all weights 1) since the perspective-invariance argument
+ * doesn't apply when the user is hand-editing — they want shape,
+ * not a fitted-to-physics representation.
+ *
+ * Tradeoff vs the existing 33×33-vertex mesh authoring:
+ *   Mesh:   N² draggable points, exact local control, but tedious
+ *           for smooth curved warps and visible faceting at low N.
+ *   Bezier: ~25 draggable points (default 5×5 = degree 4), smooth
+ *           C^∞ everywhere, much faster to author for sphere/dome
+ *           warps. Not all warps are reachable (Bezier of finite
+ *           degree can't have arbitrary local detail), but a 5×5
+ *           patch is enough for AlloSphere-class smooth surfaces.
+ *
+ * Storage: a Bezier patch lives as `m._bezier = { cols, rows, ctrl }`
+ * piggy-backing on the existing warpMesh object. ctrl is a flat
+ * (cols+1)*(rows+1)*2 array of (x, y) NDC positions in row-major
+ * order. The mesh's `verts` field stays the source of truth for the
+ * GPU pipeline — when the user drags a control point we re-tessellate
+ * verts from ctrl. This means zero shader changes; the runtime
+ * doesn't even know it's looking at a Bezier output.
+ *
+ * Round-trip: JSON.stringify preserves the `_bezier` field through
+ * .gpatch saves. On load, _validateWarpMesh ignores extra fields so
+ * the bezier rides along with the mesh.
+ */
+
+/* Bernstein basis B_i^n(t) = C(n,i) t^i (1-t)^(n-i), for i = 0..n.
+ * Returned as a flat array of length n+1. We compute binomial coeffs
+ * incrementally to avoid factorial blowup. */
+function _bernsteinBasis(n, t) {
+  const out = new Array(n + 1);
+  const u = 1 - t;
+  // B_0^n(t) = (1-t)^n.
+  out[0] = Math.pow(u, n);
+  // B_i^n(t) = C(n,i) t^i (1-t)^(n-i). Incremental binomial: C(n,i)
+  // = C(n,i-1) * (n-i+1) / i.
+  let coef = 1;
+  for (let i = 1; i <= n; i++) {
+    coef = coef * (n - i + 1) / i;
+    out[i] = coef * Math.pow(t, i) * Math.pow(u, n - i);
+  }
+  return out;
+}
+
+/* Tensor-product Bezier surface evaluation at (u, v) ∈ [0,1]².
+ * ctrl is a flat row-major (cols+1)*(rows+1)*2 array of (x, y).
+ * Returns {x, y} of the surface at (u, v). */
+function _bezierEval(ctrl, cols, rows, u, v) {
+  const Bu = _bernsteinBasis(cols, u);
+  const Bv = _bernsteinBasis(rows, v);
+  const W = cols + 1;
+  let x = 0, y = 0;
+  for (let j = 0; j <= rows; j++) {
+    const bvj = Bv[j];
+    for (let i = 0; i <= cols; i++) {
+      const w = Bu[i] * bvj;
+      const k = (j * W + i) * 2;
+      x += w * ctrl[k];
+      y += w * ctrl[k + 1];
+    }
+  }
+  return { x, y };
+}
+
+/* Build an identity Bezier control-point grid: a uniform (cols+1)×
+ * (rows+1) grid of NDC positions spanning [-1, +1]² with no warp.
+ * The Bezier surface of a regular control grid reproduces the affine
+ * map exactly (linear-precision property), so identity in → identity
+ * out. */
+function _makeIdentityBezier(cols, rows) {
+  cols = Math.max(1, cols | 0); rows = Math.max(1, rows | 0);
+  const W = cols + 1, H = rows + 1;
+  const ctrl = new Array(W * H * 2);
+  for (let r = 0; r < H; r++) {
+    for (let c = 0; c < W; c++) {
+      const i = (r * W + c) * 2;
+      ctrl[i + 0] = (c / cols) * 2 - 1;
+      ctrl[i + 1] = (r / rows) * 2 - 1;
+    }
+  }
+  return { cols, rows, ctrl };
+}
+
+/* Tessellate a Bezier patch into a fine warp mesh suitable for the
+ * existing GPU pipeline. UVs + intensity stay regular (uniform source
+ * sampling, no edge-blend); only NDC (x, y) are overridden by Bezier
+ * eval. The resulting mesh carries `m._bezier = bezier` so the editor
+ * can recognize bezier-authored meshes on reopen. */
+function _bezierToWarpMesh(bezier, meshCols, meshRows) {
+  meshCols = Math.max(2, meshCols | 0);
+  meshRows = Math.max(2, meshRows | 0);
+  const m = _makeIdentityWarpMesh(meshCols, meshRows);
+  const W = meshCols + 1, H = meshRows + 1;
+  for (let r = 0; r < H; r++) {
+    const v = r / meshRows;
+    for (let c = 0; c < W; c++) {
+      const u = c / meshCols;
+      const p = _bezierEval(bezier.ctrl, bezier.cols, bezier.rows, u, v);
+      const idx = (r * W + c) * 5;
+      m.verts[idx + 0] = p.x;
+      m.verts[idx + 1] = p.y;
+    }
+  }
+  // Carry the bezier control grid on the mesh as the source of truth.
+  // Slice ctrl so future drags don't share the input array.
+  m._bezier = { cols: bezier.cols, rows: bezier.rows, ctrl: bezier.ctrl.slice() };
+  return m;
+}
+
+/* Re-tessellate the mesh's vert positions from its current `_bezier`
+ * control grid. Called after every Bezier control-point drag. UVs +
+ * intensity are preserved (only NDC x, y change). meshCols/meshRows
+ * are pulled from the existing mesh so we don't change tessellation
+ * density mid-edit. */
+function _rebuildMeshFromBezier(m) {
+  if (!m || !m._bezier) return;
+  const cols = m.cols, rows = m.rows, W = cols + 1, H = rows + 1;
+  for (let r = 0; r < H; r++) {
+    const v = r / rows;
+    for (let c = 0; c < W; c++) {
+      const u = c / cols;
+      const p = _bezierEval(m._bezier.ctrl, m._bezier.cols, m._bezier.rows, u, v);
+      const idx = (r * W + c) * 5;
+      m.verts[idx + 0] = p.x;
+      m.verts[idx + 1] = p.y;
+    }
+  }
+}
+
+/* Default tessellation density for the GPU mesh derived from a
+ * Bezier patch. 32×32 quads = 33² = 1089 vertices — fine enough that
+ * the smooth Bezier surface doesn't show faceting on a 1080p output,
+ * cheap enough to re-tessellate on every drag at 60fps. */
+const BEZIER_MESH_TESS = 32;
+
 /* ------------ Phase 6.6.3 — CSV / MPCDI exporters ---------------------- */
 
 /* CRC-32 (IEEE 802.3 polynomial 0xEDB88320). Required by the ZIP
@@ -15283,13 +15440,25 @@ function _resampleWarpMesh(oldMesh, newCols, newRows) {
  * mutated during dragging. */
 function _cloneWarpMesh(m) {
   if (!m) return null;
-  return {
+  const clone = {
     cols: m.cols,
     rows: m.rows,
     verts: m.verts.slice(),
     _isAutoBlend: m._isAutoBlend,
-    _isTest: m._isTest
+    _isTest: m._isTest,
+    _isCustom: m._isCustom
   };
+  // 6.6.19: preserve Bezier control grid through the editor's
+  // Cancel-restore snapshot so undo doesn't silently downgrade
+  // bezier authoring back to mesh authoring.
+  if (m._bezier) {
+    clone._bezier = {
+      cols: m._bezier.cols,
+      rows: m._bezier.rows,
+      ctrl: m._bezier.ctrl.slice()
+    };
+  }
+  return clone;
 }
 
 /* Open the modal for one display. If the display has no warp mesh,
@@ -15308,8 +15477,16 @@ function openWarpEditor(displayIdx) {
   if (overlay) overlay.style.display = "flex";
   const title = document.getElementById("warp-editor-title");
   if (title) title.textContent = "Warp editor — Display " + displayIdx + " (" + (d.name || "") + ")";
+  // 6.6.19: detect bezier-authored meshes on reopen and switch the
+  // Mode dropdown accordingly. The mesh carries _bezier as the
+  // source of truth in bezier mode; verts are derived.
+  const isBezier = !!(d.warpMesh._bezier);
+  const modeSel = document.getElementById("warp-editor-mode");
+  if (modeSel) modeSel.value = isBezier ? "bezier" : "mesh";
+  _updateWarpEditorModeUI(isBezier ? "bezier" : "mesh");
+
   const resSel = document.getElementById("warp-editor-res");
-  if (resSel) {
+  if (resSel && !isBezier) {
     // Match the dropdown to the mesh's current cols. Non-square or
     // out-of-preset sizes show as "Custom…".
     const presetCols = ["4", "8", "12", "16", "24", "32"];
@@ -15318,6 +15495,17 @@ function openWarpEditor(displayIdx) {
       resSel.value = colsStr;
     } else {
       resSel.value = "custom";
+    }
+  }
+  // Bezier degree dropdown — match to current control-grid size.
+  const degSel = document.getElementById("warp-editor-degree");
+  if (degSel && isBezier) {
+    const presetDegs = ["3", "4", "6", "8"];
+    const degStr = String(d.warpMesh._bezier.cols);
+    if (d.warpMesh._bezier.cols === d.warpMesh._bezier.rows && presetDegs.includes(degStr)) {
+      degSel.value = degStr;
+    } else {
+      degSel.value = "4";    // fall back to default
     }
   }
   // Triangular checkbox starts unchecked since we can't reliably
@@ -15354,12 +15542,37 @@ function closeWarpEditor(save) {
   render();
 }
 
+/* 6.6.19: show/hide tools based on whether we're in mesh or bezier
+ * authoring mode. In mesh mode: Resolution + Triangular visible. In
+ * bezier mode: Degree visible, Triangular hidden (doesn't apply to
+ * a single Bezier patch). Resolution stays visible in mesh mode only
+ * so users don't accidentally bump the mesh tessellation density
+ * while editing a bezier. */
+function _updateWarpEditorModeUI(mode) {
+  const resLabel  = document.getElementById("warp-editor-res-label");
+  const degLabel  = document.getElementById("warp-editor-degree-label");
+  const triLabel  = document.getElementById("warp-editor-tri-label");
+  const hint      = document.getElementById("warp-editor-hint");
+  if (resLabel) resLabel.style.display = (mode === "bezier") ? "none" : "";
+  if (triLabel) triLabel.style.display = (mode === "bezier") ? "none" : "";
+  if (degLabel) degLabel.style.display = (mode === "bezier") ? "" : "none";
+  if (hint) {
+    hint.textContent = (mode === "bezier")
+      ? "Drag a control point to bend the warp · Right-click resets one point · × or Save commits · Esc / Cancel discards"
+      : "Drag a point to warp · Right-click resets one point · × or Save commits · Esc / Cancel discards · Live preview visible behind";
+  }
+}
+
 /* Render the editor canvas. Draws a calibration checkerboard +
  * overlays the warp mesh as a draggable point grid. The mesh's
  * (mx, my) NDC positions are mapped to canvas space [-1,+1] →
  * [pad, W-pad] / [pad, H-pad] (Y inverted: canvas y down vs NDC
  * y up). Selected / hovered points are drawn larger and accent-
- * colored so the user always knows which point they're moving. */
+ * colored so the user always knows which point they're moving.
+ *
+ * 6.6.19: in bezier mode, the dense mesh is drawn faintly and the
+ * Bezier control polygon (dashed lines + control points) is the
+ * draggable layer. */
 function _drawWarpEditor() {
   const canvas = document.getElementById("warp-editor-canvas");
   if (!canvas) return;
@@ -15399,10 +15612,14 @@ function _drawWarpEditor() {
   });
 
   const cols1 = m.cols + 1, rows1 = m.rows + 1;
+  const inBezier = !!(m._bezier);
 
   // Mesh quad outlines + diagonals show how the warp is deforming
   // a uniform grid. Draw before the points so points sit on top.
-  ctx.strokeStyle = "rgba(180, 190, 210, 0.45)";
+  // In bezier mode, draw the dense mesh faintly so the user can
+  // see the smooth Bezier surface, then draw the control polygon
+  // on top of it.
+  ctx.strokeStyle = inBezier ? "rgba(180, 190, 210, 0.18)" : "rgba(180, 190, 210, 0.45)";
   ctx.lineWidth = 1;
   // Horizontal lines (per row).
   for (let r = 0; r < rows1; r++) {
@@ -15425,24 +15642,81 @@ function _drawWarpEditor() {
     ctx.stroke();
   }
 
-  // Control points. Larger / accent-colored when hovered or dragged.
-  for (let r = 0; r < rows1; r++) {
-    for (let c = 0; c < cols1; c++) {
-      const idx = (r * cols1 + c) * 5;
-      const p = meshToCanvas(m.verts[idx], m.verts[idx + 1]);
-      const flat = r * cols1 + c;
-      const isDragged = (_warpEditor.draggedVertex === flat);
-      const isHover   = (_warpEditor.hoverVertex   === flat);
-      const radius = isDragged ? 9 : (isHover ? 7 : 5);
-      ctx.fillStyle = isDragged
-        ? "rgba(200, 232, 90, 0.95)"
-        : (isHover ? "rgba(170, 162, 240, 0.95)" : "rgba(170, 162, 240, 0.7)");
+  if (inBezier) {
+    // Bezier mode: control polygon (dashed) + control points.
+    const b = m._bezier;
+    const bcols1 = b.cols + 1, brows1 = b.rows + 1;
+    const cpToCanvas = (i) => meshToCanvas(b.ctrl[i * 2], b.ctrl[i * 2 + 1]);
+
+    // Dashed control polygon — visually distinguishes "this is the
+    // control net, not the actual surface" from the dense mesh below.
+    ctx.save();
+    ctx.setLineDash([6, 4]);
+    ctx.strokeStyle = "rgba(170, 162, 240, 0.55)";
+    ctx.lineWidth = 1.25;
+    // Horizontal control-net lines.
+    for (let r = 0; r < brows1; r++) {
       ctx.beginPath();
-      ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.strokeStyle = "rgba(8, 11, 16, 0.85)";
-      ctx.lineWidth = 1.5;
+      for (let c = 0; c < bcols1; c++) {
+        const p = cpToCanvas(r * bcols1 + c);
+        if (c === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+      }
       ctx.stroke();
+    }
+    // Vertical control-net lines.
+    for (let c = 0; c < bcols1; c++) {
+      ctx.beginPath();
+      for (let r = 0; r < brows1; r++) {
+        const p = cpToCanvas(r * bcols1 + c);
+        if (r === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+      }
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    // Control points. The four corners are pinned visually (Bezier
+    // interpolates corners) — render them slightly smaller and a
+    // dimmer hue to suggest "anchor" rather than "free."
+    for (let r = 0; r < brows1; r++) {
+      for (let c = 0; c < bcols1; c++) {
+        const flat = r * bcols1 + c;
+        const p = cpToCanvas(flat);
+        const isDragged = (_warpEditor.draggedVertex === flat);
+        const isHover   = (_warpEditor.hoverVertex   === flat);
+        const isCorner  = (r === 0 || r === b.rows) && (c === 0 || c === b.cols);
+        const radius = isDragged ? 10 : (isHover ? 8 : 6);
+        ctx.fillStyle = isDragged
+          ? "rgba(200, 232, 90, 0.95)"
+          : (isHover ? "rgba(170, 162, 240, 0.95)"
+            : (isCorner ? "rgba(140, 132, 200, 0.85)" : "rgba(190, 180, 255, 0.85)"));
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = "rgba(8, 11, 16, 0.85)";
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      }
+    }
+  } else {
+    // Mesh mode: every mesh vertex is draggable (legacy 6.6.2 UI).
+    for (let r = 0; r < rows1; r++) {
+      for (let c = 0; c < cols1; c++) {
+        const idx = (r * cols1 + c) * 5;
+        const p = meshToCanvas(m.verts[idx], m.verts[idx + 1]);
+        const flat = r * cols1 + c;
+        const isDragged = (_warpEditor.draggedVertex === flat);
+        const isHover   = (_warpEditor.hoverVertex   === flat);
+        const radius = isDragged ? 9 : (isHover ? 7 : 5);
+        ctx.fillStyle = isDragged
+          ? "rgba(200, 232, 90, 0.95)"
+          : (isHover ? "rgba(170, 162, 240, 0.95)" : "rgba(170, 162, 240, 0.7)");
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = "rgba(8, 11, 16, 0.85)";
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      }
     }
   }
 }
@@ -15462,8 +15736,26 @@ function _warpEditorHitTest(canvas, clientX, clientY, hitRadius) {
   const W = canvas.width, H = canvas.height;
   const pad = Math.min(W, H) * 0.06;
   const Wf = W - pad * 2, Hf = H - pad * 2;
-  const cols1 = m.cols + 1, rows1 = m.rows + 1;
   let bestIdx = -1, bestDist = hitRadius;
+  // 6.6.19: in bezier mode, hit-test against control points instead
+  // of mesh vertices. The flat-index space is the bezier control
+  // grid (small) rather than the dense mesh (~1000 verts).
+  if (m._bezier) {
+    const b = m._bezier;
+    const bcols1 = b.cols + 1, brows1 = b.rows + 1;
+    for (let r2 = 0; r2 < brows1; r2++) {
+      for (let c = 0; c < bcols1; c++) {
+        const i = (r2 * bcols1 + c) * 2;
+        const px = pad + (b.ctrl[i] + 1) * 0.5 * Wf;
+        const py = pad + (1 - (b.ctrl[i+1] + 1) * 0.5) * Hf;
+        const dist = Math.hypot(cx - px, cy - py);
+        if (dist < bestDist) { bestDist = dist; bestIdx = r2 * bcols1 + c; }
+      }
+    }
+    return { idx: bestIdx, cx, cy };
+  }
+  // Mesh mode (legacy).
+  const cols1 = m.cols + 1, rows1 = m.rows + 1;
   for (let r2 = 0; r2 < rows1; r2++) {
     for (let c = 0; c < cols1; c++) {
       const i = (r2 * cols1 + c) * 5;
@@ -15510,6 +15802,78 @@ function _wireWarpEditor() {
   if (closeBtn)  closeBtn.addEventListener("click",  () => closeWarpEditor(true));
   if (cancelBtn) cancelBtn.addEventListener("click", () => closeWarpEditor(false));
   if (saveBtn)   saveBtn.addEventListener("click",   () => closeWarpEditor(true));
+
+  // 6.6.19: mode toggle (Mesh ↔ Bezier).
+  const modeSel = document.getElementById("warp-editor-mode");
+  if (modeSel) {
+    modeSel.addEventListener("change", () => {
+      const d = state.rig && state.rig.displays && state.rig.displays[_warpEditor.displayIdx];
+      if (!d || !d.warpMesh) return;
+      const target = modeSel.value;
+      const isCurrentlyBezier = !!(d.warpMesh._bezier);
+      if (target === "bezier" && !isCurrentlyBezier) {
+        // Mesh → Bezier. If the current mesh has user edits, warn —
+        // a fresh identity Bezier overwrites them. (Future work: a
+        // least-squares fit of the existing mesh to a Bezier patch.)
+        const hasEdits = !!d.warpMesh._isCustom || !!d.warpMesh._isAutoBlend || !!d.warpMesh._isTest;
+        if (hasEdits) {
+          const ok = (typeof confirm === "function")
+            ? confirm("Switch to Bezier mode? The current mesh edits will be replaced with an identity Bezier patch (no warp). The corner X / Save still preserves whichever shape is on screen at the time.")
+            : true;
+          if (!ok) {
+            modeSel.value = "mesh";
+            return;
+          }
+        }
+        // Default Bezier: 5×5 control points (degree 4) — enough for
+        // AlloSphere-class smooth curvature.
+        const degSel = document.getElementById("warp-editor-degree");
+        const deg = degSel ? Math.max(2, parseInt(degSel.value, 10) || 4) : 4;
+        const bez = _makeIdentityBezier(deg, deg);
+        d.warpMesh = _bezierToWarpMesh(bez, BEZIER_MESH_TESS, BEZIER_MESH_TESS);
+        d.warpMesh._isCustom = !!hasEdits;   // preserve edited-flag if user already had edits
+      } else if (target === "mesh" && isCurrentlyBezier) {
+        // Bezier → Mesh. Keep the dense tessellated mesh (the user
+        // sees the same warp) and drop the bezier control grid. They
+        // can now hand-edit individual mesh verts.
+        delete d.warpMesh._bezier;
+      }
+      _updateWarpEditorModeUI(target);
+      // Reset drag state and force a redraw with the new representation.
+      _warpEditor.draggedVertex = -1;
+      _warpEditor.hoverVertex = -1;
+      if (Visual && Visual._warpCache) Visual._warpCache.delete(d.id);
+      _drawWarpEditor();
+    });
+  }
+
+  // 6.6.19: bezier degree change. Rebuilds the control grid at the
+  // new size; existing edits are not preserved (no fitter yet).
+  const degSel = document.getElementById("warp-editor-degree");
+  if (degSel) {
+    degSel.addEventListener("change", () => {
+      const d = state.rig && state.rig.displays && state.rig.displays[_warpEditor.displayIdx];
+      if (!d || !d.warpMesh || !d.warpMesh._bezier) return;
+      const deg = Math.max(2, parseInt(degSel.value, 10) || 4);
+      const hasEdits = !!d.warpMesh._isCustom;
+      if (hasEdits) {
+        const ok = (typeof confirm === "function")
+          ? confirm("Change Bezier degree? Existing control-point edits will be reset.")
+          : true;
+        if (!ok) {
+          // Restore dropdown to current degree.
+          degSel.value = String(d.warpMesh._bezier.cols);
+          return;
+        }
+      }
+      const bez = _makeIdentityBezier(deg, deg);
+      d.warpMesh = _bezierToWarpMesh(bez, BEZIER_MESH_TESS, BEZIER_MESH_TESS);
+      _warpEditor.draggedVertex = -1;
+      _warpEditor.hoverVertex = -1;
+      if (Visual && Visual._warpCache) Visual._warpCache.delete(d.id);
+      _drawWarpEditor();
+    });
+  }
 
   if (resSel) {
     resSel.addEventListener("change", () => {
@@ -15577,10 +15941,20 @@ function _wireWarpEditor() {
     resetBtn.addEventListener("click", () => {
       const d = state.rig && state.rig.displays && state.rig.displays[_warpEditor.displayIdx];
       if (!d || !d.warpMesh) return;
-      const triangular = !!(triCheckbox && triCheckbox.checked);
-      d.warpMesh = triangular
-        ? _makeTriangularWarpMesh(d.warpMesh.cols, d.warpMesh.rows)
-        : _makeIdentityWarpMesh(d.warpMesh.cols, d.warpMesh.rows);
+      // 6.6.19: in bezier mode reset rebuilds an identity bezier at
+      // the current degree; the dense mesh follows from tessellation.
+      if (d.warpMesh._bezier) {
+        const deg = d.warpMesh._bezier.cols;
+        const bez = _makeIdentityBezier(deg, deg);
+        d.warpMesh = _bezierToWarpMesh(bez, BEZIER_MESH_TESS, BEZIER_MESH_TESS);
+      } else {
+        const triangular = !!(triCheckbox && triCheckbox.checked);
+        d.warpMesh = triangular
+          ? _makeTriangularWarpMesh(d.warpMesh.cols, d.warpMesh.rows)
+          : _makeIdentityWarpMesh(d.warpMesh.cols, d.warpMesh.rows);
+      }
+      _warpEditor.draggedVertex = -1;
+      _warpEditor.hoverVertex = -1;
       if (Visual && Visual._warpCache) Visual._warpCache.delete(d.id);
       _drawWarpEditor();
     });
@@ -15607,9 +15981,20 @@ function _wireWarpEditor() {
         const cx = (e.clientX - r.left) * sx;
         const cy = (e.clientY - r.top)  * sy;
         const ndc = _warpEditorCanvasToNdc(canvas, cx, cy);
-        const offset = _warpEditor.draggedVertex * 5;
-        d.warpMesh.verts[offset + 0] = ndc.mx;
-        d.warpMesh.verts[offset + 1] = ndc.my;
+        // 6.6.19: in bezier mode the dragged index is into the
+        // control grid (cols+1 stride per row), not the dense mesh.
+        // After updating the ctrl point we re-tessellate the mesh
+        // verts so the GPU pipeline sees the new surface immediately.
+        if (d.warpMesh._bezier) {
+          const offset = _warpEditor.draggedVertex * 2;
+          d.warpMesh._bezier.ctrl[offset + 0] = ndc.mx;
+          d.warpMesh._bezier.ctrl[offset + 1] = ndc.my;
+          _rebuildMeshFromBezier(d.warpMesh);
+        } else {
+          const offset = _warpEditor.draggedVertex * 5;
+          d.warpMesh.verts[offset + 0] = ndc.mx;
+          d.warpMesh.verts[offset + 1] = ndc.my;
+        }
         // Editing makes the mesh "custom" — user-authored. Drop the
         // auto-/test- flags so the rig pane's warp pill flips to
         // "warp: custom" (red rim, doesn't get clobbered by pill
@@ -15637,19 +16022,32 @@ function _wireWarpEditor() {
     };
     canvas.addEventListener("pointerup",     endDrag);
     canvas.addEventListener("pointercancel", endDrag);
-    // Right-click → reset that vertex to its identity NDC position.
+    // Right-click → reset that vertex / control point to its identity
+    // NDC position. In bezier mode we also re-tessellate the mesh
+    // from the (now-reset) control grid.
     canvas.addEventListener("contextmenu", (e) => {
       e.preventDefault();
       const d = state.rig && state.rig.displays && state.rig.displays[_warpEditor.displayIdx];
       if (!d || !d.warpMesh) return;
       const hit = _warpEditorHitTest(canvas, e.clientX, e.clientY, 18);
       if (hit.idx < 0) return;
-      const cols1 = d.warpMesh.cols + 1;
-      const r = Math.floor(hit.idx / cols1);
-      const c = hit.idx % cols1;
-      const off = hit.idx * 5;
-      d.warpMesh.verts[off + 0] = (c / d.warpMesh.cols) * 2 - 1;
-      d.warpMesh.verts[off + 1] = (r / d.warpMesh.rows) * 2 - 1;
+      if (d.warpMesh._bezier) {
+        const b = d.warpMesh._bezier;
+        const bcols1 = b.cols + 1;
+        const r = Math.floor(hit.idx / bcols1);
+        const c = hit.idx % bcols1;
+        const off = hit.idx * 2;
+        b.ctrl[off + 0] = (c / b.cols) * 2 - 1;
+        b.ctrl[off + 1] = (r / b.rows) * 2 - 1;
+        _rebuildMeshFromBezier(d.warpMesh);
+      } else {
+        const cols1 = d.warpMesh.cols + 1;
+        const r = Math.floor(hit.idx / cols1);
+        const c = hit.idx % cols1;
+        const off = hit.idx * 5;
+        d.warpMesh.verts[off + 0] = (c / d.warpMesh.cols) * 2 - 1;
+        d.warpMesh.verts[off + 1] = (r / d.warpMesh.rows) * 2 - 1;
+      }
       if (Visual && Visual._warpCache) Visual._warpCache.delete(d.id);
       _drawWarpEditor();
     });
@@ -17999,14 +18397,18 @@ function renderRigPane() {
     const warpState = !d.warpMesh ? "off"
                      : (d.warpMesh._isTest      ? "test"
                      : (d.warpMesh._isAutoBlend ? "auto"
+                     : (d.warpMesh._bezier && d.warpMesh._isCustom ? "bezier"
                      : (d.warpMesh._isCustom    ? "custom"
-                     : "identity")));
+                     : (d.warpMesh._bezier      ? "bezier-id"
+                     : "identity")))));
     const warpLabel = ({
-      off:      "warp: off",
-      identity: "warp: identity",
-      test:     "warp: test",
-      auto:     "warp: auto-blend",
-      custom:   "warp: custom"
+      off:        "warp: off",
+      identity:   "warp: identity",
+      test:       "warp: test",
+      auto:       "warp: auto-blend",
+      custom:     "warp: custom",
+      bezier:     "warp: bezier",
+      "bezier-id":"warp: bezier (identity)"
     })[warpState];
     // Phase 6.6.10 — per-display edge-blend inputs. γ / lift / pow
     // sit on a sub-row below the pose/fov line, kept visually
