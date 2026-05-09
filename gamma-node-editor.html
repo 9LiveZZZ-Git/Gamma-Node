@@ -14477,6 +14477,70 @@ function _sweptSurfaceBounds(surface) {
   return { minX, minY, minZ, maxX, maxY, maxZ };
 }
 
+/* 6.6.20+ — unified ray-vs-screen-surface intersection. Used by
+ * theater + gizmo to wrap display vertices onto the actual screen
+ * surface ("real curved projection") instead of drawing flat quads.
+ * Returns the 3D world point where the ray (from origin through D)
+ * hits the surface, or null if the ray misses with no fallback set.
+ *
+ * fallbackR: if > 0 and the ray misses, return D normalized to that
+ * radius (visually "the beam continues to where the unit sphere
+ * would be"). Use this for visualization to avoid holes; pass 0
+ * when you want strict miss reporting. */
+function _screenProjectionPoint(D, surface, fallbackR) {
+  if (!surface) return null;
+  let t = -1;
+  if (surface.type === "sphere") {
+    t = _raySphereDistance([0,0,0], D, surface.center || [0,0,0], surface.radius || 5);
+  } else if (surface.type === "cylinder") {
+    t = _rayCylinderDistanceY([0,0,0], D, surface.center || [0,0,0],
+                               surface.radius || 5, surface.length || 5);
+  } else if (surface.type === "swept") {
+    t = _raySweptSurfaceDistance([0,0,0], D, surface);
+  } else {
+    return null;
+  }
+  if (t > 0) return [D[0] * t, D[1] * t, D[2] * t];
+  if (fallbackR && fallbackR > 0) {
+    const len = Math.hypot(D[0], D[1], D[2]);
+    if (len < 1e-9) return null;
+    const k = fallbackR / len;
+    return [D[0] * k, D[1] * k, D[2] * k];
+  }
+  return null;
+}
+
+/* Build a "normalized" copy of the screen surface where the
+ * characteristic dimension (radius) = 1. Used by the gizmo so the
+ * surface fits the frustum-corner unit sphere regardless of real
+ * radius (which can be 5m for an AlloSphere or 30m for a planetarium).
+ * Returns null for non-curved surfaces (plane / free / null). */
+function _normalizeSurfaceForGizmo(surface) {
+  if (!surface) return null;
+  if (surface.type === "sphere") {
+    return { type: "sphere", radius: 1, center: [0, 0, 0] };
+  }
+  if (surface.type === "cylinder") {
+    const R = surface.radius || 5;
+    return {
+      type: "cylinder",
+      radius: 1,
+      length: (surface.length || 5) / R,
+      center: [0, 0, 0],
+      axis: [0, 1, 0]
+    };
+  }
+  if (surface.type === "swept") {
+    const p = surface.profile || {};
+    const R = p.radius || 5;
+    const profile = (p.kind === "vertical")
+      ? { kind: "vertical", radius: 1, yMin: (p.yMin || -2.5) / R, yMax: (p.yMax || 2.5) / R }
+      : { kind: "arc",      radius: 1, pitchStart: p.pitchStart || -90, pitchEnd: p.pitchEnd || 90 };
+    return { type: "swept", profile, path: { ...(surface.path || { yawStart: -180, yawEnd: 180 }) } };
+  }
+  return null;
+}
+
 /* Built-in swept-surface presets. Mirrors the named shapes Sajadi &
  * Majumder use in their evaluations: truncated dome (AlloSphere),
  * bowl, dome, cylinder arc. The names are used in the rig template
@@ -25532,6 +25596,16 @@ function _buildTheaterMeshGeometry(displays) {
   const cap = Visual._theaterVertsPerDispCap || 289;
   const idxCap = Visual._theaterIdxPerDispCap || 1536;
   const layerCount = Math.min(displays.length, RIG_MAX_DISPLAYS);
+  // 6.6.20+ — when the rig has a curved screen surface (sphere /
+  // cylinder / swept) and surfaceVisible is on, project each display
+  // vertex onto the actual surface instead of drawing flat quads.
+  // This is the real curved-screen projection: a beam from the
+  // projector through framebuffer-NDC (mx, my) lands wherever it
+  // intersects the screen, NOT on a flat tangent plane.
+  const surface = (state && state.rig && state.rig.surface) || null;
+  const surfaceVisible = !!(state && state.rig && state.rig.surfaceVisible !== false);
+  const useCurvedScreen = !!(surface && surfaceVisible &&
+    (surface.type === "sphere" || surface.type === "cylinder" || surface.type === "swept"));
 
   // Worst-case sized buffers; we track the actual byte usage and
   // pass that to writeBuffer. Avoids per-frame ArrayBuffer alloc
@@ -25585,8 +25659,10 @@ function _buildTheaterMeshGeometry(displays) {
     const ux = fy * rz - fz * ry;
     const uy = fz * rx - fx * rz;
     const uz = fx * ry - fy * rx;
-    const halfW = R * Math.tan(fov.h * Math.PI / 360);
-    const halfH = R * Math.tan(fov.v * Math.PI / 360);
+    const tanH = Math.tan(fov.h * Math.PI / 360);
+    const tanV = Math.tan(fov.v * Math.PI / 360);
+    const halfW = R * tanH;
+    const halfH = R * tanV;
     const cx = R * fx, cy = R * fy, cz = R * fz;
 
     // Determine mesh shape. Bourke mesh format from Phase 6.6.1:
@@ -25602,14 +25678,12 @@ function _buildTheaterMeshGeometry(displays) {
       meshRows  = wm.rows;
       meshVerts = wm.verts;
     } else {
-      // Identity 1×1 grid via the canonical helper so the layout
-      // exactly matches what every Bourke-warped display gets. Earlier
-      // take used a hand-rolled perimeter order (BL, BR, TR, TL) which
-      // index math interpreted as row-major and produced bowtie quads
-      // — two triangles that only covered half the rectangle each.
-      // Using the helper means there's only one mesh layout in the
-      // codebase, full stop.
-      const idMesh = _makeIdentityWarpMesh(1, 1);
+      // 6.6.20+ — when projecting onto a curved screen with no warp
+      // mesh, use an 8×8 identity grid (81 verts) so each display's
+      // patch curves visibly. Flat-screen rigs still use 1×1 (4 verts)
+      // since flat quads need no subdivision.
+      const idDensity = useCurvedScreen ? 8 : 1;
+      const idMesh = _makeIdentityWarpMesh(idDensity, idDensity);
       meshCols  = idMesh.cols;
       meshRows  = idMesh.rows;
       meshVerts = idMesh.verts;
@@ -25627,12 +25701,35 @@ function _buildTheaterMeshGeometry(displays) {
         const mu = meshVerts[mi5 + 2];
         const mv = meshVerts[mi5 + 3];
         const mInt = meshVerts[mi5 + 4];
-        // 3D position on the display's quad surface. mx/my in [-1,1]
-        // NDC of the projector framebuffer maps to right/up offsets
-        // of halfW/halfH from the display's center direction.
-        const px = cx + rx * (mx * halfW) + ux * (my * halfH);
-        const py = cy + ry * (mx * halfW) + uy * (my * halfH);
-        const pz = cz + rz * (mx * halfW) + uz * (my * halfH);
+        // 3D position. 6.6.20+: when a curved screen is active, cast
+        // a beam from the projector (origin) through framebuffer-NDC
+        // (mx, my) and intersect with the screen surface — the
+        // physical reality of a projector hitting a curved screen.
+        // When the beam misses the screen (e.g. yaw outside the
+        // partial-revolution span of a swept surface) we fall back
+        // to the flat-quad position so the display doesn't disappear
+        // as a visual debugging aid.
+        let px, py, pz;
+        if (useCurvedScreen) {
+          const dx = fx + rx * (mx * tanH) + ux * (my * tanV);
+          const dy = fy + ry * (mx * tanH) + uy * (my * tanV);
+          const dz = fz + rz * (mx * tanH) + uz * (my * tanV);
+          const hit = _screenProjectionPoint([dx, dy, dz], surface, R);
+          if (hit) {
+            px = hit[0]; py = hit[1]; pz = hit[2];
+          } else {
+            px = cx + rx * (mx * halfW) + ux * (my * halfH);
+            py = cy + ry * (mx * halfW) + uy * (my * halfH);
+            pz = cz + rz * (mx * halfW) + uz * (my * halfH);
+          }
+        } else {
+          // Flat-quad behavior (legacy): mx/my in [-1,1] NDC of the
+          // projector framebuffer maps to right/up offsets of halfW
+          // / halfH from the display's center direction at distance R.
+          px = cx + rx * (mx * halfW) + ux * (my * halfH);
+          py = cy + ry * (mx * halfW) + uy * (my * halfH);
+          pz = cz + rz * (mx * halfW) + uz * (my * halfH);
+        }
         const off = vertHead * stride;
         f32[off + 0] = px;
         f32[off + 1] = py;
@@ -27602,12 +27699,21 @@ function _drawGizmoFrame() {
 
   // Display frustums — z-sort by mean depth so back ones draw first
   // (preserves "closer wins" ordering in wireframe-painters fashion).
+  // 6.6.20+: when a curved screen is active, the frustum FACE wraps
+  // onto the actual screen surface (sphere/cylinder/swept) rather
+  // than sitting at depth=1 as a flat quad. We tessellate the face
+  // into a grid + project each grid vertex onto the normalized
+  // screen — this shows AlloSphere / dome / bowl curvature directly
+  // on each display tile.
   const displays = (state && state.rig && state.rig.displays) || [];
   const defaultEB = _defaultEdgeBlend();
   const isCustomBlend = (eb) => !eb ||
     eb.gamma     !== defaultEB.gamma ||
     eb.blackLift !== defaultEB.blackLift ||
     eb.power     !== defaultEB.power;
+  const gizmoSurface = surfVisibleNow ? _normalizeSurfaceForGizmo(rigSurface) : null;
+  const useCurvedFrustum = !!gizmoSurface;
+  const FACE_TESS = useCurvedFrustum ? 6 : 1;   // 6×6 grid wraps smoothly
   const frustums = [];
   for (let i = 0; i < displays.length; i++) {
     const d = displays[i];
@@ -27617,17 +27723,48 @@ function _drawGizmoFrame() {
     const hH = Math.tan(fov.h * Math.PI / 360);
     const hV = Math.tan(fov.v * Math.PI / 360);
     const r = (p) => _rotateDisplayPoint(p, pose.yaw, pose.pitch);
+
+    // Tessellated face — (FACE_TESS+1)² grid points. For flat (no
+    // curved screen) this is just a 2×2 grid = the original 4
+    // corners. For curved screens, the grid points get projected
+    // onto the unit-normalized screen.
+    const N = FACE_TESS + 1;
+    const faceGrid = new Array(N * N);
+    let zSum = 0;
+    for (let row = 0; row < N; row++) {
+      for (let col = 0; col < N; col++) {
+        const u = (col / FACE_TESS) * 2 - 1;
+        const v = (row / FACE_TESS) * 2 - 1;
+        // Beam direction through frustum NDC (u, v).
+        const beam = r([u * hH, v * hV, 1]);
+        let pt;
+        if (useCurvedFrustum) {
+          const hit = _screenProjectionPoint(beam, gizmoSurface, 1);
+          pt = hit || beam;
+        } else {
+          pt = beam;
+        }
+        const proj = project(pt);
+        faceGrid[row * N + col] = proj;
+        zSum += proj.z;
+      }
+    }
+    // Outer perimeter for the face outline + frustum-face fill (in
+    // CW order: top-left → top-right → bottom-right → bottom-left).
+    // This still works for the flat case (4 actual corners) and for
+    // curved (the 4 grid corners — face fill is a polygon of just
+    // the outline, interior is drawn via grid quads when curved).
     const corners = [
-      project(r([-hH,  hV, 1])),
-      project(r([ hH,  hV, 1])),
-      project(r([ hH, -hV, 1])),
-      project(r([-hH, -hV, 1]))
+      faceGrid[0],
+      faceGrid[FACE_TESS],
+      faceGrid[N * N - 1],
+      faceGrid[(N - 1) * N]
     ];
     const apex = project([0, 0, 0]);
-    let zSum = 0;
-    for (const c of corners) zSum += c.z;
     frustums.push({
-      idx: i, corners, apex, meanZ: zSum / 4,
+      idx: i, corners, apex,
+      faceGrid, faceN: N,
+      meanZ: zSum / (N * N),
       // Phase 6.6.4b — flag warp + blend so the frustum stroke can
       // signal calibration state without an extra badge layer.
       hasWarp:    !!d.warpMesh,
@@ -27654,31 +27791,90 @@ function _drawGizmoFrame() {
       stroke = "rgba(240, 130, 130, 0.95)";
       fill   = "rgba(226, 75, 74, 0.16)";
     }
-    // Quad face at depth=1
-    ctx.beginPath();
-    ctx.moveTo(f.corners[0].x, f.corners[0].y);
-    for (let c = 1; c < 4; c++) ctx.lineTo(f.corners[c].x, f.corners[c].y);
-    ctx.closePath();
-    ctx.fillStyle = fill;
-    ctx.fill();
+    // Quad face. 6.6.20+: when curved screen is active, we have a
+    // tessellated grid of points wrapped onto the screen — fill it
+    // by tracing the outer perimeter, then stroke each grid line so
+    // the curvature reads visually. Flat case (faceN=2) collapses
+    // back to the original 4-corner quad.
+    const N = f.faceN;
+    if (N > 2) {
+      // Outer perimeter polygon for the fill — top edge, right edge,
+      // reversed bottom, reversed left.
+      ctx.beginPath();
+      const moveTo = (p, first) => first ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y);
+      let firstPt = true;
+      for (let c = 0; c < N; c++)        { moveTo(f.faceGrid[c],                 firstPt); firstPt = false; }
+      for (let r = 1; r < N; r++)        { moveTo(f.faceGrid[r * N + (N - 1)],   firstPt); firstPt = false; }
+      for (let c = N - 2; c >= 0; c--)   { moveTo(f.faceGrid[(N - 1) * N + c],   firstPt); firstPt = false; }
+      for (let r = N - 2; r > 0; r--)    { moveTo(f.faceGrid[r * N],             firstPt); firstPt = false; }
+      ctx.closePath();
+      ctx.fillStyle = fill;
+      ctx.fill();
+      // Stroke the whole grid: horizontal lines per row + vertical
+      // lines per column. The curvature shows in the bow of each
+      // line on a sphere/swept surface.
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = 1.0;
+      if (f.hasWarp && f.isTestWarp) ctx.setLineDash([3, 2]);
+      for (let r = 0; r < N; r++) {
+        ctx.beginPath();
+        for (let c = 0; c < N; c++) {
+          const p = f.faceGrid[r * N + c];
+          if (c === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+        }
+        ctx.stroke();
+      }
+      for (let c = 0; c < N; c++) {
+        ctx.beginPath();
+        for (let r = 0; r < N; r++) {
+          const p = f.faceGrid[r * N + c];
+          if (r === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+        }
+        ctx.stroke();
+      }
+      ctx.setLineDash([]);
+    } else {
+      // Flat quad fast path (legacy 6.6.4b behavior).
+      ctx.beginPath();
+      ctx.moveTo(f.corners[0].x, f.corners[0].y);
+      for (let c = 1; c < 4; c++) ctx.lineTo(f.corners[c].x, f.corners[c].y);
+      ctx.closePath();
+      ctx.fillStyle = fill;
+      ctx.fill();
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = 1.2;
+      if (f.hasWarp && f.isTestWarp) ctx.setLineDash([3, 2]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    // Apex-to-corner edges — always to the 4 outer corners regardless
+    // of tessellation density, so the frustum reads as "lines from the
+    // projector to each corner of the projected patch."
     ctx.strokeStyle = stroke;
     ctx.lineWidth = 1.2;
     if (f.hasWarp && f.isTestWarp) ctx.setLineDash([3, 2]);
-    ctx.stroke();
-    ctx.setLineDash([]);
-    // Apex-to-corner edges
     ctx.beginPath();
     for (const c of f.corners) {
       ctx.moveTo(f.apex.x, f.apex.y);
       ctx.lineTo(c.x, c.y);
     }
     ctx.stroke();
+    ctx.setLineDash([]);
     // Index label at frustum face center, with W/B suffixes when the
     // frustum is warped/blended. Color alone is not enough — the
     // suffixes survive monochrome capture and color-blind viewing.
-    let lx = 0, ly = 0;
-    for (const c of f.corners) { lx += c.x; ly += c.y; }
-    lx /= 4; ly /= 4;
+    // For curved tessellation, use the actual face center grid point
+    // so the label sits on the curve, not at a polygon centroid that
+    // could be inside the screen.
+    let lx, ly;
+    if (N > 2) {
+      const mid = f.faceGrid[Math.floor(N / 2) * N + Math.floor(N / 2)];
+      lx = mid.x; ly = mid.y;
+    } else {
+      lx = 0; ly = 0;
+      for (const c of f.corners) { lx += c.x; ly += c.y; }
+      lx /= 4; ly /= 4;
+    }
     ctx.fillStyle = stroke;
     ctx.font = "bold 11px JetBrains Mono, monospace";
     let label = String(f.idx);
