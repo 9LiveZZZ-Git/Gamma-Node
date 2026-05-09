@@ -13022,15 +13022,43 @@ fn frag_to_global_angles(uv: vec2f) -> vec2f {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4f {
-  // Phase 6.4 polish — angular cell math. size = cells around 360°
-  // azimuth; vertical gets size/2 cells across 180° pitch so each
-  // cell occupies the same angular extent in both directions.
-  // Cells are EQUIANGULAR → appear roughly square on the curved
-  // screen and form continuous rings/wedges in spherical previews.
+  // Phase 6.6.17 — CUBE-MAPPED cells. Equirect (yaw/pitch) cells
+  // squish toward poles ('rings of pizza slices'); the user's
+  // bottom-looking-at-top reference showed this clearly. Cube
+  // mapping projects the fragment's 3D direction onto the dominant
+  // axis face, then cells are uniform N×N within each face. Result:
+  // cells stay roughly equal-area across the WHOLE sphere with no
+  // polar singularity. Six faces × N×N cells where N = size/4 so
+  // the equator (which passes through 4 faces) carries 'size' cells
+  // total — same total around the equator as before, but uniform
+  // everywhere else.
   let ang = frag_to_global_angles(in.uv);
+  let yr = ang.x * 0.01745329;
+  let pr = ang.y * 0.01745329;
+  let dx = sin(yr) * cos(pr);
+  let dy = sin(pr);
+  let dz = cos(yr) * cos(pr);
+  let absX = abs(dx);
+  let absY = abs(dy);
+  let absZ = abs(dz);
+
+  var faceU: f32 = 0.0;
+  var faceV: f32 = 0.0;
+  if (absX >= absY && absX >= absZ) {
+    faceU = dz / dx;
+    faceV = dy / absX;
+  } else if (absY >= absZ) {
+    faceU = dx / absY;
+    faceV = dz / dy;
+  } else {
+    faceU = dx / dz;
+    faceV = dy / absZ;
+  }
+  // faceU, faceV ∈ [-1, 1]. Map to N cells per face.
   let size = max(u.sizeAndPad.x, 1.0);
-  let cellU = floor(ang.x / 360.0 * size);
-  let cellV = floor((ang.y + 90.0) / 180.0 * (size * 0.5));
+  let N = max(1.0, floor(size * 0.25 + 0.5));
+  let cellU = floor((faceU + 1.0) * 0.5 * N);
+  let cellV = floor((faceV + 1.0) * 0.5 * N);
   let parity = (i32(cellU) + i32(cellV)) & 1;
   return select(u.colorB, u.colorA, parity == 0);
 }`,
@@ -13111,17 +13139,40 @@ fn frag_to_global_angles(uv: vec2f) -> vec2f {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4f {
-  // Phase 6.4 polish — angular Voronoi. Cells are placed in spherical
-  // (yaw, pitch) space so they appear equiangular on the curved
-  // screen. Cell unit = 360° / density along yaw; the same cell-deg
-  // size applies to pitch so adjacent rig displays' cells line up
-  // continuously in 3D regardless of which direction they face.
+  // Phase 6.6.17 — CUBE-MAPPED Voronoi. Same logic as Checkerboard:
+  // project the 3D direction onto its dominant cube face + run
+  // Voronoi in face-local UV. Cells stay uniform across the sphere
+  // instead of bunching up at poles. Different cube faces use a
+  // different seed offset so adjacent face boundaries don't show a
+  // mirror reflection.
   let ang = frag_to_global_angles(in.uv);
-  let cellsize_deg = 360.0 / max(u.params.x, 1.0);
-  let scaled = vec2f(ang.x, ang.y) / cellsize_deg;
+  let yr = ang.x * 0.01745329;
+  let pr = ang.y * 0.01745329;
+  let dx = sin(yr) * cos(pr);
+  let dy = sin(pr);
+  let dz = cos(yr) * cos(pr);
+  let absX = abs(dx);
+  let absY = abs(dy);
+  let absZ = abs(dz);
+  var faceU: f32 = 0.0;
+  var faceV: f32 = 0.0;
+  var faceSeed: f32 = 0.0;
+  if (absX >= absY && absX >= absZ) {
+    faceU = dz / dx; faceV = dy / absX;
+    faceSeed = select(11.7, 23.4, dx < 0.0);
+  } else if (absY >= absZ) {
+    faceU = dx / absY; faceV = dz / dy;
+    faceSeed = select(35.1, 46.8, dy < 0.0);
+  } else {
+    faceU = dx / dz; faceV = dy / absZ;
+    faceSeed = select(58.5, 70.2, dz < 0.0);
+  }
+  // Density = cells per equator (4 faces) → density/4 per face.
+  let N = max(1.0, floor(max(u.params.x, 1.0) * 0.25 + 0.5));
+  let scaled = vec2f((faceU + 1.0) * 0.5 * N, (faceV + 1.0) * 0.5 * N);
   let cell = floor(scaled);
   let frag = scaled - cell;
-  let seed = vec2f(u.params.z, u.params.z * 1.7);
+  let seed = vec2f(u.params.z + faceSeed, u.params.z * 1.7 + faceSeed * 0.6);
   var minDist:  f32 = 9999.0;
   var minDist2: f32 = 9999.0;
   var minCell:  vec2f = vec2f(0.0);
