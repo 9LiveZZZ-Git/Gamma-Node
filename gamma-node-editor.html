@@ -15720,6 +15720,144 @@ function _computeOverlapBands(i, displays) {
  * intensity ramps; geometric warp comes from MPCDI / hand-edited
  * meshes (6.6.2 / 6.6.9). _isAutoBlend tags the mesh so the rig
  * pane's pill cycle can recognize it. */
+/* Phase 6.6.16 (Raskar #4) — project a 3D world point P back to a
+ * specific display's framebuffer UV via gnomonic projection. Returns
+ * { u, v, inFrame } where (u, v) ∈ [0, 1]² covers the display's full
+ * framebuffer; inFrame is false when P is behind the projector or
+ * outside its fov.
+ *
+ * Projector at rig origin facing pose direction. P transforms into
+ * the display's local right/up/forward frame; localZ < 0 means
+ * behind the projector (skip); the perspective divide gives NDC
+ * within ±tan(fov/2). */
+function _projectorFramebufferUV(P, display) {
+  const pose = display.pose || { yaw: 0, pitch: 0 };
+  const fov  = display.fov  || { h: 90, v: 60 };
+  const yr = pose.yaw   * _DEG2RAD;
+  const pr = pose.pitch * _DEG2RAD;
+  const fx = Math.sin(yr) * Math.cos(pr);
+  const fy = Math.sin(pr);
+  const fz = Math.cos(yr) * Math.cos(pr);
+  let altUpX = 0, altUpY = 1, altUpZ = 0;
+  if (Math.abs(fy) > 0.95) { altUpX = 0; altUpY = 0; altUpZ = 1; }
+  let rx = altUpY * fz - altUpZ * fy;
+  let ry = altUpZ * fx - altUpX * fz;
+  let rz = altUpX * fy - altUpY * fx;
+  const rl = Math.hypot(rx, ry, rz) || 1;
+  rx /= rl; ry /= rl; rz /= rl;
+  const ux = fy * rz - fz * ry;
+  const uy = fz * rx - fx * rz;
+  const uz = fx * ry - fy * rx;
+
+  const localX = P[0] * rx + P[1] * ry + P[2] * rz;
+  const localY = P[0] * ux + P[1] * uy + P[2] * uz;
+  const localZ = P[0] * fx + P[1] * fy + P[2] * fz;
+  if (localZ < 0.001) return { u: 0, v: 0, inFrame: false };
+
+  const tanH = Math.tan(fov.h * 0.5 * _DEG2RAD);
+  const tanV = Math.tan(fov.v * 0.5 * _DEG2RAD);
+  const ndcX = localX / (localZ * tanH);
+  const ndcY = localY / (localZ * tanV);
+  const u = (ndcX + 1) * 0.5;
+  const v = (ndcY + 1) * 0.5;
+  return {
+    u, v,
+    inFrame: u >= 0 && u <= 1 && v >= 0 && v <= 1
+  };
+}
+
+/* Phase 6.6.16 (Raskar §4.4) — screen-space alpha-blend mesh.
+ * For each mesh vertex:
+ *   1. Cast ray from origin through this display's framebuffer NDC.
+ *   2. Hit the screen surface (sphere / cylinder) → 3D point P.
+ *   3. For each display j (incl. self), project P back to j's
+ *      framebuffer; compute d_j = min(u, v, 1-u, 1-v) — distance
+ *      from the projector frame's edge — when P falls in j's frame.
+ *   4. This vertex's intensity α = d_self / Σ_j d_j.
+ *
+ * Properties:
+ *   • α sums to 1.0 across overlapping projectors at every screen
+ *     point (Raskar §4.4 fundamental).
+ *   • α → 0 at frame boundaries (smooth fade-out).
+ *   • α = 1 in regions where only one projector covers (no overlap).
+ *
+ * vs. the angular-band approximation (_makeAutoBlendMesh): correct
+ * for curved screens where neighbors don't share simple yaw/pitch
+ * extents. Identical in the simple flat-tangent-plane case. */
+function _makeScreenSpaceBlendMesh(cols, rows, display, displays, displayIdx, surface) {
+  const m = _makeIdentityWarpMesh(cols, rows);
+  if (!surface || surface.type === "free") return m;
+
+  const W = cols + 1, H = rows + 1;
+  const pose = display.pose || { yaw: 0, pitch: 0 };
+  const fov  = display.fov  || { h: 90, v: 60 };
+
+  const yr = pose.yaw   * _DEG2RAD;
+  const pr = pose.pitch * _DEG2RAD;
+  const fx = Math.sin(yr) * Math.cos(pr);
+  const fy = Math.sin(pr);
+  const fz = Math.cos(yr) * Math.cos(pr);
+  let altUpX = 0, altUpY = 1, altUpZ = 0;
+  if (Math.abs(fy) > 0.95) { altUpX = 0; altUpY = 0; altUpZ = 1; }
+  let rx = altUpY * fz - altUpZ * fy;
+  let ry = altUpZ * fx - altUpX * fz;
+  let rz = altUpX * fy - altUpY * fx;
+  const rl = Math.hypot(rx, ry, rz) || 1;
+  rx /= rl; ry /= rl; rz /= rl;
+  const ux = fy * rz - fz * ry;
+  const uy = fz * rx - fx * rz;
+  const uz = fx * ry - fy * rx;
+  const tanH = Math.tan(fov.h * 0.5 * _DEG2RAD);
+  const tanV = Math.tan(fov.v * 0.5 * _DEG2RAD);
+
+  for (let r = 0; r < H; r++) {
+    for (let c = 0; c < W; c++) {
+      const ndcX = (c / cols) * 2 - 1;
+      const ndcY = (r / rows) * 2 - 1;
+      const lx = ndcX * tanH, ly = ndcY * tanV, lz = 1;
+      const wx = rx*lx + ux*ly + fx*lz;
+      const wy = ry*lx + uy*ly + fy*lz;
+      const wz = rz*lx + uz*ly + fz*lz;
+
+      let t = -1;
+      if (surface.type === "sphere") {
+        t = _raySphereDistance([0,0,0], [wx,wy,wz], surface.center || [0,0,0], surface.radius || 5);
+      } else if (surface.type === "cylinder") {
+        t = _rayCylinderDistanceY([0,0,0], [wx,wy,wz], surface.center || [0,0,0],
+                                   surface.radius || 5, surface.length || 5);
+      } else {
+        // Plane / free: treat as if only this projector covers
+        // → identity intensity. Skip.
+        continue;
+      }
+      if (t <= 0) continue;
+      const Px = wx * t, Py = wy * t, Pz = wz * t;
+
+      // Self-distance: derived from the vertex's own framebuffer UV
+      // (the ray from origin we just cast came FROM this UV, so the
+      // re-projection of P back to self is bit-exact this UV).
+      const selfU = c / cols, selfV = r / rows;
+      const dSelf = Math.max(0, Math.min(selfU, selfV, 1 - selfU, 1 - selfV));
+
+      let dSum = dSelf;
+      for (let j = 0; j < displays.length; j++) {
+        if (j === displayIdx) continue;
+        const dj = displays[j];
+        if (!dj) continue;
+        const proj = _projectorFramebufferUV([Px, Py, Pz], dj);
+        if (!proj.inFrame) continue;
+        const d = Math.max(0, Math.min(proj.u, proj.v, 1 - proj.u, 1 - proj.v));
+        dSum += d;
+      }
+      const alpha = dSum > 0.0001 ? (dSelf / dSum) : 1.0;
+      m.verts[(r * W + c) * 5 + 4] = alpha;
+    }
+  }
+  m._isAutoBlend = true;
+  m._isScreenSpace = true;
+  return m;
+}
+
 function _makeAutoBlendMesh(cols, rows, display, displays, displayIdx) {
   const m = _makeIdentityWarpMesh(cols, rows);
   const fov = display.fov || { h: 90, v: 60 };
@@ -16001,23 +16139,39 @@ function _applyAutoBlendToRig(opts) {
   const skipHistory  = !!(opts && opts.skipHistory);
   const keepTemplate = !!(opts && opts.keepTemplate);
   if (!skipHistory) pushHistory("rig-auto-blend");
+  // Phase 6.6.16 (Raskar #4) — choose between angular auto-blend
+  // (the original, fast, works without surface info) and screen-
+  // space alpha-blend (the Raskar-paper-correct version that uses
+  // the actual screen surface). Screen-space wins when:
+  //   • The rig has a parametric surface (sphere or cylinder)
+  //   • surfaceVisible is ON (user hasn't told us this is monitors)
+  // Otherwise fall back to angular bands.
+  const surface = state.rig.surface;
+  const useScreenSpace = !!(surface && state.rig.surfaceVisible &&
+                            (surface.type === "sphere" || surface.type === "cylinder"));
+
   state.rig.displays.forEach((d, i) => {
     if (!d) return;
     // Phase 6.6.9 — custom (user-edited) meshes are sacred; auto-
     // blend leaves them alone. Otherwise a re-run after editing
     // would silently undo the user's hand-tuning.
     if (d.warpMesh && d.warpMesh._isCustom) {
-      out.push({ displayIdx: i, bands: { left: 0, right: 0, top: 0, bottom: 0 }, applied: false, skipped: "custom" });
+      out.push({ displayIdx: i, applied: false, skipped: "custom" });
+      return;
+    }
+    if (useScreenSpace) {
+      const mesh = _makeScreenSpaceBlendMesh(8, 8, d, state.rig.displays, i, surface);
+      d.warpMesh = mesh;
+      if (Visual && Visual._warpCache) Visual._warpCache.delete(d.id);
+      out.push({ displayIdx: i, applied: true, mode: "screen-space" });
       return;
     }
     const bands = _computeOverlapBands(i, state.rig.displays);
     const overlapping = bands.left + bands.right + bands.top + bands.bottom;
     if (overlapping > 0.001) {
       d.warpMesh = _makeAutoBlendMesh(8, 8, d, state.rig.displays, i);
-      // Drop cached GPU buffers so the next frame rebuilds with the
-      // new mesh — same idiom as the manual warp toggle.
       if (Visual && Visual._warpCache) Visual._warpCache.delete(d.id);
-      out.push({ displayIdx: i, bands, applied: true });
+      out.push({ displayIdx: i, bands, applied: true, mode: "angular" });
     } else {
       // No overlap → no blend ramp needed. Leave any existing mesh
       // alone (user might have a hand-edited geometric warp on this
@@ -17948,7 +18102,7 @@ function renderRigPane() {
             <button class="rig-auto-blend-btn" id="btn-rig-warp-reset"
                     title="Clear all displays' warp meshes in one click — useful for recovering from an accidental Auto-warp on angular shaders. Custom (hand-edited) meshes are preserved.">Reset warps</button>
             <button class="rig-auto-blend-btn" id="btn-rig-auto-blend"
-                    title="Detect overlapping pose footprints across all displays and auto-generate intensity ramps so adjacent projectors blend seamlessly. Displays in isolation are left as-is.">Auto-blend rig</button>
+                    title="Auto-generate intensity ramps so adjacent projectors blend seamlessly. Two algorithms used depending on rig: angular bands (when surface is plane / free / off — fast, works for flat tile rigs) and Raskar §4.4 screen-space alpha-blend (when surface is sphere / cylinder + visible ON — α sums to 1.0 across overlapping projectors at every screen point, correct for curved screens).">Auto-blend rig</button>
           </span>
         </div>
         ${displayRows}
