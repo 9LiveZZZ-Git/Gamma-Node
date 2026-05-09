@@ -12972,6 +12972,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     kind: "shader-frag",
     ins:  [
       { n: "size", t: "param" },
+      { n: "mode", t: "param" },
       { n: "rA",   t: "param" },
       { n: "gA",   t: "param" },
       { n: "bA",   t: "param" },
@@ -12982,6 +12983,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     outs: [{ n: "out", t: "texture" }],
     params: {
       size: 24,
+      mode: 0,                                // 0 = HEALPix (default), 1 = Lambert, 2 = cube
       rA: 0.92, gA: 0.92, bA: 0.92,
       rB: 0.08, gB: 0.08, bB: 0.08
     },
@@ -13037,7 +13039,71 @@ fn frag_to_global_angles(uv: vec2f) -> vec2f {
   );
 }
 
-// Phase 6.6.20.3 — surface-aware equal-area normalization.
+// Phase 6.6.20.4 — HEALPix RING pixelization.
+// "Hierarchical Equal Area isoLatitude Pixelization" (Górski et al.
+// 2005, doi:10.1086/427976). The de-facto standard in cosmology +
+// astronomy for equal-solid-angle sphere tessellation. Each pixel
+// has identical area = 4π/(12·nside²); cells follow iso-latitude
+// rings → no axis-aligned seams (unlike cube map), no polar
+// bunching (unlike equirect), no cube edges (unlike Path B Lambert).
+//
+// Reference: https://healpix.sourceforge.io/
+//            https://en.wikipedia.org/wiki/HEALPix
+//            Górski, K. M. et al., "HEALPix: A Framework for
+//              High-Resolution Discretization and Fast Analysis
+//              of Data Distributed on the Sphere," ApJ 622:759 (2005).
+//
+// Returns vec2<i32>(ring_global, pix_in_ring) where:
+//   ring_global ∈ [1, 4·nside-1]  (ring number from north pole)
+//   pix_in_ring ∈ [0, ring_pixel_count)
+//
+// (ring + pix_in_ring) parity gives a clean 2-color checker that
+// alternates both within a ring AND across rings. HEALPix cells are
+// diamond-shaped at the equator transitioning to triangular at the
+// poles; with this parity rule the checker reads visually clean.
+fn healpix_ang2cell(theta: f32, phi: f32, nside: i32) -> vec2<i32> {
+  let z  = cos(theta);
+  let za = abs(z);
+  // tt = phi / (π/2), wrapped to [0, 4).
+  let TWO_PI = 6.28318530718;
+  let phi_n = phi - TWO_PI * floor(phi / TWO_PI);
+  let tt = phi_n * 0.6366197723675814;   // 2/π
+  if (za <= 0.6666666666666667) {
+    // Equatorial belt — 2·nside+1 rings, each with 4·nside pixels.
+    let nside_f = f32(nside);
+    let temp1 = nside_f * (0.5 + tt);
+    let temp2 = nside_f * z * 0.75;
+    let jp = i32(floor(temp1 - temp2));
+    let jm = i32(floor(temp1 + temp2));
+    let ir = nside + 1 + jp - jm;          // ring offset within belt, 1..2·nside+1
+    let kshift = 1 - (ir & 1);
+    // Floor division by 2 — WGSL int / rounds toward zero, so go via
+    // float floor to get math floor for negative numerators.
+    let num = jp + jm - nside + kshift + 1;
+    var ip = i32(floor(f32(num) * 0.5));
+    let ppr = 4 * nside;
+    ip = ((ip % ppr) + ppr) % ppr;
+    let ring_global = nside + ir - 1;      // global ring index from north pole
+    return vec2<i32>(ring_global, ip);
+  }
+  // Polar caps — pixel count grows from 4 at pole-adjacent ring to
+  // 4·(nside-1) at the last cap ring.
+  let tp = tt - floor(tt);
+  let tmp = f32(nside) * sqrt(3.0 * (1.0 - za));
+  let jp = i32(floor(tp * tmp));
+  let jm = i32(floor((1.0 - tp) * tmp));
+  let ir = jp + jm + 1;                    // ring from pole, 1..nside-1
+  var ip = i32(floor(tt * f32(ir)));
+  let four_ir = 4 * ir;
+  if (ip >= four_ir) { ip = ip - four_ir; }
+  if (ip < 0)        { ip = ip + four_ir; }
+  if (z > 0.0) {
+    return vec2<i32>(ir, ip);              // north cap: ring counts from north pole
+  }
+  return vec2<i32>(4 * nside - ir, ip);    // south cap: convert to global ring
+}
+
+// Phase 6.6.20.3 — surface-aware equal-area normalization (Lambert).
 // Maps a (yaw, pitch) global direction to (u, v) ∈ [0, 1]² using the
 // natural surface parameterization:
 //   sphere / swept-arc / no-surface → (yaw_norm, sin(pitch)_norm)
@@ -13045,8 +13111,6 @@ fn frag_to_global_angles(uv: vec2f) -> vec2f {
 //                                      cells uniform in solid angle.
 //   cylinder / swept-vertical       → (yaw_norm, y_clamped_norm)
 //                                      cells uniform in arc-length × Y.
-// Yaw is wrapped into the path range. Out-of-range pitches clamp to
-// the surface bounds (no visible miss; cells just stop at the edge).
 fn surface_uv_norm(yaw_deg: f32, pitch_deg: f32) -> vec2f {
   let stype = u32(u.u_surface.x + 0.5);
   let yawStart = u.u_surface_path.x;
@@ -13090,36 +13154,68 @@ fn surface_uv_norm(yaw_deg: f32, pitch_deg: f32) -> vec2f {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4f {
-  // Phase 6.6.20.3 — SURFACE-AWARE EQUAL-AREA Checkerboard.
+  // Phase 6.6.20.4 — HEALPix is the default cell tessellation.
+  // sizeAndPad.y = mode: 0 = HEALPix (uniform-equal-area, this commit),
+  //                       1 = Lambert equal-area cylindrical (Path B
+  //                           from 6.6.20.3),
+  //                       2 = legacy cube-mapped (6.6.17 fallback).
   //
-  // Cells uniform on the physical screen (sphere/cylinder/swept):
-  //   sphere / swept-arc → cells of equal solid angle
-  //   cylinder / swept-vertical → cells of equal area
-  //
-  // Math: Lambert cylindrical equal-area parameterization places
-  // cells uniform in (yaw, sin(pitch)). The sin-of-pitch substitution
-  // compresses cells in pitch-degrees toward the poles but keeps
-  // them equal in solid angle on the sphere — which is the Bourke-
-  // reference aesthetic the user has been asking for.
-  //
-  // No polar bunching, no cube-face seams, no row-step artifacts.
-  // Yaw seam at yawStart/yawEnd boundary is unavoidable for partial
-  // sweeps; full revolutions wrap continuously.
-  let ang = frag_to_global_angles(in.uv);
-  let uv  = surface_uv_norm(ang.x, ang.y);
-  let size = max(u.sizeAndPad.x, 1.0);
-  // V cells = half of yaw cells by default — sphere has half the
-  // pitch range as yaw (180° vs 360°), so cells stay roughly square
-  // in solid-angle dimensions at the equator.
-  let v_size = max(2.0, floor(size * 0.5 + 0.5));
-  let cellU = floor(uv.x * size);
-  let cellV = floor(uv.y * v_size);
+  // HEALPix gives genuinely uniform cells on the sphere with NO
+  // axis-aligned seams — a single connected pixelization with
+  // diamond-shaped cells at the equator transitioning smoothly to
+  // triangular cells at the poles. Cells are equal solid angle =
+  // 4π/(12·nside²). Default mode for surface-aware Checkerboard.
+  let mode = i32(u.sizeAndPad.y + 0.5);
+  let ang  = frag_to_global_angles(in.uv);
+  let size = max(u.sizeAndPad.x, 4.0);
+  if (mode == 0) {
+    // HEALPix RING pixelization. nside = size/4 → 4·nside pixels
+    // around the equator (matches the user's 'size' mental model
+    // of "cells around the equator").
+    let nside = max(1, i32(floor(size * 0.25 + 0.5)));
+    let theta = (90.0 - ang.y) * 0.01745329;   // colatitude (north pole = 0)
+    let phi   = ang.x * 0.01745329 + 3.14159265;
+    let cell  = healpix_ang2cell(theta, phi, nside);
+    let parity = (cell.x + cell.y) & 1;        // (ring + pix_in_ring) parity
+    return select(u.colorB, u.colorA, parity == 0);
+  }
+  if (mode == 1) {
+    // Lambert equal-area (Path B from 6.6.20.3).
+    let uv = surface_uv_norm(ang.x, ang.y);
+    let v_size = max(2.0, floor(size * 0.5 + 0.5));
+    let cellU = floor(uv.x * size);
+    let cellV = floor(uv.y * v_size);
+    let parity = (i32(cellU) + i32(cellV)) & 1;
+    return select(u.colorB, u.colorA, parity == 0);
+  }
+  // mode == 2: legacy cube-mapped (6.6.17 fallback).
+  let yr = ang.x * 0.01745329;
+  let pr = ang.y * 0.01745329;
+  let dx = sin(yr) * cos(pr);
+  let dy = sin(pr);
+  let dz = cos(yr) * cos(pr);
+  let absX = abs(dx);
+  let absY = abs(dy);
+  let absZ = abs(dz);
+  var faceU: f32 = 0.0;
+  var faceV: f32 = 0.0;
+  if (absX >= absY && absX >= absZ) {
+    faceU = dz / dx; faceV = dy / absX;
+  } else if (absY >= absZ) {
+    faceU = dx / absY; faceV = dz / dy;
+  } else {
+    faceU = dx / dz; faceV = dy / absZ;
+  }
+  let N = max(1.0, floor(size * 0.25 + 0.5));
+  let cellU = floor((faceU + 1.0) * 0.5 * N);
+  let cellV = floor((faceV + 1.0) * 0.5 * N);
   let parity = (i32(cellU) + i32(cellV)) & 1;
   return select(u.colorB, u.colorA, parity == 0);
 }`,
     writeUniforms(node, scratch) {
       const p = node.params || {};
       // colorA at 16-19, colorB at 20-23, sizeAndPad at 24-27.
+      // sizeAndPad: x = size, y = mode (0/1/2), z/w = reserved.
       // 6.6.20.3 — u_surface at 28-31, u_surface_path at 32-35.
       scratch[16] = (typeof p.rA === "number") ? p.rA : 0.92;
       scratch[17] = (typeof p.gA === "number") ? p.gA : 0.92;
@@ -13129,11 +13225,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       scratch[21] = (typeof p.gB === "number") ? p.gB : 0.08;
       scratch[22] = (typeof p.bB === "number") ? p.bB : 0.08;
       scratch[23] = 1.0;
-      scratch[24] = (typeof p.size === "number") ? p.size : 8;
-      scratch[25] = 0; scratch[26] = 0; scratch[27] = 0;
+      scratch[24] = (typeof p.size === "number") ? p.size : 24;
+      scratch[25] = (typeof p.mode === "number") ? p.mode : 0;
+      scratch[26] = 0; scratch[27] = 0;
       _packSurfaceUniforms(scratch, 28);
     },
-    description: "Checkerboard — two-color cells, surface-aware equal-area on the rig's screen (sphere/cylinder/swept). Cells uniform in solid angle on a sphere (Bourke-reference aesthetic, no polar bunching). size: cells around the equator. Default contrast pair light-grey / dark-grey."
+    description: "Checkerboard — uniform cells on the rig's screen surface. mode: 0 = HEALPix sphere pixelization (Górski et al. 2005, default — equal solid angle, no axis seams); 1 = Lambert cylindrical equal-area (6.6.20.3); 2 = cube-mapped (6.6.17 legacy). size: cells around the equator (HEALPix: 4·nside; Lambert: direct). See docs/HEALPIX.md for details."
   },
 
   /* Phase 6.4 — Voronoi. Cellular noise with edge highlighting and
