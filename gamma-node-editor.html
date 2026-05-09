@@ -6625,7 +6625,7 @@
  * Pages deploy workflow (.github/workflows/pages.yml). The string
  * after the equals sign is what the workflow's sed targets — don't
  * change the format of this line. */
-const APP_VERSION = "0.1.76";
+const APP_VERSION = "0.1.77";
 
 /* =========================================================================
  * Node type registry — covers ~55 Gamma DSP classes
@@ -14986,11 +14986,24 @@ function _sweptSurfacePreset(name, scale) {
   const s = Number.isFinite(scale) && scale > 0 ? scale : 5;
   switch (name) {
     case "alloSphere":
-      // 30ft radius, 26ft height, 160° horizontal — Sajadi-Majumder
-      // §6 truncated dome figures. We default to symmetric ±80°
-      // yaw (160° total) and truncate the bottom pole at -30° (the
-      // floor) and keep the top all the way up to +90°. User can
-      // adjust afterward.
+      // UCSB AlloSphere — full 360° yaw, ±~85° pitch (the 4-projector-
+      // ring layout in the allosphere-real rig template covers
+      // pitches of ±60° centered, with ~50° vertical FOV per
+      // projector → effective coverage ±85°, with a small floor cut
+      // and zenith pole left uncovered). yaw is full revolution
+      // because the real rig wraps around. Aligns with the
+      // allosphere-real rig template so coverage-aware capture
+      // filters keep front/back/left/right cardinals.
+      return {
+        type: "swept",
+        profile: { kind: "arc", radius: s, pitchStart: -85, pitchEnd: 85 },
+        path:    { kind: "revolution", yawStart: -180, yawEnd: 180 }
+      };
+    case "truncatedDome160":
+      // Sajadi-Majumder TVCG 2012 §6 truncated dome — 30ft radius,
+      // 26ft height, 160° horizontal. Different physical installation
+      // than UCSB AlloSphere; this is the paper's calibration test
+      // case. Symmetric ±80° yaw, pitch -30° (floor) to +90° (zenith).
       return {
         type: "swept",
         profile: { kind: "arc", radius: s, pitchStart: -30, pitchEnd: 90 },
@@ -15593,6 +15606,54 @@ function _waitForFrames(n) {
   });
 }
 
+/* 6.6.20.9 — coverage check. Returns true if a viewing direction
+ * (yawDeg, pitchDeg) from the rig origin would actually hit the
+ * screen surface. Used to prune capture directions for partial
+ * surfaces (e.g. AlloSphere yaw [-80, 80] doesn't cover yaw=180°
+ * "back" — capturing back yields useless garbage from off-axis
+ * projectors). */
+function _directionInCoverage(yawDeg, pitchDeg, surface) {
+  if (!surface || surface.type === "free")  return true;
+  if (surface.type === "plane")             return true;
+  if (surface.type === "sphere")            return true;
+  if (surface.type === "cylinder") {
+    const halfL = (surface.length || 5) * 0.5;
+    const R = surface.radius || 5;
+    const maxPitchDeg = Math.atan(halfL / R) * 180 / Math.PI;
+    return Math.abs(pitchDeg) <= maxPitchDeg + 5;
+  }
+  if (surface.type === "swept") {
+    const path = surface.path || { yawStart: -180, yawEnd: 180 };
+    const profile = surface.profile || { kind: "arc", pitchStart: -90, pitchEnd: 90 };
+    const yawStart = path.yawStart != null ? path.yawStart : -180;
+    const yawEnd   = path.yawEnd   != null ? path.yawEnd   :  180;
+    // Wrap yaw into the path range
+    let yaw = yawDeg;
+    while (yaw > yawEnd + 180) yaw -= 360;
+    while (yaw < yawStart - 180) yaw += 360;
+    if (yaw < yawStart - 1 || yaw > yawEnd + 1) return false;
+    if (profile.kind === "arc") {
+      const pStart = profile.pitchStart != null ? profile.pitchStart : -90;
+      const pEnd   = profile.pitchEnd   != null ? profile.pitchEnd   :  90;
+      return pitchDeg >= pStart - 1 && pitchDeg <= pEnd + 1;
+    }
+    if (profile.kind === "vertical") {
+      const R = profile.radius || 5;
+      const yMin = profile.yMin != null ? profile.yMin : -2.5;
+      const yMax = profile.yMax != null ? profile.yMax :  2.5;
+      // y on the cylinder at this pitch from origin
+      const cosP = Math.cos(pitchDeg * Math.PI / 180);
+      if (Math.abs(cosP) < 1e-6) {
+        // Looking straight up/down — nominally outside vertical-profile range
+        return false;
+      }
+      const y = R * Math.tan(pitchDeg * Math.PI / 180);
+      return y >= yMin - 0.1 && y <= yMax + 0.1;
+    }
+  }
+  return true;
+}
+
 async function autoCaptureCalibration(opts) {
   if (!Visual || !Visual.canvas) {
     throw new Error("Visual canvas not initialized");
@@ -15603,23 +15664,31 @@ async function autoCaptureCalibration(opts) {
   if (!state.rig || !Array.isArray(state.rig.displays)) {
     throw new Error("Rig not configured");
   }
-  const onProgress = (opts && opts.onProgress) || null;
+  const onProgress    = (opts && opts.onProgress) || null;
+  // 6.6.20.9 defaults — all three improvements ON unless explicitly
+  // disabled via opts. User can override per-call from a future UI.
+  const autoPrep      = !(opts && opts.autoPrep      === false);  // apply Auto-warp + hard-cut blend before capture
+  const coverageAware = !(opts && opts.coverageAware === false);  // skip directions outside surface coverage
+  const perDisplay    = !(opts && opts.perDisplay    === false);  // also capture aimed at each display's pose
 
-  // Snapshot every piece of state we mutate so finally{} can put
-  // everything back exactly. The user shouldn't lose their pose /
-  // shader settings just because they ran a capture.
+  // Snapshot state so finally{} can put everything back exactly.
   const prevPreviewMode = state.rig.previewMode;
   const prevCam = {
     pos:   Visual.theaterCam.pos.slice(),
     yaw:   Visual.theaterCam.yaw,
     pitch: Visual.theaterCam.pitch
   };
-
-  // Find every Checkerboard node so we can cycle their .mode through
-  // 0..4 (HEALPix / Lambert / Cube / Octahedral / Cosine-corrected
-  // lat/long) for side-by-side comparison.
   const checkerNodes = (state.nodes || []).filter(n => n.type === "Checkerboard");
   const prevCheckerModes = checkerNodes.map(n => (n.params && n.params.mode));
+  // If autoPrep mutates warp meshes, save them too so capture is
+  // side-effect-free. (User runs Auto-warp / Auto-blend manually if
+  // they want to keep the prep result.)
+  let prevWarpMeshes = null;
+  if (autoPrep) {
+    prevWarpMeshes = state.rig.displays.map(d =>
+      (d && d.warpMesh) ? _cloneWarpMesh(d.warpMesh) : null
+    );
+  }
 
   const restoreState = () => {
     state.rig.previewMode = prevPreviewMode;
@@ -15633,12 +15702,39 @@ async function autoCaptureCalibration(opts) {
         n.params.mode = prevCheckerModes[i];
       }
     });
+    if (prevWarpMeshes) {
+      state.rig.displays.forEach((d, i) => {
+        if (!d) return;
+        d.warpMesh = prevWarpMeshes[i];
+        if (Visual && Visual._warpCache) Visual._warpCache.delete(d.id);
+      });
+    }
     if (typeof _updateProjectionPill === "function") _updateProjectionPill();
     render();
   };
 
+  // Track which prep operations actually ran (for the meta JSON).
+  const prepApplied = { autoWarp: false, autoBlend: false };
+
   try {
-    // Switch to theater + position camera at sweet spot.
+    // PHASE 1 — Auto-prep. Apply Auto-warp + hard-cut Auto-blend so
+    // the captures show clean, non-overlapping projector coverage.
+    // Warp meshes are restored in finally{} so this doesn't have
+    // permanent side effects.
+    if (autoPrep) {
+      try {
+        const warpResults = _applyAutoWarpToRig({ skipHistory: true, silent: true });
+        prepApplied.autoWarp = !!(warpResults && warpResults.length > 0);
+      } catch (_) { /* surface might be plane/free — Auto-warp aborts; skip */ }
+      try {
+        const blendResults = _applyAutoBlendToRig({ skipHistory: true, hardCuts: true });
+        prepApplied.autoBlend = !!(blendResults && blendResults.length > 0);
+      } catch (_) { /* skip */ }
+      // Let the GPU pipeline pick up the new warp meshes.
+      await _waitForFrames(3);
+    }
+
+    // PHASE 2 — switch to theater + sweet-spot.
     state.rig.previewMode = "theater";
     if (typeof _updateProjectionPill === "function") _updateProjectionPill();
     const ss = Array.isArray(state.rig.sweetSpot) ? state.rig.sweetSpot : [0, 0, 0];
@@ -15646,23 +15742,53 @@ async function autoCaptureCalibration(opts) {
     Visual.theaterCam.pos[1] = ss[1];
     Visual.theaterCam.pos[2] = ss[2];
 
-    // Six cardinal directions in radians. Up/down stop just shy of
-    // the zenith / nadir to avoid the gimbal-lock numerical
-    // degeneracy that the theater view's matrix has at exactly
-    // ±π/2 pitch.
-    const directions = [
-      { name: "front", yaw: 0,             pitch:  0 },
-      { name: "right", yaw:  Math.PI / 2,  pitch:  0 },
-      { name: "back",  yaw:  Math.PI,      pitch:  0 },
-      { name: "left",  yaw: -Math.PI / 2,  pitch:  0 },
-      { name: "up",    yaw: 0,             pitch:  Math.PI / 2 - 0.01 },
-      { name: "down",  yaw: 0,             pitch: -Math.PI / 2 + 0.01 }
+    // PHASE 3 — build the direction list.
+    //
+    // Cardinal directions: 6 axis-aligned views from the sweet-spot.
+    // Up/down stop just shy of the zenith / nadir (89.4°) to avoid
+    // the theater view matrix's gimbal-lock numerical degeneracy.
+    let directions = [
+      { name: "front", yawDeg: 0,    pitchDeg:  0,    kind: "cardinal" },
+      { name: "right", yawDeg: 90,   pitchDeg:  0,    kind: "cardinal" },
+      { name: "back",  yawDeg: 180,  pitchDeg:  0,    kind: "cardinal" },
+      { name: "left",  yawDeg: -90,  pitchDeg:  0,    kind: "cardinal" },
+      { name: "up",    yawDeg: 0,    pitchDeg:  89.4, kind: "cardinal" },
+      { name: "down",  yawDeg: 0,    pitchDeg: -89.4, kind: "cardinal" }
     ];
 
-    // Build the capture-config list. If a Checkerboard node is wired
-    // into the rendered output, cycle its mode 0..4. If only
-    // WireframeCalibration / other shaders are wired, capture the
-    // current state once per direction. Either way, 6×N captures.
+    // Coverage-aware filter — for partial surfaces (AlloSphere yaw
+    // [-80,80] etc.) drop the cardinals that aim at empty space.
+    if (coverageAware) {
+      directions = directions.filter(d =>
+        _directionInCoverage(d.yawDeg, d.pitchDeg, state.rig.surface)
+      );
+    }
+
+    // Per-display centers — one capture per projector aimed at its
+    // pose direction. Most diagnostic for finding which projector
+    // is misaligned (the wireframe pattern in that capture should
+    // be centered + the surrounding projectors' edges should
+    // connect smoothly to the central one's edges).
+    if (perDisplay && Array.isArray(state.rig.displays)) {
+      const seenNames = new Set(directions.map(d => d.name));
+      state.rig.displays.forEach((display, idx) => {
+        if (!display) return;
+        const pose = display.pose || { yaw: 0, pitch: 0 };
+        const yawDeg   = pose.yaw   || 0;
+        // Clamp pitch so we don't gimbal-lock at ±90.
+        const pitchDeg = Math.max(-89.4, Math.min(89.4, pose.pitch || 0));
+        if (coverageAware && !_directionInCoverage(yawDeg, pitchDeg, state.rig.surface)) return;
+        const safeId   = String(display.id   || ("d" + idx)).replace(/[^a-zA-Z0-9_-]/g, "");
+        const safeName = String(display.name || "").replace(/[^a-zA-Z0-9_-]/g, "");
+        const idxStr   = String(idx).padStart(2, "0");
+        const name = "display-" + idxStr + (safeId ? "-" + safeId : "") + (safeName ? "-" + safeName : "");
+        if (seenNames.has(name)) return;
+        seenNames.add(name);
+        directions.push({ name, yawDeg, pitchDeg, kind: "per-display", displayIdx: idx });
+      });
+    }
+
+    // PHASE 4 — build configs (Checkerboard mode cycle if wired).
     const configs = [];
     if (checkerNodes.length > 0) {
       const modeLabels = ["healpix", "lambert", "cube", "octahedral", "lat-long"];
@@ -15682,14 +15808,12 @@ async function autoCaptureCalibration(opts) {
     let captured = 0;
     const captures = [];
 
+    // PHASE 5 — capture loop.
     for (const cfg of configs) {
       cfg.apply();
       for (const dir of directions) {
-        Visual.theaterCam.yaw   = dir.yaw;
-        Visual.theaterCam.pitch = dir.pitch;
-        // Trigger a render and let the GPU pipeline settle.
-        // 3 frames is overkill but capture is one-shot — speed
-        // doesn't matter, robustness does.
+        Visual.theaterCam.yaw   = dir.yawDeg   * Math.PI / 180;
+        Visual.theaterCam.pitch = dir.pitchDeg * Math.PI / 180;
         render();
         await _waitForFrames(3);
         const blob = await new Promise((resolve, reject) => {
@@ -15718,6 +15842,12 @@ async function autoCaptureCalibration(opts) {
       app: "Gamma Node",
       version: APP_VERSION,
       timestamp: new Date().toISOString(),
+      captureOptions: {
+        autoPrep,
+        coverageAware,
+        perDisplay,
+        prepApplied
+      },
       rig: {
         templateKey: state.rig.templateKey,
         surface:     state.rig.surface,
@@ -15729,9 +15859,11 @@ async function autoCaptureCalibration(opts) {
         shaderCenterPitch: state.rig.shaderCenterPitch || 0
       },
       directions: directions.map(d => ({
-        name: d.name,
-        yawDeg:   d.yaw   * 180 / Math.PI,
-        pitchDeg: d.pitch * 180 / Math.PI
+        name:     d.name,
+        kind:     d.kind || "cardinal",
+        yawDeg:   d.yawDeg,
+        pitchDeg: d.pitchDeg,
+        displayIdx: d.displayIdx
       })),
       captureConfigs: configs.map(c => c.label),
       checkerNodeCount: checkerNodes.length,
@@ -15758,21 +15890,34 @@ async function autoCaptureCalibration(opts) {
       JSON.stringify(meta, null, 2)
     );
     // README so users know what they're looking at.
+    const cardinalDirs   = meta.directions.filter(d => d.kind === "cardinal");
+    const perDisplayDirs = meta.directions.filter(d => d.kind === "per-display");
     files["README.md"] = new TextEncoder().encode(
 `# Gamma Node — auto-capture calibration bundle
 
 Generated ${meta.timestamp} by Gamma Node v${APP_VERSION}.
 
+## Capture options
+
+- **Auto-prep:** ${autoPrep ? "ON" : "OFF"} — ${autoPrep ? "Auto-warp + hard-cut Auto-blend applied before capture (warp:" + (prepApplied.autoWarp ? " applied" : " skipped") + ", blend:" + (prepApplied.autoBlend ? " applied" : " skipped") + "). Restored to user's previous warp meshes after capture." : "Skipped — capture used whatever warp/blend state was already in place."}
+- **Coverage-aware:** ${coverageAware ? "ON" : "OFF"} — ${coverageAware ? "Cardinal directions outside the surface's coverage range were skipped." : "All 6 cardinal directions captured regardless of coverage."}
+- **Per-display:** ${perDisplay ? "ON" : "OFF"} — ${perDisplay ? "Captured one frame per projector aimed at that projector's pose direction (most diagnostic for finding which projector is misaligned)." : "Skipped per-display captures."}
+
 ## Files
 
-- \`*_<direction>.png\` — theater-view screenshots from the rig's
-  sweet-spot looking in the named cardinal direction.
+- \`*_<direction>.png\` — theater-view screenshots. Two kinds:
+  - \`*_front\` / \`*_right\` / \`*_back\` / \`*_left\` / \`*_up\` / \`*_down\` — cardinal axes
+  - \`*_display-NN-<id>-<name>\` — one per projector, aimed at that projector's pose
 - \`calibration-meta.json\` — full rig configuration at capture
-  time (surface, displays, poses, warp kinds).
+  time (surface, displays, poses, warp kinds, capture options).
 
-## Directions captured (6)
+## Directions captured (${meta.directions.length})
 
-${meta.directions.map(d => "- **" + d.name + "** — yaw " + d.yawDeg.toFixed(1) + "°, pitch " + d.pitchDeg.toFixed(1) + "°").join("\n")}
+### Cardinal (${cardinalDirs.length}/6)
+${cardinalDirs.length ? cardinalDirs.map(d => "- **" + d.name + "** — yaw " + d.yawDeg.toFixed(1) + "°, pitch " + d.pitchDeg.toFixed(1) + "°").join("\n") : "_(none — coverage-aware filter excluded all cardinals)_"}
+
+### Per-display (${perDisplayDirs.length})
+${perDisplayDirs.length ? perDisplayDirs.map(d => "- **" + d.name + "** — yaw " + d.yawDeg.toFixed(1) + "°, pitch " + d.pitchDeg.toFixed(1) + "°").join("\n") : "_(per-display disabled or no displays in coverage)_"}
 
 ## Capture configurations (${configs.length})
 
@@ -15780,19 +15925,26 @@ ${configs.map(c => "- " + c.label).join("\n")}
 
 ## How to read
 
-Look at each direction × config pair. Calibration verification
-guidelines:
+For each capture, calibration verification guidelines:
 
 - **Lines should connect across projector boundaries.** A clean
   edge means good calibration; shift/break means a projector's
   pose, FOV, or warp is off.
 - **Beacon circles should center on cardinal axes** (red on +X,
   green on +Y, blue on +Z if WireframeCalibration is the source).
-- **Cell parity should alternate evenly across the entire frame**
-  if Checkerboard is the source.
+- **In per-display captures**, the targeted projector's coverage
+  should be centered in the frame. Mismatches: rotation = pose
+  yaw/pitch off; size = FOV off; barrel/pincushion = warp off.
+- **Cell parity should alternate evenly** if Checkerboard is the
+  source.
 
-A future Gamma Node release will wire this bundle to a Claude
-API / Gemma 4 vision endpoint for automatic misalignment scoring.
+## Auto-analysis
+
+A future Gamma Node release will feed this bundle (PNGs + meta JSON)
+to a Claude API or Gemma 4 vision endpoint for automatic misalignment
+scoring + per-display correction proposals (Δyaw, Δpitch, Δfov, warp
+adjustments). The bundle format is designed to be self-contained for
+this.
 `
     );
 
@@ -19624,7 +19776,8 @@ function renderRigPane() {
           const path = surf.path    || { kind: "revolution", yawStart: -180, yawEnd: 180 };
           const presetButtons = `
             <span class="rig-swept-presets">
-              <button class="btn rig-swept-preset" data-swept-preset="alloSphere"    title="Truncated dome: radius 5, pitch -30°→90°, yaw ±80° (160°). Matches Sajadi-Majumder §6 truncated dome figures.">AlloSphere</button>
+              <button class="btn rig-swept-preset" data-swept-preset="alloSphere"    title="UCSB AlloSphere — full 360° yaw, pitch ±85°. Aligns with the 'AlloSphere (real 26-projector layout)' rig template so coverage-aware capture filters keep front/back/left/right cardinals.">AlloSphere</button>
+              <button class="btn rig-swept-preset" data-swept-preset="truncatedDome160" title="Sajadi-Majumder TVCG 2012 §6 truncated dome — 30ft radius, 26ft height, 160° horizontal. Different from UCSB AlloSphere; this is the paper's test installation.">Truncated dome 160°</button>
               <button class="btn rig-swept-preset" data-swept-preset="fullSphere"    title="Full sphere of revolution: pitch -90°→90°, yaw ±180°.">Full sphere</button>
               <button class="btn rig-swept-preset" data-swept-preset="dome"          title="Top hemisphere: pitch 0°→90°, full yaw.">Dome</button>
               <button class="btn rig-swept-preset" data-swept-preset="bowl"          title="Bottom hemisphere: pitch -90°→0°, full yaw.">Bowl</button>
@@ -23376,7 +23529,6 @@ public:
 
 The output of your generation is the entire file — directives + class — and nothing else. No prose, no markdown fences.
 
-==========================================================================
 ALTERNATE KIND: shader-frag (Phase 6 visual layer)
 
 Set "// @gdsp-kind shader-frag" on the first metadata line to author a
