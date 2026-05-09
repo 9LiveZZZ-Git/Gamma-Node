@@ -16206,9 +16206,70 @@ SCOPE: this version of the calibration AI only proposes pose+FOV corrections —
 
 Even when proposing 0 deltas, the reasoning field should describe any visible artifacts you saw and explain why no pose correction is needed (calibration looks fine vs. artifacts are out of scope).`;
 
+/* Phase 6.6.20.17 — AI v4 Bezier fine-tune system prompt.
+ * Used for Phase 2 of the calibration flow, AFTER main pose/FOV/
+ * keystone has converged. Asks the AI to identify residual mesh-
+ * level alignment issues and propose specific Bezier control
+ * point shifts to fix them. Sparse adjustments (max 6 per
+ * display per pass) keep parameter space tractable. */
+const _AI_BEZIER_FINETUNE_PROMPT =
+`You are a multi-projector dome calibration expert. The rig has
+already been globally aligned via pose + FOV + keystone-corner
+adjustments. You are now doing FINE MESH-LEVEL TUNING of one
+projector at a time, using Bezier control point shifts.
+
+The wireframe pattern (grid + 3 colored great circles + 3 beacons)
+is rendered in world space. After upstream calibration, lines
+mostly connect at projector boundaries — your job is to spot and
+fix any REMAINING misalignment by proposing small NDC shifts to
+specific control points in the projector's 5×5 Bezier warp grid.
+
+Indexing: 5 cols × 5 rows. col 0..4 = left → right.
+row 0..4 = top → bottom. (0,0) = top-left, (4,4) = bottom-right.
+Mid-edge points (col=2 row=0 = top-edge midpoint, col=4 row=2 =
+right-edge midpoint, etc.) are the most useful for fixing edge
+mismatches that corner adjustments alone can't reach. Interior
+points (col 1..3, row 1..3) handle bulges in the middle of the
+projected quad.
+
+For each capture, output JSON ONLY:
+{
+  "bezierAdjustments": [
+    {"col": 2, "row": 0, "dx": 0.005, "dy": 0},
+    {"col": 0, "row": 2, "dx": 0,     "dy": 0.003},
+    ... up to 6 adjustments total ...
+  ],
+  "confidence": <0..1>,
+  "reasoning": "<one sentence>"
+}
+
+Each dx/dy is in NDC units. Per-pass clamp is ±0.015 NDC (~3-4 px
+at 1080p). Output [] if you don't see any mesh-level issues to
+fix. Don't propose corner adjustments here — those went through
+the keystone phase already and should already be good.
+
+Look for:
+- Top edge of THIS projector's wireframe doesn't quite meet the
+  bottom of the projector above → adjust top-row points (row=0).
+- Mid-edge bulge: a horizontal grid line that bows inward/outward
+  near one side → adjust the mid-edge control point.
+- Interior wave: the wireframe within the projector is bowed in
+  one place but flat elsewhere → propose a small interior point
+  shift to compensate.
+
+If everything looks aligned, output bezierAdjustments: [] and
+confidence ≥ 0.7 with reasoning describing how good it looks.`;
+
 async function analyzeCalibrationWithAI(opts) {
   const onProgress = (opts && opts.onProgress) || null;
   const onCapture  = (opts && opts.onCapture)  || null;
+  // 6.6.20.17 — mode "main" (pose+FOV+keystone) or "bezier" (interior
+  // control-point fine-tune). Different system prompt + different
+  // parsing per mode; same per-display capture loop.
+  const mode = (opts && opts.mode === "bezier") ? "bezier" : "main";
+  const systemPrompt = mode === "bezier"
+    ? _AI_BEZIER_FINETUNE_PROMPT
+    : _AI_CALIBRATION_SYSTEM_PROMPT;
 
   // Stage 1 — capture (in memory, no ZIP).
   if (onProgress) onProgress({ stage: "capture", current: 0, total: 1 });
@@ -16269,6 +16330,8 @@ async function analyzeCalibrationWithAI(opts) {
       deltaYaw:   0, deltaPitch: 0, deltaFovH: 0, deltaFovV: 0,
       // Phase 6.6.20.16 — AI v3 keystone corner deltas (NDC).
       keystone:   { tlx: 0, tly: 0, trx: 0, try_: 0, blx: 0, bly: 0, brx: 0, bry: 0 },
+      // Phase 6.6.20.17 — AI v4 sparse Bezier control-point shifts.
+      bezierAdjustments: [],
       confidence: 0, reasoning: "", error: null
     };
 
@@ -16283,7 +16346,7 @@ Expected FOV: ${display.fov.h.toFixed(1)}°(h) × ${display.fov.v.toFixed(1)}°(
 The capture below shows what this projector's coverage region looks like when viewed from the rig sweet-spot, aimed at the projector's expected pose direction. Output JSON only.`;
 
       const response = await provider.call({
-        system:      _AI_CALIBRATION_SYSTEM_PROMPT,
+        system:      systemPrompt,
         user:        userText,
         model:       aiSettings.model,
         key:         aiSettings.anthropicKey,
@@ -16313,6 +16376,20 @@ The capture below shows what this projector's coverage region looks like when vi
       resultEntry.keystone.bly  = Number.isFinite(ks.bly)  ? ks.bly  : 0;
       resultEntry.keystone.brx  = Number.isFinite(ks.brx)  ? ks.brx  : 0;
       resultEntry.keystone.bry  = Number.isFinite(ks.bry)  ? ks.bry  : 0;
+      // Phase 6.6.20.17 — sparse Bezier control-point adjustments.
+      if (Array.isArray(parsed.bezierAdjustments)) {
+        for (const adj of parsed.bezierAdjustments) {
+          if (!adj || typeof adj !== "object") continue;
+          const col = Math.max(0, Math.min(4, Math.round(+adj.col || 0)));
+          const row = Math.max(0, Math.min(4, Math.round(+adj.row || 0)));
+          const dx = Number.isFinite(adj.dx) ? adj.dx : 0;
+          const dy = Number.isFinite(adj.dy) ? adj.dy : 0;
+          if (Math.abs(dx) < 1e-7 && Math.abs(dy) < 1e-7) continue;
+          resultEntry.bezierAdjustments.push({ col, row, dx, dy });
+          // Cap at 6 per display per pass.
+          if (resultEntry.bezierAdjustments.length >= 6) break;
+        }
+      }
       resultEntry.confidence = Number.isFinite(parsed.confidence)    ? Math.max(0, Math.min(1, parsed.confidence)) : 0.5;
       resultEntry.reasoning  = (typeof parsed.reasoning === "string") ? parsed.reasoning : "";
     } catch (e) {
@@ -16364,6 +16441,30 @@ function applyCalibrationCorrections(corrections) {
       k.brx  = (k.brx  || 0) + (c.keystone.brx  || 0);
       k.bry  = (k.bry  || 0) + (c.keystone.bry  || 0);
     }
+    // Phase 6.6.20.17 — Bezier interior corrections. Each entry is
+    // {col, row, dx, dy}; we lazy-init the 5×5 ctrl grid on first
+    // adjustment, then accumulate into specific control points.
+    // The grid is stored as deltas (identity = all zeros), so the
+    // accumulated deltas survive auto-prep regenerations and apply
+    // after keystone in the mesh pipeline.
+    if (Array.isArray(c.bezierAdjustments) && c.bezierAdjustments.length > 0) {
+      if (!display.bezierCorrections ||
+          !Number.isInteger(display.bezierCorrections.cols) ||
+          !Number.isInteger(display.bezierCorrections.rows) ||
+          !Array.isArray(display.bezierCorrections.ctrl)) {
+        // Lazy-init: 5×5 grid of zeros (cols=4, rows=4 → 25 control points)
+        display.bezierCorrections = { cols: 4, rows: 4, ctrl: new Array(50).fill(0) };
+      }
+      const bc = display.bezierCorrections;
+      const W = bc.cols + 1;
+      for (const adj of c.bezierAdjustments) {
+        const col = Math.max(0, Math.min(bc.cols, adj.col | 0));
+        const row = Math.max(0, Math.min(bc.rows, adj.row | 0));
+        const k = (row * W + col) * 2;
+        bc.ctrl[k + 0] = (bc.ctrl[k + 0] || 0) + (adj.dx || 0);
+        bc.ctrl[k + 1] = (bc.ctrl[k + 1] || 0) + (adj.dy || 0);
+      }
+    }
     if (Visual && Visual._warpCache) Visual._warpCache.delete(display.id);
     applied++;
   }
@@ -16407,10 +16508,11 @@ function showAICalibrationModal(analysisResult) {
                     Math.abs(k.trx || 0) + Math.abs(k.try_ || 0) +
                     Math.abs(k.blx || 0) + Math.abs(k.bly || 0) +
                     Math.abs(k.brx || 0) + Math.abs(k.bry || 0);
+      const bdSum = (c.bezierDiff && c.bezierDiff.totalAbs) || 0;
       const significant = !hasError &&
         (Math.abs(c.deltaYaw)   > 0.05 || Math.abs(c.deltaPitch) > 0.05 ||
          Math.abs(c.deltaFovH)  > 0.05 || Math.abs(c.deltaFovV)  > 0.05 ||
-         ksSum > 0.001);
+         ksSum > 0.001 || bdSum > 0.001);
       const checked = significant && conf >= 0.5 ? " checked" : "";
       const fmtDelta = (x, label) => {
         const v = (x || 0);
@@ -16434,6 +16536,16 @@ function showAICalibrationModal(analysisResult) {
             fmtKs(k.brx, "BRx") + fmtKs(k.bry, "BRy") +
           '</div>'
         : "";
+      // 6.6.20.17 — Bezier diff summary. Don't enumerate every
+      // changed control point (could be 25 entries); just show the
+      // count + max delta so the user knows fine-tune touched this
+      // display.
+      const bd = c.bezierDiff;
+      const bdLine = (bd && bd.count > 0)
+        ? '<div class="ai-calib-deltas" style="opacity:0.85">bezier: ' +
+            bd.count + ' control point' + (bd.count === 1 ? '' : 's') +
+            ' adjusted (Σ|Δ| = ' + bd.totalAbs.toFixed(4) + ' NDC)</div>'
+        : "";
       const beforeAfterPose = "yaw " + (c.pose ? c.pose.yaw.toFixed(2) : "?") +
                               "° → " + ((c.pose ? c.pose.yaw : 0) + (c.deltaYaw || 0)).toFixed(2) +
                               "°&nbsp;&nbsp;|&nbsp;&nbsp;pitch " +
@@ -16450,6 +16562,7 @@ function showAICalibrationModal(analysisResult) {
 </label>
 <div class="ai-calib-deltas">${fmtDelta(c.deltaYaw, "yaw")}${fmtDelta(c.deltaPitch, "pitch")}${fmtDelta(c.deltaFovH, "fovH")}${fmtDelta(c.deltaFovV, "fovV")}${significant ? "" : ' <span class="ai-calib-delta">(no change proposed)</span>'}</div>
 ${ksLine}
+${bdLine}
 <div class="ai-calib-detail">${beforeAfterPose}<br>${beforeAfterFov}</div>
 <div class="ai-calib-confidence" style="color: ${confColor}">${hasError ? "ERROR: " + escapeText(c.error) : ("Confidence " + (conf * 100).toFixed(0) + "% — " + escapeText(c.reasoning || "(no reasoning)"))}</div>`;
       list.appendChild(row);
@@ -16505,6 +16618,12 @@ async function runAICalibrationIterative(opts) {
   const maxDelta = (opts && Number.isFinite(opts.maxDeltaPerPass)) ? opts.maxDeltaPerPass : 0.5;
   const stopThreshold = (opts && Number.isFinite(opts.stopThreshold)) ? opts.stopThreshold : 0.15;
   const onStatus = (opts && opts.onStatus) || null;
+  // 6.6.20.17 — mode: "main" (pose+FOV+keystone) or "bezier" (sparse
+  // interior adjustments). Bezier mode runs as Phase 2 after main
+  // converges, with a different prompt + tighter clamp.
+  const mode = (opts && opts.mode === "bezier") ? "bezier" : "main";
+  const isBezier = mode === "bezier";
+  const bezierMaxDelta = (opts && Number.isFinite(opts.bezierMaxDeltaPerPass)) ? opts.bezierMaxDeltaPerPass : 0.015;
 
   // Snapshot baseline poses + keystone so the final diff modal
   // shows cumulative changes from the user's pre-AI rig state.
@@ -16522,7 +16641,14 @@ async function runAICalibrationIterative(opts) {
     pitch: d.pose ? (d.pose.pitch || 0) : 0,
     fovH:  d.fov  ? (d.fov.h      || 90) : 90,
     fovV:  d.fov  ? (d.fov.v      || 60) : 60,
-    keystoneCorners: cloneKC(d.keystoneCorners)
+    keystoneCorners: cloneKC(d.keystoneCorners),
+    // 6.6.20.17 — snapshot Bezier corrections grid (deep copy of
+    // ctrl float array) so cumulative diff captures fine-tune
+    // changes too. null if no Bezier corrections set.
+    bezierCorrections: d.bezierCorrections
+      ? { cols: d.bezierCorrections.cols, rows: d.bezierCorrections.rows,
+          ctrl: Array.isArray(d.bezierCorrections.ctrl) ? d.bezierCorrections.ctrl.slice() : [] }
+      : null
   } : null);
 
   let iterCount = 0;
@@ -16533,10 +16659,12 @@ async function runAICalibrationIterative(opts) {
     iterCount = iter + 1;
     if (onStatus) onStatus("Iteration " + iterCount + "/" + maxIters + " — capturing...");
     const result = await analyzeCalibrationWithAI({
+      mode,
       onProgress: (p) => {
         if (!onStatus) return;
-        if (p.stage === "capture") onStatus("Iter " + iterCount + " — capturing...");
-        else if (p.stage === "analyze") onStatus("Iter " + iterCount + " — AI analyzing " + p.current + "/" + p.total);
+        const phase = isBezier ? "Phase 2 (Bezier)" : "Phase 1 (pose+FOV+keystone)";
+        if (p.stage === "capture") onStatus(phase + " — iter " + iterCount + " — capturing");
+        else if (p.stage === "analyze") onStatus(phase + " — iter " + iterCount + " — AI analyzing " + p.current + "/" + p.total);
       }
     });
     lastResult = result;
@@ -16544,6 +16672,7 @@ async function runAICalibrationIterative(opts) {
     // Clamp + filter to "significant" corrections.
     // Pose/FOV deltas: ±maxDelta degrees (default 0.5°).
     // Keystone deltas: ±keystoneMaxDelta NDC (default 0.02 = ~5 px @ 1080p).
+    // Bezier deltas: ±bezierMaxDelta NDC (default 0.015 = ~3-4 px).
     const keystoneMaxDelta = 0.02;
     let totalDeltaSum = 0;
     let significantCount = 0;
@@ -16551,32 +16680,49 @@ async function runAICalibrationIterative(opts) {
     const clamped = (result.corrections || [])
       .filter(c => !c.error)
       .map(c => {
-        const cy = clamp(c.deltaYaw,   maxDelta);
-        const cp = clamp(c.deltaPitch, maxDelta);
-        const ch = clamp(c.deltaFovH,  maxDelta);
-        const cv = clamp(c.deltaFovV,  maxDelta);
+        // In bezier mode we ignore pose/FOV/keystone (the AI doesn't
+        // propose those in this phase); leave them at 0 so apply
+        // skips them.
+        const cy = isBezier ? 0 : clamp(c.deltaYaw,   maxDelta);
+        const cp = isBezier ? 0 : clamp(c.deltaPitch, maxDelta);
+        const ch = isBezier ? 0 : clamp(c.deltaFovH,  maxDelta);
+        const cv = isBezier ? 0 : clamp(c.deltaFovV,  maxDelta);
         const ks = c.keystone || {};
-        const k = {
-          tlx:  clamp(ks.tlx,  keystoneMaxDelta),
-          tly:  clamp(ks.tly,  keystoneMaxDelta),
-          trx:  clamp(ks.trx,  keystoneMaxDelta),
-          try_: clamp(ks.try_, keystoneMaxDelta),
-          blx:  clamp(ks.blx,  keystoneMaxDelta),
-          bly:  clamp(ks.bly,  keystoneMaxDelta),
-          brx:  clamp(ks.brx,  keystoneMaxDelta),
-          bry:  clamp(ks.bry,  keystoneMaxDelta)
-        };
-        // Magnitude scoring: pose deltas count more than keystone (degrees vs
-        // NDC), so weight keystone by 100× to be in degree-equivalent units.
+        const k = isBezier
+          ? { tlx: 0, tly: 0, trx: 0, try_: 0, blx: 0, bly: 0, brx: 0, bry: 0 }
+          : {
+              tlx:  clamp(ks.tlx,  keystoneMaxDelta),
+              tly:  clamp(ks.tly,  keystoneMaxDelta),
+              trx:  clamp(ks.trx,  keystoneMaxDelta),
+              try_: clamp(ks.try_, keystoneMaxDelta),
+              blx:  clamp(ks.blx,  keystoneMaxDelta),
+              bly:  clamp(ks.bly,  keystoneMaxDelta),
+              brx:  clamp(ks.brx,  keystoneMaxDelta),
+              bry:  clamp(ks.bry,  keystoneMaxDelta)
+            };
+        // Bezier adjustments: clamped per-entry, dropped if below
+        // 5e-4 NDC (~0.25 px) since the apply check filters those
+        // out anyway. Only used in main mode if the AI proposed
+        // them inadvertently — usually empty in main mode.
+        const ba = isBezier && Array.isArray(c.bezierAdjustments)
+          ? c.bezierAdjustments.map(adj => ({
+              col:  Math.max(0, Math.min(4, adj.col | 0)),
+              row:  Math.max(0, Math.min(4, adj.row | 0)),
+              dx:   clamp(adj.dx, bezierMaxDelta),
+              dy:   clamp(adj.dy, bezierMaxDelta)
+            })).filter(adj => Math.abs(adj.dx) > 5e-4 || Math.abs(adj.dy) > 5e-4)
+          : [];
         const poseMag = Math.abs(cy) + Math.abs(cp) + Math.abs(ch) + Math.abs(cv);
         const ksMag = (Math.abs(k.tlx) + Math.abs(k.tly) + Math.abs(k.trx) + Math.abs(k.try_) +
                        Math.abs(k.blx) + Math.abs(k.bly) + Math.abs(k.brx) + Math.abs(k.bry)) * 100;
-        const m = poseMag + ksMag;
+        const baMag = ba.reduce((s, adj) => s + (Math.abs(adj.dx) + Math.abs(adj.dy)) * 100, 0);
+        const m = poseMag + ksMag + baMag;
         if (m > 0.08) significantCount++;
         totalDeltaSum += m;
         return Object.assign({}, c, {
           deltaYaw: cy, deltaPitch: cp, deltaFovH: ch, deltaFovV: cv,
-          keystone: k
+          keystone: k,
+          bezierAdjustments: ba
         });
       });
 
@@ -16589,18 +16735,20 @@ async function runAICalibrationIterative(opts) {
     }
 
     // Apply the clamped corrections (only significant ones).
-    // Pose threshold: 0.02°. Keystone threshold: 0.0005 NDC (~0.25 px).
+    // Pose threshold: 0.02°. Keystone/Bezier threshold: 5e-4 NDC.
     const significant = clamped.filter(c => {
       if (Math.abs(c.deltaYaw)   > 0.02) return true;
       if (Math.abs(c.deltaPitch) > 0.02) return true;
       if (Math.abs(c.deltaFovH)  > 0.02) return true;
       if (Math.abs(c.deltaFovV)  > 0.02) return true;
       const k = c.keystone;
-      if (!k) return false;
-      return Math.abs(k.tlx)  > 5e-4 || Math.abs(k.tly)  > 5e-4 ||
-             Math.abs(k.trx)  > 5e-4 || Math.abs(k.try_) > 5e-4 ||
-             Math.abs(k.blx)  > 5e-4 || Math.abs(k.bly)  > 5e-4 ||
-             Math.abs(k.brx)  > 5e-4 || Math.abs(k.bry)  > 5e-4;
+      if (k && (Math.abs(k.tlx)  > 5e-4 || Math.abs(k.tly)  > 5e-4 ||
+                Math.abs(k.trx)  > 5e-4 || Math.abs(k.try_) > 5e-4 ||
+                Math.abs(k.blx)  > 5e-4 || Math.abs(k.bly)  > 5e-4 ||
+                Math.abs(k.brx)  > 5e-4 || Math.abs(k.bry)  > 5e-4)) return true;
+      // Bezier adjustments are already filtered to >5e-4 in the
+      // clamp step, so any non-empty list means significant.
+      return Array.isArray(c.bezierAdjustments) && c.bezierAdjustments.length > 0;
     });
     const applied = applyCalibrationCorrections(significant);
     totalCorrections += applied;
@@ -16642,6 +16790,31 @@ async function runAICalibrationIterative(opts) {
         brx:  (curKC.brx  || 0) - (baseKC.brx  || 0),
         bry:  (curKC.bry  || 0) - (baseKC.bry  || 0)
       },
+      // 6.6.20.17 — Bezier diff: count of control points changed
+      // and total absolute delta (NDC). Per-point detail kept for
+      // revert.
+      bezierDiff: (() => {
+        const baseBC = b.bezierCorrections;
+        const curBC  = display.bezierCorrections;
+        if (!baseBC && !curBC) return { count: 0, totalAbs: 0, perPoint: null };
+        const cols = (curBC && curBC.cols) || (baseBC && baseBC.cols) || 4;
+        const rows = (curBC && curBC.rows) || (baseBC && baseBC.rows) || 4;
+        const N = (cols + 1) * (rows + 1) * 2;
+        const baseCtrl = (baseBC && Array.isArray(baseBC.ctrl)) ? baseBC.ctrl : new Array(N).fill(0);
+        const curCtrl  = (curBC  && Array.isArray(curBC.ctrl))  ? curBC.ctrl  : new Array(N).fill(0);
+        let count = 0, totalAbs = 0;
+        const perPoint = [];
+        for (let pi = 0; pi < (cols + 1) * (rows + 1); pi++) {
+          const dx = (curCtrl[pi*2 + 0] || 0) - (baseCtrl[pi*2 + 0] || 0);
+          const dy = (curCtrl[pi*2 + 1] || 0) - (baseCtrl[pi*2 + 1] || 0);
+          if (Math.abs(dx) > 1e-5 || Math.abs(dy) > 1e-5) {
+            count++;
+            totalAbs += Math.abs(dx) + Math.abs(dy);
+            perPoint.push({ idx: pi, col: pi % (cols+1), row: (pi / (cols+1)) | 0, dx, dy });
+          }
+        }
+        return { count, totalAbs, perPoint, cols, rows };
+      })(),
       confidence:  1.0,
       reasoning:   "Cumulative iterative correction over " + iterCount + " pass(es)",
       error:       null
@@ -16664,14 +16837,55 @@ async function runAICalibrationIterative(opts) {
  * can review + revert any drift they don't like. */
 async function runAICalibrationFlow(opts) {
   const statusCb = opts && opts.onStatus;
+  const skipBezier = !!(opts && opts.skipBezier);
   try {
-    if (statusCb) statusCb("Starting iterative calibration...");
-    const result = await runAICalibrationIterative({
+    if (statusCb) statusCb("Phase 1 — pose+FOV+keystone calibration starting...");
+    // PHASE 1 — main pose+FOV+keystone iterative.
+    const phase1 = await runAICalibrationIterative({
+      mode:             "main",
       maxIterations:    5,
       maxDeltaPerPass:  0.5,
       stopThreshold:    0.15,
       onStatus: (msg) => { if (statusCb) statusCb(msg); }
     });
+
+    // PHASE 2 — Bezier interior fine-tune (AI v4). Runs after main
+    // phase converges, on the now-refined rig. Smaller iteration
+    // budget (3 passes) since Bezier adjustments converge faster
+    // — typically 1-2 passes catch most residual mesh issues.
+    let phase2 = null;
+    if (!skipBezier) {
+      if (statusCb) statusCb("Phase 2 — Bezier interior fine-tune starting...");
+      phase2 = await runAICalibrationIterative({
+        mode:             "bezier",
+        maxIterations:    3,
+        bezierMaxDeltaPerPass: 0.015,
+        stopThreshold:    0.001,
+        onStatus: (msg) => { if (statusCb) statusCb(msg); }
+      });
+    }
+
+    // Combine phase 1 + phase 2 cumulative diffs. Both phases'
+    // baselines were captured at THEIR start; phase 2's baseline
+    // is the post-phase-1 state, so its diff represents only the
+    // Bezier work. Total diff = phase1.finalDiff + phase2.bezierDiff.
+    const result = {
+      iterations: phase1.iterations + (phase2 ? phase2.iterations : 0),
+      totalCorrections: phase1.totalCorrections + (phase2 ? phase2.totalCorrections : 0),
+      finalDiff: phase1.finalDiff.map(d1 => {
+        // Find the matching phase2 entry for this display.
+        const d2 = phase2 ? phase2.finalDiff.find(x => x.idx === d1.idx) : null;
+        if (!d2) return d1;
+        return Object.assign({}, d1, {
+          // Carry phase 2's bezierDiff onto the merged record.
+          bezierDiff: d2.bezierDiff,
+          reasoning: "Phase 1: pose+FOV+keystone over " + phase1.iterations + " pass(es). Phase 2: Bezier over " + phase2.iterations + " pass(es)."
+        });
+      }),
+      lastResult: (phase2 && phase2.lastResult) || phase1.lastResult,
+      lastMeta:   (phase2 && phase2.lastMeta)   || phase1.lastMeta,
+      phase1, phase2
+    };
 
     // 6.6.20.14 — better UX for the three "nothing happened" cases.
     // 6.6.20.16 — also count keystone corner deltas (NDC) toward
@@ -16683,6 +16897,9 @@ async function runAICalibrationFlow(opts) {
         const k = c.keystone;
         m += (Math.abs(k.tlx) + Math.abs(k.tly) + Math.abs(k.trx) + Math.abs(k.try_) +
               Math.abs(k.blx) + Math.abs(k.bly) + Math.abs(k.brx) + Math.abs(k.bry)) * 100;
+      }
+      if (c.bezierDiff && c.bezierDiff.totalAbs > 0) {
+        m += c.bezierDiff.totalAbs * 100;
       }
       return s + m;
     }, 0);
@@ -16783,6 +17000,18 @@ async function runAICalibrationFlow(opts) {
         k.bly  -= (c.keystone.bly  || 0);
         k.brx  -= (c.keystone.brx  || 0);
         k.bry  -= (c.keystone.bry  || 0);
+      }
+      // 6.6.20.17 — revert Bezier per-point deltas. bezierDiff.perPoint
+      // has each {idx, dx, dy} that changed; subtract them from the
+      // display's bezierCorrections.ctrl array.
+      if (c.bezierDiff && Array.isArray(c.bezierDiff.perPoint) &&
+          c.bezierDiff.perPoint.length > 0 && display.bezierCorrections &&
+          Array.isArray(display.bezierCorrections.ctrl)) {
+        for (const pt of c.bezierDiff.perPoint) {
+          const k = pt.idx * 2;
+          display.bezierCorrections.ctrl[k + 0] = (display.bezierCorrections.ctrl[k + 0] || 0) - pt.dx;
+          display.bezierCorrections.ctrl[k + 1] = (display.bezierCorrections.ctrl[k + 1] || 0) - pt.dy;
+        }
       }
       if (Visual && Visual._warpCache) Visual._warpCache.delete(display.id);
       reverted++;
@@ -17509,7 +17738,8 @@ function _cloneWarpMesh(m) {
     _isAutoBlend: m._isAutoBlend,
     _isTest: m._isTest,
     _isCustom: m._isCustom,
-    _hasKeystone: m._hasKeystone   // 6.6.20.16 — idempotency flag
+    _hasKeystone: m._hasKeystone,                 // 6.6.20.16 — idempotency flag
+    _hasBezierCorrections: m._hasBezierCorrections // 6.6.20.17 — idempotency flag
   };
   // 6.6.19: preserve Bezier control grid through the editor's
   // Cancel-restore snapshot so undo doesn't silently downgrade
@@ -18665,6 +18895,43 @@ function _autoWarpMeshForDisplay(display, surface, sweetSpot, cols, rows) {
  * NDC delta units: ±0.02 is typical (1% of framebuffer ≈ 5 px at
  * 1080p). Larger deltas warp aggressively. Per-pass clamp in the
  * iterative AI loop is ±0.02. */
+/* Phase 6.6.20.17 — apply Bezier interior corrections (AI v4) on
+ * top of the keystone layer. The bezierCorrections.ctrl array is
+ * a (cols+1)×(rows+1)×2 grid of NDC offsets stored as deltas
+ * (identity = all zeros). For each mesh vertex (u, v), evaluate
+ * the tensor-product Bezier surface using these offsets as
+ * control points, and shift the vertex by the result.
+ *
+ * Idempotent via mesh._hasBezierCorrections flag (preserved
+ * through _cloneWarpMesh). Applied after keystone in both
+ * auto-warp + auto-blend dispatchers so the chain is consistent.
+ *
+ * For sparse adjustments (most ctrl values 0, just a few non-zero),
+ * the Bezier eval gracefully reduces to local bumps centered on
+ * the non-zero control points, with smooth falloff to neighbors. */
+function _applyBezierCorrectionsToMesh(mesh, bc) {
+  if (!mesh || !_validateWarpMesh(mesh) || !bc) return;
+  if (mesh._hasBezierCorrections) return;
+  if (!Array.isArray(bc.ctrl) || !Number.isInteger(bc.cols) || !Number.isInteger(bc.rows)) return;
+  // Skip cheap if all zeros.
+  let sum = 0;
+  for (let i = 0; i < bc.ctrl.length; i++) sum += Math.abs(bc.ctrl[i]);
+  if (sum < 1e-6) return;
+  const W = mesh.cols + 1, H = mesh.rows + 1;
+  for (let r = 0; r < H; r++) {
+    const v = r / mesh.rows;
+    for (let c = 0; c < W; c++) {
+      const u = c / mesh.cols;
+      // _bezierEval interprets ctrl as positions; for delta ctrl
+      // (identity = zero) it returns the bilinear-Bezier offset.
+      const offset = _bezierEval(bc.ctrl, bc.cols, bc.rows, u, v);
+      const i = (r * W + c) * 5;
+      mesh.verts[i + 0] += offset.x;
+      mesh.verts[i + 1] += offset.y;
+    }
+  }
+}
+
 function _applyKeystoneCornersToMesh(mesh, kc) {
   if (!mesh || !_validateWarpMesh(mesh) || !kc) return;
   if (mesh._hasKeystone) return;     // idempotent — already applied
@@ -18733,6 +19000,9 @@ function _applyAutoWarpToRig(opts) {
     // double-apply.
     _applyKeystoneCornersToMesh(mesh, d.keystoneCorners);
     mesh._hasKeystone = true;
+    // 6.6.20.17 — Bezier interior corrections (AI v4) layer on top.
+    _applyBezierCorrectionsToMesh(mesh, d.bezierCorrections);
+    mesh._hasBezierCorrections = true;
     d.warpMesh = mesh;
     if (Visual && Visual._warpCache) Visual._warpCache.delete(d.id);
     out.push({ displayIdx: i, applied: true });
@@ -18796,6 +19066,9 @@ function _applyAutoBlendToRig(opts) {
       // applied), so chained warp→blend doesn't double-apply.
       _applyKeystoneCornersToMesh(mesh, d.keystoneCorners);
       mesh._hasKeystone = true;
+      // 6.6.20.17 — Bezier interior corrections (AI v4) on top.
+      _applyBezierCorrectionsToMesh(mesh, d.bezierCorrections);
+      mesh._hasBezierCorrections = true;
       d.warpMesh = mesh;
       if (Visual && Visual._warpCache) Visual._warpCache.delete(d.id);
       out.push({ displayIdx: i, applied: true, mode: hardCuts ? "screen-space-hardcuts" : "screen-space" });
@@ -18887,6 +19160,13 @@ function _makeDisplay(id, name, overrides) {
     // persist across auto-prep regenerations. Default 0; AI v3
     // proposes deltas during iterative calibration.
     keystoneCorners: { tlx: 0, tly: 0, trx: 0, try_: 0, blx: 0, bly: 0, brx: 0, bry: 0 },
+    // Phase 6.6.20.17 — AI v4 Bezier interior corrections. 5×5
+    // grid of NDC offsets (50 floats) — mostly 0, populated
+    // sparsely by Bezier fine-tune. Applied AFTER keystone via
+    // tensor-product Bezier eval — each control point's offset
+    // smoothly blends into the mesh interior. Default null; lazy-
+    // inits when first non-zero adjustment applied.
+    bezierCorrections: null,
     worldUv:   { minU: 0, minV: 0, maxU: 1, maxV: 1 }
   }, overrides);
 }
@@ -24022,6 +24302,16 @@ document.getElementById("file-input").addEventListener("change", ev => {
           d.keystoneCorners.bly  = +(d.keystoneCorners.bly)  || 0;
           d.keystoneCorners.brx  = +(d.keystoneCorners.brx)  || 0;
           d.keystoneCorners.bry  = +(d.keystoneCorners.bry)  || 0;
+        }
+        // Phase 6.6.20.17 — bezierCorrections backfill (AI v4). null
+        // means "no Bezier adjustments"; lazy-inits when first
+        // non-zero delta applied during fine-tune.
+        if (!('bezierCorrections' in d)) d.bezierCorrections = null;
+        if (d.bezierCorrections && (!Array.isArray(d.bezierCorrections.ctrl) ||
+            !Number.isInteger(d.bezierCorrections.cols) ||
+            !Number.isInteger(d.bezierCorrections.rows))) {
+          // Garbage shape — drop.
+          d.bezierCorrections = null;
         }
       });
       state.nodes.forEach(n => {
