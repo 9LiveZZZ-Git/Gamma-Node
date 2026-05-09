@@ -12983,7 +12983,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     outs: [{ n: "out", t: "texture" }],
     params: {
       size: 24,
-      mode: 1,                                // 0 = HEALPix uniform-pixel, 1 = Lambert (default), 2 = cube
+      mode: 3,                                // 0 = HEALPix, 1 = Lambert, 2 = cube, 3 = octahedral (default), 4 = cosine-corrected lat/long
       rA: 0.92, gA: 0.92, bA: 0.92,
       rB: 0.08, gB: 0.08, bB: 0.08
     },
@@ -13206,28 +13206,78 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     return select(u.colorB, u.colorA, parity == 0);
   }
   // mode == 2: legacy cube-mapped (6.6.17 fallback).
-  let yr = ang.x * 0.01745329;
-  let pr = ang.y * 0.01745329;
-  let dx = sin(yr) * cos(pr);
-  let dy = sin(pr);
-  let dz = cos(yr) * cos(pr);
-  let absX = abs(dx);
-  let absY = abs(dy);
-  let absZ = abs(dz);
+  let yr2 = ang.x * 0.01745329;
+  let pr2 = ang.y * 0.01745329;
+  let dx2 = sin(yr2) * cos(pr2);
+  let dy2 = sin(pr2);
+  let dz2 = cos(yr2) * cos(pr2);
+  let absX = abs(dx2);
+  let absY = abs(dy2);
+  let absZ = abs(dz2);
+  if (mode == 4) {
+    // Phase 6.6.20.6 — COSINE-CORRECTED LAT/LONG.
+    // The Bourke aesthetic: discrete cell count per latitude band,
+    // adjusted by cos(latitude) so cells stay roughly square in
+    // solid-angle dimensions. Visible row-step transitions where
+    // adjacent rows have different cell counts (e.g. equator has
+    // 24, mid-lat has 20, polar band has 4). Closest match to the
+    // user's Bourke checker reference image.
+    let v_cells4 = max(2.0, floor(size * 0.5 + 0.5));
+    let pitch_norm = clamp((ang.y + 90.0) / 180.0, 0.0, 0.99999);
+    let cellV4 = floor(pitch_norm * v_cells4);
+    let band_pitch_deg = (cellV4 + 0.5) / v_cells4 * 180.0 - 90.0;
+    let cos_lat = max(0.001, cos(band_pitch_deg * 0.01745329));
+    let h_cells = max(2.0, floor(size * cos_lat * 0.5 + 0.5) * 2.0);
+    let yaw_norm = clamp((ang.x + 180.0) / 360.0, 0.0, 0.99999);
+    let cellU4 = floor(yaw_norm * h_cells);
+    let parity4 = (i32(cellU4) + i32(cellV4)) & 1;
+    return select(u.colorB, u.colorA, parity4 == 0);
+  }
+  if (mode == 3) {
+    // Phase 6.6.20.6 — OCTAHEDRAL mapping. Folds the sphere onto an
+    // octahedron, then onto a single 2D square. Cells are
+    // approximately equal-area on the sphere (~5x variation, not
+    // perfectly uniform — Engelhardt & Dachsbacher 2008,
+    // "Octahedron Environment Maps"). ONE visible seam at the y=0
+    // great circle where the bottom hemisphere is folded outward;
+    // otherwise no axis seams, no polar singularity, and roughly
+    // square cells everywhere.
+    //
+    // Algorithm: L1-normalize the direction (|x|+|y|+|z|=1), then
+    // project to a unit square. For y >= 0 (top hemisphere), use
+    // (x, z) directly. For y < 0 (bottom hemisphere), reflect across
+    // the diagonals: (x, z) → ((1 - |z|)·sign(x), (1 - |x|)·sign(z)).
+    // This gives a continuous mapping covering the whole sphere on
+    // a [-1, 1]² square.
+    let sumAbs = absX + absY + absZ;
+    let n = vec3f(dx2, dy2, dz2) / max(sumAbs, 1e-6);
+    var oct = vec2f(n.x, n.z);
+    if (n.y < 0.0) {
+      let signX = select(-1.0, 1.0, oct.x >= 0.0);
+      let signZ = select(-1.0, 1.0, oct.y >= 0.0);
+      oct = vec2f((1.0 - abs(oct.y)) * signX, (1.0 - abs(oct.x)) * signZ);
+    }
+    let oct_uv = oct * 0.5 + 0.5;            // [0, 1]²
+    let cellU3 = floor(oct_uv.x * size);
+    let cellV3 = floor(oct_uv.y * size);
+    let parity3 = (i32(cellU3) + i32(cellV3)) & 1;
+    return select(u.colorB, u.colorA, parity3 == 0);
+  }
+  // mode == 2: cube
   var faceU: f32 = 0.0;
   var faceV: f32 = 0.0;
   if (absX >= absY && absX >= absZ) {
-    faceU = dz / dx; faceV = dy / absX;
+    faceU = dz2 / dx2; faceV = dy2 / absX;
   } else if (absY >= absZ) {
-    faceU = dx / absY; faceV = dz / dy;
+    faceU = dx2 / absY; faceV = dz2 / dy2;
   } else {
-    faceU = dx / dz; faceV = dy / absZ;
+    faceU = dx2 / dz2; faceV = dy2 / absZ;
   }
   let N = max(1.0, floor(size * 0.25 + 0.5));
-  let cellU = floor((faceU + 1.0) * 0.5 * N);
-  let cellV = floor((faceV + 1.0) * 0.5 * N);
-  let parity = (i32(cellU) + i32(cellV)) & 1;
-  return select(u.colorB, u.colorA, parity == 0);
+  let cellU2 = floor((faceU + 1.0) * 0.5 * N);
+  let cellV2 = floor((faceV + 1.0) * 0.5 * N);
+  let parity2 = (i32(cellU2) + i32(cellV2)) & 1;
+  return select(u.colorB, u.colorA, parity2 == 0);
 }`,
     writeUniforms(node, scratch) {
       const p = node.params || {};
@@ -13247,7 +13297,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       scratch[26] = 0; scratch[27] = 0;
       _packSurfaceUniforms(scratch, 28);
     },
-    description: "Checkerboard — uniform cells on the rig's screen surface. mode: 0 = HEALPix uniform-pixel tessellation (Górski 2005 — provably equal-area diamond cells, but reads as herringbone stripes, NOT a checker; useful when uniform-pixel-tessellation is the goal); 1 = Lambert cylindrical equal-area (default — concentric ring checker, Bourke aesthetic, with polar-cap halving to soften the sin-pitch pole pinch); 2 = cube-mapped (6.6.17 legacy — visible cube-edge seams). size: cells around the equator. See docs/HEALPIX.md for the full math + tradeoffs."
+    description: "Checkerboard — uniform cells on the rig's screen surface. mode: 0 = HEALPix (Górski 2005 — equal-area diamond cells, herringbone aesthetic); 1 = Lambert cylindrical (sin-pitch, polar-cap halving); 2 = cube-mapped (6 face seams); 3 = octahedral (default — single seam at equator, square cell shapes, roughly equal-area); 4 = cosine-corrected lat/long (Bourke aesthetic — discrete cells-per-row, row-step seams, closest to classic sphere-checker references). size: cells around the equator. See docs/HEALPIX.md for the math + tradeoffs."
   },
 
   /* Phase 6.4 — Voronoi. Cellular noise with edge highlighting and
@@ -16801,7 +16851,7 @@ function _projectorFramebufferUV(P, display) {
  * vs. the angular-band approximation (_makeAutoBlendMesh): correct
  * for curved screens where neighbors don't share simple yaw/pitch
  * extents. Identical in the simple flat-tangent-plane case. */
-function _makeScreenSpaceBlendMesh(cols, rows, display, displays, displayIdx, surface) {
+function _makeScreenSpaceBlendMesh(cols, rows, display, displays, displayIdx, surface, hardCuts) {
   const m = _makeIdentityWarpMesh(cols, rows);
   if (!surface || surface.type === "free") return m;
 
@@ -16860,7 +16910,15 @@ function _makeScreenSpaceBlendMesh(cols, rows, display, displays, displayIdx, su
       const selfU = c / cols, selfV = r / rows;
       const dSelf = Math.max(0, Math.min(selfU, selfV, 1 - selfU, 1 - selfV));
 
+      // 6.6.20.6 — hard-cuts mode: the projector with the largest
+      // distance-to-frame-edge "wins" the screen point; all others
+      // get α=0. Result: each screen pixel comes from EXACTLY ONE
+      // projector — no smooth blend in the overlap region. Useful
+      // for verifying which projector covers what (calibration
+      // debugging) and for installations where smooth blending
+      // isn't possible (e.g., sharp-edge projection masks).
       let dSum = dSelf;
+      let maxOther = 0;     // largest competitor's dSelf-equivalent
       for (let j = 0; j < displays.length; j++) {
         if (j === displayIdx) continue;
         const dj = displays[j];
@@ -16869,13 +16927,22 @@ function _makeScreenSpaceBlendMesh(cols, rows, display, displays, displayIdx, su
         if (!proj.inFrame) continue;
         const d = Math.max(0, Math.min(proj.u, proj.v, 1 - proj.u, 1 - proj.v));
         dSum += d;
+        if (d > maxOther) maxOther = d;
       }
-      const alpha = dSum > 0.0001 ? (dSelf / dSum) : 1.0;
+      let alpha;
+      if (hardCuts) {
+        // Winner-takes-all. Self wins iff its dSelf >= every other
+        // overlapping projector's d.
+        alpha = (dSelf >= maxOther - 1e-6) ? 1.0 : 0.0;
+      } else {
+        alpha = dSum > 0.0001 ? (dSelf / dSum) : 1.0;
+      }
       m.verts[(r * W + c) * 5 + 4] = alpha;
     }
   }
   m._isAutoBlend = true;
   m._isScreenSpace = true;
+  if (hardCuts) m._isHardCuts = true;
   return m;
 }
 
@@ -17162,7 +17229,8 @@ function _applyAutoBlendToRig(opts) {
   // dropdown should still show it).
   const skipHistory  = !!(opts && opts.skipHistory);
   const keepTemplate = !!(opts && opts.keepTemplate);
-  if (!skipHistory) pushHistory("rig-auto-blend");
+  const hardCuts     = !!(opts && opts.hardCuts);
+  if (!skipHistory) pushHistory(hardCuts ? "rig-auto-blend-hardcuts" : "rig-auto-blend");
   // Phase 6.6.16 (Raskar #4) — choose between angular auto-blend
   // (the original, fast, works without surface info) and screen-
   // space alpha-blend (the Raskar-paper-correct version that uses
@@ -17184,10 +17252,16 @@ function _applyAutoBlendToRig(opts) {
       return;
     }
     if (useScreenSpace) {
-      const mesh = _makeScreenSpaceBlendMesh(8, 8, d, state.rig.displays, i, surface);
+      // 6.6.20.6 — denser mesh (16x16) for hard-cuts so the win/lose
+      // boundary stays a clean line at the projector overlap edges
+      // rather than the chunky 8x8-vertex polygon you'd get
+      // otherwise. Smooth alpha can stay at 8x8 since the gradient
+      // hides the resolution.
+      const N = hardCuts ? 16 : 8;
+      const mesh = _makeScreenSpaceBlendMesh(N, N, d, state.rig.displays, i, surface, hardCuts);
       d.warpMesh = mesh;
       if (Visual && Visual._warpCache) Visual._warpCache.delete(d.id);
-      out.push({ displayIdx: i, applied: true, mode: "screen-space" });
+      out.push({ displayIdx: i, applied: true, mode: hardCuts ? "screen-space-hardcuts" : "screen-space" });
       return;
     }
     const bands = _computeOverlapBands(i, state.rig.displays);
@@ -19181,6 +19255,8 @@ function renderRigPane() {
                     title="Clear all displays' warp meshes in one click — useful for recovering from an accidental Auto-warp on angular shaders. Custom (hand-edited) meshes are preserved.">Reset warps</button>
             <button class="rig-auto-blend-btn" id="btn-rig-auto-blend"
                     title="Auto-generate intensity ramps so adjacent projectors blend seamlessly. Two algorithms used depending on rig: angular bands (when surface is plane / free / off — fast, works for flat tile rigs) and Raskar §4.4 screen-space alpha-blend (when surface is sphere / cylinder + visible ON — α sums to 1.0 across overlapping projectors at every screen point, correct for curved screens).">Auto-blend rig</button>
+            <button class="rig-auto-blend-btn" id="btn-rig-auto-blend-hardcuts"
+                    title="Hard-cut blend (no smooth ramps): each screen pixel comes from EXACTLY ONE projector — the one whose framebuffer puts that pixel furthest from its frame edge. Voronoi-style assignment in screen space. Useful for calibration debugging (you can see which projector covers what), and for installations where smooth blending isn't possible (sharp masks, hard-edge LED panels). Requires curved screen surface (sphere/cylinder/swept) with surfaceVisible ON.">Auto-blend (hard cuts)</button>
           </span>
         </div>
         ${displayRows}
@@ -19615,6 +19691,27 @@ function wireRigPaneHandlers() {
         autoBtn.disabled = false;
       }, 900);
       console.log("[auto-blend] applied to", applied, "displays;", skipped, "left as-is (no overlap)");
+      renderProps && renderProps();
+      render();
+    });
+  }
+
+  // Phase 6.6.20.6 — hard-cuts variant. Each screen pixel goes to
+  // exactly one projector. Same dispatch as smooth blend but flags
+  // the path with hardCuts:true.
+  const autoHardBtn = document.getElementById("btn-rig-auto-blend-hardcuts");
+  if (autoHardBtn) {
+    autoHardBtn.addEventListener("click", () => {
+      const results = _applyAutoBlendToRig({ hardCuts: true });
+      const applied = results.filter(r => r.applied).length;
+      const skipped = results.length - applied;
+      autoHardBtn.textContent = applied + " hard-cut";
+      autoHardBtn.disabled = true;
+      setTimeout(() => {
+        autoHardBtn.textContent = "Auto-blend (hard cuts)";
+        autoHardBtn.disabled = false;
+      }, 900);
+      console.log("[auto-blend hardcuts] applied to", applied, "displays;", skipped, "skipped");
       renderProps && renderProps();
       render();
     });
