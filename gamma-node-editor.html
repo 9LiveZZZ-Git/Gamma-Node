@@ -5811,6 +5811,7 @@
     <div class="ai-calib-foot">
       <span class="ai-calib-hint">High-confidence non-zero corrections are pre-checked. Uncheck any you don't trust. Reasoning shown per row.</span>
       <span>
+        <button class="btn" id="ai-calibration-export" title="Download a ZIP containing report.md (human-readable summary of both AI phases, per-display reasoning + cumulative deltas) and corrections.json (full structured diff). Useful for documenting calibration runs, sharing with collaborators, or feeding into a follow-up analysis.">Export report…</button>
         <button class="btn" id="ai-calibration-cancel">Cancel</button>
         <button class="btn primary" id="ai-calibration-apply">Apply selected</button>
       </span>
@@ -16476,6 +16477,229 @@ function applyCalibrationCorrections(corrections) {
   return applied;
 }
 
+/* Phase 6.6.20.18 — build a diagnostic + fixes report for an
+ * AI calibration run. Inputs:
+ *   analysisResult.finalDiff — cumulative per-display deltas
+ *   analysisResult.phase1    — phase 1 result (if present)
+ *   analysisResult.phase2    — phase 2 result (if present)
+ *
+ * Output: { md: <string>, json: <object> } where md is human-
+ * readable Markdown and json is the full structured data
+ * (suitable for downstream analyzers / spreadsheet imports). */
+function _buildAICalibrationReport(analysisResult) {
+  const finalDiff = (analysisResult && analysisResult.finalDiff) || [];
+  const phase1    = analysisResult && analysisResult.phase1;
+  const phase2    = analysisResult && analysisResult.phase2;
+  const ts = new Date().toISOString();
+
+  // Helper: extract last-iteration AI reasoning per display.
+  const reasoningFromPhase = (phase) => {
+    const m = {};
+    if (!phase || !phase.lastResult || !Array.isArray(phase.lastResult.corrections)) return m;
+    for (const c of phase.lastResult.corrections) {
+      m[c.idx] = {
+        reasoning: c.reasoning || "",
+        confidence: c.confidence || 0,
+        error: c.error || null
+      };
+    }
+    return m;
+  };
+  const phase1Reason = reasoningFromPhase(phase1);
+  const phase2Reason = reasoningFromPhase(phase2);
+
+  // Per-display rows for the JSON payload + Markdown table.
+  const rows = finalDiff.map(c => {
+    const k = c.keystone || {};
+    const ksAbs = Math.abs(k.tlx || 0) + Math.abs(k.tly || 0) +
+                  Math.abs(k.trx || 0) + Math.abs(k.try_ || 0) +
+                  Math.abs(k.blx || 0) + Math.abs(k.bly || 0) +
+                  Math.abs(k.brx || 0) + Math.abs(k.bry || 0);
+    const bdCount = (c.bezierDiff && c.bezierDiff.count) || 0;
+    const bdAbs   = (c.bezierDiff && c.bezierDiff.totalAbs) || 0;
+    const changedPose = Math.abs(c.deltaYaw)   > 0.005 ||
+                        Math.abs(c.deltaPitch) > 0.005 ||
+                        Math.abs(c.deltaFovH)  > 0.005 ||
+                        Math.abs(c.deltaFovV)  > 0.005;
+    const changed = changedPose || ksAbs > 5e-4 || bdCount > 0;
+    return {
+      idx: c.idx,
+      displayId:   c.displayId,
+      displayName: c.displayName,
+      pose: c.pose,                // baseline pose
+      fov:  c.fov,
+      poseFinal: {
+        yaw:   (c.pose ? c.pose.yaw   : 0) + (c.deltaYaw   || 0),
+        pitch: (c.pose ? c.pose.pitch : 0) + (c.deltaPitch || 0)
+      },
+      fovFinal: {
+        h: (c.fov ? c.fov.h : 0) + (c.deltaFovH || 0),
+        v: (c.fov ? c.fov.v : 0) + (c.deltaFovV || 0)
+      },
+      deltas: {
+        yaw:   c.deltaYaw   || 0,
+        pitch: c.deltaPitch || 0,
+        fovH:  c.deltaFovH  || 0,
+        fovV:  c.deltaFovV  || 0
+      },
+      keystone: {
+        tlx: k.tlx || 0, tly: k.tly || 0,
+        trx: k.trx || 0, try_: k.try_ || 0,
+        blx: k.blx || 0, bly: k.bly || 0,
+        brx: k.brx || 0, bry: k.bry || 0,
+        absSum: ksAbs
+      },
+      bezier: c.bezierDiff || { count: 0, totalAbs: 0, perPoint: [] },
+      reasoning: {
+        phase1: phase1Reason[c.idx] || null,
+        phase2: phase2Reason[c.idx] || null
+      },
+      changed
+    };
+  });
+
+  // Aggregate counts.
+  const changedCount = rows.filter(r => r.changed).length;
+  const erroredCount = rows.filter(r => (r.reasoning.phase1 && r.reasoning.phase1.error) ||
+                                         (r.reasoning.phase2 && r.reasoning.phase2.error)).length;
+
+  const json = {
+    app: "Gamma Node",
+    version: APP_VERSION,
+    timestamp: ts,
+    summary: {
+      iterations: {
+        phase1: phase1 ? phase1.iterations : 0,
+        phase2: phase2 ? phase2.iterations : 0,
+        total:  (phase1 ? phase1.iterations : 0) + (phase2 ? phase2.iterations : 0)
+      },
+      totalCorrectionsApplied: analysisResult.totalCorrections || 0,
+      displaysChanged: changedCount,
+      displaysErrored: erroredCount,
+      totalDisplays: rows.length
+    },
+    rig: state.rig ? {
+      templateKey: state.rig.templateKey,
+      surface:     state.rig.surface,
+      sweetSpot:   state.rig.sweetSpot,
+      shaderCenterYaw:   state.rig.shaderCenterYaw   || 0,
+      shaderCenterPitch: state.rig.shaderCenterPitch || 0
+    } : null,
+    displays: rows
+  };
+
+  // Build the Markdown report.
+  const md = (() => {
+    const lines = [];
+    lines.push("# AI Calibration Report");
+    lines.push("");
+    lines.push("Generated " + ts + " by Gamma Node v" + APP_VERSION + ".");
+    lines.push("");
+    lines.push("## Summary");
+    lines.push("");
+    lines.push("- **Phase 1** (pose+FOV+keystone): " + (phase1 ? phase1.iterations : 0) + " iteration(s)");
+    lines.push("- **Phase 2** (Bezier interior): " + (phase2 ? phase2.iterations : 0) + " iteration(s)");
+    lines.push("- **Displays changed:** " + changedCount + " / " + rows.length);
+    lines.push("- **Errors:** " + erroredCount);
+    lines.push("- **Total corrections applied:** " + (analysisResult.totalCorrections || 0));
+    lines.push("");
+    if (state.rig && state.rig.surface) {
+      lines.push("## Rig configuration");
+      lines.push("");
+      lines.push("- Surface type: `" + state.rig.surface.type + "`");
+      if (state.rig.surface.type === "swept") {
+        const p = state.rig.surface.profile || {};
+        const path = state.rig.surface.path || {};
+        lines.push("  - Profile: " + p.kind + " radius=" + p.radius +
+                   (p.kind === "arc" ? ", pitch [" + p.pitchStart + "°, " + p.pitchEnd + "°]"
+                                     : ", y [" + p.yMin + ", " + p.yMax + "]"));
+        lines.push("  - Path: yaw [" + path.yawStart + "°, " + path.yawEnd + "°]");
+      }
+      lines.push("- Sweet spot: " + JSON.stringify(state.rig.sweetSpot));
+      lines.push("");
+    }
+    lines.push("## Per-display details");
+    lines.push("");
+    for (const r of rows) {
+      lines.push("### Display " + r.idx + " — `" + (r.displayId || "") + "`" +
+                 (r.displayName ? ' "' + r.displayName + '"' : "") +
+                 (r.changed ? "" : "  *(no changes)*"));
+      lines.push("");
+      lines.push("**Pose**: yaw " + r.pose.yaw.toFixed(2) + "° → " + r.poseFinal.yaw.toFixed(2) +
+                 "° (Δ " + (r.deltas.yaw >= 0 ? "+" : "") + r.deltas.yaw.toFixed(3) + "°), " +
+                 "pitch " + r.pose.pitch.toFixed(2) + "° → " + r.poseFinal.pitch.toFixed(2) +
+                 "° (Δ " + (r.deltas.pitch >= 0 ? "+" : "") + r.deltas.pitch.toFixed(3) + "°)");
+      lines.push("");
+      if (Math.abs(r.deltas.fovH) > 0.005 || Math.abs(r.deltas.fovV) > 0.005) {
+        lines.push("**FOV**: " + r.fov.h.toFixed(2) + "° × " + r.fov.v.toFixed(2) +
+                   "° → " + r.fovFinal.h.toFixed(2) + "° × " + r.fovFinal.v.toFixed(2) + "°");
+        lines.push("");
+      }
+      if (r.keystone.absSum > 5e-4) {
+        const k = r.keystone;
+        const fmt = v => (v >= 0 ? "+" : "") + v.toFixed(4);
+        lines.push("**Keystone corners** (NDC):");
+        lines.push("  - TL = (" + fmt(k.tlx) + ", " + fmt(k.tly) + ")");
+        lines.push("  - TR = (" + fmt(k.trx) + ", " + fmt(k.try_) + ")");
+        lines.push("  - BL = (" + fmt(k.blx) + ", " + fmt(k.bly) + ")");
+        lines.push("  - BR = (" + fmt(k.brx) + ", " + fmt(k.bry) + ")");
+        lines.push("");
+      }
+      if (r.bezier && r.bezier.count > 0 && Array.isArray(r.bezier.perPoint)) {
+        lines.push("**Bezier control points** (5×5 grid, " + r.bezier.count + " adjusted, Σ|Δ|=" +
+                   r.bezier.totalAbs.toFixed(4) + " NDC):");
+        for (const pt of r.bezier.perPoint) {
+          const fmt = v => (v >= 0 ? "+" : "") + v.toFixed(5);
+          lines.push("  - (col=" + pt.col + ", row=" + pt.row + ") = (" + fmt(pt.dx) + ", " + fmt(pt.dy) + ")");
+        }
+        lines.push("");
+      }
+      if (r.reasoning.phase1) {
+        const p1 = r.reasoning.phase1;
+        if (p1.error) {
+          lines.push("> **Phase 1 ERROR**: " + p1.error);
+        } else if (p1.reasoning) {
+          lines.push("> **Phase 1 AI** (conf " + (p1.confidence * 100).toFixed(0) + "%): " + p1.reasoning);
+        }
+        lines.push("");
+      }
+      if (r.reasoning.phase2) {
+        const p2 = r.reasoning.phase2;
+        if (p2.error) {
+          lines.push("> **Phase 2 ERROR**: " + p2.error);
+        } else if (p2.reasoning) {
+          lines.push("> **Phase 2 AI** (conf " + (p2.confidence * 100).toFixed(0) + "%): " + p2.reasoning);
+        }
+        lines.push("");
+      }
+    }
+    if (erroredCount > 0) {
+      lines.push("## Errors");
+      lines.push("");
+      lines.push(erroredCount + " display(s) had at least one phase with an API error. Review the per-display sections above for the specific error messages, then check AI Settings (User DSP tab → ⚙) for provider/key issues.");
+      lines.push("");
+    }
+    return lines.join("\n");
+  })();
+
+  return { md, json };
+}
+
+/* Phase 6.6.20.18 — package the report into a ZIP and download. */
+function exportAICalibrationReport(analysisResult) {
+  const report = _buildAICalibrationReport(analysisResult);
+  const files = {
+    "report.md":         new TextEncoder().encode(report.md),
+    "corrections.json":  new TextEncoder().encode(JSON.stringify(report.json, null, 2))
+  };
+  const zip = _writeZipArchive(files);
+  const ts  = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const fname = "ai-calibration-report-" + ts + ".zip";
+  _downloadBlob(new Blob([zip], { type: "application/zip" }), fname);
+  console.log("[ai-calibration-report] saved " + fname);
+  return fname;
+}
+
 /* Show the AI corrections diff modal. Promise resolves with the
  * filtered list of corrections the user approved (or [] on cancel). */
 function showAICalibrationModal(analysisResult) {
@@ -16583,15 +16807,35 @@ ${bdLine}
     const closeBtn  = document.getElementById("ai-calibration-close");
     const selectAll = document.getElementById("ai-calibration-select-all");
     const selectNone = document.getElementById("ai-calibration-select-none");
+    const exportBtn = document.getElementById("ai-calibration-export");
     const onApply  = () => close(true);
     const onCancel = () => close(false);
     const onAll    = () => list.querySelectorAll('input[type="checkbox"][data-correction-idx]:not(:disabled)').forEach(c => c.checked = true);
     const onNone   = () => list.querySelectorAll('input[type="checkbox"][data-correction-idx]').forEach(c => c.checked = false);
+    // Phase 6.6.20.18 — export diagnostic + fixes report. Generates
+    // a ZIP with report.md + corrections.json. Doesn't dismiss the
+    // modal — user can still apply / cancel after exporting.
+    const onExport = () => {
+      try {
+        const fname = exportAICalibrationReport(analysisResult);
+        const orig = exportBtn.textContent;
+        exportBtn.textContent = "Saved " + fname.split("-").slice(-2).join("-").replace(".zip", "");
+        exportBtn.disabled = true;
+        setTimeout(() => {
+          exportBtn.textContent = orig;
+          exportBtn.disabled = false;
+        }, 1800);
+      } catch (e) {
+        console.error("[ai-calibration-report] export failed:", e);
+        alert("Could not export report:\n\n" + (e && e.message ? e.message : String(e)));
+      }
+    };
     if (applyBtn)  applyBtn.onclick  = onApply;
     if (cancelBtn) cancelBtn.onclick = onCancel;
     if (closeBtn)  closeBtn.onclick  = onCancel;
     if (selectAll) selectAll.onclick = onAll;
     if (selectNone) selectNone.onclick = onNone;
+    if (exportBtn) exportBtn.onclick = onExport;
   });
 }
 
@@ -16971,7 +17215,18 @@ async function runAICalibrationFlow(opts) {
 
     // Has changes — show diff modal. Unchecked rows get reverted.
     const beforeRevert = result.finalDiff.slice();
-    const approved = await showAICalibrationModal({ corrections: result.finalDiff });
+    // 6.6.20.18 — pass the full result so the modal can build a
+    // diagnostic report (phase1/phase2 reasoning + cumulative
+    // diffs) on demand. The modal still uses .corrections for the
+    // diff rows; the rest is for the Export button.
+    const approved = await showAICalibrationModal({
+      corrections:      result.finalDiff,
+      finalDiff:        result.finalDiff,
+      phase1:           result.phase1,
+      phase2:           result.phase2,
+      iterations:       result.iterations,
+      totalCorrections: result.totalCorrections
+    });
     const keepIds = new Set(approved.map(c => c.idx));
     let reverted = 0;
     for (const c of beforeRevert) {
