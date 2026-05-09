@@ -12983,7 +12983,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     outs: [{ n: "out", t: "texture" }],
     params: {
       size: 24,
-      mode: 0,                                // 0 = HEALPix (default), 1 = Lambert, 2 = cube
+      mode: 1,                                // 0 = HEALPix uniform-pixel, 1 = Lambert (default), 2 = cube
       rA: 0.92, gA: 0.92, bA: 0.92,
       rB: 0.08, gB: 0.08, bB: 0.08
     },
@@ -13180,11 +13180,28 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     return select(u.colorB, u.colorA, parity == 0);
   }
   if (mode == 1) {
-    // Lambert equal-area (Path B from 6.6.20.3).
+    // Lambert equal-area (Path B from 6.6.20.3) with polar-cap
+    // mitigation. The Lambert sin-pitch substitution is mathematically
+    // perfect equal-area, but at v→0 or v→1 the cells degenerate
+    // visually into thin pizza slices that read as a singular dot
+    // at the pole. Fix: in the topmost + bottommost bands, halve
+    // the yaw cell count (cells become wider in those bands). Each
+    // halving step keeps the cells roughly square in solid-angle
+    // dimensions and removes the visible point-singularity.
     let uv = surface_uv_norm(ang.x, ang.y);
     let v_size = max(2.0, floor(size * 0.5 + 0.5));
-    let cellU = floor(uv.x * size);
     let cellV = floor(uv.y * v_size);
+    // How close to either pole — 0 at equator, ~v_size/2 at poles.
+    let pole_dist = abs(cellV - (v_size - 1.0) * 0.5);
+    let pole_max  = (v_size - 1.0) * 0.5;
+    // For the outermost 2 bands on each side, divide h_cells by 2;
+    // for the very edge band, divide by 4. Keeps it even (parity
+    // alternates correctly within rings).
+    var h_div: f32 = 1.0;
+    if (pole_dist > pole_max - 0.1)        { h_div = 4.0; }
+    else if (pole_dist > pole_max - 1.1)   { h_div = 2.0; }
+    let h_cells = max(2.0, floor(size / h_div + 0.5));
+    let cellU = floor(uv.x * h_cells);
     let parity = (i32(cellU) + i32(cellV)) & 1;
     return select(u.colorB, u.colorA, parity == 0);
   }
@@ -13230,7 +13247,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       scratch[26] = 0; scratch[27] = 0;
       _packSurfaceUniforms(scratch, 28);
     },
-    description: "Checkerboard — uniform cells on the rig's screen surface. mode: 0 = HEALPix sphere pixelization (Górski et al. 2005, default — equal solid angle, no axis seams); 1 = Lambert cylindrical equal-area (6.6.20.3); 2 = cube-mapped (6.6.17 legacy). size: cells around the equator (HEALPix: 4·nside; Lambert: direct). See docs/HEALPIX.md for details."
+    description: "Checkerboard — uniform cells on the rig's screen surface. mode: 0 = HEALPix uniform-pixel tessellation (Górski 2005 — provably equal-area diamond cells, but reads as herringbone stripes, NOT a checker; useful when uniform-pixel-tessellation is the goal); 1 = Lambert cylindrical equal-area (default — concentric ring checker, Bourke aesthetic, with polar-cap halving to soften the sin-pitch pole pinch); 2 = cube-mapped (6.6.17 legacy — visible cube-edge seams). size: cells around the equator. See docs/HEALPIX.md for the full math + tradeoffs."
   },
 
   /* Phase 6.4 — Voronoi. Cellular noise with edge highlighting and
