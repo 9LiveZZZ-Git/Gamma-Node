@@ -13449,6 +13449,210 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     description: "Voronoi cellular noise — surface-aware equal-area cells on the rig screen (sphere/cylinder/swept). F2-F1 edge highlighting + per-cell random color. density: cells around the equator. edgeThickness: dark border width. seed: shifts the cell pattern."
   },
 
+  /* Phase 6.6.20.7 — WireframeCalibration. AlloSphere-style
+   * calibration pattern: lat/long sphere wireframe + 3 axis-aligned
+   * great circles (RGB-coded) + 3 beacon small-circles around the
+   * cardinal axes (RGB-coded). All rendered as thin lines on the
+   * unit sphere, using each fragment's global (yaw, pitch) to
+   * compute angular distance to each line.
+   *
+   * Reference: AlloLib calibration_pattern.cpp (UCSB AlloSphere
+   * Research Facility) — the pattern used for the actual physical
+   * calibration of their 26-projector dome.
+   *
+   * Use this together with Auto-blend (hard cuts) to verify
+   * projector calibration: every line in the wireframe should
+   * connect smoothly across projector boundaries. If a line
+   * shifts/breaks at a boundary, that projector's pose / FOV /
+   * warp mesh is off and needs adjusting. */
+  WireframeCalibration: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    ins: [
+      { n: "lineWidth",    t: "param" },
+      { n: "slices",       t: "param" },
+      { n: "stacks",       t: "param" },
+      { n: "beaconRadius", t: "param" },
+      { n: "showGrid",     t: "param" },
+      { n: "showGreat",    t: "param" },
+      { n: "showBeacons",  t: "param" },
+      { n: "bgR",          t: "param" },
+      { n: "bgG",          t: "param" },
+      { n: "bgB",          t: "param" },
+      { n: "gridR",        t: "param" },
+      { n: "gridG",        t: "param" },
+      { n: "gridB",        t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    params: {
+      lineWidth: 0.4,
+      slices: 24,
+      stacks: 12,
+      beaconRadius: 5,
+      showGrid: 1,
+      showGreat: 1,
+      showBeacons: 1,
+      bgR: 0, bgG: 0, bgB: 0,
+      gridR: 0.4, gridG: 0.4, gridB: 0.4
+    },
+    methods: {},
+    uniformBytes: 128,
+    wgsl:
+`struct U {
+  u_resolution: vec4f,
+  u_time:       f32,
+  u_dt:         f32,
+  u_layer:      f32,
+  u_fov_v_deg:  f32,
+  u_view:       vec4f,
+  u_world_uv:   vec4f,
+  bgColor:      vec4f,
+  gridColor:    vec4f,
+  params:       vec4f,    // x=line_w_deg, y=slices, z=stacks, w=beacon_r_deg
+  flags:        vec4f,    // x=show_grid, y=show_great, z=show_beacons
+};
+@group(0) @binding(0) var<uniform> u: U;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+fn frag_to_global_angles(uv: vec2f) -> vec2f {
+  let fov_h_rad = u.u_view.w   * 0.0174532925;
+  let fov_v_rad = u.u_fov_v_deg * 0.0174532925;
+  let local_x = (uv.x - 0.5) * 2.0 * tan(fov_h_rad * 0.5);
+  let local_y = (0.5 - uv.y) * 2.0 * tan(fov_v_rad * 0.5);
+  return vec2f(
+    u.u_view.x + atan(local_x) * 57.29577951,
+    u.u_view.y + atan(local_y) * 57.29577951
+  );
+}
+
+// Smooth line ramp: 1.0 at distance 0, fades to 0 at distance line_w.
+fn line_alpha(angular_dist_deg: f32, line_w_deg: f32) -> f32 {
+  return 1.0 - smoothstep(line_w_deg * 0.5, line_w_deg, angular_dist_deg);
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let ang = frag_to_global_angles(in.uv);
+  let yaw   = ang.x;
+  let pitch = ang.y;
+  let cp = cos(pitch * 0.01745329);
+  let sp = sin(pitch * 0.01745329);
+  let cy = cos(yaw   * 0.01745329);
+  let sy = sin(yaw   * 0.01745329);
+  // Unit direction vector. Convention matches the rest of the editor:
+  //   yaw=0 forward = +Z; yaw=+90 = +X (right); pitch=+90 = +Y (up).
+  let D = vec3f(sy * cp, sp, cy * cp);
+
+  let line_w  = max(0.05, u.params.x);
+  let slices  = max(2.0,  u.params.y);
+  let stacks  = max(2.0,  u.params.z);
+  let beacon  = max(0.5,  u.params.w);
+
+  var color = u.bgColor.rgb;
+
+  // 1. Lat/long sphere wireframe grid (gray by default).
+  if (u.flags.x > 0.5) {
+    // Meridian: nearest constant-yaw line. Angular dist = arcsin(|D·N|)
+    // where N = (cos(yaw_m), 0, -sin(yaw_m)). Equivalent:
+    //   dist = arcsin(|sin(Δyaw)·cos(pitch)|).
+    // Using cos-correction makes the line angular-uniform on the
+    // sphere (sub-pixel-thin near poles, no polar bunching artifact).
+    let yaw_spacing = 360.0 / slices;
+    let yaw_nearest = round(yaw / yaw_spacing) * yaw_spacing;
+    let dy_rad = (yaw - yaw_nearest) * 0.01745329;
+    let mer_dist = asin(clamp(abs(sin(dy_rad)) * cp, 0.0, 1.0)) * 57.29578;
+    let mer_alpha = line_alpha(mer_dist, line_w);
+
+    // Parallel: nearest constant-pitch line. Distance is just
+    // |Δpitch| (angular-uniform by definition of pitch).
+    let pitch_spacing = 180.0 / stacks;
+    let pitch_nearest = round(pitch / pitch_spacing) * pitch_spacing;
+    let par_dist = abs(pitch - pitch_nearest);
+    let par_alpha = line_alpha(par_dist, line_w);
+
+    let grid_alpha = max(mer_alpha, par_alpha) * u.gridColor.a;
+    color = mix(color, u.gridColor.rgb, grid_alpha);
+  }
+
+  // 2. Three colored great circles — one per coordinate plane.
+  // Each great circle is the intersection of the sphere with a plane
+  // through the origin. Distance from D (on sphere) to that plane
+  // = arcsin(|D·N|) where N is the plane normal.
+  if (u.flags.y > 0.5) {
+    let gw = line_w * 1.5;     // slightly thicker than grid
+    // XZ plane (y=0). Equator. Normal = +Y. Color = red (matches
+    // AlloLib's mXZCircle).
+    let xz_dist = asin(clamp(abs(D.y), 0.0, 1.0)) * 57.29578;
+    color = mix(color, vec3f(1.0, 0.18, 0.18), line_alpha(xz_dist, gw));
+    // XY plane (z=0). Normal = +Z. Color = green.
+    let xy_dist = asin(clamp(abs(D.z), 0.0, 1.0)) * 57.29578;
+    color = mix(color, vec3f(0.18, 1.0, 0.18), line_alpha(xy_dist, gw));
+    // YZ plane (x=0). Normal = +X. Color = blue.
+    let yz_dist = asin(clamp(abs(D.x), 0.0, 1.0)) * 57.29578;
+    color = mix(color, vec3f(0.18, 0.18, 1.0), line_alpha(yz_dist, gw));
+  }
+
+  // 3. Beacon circles — small circles at angular radius 'beacon'
+  // around each cardinal +axis. Helps orient the viewer (each
+  // beacon is on the side it labels).
+  if (u.flags.z > 0.5) {
+    let bw = line_w * 1.5;
+    // +X beacon (right side). Show only when D.x > 0 so the beacon
+    // appears on +X side, not also on -X side. Distance from +X
+    // axis = arccos(D.x).
+    if (D.x > 0.0) {
+      let x_dist = acos(clamp(D.x, -1.0, 1.0)) * 57.29578;
+      color = mix(color, vec3f(1.0, 0.18, 0.18), line_alpha(abs(x_dist - beacon), bw));
+    }
+    // +Y beacon (top). Distance from +Y = arccos(D.y) = 90 - pitch.
+    if (D.y > 0.0) {
+      let y_dist = acos(clamp(D.y, -1.0, 1.0)) * 57.29578;
+      color = mix(color, vec3f(0.18, 1.0, 0.18), line_alpha(abs(y_dist - beacon), bw));
+    }
+    // +Z beacon (front). Distance from +Z = arccos(D.z).
+    if (D.z > 0.0) {
+      let z_dist = acos(clamp(D.z, -1.0, 1.0)) * 57.29578;
+      color = mix(color, vec3f(0.18, 0.18, 1.0), line_alpha(abs(z_dist - beacon), bw));
+    }
+  }
+
+  return vec4f(color, 1.0);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      // bgColor at 16-19, gridColor at 20-23, params at 24-27, flags at 28-31.
+      scratch[16] = (typeof p.bgR === "number") ? p.bgR : 0;
+      scratch[17] = (typeof p.bgG === "number") ? p.bgG : 0;
+      scratch[18] = (typeof p.bgB === "number") ? p.bgB : 0;
+      scratch[19] = 1.0;
+      scratch[20] = (typeof p.gridR === "number") ? p.gridR : 0.4;
+      scratch[21] = (typeof p.gridG === "number") ? p.gridG : 0.4;
+      scratch[22] = (typeof p.gridB === "number") ? p.gridB : 0.4;
+      scratch[23] = 1.0;
+      scratch[24] = (typeof p.lineWidth    === "number") ? p.lineWidth    : 0.4;
+      scratch[25] = (typeof p.slices       === "number") ? p.slices       : 24;
+      scratch[26] = (typeof p.stacks       === "number") ? p.stacks       : 12;
+      scratch[27] = (typeof p.beaconRadius === "number") ? p.beaconRadius : 5;
+      scratch[28] = (typeof p.showGrid     === "number") ? p.showGrid     : 1;
+      scratch[29] = (typeof p.showGreat    === "number") ? p.showGreat    : 1;
+      scratch[30] = (typeof p.showBeacons  === "number") ? p.showBeacons  : 1;
+      scratch[31] = 0;
+    },
+    description: "WireframeCalibration — AlloSphere-style 3D wireframe pattern (lat/long sphere grid + 3 RGB-coded great circles + 3 beacon circles around cardinal axes). Lines stay sub-pixel-thin everywhere on the sphere → no polar distortion, regardless of viewing direction. Pair with Auto-blend (hard cuts) to verify projector calibration: every line should connect smoothly at projector boundaries; any shift/break reveals miscalibrated pose, FOV, or warp. lineWidth: line angular thickness in degrees (0.4 default). slices/stacks: lat/long grid density. beaconRadius: angular radius of cardinal-axis beacons in degrees. show*: toggle each layer (1=on, 0=off). bgR/G/B: background color. gridR/G/B: lat/long grid line color. Reference: AlloLib calibration_pattern.cpp."
+  },
+
   /* Phase 6.4 — NoiseShader. Simplex 2D fBm with octaves. Output is
    * grayscale 0..1 (interpret as height field, mask, or modulator).
    * scale controls primary frequency; octaves stacks rougher detail
