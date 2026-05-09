@@ -12986,19 +12986,22 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       rB: 0.08, gB: 0.08, bB: 0.08
     },
     methods: {},
-    uniformBytes: 112,
+    uniformBytes: 144,
     wgsl:
 `struct U {
-  u_resolution: vec4f,
-  u_time:       f32,
-  u_dt:         f32,
-  u_layer:      f32,
-  u_fov_v_deg:  f32,
-  u_view:       vec4f,    // (yaw, pitch, roll, fov_h_deg)
-  u_world_uv:   vec4f,
-  colorA:       vec4f,
-  colorB:       vec4f,
-  sizeAndPad:   vec4f,    // x=size (cells around 360° azimuth), yzw=_
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,    // (yaw, pitch, roll, fov_h_deg)
+  u_world_uv:    vec4f,
+  colorA:        vec4f,
+  colorB:        vec4f,
+  sizeAndPad:    vec4f,    // x=size (cells around 360° azimuth), yzw=_
+  // Phase 6.6.20.3 — surface-aware shader uniforms.
+  u_surface:     vec4f,    // (type, radius, param_a, param_b)
+  u_surface_path: vec4f,   // (yawStart, yawEnd, _, _)
 };
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -13034,51 +13037,90 @@ fn frag_to_global_angles(uv: vec2f) -> vec2f {
   );
 }
 
+// Phase 6.6.20.3 — surface-aware equal-area normalization.
+// Maps a (yaw, pitch) global direction to (u, v) ∈ [0, 1]² using the
+// natural surface parameterization:
+//   sphere / swept-arc / no-surface → (yaw_norm, sin(pitch)_norm)
+//                                      Lambert cylindrical equal-area;
+//                                      cells uniform in solid angle.
+//   cylinder / swept-vertical       → (yaw_norm, y_clamped_norm)
+//                                      cells uniform in arc-length × Y.
+// Yaw is wrapped into the path range. Out-of-range pitches clamp to
+// the surface bounds (no visible miss; cells just stop at the edge).
+fn surface_uv_norm(yaw_deg: f32, pitch_deg: f32) -> vec2f {
+  let stype = u32(u.u_surface.x + 0.5);
+  let yawStart = u.u_surface_path.x;
+  let yawEnd   = u.u_surface_path.y;
+  let yawSpan  = max(yawEnd - yawStart, 0.001);
+  let yawWrap  = yaw_deg - 360.0 * floor((yaw_deg - yawStart) / 360.0);
+  let u_norm   = (yawWrap - yawStart) / yawSpan;
+  var v_norm: f32 = 0.5;
+  if (stype == 2u || stype == 4u) {
+    // Cylinder / swept-vertical: y at intersection = R·tan(pitch),
+    // clamped to [yMin, yMax]. Linear in y → uniform area on cylinder.
+    let R    = u.u_surface.y;
+    let yMin = u.u_surface.z;
+    let yMax = u.u_surface.w;
+    let pitchRad = pitch_deg * 0.01745329;
+    let cosP = cos(pitchRad);
+    var cy: f32 = 0.0;
+    if (abs(cosP) > 1e-4) {
+      cy = R * tan(pitchRad);
+    } else {
+      // Near-vertical ray → clamp to nearest cap
+      cy = sign(pitch_deg) * (abs(yMax) + abs(yMin)) * 100.0;
+    }
+    let cyClamped = clamp(cy, yMin, yMax);
+    v_norm = (cyClamped - yMin) / max(yMax - yMin, 0.001);
+  } else {
+    // Sphere / swept-arc / no-surface: equal-area v = sin(pitch).
+    var pStart: f32 = -90.0;
+    var pEnd:   f32 =  90.0;
+    if (stype == 3u) {
+      pStart = u.u_surface.z;
+      pEnd   = u.u_surface.w;
+    }
+    let sinStart = sin(pStart * 0.01745329);
+    let sinEnd   = sin(pEnd   * 0.01745329);
+    let sinP     = sin(pitch_deg * 0.01745329);
+    v_norm = (sinP - sinStart) / max(sinEnd - sinStart, 0.001);
+  }
+  return vec2f(u_norm, v_norm);
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4f {
-  // Phase 6.6.17 — CUBE-MAPPED cells. Equirect (yaw/pitch) cells
-  // squish toward poles ('rings of pizza slices'); the user's
-  // bottom-looking-at-top reference showed this clearly. Cube
-  // mapping projects the fragment's 3D direction onto the dominant
-  // axis face, then cells are uniform N×N within each face. Result:
-  // cells stay roughly equal-area across the WHOLE sphere with no
-  // polar singularity. Six faces × N×N cells where N = size/4 so
-  // the equator (which passes through 4 faces) carries 'size' cells
-  // total — same total around the equator as before, but uniform
-  // everywhere else.
+  // Phase 6.6.20.3 — SURFACE-AWARE EQUAL-AREA Checkerboard.
+  //
+  // Cells uniform on the physical screen (sphere/cylinder/swept):
+  //   sphere / swept-arc → cells of equal solid angle
+  //   cylinder / swept-vertical → cells of equal area
+  //
+  // Math: Lambert cylindrical equal-area parameterization places
+  // cells uniform in (yaw, sin(pitch)). The sin-of-pitch substitution
+  // compresses cells in pitch-degrees toward the poles but keeps
+  // them equal in solid angle on the sphere — which is the Bourke-
+  // reference aesthetic the user has been asking for.
+  //
+  // No polar bunching, no cube-face seams, no row-step artifacts.
+  // Yaw seam at yawStart/yawEnd boundary is unavoidable for partial
+  // sweeps; full revolutions wrap continuously.
   let ang = frag_to_global_angles(in.uv);
-  let yr = ang.x * 0.01745329;
-  let pr = ang.y * 0.01745329;
-  let dx = sin(yr) * cos(pr);
-  let dy = sin(pr);
-  let dz = cos(yr) * cos(pr);
-  let absX = abs(dx);
-  let absY = abs(dy);
-  let absZ = abs(dz);
-
-  var faceU: f32 = 0.0;
-  var faceV: f32 = 0.0;
-  if (absX >= absY && absX >= absZ) {
-    faceU = dz / dx;
-    faceV = dy / absX;
-  } else if (absY >= absZ) {
-    faceU = dx / absY;
-    faceV = dz / dy;
-  } else {
-    faceU = dx / dz;
-    faceV = dy / absZ;
-  }
-  // faceU, faceV ∈ [-1, 1]. Map to N cells per face.
+  let uv  = surface_uv_norm(ang.x, ang.y);
   let size = max(u.sizeAndPad.x, 1.0);
-  let N = max(1.0, floor(size * 0.25 + 0.5));
-  let cellU = floor((faceU + 1.0) * 0.5 * N);
-  let cellV = floor((faceV + 1.0) * 0.5 * N);
+  // V cells = half of yaw cells by default — sphere has half the
+  // pitch range as yaw (180° vs 360°), so cells stay roughly square
+  // in solid-angle dimensions at the equator.
+  let v_size = max(2.0, floor(size * 0.5 + 0.5));
+  let cellU = floor(uv.x * size);
+  let cellV = floor(uv.y * v_size);
   let parity = (i32(cellU) + i32(cellV)) & 1;
   return select(u.colorB, u.colorA, parity == 0);
 }`,
     writeUniforms(node, scratch) {
       const p = node.params || {};
-      // colorA at 16-19, colorB at 20-23, sizeAndPad at 24-27
+      // colorA at 16-19, colorB at 20-23, sizeAndPad at 24-27.
+      // 6.6.20.3 — u_surface at 28-31, u_surface_path at 32-35.
       scratch[16] = (typeof p.rA === "number") ? p.rA : 0.92;
       scratch[17] = (typeof p.gA === "number") ? p.gA : 0.92;
       scratch[18] = (typeof p.bA === "number") ? p.bA : 0.92;
@@ -13089,8 +13131,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       scratch[23] = 1.0;
       scratch[24] = (typeof p.size === "number") ? p.size : 8;
       scratch[25] = 0; scratch[26] = 0; scratch[27] = 0;
+      _packSurfaceUniforms(scratch, 28);
     },
-    description: "Checkerboard — two-color N×N grid in world UV space. A shared shader across multiple displays renders ONE continuous board (use SolidColor for per-display fills). Default contrast pair is light-grey / dark-grey for orientation tests."
+    description: "Checkerboard — two-color cells, surface-aware equal-area on the rig's screen (sphere/cylinder/swept). Cells uniform in solid angle on a sphere (Bourke-reference aesthetic, no polar bunching). size: cells around the equator. Default contrast pair light-grey / dark-grey."
   },
 
   /* Phase 6.4 — Voronoi. Cellular noise with edge highlighting and
@@ -13109,17 +13152,20 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     outs: [{ n: "out", t: "texture" }],
     params: { density: 24, edgeThickness: 0.08, seed: 0.5 },
     methods: {},
-    uniformBytes: 80,
+    uniformBytes: 112,
     wgsl:
 `struct U {
-  u_resolution: vec4f,
-  u_time:       f32,
-  u_dt:         f32,
-  u_layer:      f32,
-  u_fov_v_deg:  f32,
-  u_view:       vec4f,
-  u_world_uv:   vec4f,
-  params:       vec4f,    // x=density (cells around 360°), y=edgeThickness, z=seed, w=_
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=density (cells around 360°), y=edgeThickness, z=seed, w=_
+  // Phase 6.6.20.3 — surface-aware uniforms.
+  u_surface:     vec4f,    // (type, radius, param_a, param_b)
+  u_surface_path: vec4f,   // (yawStart, yawEnd, _, _)
 };
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -13151,42 +13197,63 @@ fn frag_to_global_angles(uv: vec2f) -> vec2f {
   );
 }
 
+// Phase 6.6.20.3 — surface-aware equal-area helper. Same as
+// Checkerboard's; duplicated because each WGSL body is a self-
+// contained module (no cross-shader linkage in inline WGSL).
+fn surface_uv_norm(yaw_deg: f32, pitch_deg: f32) -> vec2f {
+  let stype = u32(u.u_surface.x + 0.5);
+  let yawStart = u.u_surface_path.x;
+  let yawEnd   = u.u_surface_path.y;
+  let yawSpan  = max(yawEnd - yawStart, 0.001);
+  let yawWrap  = yaw_deg - 360.0 * floor((yaw_deg - yawStart) / 360.0);
+  let u_norm   = (yawWrap - yawStart) / yawSpan;
+  var v_norm: f32 = 0.5;
+  if (stype == 2u || stype == 4u) {
+    let R    = u.u_surface.y;
+    let yMin = u.u_surface.z;
+    let yMax = u.u_surface.w;
+    let pitchRad = pitch_deg * 0.01745329;
+    let cosP = cos(pitchRad);
+    var cy: f32 = 0.0;
+    if (abs(cosP) > 1e-4) {
+      cy = R * tan(pitchRad);
+    } else {
+      cy = sign(pitch_deg) * (abs(yMax) + abs(yMin)) * 100.0;
+    }
+    v_norm = (clamp(cy, yMin, yMax) - yMin) / max(yMax - yMin, 0.001);
+  } else {
+    var pStart: f32 = -90.0;
+    var pEnd:   f32 =  90.0;
+    if (stype == 3u) {
+      pStart = u.u_surface.z;
+      pEnd   = u.u_surface.w;
+    }
+    let sinStart = sin(pStart * 0.01745329);
+    let sinEnd   = sin(pEnd   * 0.01745329);
+    let sinP     = sin(pitch_deg * 0.01745329);
+    v_norm = (sinP - sinStart) / max(sinEnd - sinStart, 0.001);
+  }
+  return vec2f(u_norm, v_norm);
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4f {
-  // Phase 6.6.17 — CUBE-MAPPED Voronoi. Same logic as Checkerboard:
-  // project the 3D direction onto its dominant cube face + run
-  // Voronoi in face-local UV. Cells stay uniform across the sphere
-  // instead of bunching up at poles. Different cube faces use a
-  // different seed offset so adjacent face boundaries don't show a
-  // mirror reflection.
-  let ang = frag_to_global_angles(in.uv);
-  let yr = ang.x * 0.01745329;
-  let pr = ang.y * 0.01745329;
-  let dx = sin(yr) * cos(pr);
-  let dy = sin(pr);
-  let dz = cos(yr) * cos(pr);
-  let absX = abs(dx);
-  let absY = abs(dy);
-  let absZ = abs(dz);
-  var faceU: f32 = 0.0;
-  var faceV: f32 = 0.0;
-  var faceSeed: f32 = 0.0;
-  if (absX >= absY && absX >= absZ) {
-    faceU = dz / dx; faceV = dy / absX;
-    faceSeed = select(11.7, 23.4, dx < 0.0);
-  } else if (absY >= absZ) {
-    faceU = dx / absY; faceV = dz / dy;
-    faceSeed = select(35.1, 46.8, dy < 0.0);
-  } else {
-    faceU = dx / dz; faceV = dy / absZ;
-    faceSeed = select(58.5, 70.2, dz < 0.0);
-  }
-  // Density = cells per equator (4 faces) → density/4 per face.
-  let N = max(1.0, floor(max(u.params.x, 1.0) * 0.25 + 0.5));
-  let scaled = vec2f((faceU + 1.0) * 0.5 * N, (faceV + 1.0) * 0.5 * N);
+  // Phase 6.6.20.3 — SURFACE-AWARE EQUAL-AREA Voronoi.
+  // Cells distributed equally on the physical screen surface using
+  // the same Lambert cylindrical equal-area parameterization as
+  // Checkerboard. Sphere/swept-arc → uniform solid-angle cells;
+  // cylinder/swept-vertical → uniform arc-length × Y cells. The 3x3
+  // neighbor scan happens in local cell coords; visible only as a
+  // thin seam at the yaw boundary or near the pole row, identical
+  // to Checkerboard's seams.
+  let ang   = frag_to_global_angles(in.uv);
+  let suv   = surface_uv_norm(ang.x, ang.y);
+  let density = max(u.params.x, 1.0);
+  let v_density = max(2.0, floor(density * 0.5 + 0.5));
+  let scaled = vec2f(suv.x * density, suv.y * v_density);
   let cell = floor(scaled);
   let frag = scaled - cell;
-  let seed = vec2f(u.params.z + faceSeed, u.params.z * 1.7 + faceSeed * 0.6);
+  let seed = vec2f(u.params.z, u.params.z * 1.7);
   var minDist:  f32 = 9999.0;
   var minDist2: f32 = 9999.0;
   var minCell:  vec2f = vec2f(0.0);
@@ -13208,12 +13275,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
 }`,
     writeUniforms(node, scratch) {
       const p = node.params || {};
+      // params at 16-19. 6.6.20.3 — u_surface at 20-23, u_surface_path at 24-27.
       scratch[16] = (typeof p.density       === "number") ? p.density       : 8;
       scratch[17] = (typeof p.edgeThickness === "number") ? p.edgeThickness : 0.05;
       scratch[18] = (typeof p.seed          === "number") ? p.seed          : 0.5;
       scratch[19] = 0;
+      _packSurfaceUniforms(scratch, 20);
     },
-    description: "Voronoi cellular noise — F2-F1 edge highlighting + per-cell random color. density: cells per world-UV unit (1..32); edgeThickness: dark border width (0..0.5); seed: shifts the cell pattern. Combine with FeedbackShader for trippy organic motion."
+    description: "Voronoi cellular noise — surface-aware equal-area cells on the rig screen (sphere/cylinder/swept). F2-F1 edge highlighting + per-cell random color. density: cells around the equator. edgeThickness: dark border width. seed: shifts the cell pattern."
   },
 
   /* Phase 6.4 — NoiseShader. Simplex 2D fBm with octaves. Output is
@@ -26734,6 +26803,87 @@ function _disposeShaderInstance(nodeId) {
  *   let world_uv = mix(u.u_world_uv.xy, u.u_world_uv.zw, in.uv);
  * Single-display rigs default to u_world_uv = (0,0,1,1) so existing
  * shaders that read in.uv directly behave identically. */
+/* Phase 6.6.20.3 — pack the rig's screen-surface descriptor into a
+ * shader's uniform scratch buffer at the given Float32 base index.
+ * Layout (8 floats, 2 vec4s):
+ *
+ *   [base+0..3] u_surface = (type, radius, param_a, param_b)
+ *   [base+4..7] u_surface_path = (yawStart, yawEnd, _, _)
+ *
+ * type codes:
+ *   0 = none / free / plane    → defaults to unit sphere full range
+ *   1 = sphere                 → param_a = -90, param_b = 90 (full)
+ *   2 = cylinder               → param_a = -length/2, param_b = +length/2
+ *   3 = swept (arc profile)    → param_a = pitchStart, param_b = pitchEnd
+ *   4 = swept (vertical profile) → param_a = yMin, param_b = yMax
+ *
+ * This lets surface-aware shaders (Checkerboard, Voronoi as of 6.6.20.3)
+ * read `u.u_surface.x` to dispatch to the right parameterization, and
+ * use param_a / param_b / yawStart / yawEnd to compute equal-area
+ * normalized UV for cell math.
+ *
+ * No-curved-surface fallback (stype=0): emits "fake unit sphere" so
+ * shaders in tile/equirect/fisheye preview modes still render uniform
+ * cells. The shader treats stype=0 the same as a full sphere of radius 1. */
+function _packSurfaceUniforms(scratch, base) {
+  const surface = (state && state.rig && state.rig.surface) || null;
+  const surfaceVisible = !!(state && state.rig && state.rig.surfaceVisible !== false);
+  const isCurved = !!(surface && surfaceVisible &&
+    (surface.type === "sphere" || surface.type === "cylinder" || surface.type === "swept"));
+  if (!isCurved) {
+    scratch[base + 0] = 0;        // type: none
+    scratch[base + 1] = 1;        // radius (unit fallback)
+    scratch[base + 2] = -90;      // pitchStart fallback
+    scratch[base + 3] = 90;       // pitchEnd fallback
+    scratch[base + 4] = -180;     // yawStart fallback
+    scratch[base + 5] = 180;      // yawEnd fallback
+    scratch[base + 6] = 0;
+    scratch[base + 7] = 0;
+    return;
+  }
+  if (surface.type === "sphere") {
+    scratch[base + 0] = 1;
+    scratch[base + 1] = surface.radius || 5;
+    scratch[base + 2] = -90;
+    scratch[base + 3] = 90;
+    scratch[base + 4] = -180;
+    scratch[base + 5] = 180;
+    scratch[base + 6] = 0;
+    scratch[base + 7] = 0;
+    return;
+  }
+  if (surface.type === "cylinder") {
+    const L = surface.length || 5;
+    scratch[base + 0] = 2;
+    scratch[base + 1] = surface.radius || 5;
+    scratch[base + 2] = -L * 0.5;
+    scratch[base + 3] =  L * 0.5;
+    scratch[base + 4] = -180;
+    scratch[base + 5] = 180;
+    scratch[base + 6] = 0;
+    scratch[base + 7] = 0;
+    return;
+  }
+  // type === "swept"
+  const profile = surface.profile || {};
+  const path = surface.path || { yawStart: -180, yawEnd: 180 };
+  if (profile.kind === "vertical") {
+    scratch[base + 0] = 4;
+    scratch[base + 1] = profile.radius || 5;
+    scratch[base + 2] = profile.yMin != null ? profile.yMin : -2.5;
+    scratch[base + 3] = profile.yMax != null ? profile.yMax :  2.5;
+  } else {
+    scratch[base + 0] = 3;
+    scratch[base + 1] = profile.radius || 5;
+    scratch[base + 2] = profile.pitchStart != null ? profile.pitchStart : -90;
+    scratch[base + 3] = profile.pitchEnd   != null ? profile.pitchEnd   :  90;
+  }
+  scratch[base + 4] = path.yawStart != null ? path.yawStart : -180;
+  scratch[base + 5] = path.yawEnd   != null ? path.yawEnd   :  180;
+  scratch[base + 6] = 0;
+  scratch[base + 7] = 0;
+}
+
 function _writeShaderPreamble(scratch, dtSec, display, worldUvOverride, layerIdx) {
   const t = (performance.now() - Visual.startTime) * 0.001;
   scratch[0]  = Visual.fbWidth;
