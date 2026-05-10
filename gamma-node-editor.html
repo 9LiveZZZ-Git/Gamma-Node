@@ -912,7 +912,8 @@
     font-family: var(--font-mono);
     font-size: 11px;
   }
-  .prop-grid input[type="number"] {
+  .prop-grid input[type="number"],
+  .prop-grid input[type="text"] {
     height: 28px;
     font-size: 12px;
     padding: 0 8px;
@@ -923,7 +924,8 @@
     width: 100%;
     font-family: var(--font-mono);
   }
-  .prop-grid input[type="number"]:focus {
+  .prop-grid input[type="number"]:focus,
+  .prop-grid input[type="text"]:focus {
     outline: none;
     border-color: var(--selected);
   }
@@ -4463,13 +4465,16 @@
     color: var(--text);
     font-size: 11.5px;
   }
-  .prop-grid input[type="number"] {
+  .prop-grid input[type="number"],
+  .prop-grid input[type="text"] {
     background: var(--surface-2);
     border-color: var(--border);
     transition: border-color .12s, background .12s;
   }
-  .prop-grid input[type="number"]:hover { background: var(--surface-3); }
-  .prop-grid input[type="number"]:focus {
+  .prop-grid input[type="number"]:hover,
+  .prop-grid input[type="text"]:hover { background: var(--surface-3); }
+  .prop-grid input[type="number"]:focus,
+  .prop-grid input[type="text"]:focus {
     background: var(--bg);
     border-color: var(--accent);
     box-shadow: 0 0 0 3px rgba(200, 232, 90, 0.12);
@@ -14082,7 +14087,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
 
     // 10 chars × 6 cells (5 letter + 1 spacing) = 60 cols, 7 rows.
     let col = i32(floor(x_norm * 60.0));
-    let row = 6 - i32(floor((1.0 - y_norm) * 7.0));     // flip y → top-down read
+    let row = i32(floor((1.0 - y_norm) * 7.0));     // flip y → top-down read
 
     let letter_idx = col / 6;
     let local_col  = col - letter_idx * 6;
@@ -28892,7 +28897,25 @@ function _allocateFramebuffer() {
   if (Visual.feedbackArray) {
     try { Visual.feedbackArray.destroy(); } catch (_) {}
   }
-  const layerCount = Math.max(1, (state && state.rig && Array.isArray(state.rig.displays) && state.rig.displays.length) || 1);
+  // Phase 6.6.29 — over-allocate by SCRATCH_BUDGET layers past the
+  // rig's display count so the composition scratch-layer allocator
+  // (Phase 6.6.26) has somewhere to write upstream shader-frag
+  // outputs that don't have their own VOs. Capped at
+  // RIG_MAX_DISPLAYS total so 26-display AlloSphere rigs still
+  // fit (32 - 26 = 6 scratch slots for them).
+  //
+  // Previous v0.2.1-v0.2.3 code allocated only displayCount
+  // layers, leaving _buildRenderPlan's allocScratch() function
+  // unable to assign anything in range -- so a setup like
+  // (StarNest + Butterflies -> BlendShader -> VO) silently fell
+  // back to the manual fallback layer indices (which point at
+  // BlendShader's OWN output layer) and showed all-black self-
+  // feedback. With the over-allocation in place the user's
+  // screenshot setup now actually composites.
+  const SCRATCH_BUDGET = 8;
+  const displayCount = Math.max(1, (state && state.rig && Array.isArray(state.rig.displays) && state.rig.displays.length) || 1);
+  Visual.rigDisplayCount = displayCount;   // remember so other code can distinguish
+  const layerCount = Math.min(RIG_MAX_DISPLAYS, displayCount + SCRATCH_BUDGET);
   Visual.framebuffer = Visual.device.createTexture({
     label: "visual-framebuffer-array-" + layerCount + "x-" + Visual.resolutionKey,
     size: [Visual.fbWidth, Visual.fbHeight, layerCount],
@@ -30461,7 +30484,14 @@ function _encodeRigComposite(enc) {
   if (!Visual.device || !Visual.context || !Visual.rigCompositePipeline ||
       !Visual.rigCompositeBindGroup || !Visual.rigCompositeUniformBuffer ||
       !Visual.rigDisplaysBuffer) return false;
-  const layerCount = Visual.framebufferLayerViews.length || 1;
+  // Phase 6.6.29 — tile composite shows ONLY the rig's real displays,
+  // not scratch layers. framebufferLayerViews.length now includes
+  // SCRATCH_BUDGET extra layers past the display count, so we cap
+  // here to avoid drawing scratch slots as visible tiles.
+  const layerCount = Math.min(
+    Visual.framebufferLayerViews.length || 1,
+    (Visual.rigDisplayCount || (state && state.rig && state.rig.displays && state.rig.displays.length) || 1)
+  );
   const mode = (state && state.rig && state.rig.previewMode) || "tile";
   const modeIdx = ({ tile: 0, cylinder: 1, equirect: 2, fisheye: 3 })[mode] || 0;
   const { cols, rows } = _rigTileLayout(layerCount);
@@ -31296,7 +31326,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     let x_norm = (dy + text_w * 0.5) / text_w;       // 0..1 left-to-right
     let y_norm = (dp + text_h * 0.5) / text_h;       // 0..1 bottom-to-top
     let cci = i32(floor(x_norm * nchars * 6.0));
-    let row = 6 - i32(floor((1.0 - y_norm) * 7.0));
+    let row = i32(floor((1.0 - y_norm) * 7.0));
     let char_idx = cci / 6;
     let local_col = cci - char_idx * 6;
     if (local_col >= 0 && local_col < 5 && row >= 0 && row <= 6 && u32(char_idx) < TEXT_LEN) {
