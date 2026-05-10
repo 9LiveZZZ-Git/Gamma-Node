@@ -15891,20 +15891,28 @@ async function autoCaptureCalibration(opts) {
   const prepApplied = { autoWarp: false, autoBlend: false };
 
   try {
-    // PHASE 1 — Auto-prep. Apply Auto-warp + hard-cut Auto-blend so
-    // the captures show clean, non-overlapping projector coverage.
-    // Warp meshes are restored in finally{} so this doesn't have
-    // permanent side effects.
+    // PHASE 1 — Auto-prep. Phase 6.6.20.22: SKIP auto-warp here.
+    // Auto-warp was originally designed for the OLD flat-quad
+    // theater rendering — it pre-distorts source UVs so flat
+    // projector tiles look audience-correct on a curved screen.
+    // But theater since 6.6.20.1 places mesh vertices on the
+    // actual sphere via raycasting, which already handles
+    // audience-correctness. Running auto-warp on top creates a
+    // DOUBLE WARP (UV remapping + raycast displacement) that
+    // shifts adjacent projectors' content out of alignment at
+    // boundaries, producing the visible "thick stacked line"
+    // artifacts the user reported.
+    //
+    // Auto-blend stays (its hard-cut alpha doesn't remap UVs,
+    // just sets per-vertex intensity for projector overlap
+    // assignment). Custom hand-edited warps still survive via
+    // _isCustom skip.
     if (autoPrep) {
-      try {
-        const warpResults = _applyAutoWarpToRig({ skipHistory: true, silent: true });
-        prepApplied.autoWarp = !!(warpResults && warpResults.length > 0);
-      } catch (_) { /* surface might be plane/free — Auto-warp aborts; skip */ }
       try {
         const blendResults = _applyAutoBlendToRig({ skipHistory: true, hardCuts: true });
         prepApplied.autoBlend = !!(blendResults && blendResults.length > 0);
       } catch (_) { /* skip */ }
-      // Let the GPU pipeline pick up the new warp meshes.
+      // autoWarp deliberately omitted — see comment above.
       await _waitForFrames(3);
     }
 
@@ -17279,10 +17287,13 @@ function resetAICalibration(opts) {
                 "This will:\n" +
                 "  • Zero every display's keystoneCorners (8 NDC offsets per display)\n" +
                 "  • Drop every display's bezierCorrections (5×5 Bezier control grid)\n" +
-                "  • Re-run Auto-warp + Auto-blend so the visible meshes reflect the clean state\n\n" +
-                "Pose / FOV are NOT reverted (those came from the rig template; re-pick the\n" +
-                "template in the Rig panel if you want pose+FOV reset too). Custom hand-edited\n" +
-                "warp meshes are preserved.\n\n" +
+                "  • Set every display's warpMesh to null (back to no-warp baseline)\n\n" +
+                "The theater preview will then render via the curved-screen-projection\n" +
+                "path alone — vertices placed on the actual sphere via raycasting, no\n" +
+                "additional auto-warp UV remapping. This matches the 'clean default'\n" +
+                "look (single thin lines, no boundary stacking).\n\n" +
+                "Pose / FOV are NOT reverted (re-pick the rig template for that). Custom\n" +
+                "hand-edited warp meshes are preserved.\n\n" +
                 "Continue?")
       : true;
     if (!ok) return 0;
@@ -17291,6 +17302,8 @@ function resetAICalibration(opts) {
   let cleaned = 0;
   for (const d of state.rig.displays) {
     if (!d) continue;
+    // Custom (hand-edited) meshes are sacred — leave them.
+    const isCustom = d.warpMesh && d.warpMesh._isCustom;
     let hadAny = false;
     if (d.keystoneCorners) {
       const k = d.keystoneCorners;
@@ -17306,18 +17319,41 @@ function resetAICalibration(opts) {
       hadAny = true;
       d.bezierCorrections = null;
     }
+    // 6.6.20.22 — KEY FIX: actually null out the warp mesh too. The
+    // previous reset re-ran Auto-warp + Auto-blend, which generated
+    // a fresh 128×128 mesh — but auto-warp combined with the
+    // curved-screen-projection added in 6.6.20.1 produces a DOUBLE
+    // WARP (theater raycasts vertex positions onto the sphere AND
+    // auto-warp remaps source UVs for audience-correctness, which
+    // was designed for the OLD flat-quad theater). The double-warp
+    // is what causes adjacent projectors' content to disagree at
+    // boundaries — the visible "thick green line stacking" the
+    // user observed.
+    //
+    // True clean state = warpMesh: null. Theater then renders via
+    // the curved-screen-projection alone (8×8 identity mesh per
+    // display, vertices on the sphere, source UV = identity grid).
+    // The wireframe shader is rendered correctly per display and
+    // the lines actually meet at projector boundaries because
+    // there's no UV remapping to misalign them.
+    if (!isCustom && d.warpMesh) {
+      hadAny = true;
+      d.warpMesh = null;
+    }
     if (hadAny) cleaned++;
     if (Visual && Visual._warpCache) Visual._warpCache.delete(d.id);
   }
-  // Re-bake clean state into the visible meshes.
-  try { _applyAutoWarpToRig({ skipHistory: true, silent: true }); } catch (_) {}
-  try { _applyAutoBlendToRig({ skipHistory: true, hardCuts: true }); } catch (_) {}
+  // 6.6.20.22 — DON'T re-run Auto-warp + Auto-blend after reset.
+  // Theater handles audience-correctness via curved-screen-projection
+  // alone now; warp meshes are no longer needed for that. If the
+  // user specifically wants edge-blend alpha ramps, they can click
+  // Auto-blend (hard cuts) manually.
   if (Visual && Visual._warpCache && typeof Visual._warpCache.clear === "function") {
     Visual._warpCache.clear();
   }
   renderProps && renderProps();
   render();
-  console.log("[ai-calibration-reset] cleaned " + cleaned + " display(s)");
+  console.log("[ai-calibration-reset] cleaned " + cleaned + " display(s) — back to no-warp baseline");
   return cleaned;
 }
 
@@ -17533,9 +17569,11 @@ async function runAICalibrationFlow(opts) {
     // what the AI corrected. Custom (hand-edited) meshes are still
     // skipped per the existing _isCustom check.
     if (kept > 0 && state.rig && state.rig.surfaceVisible) {
-      try {
-        _applyAutoWarpToRig({ skipHistory: true, silent: true });
-      } catch (_) {}
+      // 6.6.20.22 — bake corrections by re-running Auto-blend ONLY
+      // (NOT Auto-warp; see autoPrep comment). Auto-blend at this
+      // density preserves keystone+Bezier corrections via the
+      // _applyKeystoneCornersToMesh + _applyBezierCorrectionsToMesh
+      // helpers it calls internally. Auto-warp would double-warp.
       try {
         _applyAutoBlendToRig({ skipHistory: true, hardCuts: true });
       } catch (_) {}
