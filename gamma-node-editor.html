@@ -14900,7 +14900,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     category: "Visual", color: COLOR.visual, header: null,
     cppType: "",
     kind: "shader-frag",
-    bindLayout: "feedback",
+    bindLayout: "composition",
     ins: [
       { n: "inA",  t: "texture" },
       { n: "inB",  t: "texture" },
@@ -14988,7 +14988,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     category: "Visual", color: COLOR.visual, header: null,
     cppType: "",
     kind: "shader-frag",
-    bindLayout: "feedback",
+    bindLayout: "composition",
     ins: [
       { n: "color",    t: "texture" },
       { n: "mask",     t: "texture" },
@@ -15059,7 +15059,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     category: "Visual", color: COLOR.visual, header: null,
     cppType: "",
     kind: "shader-frag",
-    bindLayout: "feedback",
+    bindLayout: "composition",
     ins: [
       { n: "in",         t: "texture" },
       { n: "brightness", t: "param" },
@@ -15156,7 +15156,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     category: "Visual", color: COLOR.visual, header: null,
     cppType: "",
     kind: "shader-frag",
-    bindLayout: "feedback",
+    bindLayout: "composition",
     ins: [
       { n: "in",       t: "texture" },
       { n: "cellSize", t: "param" }
@@ -15219,7 +15219,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     category: "Visual", color: COLOR.visual, header: null,
     cppType: "",
     kind: "shader-frag",
-    bindLayout: "feedback",
+    bindLayout: "composition",
     ins: [
       { n: "in",     t: "texture" },
       { n: "levels", t: "param" }
@@ -15279,7 +15279,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     category: "Visual", color: COLOR.visual, header: null,
     cppType: "",
     kind: "shader-frag",
-    bindLayout: "feedback",
+    bindLayout: "composition",
     ins: [
       { n: "in",        t: "texture" },
       { n: "threshold", t: "param" },
@@ -15366,7 +15366,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     category: "Visual", color: COLOR.visual, header: null,
     cppType: "",
     kind: "shader-frag",
-    bindLayout: "feedback",
+    bindLayout: "composition",
     ins: [
       { n: "in",     t: "texture" },
       { n: "radius", t: "param" }
@@ -28712,6 +28712,23 @@ const Visual = {
   // last frame's composite output.
   feedbackArray:     null,
   feedbackArrayView: null,
+  // Phase 6.6.30 — composition shader-frag bind layout. Same shape
+  // as feedback (uniform + texture_2d_array + sampler) but binds
+  // the SCRATCH texture (not feedbackArray) so composition reads
+  // SAME-FRAME upstream content instead of 1-frame-lagged content.
+  // Lets a single composition node distribute correctly to N VOs:
+  // the per-VO render loop overwrites each scratch slot with the
+  // current consumer's pose-correct upstream render before that
+  // consumer's composition pass reads it.
+  compositionShaderBgl: null,
+  compositionShaderPipelineLayout: null,
+  // Scratch render-target texture (Phase 6.6.30). Separate from
+  // framebuffer so composition can read it while the framebuffer is
+  // an attachment without WebGPU subresource-conflict issues.
+  // SCRATCH_BUDGET layers; allocated in _allocateFramebuffer.
+  scratchTexture:        null,
+  scratchArrayView:      null,
+  scratchLayerViews:     [],
 
   // Per-node-instance render state. Map<nodeId, { uniformBuffer,
   // bindGroup, scratch }>. uniformBuffer is the GPU-side state that
@@ -28897,25 +28914,20 @@ function _allocateFramebuffer() {
   if (Visual.feedbackArray) {
     try { Visual.feedbackArray.destroy(); } catch (_) {}
   }
-  // Phase 6.6.29 — over-allocate by SCRATCH_BUDGET layers past the
-  // rig's display count so the composition scratch-layer allocator
-  // (Phase 6.6.26) has somewhere to write upstream shader-frag
-  // outputs that don't have their own VOs. Capped at
-  // RIG_MAX_DISPLAYS total so 26-display AlloSphere rigs still
-  // fit (32 - 26 = 6 scratch slots for them).
-  //
-  // Previous v0.2.1-v0.2.3 code allocated only displayCount
-  // layers, leaving _buildRenderPlan's allocScratch() function
-  // unable to assign anything in range -- so a setup like
-  // (StarNest + Butterflies -> BlendShader -> VO) silently fell
-  // back to the manual fallback layer indices (which point at
-  // BlendShader's OWN output layer) and showed all-black self-
-  // feedback. With the over-allocation in place the user's
-  // screenshot setup now actually composites.
+  if (Visual.scratchTexture) {
+    try { Visual.scratchTexture.destroy(); } catch (_) {}
+  }
+  // Phase 6.6.30 — framebuffer + feedbackArray sized to rig display
+  // count only (reverted v0.2.4's over-allocation). Scratch lives in
+  // a SEPARATE Visual.scratchTexture (allocated below). Lets each
+  // VO's composition pass read scratch in the SAME frame without
+  // the WebGPU same-texture-attachment-and-binding conflict that
+  // an over-allocated framebuffer would have hit.
   const SCRATCH_BUDGET = 8;
   const displayCount = Math.max(1, (state && state.rig && Array.isArray(state.rig.displays) && state.rig.displays.length) || 1);
-  Visual.rigDisplayCount = displayCount;   // remember so other code can distinguish
-  const layerCount = Math.min(RIG_MAX_DISPLAYS, displayCount + SCRATCH_BUDGET);
+  Visual.rigDisplayCount = displayCount;
+  Visual.scratchBudget   = SCRATCH_BUDGET;
+  const layerCount = displayCount;
   Visual.framebuffer = Visual.device.createTexture({
     label: "visual-framebuffer-array-" + layerCount + "x-" + Visual.resolutionKey,
     size: [Visual.fbWidth, Visual.fbHeight, layerCount],
@@ -28955,8 +28967,37 @@ function _allocateFramebuffer() {
     label: "feedback-array",
     dimension: "2d-array"
   });
-  // Drop any cached shader instances since their feedback bind groups
-  // reference the now-destroyed view; they'll rebuild on next render.
+  // Phase 6.6.30 — separate scratch render-target texture for
+  // composition node inputs. SCRATCH_BUDGET layers, isolated from
+  // the framebuffer so composition shaders can sample it while the
+  // framebuffer is bound as a render attachment. Per-VO render
+  // loop overwrites these slots before each consumer's composition
+  // pass, so the same slot can be reused across N consumer VOs --
+  // SCRATCH_BUDGET only needs to cover ONE consumer's chain width,
+  // not N consumers × width.
+  Visual.scratchTexture = Visual.device.createTexture({
+    label: "visual-scratch-array-" + SCRATCH_BUDGET + "x-" + Visual.resolutionKey,
+    size: [Visual.fbWidth, Visual.fbHeight, SCRATCH_BUDGET],
+    dimension: "2d",
+    format: Visual.fbFormat,
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
+  });
+  Visual.scratchArrayView = Visual.scratchTexture.createView({
+    label: "scratch-array",
+    dimension: "2d-array"
+  });
+  Visual.scratchLayerViews = [];
+  for (let i = 0; i < SCRATCH_BUDGET; i++) {
+    Visual.scratchLayerViews.push(Visual.scratchTexture.createView({
+      label: "scratch-layer-" + i,
+      dimension: "2d",
+      baseArrayLayer: i,
+      arrayLayerCount: 1
+    }));
+  }
+  // Drop any cached shader instances since their feedback / composition
+  // bind groups reference the now-destroyed views; they'll rebuild on
+  // next render.
   Visual.shaderInstances.clear();
 }
 
@@ -30484,14 +30525,7 @@ function _encodeRigComposite(enc) {
   if (!Visual.device || !Visual.context || !Visual.rigCompositePipeline ||
       !Visual.rigCompositeBindGroup || !Visual.rigCompositeUniformBuffer ||
       !Visual.rigDisplaysBuffer) return false;
-  // Phase 6.6.29 — tile composite shows ONLY the rig's real displays,
-  // not scratch layers. framebufferLayerViews.length now includes
-  // SCRATCH_BUDGET extra layers past the display count, so we cap
-  // here to avoid drawing scratch slots as visible tiles.
-  const layerCount = Math.min(
-    Visual.framebufferLayerViews.length || 1,
-    (Visual.rigDisplayCount || (state && state.rig && state.rig.displays && state.rig.displays.length) || 1)
-  );
+  const layerCount = Visual.framebufferLayerViews.length || 1;
   const mode = (state && state.rig && state.rig.previewMode) || "tile";
   const modeIdx = ({ tile: 0, cylinder: 1, equirect: 2, fisheye: 3 })[mode] || 0;
   const { cols, rows } = _rigTileLayout(layerCount);
@@ -30858,6 +30892,33 @@ function _ensureFeedbackShaderLayout() {
   });
 }
 
+/* Phase 6.6.30 — bind-group layout for composition shader-frag nodes
+ * (BlendShader / MaskShader / ColorCorrect / Pixelate / Posterize /
+ * EdgeDetect / Blur). Same shape as feedback (uniform + texture +
+ * sampler) but binds Visual.scratchArrayView -- a SEPARATE scratch
+ * texture from the framebuffer + feedbackArray. Composition reads
+ * SAME-FRAME scratch content (written by upstream shader-frag passes
+ * earlier in the same submit) instead of 1-frame-lagged framebuffer
+ * history, so a single composition node distributes correctly when
+ * wired to multiple VOs: each VO's render loop overwrites scratch
+ * slots with its OWN pose-correct upstream renders before the
+ * consumer composition pass reads them. */
+function _ensureCompositionShaderLayout() {
+  if (Visual.compositionShaderBgl) return;
+  Visual.compositionShaderBgl = Visual.device.createBindGroupLayout({
+    label: "shader-frag-composition-bgl",
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+      { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d-array" } },
+      { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } }
+    ]
+  });
+  Visual.compositionShaderPipelineLayout = Visual.device.createPipelineLayout({
+    label: "shader-frag-composition-pl",
+    bindGroupLayouts: [Visual.compositionShaderBgl]
+  });
+}
+
 /* Get-or-create a render pipeline for a WGSL body. Returns the cache
  * entry: { promise, pipeline, error }. First call kicks off async
  * compile; subsequent calls share the promise. Renderer reads
@@ -30866,14 +30927,17 @@ function _ensureFeedbackShaderLayout() {
 function _getShaderPipeline(wgsl, bindLayout) {
   bindLayout = bindLayout || "standard";
   _ensureStandardShaderLayout();
-  if (bindLayout === "feedback") _ensureFeedbackShaderLayout();
+  if (bindLayout === "feedback")    _ensureFeedbackShaderLayout();
+  if (bindLayout === "composition") _ensureCompositionShaderLayout();
   const key = _fnv1a(wgsl) + "@" + bindLayout;
   let entry = Visual.shaderPipelineCache.get(key);
   if (entry) return entry;
 
   const pipelineLayout = bindLayout === "feedback"
     ? Visual.feedbackShaderPipelineLayout
-    : Visual.standardShaderPipelineLayout;
+    : bindLayout === "composition"
+      ? Visual.compositionShaderPipelineLayout
+      : Visual.standardShaderPipelineLayout;
 
   entry = { key, promise: null, pipeline: null, error: null };
   entry.promise = (async () => {
@@ -30951,14 +31015,17 @@ function _ensureShaderInstance(nodeId, def, srcNode) {
   if (typeof wgsl !== "string" || wgsl.length === 0) return null;
   const desiredEntry = _getShaderPipeline(wgsl, bindLayout);
 
-  // Reallocate when the buffer size, bindLayout, or feedback array
-  // ref doesn't match (fresh node, user edited params, framebuffer
-  // resized so feedbackArray's view is stale, etc).
-  const feedbackView = bindLayout === "feedback" ? Visual.feedbackArrayView : null;
-  const feedbackSampler = bindLayout === "feedback" ? Visual.blitSampler : null;
-  const layoutMismatch = inst && inst._bindLayout !== bindLayout;
-  const feedbackViewStale = inst && bindLayout === "feedback" && inst._feedbackView !== feedbackView;
-  if (!inst || inst._uniformBytes !== def.uniformBytes || layoutMismatch || feedbackViewStale) {
+  // Reallocate when the buffer size, bindLayout, or texture-view ref
+  // doesn't match (fresh node, user edited params, framebuffer
+  // resized so the view's stale, etc).
+  const feedbackView    = bindLayout === "feedback"    ? Visual.feedbackArrayView : null;
+  const compositionView = bindLayout === "composition" ? Visual.scratchArrayView  : null;
+  const samplerRef      = (bindLayout === "feedback" || bindLayout === "composition")
+                          ? Visual.blitSampler : null;
+  const layoutMismatch     = inst && inst._bindLayout !== bindLayout;
+  const feedbackViewStale  = inst && bindLayout === "feedback"    && inst._feedbackView !== feedbackView;
+  const compViewStale      = inst && bindLayout === "composition" && inst._compositionView !== compositionView;
+  if (!inst || inst._uniformBytes !== def.uniformBytes || layoutMismatch || feedbackViewStale || compViewStale) {
     if (inst && inst.uniformBuffer) {
       try { inst.uniformBuffer.destroy(); } catch (_) {}
     }
@@ -30969,14 +31036,24 @@ function _ensureShaderInstance(nodeId, def, srcNode) {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
     });
     let bg;
-    if (bindLayout === "feedback" && feedbackView && feedbackSampler) {
+    if (bindLayout === "feedback" && feedbackView && samplerRef) {
       bg = Visual.device.createBindGroup({
         label: "shader-frag-feedback-bg-" + nodeId,
         layout: Visual.feedbackShaderBgl,
         entries: [
           { binding: 0, resource: { buffer: buf } },
           { binding: 1, resource: feedbackView },
-          { binding: 2, resource: feedbackSampler }
+          { binding: 2, resource: samplerRef }
+        ]
+      });
+    } else if (bindLayout === "composition" && compositionView && samplerRef) {
+      bg = Visual.device.createBindGroup({
+        label: "shader-frag-composition-bg-" + nodeId,
+        layout: Visual.compositionShaderBgl,
+        entries: [
+          { binding: 0, resource: { buffer: buf } },
+          { binding: 1, resource: compositionView },
+          { binding: 2, resource: samplerRef }
         ]
       });
     } else {
@@ -30987,13 +31064,14 @@ function _ensureShaderInstance(nodeId, def, srcNode) {
       });
     }
     inst = {
-      uniformBuffer:  buf,
-      bindGroup:      bg,
-      scratch:        new Float32Array(bytes / 4),
-      _uniformBytes:  bytes,
-      _bindLayout:    bindLayout,
-      _feedbackView:  feedbackView,
-      pipelineEntry:  desiredEntry
+      uniformBuffer:    buf,
+      bindGroup:        bg,
+      scratch:          new Float32Array(bytes / 4),
+      _uniformBytes:    bytes,
+      _bindLayout:      bindLayout,
+      _feedbackView:    feedbackView,
+      _compositionView: compositionView,
+      pipelineEntry:    desiredEntry
     };
     Visual.shaderInstances.set(nodeId, inst);
     return inst;
@@ -31746,154 +31824,154 @@ function _encodeVisualGraph(enc, dtSec) {
   const layerCount = Visual.framebufferLayerViews.length || 1;
   const renderedLayers = new Set();
 
-  // Phase 6.6.26 — build the frame's render plan: each shader-frag
-  // node that needs to render this frame plus the layer it writes
-  // to + the consumer VO whose pose drives u_view. Direct-VO sources
-  // go to the VO's display layer; sources only reachable via
-  // composition texture-input ports get auto-allocated scratch
-  // layers (drawn from RIG_MAX_DISPLAYS downward, past the rig's
-  // real display count). Stored on Visual so the composition
-  // texture-input resolver can look up scratch-layer assignments.
-  Visual._currentRenderPlan = _buildRenderPlan(visualOutputs, layerCount);
-  // Render scratch-layer entries FIRST (so the framebuffer copy at
-  // end-of-frame captures their output for next frame's reads).
-  for (const entry of Visual._currentRenderPlan.values()) {
-    if (!entry.isScratch) continue;
-    const ok = _encodeShaderFragPassForPlan(enc, entry, dtSec);
-    if (ok) renderedLayers.add(entry.layerIdx);
-  }
+  // Phase 6.6.30 — build the per-VO render plan + render schedules.
+  // Each VO has its own ordered sequence of passes: scratch passes
+  // (upstream composition inputs, rendered with THIS VO's pose) then
+  // the VO's direct shader-frag pass. Scratch slots are RELATIVE
+  // indices into Visual.scratchTexture (0..SCRATCH_BUDGET-1) and
+  // get REUSED across consumer VOs -- consumer A's scratch passes
+  // write the slots, A's composition reads them, then B's scratch
+  // passes overwrite the same slots before B's composition reads.
+  // Same-frame reads via the composition bind layout, so no 1-frame
+  // lag and per-VO pose correctness even when one composition node
+  // distributes to 26 displays.
+  const planResult = _buildRenderPlan(visualOutputs);
+  Visual._currentRenderPlan = planResult.plan;
 
   for (const vo of visualOutputs) {
-    let layerIdx = (vo.params && typeof vo.params.display === "number") ? (vo.params.display | 0) : 0;
-    if (layerIdx < 0)            layerIdx = 0;
-    if (layerIdx >= layerCount)  layerIdx = layerCount - 1;
-    const incomingEdge = state.edges.find(e =>
-      e.to.node === vo.id && e.to.port === "in"
-    );
-    let ok = false;
-    if (incomingEdge) {
-      const src = state.nodes.find(n => n.id === incomingEdge.from.node);
-      if (src) {
-        const def = TYPES[src.type];
-        // Phase 6.6.25 — also allow def.wgsl to be a function (the
-        // dynamic-WGSL form used by the v0.2.0 mesh-text Text node).
-        // Without this check the Text node compiles but never gets
-        // rendered.
-        if (def && def.kind === "shader-frag" &&
-            (typeof def.wgsl === "string" || typeof def.wgsl === "function")) {
-          ok = _encodeShaderFragPassForVO(enc, vo, src, def, dtSec, layerIdx);
-        }
-      }
+    const schedule = planResult.schedules.get(vo.id) || [];
+    for (const entry of schedule) {
+      const ok = _encodeShaderFragPassForPlan(enc, entry, dtSec);
+      if (ok && !entry.isScratch) renderedLayers.add(entry.layerIdx);
     }
-    if (ok) renderedLayers.add(layerIdx);
   }
-  // Clear every layer that didn't get a shader pass this frame —
-  // covers (a) unwired or invalid-source VOs (which would otherwise
-  // freeze on the last good frame), (b) orphan layers with no VO
-  // targeting them at all (which would freeze on whatever a deleted
-  // VO last drew there), and (c) VOs whose pipeline is still
-  // compiling on the first drop of a fresh shader-frag node.
+
+  // Clear every framebuffer layer that didn't get a shader pass this
+  // frame — covers unwired VOs, orphan layers, pipeline-still-
+  // compiling new shader-frags. Scratch slots don't need clearing
+  // (next frame's per-VO render overwrites them, and unused ones
+  // sample to whatever was there last — but no composition node
+  // reads them unless wired, and unwired texture ports return the
+  // manual layer-index fallback instead).
   for (let i = 0; i < layerCount; i++) {
     if (!renderedLayers.has(i)) _encodeLayerClear(enc, i);
   }
-  return true;   // VOs exist → composite runs
+  return true;
 }
 
-/* Phase 6.6.26 — walk the patch graph from each VisualOutput and
- * record every shader-frag node that needs to render this frame
- * plus where it writes to. Returns Map<planKey, planEntry>.
+/* Phase 6.6.30 — walk the patch graph from each VisualOutput and
+ * build a per-VO render schedule plus a flat key->entry map for
+ * texture-input resolution. Two big changes from v0.2.1's design:
+ *
+ *   1. Scratch slots are RELATIVE indices (0..SCRATCH_BUDGET-1)
+ *      into Visual.scratchTexture, not absolute framebuffer layers.
+ *      The scratch counter resets to 0 for each VO so different
+ *      consumers REUSE the same slots -- each VO overwrites the
+ *      slots before its composition pass reads them.
+ *
+ *   2. Per-VO schedule is post-order DFS (leaves first, target
+ *      last) so by the time a composition pass runs, all its
+ *      upstream scratch slots have been written this frame.
  *
  * planKey:    `${sourceNodeId}@${consumerVOId}` -- unique per
- *             (source × consumer VO) pair so the same source
- *             feeding two different VOs gets two plan entries
- *             (rendered with each consumer's pose).
+ *             (source × consumer VO) pair. Lookup target for
+ *             _resolveTextureInputLayer.
  * planEntry:  { node, def, layerIdx, consumerVO, isScratch }.
- *
- * Direct VO consumers (source wired straight to a VO.in) get the
- * VO's display layer and isScratch=false; the existing per-VO
- * render loop in _encodeVisualGraph picks them up. Composition
- * upstream sources (source wired into a comp node's texture input)
- * get auto-allocated scratch layers from RIG_MAX_DISPLAYS-1
- * downward and isScratch=true; _encodeShaderFragPassForPlan
- * renders them. Composition reads come via fbHistory next frame,
- * so all of this is 1-frame-lagged but pose-consistent. */
-function _buildRenderPlan(visualOutputs, layerCount) {
+ *             For isScratch, layerIdx is the relative scratch
+ *             index. For direct, layerIdx is the framebuffer
+ *             display layer. */
+function _buildRenderPlan(visualOutputs) {
   const plan = new Map();
-  if (!Array.isArray(state.edges)) return plan;
-
-  const rigDisplayCount = (state.rig && state.rig.displays) ? state.rig.displays.length : 1;
-  let nextScratch = Math.min(RIG_MAX_DISPLAYS - 1, layerCount - 1);
-  const allocScratch = () => {
-    if (nextScratch < rigDisplayCount) return -1;
-    return nextScratch--;
-  };
-
-  function walk(nodeId, consumerVO, isViaCompPort) {
-    const node = state.nodes.find(n => n.id === nodeId);
-    if (!node) return;
-    const def = TYPES[node.type];
-    if (!def || def.kind !== "shader-frag") return;
-    if (!(typeof def.wgsl === "string" || typeof def.wgsl === "function")) return;
-
-    const planKey = node.id + "@" + consumerVO.id;
-    if (plan.has(planKey)) return;
-
-    let layerIdx;
-    let isScratch;
-    if (isViaCompPort) {
-      // Reached this node by walking up from a composition texture
-      // port -> needs a scratch layer. (Even if the node ALSO has a
-      // direct VO wire elsewhere, this consumer needs its own pose-
-      // correct render, so scratch is right.)
-      layerIdx = allocScratch();
-      if (layerIdx < 0) return;            // ran out of scratch
-      isScratch = true;
-    } else {
-      // Direct wire to consumerVO.in -> use the VO's display layer.
-      layerIdx = (consumerVO.params && typeof consumerVO.params.display === "number")
-        ? (consumerVO.params.display | 0) : 0;
-      if (layerIdx < 0) layerIdx = 0;
-      if (layerIdx >= rigDisplayCount) layerIdx = rigDisplayCount - 1;
-      isScratch = false;
-    }
-
-    plan.set(planKey, { node, def, layerIdx, consumerVO, isScratch });
-
-    // Recurse into this node's texture input ports.
-    if (Array.isArray(def.ins)) {
-      for (const port of def.ins) {
-        if (!port || port.t !== "texture") continue;
-        const wire = state.edges.find(e =>
-          e && e.to && e.to.node === nodeId && e.to.port === port.n
-        );
-        if (!wire || !wire.from) continue;
-        walk(wire.from.node, consumerVO, true);
-      }
-    }
+  const schedules = new Map();
+  if (!Array.isArray(state.edges) || !Array.isArray(state.nodes)) {
+    return { plan, schedules };
   }
 
+  const rigDisplayCount = (state.rig && state.rig.displays) ? state.rig.displays.length : 1;
+  const SCRATCH_BUDGET = (typeof Visual.scratchBudget === "number") ? Visual.scratchBudget : 8;
+
   for (const vo of visualOutputs) {
+    const sched = [];
+    schedules.set(vo.id, sched);
+    let scratchCounter = 0;
+
+    function walk(nodeId, isViaCompPort) {
+      const node = state.nodes.find(n => n.id === nodeId);
+      if (!node) return;
+      const def = TYPES[node.type];
+      if (!def || def.kind !== "shader-frag") return;
+      if (!(typeof def.wgsl === "string" || typeof def.wgsl === "function")) return;
+
+      const planKey = node.id + "@" + vo.id;
+      if (plan.has(planKey)) return;
+
+      let layerIdx;
+      let isScratch;
+      if (isViaCompPort) {
+        if (scratchCounter >= SCRATCH_BUDGET) return;
+        layerIdx = scratchCounter++;
+        isScratch = true;
+      } else {
+        layerIdx = (vo.params && typeof vo.params.display === "number")
+          ? (vo.params.display | 0) : 0;
+        if (layerIdx < 0) layerIdx = 0;
+        if (layerIdx >= rigDisplayCount) layerIdx = rigDisplayCount - 1;
+        isScratch = false;
+      }
+
+      const entry = { node, def, layerIdx, consumerVO: vo, isScratch };
+      plan.set(planKey, entry);
+
+      // Recurse FIRST (post-order DFS) so leaves render before
+      // their downstream consumers within the schedule.
+      if (Array.isArray(def.ins)) {
+        for (const port of def.ins) {
+          if (!port || port.t !== "texture") continue;
+          const wire = state.edges.find(e =>
+            e && e.to && e.to.node === nodeId && e.to.port === port.n
+          );
+          if (!wire || !wire.from) continue;
+          walk(wire.from.node, true);
+        }
+      }
+      sched.push(entry);
+    }
+
     const incoming = state.edges.find(e =>
       e && e.to && e.to.node === vo.id && e.to.port === "in"
     );
-    if (!incoming || !incoming.from) continue;
-    walk(incoming.from.node, vo, false);
+    if (incoming && incoming.from) walk(incoming.from.node, false);
   }
-  return plan;
+  return { plan, schedules };
 }
 
-/* Phase 6.6.26 — render one scratch-layer entry from the plan.
- * Mirrors _encodeShaderFragPassForVO but: uses the consumer VO's
- * display for pose (so the source renders FOR that consumer), uses
- * a synthetic instance key so it doesn't collide with the direct
- * per-VO render of the same VO, and writes to the scratch layer
- * the plan assigned (not the consumer's display). */
+/* Phase 6.6.30 — render one plan entry. Handles BOTH the scratch
+ * case (writes to Visual.scratchLayerViews[layerIdx] -- relative
+ * index 0..SCRATCH_BUDGET-1, used by composition reads in the same
+ * frame) AND the direct VO case (writes to
+ * Visual.framebufferLayerViews[layerIdx] -- absolute display layer).
+ *
+ * Per-consumer instance key prevents collision between the same
+ * source feeding multiple consumer VOs (each has its own uniform
+ * buffer + pose). Scratch entries' bound texture (via composition
+ * bind layout) is Visual.scratchArrayView; the writeUniforms-
+ * resolved scratch indices are RELATIVE so the WGSL sample with
+ * those indices reads the right scratch layer. */
 function _encodeShaderFragPassForPlan(enc, entry, dtSec) {
-  const { node, def, layerIdx, consumerVO } = entry;
-  const layerView = Visual.framebufferLayerViews[layerIdx];
+  const { node, def, layerIdx, consumerVO, isScratch } = entry;
+  const layerView = isScratch
+    ? Visual.scratchLayerViews[layerIdx]
+    : Visual.framebufferLayerViews[layerIdx];
   if (!layerView) return false;
 
-  const instKey = "scratch:" + node.id + ":" + consumerVO.id;
+  // Instance key — direct entries use the consumer VO id (one
+  // shader instance per VO target, matching the pre-6.6.30 form).
+  // Scratch entries use a "scratch:" prefix so a node that's BOTH
+  // direct-wired AND used as a composition input has two separate
+  // instances (different bind layouts, different uniforms).
+  const instKey = isScratch
+    ? "scratch:" + node.id + ":" + consumerVO.id
+    : consumerVO.id;
   // Phase 6.6.28 — wire-resolved params for the dynamic WGSL fn too.
   const nodeResolvedForInst = _nodeWithResolvedParams(node);
   const inst = _ensureShaderInstance(instKey, def, nodeResolvedForInst);
@@ -31901,21 +31979,23 @@ function _encodeShaderFragPassForPlan(enc, entry, dtSec) {
   const pipeEntry = inst.pipelineEntry;
   if (!pipeEntry || !pipeEntry.pipeline) return false;
 
-  // Use the consumer VO's display for pose so the source renders
-  // the world from that perspective. The output sits in the scratch
-  // layer; the consumer reads it via fbHistory next frame.
+  // Pose: consumer VO's display drives u_view for BOTH scratch and
+  // direct passes. Scratch passes render the source FROM the
+  // consumer's perspective; direct passes write the consumer's
+  // display layer with the consumer's pose.
   const consumerDisp = (consumerVO.params && typeof consumerVO.params.display === "number")
     ? (consumerVO.params.display | 0) : 0;
   const display = state.rig && state.rig.displays && state.rig.displays[consumerDisp];
   const renderWuv = _renderWorldUvForVO(consumerVO, node.id);
 
-  _writeShaderPreamble(inst.scratch, dtSec, display, renderWuv, layerIdx);
-  // Phase 6.6.28 — re-use the resolved node from instance creation.
+  // u_layer in the uniform = consumer's display layer (used by
+  // FeedbackShader to know which feedback layer to sample as
+  // "previous frame of THIS display"). Scratch entries also use the
+  // consumer's display layer here, not the scratch slot.
+  _writeShaderPreamble(inst.scratch, dtSec, display, renderWuv, consumerDisp);
   if (typeof def.writeUniforms === "function") {
     def.writeUniforms(nodeResolvedForInst, inst.scratch);
   }
-  // Re-apply the composition texture-input resolver for this scratch
-  // node's own inputs (e.g. a BlendShader feeding another BlendShader).
   const slotMap = def.textureInputSlots;
   if (slotMap && Array.isArray(def.ins)) {
     for (const port of def.ins) {
@@ -31928,8 +32008,11 @@ function _encodeShaderFragPassForPlan(enc, entry, dtSec) {
   }
   Visual.device.queue.writeBuffer(inst.uniformBuffer, 0, inst.scratch.buffer, inst.scratch.byteOffset, inst.scratch.byteLength);
 
+  const label = (isScratch ? "shader-frag-scratch-" : "shader-frag-") +
+    node.type + "-" + node.id + "-vo-" + consumerVO.id + "-" +
+    (isScratch ? "scratch" + layerIdx : "layer" + layerIdx);
   const pass = enc.beginRenderPass({
-    label: "shader-frag-scratch-" + node.type + "-" + node.id + "-vo-" + consumerVO.id + "-layer-" + layerIdx,
+    label: label,
     colorAttachments: [{
       view: layerView,
       clearValue: { r: 0, g: 0, b: 0, a: 1 },
