@@ -6741,7 +6741,7 @@
  * Pages deploy workflow (.github/workflows/pages.yml). The string
  * after the equals sign is what the workflow's sed targets — don't
  * change the format of this line. */
-const APP_VERSION = "0.1.100";
+const APP_VERSION = "0.2.0";
 
 /* =========================================================================
  * Node type registry — covers ~55 Gamma DSP classes
@@ -12666,48 +12666,74 @@ public:
     description: "Patch-level rig HUD — overlays display tiles with labels (index/name), warp/blend status badges, and audio-reactive highlights. Drop one in the patch to enable; only the first RigGizmo's params take effect (the node is global). Tile preview only — non-tile modes hide the overlay."
   },
 
-  /* Phase 6.6.12 — Text overlay. Like RigGizmo: a patch-level
-   * visual node that draws on the 2D overlay canvas above the
-   * WebGPU output. Renders flat text in screen / display space so
-   * the projection pipeline never warps it — perfect for verifying
-   * which display is which and whether sharp content reaches the
-   * corners of each projector. Multiple Text nodes can coexist;
-   * each draws its own string. */
+  /* Phase 6.6.25 — Mesh Text. Converted from the original 2D
+   * overlay form into a proper shader-frag whose output goes to
+   * a VisualOutput, so text now renders on the dome surface,
+   * projector-correct via the gnomonic-fix template, and can be
+   * fed into BlendShader / MaskShader / etc. as a texture.
+   *
+   * Architecture:
+   *   • def.wgsl is a function (node) => string -- the user's
+   *     `text` param compiles into the shader as a const
+   *     glyph-index array, alongside the static 5x7 bitmap font.
+   *     v0.1.98 dynamic-WGSL infra handles the hot-reload + cache.
+   *   • Char set: A-Z + a-z (auto-uppercased) + 0-9 + space + - +
+   *     . + ! (40 glyphs). Unsupported chars render as space.
+   *   • Max text length 32 (fixed-size const array in WGSL).
+   *
+   * Old 2D-overlay form deprecated: shader-frag-kind Text nodes
+   * are filtered out of the _drawTextOverlay loop below, so this
+   * is a clean replacement -- old patches that had Text overlay
+   * lose the 2D rendering but gain the dome rendering with their
+   * existing 'text' + 'r/g/b' + 'plateOpacity' params still
+   * recognized (overlay-only params like font / fontSize / x / y
+   * / perDisplay get ignored). */
   Text: {
     category: "Visual", color: COLOR.visual, header: null,
     cppType: "",
-    ins:  [],
-    outs: [],
+    kind: "shader-frag",
+    ins: [
+      { n: "text",         t: "param" },
+      { n: "yawDeg",       t: "param" },
+      { n: "pitchDeg",     t: "param" },
+      { n: "sizeDeg",      t: "param" },
+      { n: "r",            t: "param" },
+      { n: "g",            t: "param" },
+      { n: "b",            t: "param" },
+      { n: "plateOpacity", t: "param" },
+      { n: "bgR",          t: "param" },
+      { n: "bgG",          t: "param" },
+      { n: "bgB",          t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
     params: {
-      // Substitution tokens supported in the string:
-      //   {idx}  — display index (0, 1, 2…)
-      //   {name} — display.name
-      //   {n}    — total display count
-      // perDisplay=false ignores tokens (single instance, no idx).
-      text: "TEST {idx}",
-      // mono / sans / serif / display. The "display" stack uses a
-      // heavy sans-serif for high-contrast calibration overlays.
-      font: "sans",
-      // pixel size at 1× DPR; multiplied by devicePixelRatio when
-      // drawn so the text stays crisp on Retina / 4K canvases.
-      fontSize: 96,
-      // 0..1 each. Default white.
+      text: "GAMMA NODE",
+      yawDeg: 0,
+      pitchDeg: 0,
+      sizeDeg: 16,
       r: 1.0, g: 1.0, b: 1.0,
-      // Text x/y as a fraction of the host rect. 0.5/0.5 = center.
-      // perDisplay=true → host rect is each display's tile.
-      // perDisplay=false → host rect is the whole canvas.
-      x: 0.5,
-      y: 0.5,
-      // Repeat across each display in tile mode? Default true so
-      // dropping the node into a multi-display patch immediately
-      // gives a per-display label without further wiring.
-      perDisplay: true,
-      // 0..1 — black plate behind the text for readability against
-      // bright shader content. 0 = no plate.
-      plateOpacity: 0.55
+      plateOpacity: 0.0,
+      bgR: 0.0, bgG: 0.0, bgB: 0.0
     },
-    methods: { text: null, font: null, fontSize: null, r: null, g: null, b: null, x: null, y: null, perDisplay: null, plateOpacity: null },
-    description: "Flat text overlay in screen / display space. Renders ABOVE the WebGPU output via the 2D overlay canvas, so projection / warp / blend never distort the text — useful for projection verification, calibration markers, and on-stage signage. {idx}, {name}, {n} substitution tokens get filled per-display when perDisplay is on."
+    methods: {},
+    uniformBytes: 112,
+    wgsl: function (node) { return _buildTextShaderWGSL(node); },
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.yawDeg       === "number") ? p.yawDeg       : 0;
+      scratch[17] = (typeof p.pitchDeg     === "number") ? p.pitchDeg     : 0;
+      scratch[18] = (typeof p.sizeDeg      === "number") ? p.sizeDeg      : 16;
+      scratch[19] = (typeof p.plateOpacity === "number") ? p.plateOpacity : 0.0;
+      scratch[20] = (typeof p.r === "number") ? p.r : 1.0;
+      scratch[21] = (typeof p.g === "number") ? p.g : 1.0;
+      scratch[22] = (typeof p.b === "number") ? p.b : 1.0;
+      scratch[23] = 0;
+      scratch[24] = (typeof p.bgR === "number") ? p.bgR : 0.0;
+      scratch[25] = (typeof p.bgG === "number") ? p.bgG : 0.0;
+      scratch[26] = (typeof p.bgB === "number") ? p.bgB : 0.0;
+      scratch[27] = 0;
+    },
+    description: "Mesh text — bitmap A-Z + 0-9 + space + dash + period + ! rendered on the dome surface via the shader-frag pipeline. Char set: A-Z, a-z (auto-uppercased), 0-9, space, '-', '.', '!' — anything else becomes a space. Wire `out` to a VisualOutput to project it onto a display, or to BlendShader.inA + a backdrop on inB for overlay. text: up to 32 chars (truncated). yawDeg/pitchDeg: text center on the sphere in degrees. sizeDeg: vertical angular size (16° readable from sweet-spot). r/g/b: text color [0..1]. plateOpacity [0..1]: background plate alpha (0 = transparent, useful for overlay; >0 paints a bgColor rectangle behind the text). bgR/G/B: plate color."
   },
 
   /* Phase 6.2.x — first two shader-frag nodes. Both are kind:
@@ -30763,6 +30789,216 @@ function _packSurfaceUniforms(scratch, base) {
   scratch[base + 7] = 0;
 }
 
+/* Phase 6.6.25 — Text node mesh-text WGSL generator. The Text
+ * node's `wgsl` field is a function (node) => string that bakes
+ * the user's text param into the shader as a const glyph-index
+ * array, alongside the static 5x7 bitmap font for A-Z + 0-9 +
+ * space + dash + period + bang (40 glyphs total, 280 rows). The
+ * function form uses the v0.1.98 dynamic-WGSL infra: each text
+ * value compiles to its own pipeline (cached by hash), the old
+ * pipeline keeps rendering until the new one is ready (no
+ * flicker), unsupported chars become spaces.
+ *
+ * Why dynamic WGSL instead of uniform-passed glyphs: simpler.
+ * No vec4u packing, no Uint32Array view of a Float32Array, no
+ * shader-side glyph-from-uniform helper. Cost is one pipeline
+ * compile per unique text value (~10-50 ms, async, cached). For
+ * a Text node that rarely changes after authoring, that's
+ * imperceptible. */
+const _TEXT_FONT_ROWS = [
+  // A-Z (indices 0-25); each entry = 7 row bitmasks (5 bits, MSB=col 0).
+  [14, 17, 17, 31, 17, 17, 17], // A
+  [30, 17, 17, 30, 17, 17, 30], // B
+  [14, 17, 16, 16, 16, 17, 14], // C
+  [30, 17, 17, 17, 17, 17, 30], // D
+  [31, 16, 16, 30, 16, 16, 31], // E
+  [31, 16, 16, 30, 16, 16, 16], // F
+  [14, 17, 16, 23, 17, 17, 14], // G
+  [17, 17, 17, 31, 17, 17, 17], // H
+  [31,  4,  4,  4,  4,  4, 31], // I
+  [ 7,  2,  2,  2,  2, 18, 12], // J
+  [17, 18, 20, 24, 20, 18, 17], // K
+  [16, 16, 16, 16, 16, 16, 31], // L
+  [17, 27, 21, 17, 17, 17, 17], // M
+  [17, 25, 21, 19, 17, 17, 17], // N
+  [14, 17, 17, 17, 17, 17, 14], // O
+  [30, 17, 17, 30, 16, 16, 16], // P
+  [14, 17, 17, 17, 21, 18, 13], // Q
+  [30, 17, 17, 30, 20, 18, 17], // R
+  [15, 16, 16, 14,  1,  1, 30], // S
+  [31,  4,  4,  4,  4,  4,  4], // T
+  [17, 17, 17, 17, 17, 17, 14], // U
+  [17, 17, 17, 17, 17, 10,  4], // V
+  [17, 17, 17, 17, 21, 21, 10], // W
+  [17, 17, 10,  4, 10, 17, 17], // X
+  [17, 17, 10,  4,  4,  4,  4], // Y
+  [31,  2,  4,  8, 16, 16, 31], // Z
+  // 0-9 (indices 26-35)
+  [14, 17, 19, 21, 25, 17, 14], // 0
+  [ 4, 12,  4,  4,  4,  4, 14], // 1
+  [14, 17,  1,  2,  4,  8, 31], // 2
+  [30,  1,  1, 14,  1,  1, 30], // 3
+  [ 2,  6, 10, 18, 31,  2,  2], // 4
+  [31, 16, 16, 30,  1,  1, 30], // 5
+  [14, 17, 16, 30, 17, 17, 14], // 6
+  [31,  1,  2,  4,  8,  8,  8], // 7
+  [14, 17, 17, 14, 17, 17, 14], // 8
+  [14, 17, 17, 15,  1, 17, 14], // 9
+  // space (36)
+  [ 0,  0,  0,  0,  0,  0,  0],
+  // dash (37)
+  [ 0,  0,  0, 14,  0,  0,  0],
+  // period (38)
+  [ 0,  0,  0,  0,  0, 12, 12],
+  // ! (39)
+  [ 4,  4,  4,  4,  4,  0,  4]
+];
+
+function _textCharToGlyphIdx(ch) {
+  if (!ch) return 36;             // space
+  const c = ch.charCodeAt(0);
+  if (c >= 65 && c <= 90)  return c - 65;        // A-Z
+  if (c >= 97 && c <= 122) return c - 97;        // a-z lowercased
+  if (c >= 48 && c <= 57)  return c - 48 + 26;   // 0-9
+  if (ch === '-') return 37;
+  if (ch === '.') return 38;
+  if (ch === '!') return 39;
+  return 36;                                     // unknown -> space
+}
+
+function _buildTextShaderWGSL(node) {
+  const rawText = (node && node.params && typeof node.params.text === "string")
+    ? node.params.text
+    : "GAMMA NODE";
+  const MAX = 32;
+  const trimmed = rawText.slice(0, MAX);
+  const glyphIdx = [];
+  for (let i = 0; i < MAX; i++) {
+    glyphIdx.push(_textCharToGlyphIdx(trimmed[i] || ""));
+  }
+  const textLen = trimmed.length;
+
+  // Flatten the font rows into a 280-element array of u32 row
+  // bitmasks; baked into the shader as a const at module scope.
+  const fontFlat = [];
+  for (const glyph of _TEXT_FONT_ROWS) {
+    for (const row of glyph) fontFlat.push(row);
+  }
+  const fontStr = fontFlat.map(v => v + "u").join(", ");
+  const glyphsStr = glyphIdx.map(g => g + "u").join(", ");
+
+  return `struct U {
+  u_resolution: vec4f,
+  u_time:       f32,
+  u_dt:         f32,
+  u_layer:      f32,
+  u_fov_v_deg:  f32,
+  u_view:       vec4f,
+  u_world_uv:   vec4f,
+  params:       vec4f,    // x=yawDeg, y=pitchDeg, z=sizeDeg, w=plateOpacity
+  color:        vec4f,    // x=r, y=g, z=b, w=_
+  bgColor:      vec4f,    // x=bgR, y=bgG, z=bgB, w=_
+};
+@group(0) @binding(0) var<uniform> u: U;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+fn frag_to_global_angles(uv: vec2f) -> vec2f {
+  // Standard basis-rotation gnomonic (see WireframeCalibration shader).
+  let fov_h_rad = u.u_view.w   * 0.0174532925;
+  let fov_v_rad = u.u_fov_v_deg * 0.0174532925;
+  let local_x = (uv.x - 0.5) * 2.0 * tan(fov_h_rad * 0.5);
+  let local_y = (0.5 - uv.y) * 2.0 * tan(fov_v_rad * 0.5);
+  let yaw_rad   = u.u_view.x * 0.0174532925;
+  let pitch_rad = u.u_view.y * 0.0174532925;
+  let cy = cos(yaw_rad);   let sy = sin(yaw_rad);
+  let cp = cos(pitch_rad); let sp = sin(pitch_rad);
+  let fwd = vec3f(sy * cp, sp, cy * cp);
+  var up_ref = vec3f(0.0, 1.0, 0.0);
+  if (abs(fwd.y) > 0.999) { up_ref = vec3f(0.0, 0.0, 1.0); }
+  let right = normalize(cross(up_ref, fwd));
+  let up    = cross(fwd, right);
+  let dir = normalize(local_x * right + local_y * up + fwd);
+  let pitch_out = asin(clamp(dir.y, -1.0, 1.0));
+  let yaw_out   = atan2(dir.x, dir.z);
+  return vec2f(yaw_out * 57.29577951, pitch_out * 57.29577951);
+}
+
+const TEXT_LEN: u32 = ${textLen}u;
+const TEXT_GLYPHS: array<u32, ${MAX}> = array<u32, ${MAX}>(${glyphsStr});
+const FONT: array<u32, 280> = array<u32, 280>(${fontStr});
+
+fn glyph_pixel(g: u32, x: i32, y: i32) -> bool {
+  if (g >= 40u) { return false; }
+  if (x < 0 || x > 4 || y < 0 || y > 6) { return false; }
+  let row = FONT[g * 7u + u32(y)];
+  let bit = (row >> u32(4 - x)) & 1u;
+  return bit == 1u;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let ang = frag_to_global_angles(in.uv);
+  let yaw   = ang.x;
+  let pitch = ang.y;
+
+  let yaw_c   = u.params.x;
+  let pitch_c = u.params.y;
+  let size    = max(2.0, u.params.z);
+  let plateA  = clamp(u.params.w, 0.0, 1.0);
+
+  // Each char is 5 cells wide, 7 cells tall + 1 cell spacing.
+  // Cell size derived so total height = sizeDeg.
+  let cell    = size / 7.0;
+  let nchars  = max(1.0, f32(TEXT_LEN));
+  let text_w  = (nchars * 6.0 - 1.0) * cell;
+  let text_h  = size;
+
+  // Yaw delta with proper plus/minus 180 wrap.
+  var dy = yaw - yaw_c;
+  if (dy >  180.0) { dy = dy - 360.0; }
+  if (dy < -180.0) { dy = dy + 360.0; }
+  let dp = pitch - pitch_c;
+
+  let pad      = cell * 0.5;
+  let in_plate = abs(dy) <= text_w * 0.5 + pad && abs(dp) <= text_h * 0.5 + pad;
+  let in_text  = abs(dy) <= text_w * 0.5      && abs(dp) <= text_h * 0.5;
+
+  var col = vec3<f32>(0.0);
+
+  if (in_plate) {
+    col = mix(vec3<f32>(0.0), u.bgColor.rgb, plateA);
+  }
+
+  if (in_text) {
+    let x_norm = (dy + text_w * 0.5) / text_w;       // 0..1 left-to-right
+    let y_norm = (dp + text_h * 0.5) / text_h;       // 0..1 bottom-to-top
+    let cci = i32(floor(x_norm * nchars * 6.0));
+    let row = 6 - i32(floor((1.0 - y_norm) * 7.0));
+    let char_idx = cci / 6;
+    let local_col = cci - char_idx * 6;
+    if (local_col >= 0 && local_col < 5 && row >= 0 && row <= 6 && u32(char_idx) < TEXT_LEN) {
+      let g = TEXT_GLYPHS[char_idx];
+      if (glyph_pixel(g, local_col, row)) {
+        col = u.color.rgb;
+      }
+    }
+  }
+
+  return vec4<f32>(col, 1.0);
+}`;
+}
+
 function _writeShaderPreamble(scratch, dtSec, display, worldUvOverride, layerIdx) {
   const t = (performance.now() - Visual.startTime) * 0.001;
   scratch[0]  = Visual.fbWidth;
@@ -31235,11 +31471,16 @@ function _drawVisualOverlay() {
     _drawRigGizmoHud(ctx2, gizmoNode, displays, layerCount, vp, tileW, tileH, cols);
   }
 
-  // Phase 6.6.12 — Text overlays. Multiple Text nodes are drawn in
-  // patch order so users can stack them. perDisplay=true repeats each
-  // text on every tile; perDisplay=false draws once at the canvas
-  // center (or user-positioned). Works in every preview mode.
-  const textNodes = nodes.filter(n => n && n.type === "Text");
+  // Phase 6.6.25 — Text nodes are now shader-frag mesh text
+  // (rendered via the regular shader-frag pipeline + VisualOutput).
+  // The legacy 2D-overlay path here is filtered out for any Text
+  // whose registry def has kind: "shader-frag" -- i.e. all of them
+  // post-6.6.25. If a future TextOverlay node ships as a 2D
+  // overlay variant, this filter lets both coexist.
+  const textNodes = nodes.filter(n =>
+    n && n.type === "Text" &&
+    !(TYPES[n.type] && TYPES[n.type].kind === "shader-frag")
+  );
   for (const t of textNodes) {
     _drawTextOverlay(ctx2, t, displays, layerCount, vp, tileW, tileH, cols, mode);
   }
