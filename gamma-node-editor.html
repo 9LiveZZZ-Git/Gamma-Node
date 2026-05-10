@@ -15829,7 +15829,8 @@ async function autoCaptureCalibration(opts) {
   const prevCam = {
     pos:   Visual.theaterCam.pos.slice(),
     yaw:   Visual.theaterCam.yaw,
-    pitch: Visual.theaterCam.pitch
+    pitch: Visual.theaterCam.pitch,
+    fov:   Visual.theaterCam.fov   // 6.6.20.19 — also save FOV for wider AI captures
   };
   const checkerNodes = (state.nodes || []).filter(n => n.type === "Checkerboard");
   const prevCheckerModes = checkerNodes.map(n => (n.params && n.params.mode));
@@ -15850,6 +15851,7 @@ async function autoCaptureCalibration(opts) {
     Visual.theaterCam.pos[2] = prevCam.pos[2];
     Visual.theaterCam.yaw   = prevCam.yaw;
     Visual.theaterCam.pitch = prevCam.pitch;
+    Visual.theaterCam.fov   = prevCam.fov;       // 6.6.20.19 — restore FOV
     checkerNodes.forEach((n, i) => {
       if (n.params && prevCheckerModes[i] !== undefined) {
         n.params.mode = prevCheckerModes[i];
@@ -15894,6 +15896,15 @@ async function autoCaptureCalibration(opts) {
     Visual.theaterCam.pos[0] = ss[0];
     Visual.theaterCam.pos[1] = ss[1];
     Visual.theaterCam.pos[2] = ss[2];
+    // 6.6.20.19 — wider capture FOV (90° vertical, was 60°) so each
+    // per-display photo shows the target projector + ~50% of the
+    // adjacent neighbors' coverage at the frame edges. Without this,
+    // the AI was only seeing one projector centered and couldn't
+    // verify boundary alignment — Phase 2 reasoning was generic
+    // ("slight edge bulge") because the boundary literally wasn't
+    // in the frame. Wide FOV puts the boundary mid-frame where AI
+    // can see both sides. Restored in finally{}.
+    Visual.theaterCam.fov = 90;
 
     // PHASE 3 — build the direction list.
     //
@@ -16148,7 +16159,9 @@ function _arrayBufferToBase64(buffer) {
 const _AI_CALIBRATION_SYSTEM_PROMPT =
 `You are a multi-projector dome calibration expert. You analyze screenshots from a virtual multi-projector rig with a 3D wireframe calibration pattern (lat/long sphere grid + 3 axis-colored great circles + 3 cardinal-axis beacon circles).
 
-Each capture you receive shows ONE projector's coverage region as seen from the rig's audience sweet-spot, looking AT that projector's pose direction. The wireframe pattern is rendered globally in world space; if the projector's pose / FOV / warp are perfectly calibrated, the wireframe should appear centered in the frame, with neighboring projectors' edges connecting smoothly to this projector's edges.
+Each capture is a WIDE-FOV (90° vertical) view from the rig's audience sweet-spot, AIMED at one projector's pose direction. The TARGET projector fills the central ~50% of the frame; ADJACENT projectors' coverage is visible at the EDGES of the frame. This lets you compare boundaries — your job is largely to check that the wireframe lines on this projector's edges connect cleanly to the neighbor projectors' edges visible alongside.
+
+The wireframe pattern is rendered globally in world space; if pose / FOV / warp are perfectly calibrated, the lat/long lines should connect with no shift, the great circles should be unbroken curves, and the beacons should appear at consistent angles. Visible disconnects at projector boundaries are exactly what calibration is meant to fix.
 
 Calibration cues:
 - The CENTER of the frame should be where the projector aims. If the visible pattern's "center of mass" is offset from the screen center, that suggests a yaw / pitch error in the projector's pose.
@@ -16220,10 +16233,15 @@ adjustments. You are now doing FINE MESH-LEVEL TUNING of one
 projector at a time, using Bezier control point shifts.
 
 The wireframe pattern (grid + 3 colored great circles + 3 beacons)
-is rendered in world space. After upstream calibration, lines
-mostly connect at projector boundaries — your job is to spot and
-fix any REMAINING misalignment by proposing small NDC shifts to
-specific control points in the projector's 5×5 Bezier warp grid.
+is rendered in world space. The capture is a WIDE-FOV (90°
+vertical) view aimed at this projector's pose direction. The
+TARGET projector fills the central ~50% of the frame; ADJACENT
+projectors' coverage is visible at the EDGES of the frame. Look
+for REAL boundary discontinuities — places where wireframe lines
+on this projector visibly fail to meet the same line continuing
+into the adjacent projector at the edge of the frame. Don't
+hallucinate "slight edge bulges" — only propose adjustments
+where you can see an actual discontinuity in the image.
 
 Indexing: 5 cols × 5 rows. col 0..4 = left → right.
 row 0..4 = top → bottom. (0,0) = top-left, (4,4) = bottom-right.
@@ -17277,6 +17295,27 @@ async function runAICalibrationFlow(opts) {
       render();
     }
     const kept = beforeRevert.length - reverted;
+    // 6.6.20.19 — bake AI corrections into the visible warp meshes
+    // so the user sees the result when they open the warp editor on
+    // any display. The AI corrections live in display.keystoneCorners
+    // + display.bezierCorrections (separate fields), and only get
+    // applied when auto-warp / auto-blend regenerates the mesh. This
+    // forces that regeneration NOW so the on-screen state matches
+    // what the AI corrected. Custom (hand-edited) meshes are still
+    // skipped per the existing _isCustom check.
+    if (kept > 0 && state.rig && state.rig.surfaceVisible) {
+      try {
+        _applyAutoWarpToRig({ skipHistory: true, silent: true });
+      } catch (_) {}
+      try {
+        _applyAutoBlendToRig({ skipHistory: true, hardCuts: true });
+      } catch (_) {}
+      if (Visual && Visual._warpCache) {
+        // Force every display's warp cache to rebuild on next frame.
+        if (typeof Visual._warpCache.clear === "function") Visual._warpCache.clear();
+      }
+      render();
+    }
     if (statusCb) statusCb("Done — " + kept + " kept, " + reverted + " reverted (" + result.iterations + " iter)");
     return { applied: kept, skipped: reverted, iterations: result.iterations };
   } catch (e) {
