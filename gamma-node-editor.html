@@ -16360,12 +16360,27 @@ The wireframe pattern (grid + 3 colored great circles + 3 beacons)
 is rendered in world space. The capture is a WIDE-FOV (90°
 vertical) view aimed at this projector's pose direction. The
 TARGET projector fills the central ~50% of the frame; ADJACENT
-projectors' coverage is visible at the EDGES of the frame. Look
-for REAL boundary discontinuities — places where wireframe lines
-on this projector visibly fail to meet the same line continuing
-into the adjacent projector at the edge of the frame. Don't
-hallucinate "slight edge bulges" — only propose adjustments
-where you can see an actual discontinuity in the image.
+projectors' coverage is visible at the EDGES of the frame.
+
+CRITICAL: be very conservative. Earlier passes of this calibration
+flow turned out to propose hallucinated corrections that DEGRADED
+the rig. Symptoms of hallucination: identical adjustments across
+multiple displays, vague "slight edge bulges" reasoning, no
+specific named feature in the image. Avoid these failure modes.
+
+YOU MAY ONLY PROPOSE A NON-EMPTY bezierAdjustments LIST IF:
+
+  1. You can describe in your reasoning a SPECIFIC boundary
+     discontinuity by reference to a NAMED FEATURE in the image
+     (e.g., "the red equator line breaks 4 px to the right at the
+     boundary between this projector and its left neighbor").
+  2. You see the SAME line on both projectors at the boundary,
+     and they fail to meet.
+  3. Your confidence is 0.7 or higher.
+
+If any of those isn't true, output bezierAdjustments: [] and
+confidence ≤ 0.6. The default rig is already well-calibrated;
+"no changes needed" is the correct answer most of the time.
 
 Indexing: 5 cols × 5 rows. col 0..4 = left → right.
 row 0..4 = top → bottom. (0,0) = top-left, (4,4) = bottom-right.
@@ -17111,10 +17126,14 @@ async function runAICalibrationIterative(opts) {
               bry:  clamp(ks.bry,  keystoneMaxDelta)
             };
         // Bezier adjustments: clamped per-entry, dropped if below
-        // 5e-4 NDC (~0.25 px) since the apply check filters those
-        // out anyway. Only used in main mode if the AI proposed
-        // them inadvertently — usually empty in main mode.
-        const ba = isBezier && Array.isArray(c.bezierAdjustments)
+        // 5e-4 NDC (~0.25 px). Phase 6.6.20.21: also require AI
+        // confidence ≥ 0.7 to apply ANY bezier adjustments — the
+        // hallucination failure mode (uniform "slight edge bulge"
+        // across all displays at confidence 0.75) was tipped over
+        // by the threshold being too lenient. Bumped to 0.7 so
+        // generic boilerplate at 0.5-0.65 confidence gets dropped.
+        const conf = Number.isFinite(c.confidence) ? c.confidence : 0.5;
+        const ba = isBezier && Array.isArray(c.bezierAdjustments) && conf >= 0.7
           ? c.bezierAdjustments.map(adj => ({
               col:  Math.max(0, Math.min(4, adj.col | 0)),
               row:  Math.max(0, Math.min(4, adj.row | 0)),
@@ -17238,6 +17257,68 @@ async function runAICalibrationIterative(opts) {
     lastResult,                              // last analyzeCalibrationWithAI return — has per-display errors
     lastMeta: lastResult ? lastResult.meta : null
   };
+}
+
+/* Phase 6.6.20.21 — wipe all AI calibration state from the rig.
+ * Returns each display to baseline pose+FOV (per current rig
+ * template), zeros keystoneCorners, drops bezierCorrections, and
+ * re-runs auto-warp + auto-blend so the visible mesh state matches.
+ *
+ * Used when AI calibration produced a worse result and the user
+ * wants to start over from a clean rig. Doesn't touch custom
+ * (hand-edited) warp meshes — those are sacred per the existing
+ * _isCustom check.
+ *
+ * Confirmation dialog by default; pass {silent: true} to skip. */
+function resetAICalibration(opts) {
+  if (!state.rig || !Array.isArray(state.rig.displays)) return 0;
+  const silent = !!(opts && opts.silent);
+  if (!silent) {
+    const ok = (typeof confirm === "function")
+      ? confirm("Reset all AI calibration corrections?\n\n" +
+                "This will:\n" +
+                "  • Zero every display's keystoneCorners (8 NDC offsets per display)\n" +
+                "  • Drop every display's bezierCorrections (5×5 Bezier control grid)\n" +
+                "  • Re-run Auto-warp + Auto-blend so the visible meshes reflect the clean state\n\n" +
+                "Pose / FOV are NOT reverted (those came from the rig template; re-pick the\n" +
+                "template in the Rig panel if you want pose+FOV reset too). Custom hand-edited\n" +
+                "warp meshes are preserved.\n\n" +
+                "Continue?")
+      : true;
+    if (!ok) return 0;
+  }
+  pushHistory("ai-calibration-reset");
+  let cleaned = 0;
+  for (const d of state.rig.displays) {
+    if (!d) continue;
+    let hadAny = false;
+    if (d.keystoneCorners) {
+      const k = d.keystoneCorners;
+      if (Math.abs(k.tlx || 0) > 1e-6 || Math.abs(k.tly || 0) > 1e-6 ||
+          Math.abs(k.trx || 0) > 1e-6 || Math.abs(k.try_ || 0) > 1e-6 ||
+          Math.abs(k.blx || 0) > 1e-6 || Math.abs(k.bly || 0) > 1e-6 ||
+          Math.abs(k.brx || 0) > 1e-6 || Math.abs(k.bry || 0) > 1e-6) {
+        hadAny = true;
+      }
+      d.keystoneCorners = { tlx: 0, tly: 0, trx: 0, try_: 0, blx: 0, bly: 0, brx: 0, bry: 0 };
+    }
+    if (d.bezierCorrections) {
+      hadAny = true;
+      d.bezierCorrections = null;
+    }
+    if (hadAny) cleaned++;
+    if (Visual && Visual._warpCache) Visual._warpCache.delete(d.id);
+  }
+  // Re-bake clean state into the visible meshes.
+  try { _applyAutoWarpToRig({ skipHistory: true, silent: true }); } catch (_) {}
+  try { _applyAutoBlendToRig({ skipHistory: true, hardCuts: true }); } catch (_) {}
+  if (Visual && Visual._warpCache && typeof Visual._warpCache.clear === "function") {
+    Visual._warpCache.clear();
+  }
+  renderProps && renderProps();
+  render();
+  console.log("[ai-calibration-reset] cleaned " + cleaned + " display(s)");
+  return cleaned;
 }
 
 /* User-facing entry point — wraps iterative AI calibration into one
@@ -21586,6 +21667,8 @@ function renderRigPane() {
                     title="Hard-cut blend (no smooth ramps): each screen pixel comes from EXACTLY ONE projector — the one whose framebuffer puts that pixel furthest from its frame edge. Voronoi-style assignment in screen space. Useful for calibration debugging (you can see which projector covers what), and for installations where smooth blending isn't possible (sharp masks, hard-edge LED panels). Requires curved screen surface (sphere/cylinder/swept) with surfaceVisible ON.">Auto-blend (hard cuts)</button>
             <button class="rig-auto-blend-btn" id="btn-rig-auto-capture"
                     title="Auto-capture calibration: switch to theater preview, position camera at sweet spot, take screenshots looking in 6 cardinal directions (front / back / left / right / up / down). If a Checkerboard node is wired, cycles its mode 0..4 between snapshots (HEALPix / Lambert / Cube / Octahedral / Cosine lat-long). Downloads a ZIP bundle with the PNGs + a JSON metadata file describing the rig. Use with WireframeCalibration + Auto-blend (hard cuts) to verify projector calibration visually.">Auto-capture calibration</button>
+            <button class="rig-auto-blend-btn" id="btn-rig-ai-reset"
+                    title="Reset all AI calibration corrections to a clean baseline. Zeros keystoneCorners + drops bezierCorrections on every display, then re-runs Auto-warp + Auto-blend so the visible mesh matches the clean state. Pose/FOV not reverted (re-pick the rig template for that). Custom hand-edited warps preserved.">Reset AI corrections</button>
             <button class="rig-auto-blend-btn" id="btn-rig-ai-calibrate"
                     title="AI calibration v2 (iterative converge): runs up to 5 passes, capping per-pass deltas at ±0.5° per axis. Each pass captures, sends to Anthropic/Gemma vision, applies clamped corrections, recaptures. Stops when mean delta drops below 0.15° OR after 5 passes. Final modal lets you review the CUMULATIVE baseline-to-current diff and uncheck any projector you want reverted. Wire WireframeCalibration to your VisualOutputs first; AI key set in the User DSP tab → ⚙ Settings.">AI calibrate rig…</button>
           </span>
@@ -22024,6 +22107,24 @@ function wireRigPaneHandlers() {
       console.log("[auto-blend] applied to", applied, "displays;", skipped, "left as-is (no overlap)");
       renderProps && renderProps();
       render();
+    });
+  }
+
+  // Phase 6.6.20.21 — Reset AI corrections button. Zeros all
+  // keystoneCorners + bezierCorrections, re-bakes clean meshes.
+  const aiResetBtn = document.getElementById("btn-rig-ai-reset");
+  if (aiResetBtn) {
+    aiResetBtn.addEventListener("click", () => {
+      const cleaned = resetAICalibration();
+      if (cleaned >= 0) {
+        const orig = aiResetBtn.textContent;
+        aiResetBtn.textContent = "Cleaned " + cleaned + " display(s)";
+        aiResetBtn.disabled = true;
+        setTimeout(() => {
+          aiResetBtn.textContent = orig;
+          aiResetBtn.disabled = false;
+        }, 1500);
+      }
     });
   }
 
