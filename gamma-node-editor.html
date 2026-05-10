@@ -13142,17 +13142,43 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
 // approximation breaks down at large fov; atan() recovers the
 // correct angle from any fov (including 90° cube-face displays).
 fn frag_to_global_angles(uv: vec2f) -> vec2f {
+  // 6.6.20.24 — proper gnomonic-to-sphere math via projector basis
+  // rotation. The previous form added atan(local_x) to yaw and
+  // atan(local_y) to pitch independently, which is only correct
+  // when the projector points along the equator (pitch=0). For
+  // tilted projectors (AlloSphere top / bottom rings, polar caps)
+  // this caused adjacent projectors to compute different (yaw,
+  // pitch) for the same world point at their shared boundary —
+  // the visible X-shape crosses + doubled lines in calibration
+  // captures.
+  //
+  // Correct math: build the projector's world basis (right, up,
+  // forward) from its pose, rotate the fragment's local direction
+  // (local_x along right, local_y along up, +1 forward) into world
+  // space, then re-extract (yaw, pitch). Identical results across
+  // every projector that shares a boundary point.
   let fov_h_rad = u.u_view.w   * 0.0174532925;
   let fov_v_rad = u.u_fov_v_deg * 0.0174532925;
   let local_x = (uv.x - 0.5) * 2.0 * tan(fov_h_rad * 0.5);
   let local_y = (0.5 - uv.y) * 2.0 * tan(fov_v_rad * 0.5);
-  let yaw_off_rad   = atan(local_x);
-  let pitch_off_rad = atan(local_y);
-  // Convert back to degrees. 57.29577951 = 180 / PI.
-  return vec2f(
-    u.u_view.x + yaw_off_rad   * 57.29577951,
-    u.u_view.y + pitch_off_rad * 57.29577951
-  );
+  let yaw_rad   = u.u_view.x * 0.0174532925;
+  let pitch_rad = u.u_view.y * 0.0174532925;
+  let cy = cos(yaw_rad);   let sy = sin(yaw_rad);
+  let cp = cos(pitch_rad); let sp = sin(pitch_rad);
+  // Convention: yaw=0 forward = +Z; yaw=+90 = +X; pitch=+90 = +Y.
+  let fwd = vec3f(sy * cp, sp, cy * cp);
+  // Up reference flips to +Z near the poles to keep the cross
+  // product non-degenerate (looking straight up, world Y becomes
+  // co-linear with forward).
+  var up_ref = vec3f(0.0, 1.0, 0.0);
+  if (abs(fwd.y) > 0.999) { up_ref = vec3f(0.0, 0.0, 1.0); }
+  let right = normalize(cross(up_ref, fwd));
+  let up    = cross(fwd, right);
+  let dir = normalize(local_x * right + local_y * up + fwd);
+  let pitch_out = asin(clamp(dir.y, -1.0, 1.0));
+  let yaw_out   = atan2(dir.x, dir.z);
+  // 57.29577951 = 180 / PI.
+  return vec2f(yaw_out * 57.29577951, pitch_out * 57.29577951);
 }
 
 // Phase 6.6.20.4 — HEALPix RING pixelization.
@@ -13467,14 +13493,25 @@ fn hash22(p: vec2f) -> vec2f {
 }
 
 fn frag_to_global_angles(uv: vec2f) -> vec2f {
+  // 6.6.20.24 — proper gnomonic→sphere via projector basis rotation
+  // (see WireframeCalibration shader for full comment).
   let fov_h_rad = u.u_view.w   * 0.0174532925;
   let fov_v_rad = u.u_fov_v_deg * 0.0174532925;
   let local_x = (uv.x - 0.5) * 2.0 * tan(fov_h_rad * 0.5);
   let local_y = (0.5 - uv.y) * 2.0 * tan(fov_v_rad * 0.5);
-  return vec2f(
-    u.u_view.x + atan(local_x) * 57.29577951,
-    u.u_view.y + atan(local_y) * 57.29577951
-  );
+  let yaw_rad   = u.u_view.x * 0.0174532925;
+  let pitch_rad = u.u_view.y * 0.0174532925;
+  let cy = cos(yaw_rad);   let sy = sin(yaw_rad);
+  let cp = cos(pitch_rad); let sp = sin(pitch_rad);
+  let fwd = vec3f(sy * cp, sp, cy * cp);
+  var up_ref = vec3f(0.0, 1.0, 0.0);
+  if (abs(fwd.y) > 0.999) { up_ref = vec3f(0.0, 0.0, 1.0); }
+  let right = normalize(cross(up_ref, fwd));
+  let up    = cross(fwd, right);
+  let dir = normalize(local_x * right + local_y * up + fwd);
+  let pitch_out = asin(clamp(dir.y, -1.0, 1.0));
+  let yaw_out   = atan2(dir.x, dir.z);
+  return vec2f(yaw_out * 57.29577951, pitch_out * 57.29577951);
 }
 
 // Phase 6.6.20.3 — surface-aware equal-area helper. Same as
@@ -13645,14 +13682,25 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
 }
 
 fn frag_to_global_angles(uv: vec2f) -> vec2f {
+  // 6.6.20.24 — proper gnomonic→sphere via projector basis rotation
+  // (see WireframeCalibration shader for full comment).
   let fov_h_rad = u.u_view.w   * 0.0174532925;
   let fov_v_rad = u.u_fov_v_deg * 0.0174532925;
   let local_x = (uv.x - 0.5) * 2.0 * tan(fov_h_rad * 0.5);
   let local_y = (0.5 - uv.y) * 2.0 * tan(fov_v_rad * 0.5);
-  return vec2f(
-    u.u_view.x + atan(local_x) * 57.29577951,
-    u.u_view.y + atan(local_y) * 57.29577951
-  );
+  let yaw_rad   = u.u_view.x * 0.0174532925;
+  let pitch_rad = u.u_view.y * 0.0174532925;
+  let cy = cos(yaw_rad);   let sy = sin(yaw_rad);
+  let cp = cos(pitch_rad); let sp = sin(pitch_rad);
+  let fwd = vec3f(sy * cp, sp, cy * cp);
+  var up_ref = vec3f(0.0, 1.0, 0.0);
+  if (abs(fwd.y) > 0.999) { up_ref = vec3f(0.0, 0.0, 1.0); }
+  let right = normalize(cross(up_ref, fwd));
+  let up    = cross(fwd, right);
+  let dir = normalize(local_x * right + local_y * up + fwd);
+  let pitch_out = asin(clamp(dir.y, -1.0, 1.0));
+  let yaw_out   = atan2(dir.x, dir.z);
+  return vec2f(yaw_out * 57.29577951, pitch_out * 57.29577951);
 }
 
 // Smooth line ramp: 1.0 at distance 0, fades to 0 at distance line_w.
@@ -13874,14 +13922,25 @@ fn snoise2(p: vec2f) -> f32 {
 }
 
 fn frag_to_global_angles(uv: vec2f) -> vec2f {
+  // 6.6.20.24 — proper gnomonic→sphere via projector basis rotation
+  // (see WireframeCalibration shader for full comment).
   let fov_h_rad = u.u_view.w   * 0.0174532925;
   let fov_v_rad = u.u_fov_v_deg * 0.0174532925;
   let local_x = (uv.x - 0.5) * 2.0 * tan(fov_h_rad * 0.5);
   let local_y = (0.5 - uv.y) * 2.0 * tan(fov_v_rad * 0.5);
-  return vec2f(
-    u.u_view.x + atan(local_x) * 57.29577951,
-    u.u_view.y + atan(local_y) * 57.29577951
-  );
+  let yaw_rad   = u.u_view.x * 0.0174532925;
+  let pitch_rad = u.u_view.y * 0.0174532925;
+  let cy = cos(yaw_rad);   let sy = sin(yaw_rad);
+  let cp = cos(pitch_rad); let sp = sin(pitch_rad);
+  let fwd = vec3f(sy * cp, sp, cy * cp);
+  var up_ref = vec3f(0.0, 1.0, 0.0);
+  if (abs(fwd.y) > 0.999) { up_ref = vec3f(0.0, 0.0, 1.0); }
+  let right = normalize(cross(up_ref, fwd));
+  let up    = cross(fwd, right);
+  let dir = normalize(local_x * right + local_y * up + fwd);
+  let pitch_out = asin(clamp(dir.y, -1.0, 1.0));
+  let yaw_out   = atan2(dir.x, dir.z);
+  return vec2f(yaw_out * 57.29577951, pitch_out * 57.29577951);
 }
 
 @fragment
