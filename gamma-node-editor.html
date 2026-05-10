@@ -31500,6 +31500,60 @@ function _renderWorldUvForVO(currentVO, srcId) {
  * the manual layer-index param (the legacy Phase 6.6.22 form)
  * stays in place. WGSL treats a value < 0 as "ignore / black"
  * so unwired ports render neutrally instead of garbage. */
+/* Phase 6.6.28 — runtime param-wire resolver. For a shader-frag
+ * node, build a shallow copy of node.params where each `t: "param"`
+ * input port that has a wire connected has its value replaced by
+ * the live source value (Slider's current params.value for now;
+ * future: LFO / Ramp / etc. via a shared signal-rate sampler).
+ * The returned object is passed in lieu of node.params to the
+ * registry's writeUniforms — existing code that does
+ * `node.params.mix` automatically picks up the wired Slider value.
+ *
+ * Limited to Slider sources in this MVP. Audio-rate nodes (LFO,
+ * envelope, etc.) would need to hand off their current sample
+ * value from the AudioWorklet to the main thread each frame; that
+ * SAB-based audio bridge is Phase 6.5. */
+function _resolveNodeParams(node) {
+  const out = Object.assign({}, node && node.params);
+  if (typeof state === "undefined" || !state ||
+      !Array.isArray(state.edges) || !Array.isArray(state.nodes)) return out;
+  const def = TYPES[node && node.type];
+  if (!def || !Array.isArray(def.ins)) return out;
+  for (const port of def.ins) {
+    if (!port || port.t !== "param") continue;
+    const wire = state.edges.find(e =>
+      e && e.to && e.to.node === node.id && e.to.port === port.n
+    );
+    if (!wire || !wire.from) continue;
+    const src = state.nodes.find(n => n && n.id === wire.from.node);
+    if (!src) continue;
+    // Slider source: surface its current value (set by the Monitor
+    // controls panel + persisted in node.params.value). The Slider's
+    // min/max/curve mapping happens on the C++ side via setValue; in
+    // JS we just expose the raw value. User should set min=0, max=1
+    // for shader-frag mix-style params, or scale themselves.
+    if (src.type === "Slider") {
+      const v = (src.params && typeof src.params.value === "number")
+        ? src.params.value : 0;
+      out[port.n] = v;
+    }
+    // Future source types (Knob, audio-rate LFO via SAB, etc.) plug
+    // in here.
+  }
+  return out;
+}
+
+/* Phase 6.6.28 — wrap a node so its .params reads return the wire-
+ * resolved values. Used to pass into def.writeUniforms + dynamic
+ * wgsl functions without changing their (node, scratch) signature. */
+function _nodeWithResolvedParams(node) {
+  if (!node) return node;
+  const resolved = _resolveNodeParams(node);
+  // Object.assign here intentionally clones the node shallowly so we
+  // don't mutate the user's patch state with a swapped .params.
+  return Object.assign({}, node, { params: resolved });
+}
+
 function _resolveTextureInputLayer(node, portName, consumerVOId) {
   if (typeof state === "undefined" || !state ||
       !Array.isArray(state.edges) || !Array.isArray(state.nodes)) return -1;
@@ -31543,7 +31597,11 @@ function _encodeShaderFragPassForVO(enc, vo, src, def, dtSec, layerIdx) {
   // Phase 6.6.23 — pass the source node so def.wgsl can be a
   // (srcNode) => string function. Null inst means the dynamic
   // WGSL function threw or returned non-string; skip frame.
-  const inst = _ensureShaderInstance(vo.id, def, src);
+  // Phase 6.6.28 — substitute wire-resolved param values so the
+  // dynamic WGSL function (e.g. Text's text param) sees live
+  // Slider values, not just the manual fallback.
+  const srcResolvedForInst = _nodeWithResolvedParams(src);
+  const inst = _ensureShaderInstance(vo.id, def, srcResolvedForInst);
   if (!inst) return false;
   const entry = inst.pipelineEntry;
   if (!entry || !entry.pipeline) return false;
@@ -31563,8 +31621,12 @@ function _encodeShaderFragPassForVO(enc, vo, src, def, dtSec, layerIdx) {
   const display = state.rig && state.rig.displays && state.rig.displays[layerIdx];
   const renderWuv = _renderWorldUvForVO(vo, src.id);
   _writeShaderPreamble(inst.scratch, dtSec, display, renderWuv, layerIdx);
+  // Phase 6.6.28 — pass the wire-resolved src (computed above for
+  // the dynamic WGSL function) to writeUniforms too. writeUniforms
+  // sees node.params as the merged view (manual params + wired
+  // Slider values), existing registry code is unchanged.
   if (typeof def.writeUniforms === "function") {
-    def.writeUniforms(src, inst.scratch);
+    def.writeUniforms(srcResolvedForInst, inst.scratch);
   }
   // Phase 6.6.24 — for each composition shader-frag with declared
   // texture input ports + a textureInputSlots map (port -> scratch
@@ -31802,7 +31864,9 @@ function _encodeShaderFragPassForPlan(enc, entry, dtSec) {
   if (!layerView) return false;
 
   const instKey = "scratch:" + node.id + ":" + consumerVO.id;
-  const inst = _ensureShaderInstance(instKey, def, node);
+  // Phase 6.6.28 — wire-resolved params for the dynamic WGSL fn too.
+  const nodeResolvedForInst = _nodeWithResolvedParams(node);
+  const inst = _ensureShaderInstance(instKey, def, nodeResolvedForInst);
   if (!inst) return false;
   const pipeEntry = inst.pipelineEntry;
   if (!pipeEntry || !pipeEntry.pipeline) return false;
@@ -31816,8 +31880,9 @@ function _encodeShaderFragPassForPlan(enc, entry, dtSec) {
   const renderWuv = _renderWorldUvForVO(consumerVO, node.id);
 
   _writeShaderPreamble(inst.scratch, dtSec, display, renderWuv, layerIdx);
+  // Phase 6.6.28 — re-use the resolved node from instance creation.
   if (typeof def.writeUniforms === "function") {
-    def.writeUniforms(node, inst.scratch);
+    def.writeUniforms(nodeResolvedForInst, inst.scratch);
   }
   // Re-apply the composition texture-input resolver for this scratch
   // node's own inputs (e.g. a BlendShader feeding another BlendShader).
