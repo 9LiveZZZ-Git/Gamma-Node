@@ -30534,11 +30534,42 @@ function _getShaderPipeline(wgsl, bindLayout) {
  *     is actually ready. The old pipeline keeps rendering until then.
  *   • When def.uniformBytes changes (param count edited), the buffer
  *     itself has to be reallocated; the old buffer is destroyed and a
- *     fresh bind group is built. Pipeline entry is also re-checked. */
-function _ensureShaderInstance(nodeId, def) {
+ *     fresh bind group is built. Pipeline entry is also re-checked.
+ *
+ * Phase 6.6.23 — dynamic WGSL. def.wgsl can now be EITHER a string
+ * (every instance shares one compiled pipeline, hashed by the WGSL
+ * source) or a function (srcNode) => string (each call computes
+ * the WGSL fresh from the node's current params; same-string
+ * outputs still share a cached pipeline via the hash key, but
+ * different params that change the source recompile lazily on
+ * the first frame they're seen). The function form lets a single
+ * registry entry produce per-node WGSL — used by the upcoming
+ * MeshText conversion (param 'text' compiled into the bitmap
+ * lookup table) and any future user-DSP node whose generated
+ * shader depends on its own params. The function MUST be pure +
+ * deterministic for a given node; non-deterministic output would
+ * cause every frame to look up a new cache entry and trigger
+ * an endless compile cascade. */
+function _ensureShaderInstance(nodeId, def, srcNode) {
   let inst = Visual.shaderInstances.get(nodeId);
   const bindLayout = def.bindLayout || "standard";
-  const desiredEntry = _getShaderPipeline(def.wgsl, bindLayout);
+  // Phase 6.6.23 — resolve dynamic WGSL. If the function throws,
+  // log it once + bail; caller falls back gracefully (returns
+  // null, _encodeShaderFragPassForVO checks for it).
+  let wgsl;
+  try {
+    wgsl = (typeof def.wgsl === "function")
+      ? def.wgsl(srcNode || {})
+      : def.wgsl;
+  } catch (e) {
+    if (!def._dynWgslWarned) {
+      console.warn("[visual] dynamic WGSL function threw for node " + nodeId + ":", e);
+      def._dynWgslWarned = true;
+    }
+    return null;
+  }
+  if (typeof wgsl !== "string" || wgsl.length === 0) return null;
+  const desiredEntry = _getShaderPipeline(wgsl, bindLayout);
 
   // Reallocate when the buffer size, bindLayout, or feedback array
   // ref doesn't match (fresh node, user edited params, framebuffer
@@ -30896,7 +30927,11 @@ function _renderWorldUvForVO(currentVO, srcId) {
 function _encodeShaderFragPassForVO(enc, vo, src, def, dtSec, layerIdx) {
   const layerView = Visual.framebufferLayerViews[layerIdx];
   if (!layerView) return false;
-  const inst = _ensureShaderInstance(vo.id, def);
+  // Phase 6.6.23 — pass the source node so def.wgsl can be a
+  // (srcNode) => string function. Null inst means the dynamic
+  // WGSL function threw or returned non-string; skip frame.
+  const inst = _ensureShaderInstance(vo.id, def, src);
+  if (!inst) return false;
   const entry = inst.pipelineEntry;
   if (!entry || !entry.pipeline) return false;
 
