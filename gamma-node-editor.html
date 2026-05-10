@@ -31188,7 +31188,7 @@ function _renderWorldUvForVO(currentVO, srcId) {
  * the manual layer-index param (the legacy Phase 6.6.22 form)
  * stays in place. WGSL treats a value < 0 as "ignore / black"
  * so unwired ports render neutrally instead of garbage. */
-function _resolveTextureInputLayer(node, portName) {
+function _resolveTextureInputLayer(node, portName, consumerVOId) {
   if (typeof state === "undefined" || !state ||
       !Array.isArray(state.edges) || !Array.isArray(state.nodes)) return -1;
   const incoming = state.edges.find(e =>
@@ -31197,11 +31197,17 @@ function _resolveTextureInputLayer(node, portName) {
   if (!incoming) return -1;
   const sourceNodeId = incoming.from && incoming.from.node;
   if (!sourceNodeId) return -1;
-  // Direct downstream VisualOutput on the source itself. Multi-hop
-  // chains (ShaderA -> BlendA -> BlendB) require ShaderA / BlendA
-  // to ALSO have their own VOs so they render to known layers;
-  // walking through composition chains for transitive layer
-  // resolution is Phase 6.6.25.
+  // Phase 6.6.26 — first try the current frame's render plan
+  // (scratch-layer assignments + direct-VO assignments). The plan
+  // key is `${sourceNodeId}@${consumerVOId}` so we get the
+  // pose-correct render of the source for this specific consumer.
+  if (Visual._currentRenderPlan && consumerVOId) {
+    const planEntry = Visual._currentRenderPlan.get(sourceNodeId + "@" + consumerVOId);
+    if (planEntry && planEntry.layerIdx >= 0) return planEntry.layerIdx;
+  }
+  // Legacy fallback (pre-6.6.26): direct downstream VisualOutput on
+  // the source itself. Only matters if the plan didn't capture it
+  // for some reason (e.g. called without consumerVOId).
   const vo = state.nodes.find(n =>
     n && n.type === "VisualOutput" &&
     state.edges.some(e =>
@@ -31262,7 +31268,7 @@ function _encodeShaderFragPassForVO(enc, vo, src, def, dtSec, layerIdx) {
       if (!port || port.t !== "texture") continue;
       const slot = slotMap[port.n];
       if (typeof slot !== "number") continue;
-      const resolved = _resolveTextureInputLayer(src, port.n);
+      const resolved = _resolveTextureInputLayer(src, port.n, vo.id);
       if (resolved >= 0) inst.scratch[slot] = resolved;
     }
   }
@@ -31335,6 +31341,24 @@ function _encodeVisualGraph(enc, dtSec) {
   if (visualOutputs.length === 0) return false;
   const layerCount = Visual.framebufferLayerViews.length || 1;
   const renderedLayers = new Set();
+
+  // Phase 6.6.26 — build the frame's render plan: each shader-frag
+  // node that needs to render this frame plus the layer it writes
+  // to + the consumer VO whose pose drives u_view. Direct-VO sources
+  // go to the VO's display layer; sources only reachable via
+  // composition texture-input ports get auto-allocated scratch
+  // layers (drawn from RIG_MAX_DISPLAYS downward, past the rig's
+  // real display count). Stored on Visual so the composition
+  // texture-input resolver can look up scratch-layer assignments.
+  Visual._currentRenderPlan = _buildRenderPlan(visualOutputs, layerCount);
+  // Render scratch-layer entries FIRST (so the framebuffer copy at
+  // end-of-frame captures their output for next frame's reads).
+  for (const entry of Visual._currentRenderPlan.values()) {
+    if (!entry.isScratch) continue;
+    const ok = _encodeShaderFragPassForPlan(enc, entry, dtSec);
+    if (ok) renderedLayers.add(entry.layerIdx);
+  }
+
   for (const vo of visualOutputs) {
     let layerIdx = (vo.params && typeof vo.params.display === "number") ? (vo.params.display | 0) : 0;
     if (layerIdx < 0)            layerIdx = 0;
@@ -31347,7 +31371,12 @@ function _encodeVisualGraph(enc, dtSec) {
       const src = state.nodes.find(n => n.id === incomingEdge.from.node);
       if (src) {
         const def = TYPES[src.type];
-        if (def && def.kind === "shader-frag" && typeof def.wgsl === "string") {
+        // Phase 6.6.25 — also allow def.wgsl to be a function (the
+        // dynamic-WGSL form used by the v0.2.0 mesh-text Text node).
+        // Without this check the Text node compiles but never gets
+        // rendered.
+        if (def && def.kind === "shader-frag" &&
+            (typeof def.wgsl === "string" || typeof def.wgsl === "function")) {
           ok = _encodeShaderFragPassForVO(enc, vo, src, def, dtSec, layerIdx);
         }
       }
@@ -31364,6 +31393,148 @@ function _encodeVisualGraph(enc, dtSec) {
     if (!renderedLayers.has(i)) _encodeLayerClear(enc, i);
   }
   return true;   // VOs exist → composite runs
+}
+
+/* Phase 6.6.26 — walk the patch graph from each VisualOutput and
+ * record every shader-frag node that needs to render this frame
+ * plus where it writes to. Returns Map<planKey, planEntry>.
+ *
+ * planKey:    `${sourceNodeId}@${consumerVOId}` -- unique per
+ *             (source × consumer VO) pair so the same source
+ *             feeding two different VOs gets two plan entries
+ *             (rendered with each consumer's pose).
+ * planEntry:  { node, def, layerIdx, consumerVO, isScratch }.
+ *
+ * Direct VO consumers (source wired straight to a VO.in) get the
+ * VO's display layer and isScratch=false; the existing per-VO
+ * render loop in _encodeVisualGraph picks them up. Composition
+ * upstream sources (source wired into a comp node's texture input)
+ * get auto-allocated scratch layers from RIG_MAX_DISPLAYS-1
+ * downward and isScratch=true; _encodeShaderFragPassForPlan
+ * renders them. Composition reads come via fbHistory next frame,
+ * so all of this is 1-frame-lagged but pose-consistent. */
+function _buildRenderPlan(visualOutputs, layerCount) {
+  const plan = new Map();
+  if (!Array.isArray(state.edges)) return plan;
+
+  const rigDisplayCount = (state.rig && state.rig.displays) ? state.rig.displays.length : 1;
+  let nextScratch = Math.min(RIG_MAX_DISPLAYS - 1, layerCount - 1);
+  const allocScratch = () => {
+    if (nextScratch < rigDisplayCount) return -1;
+    return nextScratch--;
+  };
+
+  function walk(nodeId, consumerVO, isViaCompPort) {
+    const node = state.nodes.find(n => n.id === nodeId);
+    if (!node) return;
+    const def = TYPES[node.type];
+    if (!def || def.kind !== "shader-frag") return;
+    if (!(typeof def.wgsl === "string" || typeof def.wgsl === "function")) return;
+
+    const planKey = node.id + "@" + consumerVO.id;
+    if (plan.has(planKey)) return;
+
+    let layerIdx;
+    let isScratch;
+    if (isViaCompPort) {
+      // Reached this node by walking up from a composition texture
+      // port -> needs a scratch layer. (Even if the node ALSO has a
+      // direct VO wire elsewhere, this consumer needs its own pose-
+      // correct render, so scratch is right.)
+      layerIdx = allocScratch();
+      if (layerIdx < 0) return;            // ran out of scratch
+      isScratch = true;
+    } else {
+      // Direct wire to consumerVO.in -> use the VO's display layer.
+      layerIdx = (consumerVO.params && typeof consumerVO.params.display === "number")
+        ? (consumerVO.params.display | 0) : 0;
+      if (layerIdx < 0) layerIdx = 0;
+      if (layerIdx >= rigDisplayCount) layerIdx = rigDisplayCount - 1;
+      isScratch = false;
+    }
+
+    plan.set(planKey, { node, def, layerIdx, consumerVO, isScratch });
+
+    // Recurse into this node's texture input ports.
+    if (Array.isArray(def.ins)) {
+      for (const port of def.ins) {
+        if (!port || port.t !== "texture") continue;
+        const wire = state.edges.find(e =>
+          e && e.to && e.to.node === nodeId && e.to.port === port.n
+        );
+        if (!wire || !wire.from) continue;
+        walk(wire.from.node, consumerVO, true);
+      }
+    }
+  }
+
+  for (const vo of visualOutputs) {
+    const incoming = state.edges.find(e =>
+      e && e.to && e.to.node === vo.id && e.to.port === "in"
+    );
+    if (!incoming || !incoming.from) continue;
+    walk(incoming.from.node, vo, false);
+  }
+  return plan;
+}
+
+/* Phase 6.6.26 — render one scratch-layer entry from the plan.
+ * Mirrors _encodeShaderFragPassForVO but: uses the consumer VO's
+ * display for pose (so the source renders FOR that consumer), uses
+ * a synthetic instance key so it doesn't collide with the direct
+ * per-VO render of the same VO, and writes to the scratch layer
+ * the plan assigned (not the consumer's display). */
+function _encodeShaderFragPassForPlan(enc, entry, dtSec) {
+  const { node, def, layerIdx, consumerVO } = entry;
+  const layerView = Visual.framebufferLayerViews[layerIdx];
+  if (!layerView) return false;
+
+  const instKey = "scratch:" + node.id + ":" + consumerVO.id;
+  const inst = _ensureShaderInstance(instKey, def, node);
+  if (!inst) return false;
+  const pipeEntry = inst.pipelineEntry;
+  if (!pipeEntry || !pipeEntry.pipeline) return false;
+
+  // Use the consumer VO's display for pose so the source renders
+  // the world from that perspective. The output sits in the scratch
+  // layer; the consumer reads it via fbHistory next frame.
+  const consumerDisp = (consumerVO.params && typeof consumerVO.params.display === "number")
+    ? (consumerVO.params.display | 0) : 0;
+  const display = state.rig && state.rig.displays && state.rig.displays[consumerDisp];
+  const renderWuv = _renderWorldUvForVO(consumerVO, node.id);
+
+  _writeShaderPreamble(inst.scratch, dtSec, display, renderWuv, layerIdx);
+  if (typeof def.writeUniforms === "function") {
+    def.writeUniforms(node, inst.scratch);
+  }
+  // Re-apply the composition texture-input resolver for this scratch
+  // node's own inputs (e.g. a BlendShader feeding another BlendShader).
+  const slotMap = def.textureInputSlots;
+  if (slotMap && Array.isArray(def.ins)) {
+    for (const port of def.ins) {
+      if (!port || port.t !== "texture") continue;
+      const slot = slotMap[port.n];
+      if (typeof slot !== "number") continue;
+      const resolved = _resolveTextureInputLayer(node, port.n, consumerVO.id);
+      if (resolved >= 0) inst.scratch[slot] = resolved;
+    }
+  }
+  Visual.device.queue.writeBuffer(inst.uniformBuffer, 0, inst.scratch.buffer, inst.scratch.byteOffset, inst.scratch.byteLength);
+
+  const pass = enc.beginRenderPass({
+    label: "shader-frag-scratch-" + node.type + "-" + node.id + "-vo-" + consumerVO.id + "-layer-" + layerIdx,
+    colorAttachments: [{
+      view: layerView,
+      clearValue: { r: 0, g: 0, b: 0, a: 1 },
+      loadOp: "clear",
+      storeOp: "store"
+    }]
+  });
+  pass.setPipeline(pipeEntry.pipeline);
+  pass.setBindGroup(0, inst.bindGroup);
+  pass.draw(3);
+  pass.end();
+  return true;
 }
 
 /* ----- Phase 6.5.16 — 3D rig wireframe gizmo ------------------------- */
