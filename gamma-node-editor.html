@@ -14206,20 +14206,29 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
 
   let time = u.u_time * speed + 0.25;
 
-  // Camera position drifts through space. Original Shadertoy used
-  // mouse rotations; we don't have a mouse input on the dome so
-  // we substitute slow time-driven yaw/pitch that gently swings
-  // the viewing point. Keeps the "flying through stars" feel.
-  let a1 = sin(time * 0.30) * 0.50;
-  let a2 = cos(time * 0.40) * 0.40;
-  let cosA1 = cos(a1); let sinA1 = sin(a1);
-  let cosA2 = cos(a2); let sinA2 = sin(a2);
+  // Camera position drifts through space. Shadertoy's original
+  // version uses mouse-driven 'from' rotation (a1=0.5, a2=0.8 at
+  // mouse=center); we match those defaults so the static frame
+  // looks like the canonical Shadertoy preview, then add a tiny
+  // time-driven oscillation on top. Phase 6.6.21.1: stripped a
+  // larger animation that was placing 'from' in low-density
+  // void regions on the first frames -> all-black output. The
+  // backticks-in-WGSL-comments thing closes the JS template
+  // literal early; never use backticks inside an embedded shader.
+  let a1 = 0.5 + sin(time * 0.20) * 0.10;
+  let a2 = 0.8 + cos(time * 0.15) * 0.10;
+  let cosA1 = cos(a1);
+  let sinA1 = sin(a1);
+  let cosA2 = cos(a2);
+  let sinA2 = sin(a2);
 
-  var from = vec3f(1.0, 0.5, 0.5) + vec3f(time * 2.0, time, -2.0);
-  let fxz = vec2f(from.x * cosA1 + from.z * sinA1, -from.x * sinA1 + from.z * cosA1);
-  from = vec3f(fxz.x, from.y, fxz.y);
-  let fxy = vec2f(from.x * cosA2 + from.y * sinA2, -from.x * sinA2 + from.y * cosA2);
-  from = vec3f(fxy.x, fxy.y, from.z);
+  var from = vec3<f32>(1.0, 0.5, 0.5) + vec3<f32>(time * 2.0, time, -2.0);
+  let fxz_x =  from.x * cosA1 + from.z * sinA1;
+  let fxz_z = -from.x * sinA1 + from.z * cosA1;
+  from = vec3<f32>(fxz_x, from.y, fxz_z);
+  let fxy_x =  from.x * cosA2 + from.y * sinA2;
+  let fxy_y = -from.x * sinA2 + from.y * cosA2;
+  from = vec3<f32>(fxy_x, fxy_y, from.z);
 
   // Volumetric raymarch. Each step folds the world into a tiled
   // "kaleidoscope" cell, then iterates the abs(p)/dot(p,p) - param
@@ -14228,36 +14237,43 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   // with distance + dark-matter density.
   var s:    f32 = 0.1;
   var fade: f32 = 1.0;
-  var v:    vec3f = vec3f(0.0);
+  var v:    vec3<f32> = vec3<f32>(0.0, 0.0, 0.0);
   let tile2 = tile * 2.0;
 
   for (var r: i32 = 0; r < volsteps; r = r + 1) {
     var p = from + s * dir * 0.5;
     // Tile fold: p = abs(tile - mod(p, tile*2))
-    p = abs(vec3f(tile) - (p - tile2 * floor(p / tile2)));
+    let pmod = p - tile2 * floor(p / tile2);
+    p = abs(vec3<f32>(tile, tile, tile) - pmod);
 
     var pa: f32 = 0.0;
     var a:  f32 = 0.0;
     for (var i: i32 = 0; i < iterations; i = i + 1) {
-      let dp = max(dot(p, p), 1e-4);            // guard /0 at origin
-      p = abs(p) / dp - vec3f(formuparam);
+      let dpp = max(dot(p, p), 0.0001);      // guard /0 at origin
+      p = abs(p) / dpp - vec3<f32>(formuparam, formuparam, formuparam);
       let pl = length(p);
       a = a + abs(pl - pa);
       pa = pl;
     }
     let dm = max(0.0, darkmatter - a * a * 0.001);
-    a = a * a * a;
+    let a3 = a * a * a;
     if (r > 6) { fade = fade * (1.0 - dm); }
-    v = v + vec3f(fade);
-    v = v + vec3f(s, s * s, s * s * s * s) * a * brightness * fade;
+    v = v + vec3<f32>(fade, fade, fade);
+    v = v + vec3<f32>(s, s * s, s * s * s * s) * a3 * brightness * fade;
     fade = fade * distfading;
     s = s + stepsize;
   }
 
   // Saturation adjust: blend toward grayscale by (1 - saturation).
   let lv = length(v);
-  v = mix(vec3f(lv), v, saturation);
-  return vec4f(v * 0.01, 1.0);
+  v = mix(vec3<f32>(lv, lv, lv), v, saturation);
+  // Original Shadertoy uses *0.01 with HDR output. Our framebuffer
+  // is LDR -> exposure-tonemap to keep highlights visible without
+  // crushing midtones to black. 1 - exp(-v*0.02) is a standard
+  // photographic-curve approximation; max() guards against NaN
+  // from accumulated overflow on extreme parameter values.
+  let toned = vec3<f32>(1.0) - exp(-max(v * 0.020, vec3<f32>(0.0)));
+  return vec4<f32>(toned, 1.0);
 }`,
     writeUniforms(node, scratch) {
       const p = node.params || {};
