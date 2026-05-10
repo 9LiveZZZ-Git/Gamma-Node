@@ -33242,6 +33242,114 @@ const previewState = {
   archiveBuffer: null     // ArrayBuffer of the Gamma tarball (cached after first fetch)
 };
 
+/* =========================================================================
+ * Phase 6.5.1 — Audio bridge (SharedArrayBuffer between worklet + main)
+ *
+ * Layout (4 KB total, indexed as Int32 + Float32 views over the same SAB):
+ *   Header (8 × i32 = 32 bytes):
+ *     [0] magic 'GAMA' (0x474D4143)
+ *     [1] version (1)
+ *     [2] frame counter (Atomics-incremented per audio quantum)
+ *     [3] sample rate reinterpret as i32 (read via Float32 view)
+ *     [4..7] reserved
+ *   Scalars (16 × f32 at indices 8..23):
+ *     16 scalar bridge slots. 6.5.2 EnvFollow / 6.5.4 Clock / future
+ *     audio-rate-to-uniform nodes register their slot here.
+ *   FFT bins (256 × f32 at indices 24..279):
+ *     6.5.3 FFTBins writes magnitude bins per quantum.
+ *   Remaining bytes 1120..4095 reserved for future expansion (waveform
+ *     buffer, gate triggers, etc.).
+ *
+ * Concurrency model: the worklet is the SOLE writer for slots; the main
+ * thread READS only. Atomics.add on the frame counter (index 2) signals
+ * "new quantum is in", but each f32 slot read is naturally tear-free at
+ * 32-bit alignment so we don't need locks for scalar values. The main
+ * thread reads once per requestAnimationFrame and writes to GPU uniform
+ * buffers; the worklet runs at audio-quantum rate (~2.7 ms at 48k/128).
+ *
+ * Slot allocation strategy (deferred to 6.5.2+): each bridge node
+ * registers a slot via audioBridge.allocScalar() which returns a stable
+ * index. The slot index is baked into the codegen so the wasm-side
+ * tick function writes to bridgeFloats[8 + slotIdx]. For 6.5.1 (this
+ * commit) the worklet writes ONE smoke-test value (master peak from
+ * the audio output buffer) to slot 0 so we can verify the plumbing
+ * round-trips before wiring it to shader-frag uniforms. */
+const AUDIO_BRIDGE_SAB_BYTES   = 4096;
+const AUDIO_BRIDGE_SCALAR_BASE = 8;       // f32 index of slot 0
+const AUDIO_BRIDGE_SCALAR_COUNT = 16;
+const AUDIO_BRIDGE_FFT_BASE    = 24;      // f32 index of FFT bin 0
+const AUDIO_BRIDGE_FFT_COUNT   = 256;
+const AUDIO_BRIDGE_MAGIC       = 0x474D4143;  // 'GAMA' little-endian
+
+const audioBridge = {
+  sab:        null,
+  floats:     null,   // Float32Array view over the whole SAB
+  ints:       null,   // Int32Array view over the whole SAB
+  available:  false,
+  // 6.5.1 — fixed slot assignment so the main thread can read a known
+  // value without waiting for a registration handshake. 6.5.2+ will
+  // formalize allocation via the EnvFollow/Clock/FFT bridge nodes.
+  TEST_MASTER_PEAK_SLOT: 0,
+
+  init() {
+    if (this.sab) return true;
+    // SharedArrayBuffer needs cross-origin isolation (COOP/COEP). The
+    // editor's coi-serviceworker turns this on in production; if it
+    // isn't active the bridge stays disabled and readScalar() returns
+    // 0. Bridge nodes that depend on it can still ship; they just
+    // produce zero until the user gets COOP/COEP right.
+    if (typeof SharedArrayBuffer === "undefined" ||
+        typeof self !== "undefined" && !self.crossOriginIsolated) {
+      this.available = false;
+      console.warn("[audio-bridge] SharedArrayBuffer unavailable -- " +
+                   "crossOriginIsolated=" + (typeof self !== "undefined" ? self.crossOriginIsolated : "n/a") +
+                   "; bridge stays disabled");
+      return false;
+    }
+    try {
+      this.sab    = new SharedArrayBuffer(AUDIO_BRIDGE_SAB_BYTES);
+      this.floats = new Float32Array(this.sab);
+      this.ints   = new Int32Array(this.sab);
+      this.ints[0] = AUDIO_BRIDGE_MAGIC;
+      this.ints[1] = 1;
+      this.ints[2] = 0;
+      this.available = true;
+      console.log("[audio-bridge] SAB allocated, " + AUDIO_BRIDGE_SAB_BYTES + " B, " +
+                  AUDIO_BRIDGE_SCALAR_COUNT + " scalar slots + " +
+                  AUDIO_BRIDGE_FFT_COUNT + " FFT bins");
+      return true;
+    } catch (e) {
+      this.available = false;
+      console.warn("[audio-bridge] SAB allocation failed:", e);
+      return false;
+    }
+  },
+
+  /* Read a scalar bridge slot. Returns 0 when the bridge isn't
+   * available or idx is out of range. Tear-free at 32-bit alignment;
+   * stale data is acceptable -- the worklet always writes the latest
+   * value, so a read just gets whatever the most recent quantum saw. */
+  readScalar(idx) {
+    if (!this.available || idx < 0 || idx >= AUDIO_BRIDGE_SCALAR_COUNT) return 0;
+    return this.floats[AUDIO_BRIDGE_SCALAR_BASE + idx];
+  },
+
+  /* Read one FFT magnitude bin. Same tear-free + stale-OK contract. */
+  readFftBin(idx) {
+    if (!this.available || idx < 0 || idx >= AUDIO_BRIDGE_FFT_COUNT) return 0;
+    return this.floats[AUDIO_BRIDGE_FFT_BASE + idx];
+  },
+
+  /* Atomically read the per-quantum frame counter. Diagnostic /
+   * health-check: if this doesn't tick over multiple rAF frames, the
+   * worklet isn't writing (audio is dead or the worklet hasn't
+   * received the bridge-init message yet). */
+  frameCounter() {
+    if (!this.available) return 0;
+    return Atomics.load(this.ints, 2);
+  }
+};
+
 const previewBtnPlay = document.getElementById("btn-preview-play");
 const previewBtnStop = document.getElementById("btn-preview-stop");
 const previewStatusEl = document.getElementById("preview-status");
@@ -34059,6 +34167,12 @@ class PreviewProcessor extends AudioWorkletProcessor {
     this.micBufPtr = 0;
     this.micSetLen = null;
     this.micEnabled = false;
+    // Phase 6.5.1 — audio bridge. The main thread allocates a SAB
+    // and posts it once; the worklet keeps the views alive and
+    // writes scalar values + (future) FFT bins per quantum. Null
+    // until bridge-init arrives; process() guards on it.
+    this.bridgeFloats = null;
+    this.bridgeInts   = null;
     this.port.onmessage = (ev) => {
       const m = ev.data;
       if (m.type === "load") this.loadModule(m.wasmBytes).catch(e => {
@@ -34066,6 +34180,12 @@ class PreviewProcessor extends AudioWorkletProcessor {
       });
       else if (m.type === "set" && this.setFn) this.setFn(m.index, m.value);
       else if (m.type === "stop") this.instance = null;
+      else if (m.type === "bridge-init" && m.sab) {
+        // Stash worklet-side views over the shared buffer. The same
+        // bytes the main thread sees; tear-free for 32-bit reads.
+        this.bridgeFloats = new Float32Array(m.sab);
+        this.bridgeInts   = new Int32Array(m.sab);
+      }
     };
   }
   async loadModule(bytes) {
@@ -34148,6 +34268,27 @@ class PreviewProcessor extends AudioWorkletProcessor {
     const rOff = this.outRPtr >> 2;
     out[0].set(heap.subarray(lOff, lOff + out[0].length));
     if (out.length > 1) out[1].set(heap.subarray(rOff, rOff + out[1].length));
+    // Phase 6.5.1 — audio bridge smoke test. While Phase 6.5.2+ ships
+    // proper EnvFollow / FFT / Clock bridge nodes, this writes the
+    // master-output peak (max |L|, |R| over the quantum) to scalar
+    // slot 0 so the main thread can verify the SAB plumbing
+    // round-trips even before any bridge node is in the patch. Cheap
+    // -- one pass over 128 samples per quantum.
+    if (this.bridgeFloats) {
+      let peak = 0;
+      const lBuf = out[0];
+      const rBuf = out.length > 1 ? out[1] : null;
+      for (let i = 0; i < lBuf.length; i++) {
+        const a = lBuf[i] >= 0 ? lBuf[i] : -lBuf[i];
+        if (a > peak) peak = a;
+        if (rBuf) {
+          const b = rBuf[i] >= 0 ? rBuf[i] : -rBuf[i];
+          if (b > peak) peak = b;
+        }
+      }
+      this.bridgeFloats[8] = peak;       // scalar slot 0 (AUDIO_BRIDGE_SCALAR_BASE)
+      Atomics.add(this.bridgeInts, 2, 1); // bump quantum frame counter
+    }
     // After ~50 process calls (~150ms @48k/128) report what the worklet
     // is actually emitting. Lets us tell apart "wasm produces zero" vs
     // "audio path is broken downstream of the worklet".
@@ -34214,6 +34355,14 @@ async function ensureAudioWorklet() {
   previewState.analyserL = analyserL;
   previewState.analyserR = analyserR;
   startMeterLoop();
+
+  // Phase 6.5.1 — hand the shared bridge SAB to the worklet. Safe to
+  // call on every worklet creation; audioBridge.init() is idempotent.
+  // If SAB isn't available (no COOP/COEP), init returns false and the
+  // worklet's process() guards on this.bridgeFloats being null.
+  if (audioBridge.init()) {
+    node.port.postMessage({ type: "bridge-init", sab: audioBridge.sab });
+  }
 
   node.port.onmessage = (ev) => {
     if (ev.data.type === "loaded") {
