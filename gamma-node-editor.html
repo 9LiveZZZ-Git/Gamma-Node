@@ -15823,6 +15823,16 @@ async function autoCaptureCalibration(opts) {
   const autoPrep      = !(opts && opts.autoPrep      === false);  // apply Auto-warp + hard-cut blend before capture
   const coverageAware = !(opts && opts.coverageAware === false);  // skip directions outside surface coverage
   const perDisplay    = !(opts && opts.perDisplay    === false);  // also capture aimed at each display's pose
+  // 6.6.20.20 — also capture BOUNDARY views between adjacent
+  // projector pairs. Each pair's mid-direction shows the seam
+  // mid-frame so the AI can verify whether wireframe lines
+  // connect cleanly across the boundary. Default ON.
+  const boundaryPairs = !(opts && opts.boundaryPairs === false);
+  // 6.6.20.20 — also capture POLE shots (forced inside surface
+  // coverage at ±80° pitch). Reveals polar projector convergence
+  // issues that the cardinal up/down (89.4°) miss because they're
+  // outside coverage. Default ON.
+  const polarShots    = !(opts && opts.polarShots    === false);
 
   // Snapshot state so finally{} can put everything back exactly.
   const prevPreviewMode = state.rig.previewMode;
@@ -15832,7 +15842,16 @@ async function autoCaptureCalibration(opts) {
     pitch: Visual.theaterCam.pitch,
     fov:   Visual.theaterCam.fov   // 6.6.20.19 — also save FOV for wider AI captures
   };
-  const checkerNodes = (state.nodes || []).filter(n => n.type === "Checkerboard");
+  // 6.6.20.20 — detect what shaders are in the patch. AI calibration
+  // expects WireframeCalibration to be wired to the VOs (it's the
+  // shader whose output the AI prompts describe — red equator,
+  // RGB great circles, beacon circles etc.). When called from the
+  // AI flow (opts.aiMode), we SKIP Checkerboard mode-cycling
+  // entirely; cycling 5 modes mid-loop confuses the AI's frame-to-
+  // frame comparison and the captures become inconsistent.
+  const aiMode = !!(opts && opts.aiMode);
+  const wireframeNodes = (state.nodes || []).filter(n => n.type === "WireframeCalibration");
+  const checkerNodes   = (state.nodes || []).filter(n => n.type === "Checkerboard");
   const prevCheckerModes = checkerNodes.map(n => (n.params && n.params.mode));
   // If autoPrep mutates warp meshes, save them too so capture is
   // side-effect-free. (User runs Auto-warp / Auto-blend manually if
@@ -15952,9 +15971,105 @@ async function autoCaptureCalibration(opts) {
       });
     }
 
+    // 6.6.20.20 — BOUNDARY-PAIR captures. For each pair of
+    // projectors whose coverage overlaps, aim camera at the midpoint
+    // between their pose directions. This puts the SEAM between
+    // them dead-center in the frame, so the AI can verify whether
+    // wireframe lines actually connect across the boundary (which
+    // it cannot do from a single-projector-centered capture).
+    if (boundaryPairs && Array.isArray(state.rig.displays)) {
+      const seenNames = new Set(directions.map(d => d.name));
+      const displays = state.rig.displays;
+      // Two projectors share a boundary if their pose-to-pose
+      // angular distance is less than the sum of their half-FOVs.
+      // Compute half-fov as max(fov.h, fov.v)/2 for a conservative
+      // overlap test.
+      const angDist = (poseA, poseB) => {
+        // Unit vectors for each pose; angular distance = arccos(dot).
+        const ya = (poseA.yaw || 0) * Math.PI / 180, pa = (poseA.pitch || 0) * Math.PI / 180;
+        const yb = (poseB.yaw || 0) * Math.PI / 180, pb = (poseB.pitch || 0) * Math.PI / 180;
+        const ax = Math.sin(ya) * Math.cos(pa), ay = Math.sin(pa), az = Math.cos(ya) * Math.cos(pa);
+        const bx = Math.sin(yb) * Math.cos(pb), by = Math.sin(pb), bz = Math.cos(yb) * Math.cos(pb);
+        const dot = Math.max(-1, Math.min(1, ax*bx + ay*by + az*bz));
+        return Math.acos(dot) * 180 / Math.PI;
+      };
+      const midDirection = (poseA, poseB) => {
+        // Slerp midpoint (unit-vector average + renormalize works
+        // for non-antipodal pairs, which all rig pairs are).
+        const ya = (poseA.yaw || 0) * Math.PI / 180, pa = (poseA.pitch || 0) * Math.PI / 180;
+        const yb = (poseB.yaw || 0) * Math.PI / 180, pb = (poseB.pitch || 0) * Math.PI / 180;
+        const ax = Math.sin(ya) * Math.cos(pa), ay = Math.sin(pa), az = Math.cos(ya) * Math.cos(pa);
+        const bx = Math.sin(yb) * Math.cos(pb), by = Math.sin(pb), bz = Math.cos(yb) * Math.cos(pb);
+        const mx = (ax + bx) * 0.5, my = (ay + by) * 0.5, mz = (az + bz) * 0.5;
+        const len = Math.hypot(mx, my, mz);
+        if (len < 1e-6) return null;     // antipodal, can't midpoint
+        const nx = mx / len, ny = my / len, nz = mz / len;
+        return {
+          yawDeg:   Math.atan2(nx, nz) * 180 / Math.PI,
+          pitchDeg: Math.asin(Math.max(-1, Math.min(1, ny))) * 180 / Math.PI
+        };
+      };
+      let added = 0;
+      const MAX_BOUNDARY_PAIRS = 60;       // cap so 26-display rigs don't explode
+      for (let i = 0; i < displays.length && added < MAX_BOUNDARY_PAIRS; i++) {
+        const dA = displays[i];
+        if (!dA || !dA.pose || !dA.fov) continue;
+        const halfA = Math.max(dA.fov.h || 90, dA.fov.v || 60) * 0.5;
+        for (let j = i + 1; j < displays.length && added < MAX_BOUNDARY_PAIRS; j++) {
+          const dB = displays[j];
+          if (!dB || !dB.pose || !dB.fov) continue;
+          const halfB = Math.max(dB.fov.h || 90, dB.fov.v || 60) * 0.5;
+          const dist = angDist(dA.pose, dB.pose);
+          // Adjacent if angular distance < sum of half-FOVs (overlap)
+          // AND > some minimum (not the same projector twice).
+          if (dist > halfA + halfB || dist < 5) continue;
+          const mid = midDirection(dA.pose, dB.pose);
+          if (!mid) continue;
+          // Clamp pitch to avoid gimbal-lock.
+          const pitchDeg = Math.max(-89.4, Math.min(89.4, mid.pitchDeg));
+          if (coverageAware && !_directionInCoverage(mid.yawDeg, pitchDeg, state.rig.surface)) continue;
+          const idxA = String(i).padStart(2, "0");
+          const idxB = String(j).padStart(2, "0");
+          const name = "boundary-" + idxA + "-" + idxB;
+          if (seenNames.has(name)) continue;
+          seenNames.add(name);
+          directions.push({
+            name,
+            yawDeg: mid.yawDeg,
+            pitchDeg,
+            kind: "boundary",
+            displayPair: [i, j]
+          });
+          added++;
+        }
+      }
+    }
+
+    // 6.6.20.20 — POLE shots forced (within coverage). Cardinals
+    // up/down (±89.4°) get filtered out for partial-pitch surfaces,
+    // but projector convergence near the poles is exactly where
+    // calibration usually fails. Capture at ±80° pitch which sits
+    // INSIDE the AlloSphere preset's ±85° range — same direction
+    // intent (looking near a pole) but inside coverage.
+    if (polarShots) {
+      const seenNames = new Set(directions.map(d => d.name));
+      const polePitches = [80, -80];
+      for (const pitchDeg of polePitches) {
+        if (coverageAware && !_directionInCoverage(0, pitchDeg, state.rig.surface)) continue;
+        const name = pitchDeg > 0 ? "near-zenith" : "near-nadir";
+        if (seenNames.has(name)) continue;
+        directions.push({ name, yawDeg: 0, pitchDeg, kind: "pole" });
+      }
+    }
+
     // PHASE 4 — build configs (Checkerboard mode cycle if wired).
+    // 6.6.20.20 — in AI mode, suppress mode cycling. The AI flow
+    // wants stable WireframeCalibration captures; cycling
+    // Checkerboard modes mid-loop produces 5× as many captures
+    // and the AI compares mode-0 vs mode-1 vs ... visuals as if
+    // they were calibration changes. Stability beats variety here.
     const configs = [];
-    if (checkerNodes.length > 0) {
+    if (!aiMode && checkerNodes.length > 0) {
       const modeLabels = ["healpix", "lambert", "cube", "octahedral", "lat-long"];
       for (let mode = 0; mode <= 4; mode++) {
         configs.push({
@@ -15978,8 +16093,17 @@ async function autoCaptureCalibration(opts) {
       for (const dir of directions) {
         Visual.theaterCam.yaw   = dir.yawDeg   * Math.PI / 180;
         Visual.theaterCam.pitch = dir.pitchDeg * Math.PI / 180;
+        // 6.6.20.20 — render twice (once to update the visual
+        // pipeline's theater camera matrix from the new yaw/pitch,
+        // once to actually draw with the new matrix in place) and
+        // wait 6 frames so WebGPU's command queue + canvas
+        // composition settles. The previous 3-frame wait was
+        // enough for static rigs but missed transient rendering
+        // states when the camera angle changed mid-loop.
         render();
-        await _waitForFrames(3);
+        await _waitForFrames(2);
+        render();
+        await _waitForFrames(6);
         const blob = await new Promise((resolve, reject) => {
           Visual.canvas.toBlob((b) => {
             if (b) resolve(b);
@@ -16290,13 +16414,37 @@ async function analyzeCalibrationWithAI(opts) {
     ? _AI_BEZIER_FINETUNE_PROMPT
     : _AI_CALIBRATION_SYSTEM_PROMPT;
 
-  // Stage 1 — capture (in memory, no ZIP).
+  // 6.6.20.20 — pre-flight: warn if no WireframeCalibration is
+  // wired to a VisualOutput. The AI prompts describe a specific
+  // wireframe pattern (red equator, RGB great circles, beacon
+  // circles) — if the user has Checkerboard or some other shader
+  // wired instead, captures show that content and the AI's
+  // analysis is meaningless.
+  const hasWireframe = (state.nodes || []).some(n => n.type === "WireframeCalibration");
+  const wireframeWiredToVO = hasWireframe && (state.edges || []).some(e => {
+    const from = (state.nodes || []).find(n => n.id === e.from.node);
+    return from && from.type === "WireframeCalibration" && (state.edges || []).some(e2 =>
+      e2.from.node === from.id && e2.to.port === "in" &&
+      (state.nodes || []).find(n => n.id === e2.to.node && n.type === "VisualOutput")
+    );
+  });
+  if (!hasWireframe || !wireframeWiredToVO) {
+    const proceed = (typeof confirm === "function")
+      ? confirm("AI calibration expects a WireframeCalibration node wired to your VisualOutputs (it's the visual target the AI prompts describe — red equator + RGB great circles + beacon circles).\n\nNone detected wired. The AI will still run, but the captures will show whatever you have wired to the VOs and the corrections may not match what the AI thinks it's seeing.\n\nProceed anyway?")
+      : true;
+    if (!proceed) throw new Error("AI calibration cancelled — wire a WireframeCalibration node to your VOs first.");
+  }
+
+  // Stage 1 — capture (in memory, no ZIP). aiMode=true so
+  // autoCaptureCalibration suppresses Checkerboard mode-cycling
+  // and uses the wider 90° capture FOV.
   if (onProgress) onProgress({ stage: "capture", current: 0, total: 1 });
   const cap = await autoCaptureCalibration({
     skipDownload: true,
     autoPrep:      true,
     coverageAware: true,
     perDisplay:    true,
+    aiMode:        true,
     onProgress: (cur, total) => {
       if (onCapture) onCapture(cur, total);
     }
