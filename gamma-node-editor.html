@@ -14321,6 +14321,313 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     description: "StarNest — volumetric 'fly through fractal star cluster' effect. Port of Pablo Roman Andrioli's classic Shadertoy 'Star Nest' (https://www.shadertoy.com/view/XlfGRj), modified so each fragment's ray direction comes from the projector basis (per the gnomonic-fix template) — the same 3D scene renders continuously across every projector boundary on the dome. zoom: ray scale (0.8 default — bigger = wider FOV-like effect). speed: time multiplier (0.01 default — very slow drift). tile: kaleidoscope cell size (0.85 default). formuparam: fractal formula 'magic number' (0.53 default — try 0.4–0.6 for very different structures). darkmatter: dark-region density (0.30 default). brightness: emission scale (0.0015 default). distfading: per-step fade (0.73 default). saturation: 0=grayscale, 1=full color (0.85 default). Heavy on per-fragment ALU (340 inner iterations/pixel) — at 1080² × 26 displays expect ~30 fps; drop framebuffer res in the rig settings if you see stuttering."
   },
 
+  /* Phase 6.6.27 — Butterflies. Volumetric ray-trace of 8 (or
+   * fewer) butterflies orbiting the rig center, with procedural
+   * 5x7 wing texture (lots of nested distance fields per fragment).
+   * Port of jorge2017a2's "8 butterflies dancing" Shadertoy with
+   * one big change: camera is FIXED at the origin (= rig center
+   * = sweet-spot), butterflies orbit AROUND the user via the same
+   * butterflyPath. No camera rotation -- each fragment's ray dir
+   * is its projector world direction (gnomonic-fix template), so
+   * the butterflies are projector-boundary-consistent across the
+   * AlloSphere or any other rig.
+   *
+   * Output is RGBA with alpha=1 where a butterfly is hit, alpha=0
+   * elsewhere. Designed to be wired into BlendShader.inA + a
+   * backdrop on inB (mode=5 alpha-over): butterflies float over
+   * whatever your background shader draws. */
+  Butterflies: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    ins: [
+      { n: "speed",       t: "param" },
+      { n: "numActive",   t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    params: { speed: 1.0, numActive: 8 },
+    methods: {},
+    uniformBytes: 80,
+    wgsl:
+`struct U {
+  u_resolution: vec4f,
+  u_time:       f32,
+  u_dt:         f32,
+  u_layer:      f32,
+  u_fov_v_deg:  f32,
+  u_view:       vec4f,
+  u_world_uv:   vec4f,
+  params:       vec4f,    // x=speed, y=numActive, zw=_
+};
+@group(0) @binding(0) var<uniform> u: U;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+fn frag_world_dir(uv: vec2f) -> vec3f {
+  let fov_h_rad = u.u_view.w   * 0.0174532925;
+  let fov_v_rad = u.u_fov_v_deg * 0.0174532925;
+  let local_x = (uv.x - 0.5) * 2.0 * tan(fov_h_rad * 0.5);
+  let local_y = (0.5 - uv.y) * 2.0 * tan(fov_v_rad * 0.5);
+  let yaw_rad   = u.u_view.x * 0.0174532925;
+  let pitch_rad = u.u_view.y * 0.0174532925;
+  let cy = cos(yaw_rad);   let sy = sin(yaw_rad);
+  let cp = cos(pitch_rad); let sp = sin(pitch_rad);
+  let fwd = vec3f(sy * cp, sp, cy * cp);
+  var up_ref = vec3f(0.0, 1.0, 0.0);
+  if (abs(fwd.y) > 0.999) { up_ref = vec3f(0.0, 0.0, 1.0); }
+  let right = normalize(cross(up_ref, fwd));
+  let up    = cross(fwd, right);
+  return normalize(local_x * right + local_y * up + fwd);
+}
+
+// --- IQ value noise ---
+fn hash11(n: f32) -> f32 { return fract(sin(n) * 43758.5453123); }
+
+fn noise2(x: vec2<f32>) -> f32 {
+  let p = floor(x);
+  let f0 = fract(x);
+  let f = f0 * f0 * (3.0 - 2.0 * f0);
+  let n = p.x + p.y * 157.0;
+  return mix(
+    mix(hash11(n + 0.0),   hash11(n + 1.0),   f.x),
+    mix(hash11(n + 157.0), hash11(n + 158.0), f.x),
+    f.y
+  );
+}
+
+fn fbm2(p: vec2<f32>) -> f32 {
+  var f: f32 = 0.0;
+  for (var i: i32 = 1; i <= 9; i = i + 1) {
+    let x = exp2(f32(i));
+    f = f + (noise2(p * x) - 0.5) / x;
+  }
+  return f;
+}
+
+fn sq(x: f32) -> f32 { return x * x; }
+
+fn rot2(a: f32, v: vec2<f32>) -> vec2<f32> {
+  let c = cos(a); let s = sin(a);
+  return vec2<f32>(c * v.x + s * v.y, c * v.y - s * v.x);
+}
+
+// --- Wing geometry (hardcoded vertex positions) ---
+fn wing0Node(i: i32) -> vec3<f32> {
+  if (i < 1) { return vec3<f32>(-0.23,  0.0,   1.0); }
+  if (i < 2) { return vec3<f32>(-0.7,   0.25,  1.0); }
+  if (i < 3) { return vec3<f32>(-0.4,   0.8,   1.0); }
+  if (i < 4) { return vec3<f32>(-0.8,   0.24,  1.3); }
+  if (i < 5) { return vec3<f32>(-0.8,   0.84,  0.6); }
+  if (i < 6) { return vec3<f32>(-0.9,   0.4,   1.2); }
+  if (i < 7) { return vec3<f32>(-1.04,  0.6,   1.2); }
+  return vec3<f32>(-0.1, -0.1, 1.0);
+}
+
+fn wing1Node(i: i32) -> vec3<f32> {
+  if (i < 1) { return vec3<f32>( 0.1,   0.3,  1.0); }
+  if (i < 2) { return vec3<f32>(-0.3,   0.4,  1.0); }
+  if (i < 3) { return vec3<f32>(-0.3,   0.2,  1.0); }
+  if (i < 4) { return vec3<f32>(-0.25, -0.1,  1.0); }
+  if (i < 5) { return vec3<f32>(-0.2,  -0.25, 1.0); }
+  if (i < 6) { return vec3<f32>(-0.05, -0.5,  1.0); }
+  return vec3<f32>( 0.5, -0.2, 1.0);
+}
+
+fn wing0NodeT(i: i32) -> vec3<f32> {
+  return (wing0Node(i) + vec3<f32>(-0.7, -0.05, 0.0)) * vec3<f32>(0.84, 0.7, 1.0);
+}
+
+fn wing1NodeT(i: i32) -> vec3<f32> {
+  return (wing1Node(i) + vec3<f32>(-0.7, -0.05, 0.0)) * vec3<f32>(0.84, 0.7, 1.0);
+}
+
+fn wing0Tex(p_in: vec2<f32>) -> vec3<f32> {
+  let p = rot2(-0.7, p_in + vec2<f32>(0.3, 0.0));
+  var cn: i32 = 0;
+  var cnd: f32 = 1e3;
+  for (var i: i32 = 0; i < 8; i = i + 1) {
+    let d = distance(p, wing0NodeT(i).xy);
+    if (d < cnd) { cnd = d; cn = i; }
+  }
+  var s = 0.04 + pow(max(0.0, -p.y * 0.4), 1.3) + pow(max(0.0, -p.x - 1.0), 1.3) * 0.1;
+  s = s + 0.2 * (1.0 - smoothstep(0.0, 0.4, distance(p, vec2<f32>(-1.2, 0.2)))) +
+          0.2 * (1.0 - smoothstep(0.0, 0.3, distance(p, vec2<f32>(-1.0, 0.5))));
+  var c: f32 = 0.0;
+  for (var j: i32 = 0; j < 8; j = j + 1) {
+    if (j == cn) { continue; }
+    let n0 = wing0NodeT(cn);
+    let n1 = wing0NodeT(j);
+    let nd = n1.xy - n0.xy;
+    let d = dot(p - (n0.xy + nd * 0.5), normalize(nd)) + s * n0.z;
+    c = c + sq(max(0.0, d));
+  }
+  let p0 = sq(max(0.0, dot(p - vec2<f32>(-0.5, 0.0), normalize(vec2<f32>(1.0, -0.9)))));
+  c = c + sq(max(0.0, (distance(p + vec2<f32>(0.6, 1.45), vec2<f32>(0.0)) - 2.0 + s))) + p0 +
+          sq(max(0.0, dot(p - vec2<f32>(-0.6, -0.2), normalize(vec2<f32>(-0.3, -0.9)))));
+  let c2 = sq(max(0.0, (distance(p + vec2<f32>(0.6, 1.55), vec2<f32>(0.0)) - 2.0))) + p0 +
+           sq(max(0.0, dot(p - vec2<f32>(-0.6, -0.2), normalize(vec2<f32>(-0.3, -0.9))) - 0.1));
+  let xa = vec2<f32>(-1.7, 0.0);
+  let xb = vec2<f32>(-0.8, -0.3);
+  let xs = vec2<f32>(0.6, 1.0);
+  let t_clamped = clamp(dot(p - xa, xb - xa) / dot(xb - xa, xb - xa), 0.0, 1.0);
+  let u_mix = mix(xa, xb, floor(t_clamped * 5.0 + 0.5) / 5.0);
+  let x = max(
+    1.0 - smoothstep(0.06, 0.07, distance(p, vec2<f32>(-1.2, 0.3))),
+    1.0 - smoothstep(0.02, 0.025, length((p - u_mix) * xs))
+  );
+  return vec3<f32>(
+    1.0 - smoothstep(s - 0.015, s - 0.015 + 0.006, sqrt(c)),
+    1.0 - smoothstep(0.1, 0.106, sqrt(c2) - 0.03),
+    x
+  );
+}
+
+fn wing1Tex(p_in: vec2<f32>) -> vec3<f32> {
+  let p = p_in + vec2<f32>(0.0, 0.16);
+  var cn: i32 = 0;
+  var cnd: f32 = 1e3;
+  for (var i: i32 = 0; i < 7; i = i + 1) {
+    let d = distance(p, wing1NodeT(i).xy);
+    if (d < cnd) { cnd = d; cn = i; }
+  }
+  let s = 0.04 + pow(max(0.0, -p.y * 0.4), 1.3) + pow(max(0.0, -p.x - 1.0), 1.3) * 0.1;
+  var c: f32 = 0.0;
+  for (var j: i32 = 0; j < 7; j = j + 1) {
+    if (j == cn) { continue; }
+    let n0 = wing1NodeT(cn);
+    let n1 = wing1NodeT(j);
+    let nd = n1.xy - n0.xy;
+    let d = dot(p - (n0.xy + nd * 0.5), normalize(nd)) + s * n0.z;
+    c = c + sq(max(0.0, d));
+  }
+  let p0 = sq(max(0.0, dot(p - vec2<f32>(-0.5, -0.4), normalize(vec2<f32>(1.0, -0.7)))));
+  let p1 = sq(max(0.0, dot(p - vec2<f32>(-0.3, 0.3), normalize(-vec2<f32>(0.1, -0.9)))));
+  c = c + sq(max(0.0, (distance(p + vec2<f32>(0.52, -0.1), vec2<f32>(0.0)) - 0.5))) + p0 + p1;
+  let c2 = sq(max(0.0, (distance(p + vec2<f32>(0.5, 0.0), vec2<f32>(0.0)) - 0.53))) + p0 + p1;
+  let xr: f32 = 0.7;
+  let xa = vec2<f32>(-0.4, 0.05);
+  let pd = rot2(-0.2, p - xa);
+  let raw_ang = atan2(pd.y, pd.x);
+  let clamped_ang = clamp(raw_ang, -3.1, -1.8);
+  let ang = mix(-3.1, -1.8, floor((clamped_ang + 3.1) / 1.299 * 6.0 + 0.5) / 6.0);
+  let x = 1.0 - smoothstep(0.02, 0.025, distance(pd, vec2<f32>(cos(ang), sin(ang)) * xr));
+  return vec3<f32>(
+    1.0 - smoothstep(s - 0.015, s - 0.015 + 0.006, sqrt(c)),
+    1.0 - smoothstep(0.1, 0.106, sqrt(c2) - 0.03),
+    x
+  );
+}
+
+fn wing_color(p_in: vec2<f32>) -> vec4<f32> {
+  let p = p_in + fbm2(p_in * 4.0) * 0.02;
+  let mixT = fbm2(p * vec2<f32>(1.0, 16.0)) * 0.26 +
+             pow(clamp((p.y * 4.0 - abs(p.x) * 2.0) / 3.0, 0.0, 1.0), 2.0);
+  var wc = mix(vec3<f32>(1.0, 0.5, 0.15), vec3<f32>(2.0, 0.5, 0.15) * 0.3, mixT) * 0.8;
+  wc = pow(wc, vec3<f32>(1.5));
+  let c0 = wing0Tex(p);
+  let c1 = wing1Tex(p);
+  var col = mix(mix(vec3<f32>(0.0), c0.x * wc, c0.y), c1.x * wc, c1.y);
+  col = mix(col, vec3<f32>(1.0), c0.z);
+  col = mix(col, vec3<f32>(1.0), c1.z);
+  return vec4<f32>(col, max(c0.y, c1.y));
+}
+
+// Ray-plane intersection for one wing, returns (wing_u, wing_v, t).
+fn traceWing(ro: vec3<f32>, rd: vec3<f32>, bo: vec3<f32>, bd: vec3<f32>, flap: f32) -> vec3<f32> {
+  let up = vec3<f32>(0.0, 1.0, 0.0);
+  let c = cross(bd, up);
+  let flapangle = mix(20.0 * 0.0174532925, 150.0 * 0.0174532925, flap);
+  let w = cos(flapangle) * c + sin(flapangle) * up;
+  let denom = dot(rd, w);
+  let t = -dot(ro, w) / denom;
+  let s = cross(w, bd);
+  let rp = ro + rd * t;
+  return vec3<f32>(dot(rp, s), dot(rp, bd), t);
+}
+
+fn traceButterfly(ro_in: vec3<f32>, rd_in: vec3<f32>, bo_in: vec3<f32>, bd: vec3<f32>, flap_in: f32) -> vec4<f32> {
+  let flap = pow(flap_in, 0.75);
+  var bo = bo_in;
+  bo.y = bo.y - flap * 0.5;
+  var ro = ro_in - bo;
+  var rd = rd_in;
+  let up = vec3<f32>(0.0, 1.0, 0.0);
+  let c = cross(bd, up);
+
+  let w0 = traceWing(ro, rd, bo, bd, flap);
+
+  // Reflect ro + rd across the c axis to get the mirrored wing.
+  ro = ro - dot(ro, c) * 2.0 * c;
+  rd = rd - dot(rd, c) * 2.0 * c;
+  let w1 = traceWing(ro, rd, bo, bd, flap);
+
+  if (max(abs(w0.x), abs(w0.y)) > 2.0 && max(abs(w1.x), abs(w1.y)) > 2.0) {
+    return vec4<f32>(0.0, 0.0, 0.0, 1e4);
+  }
+  let c0 = wing_color(w0.xy);
+  let c1 = wing_color(w1.xy);
+  let u0 = c0.a > 0.0 && w0.z > 0.0;
+  let u1 = c1.a > 0.0 && w1.z > 0.0;
+  if (!u0 && !u1) { return vec4<f32>(0.0, 0.0, 0.0, 1e4); }
+  if (u0 && !u1)  { return vec4<f32>(c0.rgb, w0.z); }
+  if (!u0 && u1)  { return vec4<f32>(c1.rgb, w1.z); }
+  return mix(vec4<f32>(c0.rgb, w0.z), vec4<f32>(c1.rgb, w1.z), step(w1.z, w0.z));
+}
+
+fn butterflyPath(t: f32) -> vec3<f32> {
+  return vec3<f32>(cos(t), cos(t * 0.22) + sin(t * 4.0) * 0.1, sin(t * 1.3)) * 4.0;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let time = u.u_time * max(0.01, u.params.x);   // params.x = speed
+  let nactive = i32(clamp(u.params.y, 1.0, 8.0));
+
+  // Camera at the rig center; rd from the projector basis.
+  let ro = vec3<f32>(0.0, 0.0, 0.0);
+  let rd = frag_world_dir(in.uv);
+
+  var col = vec3<f32>(0.0);
+  var depth: f32 = 1e3;
+
+  for (var i: i32 = 0; i < 8; i = i + 1) {
+    if (i >= nactive) { break; }
+    let t = time + f32(i) * 10.2;
+    let bo = butterflyPath(t);
+    let bp_next = butterflyPath(t + 0.01);
+    let bd_xz = normalize(bp_next.xz - bo.xz);
+    let bd = vec3<f32>(bd_xz.x, 0.0, bd_xz.y);
+    let flap = 0.5 + 0.5 * cos(t * 9.0);
+    let b = traceButterfly(ro, rd, bo, bd, flap);
+    let hit = b.a < depth;
+    col = select(col, b.rgb, hit);
+    depth = min(depth, b.a);
+  }
+
+  let alpha = select(0.0, 1.0, depth < 1e2);
+  // Gamma match to Shadertoy original.
+  let outRgb = sqrt(max(col, vec3<f32>(0.0)));
+  return vec4<f32>(outRgb, alpha);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.speed     === "number") ? p.speed     : 1.0;
+      scratch[17] = (typeof p.numActive === "number") ? p.numActive : 8;
+      scratch[18] = 0; scratch[19] = 0;
+    },
+    description: "Butterflies — volumetric ray-trace of up to 8 butterflies orbiting the rig center, with procedural wing texture (nested SDFs per fragment). Port of jorge2017a2's Shadertoy 'butterflies', re-cast for the dome: camera fixed at origin (= rig center / sweet-spot), butterflies orbit around the viewer via butterflyPath. Output is RGBA with alpha=1 where a butterfly is hit, alpha=0 elsewhere — wire `out` into BlendShader.inA + a backdrop on inB with mode=5 (alpha-over) for butterflies floating over any other shader. speed: time multiplier (1.0 default). numActive: butterfly count, 1..8 (8 default). Expensive: 8 butterflies × 2 wings × ~150 ALU ops each per fragment — drop framebuffer resolution if you see stuttering."
+  },
+
   /* Phase 6.4 — NoiseShader. Simplex 2D fBm with octaves. Output is
    * grayscale 0..1 (interpret as height field, mask, or modulator).
    * scale controls primary frequency; octaves stacks rougher detail
@@ -14639,18 +14946,23 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   let layerB = u32(max(0.0, u.params.y));
   let mix_t  = clamp(u.params.z, 0.0, 1.0);
   let mode   = i32(u.params.w + 0.5);
-  let A = textureSampleLevel(fbHistory, fbSampler, in.uv, layerA, 0.0).rgb;
-  let B = textureSampleLevel(fbHistory, fbSampler, in.uv, layerB, 0.0).rgb;
+  let sampleA = textureSampleLevel(fbHistory, fbSampler, in.uv, layerA, 0.0);
+  let sampleB = textureSampleLevel(fbHistory, fbSampler, in.uv, layerB, 0.0);
+  let A = sampleA.rgb;
+  let B = sampleB.rgb;
   var blended: vec3<f32> = A;
   if (mode == 0)      { blended = mix(A, B, mix_t); }                                              // normal
   else if (mode == 1) { blended = A + B * mix_t; }                                                 // add
   else if (mode == 2) { blended = mix(A, A * B, mix_t); }                                          // multiply
   else if (mode == 3) { blended = mix(A, vec3<f32>(1.0) - (vec3<f32>(1.0) - A) * (vec3<f32>(1.0) - B), mix_t); }  // screen
-  else                { // overlay
+  else if (mode == 4) { // overlay
     let lo = 2.0 * A * B;
     let hi = vec3<f32>(1.0) - 2.0 * (vec3<f32>(1.0) - A) * (vec3<f32>(1.0) - B);
     let mask = step(vec3<f32>(0.5), A);
     blended = mix(A, mix(lo, hi, mask), mix_t);
+  }
+  else { // mode == 5 — alpha-over (A composited on top of B by A's alpha)
+    blended = mix(B, A, sampleA.a * mix_t);
   }
   return vec4<f32>(clamp(blended, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }`,
@@ -14661,7 +14973,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       scratch[18] = (typeof p.mix      === "number") ? p.mix      : 0.5;
       scratch[19] = (typeof p.mode     === "number") ? p.mode     : 0;
     },
-    description: "BlendShader — combine two upstream texture sources with one of 5 blend modes (normal, add, multiply, screen, overlay). Wire ShaderA's `out` to `inA` and ShaderB's `out` to `inB`; both sources also need their own VisualOutput so they render to known layers (the framework resolves each input port to its source's downstream-VO display layer, 1-frame lag). mix: 0..1 blend amount. mode: 0=normal, 1=add, 2=multiply, 3=screen, 4=overlay. inALayer/inBLayer params are manual-fallback layer indices used when the corresponding texture port is unwired."
+    description: "BlendShader — combine two upstream texture sources with one of 6 blend modes (normal, add, multiply, screen, overlay, alpha-over). Wire ShaderA's `out` to `inA` and ShaderB's `out` to `inB`; the framework auto-allocates scratch framebuffer layers for upstream sources that don't have their own VisualOutput (Phase 6.6.26). mix: 0..1 blend amount. mode: 0=normal, 1=add, 2=multiply, 3=screen, 4=overlay, 5=alpha-over (A composited on B by A's framebuffer alpha — use with Butterflies or any other source that writes per-pixel alpha). inALayer/inBLayer params are manual-fallback layer indices used when the corresponding texture port is unwired."
   },
 
   /* MaskShader — multiply input A's RGB by input B's luminance.
