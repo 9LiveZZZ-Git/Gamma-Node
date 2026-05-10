@@ -13854,6 +13854,426 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     description: "WireframeCalibration — AlloSphere-style 3D wireframe pattern (lat/long sphere grid + 3 RGB-coded great circles + 3 beacon circles around cardinal axes). Lines stay sub-pixel-thin everywhere on the sphere → no polar distortion, regardless of viewing direction. Pair with Auto-blend (hard cuts) to verify projector calibration: every line should connect smoothly at projector boundaries; any shift/break reveals miscalibrated pose, FOV, or warp. lineWidth: line angular thickness in degrees (0.4 default). slices/stacks: lat/long grid density. beaconRadius: angular radius of cardinal-axis beacons in degrees. show*: toggle each layer (1=on, 0=off). bgR/G/B: background color. gridR/G/B: lat/long grid line color. Reference: AlloLib calibration_pattern.cpp."
   },
 
+  /* Phase 6.6.21 — GammaScreensaver. Bouncing "GAMMA NODE" logo
+   * across the dome. Triangle-wave bounces in (yaw, pitch); hue
+   * cycles slowly. 5×7 bitmap font drawn directly in angular
+   * coords so the text reads correctly across all projectors and
+   * sits at constant angular size from the sweet-spot. Designed
+   * to be a fun + theme-appropriate idle pattern. */
+  GammaScreensaver: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    ins: [
+      { n: "speed",   t: "param" },
+      { n: "logoW",   t: "param" },
+      { n: "logoH",   t: "param" },
+      { n: "bgGrid",  t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    params: { speed: 1.0, logoW: 80, logoH: 16, bgGrid: 1 },
+    methods: {},
+    uniformBytes: 80,
+    wgsl:
+`struct U {
+  u_resolution: vec4f,
+  u_time:       f32,
+  u_dt:         f32,
+  u_layer:      f32,
+  u_fov_v_deg:  f32,
+  u_view:       vec4f,
+  u_world_uv:   vec4f,
+  params:       vec4f,    // x=speed, y=logoW_deg, z=logoH_deg, w=bgGrid
+};
+@group(0) @binding(0) var<uniform> u: U;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+fn frag_to_global_angles(uv: vec2f) -> vec2f {
+  // 6.6.20.24 — proper gnomonic→sphere via projector basis rotation
+  // (see WireframeCalibration shader for full comment).
+  let fov_h_rad = u.u_view.w   * 0.0174532925;
+  let fov_v_rad = u.u_fov_v_deg * 0.0174532925;
+  let local_x = (uv.x - 0.5) * 2.0 * tan(fov_h_rad * 0.5);
+  let local_y = (0.5 - uv.y) * 2.0 * tan(fov_v_rad * 0.5);
+  let yaw_rad   = u.u_view.x * 0.0174532925;
+  let pitch_rad = u.u_view.y * 0.0174532925;
+  let cy = cos(yaw_rad);   let sy = sin(yaw_rad);
+  let cp = cos(pitch_rad); let sp = sin(pitch_rad);
+  let fwd = vec3f(sy * cp, sp, cy * cp);
+  var up_ref = vec3f(0.0, 1.0, 0.0);
+  if (abs(fwd.y) > 0.999) { up_ref = vec3f(0.0, 0.0, 1.0); }
+  let right = normalize(cross(up_ref, fwd));
+  let up    = cross(fwd, right);
+  let dir = normalize(local_x * right + local_y * up + fwd);
+  let pitch_out = asin(clamp(dir.y, -1.0, 1.0));
+  let yaw_out   = atan2(dir.x, dir.z);
+  return vec2f(yaw_out * 57.29577951, pitch_out * 57.29577951);
+}
+
+// 5x7 bitmap font for "GAMMA NODE". Glyph indices:
+//   0=G  1=A  2=M  3=N  4=O  5=D  6=E  7=space
+fn glyph_pixel(g: u32, x: i32, y: i32) -> bool {
+  if (x < 0 || x > 4 || y < 0 || y > 6) { return false; }
+  if (g == 0u) {                                          // G
+    if (y == 0) { return x >= 1 && x <= 3; }
+    if (y == 1) { return x == 0 || x == 4; }
+    if (y == 2) { return x == 0; }
+    if (y == 3) { return x == 0 || (x >= 2 && x <= 4); }
+    if (y == 4) { return x == 0 || x == 4; }
+    if (y == 5) { return x == 0 || x == 4; }
+    if (y == 6) { return x >= 1 && x <= 3; }
+  }
+  if (g == 1u) {                                          // A
+    if (y == 0) { return x == 2; }
+    if (y == 1) { return x == 1 || x == 3; }
+    if (y == 2) { return x == 0 || x == 4; }
+    if (y == 3) { return x == 0 || x == 4; }
+    if (y == 4) { return true; }
+    if (y == 5) { return x == 0 || x == 4; }
+    if (y == 6) { return x == 0 || x == 4; }
+  }
+  if (g == 2u) {                                          // M
+    if (y == 0) { return x == 0 || x == 4; }
+    if (y == 1) { return x == 0 || x == 1 || x == 3 || x == 4; }
+    if (y == 2) { return x == 0 || x == 2 || x == 4; }
+    if (y == 3) { return x == 0 || x == 2 || x == 4; }
+    if (y == 4) { return x == 0 || x == 4; }
+    if (y == 5) { return x == 0 || x == 4; }
+    if (y == 6) { return x == 0 || x == 4; }
+  }
+  if (g == 3u) {                                          // N
+    if (y == 0) { return x == 0 || x == 4; }
+    if (y == 1) { return x == 0 || x == 1 || x == 4; }
+    if (y == 2) { return x == 0 || x == 2 || x == 4; }
+    if (y == 3) { return x == 0 || x == 2 || x == 4; }
+    if (y == 4) { return x == 0 || x == 3 || x == 4; }
+    if (y == 5) { return x == 0 || x == 4; }
+    if (y == 6) { return x == 0 || x == 4; }
+  }
+  if (g == 4u) {                                          // O
+    if (y == 0) { return x >= 1 && x <= 3; }
+    if (y == 1) { return x == 0 || x == 4; }
+    if (y == 2) { return x == 0 || x == 4; }
+    if (y == 3) { return x == 0 || x == 4; }
+    if (y == 4) { return x == 0 || x == 4; }
+    if (y == 5) { return x == 0 || x == 4; }
+    if (y == 6) { return x >= 1 && x <= 3; }
+  }
+  if (g == 5u) {                                          // D
+    if (y == 0) { return x >= 0 && x <= 3; }
+    if (y == 1) { return x == 0 || x == 4; }
+    if (y == 2) { return x == 0 || x == 4; }
+    if (y == 3) { return x == 0 || x == 4; }
+    if (y == 4) { return x == 0 || x == 4; }
+    if (y == 5) { return x == 0 || x == 4; }
+    if (y == 6) { return x >= 0 && x <= 3; }
+  }
+  if (g == 6u) {                                          // E
+    if (y == 0) { return true; }
+    if (y == 1) { return x == 0; }
+    if (y == 2) { return x == 0; }
+    if (y == 3) { return x >= 0 && x <= 3; }
+    if (y == 4) { return x == 0; }
+    if (y == 5) { return x == 0; }
+    if (y == 6) { return true; }
+  }
+  return false;
+}
+
+// HSV → RGB. Hue ∈ [0, 1].
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> vec3f {
+  let i = floor(h * 6.0);
+  let f = h * 6.0 - i;
+  let p = v * (1.0 - s);
+  let q = v * (1.0 - f * s);
+  let t = v * (1.0 - (1.0 - f) * s);
+  let mod_i = i32(i) - 6 * (i32(i) / 6);
+  if (mod_i == 0) { return vec3f(v, t, p); }
+  if (mod_i == 1) { return vec3f(q, v, p); }
+  if (mod_i == 2) { return vec3f(p, v, t); }
+  if (mod_i == 3) { return vec3f(p, q, v); }
+  if (mod_i == 4) { return vec3f(t, p, v); }
+  return vec3f(v, p, q);
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let ang = frag_to_global_angles(in.uv);
+  let yaw   = ang.x;
+  let pitch = ang.y;
+
+  let speed  = max(0.0, u.params.x);
+  let W      = max(10.0, u.params.y);          // logo width  (degrees)
+  let H      = max(4.0,  u.params.z);          // logo height (degrees)
+  let t      = u.u_time * speed;
+
+  // Triangle-wave bouncing animation. Yaw drifts farther + faster
+  // than pitch so the path is a deliberate, slightly irregular
+  // wander instead of a Lissajous loop. yaw range = ±60°,
+  // pitch range = ±25°. Period ≈ 20 s yaw / 33 s pitch.
+  let trX_phase = fract(t * 0.05);
+  let trY_phase = fract(t * 0.03 + 0.5);
+  let yaw_c   = (abs(trX_phase * 4.0 - 2.0) - 1.0) * 60.0;
+  let pitch_c = (abs(trY_phase * 4.0 - 2.0) - 1.0) * 25.0;
+
+  // Color cycles slowly. Phase shift on each pitch bounce gives a
+  // "DVD logo color flips on bounce" feel without needing state.
+  let bounce_n = floor(t * 0.06);
+  let hue_base = fract(t * 0.013 + bounce_n * 0.137);
+  let logo_color = hsv_to_rgb(hue_base, 0.85, 1.0);
+
+  // Yaw delta with proper ±180° wrap.
+  var dy = yaw - yaw_c;
+  if (dy >  180.0) { dy = dy - 360.0; }
+  if (dy < -180.0) { dy = dy + 360.0; }
+  let dp = pitch - pitch_c;
+
+  // Background. Optional subtle 30°-spaced grid crosshair.
+  var color = vec3f(0.0);
+  if (u.params.w > 0.5) {
+    let g_pitch = abs(pitch - round(pitch / 30.0) * 30.0);
+    let g_yaw   = abs(yaw   - round(yaw   / 30.0) * 30.0);
+    if (min(g_pitch, g_yaw) < 0.18) {
+      color = vec3f(0.045, 0.06, 0.10);
+    }
+  }
+
+  // Inside logo box?
+  if (abs(dy) <= W * 0.5 && abs(dp) <= H * 0.5) {
+    let x_norm = (dy + W * 0.5) / W;          // [0, 1]  — left-to-right
+    let y_norm = (dp + H * 0.5) / H;          // [0, 1]  — bottom-to-top
+
+    // 10 chars × 6 cells (5 letter + 1 spacing) = 60 cols, 7 rows.
+    let col = i32(floor(x_norm * 60.0));
+    let row = 6 - i32(floor((1.0 - y_norm) * 7.0));     // flip y → top-down read
+
+    let letter_idx = col / 6;
+    let local_col  = col - letter_idx * 6;
+
+    // String "GAMMA NODE": 0,1,2,2,1,7,3,4,5,6
+    var glyph_id: u32 = 7u;
+    if (letter_idx == 0) { glyph_id = 0u; }
+    if (letter_idx == 1) { glyph_id = 1u; }
+    if (letter_idx == 2) { glyph_id = 2u; }
+    if (letter_idx == 3) { glyph_id = 2u; }
+    if (letter_idx == 4) { glyph_id = 1u; }
+    if (letter_idx == 5) { glyph_id = 7u; }
+    if (letter_idx == 6) { glyph_id = 3u; }
+    if (letter_idx == 7) { glyph_id = 4u; }
+    if (letter_idx == 8) { glyph_id = 5u; }
+    if (letter_idx == 9) { glyph_id = 6u; }
+
+    if (local_col >= 0 && local_col < 5 && row >= 0 && row <= 6) {
+      if (glyph_pixel(glyph_id, local_col, row)) {
+        color = logo_color;
+      }
+    }
+
+    // Subtle bounding-box outline so the logo has a "card" feel.
+    let edge_dist_x = min(W * 0.5 - abs(dy), 0.5);
+    let edge_dist_y = min(H * 0.5 - abs(dp), 0.5);
+    if (min(edge_dist_x, edge_dist_y) < 0.2) {
+      color = mix(color, logo_color * 0.4, 0.7);
+    }
+  }
+
+  return vec4f(color, 1.0);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.speed  === "number") ? p.speed  : 1.0;
+      scratch[17] = (typeof p.logoW  === "number") ? p.logoW  : 80;
+      scratch[18] = (typeof p.logoH  === "number") ? p.logoH  : 16;
+      scratch[19] = (typeof p.bgGrid === "number") ? p.bgGrid : 1;
+    },
+    description: "GammaScreensaver — bouncing 'GAMMA NODE' logo across the dome (DVD-style idle pattern). Triangle-wave bounces in yaw + pitch with constant angular velocity; hue cycles slowly with a phase nudge on each pitch bounce. Text drawn directly in angular (yaw, pitch) coordinates so it stays projector-correct everywhere on the sphere/cylinder. speed: animation rate (1.0 default). logoW/logoH: angular width + height of the logo in degrees (80 × 16 default → readable from sweet-spot, leaves dome-wide travel space). bgGrid: 0/1 subtle 30°-spaced background crosshair (1 default)."
+  },
+
+  /* Phase 6.6.21 — StarNest. Volumetric "fly through fractal star
+   * cluster" effect. Port of Pablo Roman Andrioli's classic
+   * Shadertoy "Star Nest" (https://www.shadertoy.com/view/XlfGRj),
+   * modified so the ray direction comes from the projector basis
+   * instead of screen-space UV — every projector renders the same
+   * 3D scene from the rig center, lines + density stay continuous
+   * across boundaries. The volumetric fold + iterated abs/dot
+   * formula is unchanged from the original. Heavy on per-fragment
+   * ALU (volsteps × iterations = 340 inner-loop iterations / pixel)
+   * — drop framebuffer res below 1080² if you see frame stuttering. */
+  StarNest: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    ins: [
+      { n: "zoom",       t: "param" },
+      { n: "speed",      t: "param" },
+      { n: "tile",       t: "param" },
+      { n: "formuparam", t: "param" },
+      { n: "darkmatter", t: "param" },
+      { n: "brightness", t: "param" },
+      { n: "distfading", t: "param" },
+      { n: "saturation", t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    params: {
+      zoom:       0.800,
+      speed:      0.010,
+      tile:       0.850,
+      formuparam: 0.530,
+      darkmatter: 0.300,
+      brightness: 0.0015,
+      distfading: 0.730,
+      saturation: 0.850
+    },
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution: vec4f,
+  u_time:       f32,
+  u_dt:         f32,
+  u_layer:      f32,
+  u_fov_v_deg:  f32,
+  u_view:       vec4f,
+  u_world_uv:   vec4f,
+  params:       vec4f,    // x=zoom, y=formuparam, z=darkmatter, w=brightness
+  params2:      vec4f,    // x=distfading, y=saturation, z=tile, w=speed
+};
+@group(0) @binding(0) var<uniform> u: U;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+// Returns the fragment's WORLD direction (cartesian) on the unit
+// sphere — proper basis-rotated form (see WireframeCalibration
+// shader for the gnomonic-fix template comment).
+fn frag_world_dir(uv: vec2f) -> vec3f {
+  let fov_h_rad = u.u_view.w   * 0.0174532925;
+  let fov_v_rad = u.u_fov_v_deg * 0.0174532925;
+  let local_x = (uv.x - 0.5) * 2.0 * tan(fov_h_rad * 0.5);
+  let local_y = (0.5 - uv.y) * 2.0 * tan(fov_v_rad * 0.5);
+  let yaw_rad   = u.u_view.x * 0.0174532925;
+  let pitch_rad = u.u_view.y * 0.0174532925;
+  let cy = cos(yaw_rad);   let sy = sin(yaw_rad);
+  let cp = cos(pitch_rad); let sp = sin(pitch_rad);
+  let fwd = vec3f(sy * cp, sp, cy * cp);
+  var up_ref = vec3f(0.0, 1.0, 0.0);
+  if (abs(fwd.y) > 0.999) { up_ref = vec3f(0.0, 0.0, 1.0); }
+  let right = normalize(cross(up_ref, fwd));
+  let up    = cross(fwd, right);
+  return normalize(local_x * right + local_y * up + fwd);
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  // Constants that match the original Shadertoy defines.
+  let iterations: i32 = 17;
+  let volsteps:   i32 = 20;
+  let stepsize:   f32 = 0.1;
+
+  let zoom       = u.params.x;
+  let formuparam = u.params.y;
+  let darkmatter = u.params.z;
+  let brightness = u.params.w;
+  let distfading = u.params2.x;
+  let saturation = u.params2.y;
+  let tile       = u.params2.z;
+  let speed      = u.params2.w;
+
+  // World direction from the projector basis, scaled by zoom. This
+  // replaces Shadertoy's vec3(uv*zoom, 1) — same role (the per-
+  // fragment ray direction) but dome-correct instead of flat.
+  let dir = frag_world_dir(in.uv) * zoom;
+
+  let time = u.u_time * speed + 0.25;
+
+  // Camera position drifts through space. Original Shadertoy used
+  // mouse rotations; we don't have a mouse input on the dome so
+  // we substitute slow time-driven yaw/pitch that gently swings
+  // the viewing point. Keeps the "flying through stars" feel.
+  let a1 = sin(time * 0.30) * 0.50;
+  let a2 = cos(time * 0.40) * 0.40;
+  let cosA1 = cos(a1); let sinA1 = sin(a1);
+  let cosA2 = cos(a2); let sinA2 = sin(a2);
+
+  var from = vec3f(1.0, 0.5, 0.5) + vec3f(time * 2.0, time, -2.0);
+  let fxz = vec2f(from.x * cosA1 + from.z * sinA1, -from.x * sinA1 + from.z * cosA1);
+  from = vec3f(fxz.x, from.y, fxz.y);
+  let fxy = vec2f(from.x * cosA2 + from.y * sinA2, -from.x * sinA2 + from.y * cosA2);
+  from = vec3f(fxy.x, fxy.y, from.z);
+
+  // Volumetric raymarch. Each step folds the world into a tiled
+  // "kaleidoscope" cell, then iterates the abs(p)/dot(p,p) - param
+  // formula — that's what produces the iridescent star-cluster
+  // structure. v accumulates color along the ray, fade falls off
+  // with distance + dark-matter density.
+  var s:    f32 = 0.1;
+  var fade: f32 = 1.0;
+  var v:    vec3f = vec3f(0.0);
+  let tile2 = tile * 2.0;
+
+  for (var r: i32 = 0; r < volsteps; r = r + 1) {
+    var p = from + s * dir * 0.5;
+    // Tile fold: p = abs(tile - mod(p, tile*2))
+    p = abs(vec3f(tile) - (p - tile2 * floor(p / tile2)));
+
+    var pa: f32 = 0.0;
+    var a:  f32 = 0.0;
+    for (var i: i32 = 0; i < iterations; i = i + 1) {
+      let dp = max(dot(p, p), 1e-4);            // guard /0 at origin
+      p = abs(p) / dp - vec3f(formuparam);
+      let pl = length(p);
+      a = a + abs(pl - pa);
+      pa = pl;
+    }
+    let dm = max(0.0, darkmatter - a * a * 0.001);
+    a = a * a * a;
+    if (r > 6) { fade = fade * (1.0 - dm); }
+    v = v + vec3f(fade);
+    v = v + vec3f(s, s * s, s * s * s * s) * a * brightness * fade;
+    fade = fade * distfading;
+    s = s + stepsize;
+  }
+
+  // Saturation adjust: blend toward grayscale by (1 - saturation).
+  let lv = length(v);
+  v = mix(vec3f(lv), v, saturation);
+  return vec4f(v * 0.01, 1.0);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      // params at 16-19, params2 at 20-23.
+      scratch[16] = (typeof p.zoom       === "number") ? p.zoom       : 0.800;
+      scratch[17] = (typeof p.formuparam === "number") ? p.formuparam : 0.530;
+      scratch[18] = (typeof p.darkmatter === "number") ? p.darkmatter : 0.300;
+      scratch[19] = (typeof p.brightness === "number") ? p.brightness : 0.0015;
+      scratch[20] = (typeof p.distfading === "number") ? p.distfading : 0.730;
+      scratch[21] = (typeof p.saturation === "number") ? p.saturation : 0.850;
+      scratch[22] = (typeof p.tile       === "number") ? p.tile       : 0.850;
+      scratch[23] = (typeof p.speed      === "number") ? p.speed      : 0.010;
+    },
+    description: "StarNest — volumetric 'fly through fractal star cluster' effect. Port of Pablo Roman Andrioli's classic Shadertoy 'Star Nest' (https://www.shadertoy.com/view/XlfGRj), modified so each fragment's ray direction comes from the projector basis (per the gnomonic-fix template) — the same 3D scene renders continuously across every projector boundary on the dome. zoom: ray scale (0.8 default — bigger = wider FOV-like effect). speed: time multiplier (0.01 default — very slow drift). tile: kaleidoscope cell size (0.85 default). formuparam: fractal formula 'magic number' (0.53 default — try 0.4–0.6 for very different structures). darkmatter: dark-region density (0.30 default). brightness: emission scale (0.0015 default). distfading: per-step fade (0.73 default). saturation: 0=grayscale, 1=full color (0.85 default). Heavy on per-fragment ALU (340 inner iterations/pixel) — at 1080² × 26 displays expect ~30 fps; drop framebuffer res in the rig settings if you see stuttering."
+  },
+
   /* Phase 6.4 — NoiseShader. Simplex 2D fBm with octaves. Output is
    * grayscale 0..1 (interpret as height field, mask, or modulator).
    * scale controls primary frequency; octaves stacks rougher detail
