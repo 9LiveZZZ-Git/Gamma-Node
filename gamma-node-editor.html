@@ -6444,7 +6444,21 @@
 
           <button class="export-action" id="exp-rec-composite">
             <span class="export-action-name">Record composite preview → WebM <span id="exp-rec-state-tag" style="display:none;" class="recording-tag">REC</span></span>
-            <span class="export-action-sub">Continuous video of the visible canvas (60 fps) via MediaRecorder, plus audio if a preview is playing. Click again to stop + download. <em>Per-display recording at target resolution is on the roadmap; today's recording mirrors what's on screen.</em></span>
+            <span class="export-action-sub">Continuous video of the visible canvas (60 fps) via MediaRecorder, plus audio if a preview is playing. Click again to stop + download. Mirrors what an operator sees.</span>
+          </button>
+
+          <button class="export-action" id="exp-rec-perdisplay">
+            <span class="export-action-name"><span>Record per-display → ZIP </span><span id="exp-rec-pd-tag" style="display:none;" class="recording-tag">REC</span></span>
+            <span class="export-action-sub">N parallel MediaRecorders, one per rig display at <code id="exp-rec-pd-dims">1920×1080</code>. Each display's framebuffer layer goes to its own canvas + MediaRecorder; outputs <code>display-NN-id.webm</code> for each + <code>meta.json</code>. Audio captured per recorder if a preview is playing. Heavy GPU/memory — keep an eye on the fps readout at large rig sizes (4K × 26 = ~850 MB swapchain).</span>
+          </button>
+        </div>
+
+        <!-- Audio render ----------------------------------------------- -->
+        <div class="export-section">
+          <div class="export-section-header">Audio render</div>
+          <button class="export-action" id="exp-audio-render">
+            <span class="export-action-name">Render audio → WAV (offline, high quality)</span>
+            <span class="export-action-sub">Runs the patch through an <code>OfflineAudioContext</code> at <code id="exp-audio-sr">48000</code> Hz × stereo, 16-bit PCM. Duration prompted on click (default 30 s, max 3600 s). Needs a compiled patch — click ▶ once first so the editor can cache the wasm.</span>
           </button>
         </div>
 
@@ -29936,6 +29950,20 @@ window.addEventListener("resize", () => {
  * recreating the view object every frame. */
 function _allocateFramebuffer() {
   if (!Visual.device) return;
+  // v0.2.21 — abort an in-flight per-display recording before
+  // destroying the framebuffer. The recording holds per-layer bind
+  // groups that reference Visual.framebufferLayerViews[i]; without
+  // this stop the next render pass would attach a destroyed texture
+  // view + crash WebGPU. _stopPerDisplayRecordingAndDownload() flushes
+  // the recorders + builds the ZIP, so the user gets whatever was
+  // recorded so far instead of losing the take.
+  if (typeof perDisplayRecordingActive === "function" && perDisplayRecordingActive()) {
+    console.log("[per-display] framebuffer reallocating — flushing recording");
+    // Fire-and-forget; the modal status line shows progress, the
+    // ZIP downloads when ready.
+    _stopPerDisplayRecordingAndDownload().catch(e =>
+      console.warn("[per-display] flush-on-realloc failed:", e));
+  }
   if (Visual.framebuffer) {
     try { Visual.framebuffer.destroy(); } catch (_) {}
   }
@@ -34405,6 +34433,14 @@ function renderVisualFrame() {
     }
   }
 
+  // v0.2.21 — per-display recording blit hook. When the user starts
+  // a per-display recording, this encodes one fullscreen-triangle
+  // blit pass per recorder canvas, sampling Visual.framebufferLayerViews[i]
+  // through the existing blit pipeline. Same command encoder as the
+  // main frame so all the blits commit in one queue.submit. Skips
+  // silently when no recording is active.
+  _encodePerDisplayBlitsIntoEncoder(enc);
+
   // Phase 6.3.2 — capture this frame's framebuffer into the feedback
   // array so next frame's FeedbackShader sees it as "previous." The
   // copy queues after every render pass that writes the framebuffer
@@ -34905,6 +34941,415 @@ async function captureAllDisplaysZip(progressFn) {
 }
 
 /* =========================================================================
+ * v0.2.21 — per-display video recording (.webm-per-layer, bundled in ZIP)
+ *
+ * One MediaRecorder per rig display. For each display:
+ *   - Allocate an offscreen <canvas> at Visual.fbWidth × Visual.fbHeight
+ *     (the SAME texture-array layer's native resolution; viewport DPR
+ *     does not affect this).
+ *   - Get a WebGPU context from the canvas, configure with the same
+ *     device + presentation format used by the visible canvas.
+ *   - Build a bind group for the existing Visual.blitPipeline that
+ *     samples framebufferLayerViews[i].
+ *   - Each frame, after the main render loop finishes Visual.framebuffer,
+ *     encode a blit pass into each per-display canvas's swapchain
+ *     texture. WebGPU presents each canvas independently.
+ *   - canvas.captureStream(60) feeds a MediaRecorder. Audio tap is
+ *     per-recorder (each gets its own MediaStreamDestinationNode
+ *     hanging off previewState.workletNode).
+ *
+ * Stop: stop every recorder, await all "stop" events, bundle the chunks
+ * into a ZIP with display-NN-<id>.webm entries + meta.json.
+ *
+ * Memory cost note: at 1080p × 8 displays = ~63 MB of swapchain memory;
+ * at 4K × 26 (AlloSphere) = ~850 MB. The sub-line in the menu calls
+ * out the heavy case so the user knows what they're committing to. */
+
+const perDisplayRec = {
+  active: false,
+  canvases: [],
+  contexts: [],
+  bindGroups: [],
+  recorders: [],
+  chunks: [],
+  audioTaps: [],
+  startT: 0,
+  mime: "video/webm",
+  fbWidth: 0,
+  fbHeight: 0,
+  layerCount: 0,
+  uiTimer: null
+};
+
+function perDisplayRecordingActive() { return perDisplayRec.active; }
+
+function perDisplayRecordingToggle() {
+  if (perDisplayRec.active) {
+    return _stopPerDisplayRecordingAndDownload();
+  }
+  return _startPerDisplayRecording();
+}
+
+async function _startPerDisplayRecording() {
+  if (perDisplayRec.active) return;
+  if (!Visual.device || !Visual.blitPipeline || !Visual.framebufferLayerViews ||
+      !Visual.framebufferLayerViews.length) {
+    throw new Error("WebGPU not ready / no rig displays");
+  }
+  const mime = _pickWebmMimeType();
+  if (!mime) throw new Error("No supported WebM mime-type for MediaRecorder");
+  const N = Visual.framebufferLayerViews.length;
+  perDisplayRec.mime = mime;
+  perDisplayRec.fbWidth  = Visual.fbWidth;
+  perDisplayRec.fbHeight = Visual.fbHeight;
+  perDisplayRec.layerCount = N;
+  perDisplayRec.canvases = [];
+  perDisplayRec.contexts = [];
+  perDisplayRec.bindGroups = [];
+  perDisplayRec.recorders = [];
+  perDisplayRec.chunks = [];
+  perDisplayRec.audioTaps = [];
+
+  for (let i = 0; i < N; i++) {
+    const c = document.createElement("canvas");
+    c.width  = Visual.fbWidth;
+    c.height = Visual.fbHeight;
+    c.style.cssText = "position:fixed;left:-99999px;top:-99999px;width:1px;height:1px;visibility:hidden;pointer-events:none;";
+    document.body.appendChild(c);
+    const ctx = c.getContext("webgpu");
+    if (!ctx) {
+      console.warn("[per-display] failed to get WebGPU context for layer", i);
+      c.remove();
+      perDisplayRec.canvases.push(null);
+      perDisplayRec.contexts.push(null);
+      perDisplayRec.bindGroups.push(null);
+      perDisplayRec.recorders.push(null);
+      perDisplayRec.chunks.push([]);
+      perDisplayRec.audioTaps.push(null);
+      continue;
+    }
+    ctx.configure({
+      device: Visual.device,
+      format: Visual.presentationFormat,
+      alphaMode: "premultiplied"
+    });
+    const bg = Visual.device.createBindGroup({
+      label: "per-display-blit-bg-" + i,
+      layout: Visual.blitBindGroupLayout,
+      entries: [
+        { binding: 0, resource: Visual.framebufferLayerViews[i] },
+        { binding: 1, resource: Visual.blitSampler }
+      ]
+    });
+    const stream = c.captureStream(60);
+    // Per-recorder audio tap — each MediaRecorder needs its own
+    // MediaStreamDestinationNode because a MediaStream's audio tracks
+    // can't be shared across recorders. The worklet output node fans
+    // out to ctx.destination (speakers) AND every tap dest.
+    let audioTap = null;
+    if (previewState && previewState.audioCtx && previewState.workletNode) {
+      try {
+        const dest = previewState.audioCtx.createMediaStreamDestination();
+        previewState.workletNode.connect(dest);
+        for (const t of dest.stream.getAudioTracks()) stream.addTrack(t);
+        audioTap = { dest, srcNode: previewState.workletNode };
+      } catch (e) {
+        console.warn("[per-display] audio tap failed for layer", i, e);
+      }
+    }
+    let rec = null;
+    const chunks = [];
+    try {
+      rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 8_000_000 });
+      rec.ondataavailable = (ev) => { if (ev.data && ev.data.size > 0) chunks.push(ev.data); };
+      rec.start(1000);
+    } catch (e) {
+      console.warn("[per-display] MediaRecorder ctor failed for layer", i, e);
+      if (audioTap) { try { audioTap.srcNode.disconnect(audioTap.dest); } catch (_) {} audioTap = null; }
+      try { ctx.unconfigure(); } catch (_) {}
+      c.remove();
+      perDisplayRec.canvases.push(null);
+      perDisplayRec.contexts.push(null);
+      perDisplayRec.bindGroups.push(null);
+      perDisplayRec.recorders.push(null);
+      perDisplayRec.chunks.push([]);
+      perDisplayRec.audioTaps.push(null);
+      continue;
+    }
+    perDisplayRec.canvases.push(c);
+    perDisplayRec.contexts.push(ctx);
+    perDisplayRec.bindGroups.push(bg);
+    perDisplayRec.recorders.push(rec);
+    perDisplayRec.chunks.push(chunks);
+    perDisplayRec.audioTaps.push(audioTap);
+  }
+  perDisplayRec.active = true;
+  perDisplayRec.startT = performance.now();
+  _updatePerDisplayRecUi(true);
+  if (perDisplayRec.uiTimer) clearInterval(perDisplayRec.uiTimer);
+  perDisplayRec.uiTimer = setInterval(_updatePerDisplayElapsed, 250);
+}
+
+async function _stopPerDisplayRecordingAndDownload() {
+  if (!perDisplayRec.active) return;
+  // Halt the render-loop blit hook FIRST so no further commands target
+  // the recorder canvases. The recorders will flush their last data on
+  // stop().
+  perDisplayRec.active = false;
+  if (perDisplayRec.uiTimer) { clearInterval(perDisplayRec.uiTimer); perDisplayRec.uiTimer = null; }
+
+  const stops = perDisplayRec.recorders.map(rec => {
+    if (!rec || rec.state === "inactive") return Promise.resolve();
+    return new Promise(resolve => {
+      rec.addEventListener("stop", () => resolve(), { once: true });
+      try { rec.stop(); } catch (_) { resolve(); }
+    });
+  });
+  await Promise.all(stops);
+
+  const N = perDisplayRec.layerCount;
+  const files = {};
+  const ext = perDisplayRec.mime.includes("webm") ? "webm" : "bin";
+  for (let i = 0; i < N; i++) {
+    const chunks = perDisplayRec.chunks[i];
+    if (!chunks || !chunks.length) continue;
+    const blob = new Blob(chunks, { type: perDisplayRec.mime });
+    const disp = state && state.rig && state.rig.displays && state.rig.displays[i];
+    const idStr = disp && disp.id ? String(disp.id) : ("d" + i);
+    const safeId = idStr.replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 40);
+    const nn = String(i).padStart(2, "0");
+    files["display-" + nn + "-" + safeId + "." + ext] = new Uint8Array(await blob.arrayBuffer());
+  }
+  const elapsedS = (performance.now() - perDisplayRec.startT) / 1000;
+  files["meta.json"] = new TextEncoder().encode(JSON.stringify({
+    timestamp: new Date().toISOString(),
+    version: typeof APP_VERSION !== "undefined" ? APP_VERSION : "?",
+    durationSec: elapsedS,
+    fbWidth:  perDisplayRec.fbWidth,
+    fbHeight: perDisplayRec.fbHeight,
+    fbFormat: Visual.fbFormat,
+    mime: perDisplayRec.mime,
+    fps: 60,
+    displayCount: N,
+    displays: (state && state.rig && state.rig.displays || []).slice(0, N).map((d, i) => d ? {
+      idx: i, id: d.id, name: d.name,
+      pose: d.pose || { yaw: 0, pitch: 0, roll: 0 },
+      fov:  d.fov  || { h: 90, v: 60 }
+    } : { idx: i, missing: true })
+  }, null, 2));
+  const zip = _writeZipArchive(files);
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  _downloadBlob(new Blob([zip], { type: "application/zip" }), "gamma-perdisplay-rec-" + stamp + ".zip");
+
+  // Cleanup canvases + audio taps + reset state
+  for (let i = 0; i < perDisplayRec.canvases.length; i++) {
+    const c = perDisplayRec.canvases[i];
+    const ctx = perDisplayRec.contexts[i];
+    const tap = perDisplayRec.audioTaps[i];
+    if (tap) { try { tap.srcNode.disconnect(tap.dest); } catch (_) {} }
+    if (ctx) { try { ctx.unconfigure(); } catch (_) {} }
+    if (c && c.parentNode) c.parentNode.removeChild(c);
+  }
+  perDisplayRec.canvases = [];
+  perDisplayRec.contexts = [];
+  perDisplayRec.bindGroups = [];
+  perDisplayRec.recorders = [];
+  perDisplayRec.chunks = [];
+  perDisplayRec.audioTaps = [];
+  _updatePerDisplayRecUi(false);
+}
+
+/* Per-frame blit hook — called from renderVisualFrame() after the
+ * composite/theater/warp passes complete. Encodes one blit pass per
+ * active recorder canvas; uses the SAME command encoder as the main
+ * frame so everything submits in one Visual.device.queue.submit. */
+function _encodePerDisplayBlitsIntoEncoder(enc) {
+  if (!perDisplayRec.active) return;
+  const N = perDisplayRec.contexts.length;
+  for (let i = 0; i < N; i++) {
+    const ctx = perDisplayRec.contexts[i];
+    const bg  = perDisplayRec.bindGroups[i];
+    if (!ctx || !bg) continue;
+    let view;
+    try { view = ctx.getCurrentTexture().createView(); }
+    catch (e) {
+      // The browser dropped the canvas's swapchain (e.g. tab backgrounded).
+      // Skip this frame; future frames will retry.
+      continue;
+    }
+    const pass = enc.beginRenderPass({
+      label: "per-display-blit-" + i,
+      colorAttachments: [{
+        view,
+        clearValue: { r: 0, g: 0, b: 0, a: 1.0 },
+        loadOp: "clear",
+        storeOp: "store"
+      }]
+    });
+    pass.setPipeline(Visual.blitPipeline);
+    pass.setBindGroup(0, bg);
+    pass.draw(3);
+    pass.end();
+  }
+}
+
+function _updatePerDisplayRecUi(recording) {
+  const tag = document.getElementById("exp-rec-pd-tag");
+  if (tag) tag.style.display = recording ? "inline-block" : "none";
+  const btn = document.getElementById("exp-rec-perdisplay");
+  if (btn) {
+    const nameEl = btn.querySelector(".export-action-name");
+    if (nameEl) {
+      // Preserve trailing REC tag inside the name span (it's a child).
+      // Re-render label text but keep the tag node alive.
+      const tagInside = nameEl.querySelector(".recording-tag");
+      nameEl.firstChild && (nameEl.firstChild.textContent =
+        recording ? "Stop per-display recording → ZIP " : "Record per-display → ZIP ");
+      if (tagInside) {
+        tagInside.style.display = recording ? "inline-block" : "none";
+      }
+    }
+  }
+}
+
+function _updatePerDisplayElapsed() {
+  if (!perDisplayRec.active) return;
+  const tag = document.getElementById("exp-rec-pd-tag");
+  if (!tag) return;
+  const s = Math.floor((performance.now() - perDisplayRec.startT) / 1000);
+  const mm = String(Math.floor(s / 60)).padStart(2, "0");
+  const ss = String(s % 60).padStart(2, "0");
+  tag.textContent = "REC " + mm + ":" + ss;
+}
+
+/* =========================================================================
+ * v0.2.21 — Offline audio render to WAV (high-quality)
+ *
+ * Runs the cached patch wasm through an OfflineAudioContext (no audio
+ * device, no real-time deadline) for the requested duration. Output:
+ * stereo 16-bit PCM WAV at the sample rate of the realtime preview
+ * context (typically 48 kHz). Higher than real-time playback in
+ * practice because the worklet's audio quantum is the same but the
+ * host can run it as fast as the CPU allows.
+ *
+ * Requires the wasm bytes from the most recent successful compile --
+ * previewState.lastWasm is populated in previewCompileAndPlay before
+ * the transfer to the realtime worklet (see the two
+ * `previewState.lastWasm = wasmBytes.slice(0)` lines).
+ *
+ * The OfflineAudioContext is a fresh BaseAudioContext: addModule the
+ * processor source, instantiate a new AudioWorkletNode, send it the
+ * cached wasm via postMessage. No realtime SAB bridge in offline mode
+ * (audio uniform path is a visual concern; render-to-file doesn't
+ * need it). MIDI / mic / clock-driven setters all run from the
+ * worklet's auto-fire body the same way they do realtime. */
+async function renderOfflineAudio(durationSec) {
+  if (!previewState || !previewState.lastWasm) {
+    throw new Error("No compiled wasm cached. Click ▶ once to compile the patch, then try again.");
+  }
+  durationSec = Math.max(0.1, Math.min(3600, Number(durationSec) || 30));
+  const sampleRate = (previewState.audioCtx && previewState.audioCtx.sampleRate) || 48000;
+  const numChannels = 2;
+  const lengthSamples = Math.max(1, Math.floor(durationSec * sampleRate));
+  const offCtx = new OfflineAudioContext({
+    numberOfChannels: numChannels,
+    length: lengthSamples,
+    sampleRate: sampleRate
+  });
+  const blob = new Blob([PREVIEW_PROCESSOR_SRC], { type: "application/javascript" });
+  const url  = URL.createObjectURL(blob);
+  try {
+    await offCtx.audioWorklet.addModule(url);
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+  const node = new AudioWorkletNode(offCtx, "gamma-preview-processor", {
+    outputChannelCount: [numChannels],
+    numberOfInputs: 1,
+    numberOfOutputs: 1
+  });
+  node.connect(offCtx.destination);
+  // Clone the cached wasm so we don't detach the master copy when we
+  // transfer it to the offline worklet.
+  const wasmClone = previewState.lastWasm.slice(0);
+  // Wait for the worklet to confirm "loaded" before starting the render.
+  // The worklet posts "loaded" once instantiation completes; without
+  // this we'd start with an empty processor that emits silence.
+  const loaded = new Promise((resolve, reject) => {
+    let timer = null;
+    const onmsg = (ev) => {
+      if (!ev || !ev.data) return;
+      if (ev.data.type === "loaded") {
+        node.port.removeEventListener("message", onmsg);
+        if (timer) clearTimeout(timer);
+        resolve();
+      } else if (ev.data.type === "error") {
+        node.port.removeEventListener("message", onmsg);
+        if (timer) clearTimeout(timer);
+        reject(new Error(ev.data.error || "worklet load error"));
+      }
+    };
+    node.port.addEventListener("message", onmsg);
+    node.port.start();
+    // Safety timeout: if no "loaded" arrives in 8 s, abort. WASM instantiation
+    // for typical patches completes well under 1 s.
+    timer = setTimeout(() => {
+      node.port.removeEventListener("message", onmsg);
+      reject(new Error("worklet load timeout"));
+    }, 8000);
+  });
+  node.port.postMessage({ type: "load", wasmBytes: wasmClone }, [wasmClone]);
+  await loaded;
+  const audioBuffer = await offCtx.startRendering();
+  return audioBuffer;
+}
+
+/* Encode an AudioBuffer to 16-bit PCM WAV. Returns a Blob ready for
+ * download. Standard 44-byte RIFF/WAVE header + interleaved Int16.
+ * Clamps to [-1, 1] before quantization. */
+function audioBufferToWavBlob(audioBuffer) {
+  const numChannels = audioBuffer.numberOfChannels;
+  const sampleRate  = audioBuffer.sampleRate;
+  const length      = audioBuffer.length;
+  const channelData = [];
+  for (let ch = 0; ch < numChannels; ch++) channelData.push(audioBuffer.getChannelData(ch));
+  // Interleave + quantize in one pass.
+  const samples = new Int16Array(length * numChannels);
+  for (let i = 0; i < length; i++) {
+    for (let ch = 0; ch < numChannels; ch++) {
+      let s = channelData[ch][i];
+      if (s > 1) s = 1; else if (s < -1) s = -1;
+      samples[i * numChannels + ch] = (s < 0) ? (s * 0x8000) : (s * 0x7FFF);
+    }
+  }
+  const dataBytes = samples.length * 2;
+  const buf = new ArrayBuffer(44 + dataBytes);
+  const view = new DataView(buf);
+  let p = 0;
+  const wstr = (s) => { for (let i = 0; i < s.length; i++) view.setUint8(p++, s.charCodeAt(i)); };
+  wstr("RIFF");
+  view.setUint32(p, 36 + dataBytes, true); p += 4;
+  wstr("WAVE");
+  wstr("fmt ");
+  view.setUint32(p, 16, true);                       p += 4;   // chunk size
+  view.setUint16(p, 1, true);                        p += 2;   // PCM format
+  view.setUint16(p, numChannels, true);              p += 2;
+  view.setUint32(p, sampleRate, true);               p += 4;
+  view.setUint32(p, sampleRate * numChannels * 2, true); p += 4; // byte rate
+  view.setUint16(p, numChannels * 2, true);          p += 2;   // block align
+  view.setUint16(p, 16, true);                       p += 2;   // bits per sample
+  wstr("data");
+  view.setUint32(p, dataBytes, true);                p += 4;
+  // Copy samples in. samples is Int16Array; need to respect target byte order
+  // (WAV is little-endian, JS DataView/typed arrays are little-endian on the
+  // platforms we ship on, but we go via DataView setInt16 to be portable).
+  for (let i = 0; i < samples.length; i++) {
+    view.setInt16(44 + i * 2, samples[i], true);
+  }
+  return new Blob([buf], { type: "audio/wav" });
+}
+
+/* =========================================================================
  * v0.2.19 — Export center modal control
  * ======================================================================== */
 
@@ -34954,6 +35399,15 @@ function _openExportModal() {
   }
   const tag = document.getElementById("exp-rec-state-tag");
   if (tag) tag.style.display = _videoRecorder ? "inline-block" : "none";
+  // v0.2.21 — per-display rec state + dims, audio render context info.
+  const pdDimsEl = document.getElementById("exp-rec-pd-dims");
+  if (pdDimsEl) pdDimsEl.textContent = (Visual.fbWidth || "?") + "×" + (Visual.fbHeight || "?");
+  _updatePerDisplayRecUi(perDisplayRecordingActive());
+  const srEl = document.getElementById("exp-audio-sr");
+  if (srEl) {
+    const sr = (previewState && previewState.audioCtx && previewState.audioCtx.sampleRate) || 48000;
+    srEl.textContent = String(sr);
+  }
   const status = document.getElementById("exp-status");
   if (status) { status.textContent = ""; status.className = "export-status"; }
   modal.style.display = "flex";
@@ -36766,6 +37220,10 @@ async function previewCompileAndPlay() {
       previewProgressStage("load-wasm");
       const node = await ensureAudioWorklet();
       if (previewState.audioCtx.state === "suspended") await previewState.audioCtx.resume();
+      // v0.2.21 — retain a clone for offline audio render before
+      // transferring the original to the worklet (postMessage with a
+      // transfer list detaches the source buffer on the main thread).
+      try { previewState.lastWasm = wasmBytes.slice(0); } catch (_) { previewState.lastWasm = null; }
       node.port.postMessage({ type: "load", wasmBytes }, [wasmBytes]);
     } catch (e) {
       previewProgressEnd(false);
@@ -36862,6 +37320,8 @@ async function previewCompileAndPlay() {
       // feed it into a patch that doesn't want it.
       disconnectMic();
     }
+    // v0.2.21 — clone for offline audio render before transfer.
+    try { previewState.lastWasm = wasmBytes.slice(0); } catch (_) { previewState.lastWasm = null; }
     node.port.postMessage({ type: "load", wasmBytes }, [wasmBytes]);
     // setPreviewStatus("playing") fires when worklet posts back "loaded";
     // we finish the progress bar there too via the existing handler.
@@ -42047,6 +42507,65 @@ ensureGPUDevice();
       const tag = document.getElementById("exp-rec-state-tag");
       if (tag) tag.style.display = _videoRecorder ? "inline-block" : "none";
       _setExportStatus(_videoRecorder ? "Recording started — click again to stop" : "Recording stopped + downloaded", "success");
+    });
+  }
+
+
+
+  // -- Visual: per-display recording (toggle, bundles into ZIP) --
+  const pdRecBtn = document.getElementById("exp-rec-perdisplay");
+  if (pdRecBtn) {
+    pdRecBtn.addEventListener("click", async () => {
+      pdRecBtn.disabled = true;
+      try {
+        if (perDisplayRecordingActive()) {
+          _setExportStatus("Stopping per-display recording + bundling…");
+          await _stopPerDisplayRecordingAndDownload();
+          _setExportStatus("Per-display ZIP downloaded", "success");
+        } else {
+          const N = (Visual.framebufferLayerViews && Visual.framebufferLayerViews.length) || 0;
+          if (N === 0) { _setExportStatus("No rig displays to record", "error"); return; }
+          _setExportStatus("Starting " + N + " parallel MediaRecorders at " + Visual.fbWidth + "×" + Visual.fbHeight + "…");
+          await _startPerDisplayRecording();
+          _setExportStatus("Recording " + N + " displays — click again to stop", "success");
+        }
+      } catch (e) {
+        console.warn("[export] per-display recording toggle failed:", e);
+        _setExportStatus("Per-display recording failed: " + (e && e.message || e), "error");
+      } finally {
+        pdRecBtn.disabled = false;
+      }
+    });
+  }
+
+  // -- Audio render → WAV (offline) --
+  const audioBtn = document.getElementById("exp-audio-render");
+  if (audioBtn) {
+    audioBtn.addEventListener("click", async () => {
+      const defaultDuration = 30;
+      const answer = window.prompt("Render duration in seconds (1–3600):", String(defaultDuration));
+      if (answer == null) return;   // user cancelled
+      const duration = Math.max(1, Math.min(3600, parseFloat(answer) || defaultDuration));
+      audioBtn.disabled = true;
+      const orig = audioBtn.querySelector(".export-action-name").textContent;
+      try {
+        audioBtn.querySelector(".export-action-name").textContent = "Rendering " + duration + " s offline…";
+        _setExportStatus("Rendering audio (" + duration + " s)…");
+        const audioBuf = await renderOfflineAudio(duration);
+        _setExportStatus("Encoding WAV…");
+        const blob = audioBufferToWavBlob(audioBuf);
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+        const className = ((state && state.patchName) || "MyPatch").replace(/[^A-Za-z0-9_]/g, "") || "MyPatch";
+        _downloadBlob(blob, "gamma-render-" + className + "-" + stamp + ".wav");
+        _setExportStatus("Saved WAV (" + duration + " s × " + audioBuf.numberOfChannels + "ch × " +
+          audioBuf.sampleRate + " Hz)", "success");
+      } catch (e) {
+        console.warn("[export] audio render failed:", e);
+        _setExportStatus("Audio render failed: " + (e && e.message || e), "error");
+      } finally {
+        audioBtn.disabled = false;
+        audioBtn.querySelector(".export-action-name").textContent = orig;
+      }
     });
   }
 
