@@ -14224,7 +14224,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       { n: "darkmatter", t: "param" },
       { n: "brightness", t: "param" },
       { n: "distfading", t: "param" },
-      { n: "saturation", t: "param" }
+      { n: "saturation", t: "param" },
+      // Phase 6.6.32 — Gamma reactivity.
+      { n: "audioReact", t: "param" },
+      { n: "bassReact",  t: "param" },
+      { n: "clockReact", t: "clock" }
     ],
     outs: [{ n: "out", t: "texture" }],
     params: {
@@ -14235,10 +14239,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       darkmatter: 0.300,
       brightness: 0.0015,
       distfading: 0.730,
-      saturation: 0.850
+      saturation: 0.850,
+      audioReact: 0.0,
+      bassReact:  0.0,
+      clockReact: 0.0
     },
     methods: {},
-    uniformBytes: 96,
+    uniformBytes: 112,
     wgsl:
 `struct U {
   u_resolution: vec4f,
@@ -14250,8 +14257,25 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   u_world_uv:   vec4f,
   params:       vec4f,    // x=zoom, y=formuparam, z=darkmatter, w=brightness
   params2:      vec4f,    // x=distfading, y=saturation, z=tile, w=speed
+  params3:      vec4f,    // x=audioReact, y=bassReact, z=clockReact, w=_
 };
 @group(0) @binding(0) var<uniform> u: U;
+
+// Phase 6.6.32 — audio bridge (see Plasma for full struct docs).
+struct AudioU {
+  values: array<vec4<f32>, 4>,
+  fft:    array<vec4<f32>, 64>,
+};
+@group(0) @binding(3) var<uniform> u_audio: AudioU;
+
+fn fft_bin(k: u32) -> f32 {
+  let v = u_audio.fft[k / 4u];
+  let lane = k & 3u;
+  if (lane == 0u) { return v.x; }
+  if (lane == 1u) { return v.y; }
+  if (lane == 2u) { return v.z; }
+  return v.w;
+}
 
 struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
 
@@ -14337,6 +14361,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   let fxy_y = -cam_pos.x * sinA2 + cam_pos.y * cosA2;
   cam_pos = vec3<f32>(fxy_x, fxy_y, cam_pos.z);
 
+  // Phase 6.6.32 — audio reactivity. peak modulates brightness
+  // (bright frames on loud audio), bass modulates step size
+  // (sub-bass kicks "pull" the depth field forward), clockReact
+  // adds a per-beat brightness pulse when wired from MasterClock.
+  let peak = u_audio.values[0].x;
+  var bass: f32 = 0.0;
+  for (var k: u32 = 0u; k < 8u; k = k + 1u) { bass = bass + fft_bin(k); }
+  bass = bass * 0.125;
+  let audioBri  = 1.0 + u.params3.x * peak + u.params3.z;
+  let bassStep  = 1.0 + u.params3.y * bass;
+
   // Volumetric raymarch. Each step folds the world into a tiled
   // "kaleidoscope" cell, then iterates the abs(p)/dot(p,p) - param
   // formula — that's what produces the iridescent star-cluster
@@ -14366,9 +14401,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     let a3 = a * a * a;
     if (r > 6) { fade = fade * (1.0 - dm); }
     v = v + vec3<f32>(fade, fade, fade);
-    v = v + vec3<f32>(s, s * s, s * s * s * s) * a3 * brightness * fade;
+    // Phase 6.6.32 — Gamma Node color ramp. Replaces the original
+    // (s, s^2, s^4) warm-orange temperature curve with a phosphor-
+    // green / info-cyan / amber distance ramp that matches the
+    // editor's instrument palette. Near (small s): dim green; mid:
+    // cyan-green; far: cyan dominant with amber highlights.
+    let chR = s * s * s * 0.35;        // sparse amber/red at distance
+    let chG = s * 0.95;                 // phosphor dominant
+    let chB = s * s * 1.05;             // cyan rises with depth
+    v = v + vec3<f32>(chR, chG, chB) * a3 * brightness * audioBri * fade;
     fade = fade * distfading;
-    s = s + stepsize;
+    s = s + stepsize * bassStep;
   }
 
   // Saturation adjust: blend toward grayscale by (1 - saturation).
@@ -14393,8 +14436,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       scratch[21] = (typeof p.saturation === "number") ? p.saturation : 0.850;
       scratch[22] = (typeof p.tile       === "number") ? p.tile       : 0.850;
       scratch[23] = (typeof p.speed      === "number") ? p.speed      : 0.010;
+      // Phase 6.6.32 — params3 (audio reactivity).
+      scratch[24] = (typeof p.audioReact === "number") ? p.audioReact : 0.0;
+      scratch[25] = (typeof p.bassReact  === "number") ? p.bassReact  : 0.0;
+      scratch[26] = (typeof p.clockReact === "number") ? p.clockReact : 0.0;
+      scratch[27] = 0;
     },
-    description: "StarNest — volumetric 'fly through fractal star cluster' effect. Port of Pablo Roman Andrioli's classic Shadertoy 'Star Nest' (https://www.shadertoy.com/view/XlfGRj), modified so each fragment's ray direction comes from the projector basis (per the gnomonic-fix template) — the same 3D scene renders continuously across every projector boundary on the dome. zoom: ray scale (0.8 default — bigger = wider FOV-like effect). speed: time multiplier (0.01 default — very slow drift). tile: kaleidoscope cell size (0.85 default). formuparam: fractal formula 'magic number' (0.53 default — try 0.4–0.6 for very different structures). darkmatter: dark-region density (0.30 default). brightness: emission scale (0.0015 default). distfading: per-step fade (0.73 default). saturation: 0=grayscale, 1=full color (0.85 default). Heavy on per-fragment ALU (340 inner iterations/pixel) — at 1080² × 26 displays expect ~30 fps; drop framebuffer res in the rig settings if you see stuttering."
+    description: "StarNest — Gamma Node take on the volumetric fly-through-fractal-stars effect. Same kaleidoscope-fold + iterated abs(p)/dot(p,p) - param formula as Pablo Roman Andrioli's Shadertoy original, but the per-ray color ramp re-keyed from the warm-orange temperature curve to a phosphor-green / info-cyan / amber palette that matches the rest of the editor. Ray direction comes from the projector basis (gnomonic-fix template) — same scene across every dome boundary. zoom: ray scale (0.8). speed: time multiplier (0.01). tile: kaleidoscope cell size (0.85). formuparam: fractal 'magic number' (0.53; try 0.4–0.6). darkmatter: dark-region density (0.30). brightness: emission scale (0.0015). distfading: per-step fade (0.73). saturation: 0=grayscale, 1=full color. audioReact: scales master peak into brightness. bassReact: scales bass FFT (bins 0..7) into step size — kicks pull the depth field forward. clockReact: wire MasterClock.beat for an on-the-beat brightness pulse. Heavy: 340 inner iterations/fragment; drop framebuffer res if it stutters on the dome."
   },
 
   /* Phase 6.6.27 — Butterflies. Volumetric ray-trace of 8 (or
@@ -14418,12 +14466,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     kind: "shader-frag",
     ins: [
       { n: "speed",       t: "param" },
-      { n: "numActive",   t: "param" }
+      { n: "numActive",   t: "param" },
+      // Phase 6.6.32 — Gamma reactivity. Master peak, bass FFT,
+      // and clock-wirable speed boost.
+      { n: "audioReact",  t: "param" },
+      { n: "bassReact",   t: "param" },
+      { n: "clockReact",  t: "clock" }
     ],
     outs: [{ n: "out", t: "texture" }],
-    params: { speed: 1.0, numActive: 8 },
+    params: { speed: 1.0, numActive: 8, audioReact: 0.0, bassReact: 0.0, clockReact: 0.0 },
     methods: {},
-    uniformBytes: 80,
+    uniformBytes: 96,
     wgsl:
 `struct U {
   u_resolution: vec4f,
@@ -14433,9 +14486,26 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   u_fov_v_deg:  f32,
   u_view:       vec4f,
   u_world_uv:   vec4f,
-  params:       vec4f,    // x=speed, y=numActive, zw=_
+  params:       vec4f,    // x=speed, y=numActive, z=audioReact, w=bassReact
+  params2:      vec4f,    // x=clockReact, yzw=_
 };
 @group(0) @binding(0) var<uniform> u: U;
+
+// Phase 6.6.32 — audio bridge (see Plasma for full struct docs).
+struct AudioU {
+  values: array<vec4<f32>, 4>,
+  fft:    array<vec4<f32>, 64>,
+};
+@group(0) @binding(3) var<uniform> u_audio: AudioU;
+
+fn fft_bin(k: u32) -> f32 {
+  let v = u_audio.fft[k / 4u];
+  let lane = k & 3u;
+  if (lane == 0u) { return v.x; }
+  if (lane == 1u) { return v.y; }
+  if (lane == 2u) { return v.z; }
+  return v.w;
+}
 
 struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
 
@@ -14606,15 +14676,28 @@ fn wing1Tex(p_in: vec2<f32>) -> vec3<f32> {
 
 fn wing_color(p_in: vec2<f32>) -> vec4<f32> {
   let p = p_in + fbm2(p_in * 4.0) * 0.02;
-  let mixT = fbm2(p * vec2<f32>(1.0, 16.0)) * 0.26 +
+  // Phase 6.6.32 — Gamma Node palette: phosphor green wing surface
+  // shading into info-cyan along the inner edge, with amber accent
+  // at the wing-edge / vein highlights. Replaces jorge2017a2's
+  // warm-orange Shadertoy original. Same noise-driven mixT keeps
+  // the organic per-wing texture variation; the colors are just
+  // re-keyed to the editor's instrument palette.
+  let phosphor = vec3<f32>(0.78, 0.91, 0.35);
+  let cyan     = vec3<f32>(0.51, 0.91, 1.00);
+  let amber    = vec3<f32>(0.95, 0.55, 0.18);
+  let mixT = fbm2(p * vec2<f32>(1.0, 16.0)) * 0.40 +
              pow(clamp((p.y * 4.0 - abs(p.x) * 2.0) / 3.0, 0.0, 1.0), 2.0);
-  var wc = mix(vec3<f32>(1.0, 0.5, 0.15), vec3<f32>(2.0, 0.5, 0.15) * 0.3, mixT) * 0.8;
-  wc = pow(wc, vec3<f32>(1.5));
+  let edgeT = pow(clamp(-p.x * 0.5, 0.0, 1.0), 1.5);
+  var wc = mix(phosphor, cyan, mixT);
+  wc = mix(wc, amber, edgeT * 0.45);
+  wc = pow(wc, vec3<f32>(1.3)) * 0.9;
   let c0 = wing0Tex(p);
   let c1 = wing1Tex(p);
   var col = mix(mix(vec3<f32>(0.0), c0.x * wc, c0.y), c1.x * wc, c1.y);
-  col = mix(col, vec3<f32>(1.0), c0.z);
-  col = mix(col, vec3<f32>(1.0), c1.z);
+  // Vein highlights pick up the secondary palette instead of plain
+  // white — body gets phosphor sparkle, wings get cyan glints.
+  col = mix(col, phosphor * 1.3, c0.z);
+  col = mix(col, cyan * 1.2, c1.z);
   return vec4<f32>(col, max(c0.y, c1.y));
 }
 
@@ -14666,7 +14749,17 @@ fn butterflyPath(t: f32) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4f {
-  let time = u.u_time * max(0.01, u.params.x);   // params.x = speed
+  // Phase 6.6.32 — audio-reactive speed + brightness.
+  //   audioReact * master peak  → boost orbit speed during loud frames
+  //   bassReact  * mean(fft 0-7) → boost flap rate on kick drums
+  //   clockReact (wirable from MasterClock) → also boosts speed
+  let peak = u_audio.values[0].x;
+  var bass: f32 = 0.0;
+  for (var i: u32 = 0u; i < 8u; i = i + 1u) { bass = bass + fft_bin(i); }
+  bass = bass * 0.125;
+  let audioBoost = u.params.z * peak + u.params2.x;            // speed term
+  let bassBoost  = u.params.w * bass;                          // flap term
+  let time = u.u_time * (max(0.01, u.params.x) + audioBoost);
   let nactive = i32(clamp(u.params.y, 1.0, 8.0));
 
   // Camera at the rig center; rd from the projector basis.
@@ -14683,7 +14776,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     let bp_next = butterflyPath(t + 0.01);
     let bd_xz = normalize(bp_next.xz - bo.xz);
     let bd = vec3<f32>(bd_xz.x, 0.0, bd_xz.y);
-    let flap = 0.5 + 0.5 * cos(t * 9.0);
+    // bassBoost scales the per-butterfly flap rate so kick drums
+    // visibly flutter the wings without affecting orbit speed.
+    let flap = 0.5 + 0.5 * cos(t * (9.0 + bassBoost * 24.0));
     let b = traceButterfly(ro, rd, bo, bd, flap);
     let hit = b.a < depth;
     col = select(col, b.rgb, hit);
@@ -14691,17 +14786,21 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   }
 
   let alpha = select(0.0, 1.0, depth < 1e2);
-  // Gamma match to Shadertoy original.
+  // sqrt() gamma curve — same as the Shadertoy original, but
+  // applied to our Gamma palette instead of the warm-orange set.
   let outRgb = sqrt(max(col, vec3<f32>(0.0)));
   return vec4<f32>(outRgb, alpha);
 }`,
     writeUniforms(node, scratch) {
       const p = node.params || {};
-      scratch[16] = (typeof p.speed     === "number") ? p.speed     : 1.0;
-      scratch[17] = (typeof p.numActive === "number") ? p.numActive : 8;
-      scratch[18] = 0; scratch[19] = 0;
+      scratch[16] = (typeof p.speed       === "number") ? p.speed       : 1.0;
+      scratch[17] = (typeof p.numActive   === "number") ? p.numActive   : 8;
+      scratch[18] = (typeof p.audioReact  === "number") ? p.audioReact  : 0.0;
+      scratch[19] = (typeof p.bassReact   === "number") ? p.bassReact   : 0.0;
+      scratch[20] = (typeof p.clockReact  === "number") ? p.clockReact  : 0.0;
+      scratch[21] = 0; scratch[22] = 0; scratch[23] = 0;
     },
-    description: "Butterflies — volumetric ray-trace of up to 8 butterflies orbiting the rig center, with procedural wing texture (nested SDFs per fragment). Port of jorge2017a2's Shadertoy 'butterflies', re-cast for the dome: camera fixed at origin (= rig center / sweet-spot), butterflies orbit around the viewer via butterflyPath. Output is RGBA with alpha=1 where a butterfly is hit, alpha=0 elsewhere — wire `out` into BlendShader.inA + a backdrop on inB with mode=5 (alpha-over) for butterflies floating over any other shader. speed: time multiplier (1.0 default). numActive: butterfly count, 1..8 (8 default). Expensive: 8 butterflies × 2 wings × ~150 ALU ops each per fragment — drop framebuffer resolution if you see stuttering."
+    description: "Butterflies — Gamma Node take on the volumetric butterfly ray-trace. 8 butterflies orbit the rig center / sweet-spot; each fragment's ray direction comes from the projector basis (gnomonic-fix template) so the scene stays continuous across every dome boundary. Wings re-keyed from the original orange palette to the editor's phosphor-green / info-cyan / amber instrument theme. Output is RGBA — alpha=1 only where a butterfly is hit, so the obvious composition is Butterflies → BlendShader.inA + a backdrop on inB with mode=5 (alpha-over). speed: orbit time multiplier (1.0). numActive: butterfly count 1..8. audioReact: scales master output peak into orbit speed. bassReact: scales mean FFT bins 0..7 into per-butterfly flap rate so kick drums flutter the wings. clockReact: wire MasterClock.beat for on-the-beat speed pulses. Expensive: ~340 inner-loop iterations per fragment; drop framebuffer res if it stutters."
   },
 
   /* Phase 6.4 — NoiseShader. Simplex 2D fBm with octaves. Output is
