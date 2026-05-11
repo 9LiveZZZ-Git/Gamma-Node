@@ -13300,6 +13300,110 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     description: "Live webcam feed via getUserMedia. Click ▶ once (or wire into VisualOutput + WebGPU render) to trigger the browser's camera permission prompt. Plugs into BlendShader / ColorCorrect / MaskShader chains like any other visual source — turn the editor into a VJ tool with one wire. mirrored=1 flips horizontally (selfie cam); exposure scales output gain; tint_{r,g,b} multiplies per-channel."
   },
 
+  /* VideoFile (v0.3.11) — file-driven video source.
+   *
+   * Same WGSL pipeline as Webcam (shares the cached pipeline because
+   * the source text matches); the only difference is where the
+   * underlying <video> element's src comes from. fileUrl is a
+   * standard URL string: a blob URL (browser-local picked file) or
+   * an http(s) URL (CORS-cleared video). The properties panel
+   * renders a "Pick file…" button on click that opens an OS file
+   * picker → URL.createObjectURL → params.fileUrl. URLs typed in
+   * directly also work (server-hosted videos with CORS).
+   *
+   * The element is created with loop=true so the video repeats
+   * indefinitely. Use a downstream BlendShader to mix it with
+   * other content. Also pluggable into the new "video" input on
+   * HandLandmarker / PoseLandmarker / FaceLandmarker / HandKeyboard
+   * so MediaPipe runs detection on the file frames instead of the
+   * live camera. */
+  VideoFile: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "video-source",
+    ins: [
+      { n: "mirrored", t: "param" },
+      { n: "exposure", t: "param" },
+      { n: "tint_r",   t: "param" },
+      { n: "tint_g",   t: "param" },
+      { n: "tint_b",   t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    params: {
+      fileUrl: "",
+      mirrored: 0, exposure: 1.0,
+      tint_r: 1.0, tint_g: 1.0, tint_b: 1.0
+    },
+    methods: { fileUrl: null, mirrored: null, exposure: null, tint_r: null, tint_g: null, tint_b: null },
+    uiOnlyParams: ["fileUrl"],
+    uniformBytes: 96,
+    // Same WGSL as Webcam -- pipeline cache hashes the source so
+    // both nodes share the compiled pipeline.
+    wgsl:
+`struct U {
+  u_resolution: vec4f,
+  u_time:       f32,
+  u_dt:         f32,
+  _pad0:        vec2f,
+  u_view:       vec4f,
+  u_world_uv:   vec4f,
+  params:       vec4f,   // x=mirrored, y=exposure, z=_, w=_
+  tint:         vec4f,   // r, g, b, _
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var videoTex: texture_external;
+@group(0) @binding(2) var videoSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(
+    vec2f(-1.0, -1.0),
+    vec2f( 3.0, -1.0),
+    vec2f(-1.0,  3.0),
+  );
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let videoDim = vec2f(textureDimensions(videoTex));
+  let fbDim    = u.u_resolution.xy;
+  let videoAR  = videoDim.x / videoDim.y;
+  let fbAR     = fbDim.x    / fbDim.y;
+  var uv       = in.uv;
+  if (videoAR > fbAR) {
+    let crop = fbAR / videoAR;
+    uv.x = (uv.x - 0.5) * crop + 0.5;
+  } else {
+    let crop = videoAR / fbAR;
+    uv.y = (uv.y - 0.5) * crop + 0.5;
+  }
+  if (u.params.x > 0.5) { uv.x = 1.0 - uv.x; }
+  let color = textureSampleBaseClampToEdge(videoTex, videoSampler, uv);
+  let rgb = color.rgb * u.params.y * u.tint.rgb;
+  return vec4f(rgb, color.a);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.mirrored === "number") ? p.mirrored : 0;
+      scratch[17] = (typeof p.exposure === "number") ? p.exposure : 1.0;
+      scratch[18] = 0;
+      scratch[19] = 0;
+      scratch[20] = (typeof p.tint_r === "number") ? p.tint_r : 1.0;
+      scratch[21] = (typeof p.tint_g === "number") ? p.tint_g : 1.0;
+      scratch[22] = (typeof p.tint_b === "number") ? p.tint_b : 1.0;
+      scratch[23] = 0;
+    },
+    description: "Plays back a video file as a texture. Click the node's 'Pick file…' button in the props panel to load a local video, or paste an http(s) URL into fileUrl. Loops indefinitely; same WGSL pipeline as Webcam (shared compiled pipeline). Wire `out` → BlendShader / VisualOutput, or wire into the `video` input of any MediaPipe landmark node to run detection on the file's frames instead of the live camera. mirrored=1 flips horizontally; exposure scales output gain; tint_{r,g,b} multiplies per-channel."
+  },
+
   /* Phase 7.1b — HandLandmarker (MediaPipe Tasks Vision).
    *
    * Real-time hand tracking via MediaPipe's WASM-GPU pipeline. Runs
@@ -13377,7 +13481,14 @@ public:
     }
 };`,
     kind: "ai-vision-canvas",
-    ins: [],
+    // v0.3.11 — optional "video" texture input. When wired (typically
+    // from Webcam / VideoFile / ScreenShare), the detector samples
+    // the SOURCE node's underlying <video> element instead of opening
+    // its own getUserMedia camera stream. Lets one webcam stream
+    // feed multiple detectors, or run MediaPipe over a pre-recorded
+    // video file. Unwired = falls back to own camera (original
+    // behaviour).
+    ins: [{ n: "video", t: "texture" }],
     outs: [
       { n: "out",      t: "texture" },
       // Multi-output struct fields — codegen reads ".field" off the
@@ -13496,7 +13607,10 @@ public:
     }
 };`,
     kind: "ai-vision-canvas",
-    ins: [],
+    // v0.3.11 — optional "video" texture input. When wired (from
+    // Webcam / VideoFile / etc), MediaPipe samples the source's
+    // underlying <video> element instead of opening own camera.
+    ins: [{ n: "video", t: "texture" }],
     outs: [
       { n: "out",         t: "texture" },
       { n: "present",     t: "param", access: ".present"     },
@@ -13621,7 +13735,10 @@ public:
     }
 };`,
     kind: "ai-vision-canvas",
-    ins: [],
+    // v0.3.11 — optional "video" texture input. When wired (from
+    // Webcam / VideoFile / etc), MediaPipe samples the source's
+    // underlying <video> element instead of opening own camera.
+    ins: [{ n: "video", t: "texture" }],
     outs: [
       { n: "out",             t: "texture" },
       { n: "present",         t: "param", access: ".present"         },
@@ -13731,7 +13848,10 @@ public:
     Out operator()() { return { v_[0], v_[1], v_[2], v_[3], v_[4] }; }
 };`,
     kind: "ai-vision-canvas",
-    ins: [],
+    // v0.3.11 — optional "video" texture input. When wired (from
+    // Webcam / VideoFile / etc), MediaPipe samples the source's
+    // underlying <video> element instead of opening own camera.
+    ins: [{ n: "video", t: "texture" }],
     outs: [
       { n: "out",      t: "texture" },
       { n: "present",  t: "param", access: ".present"  },
@@ -26110,7 +26230,53 @@ function renderProps() {
       html += `</div>`;
     }
   }
+  // v0.3.11 — VideoFile pick-file button. Renders inline in the
+  // props panel; clicking opens an OS file picker; selection makes
+  // a blob URL + assigns to params.fileUrl. The text input above
+  // (the standard string-param renderer) still works for pasting
+  // http(s) URLs directly.
+  if (node.type === "VideoFile") {
+    const curUrl = (node.params && node.params.fileUrl) || "";
+    const summary = curUrl
+      ? (curUrl.startsWith("blob:")
+          ? "Local file loaded (blob URL — session-only)"
+          : "URL: " + escapeText(curUrl.length > 60 ? curUrl.slice(0, 57) + "…" : curUrl))
+      : "No file picked yet. Click below to browse or paste a URL above.";
+    html += `<div class="prop-section">Video source</div>
+             <div class="prop-inline" style="margin-bottom:8px;color:var(--text-2);font-size:11px;">${summary}</div>
+             <button class="btn primary" id="btn-videofile-pick" style="width:100%;">📁 Pick video file…</button>`;
+  }
   propsEl.innerHTML = html;
+
+  // VideoFile pick-button wiring.
+  const pickBtn = propsEl.querySelector('#btn-videofile-pick');
+  if (pickBtn && node.type === "VideoFile") {
+    pickBtn.addEventListener('click', () => {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = 'video/*';
+      input.addEventListener('change', () => {
+        const file = input.files && input.files[0];
+        if (!file) return;
+        // Revoke any previous blob URL so we don't leak.
+        const oldUrl = node.params && node.params.fileUrl;
+        if (oldUrl && oldUrl.startsWith('blob:')) {
+          try { URL.revokeObjectURL(oldUrl); } catch (_) {}
+        }
+        const url = URL.createObjectURL(file);
+        if (!node.params) node.params = {};
+        node.params.fileUrl = url;
+        // Re-render props to reflect the new URL summary + nudge the
+        // render loop to re-init the VideoFile node with the new src.
+        pushHistory("videofile-pick:" + node.id);
+        _disposeVideoSource(node.id);
+        renderProps();
+        render();
+      });
+      input.click();
+    });
+  }
+
   // Wire the "Edit piano roll" button (PianoRoll AND MultiPianoRoll
   // both use #btn-open-pianoroll → the modal detects which one via
   // the node's def.kind and shows track tabs accordingly).
@@ -33378,11 +33544,90 @@ function _disposeVideoSource(nodeId) {
     try { entry.stream.getTracks().forEach(t => t.stop()); } catch (_) {}
   }
   if (entry.videoEl) {
-    try { entry.videoEl.srcObject = null; } catch (_) {}
+    try { entry.videoEl.srcObject = null; entry.videoEl.removeAttribute("src"); } catch (_) {}
     try { entry.videoEl.pause(); } catch (_) {}
     if (entry.videoEl.parentNode) entry.videoEl.parentNode.removeChild(entry.videoEl);
   }
+  if (entry.objectUrl) {
+    try { URL.revokeObjectURL(entry.objectUrl); } catch (_) {}
+  }
   _videoSources.delete(nodeId);
+}
+
+/* v0.3.11 — VideoFile init. Distinct from _ensureWebcamStream
+ * (which calls getUserMedia); this one loads an arbitrary URL into
+ * an HTMLVideoElement. Same _videoSources storage so the video-
+ * source render path + the landmark-node texture-input lookup both
+ * find it. Loops indefinitely; respects URL changes by reloading. */
+async function _ensureVideoFile(nodeId, params) {
+  const fileUrl = (params && params.fileUrl) || "";
+  let entry = _videoSources.get(nodeId);
+  // If a different URL is requested, dispose + reinitialize.
+  if (entry && entry.fileUrl !== fileUrl) {
+    _disposeVideoSource(nodeId);
+    entry = null;
+  }
+  if (entry) return entry;
+  entry = {
+    videoEl: null, stream: null, ready: false, error: null,
+    requesting: true, kind: "videofile", fileUrl, objectUrl: null
+  };
+  _videoSources.set(nodeId, entry);
+  try {
+    if (!fileUrl) throw new Error("fileUrl param is empty — pick a file in the props panel");
+    const videoEl = document.createElement("video");
+    videoEl.src         = fileUrl;
+    videoEl.playsInline = true;
+    videoEl.muted       = true;
+    videoEl.loop        = true;
+    videoEl.autoplay    = true;
+    // Important: importExternalTexture requires the video to have
+    // started decoding frames. Wait for the first loadeddata event
+    // (with a sane timeout) before flagging ready.
+    await new Promise((resolve, reject) => {
+      const onLoaded = () => { videoEl.removeEventListener("loadeddata", onLoaded); resolve(); };
+      const onError  = (e) => { videoEl.removeEventListener("error", onError); reject(e); };
+      videoEl.addEventListener("loadeddata", onLoaded, { once: true });
+      videoEl.addEventListener("error", onError, { once: true });
+      setTimeout(() => resolve(), 5000);   // safety: assume it eventually loads
+    });
+    try { await videoEl.play(); } catch (_) {}
+    entry.videoEl = videoEl;
+    entry.ready = true;
+    console.log("[videofile] node " + nodeId + " playing " +
+                fileUrl.slice(0, 80) + " (" +
+                (videoEl.videoWidth || "?") + "×" + (videoEl.videoHeight || "?") + ")");
+  } catch (e) {
+    console.warn("[videofile] init failed for node " + nodeId + ":", e);
+    entry.error = e;
+  } finally {
+    entry.requesting = false;
+  }
+  return entry;
+}
+
+/* v0.3.11 — locate an upstream video <element> for a landmark node's
+ * "video" texture input. Resolves the wire to the source node id,
+ * looks up _videoSources, returns the active <video> element if
+ * ready. Returns null when the wire is absent OR the source isn't
+ * initialized yet OR the source's stream/element isn't ready. The
+ * landmark init helper falls back to its own getUserMedia in that
+ * case. */
+function _findUpstreamVideoEl(nodeId) {
+  if (typeof state === "undefined" || !state || !Array.isArray(state.edges)) return null;
+  const edge = state.edges.find(e =>
+    e && e.to && e.to.node === nodeId && e.to.port === "video");
+  if (!edge || !edge.from) return null;
+  // Kick the source's init (idempotent) so it warms up alongside us.
+  const srcNode = state.nodes && state.nodes.find(n => n.id === edge.from.node);
+  if (srcNode) {
+    if (srcNode.type === "VideoFile")   _ensureVideoFile(srcNode.id, srcNode.params || {});
+    else if (srcNode.type === "Webcam") _ensureWebcamStream(srcNode.id);
+  }
+  const src = _videoSources.get(edge.from.node);
+  if (!src || !src.ready || !src.videoEl) return null;
+  if (src.videoEl.readyState < 2) return null;
+  return src.videoEl;
 }
 
 /* =========================================================================
@@ -33458,6 +33703,24 @@ async function _ensureMediapipeCamera(entry) {
   return stream;
 }
 
+/* v0.3.11 — pick the right video source for a landmark detector.
+ * Checks for an upstream wire to the node's "video" texture input
+ * first; if a Webcam / VideoFile / etc is wired in AND ready, we
+ * borrow its <video> element + mark sharedVideoEl=true so cleanup
+ * doesn't tear down a stream another node owns. Otherwise we open
+ * our own getUserMedia camera (the v0.3.6 behaviour). */
+async function _ensureMediapipeSource(nodeId, entry) {
+  const upstream = _findUpstreamVideoEl(nodeId);
+  if (upstream) {
+    entry.videoEl       = upstream;
+    entry.sharedVideoEl = true;
+    return upstream;
+  }
+  await _ensureMediapipeCamera(entry);
+  entry.sharedVideoEl = false;
+  return entry.videoEl;
+}
+
 async function _ensureHandLandmarker(nodeId, params) {
   let entry = _mediapipeNodes.get(nodeId);
   if (entry) return entry;
@@ -33475,7 +33738,7 @@ async function _ensureHandLandmarker(nodeId, params) {
   _mediapipeNodes.set(nodeId, entry);
   try {
     const { HandLandmarker, filesets } = await _loadMediaPipeVision();
-    await _ensureMediapipeCamera(entry);
+    await _ensureMediapipeSource(nodeId, entry);
     entry.detector = await HandLandmarker.createFromOptions(filesets, {
       baseOptions: {
         modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
@@ -33656,11 +33919,17 @@ function _disposeMediapipeNode(nodeId) {
   if (entry.detector && typeof entry.detector.close === "function") {
     try { entry.detector.close(); } catch (_) {}
   }
-  if (entry.stream) {
-    try { entry.stream.getTracks().forEach(t => t.stop()); } catch (_) {}
-  }
-  if (entry.videoEl) {
-    try { entry.videoEl.srcObject = null; entry.videoEl.pause(); } catch (_) {}
+  // v0.3.11 — only stop the stream / detach the videoEl if WE own
+  // it. When the source video came from an upstream Webcam / VideoFile
+  // via the new "video" texture input, the upstream node still owns
+  // it and we'd be ripping the camera out from under siblings.
+  if (!entry.sharedVideoEl) {
+    if (entry.stream) {
+      try { entry.stream.getTracks().forEach(t => t.stop()); } catch (_) {}
+    }
+    if (entry.videoEl) {
+      try { entry.videoEl.srcObject = null; entry.videoEl.pause(); } catch (_) {}
+    }
   }
   _mediapipeNodes.delete(nodeId);
 }
@@ -33759,7 +34028,7 @@ async function _ensurePoseLandmarker(nodeId, params) {
   _mediapipeNodes.set(nodeId, entry);
   try {
     const { PoseLandmarker, filesets } = await _loadMediaPipeVision();
-    await _ensureMediapipeCamera(entry);
+    await _ensureMediapipeSource(nodeId, entry);
     entry.detector = await PoseLandmarker.createFromOptions(filesets, {
       baseOptions: {
         modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
@@ -33898,7 +34167,7 @@ async function _ensureFaceLandmarker(nodeId, params) {
   _mediapipeNodes.set(nodeId, entry);
   try {
     const { FaceLandmarker, filesets } = await _loadMediaPipeVision();
-    await _ensureMediapipeCamera(entry);
+    await _ensureMediapipeSource(nodeId, entry);
     entry.detector = await FaceLandmarker.createFromOptions(filesets, {
       baseOptions: {
         modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
@@ -34023,7 +34292,7 @@ async function _ensureHandKeyboard(nodeId, params) {
   _mediapipeNodes.set(nodeId, entry);
   try {
     const { HandLandmarker, filesets } = await _loadMediaPipeVision();
-    await _ensureMediapipeCamera(entry);
+    await _ensureMediapipeSource(nodeId, entry);
     entry.detector = await HandLandmarker.createFromOptions(filesets, {
       baseOptions: {
         modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
@@ -35253,7 +35522,16 @@ function _encodeShaderFragPassForPlan(enc, entry, dtSec) {
   if (def.bindLayout === "video-source") {
     const src = _videoSources.get(node.id);
     if (!src) {
-      _ensureWebcamStream(node.id);
+      // v0.3.11 — dispatch by node type: VideoFile loads from a URL,
+      // Webcam (default) opens getUserMedia.
+      if (node.type === "VideoFile") _ensureVideoFile(node.id, node.params || {});
+      else                            _ensureWebcamStream(node.id);
+      return false;
+    }
+    // v0.3.11 — if the source's params changed (e.g. VideoFile fileUrl
+    // edited), re-init so the new URL takes effect.
+    if (node.type === "VideoFile" && src.fileUrl !== (node.params && node.params.fileUrl)) {
+      _ensureVideoFile(node.id, node.params || {});
       return false;
     }
     if (!src.ready || !src.videoEl || src.videoEl.readyState < 2) return false;
