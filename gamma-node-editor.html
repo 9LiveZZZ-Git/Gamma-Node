@@ -13330,22 +13330,30 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   HandLandmarker: {
     category: "AI", color: COLOR.ai, header: null,
     cppType: "",
-    kind: "ai-vision",
+    kind: "ai-vision-canvas",
     ins: [
       // No texture input -- the node manages its own camera stream
-      // internally (separate from any Webcam node). The maxHands /
-      // minConfidence params steer the detector config at init time.
+      // internally (or shares an existing Webcam node's stream
+      // automatically). maxHands / minConfidence steer the detector
+      // config at init time. bgMode toggles whether the texture output
+      // shows the camera frame underneath the landmark overlay (1) or
+      // only the overlay on a transparent background (0, for blending
+      // over a different source via BlendShader).
     ],
     outs: [
+      // v0.3.3 — texture output: camera + landmark overlay (or just
+      // overlay if bgMode=0). Wire to VisualOutput to see what the
+      // detector is seeing.
+      { n: "out",      t: "texture" },
       { n: "numHands", t: "param" },
       { n: "h1_x",     t: "param" }, { n: "h1_y",    t: "param" }, { n: "h1_z",    t: "param" },
       { n: "h1_pinch", t: "param" }, { n: "h1_open", t: "param" }, { n: "h1_rot",  t: "param" },
       { n: "h2_x",     t: "param" }, { n: "h2_y",    t: "param" }, { n: "h2_z",    t: "param" },
       { n: "h2_pinch", t: "param" }, { n: "h2_open", t: "param" }, { n: "h2_rot",  t: "param" }
     ],
-    params: { maxHands: 2, minConfidence: 0.5 },
-    methods: { maxHands: null, minConfidence: null },
-    description: "Real-time hand-landmark detection via MediaPipe (WASM-GPU). Outputs per-hand position / pinch / openness / rotation as param wires. Pinch your fingers to drive a shader speed; wave your hand to sweep a hue. First use prompts for camera permission + downloads ~8MB of model + WASM (cached after). Plugs into any shader-frag param via the wire system."
+    params: { maxHands: 2, minConfidence: 0.5, bgMode: 1, mirrored: 1, lineWidth: 2.5, dotRadius: 4 },
+    methods: { maxHands: null, minConfidence: null, bgMode: null, mirrored: null, lineWidth: null, dotRadius: null },
+    description: "Real-time hand-landmark detection via MediaPipe (WASM+GPU). Outputs (1) a texture showing the camera feed with a skeleton overlay drawn on top of it, color-coded by handedness (phosphor=left, cyan=right), and (2) per-hand position / pinch / openness / rotation as param wires. Wire `out` → VisualOutput to see what the detector sees; wire e.g. `h1_pinch` → Plasma.speed for gesture control. First use prompts for camera permission + downloads ~8MB of model + WASM (cached after). bgMode=0 makes the overlay transparent for blending over a separate source."
   },
 
   /* Gradient — 2-color linear blend along a configurable angle.
@@ -22937,18 +22945,58 @@ const _demos = [
             letter-spacing="0.12em">MEDIAPIPE</text>
     </svg>`,
     build: () => {
-      const hands = makeNode("HandLandmarker", 40, 60, { maxHands: 1, minConfidence: 0.5 });
-      const plas  = makeNode("Plasma",         320, 60, { speed: 0.3, scale: 1.0, paletteOffset: 0, audioReact: 0, bassReact: 0, clockReact: 0 });
-      const vo    = makeNode("VisualOutput",   600, 60, { display: 0 });
-      // h1_pinch is small (~0.05) when fingers touch, large (~0.25)
-      // when spread. Multiply through to a useful speed range.
+      // HandLandmarker drives Plasma params via wired-param resolver
+      // AND emits a transparent landmark-skeleton texture (bgMode:0)
+      // that BlendShader composites alpha-over the plasma background.
+      // User sees a gesture-reactive plasma WITH their hand skeleton
+      // tracked on top in real time.
+      const hands = makeNode("HandLandmarker", 40,  60, { maxHands: 1, minConfidence: 0.5, bgMode: 0, mirrored: 1 });
+      const plas  = makeNode("Plasma",         40, 240, { speed: 0.3, scale: 1.0, paletteOffset: 0, audioReact: 0, bassReact: 0, clockReact: 0 });
+      const blend = makeNode("BlendShader",   320, 150, { mode: 5, mix: 1.0 });   // alpha-over
+      const vo    = makeNode("VisualOutput",  600, 150, { display: 0 });
+      // Gesture-driven plasma params.
       state.edges.push({ from: { node: hands, port: "h1_pinch" }, to: { node: plas, port: "speed" } });
-      // Hand y position controls palette hue offset (top of frame
-      // = 0, bottom = ~6.28). Sweep hand up/down to cycle colours.
-      state.edges.push({ from: { node: hands, port: "h1_y" }, to: { node: plas, port: "paletteOffset" } });
-      // Hand openness drives "scale" -- spread fingers zooms the plasma in.
-      state.edges.push({ from: { node: hands, port: "h1_open" }, to: { node: plas, port: "scale" } });
-      state.edges.push({ from: { node: plas, port: "out" }, to: { node: vo, port: "in" } });
+      state.edges.push({ from: { node: hands, port: "h1_y" },     to: { node: plas, port: "paletteOffset" } });
+      state.edges.push({ from: { node: hands, port: "h1_open" },  to: { node: plas, port: "scale" } });
+      // Composite: Plasma fills the screen, hand-skeleton overlays
+      // (BlendShader mode 5 = alpha-over).
+      state.edges.push({ from: { node: plas,  port: "out" }, to: { node: blend, port: "inA" } });
+      state.edges.push({ from: { node: hands, port: "out" }, to: { node: blend, port: "inB" } });
+      state.edges.push({ from: { node: blend, port: "out" }, to: { node: vo,    port: "in"  } });
+    }
+  },
+
+  /* Hand Tracker — simplest possible MediaPipe demo. Wires
+   * HandLandmarker.out → VisualOutput so the user sees their
+   * camera feed with the live skeleton overlay drawn on top. No
+   * other shaders, no audio. Drop this in to confirm permissions +
+   * model download worked before building anything more complex. */
+  {
+    id: "hand-tracker",
+    name: "Hand Tracker",
+    sub: "live camera + skeleton overlay",
+    type: "visual",
+    thumb: `<svg viewBox="0 0 100 44">
+      <rect width="100" height="44" fill="rgba(0,0,0,0.85)"/>
+      <rect x="20" y="6" width="60" height="32" rx="3" fill="rgba(178,100,200,0.10)" stroke="rgba(178,100,200,0.55)" stroke-width="0.7"/>
+      <g stroke="rgba(200,232,90,0.95)" stroke-width="0.7" stroke-linecap="round" fill="rgba(200,232,90,0.95)">
+        <line x1="46" y1="32" x2="50" y2="22"/>
+        <line x1="50" y1="22" x2="44" y2="14"/>
+        <line x1="50" y1="22" x2="50" y2="12"/>
+        <line x1="50" y1="22" x2="56" y2="14"/>
+        <line x1="50" y1="22" x2="58" y2="18"/>
+        <circle cx="46" cy="32" r="1.0"/>
+        <circle cx="50" cy="22" r="0.9"/>
+        <circle cx="44" cy="14" r="0.8"/>
+        <circle cx="50" cy="12" r="0.8"/>
+        <circle cx="56" cy="14" r="0.8"/>
+        <circle cx="58" cy="18" r="0.8"/>
+      </g>
+    </svg>`,
+    build: () => {
+      const hands = makeNode("HandLandmarker", 40, 60, { maxHands: 2, minConfidence: 0.5, bgMode: 1, mirrored: 1 });
+      const vo    = makeNode("VisualOutput",   360, 60, { display: 0 });
+      state.edges.push({ from: { node: hands, port: "out" }, to: { node: vo, port: "in" } });
     }
   },
 
@@ -32859,8 +32907,17 @@ async function _ensureMediapipeCamera(entry) {
 async function _ensureHandLandmarker(nodeId, params) {
   let entry = _mediapipeNodes.get(nodeId);
   if (entry) return entry;
-  entry = { kind: "hand", detector: null, videoEl: null, stream: null,
-            latest: null, ready: false, requesting: true, error: null, rafHandle: null };
+  entry = {
+    kind: "hand", detector: null, videoEl: null, stream: null,
+    latest: null, ready: false, requesting: true, error: null, rafHandle: null,
+    // v0.3.3 — texture-output infrastructure. drawCanvas is sized to
+    // match the framebuffer so a single copyExternalImageToTexture per
+    // frame fills the assigned layer without per-pixel scaling. The
+    // detection loop draws the source video frame (scaled to canvas
+    // dims) + the landmark skeleton overlay; ai-vision-canvas render
+    // path queues the copy each frame.
+    drawCanvas: null, drawCtx: null, params: params || {}
+  };
   _mediapipeNodes.set(nodeId, entry);
   try {
     const { HandLandmarker, filesets } = await _loadMediaPipeVision();
@@ -32876,8 +32933,19 @@ async function _ensureHandLandmarker(nodeId, params) {
       minHandPresenceConfidence: 0.5,
       minTrackingConfidence: 0.5
     });
+    // Allocate the draw canvas now that we know the framebuffer size.
+    // Mirrors the editor's current render resolution so the copy
+    // queued in _encodeShaderFragPassForPlan fills the framebuffer
+    // layer 1:1 without per-pixel scaling.
+    const w = Visual.fbWidth  || 1920;
+    const h = Visual.fbHeight || 1080;
+    entry.drawCanvas = document.createElement("canvas");
+    entry.drawCanvas.width  = w;
+    entry.drawCanvas.height = h;
+    entry.drawCtx = entry.drawCanvas.getContext("2d", { alpha: true });
     entry.ready = true;
-    console.log("[handlandmarker] node " + nodeId + " ready (numHands=" + entry.detector.numHands + ")");
+    console.log("[handlandmarker] node " + nodeId + " ready (numHands=" +
+                entry.detector.numHands + ", canvas=" + w + "×" + h + ")");
     _startMediapipeLoop(nodeId);
   } catch (e) {
     console.warn("[handlandmarker] init failed for node " + nodeId + ":", e);
@@ -32886,6 +32954,99 @@ async function _ensureHandLandmarker(nodeId, params) {
     entry.requesting = false;
   }
   return entry;
+}
+
+/* MediaPipe hand-skeleton wiring per the official spec. 21 landmarks:
+ *   0 wrist
+ *   1-4   thumb (CMC, MCP, IP, TIP)
+ *   5-8   index (MCP, PIP, DIP, TIP)
+ *   9-12  middle
+ *   13-16 ring
+ *   17-20 pinky
+ * Connections walk each finger from MCP -> TIP + cross-link the MCPs. */
+const _HAND_CONNECTIONS = [
+  [0,1],[1,2],[2,3],[3,4],          // thumb
+  [0,5],[5,6],[6,7],[7,8],          // index
+  [5,9],[9,10],[10,11],[11,12],     // middle
+  [9,13],[13,14],[14,15],[15,16],   // ring
+  [13,17],[17,18],[18,19],[19,20],  // pinky
+  [0,17]                            // wrist-to-pinky-base (palm edge)
+];
+
+/* Draw the latest detection onto the entry's 2D canvas. Called from
+ * the detection rAF loop after detectForVideo. bgMode = 1 paints the
+ * source video frame first (camera + overlay); bgMode = 0 leaves the
+ * canvas transparent and only draws the skeleton (for blending the
+ * overlay over a different source via BlendShader). */
+function _drawHandLandmarkerOverlay(entry, params) {
+  const ctx = entry.drawCtx;
+  const cvs = entry.drawCanvas;
+  if (!ctx || !cvs) return;
+  const w = cvs.width, h = cvs.height;
+  const result = entry.latest;
+  const bgMode = (params && typeof params.bgMode === "number") ? params.bgMode : 1;
+  const mirrored = (params && typeof params.mirrored === "number") ? params.mirrored : 1;
+  const lineWidth = (params && typeof params.lineWidth === "number") ? params.lineWidth : 2.5;
+  const dotRadius = (params && typeof params.dotRadius === "number") ? params.dotRadius : 4;
+
+  if (bgMode === 0) {
+    ctx.clearRect(0, 0, w, h);
+  } else if (entry.videoEl && entry.videoEl.readyState >= 2) {
+    // drawImage with explicit dimensions performs bilinear scaling
+    // from the camera native (typically 1280×720) up to canvas
+    // (typically 1920×1080+). Mirror by flipping the transform.
+    ctx.save();
+    if (mirrored > 0.5) {
+      ctx.translate(w, 0);
+      ctx.scale(-1, 1);
+    }
+    ctx.drawImage(entry.videoEl, 0, 0, w, h);
+    ctx.restore();
+  } else {
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, w, h);
+  }
+  if (!result || !result.landmarks) return;
+  ctx.lineWidth = lineWidth;
+  ctx.lineCap   = "round";
+  for (let i = 0; i < result.landmarks.length; i++) {
+    const hand = result.landmarks[i];
+    if (!hand || hand.length < 21) continue;
+    const handedness = (result.handednesses && result.handednesses[i] && result.handednesses[i][0]);
+    // MediaPipe's "handedness" is from the camera's POV, so a
+    // mirrored selfie cam reports the user's RIGHT hand as Left.
+    // We swap names back in display land for intuitive "your left
+    // hand is phosphor green" UX.
+    let name = handedness ? handedness.categoryName : "Unknown";
+    if (mirrored > 0.5) name = (name === "Left" ? "Right" : (name === "Right" ? "Left" : name));
+    const color = (name === "Right") ? "rgb(131, 232, 255)"   // cyan
+                : (name === "Left")  ? "rgb(200, 232, 90)"    // phosphor green
+                : "rgb(232, 140, 60)";                         // amber fallback
+    ctx.strokeStyle = color;
+    ctx.fillStyle   = color;
+    // Skeleton lines.
+    for (let k = 0; k < _HAND_CONNECTIONS.length; k++) {
+      const [a, b] = _HAND_CONNECTIONS[k];
+      let ax = hand[a].x, bx = hand[b].x;
+      if (mirrored > 0.5) { ax = 1.0 - ax; bx = 1.0 - bx; }
+      ctx.beginPath();
+      ctx.moveTo(ax * w, hand[a].y * h);
+      ctx.lineTo(bx * w, hand[b].y * h);
+      ctx.stroke();
+    }
+    // Landmark dots. Wrist (0) bigger, fingertips bigger than knuckles.
+    for (let j = 0; j < hand.length; j++) {
+      const lm = hand[j];
+      let x = lm.x;
+      if (mirrored > 0.5) x = 1.0 - x;
+      const r = (j === 0) ? dotRadius * 1.6
+              : (j === 4 || j === 8 || j === 12 || j === 16 || j === 20) ? dotRadius * 1.2
+              : dotRadius;
+      ctx.beginPath();
+      ctx.arc(x * w, lm.y * h, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
 }
 
 /* Per-node detection rAF loop. Runs detectForVideo every frame the
@@ -32909,6 +33070,17 @@ function _startMediapipeLoop(nodeId) {
       try {
         if (e.kind === "hand") {
           e.latest = e.detector.detectForVideo(v, performance.now());
+          // v0.3.3 — also paint the visualization canvas. The render
+          // path picks it up via copyExternalImageToTexture into the
+          // assigned framebuffer / scratch layer next frame.
+          if (e.drawCanvas) {
+            // Find the live params for this node so bgMode / mirrored
+            // / line styling can change at runtime via the UI without
+            // re-initializing the detector.
+            const liveNode = state && Array.isArray(state.nodes)
+              ? state.nodes.find(n => n.id === nodeId) : null;
+            _drawHandLandmarkerOverlay(e, liveNode ? liveNode.params : e.params);
+          }
         } else if (e.kind === "pose" || e.kind === "face") {
           e.latest = e.detector.detectForVideo(v, performance.now());
         }
@@ -33882,8 +34054,19 @@ function _buildRenderPlan(visualOutputs) {
       const node = state.nodes.find(n => n.id === nodeId);
       if (!node) return;
       const def = TYPES[node.type];
-      if (!def || def.kind !== "shader-frag") return;
-      if (!(typeof def.wgsl === "string" || typeof def.wgsl === "function")) return;
+      // v0.3.3 — "ai-vision-canvas" is the second kind that participates
+      // in the visual render plan. Doesn't have a WGSL shader; instead
+      // the framework queues a copyExternalImageToTexture from a 2D
+      // canvas (where the detection loop drew video + landmark overlay)
+      // straight into the assigned framebuffer/scratch layer. The plan
+      // walker treats it like a shader-frag for layer assignment +
+      // post-order DFS scheduling, then _encodeShaderFragPassForPlan
+      // dispatches by kind at encode time.
+      if (!def) return;
+      const isShaderFrag = def.kind === "shader-frag" &&
+                           (typeof def.wgsl === "string" || typeof def.wgsl === "function");
+      const isAiCanvas   = def.kind === "ai-vision-canvas";
+      if (!isShaderFrag && !isAiCanvas) return;
 
       const planKey = node.id + "@" + vo.id;
       if (plan.has(planKey)) return;
@@ -33971,6 +34154,36 @@ function _encodeShaderFragPassForPlan(enc, entry, dtSec) {
     layerView = Visual.framebufferLayerViews[layerIdx];
   }
   if (!layerView) return false;
+
+  // v0.3.3 — ai-vision-canvas branch: bypass the shader pipeline
+  // entirely. The MediaPipe detection loop drew video + landmark
+  // overlay into entry.drawCanvas; queue a direct
+  // copyExternalImageToTexture into the assigned framebuffer / scratch
+  // layer. queue.copy* runs in submission order alongside encoder
+  // commands, so downstream composition passes in the same submit see
+  // the freshly-copied pixels.
+  if (def.kind === "ai-vision-canvas") {
+    const e = _mediapipeNodes.get(node.id);
+    if (!e) { _ensureHandLandmarker(node.id, node.params || {}); return false; }
+    if (!e.ready || !e.drawCanvas) return false;
+    const destTexture = isScratch
+      ? (writeKey === "a" ? Visual.scratchTextureA : Visual.scratchTextureB)
+      : Visual.framebuffer;
+    const cw = Math.min(e.drawCanvas.width  || 0, Visual.fbWidth);
+    const ch = Math.min(e.drawCanvas.height || 0, Visual.fbHeight);
+    if (cw === 0 || ch === 0) return false;
+    try {
+      Visual.device.queue.copyExternalImageToTexture(
+        { source: e.drawCanvas, flipY: false },
+        { texture: destTexture, origin: { x: 0, y: 0, z: layerIdx } },
+        [cw, ch, 1]
+      );
+    } catch (err) {
+      // Canvas not yet drawable (first frame race, etc). Silent skip.
+      return false;
+    }
+    return true;
+  }
 
   // Instance key — direct entries use the consumer VO id (one
   // shader instance per VO target, matching the pre-6.6.30 form).
