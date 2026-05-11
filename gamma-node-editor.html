@@ -35631,21 +35631,6 @@ function _refreshLiveControlSetters() {
   return map;
 }
 
-function _isLiveControlPortWiredToAudio(nodeId, port) {
-  if (typeof state === "undefined" || !state || !Array.isArray(state.edges) || !Array.isArray(state.nodes)) return false;
-  for (let i = 0; i < state.edges.length; i++) {
-    const e = state.edges[i];
-    if (!e || !e.from || !e.to) continue;
-    if (e.from.node !== nodeId || e.from.port !== port) continue;
-    const target = state.nodes.find(n => n.id === e.to.node);
-    if (!target) continue;
-    const def = TYPES[target.type];
-    // Has cppType → participates in audio codegen → setter exists in worklet.
-    if (def && def.cppType) return true;
-  }
-  return false;
-}
-
 function _pushLiveControlsToWorklet() {
   if (!previewState || previewState.state !== "playing" || !previewState.workletNode) return;
   if (typeof state === "undefined" || !state || !Array.isArray(state.nodes)) return;
@@ -35658,13 +35643,22 @@ function _pushLiveControlsToWorklet() {
     "h1_x", "h1_y", "h1_z", "h1_pinch", "h1_open", "h1_rot",
     "h2_x", "h2_y", "h2_z", "h2_pinch", "h2_open", "h2_rot"
   ];
+  // v0.3.8 — push EVERY live port that has a setter index in the
+  // worklet's dispatch table, regardless of whether its wire reaches
+  // a cppType node directly. The earlier "wired to audio" filter
+  // broke when the immediate downstream was a template node like
+  // Mul / Add / Tanh (cppType: "" — inlined at codegen time): the
+  // filter returned false, no setter push, gate stuck at 0, silence.
+  // Cost without the filter is ~840 msg/sec per HandLandmarker
+  // (14 ports × 60 fps), which Web Audio handles comfortably.
+  // Unused setter writes are harmless -- the C++ class member just
+  // stores the value; if nothing reads it, no audio path is affected.
   for (const node of live) {
     const innerMap = setterIndex.get(node.id);
     if (!innerMap) continue;
     for (const port of HAND_PORTS) {
       const idx = innerMap[port];
       if (typeof idx !== "number") continue;
-      if (!_isLiveControlPortWiredToAudio(node.id, port)) continue;
       const value = _handLandmarkerValue(node, port);
       previewState.workletNode.port.postMessage({ type: "set", index: idx, value: value });
     }
