@@ -6447,6 +6447,11 @@
             <span class="export-action-sub">Continuous video of the visible canvas (60 fps) via MediaRecorder, plus audio if a preview is playing. Click again to stop + download. Mirrors what an operator sees.</span>
           </button>
 
+          <button class="export-action" id="exp-rec-composite-timed">
+            <span class="export-action-name">Record composite preview → WebM (timed)</span>
+            <span class="export-action-sub">Same as above, but prompts for a duration and auto-stops + downloads after N seconds. Useful when you know the take length up front. <em>Note: this is real-time; faster-than-realtime offline render-with-visual needs a WebCodecs + container-muxing pipeline — on the roadmap.</em></span>
+          </button>
+
           <button class="export-action" id="exp-rec-perdisplay">
             <span class="export-action-name"><span>Record per-display → ZIP </span><span id="exp-rec-pd-tag" style="display:none;" class="recording-tag">REC</span></span>
             <span class="export-action-sub">N parallel MediaRecorders, one per rig display at <code id="exp-rec-pd-dims">1920×1080</code>. Each display's framebuffer layer goes to its own canvas + MediaRecorder; outputs <code>display-NN-id.webm</code> for each + <code>meta.json</code>. Audio captured per recorder if a preview is playing. Heavy GPU/memory — keep an eye on the fps readout at large rig sizes (4K × 26 = ~850 MB swapchain).</span>
@@ -6456,10 +6461,19 @@
         <!-- Audio render ----------------------------------------------- -->
         <div class="export-section">
           <div class="export-section-header">Audio render</div>
-          <button class="export-action" id="exp-audio-render">
-            <span class="export-action-name">Render audio → WAV (offline, high quality)</span>
-            <span class="export-action-sub">Runs the patch through an <code>OfflineAudioContext</code> at <code id="exp-audio-sr">48000</code> Hz × stereo, 16-bit PCM. Duration prompted on click (default 30 s, max 3600 s). Needs a compiled patch — click ▶ once first so the editor can cache the wasm.</span>
-          </button>
+          <div class="export-action" style="cursor:default;">
+            <span class="export-action-name">Offline render — high-quality, faster-than-realtime when CPU allows</span>
+            <span class="export-action-sub">Runs the patch through an <code>OfflineAudioContext</code> at <code id="exp-audio-sr">48000</code> Hz × stereo. Live runtime is 32-bit float end-to-end (Web Audio + Gamma DSP); 16/24-bit WAV options quantize from that source, 32-bit float WAV is the native source verbatim. Duration prompted on click (1–3600 s). Needs a compiled patch — click ▶ once first so the editor can cache the wasm.</span>
+          </div>
+          <div class="export-display-row">
+            <select id="exp-audio-format">
+              <option value="wav16">WAV 16-bit PCM     (lossless · CD quality · ~10 MB/min)</option>
+              <option value="wav24">WAV 24-bit PCM     (lossless · DAW-friendly · ~15 MB/min)</option>
+              <option value="wav32f">WAV 32-bit float  (archival · no clipping · ~20 MB/min · native runtime depth)</option>
+              <option value="mp3">MP3 320 kbps          (compressed · share · ~2.4 MB/min · loads lamejs from CDN)</option>
+            </select>
+            <button class="export-action" id="exp-audio-render" title="Run the offline render at the selected format + prompted duration">Render</button>
+          </div>
         </div>
 
         <!-- Rig + calibration ------------------------------------------ -->
@@ -34940,6 +34954,39 @@ async function captureAllDisplaysZip(progressFn) {
   return new Blob([zip], { type: "application/zip" });
 }
 
+/* v0.2.22 — timed composite A/V recording.
+ *
+ * The "deferred" item for offline render-with-visual mux'd into mp4
+ * would need a WebCodecs+container pipeline (VideoEncoder + a webm
+ * muxer + AudioEncoder + sync). Significant lift. The practical
+ * version that ships today: start a normal composite WebM recording
+ * (canvas.captureStream(60) + MediaRecorder, same path as the
+ * untimed toggle) but auto-stop after a user-specified duration.
+ * Output: a single .webm with audio + visual in sync, matching what
+ * the live operator would see at exactly N seconds.
+ *
+ * Different from the toggle: no need to remember to stop, no risk
+ * of grabbing the wrong moment. Plus the stop timer fires from a
+ * setTimeout so the user can cancel by clicking the button before
+ * the time runs out (which calls stopVideoCapture() and clears the
+ * timer). */
+let _timedAVTimer = null;
+async function startTimedAVRecording(durationSec) {
+  durationSec = Math.max(1, Math.min(3600, Number(durationSec) || 30));
+  startVideoCapture();
+  if (!_videoRecorder) throw new Error("captureStream / MediaRecorder unavailable");
+  if (_timedAVTimer) clearTimeout(_timedAVTimer);
+  _timedAVTimer = setTimeout(() => {
+    _timedAVTimer = null;
+    if (_videoRecorder) stopVideoCapture();
+  }, durationSec * 1000);
+  return durationSec;
+}
+function cancelTimedAVRecording() {
+  if (_timedAVTimer) { clearTimeout(_timedAVTimer); _timedAVTimer = null; }
+  if (_videoRecorder) stopVideoCapture();
+}
+
 /* =========================================================================
  * v0.2.21 — per-display video recording (.webm-per-layer, bundled in ZIP)
  *
@@ -35304,49 +35351,162 @@ async function renderOfflineAudio(durationSec) {
   return audioBuffer;
 }
 
-/* Encode an AudioBuffer to 16-bit PCM WAV. Returns a Blob ready for
- * download. Standard 44-byte RIFF/WAVE header + interleaved Int16.
- * Clamps to [-1, 1] before quantization. */
-function audioBufferToWavBlob(audioBuffer) {
-  const numChannels = audioBuffer.numberOfChannels;
-  const sampleRate  = audioBuffer.sampleRate;
-  const length      = audioBuffer.length;
-  const channelData = [];
+/* Encode an AudioBuffer to a WAV Blob. v0.2.22 — supports three
+ * common bit depths:
+ *   16    → signed PCM, 2 B/sample        (default, CD-quality, ~10 MB/min stereo @ 48kHz)
+ *   24    → signed PCM, 3 B/sample        (DAW-friendly, ~15 MB/min)
+ *   32    → IEEE float, 4 B/sample        (archival, lossless headroom, ~20 MB/min)
+ * Format code in the fmt chunk: 1 for PCM (16/24), 3 for IEEE float (32).
+ * Clamps to [-1, 1] before quantization; for 32-bit float the samples
+ * are written verbatim (no clamping; signals above 0 dBFS preserved
+ * for downstream processing). */
+function audioBufferToWavBlob(audioBuffer, bitDepth) {
+  bitDepth = (bitDepth === 24 || bitDepth === 32) ? bitDepth : 16;
+  const isFloat       = (bitDepth === 32);
+  const bytesPerSamp  = bitDepth / 8;
+  const numChannels   = audioBuffer.numberOfChannels;
+  const sampleRate    = audioBuffer.sampleRate;
+  const length        = audioBuffer.length;
+  const channelData   = [];
   for (let ch = 0; ch < numChannels; ch++) channelData.push(audioBuffer.getChannelData(ch));
-  // Interleave + quantize in one pass.
-  const samples = new Int16Array(length * numChannels);
-  for (let i = 0; i < length; i++) {
-    for (let ch = 0; ch < numChannels; ch++) {
-      let s = channelData[ch][i];
-      if (s > 1) s = 1; else if (s < -1) s = -1;
-      samples[i * numChannels + ch] = (s < 0) ? (s * 0x8000) : (s * 0x7FFF);
-    }
-  }
-  const dataBytes = samples.length * 2;
-  const buf = new ArrayBuffer(44 + dataBytes);
+  const dataBytes = length * numChannels * bytesPerSamp;
+  const buf  = new ArrayBuffer(44 + dataBytes);
   const view = new DataView(buf);
   let p = 0;
   const wstr = (s) => { for (let i = 0; i < s.length; i++) view.setUint8(p++, s.charCodeAt(i)); };
   wstr("RIFF");
-  view.setUint32(p, 36 + dataBytes, true); p += 4;
+  view.setUint32(p, 36 + dataBytes, true);                    p += 4;
   wstr("WAVE");
   wstr("fmt ");
-  view.setUint32(p, 16, true);                       p += 4;   // chunk size
-  view.setUint16(p, 1, true);                        p += 2;   // PCM format
-  view.setUint16(p, numChannels, true);              p += 2;
-  view.setUint32(p, sampleRate, true);               p += 4;
-  view.setUint32(p, sampleRate * numChannels * 2, true); p += 4; // byte rate
-  view.setUint16(p, numChannels * 2, true);          p += 2;   // block align
-  view.setUint16(p, 16, true);                       p += 2;   // bits per sample
+  view.setUint32(p, 16, true);                                p += 4;  // fmt chunk size (16 = canonical PCM/float)
+  view.setUint16(p, isFloat ? 3 : 1, true);                   p += 2;  // 1=PCM, 3=IEEE float
+  view.setUint16(p, numChannels, true);                       p += 2;
+  view.setUint32(p, sampleRate, true);                        p += 4;
+  view.setUint32(p, sampleRate * numChannels * bytesPerSamp, true); p += 4;  // byte rate
+  view.setUint16(p, numChannels * bytesPerSamp, true);        p += 2;  // block align
+  view.setUint16(p, bitDepth, true);                          p += 2;  // bits per sample
   wstr("data");
-  view.setUint32(p, dataBytes, true);                p += 4;
-  // Copy samples in. samples is Int16Array; need to respect target byte order
-  // (WAV is little-endian, JS DataView/typed arrays are little-endian on the
-  // platforms we ship on, but we go via DataView setInt16 to be portable).
-  for (let i = 0; i < samples.length; i++) {
-    view.setInt16(44 + i * 2, samples[i], true);
+  view.setUint32(p, dataBytes, true);                         p += 4;
+
+  // Write payload — bit-depth-specific.
+  let off = 44;
+  if (isFloat) {
+    // 32-bit IEEE float. No clamping -- pass-through; signal headroom
+    // above 0 dBFS preserved for archival / pre-mastering use.
+    for (let i = 0; i < length; i++) {
+      for (let ch = 0; ch < numChannels; ch++) {
+        view.setFloat32(off, channelData[ch][i], true);
+        off += 4;
+      }
+    }
+  } else if (bitDepth === 24) {
+    // 24-bit signed PCM, little-endian three-byte words. Range
+    // [-8388608, 8388607]. JS doesn't have setInt24; pack manually.
+    for (let i = 0; i < length; i++) {
+      for (let ch = 0; ch < numChannels; ch++) {
+        let s = channelData[ch][i];
+        if (s > 1) s = 1; else if (s < -1) s = -1;
+        const v = (s < 0) ? Math.round(s * 0x800000) : Math.round(s * 0x7FFFFF);
+        view.setUint8(off,     v        & 0xFF);
+        view.setUint8(off + 1, (v >> 8)  & 0xFF);
+        view.setUint8(off + 2, (v >> 16) & 0xFF);
+        off += 3;
+      }
+    }
+  } else {
+    // 16-bit signed PCM (default). Range [-32768, 32767].
+    for (let i = 0; i < length; i++) {
+      for (let ch = 0; ch < numChannels; ch++) {
+        let s = channelData[ch][i];
+        if (s > 1) s = 1; else if (s < -1) s = -1;
+        const v = (s < 0) ? Math.round(s * 0x8000) : Math.round(s * 0x7FFF);
+        view.setInt16(off, v, true);
+        off += 2;
+      }
+    }
   }
   return new Blob([buf], { type: "audio/wav" });
+}
+
+/* v0.2.22 — MP3 export via lamejs (loaded from CDN on first use).
+ *
+ * Dynamic-import pattern mirrors the AI panel: don't load the library
+ * unless the user asks for MP3. ~270 KB total (lame.min.js), cached
+ * by the browser after first fetch.
+ *
+ * Encoding: float32 -> int16 -> Mp3Encoder.encodeBuffer in 1152-sample
+ * (MP3 frame-size) chunks. Mono and stereo both supported; lamejs's
+ * encoder takes (left, right) for stereo or just (mono) for mono. */
+let _lamejsLoadPromise = null;
+function _loadLamejs() {
+  if (typeof globalThis.lamejs !== "undefined") return Promise.resolve(globalThis.lamejs);
+  if (_lamejsLoadPromise) return _lamejsLoadPromise;
+  // Pinned UMD bundle; the JsDelivr mirror is heavily cached. Falls
+  // back to unpkg if the first host fails.
+  const urls = [
+    "https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js",
+    "https://unpkg.com/lamejs@1.2.1/lame.min.js"
+  ];
+  _lamejsLoadPromise = (async () => {
+    for (const url of urls) {
+      try {
+        await new Promise((resolve, reject) => {
+          const s = document.createElement("script");
+          s.src = url;
+          s.async = true;
+          s.onload  = () => resolve();
+          s.onerror = () => reject(new Error("script load failed: " + url));
+          document.head.appendChild(s);
+        });
+        if (typeof globalThis.lamejs !== "undefined") return globalThis.lamejs;
+      } catch (e) {
+        console.warn("[mp3] lamejs CDN attempt failed:", e);
+      }
+    }
+    throw new Error("Could not load lamejs from any CDN (jsdelivr / unpkg)");
+  })();
+  return _lamejsLoadPromise;
+}
+
+async function audioBufferToMp3Blob(audioBuffer, bitrateKbps) {
+  const lib = await _loadLamejs();
+  bitrateKbps = Math.max(64, Math.min(320, bitrateKbps || 320));
+  const numChannels = audioBuffer.numberOfChannels;
+  const sampleRate  = audioBuffer.sampleRate;
+  const length      = audioBuffer.length;
+  const Mp3Encoder  = lib.Mp3Encoder;
+  if (!Mp3Encoder) throw new Error("lamejs.Mp3Encoder missing — wrong build");
+  const enc = new Mp3Encoder(numChannels, sampleRate, bitrateKbps);
+  const dataL = audioBuffer.getChannelData(0);
+  const dataR = numChannels > 1 ? audioBuffer.getChannelData(1) : null;
+  // MP3 frame size is 1152 samples. Encode in chunks of that to keep
+  // the encoder's internal buffers small + flush smoothly at the end.
+  const CHUNK = 1152;
+  const chunks = [];
+  const toI16 = (buf, start, end) => {
+    const out = new Int16Array(end - start);
+    for (let i = start; i < end; i++) {
+      let s = buf[i];
+      if (s > 1) s = 1; else if (s < -1) s = -1;
+      out[i - start] = (s < 0) ? Math.round(s * 0x8000) : Math.round(s * 0x7FFF);
+    }
+    return out;
+  };
+  for (let i = 0; i < length; i += CHUNK) {
+    const end = Math.min(i + CHUNK, length);
+    const L = toI16(dataL, i, end);
+    let mp3buf;
+    if (dataR) {
+      const R = toI16(dataR, i, end);
+      mp3buf = enc.encodeBuffer(L, R);
+    } else {
+      mp3buf = enc.encodeBuffer(L);
+    }
+    if (mp3buf && mp3buf.length > 0) chunks.push(new Uint8Array(mp3buf));
+  }
+  const tail = enc.flush();
+  if (tail && tail.length > 0) chunks.push(new Uint8Array(tail));
+  return new Blob(chunks, { type: "audio/mpeg" });
 }
 
 /* =========================================================================
@@ -42538,33 +42698,74 @@ ensureGPUDevice();
     });
   }
 
-  // -- Audio render → WAV (offline) --
-  const audioBtn = document.getElementById("exp-audio-render");
+  // -- Audio render → WAV/MP3 (offline) — format selected via dropdown --
+  const audioBtn  = document.getElementById("exp-audio-render");
+  const audioFmt  = document.getElementById("exp-audio-format");
   if (audioBtn) {
     audioBtn.addEventListener("click", async () => {
+      const fmt = (audioFmt && audioFmt.value) || "wav16";
+      const fmtLabels = {
+        wav16:  { ext: "wav", label: "WAV 16-bit PCM",   bitDepth: 16 },
+        wav24:  { ext: "wav", label: "WAV 24-bit PCM",   bitDepth: 24 },
+        wav32f: { ext: "wav", label: "WAV 32-bit float", bitDepth: 32 },
+        mp3:    { ext: "mp3", label: "MP3 320 kbps",     bitrate: 320 }
+      };
+      const info = fmtLabels[fmt] || fmtLabels.wav16;
       const defaultDuration = 30;
       const answer = window.prompt("Render duration in seconds (1–3600):", String(defaultDuration));
       if (answer == null) return;   // user cancelled
       const duration = Math.max(1, Math.min(3600, parseFloat(answer) || defaultDuration));
       audioBtn.disabled = true;
-      const orig = audioBtn.querySelector(".export-action-name").textContent;
+      const orig = audioBtn.textContent;
+      audioBtn.textContent = "…";
       try {
-        audioBtn.querySelector(".export-action-name").textContent = "Rendering " + duration + " s offline…";
-        _setExportStatus("Rendering audio (" + duration + " s)…");
+        _setExportStatus("Rendering " + duration + " s through OfflineAudioContext…");
         const audioBuf = await renderOfflineAudio(duration);
-        _setExportStatus("Encoding WAV…");
-        const blob = audioBufferToWavBlob(audioBuf);
+        let blob;
+        if (fmt === "mp3") {
+          _setExportStatus("Loading lamejs + encoding MP3…");
+          blob = await audioBufferToMp3Blob(audioBuf, info.bitrate);
+        } else {
+          _setExportStatus("Encoding " + info.label + "…");
+          blob = audioBufferToWavBlob(audioBuf, info.bitDepth);
+        }
         const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
         const className = ((state && state.patchName) || "MyPatch").replace(/[^A-Za-z0-9_]/g, "") || "MyPatch";
-        _downloadBlob(blob, "gamma-render-" + className + "-" + stamp + ".wav");
-        _setExportStatus("Saved WAV (" + duration + " s × " + audioBuf.numberOfChannels + "ch × " +
-          audioBuf.sampleRate + " Hz)", "success");
+        const tag = fmt === "wav16"  ? "16bit"
+                  : fmt === "wav24"  ? "24bit"
+                  : fmt === "wav32f" ? "32bitf"
+                  : "320k";
+        _downloadBlob(blob, "gamma-render-" + className + "-" + tag + "-" + stamp + "." + info.ext);
+        _setExportStatus("Saved " + info.label + " (" + duration + " s × " +
+          audioBuf.numberOfChannels + "ch × " + audioBuf.sampleRate + " Hz, " +
+          (blob.size / (1024 * 1024)).toFixed(1) + " MB)", "success");
       } catch (e) {
         console.warn("[export] audio render failed:", e);
-        _setExportStatus("Audio render failed: " + (e && e.message || e), "error");
+        _setExportStatus(info.label + " render failed: " + (e && e.message || e), "error");
       } finally {
         audioBtn.disabled = false;
-        audioBtn.querySelector(".export-action-name").textContent = orig;
+        audioBtn.textContent = orig;
+      }
+    });
+  }
+
+  // -- Timed composite A/V recording (auto-stops after N seconds) --
+  const timedRecBtn = document.getElementById("exp-rec-composite-timed");
+  if (timedRecBtn) {
+    timedRecBtn.addEventListener("click", async () => {
+      if (_videoRecorder) {
+        _setExportStatus("Composite recording already running — stop it first", "error");
+        return;
+      }
+      const answer = window.prompt("Duration in seconds (1–3600):", "30");
+      if (answer == null) return;
+      const duration = Math.max(1, Math.min(3600, parseFloat(answer) || 30));
+      try {
+        await startTimedAVRecording(duration);
+        _setExportStatus("Recording " + duration + " s — will auto-stop + download", "success");
+      } catch (e) {
+        console.warn("[export] timed A/V record failed:", e);
+        _setExportStatus("Timed recording failed: " + (e && e.message || e), "error");
       }
     });
   }
