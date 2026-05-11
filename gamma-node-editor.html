@@ -35622,10 +35622,28 @@ async function exportStandaloneHtml(options) {
   // render paths (cloned via slice() BEFORE the postMessage transfer
   // -- see the two "previewState.lastWasm = wasmBytes.slice(0)" lines
   // in previewCompileAndPlay).
+  //
+  // v0.2.25 — if no cached wasm, auto-compile now. Saves the user
+  // a manual "click ▶, then click Export" two-step. Uses the same
+  // local-cli / Wasmer SDK pipeline as the realtime play path. We
+  // report progress through the standalone-button's nameEl + the
+  // modal status line via the caller's progress callback below.
   if (viewerMode && bundleWasm) {
-    if (!previewState || !previewState.lastWasm ||
-        previewState.lastWasm.byteLength === 0) {
-      throw new Error("Standalone viewer needs a compiled patch wasm. Click ▶ once to compile, then try again.");
+    const cached = previewState && previewState.lastWasm && previewState.lastWasm.byteLength;
+    if (!cached) {
+      try {
+        const progress = typeof options.progress === "function" ? options.progress : null;
+        if (progress) progress("No cached wasm — compiling patch first…");
+        const bytes = await compilePatchForExport(progress);
+        if (!bytes || bytes.byteLength === 0) {
+          throw new Error("Compile returned empty wasm");
+        }
+        // Cache for future exports + any subsequent ▶ click.
+        previewState.lastWasm = bytes.slice(0);
+      } catch (e) {
+        throw new Error("Auto-compile for viewer failed: " + (e && e.message || e) +
+          ". Start gamma-compile-server or click ▶ first to compile, then retry Export.");
+      }
     }
   }
 
@@ -37536,6 +37554,77 @@ async function compileViaLocalServer(wrapped, smokeTest) {
   // Error path: server returns JSON with { error, stderr }.
   const body = await res.json().catch(() => ({}));
   throw Object.assign(new Error(body.error || ("local-cli HTTP " + res.status)), { stderr: body.stderr || "" });
+}
+
+/* v0.2.25 — compile-only path for export.
+ *
+ * The standalone-viewer export needs the patch's compiled wasm but
+ * shouldn't have a side effect of starting playback. previewCompileAndPlay()
+ * does both; this entry point runs just the compile half and returns
+ * the wasm ArrayBuffer. Uses the same local-server-first / Wasmer-SDK-
+ * fallback pipeline. Throws on codegen errors (cycle without Delay1)
+ * or compile failures (clang stderr surfaced through the error message).
+ *
+ * progressFn optional: (msg, kind) => void for status updates so the
+ * Export modal can show "compiling via local-cli…" / "compiling via
+ * Wasmer…" etc. without cross-wiring into the toolbar pill. */
+async function compilePatchForExport(progressFn) {
+  const note = (msg) => { if (typeof progressFn === "function") try { progressFn(msg); } catch (_) {} };
+  note("Codegen…");
+  let patchCpp;
+  try {
+    patchCpp = generateCode();
+  } catch (e) {
+    throw new Error("Codegen failed: " + e.message);
+  }
+  if (patchCpp.startsWith("// ❌")) {
+    throw new Error("Patch has a cycle without Delay1 — fix the canvas warning before exporting");
+  }
+  const className = (state.patchName || "MyPatch").replace(/[^A-Za-z0-9_]/g, "");
+  const wrapped = wrapForPreview(patchCpp, className);
+  previewState.lastWrapped = wrapped;
+
+  // 1. Try the local compile-server first (fast, full-fidelity).
+  const useLocal = await probeLocalServer();
+  if (useLocal) {
+    note("Compiling via local-cli…");
+    const { wasmBytes } = await compileViaLocalServer(wrapped, false);
+    return wasmBytes;
+  }
+
+  // 2. Fall back to the Wasmer SDK worker. Slower; may OOM on large
+  //    patches per the README. Worker lives on previewState.worker.
+  note("Initializing Wasmer compile worker…");
+  try {
+    await ensureCompileWorker();
+  } catch (e) {
+    throw new Error("Compile worker init failed: " + e.message + ". Start the gamma-compile-server daemon or check internet for the Wasmer SDK CDN.");
+  }
+  note("Compiling via Wasmer (browser)…");
+  return new Promise((resolve, reject) => {
+    const onReply = (ev) => {
+      const m = ev.data;
+      if (!m) return;
+      if (m.type === "progress" && m.stage) {
+        note("Compiling… " + m.stage);
+      } else if (m.type === "compiled") {
+        previewState.worker.removeEventListener("message", onReply);
+        const bytes = m.wasmBytes instanceof ArrayBuffer ? m.wasmBytes : m.wasmBytes.buffer;
+        resolve(bytes);
+      } else if (m.type === "compile-error") {
+        previewState.worker.removeEventListener("message", onReply);
+        reject(Object.assign(new Error(m.error || "compile failed"),
+                             { stderr: m.stderr || "" }));
+      }
+    };
+    previewState.worker.addEventListener("message", onReply);
+    previewState.worker.postMessage({
+      type: "compile",
+      wrappedSrc: wrapped,
+      archiveUrl: new URL(PREVIEW.gammaArchiveUrl, location.href).toString(),
+      sdkUrl: PREVIEW.wasmerSdkUrl
+    });
+  });
 }
 
 /* ------------- Compile + load + play orchestration ------------- */
@@ -42896,7 +42985,11 @@ ensureGPUDevice();
         const viewerBox = document.getElementById("exp-standalone-viewer");
         const autoLiveMode = !!(liveBox && liveBox.checked);
         const viewerMode   = !!(viewerBox && viewerBox.checked);
-        const out = await exportStandaloneHtml({ autoLiveMode, viewerMode });
+        // Forward compile-progress to the modal status line so the
+        // user sees what's happening during the (potentially long)
+        // first-time compile from a freshly-loaded patch.
+        const progress = (msg) => _setExportStatus(msg);
+        const out = await exportStandaloneHtml({ autoLiveMode, viewerMode, progress });
         _downloadBlob(new Blob([out.html], { type: "text/html" }), out.filename);
         const mb = (out.size / (1024 * 1024)).toFixed(2);
         const wasmLine = out.viewerMode && out.wasmKb
