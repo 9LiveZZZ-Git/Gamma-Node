@@ -13052,10 +13052,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     ins:  [
       { n: "speed",         t: "param" },
       { n: "scale",         t: "param" },
-      { n: "paletteOffset", t: "param" }
+      { n: "paletteOffset", t: "param" },
+      // Phase 6.5.2 — audio reactivity. 0 = legacy time-only animation,
+      // larger values multiply the SAB master-peak slot into the
+      // speed term, so audio pulses make the plasma swirl faster.
+      { n: "audioReact",    t: "param" }
     ],
     outs: [{ n: "out", t: "texture" }],
-    params: { speed: 1.0, scale: 1.0, paletteOffset: 0.0 },
+    params: { speed: 1.0, scale: 1.0, paletteOffset: 0.0, audioReact: 0.0 },
     methods: {},
     uniformBytes: 80,
     wgsl:
@@ -13066,9 +13070,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   _pad0:        vec2f,
   u_view:       vec4f,
   u_world_uv:   vec4f,
-  params:       vec4f,    // x=speed, y=scale, z=paletteOffset, w=_
+  params:       vec4f,    // x=speed, y=scale, z=paletteOffset, w=audioReact
 };
 @group(0) @binding(0) var<uniform> u: U;
+
+// Phase 6.5.2 — audio uniform. Slot 0 currently mirrors the worklet's
+// master output peak (max |L|, |R| over the latest quantum, 0..1).
+// Slots 1-15 reserved for future EnvFollow / Clock / per-band FFT
+// bridge nodes (Phase 6.5.3+).
+struct AudioU { values: array<vec4<f32>, 4> };
+@group(0) @binding(3) var<uniform> u_audio: AudioU;
 
 struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
 
@@ -13086,7 +13097,12 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
 fn fs_main(in: VsOut) -> @location(0) vec4f {
   let world_uv = mix(u.u_world_uv.xy, u.u_world_uv.zw, in.uv);
   let p = (world_uv - vec2f(0.5)) * u.params.y * 8.0;
-  let t = u.u_time * u.params.x;
+  // params.w = audioReact (0..N). Multiplied into the master-peak
+  // bridge slot so the user can scale how much audio drives the
+  // animation. 0 = pure time-based (legacy behavior), 1 = peak
+  // adds 1× to base speed, 2 = doubles it, etc.
+  let peak_speed = u.params.w * u_audio.values[0].x;
+  let t = u.u_time * (u.params.x + peak_speed);
   var v: f32 = 0.0;
   v = v + sin(p.x * 1.5 + t);
   v = v + sin(p.y * 1.5 + t * 1.3);
@@ -13104,9 +13120,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       scratch[16] = (typeof p.speed         === "number") ? p.speed         : 1.0;
       scratch[17] = (typeof p.scale         === "number") ? p.scale         : 1.0;
       scratch[18] = (typeof p.paletteOffset === "number") ? p.paletteOffset : 0.0;
-      scratch[19] = 0;
+      scratch[19] = (typeof p.audioReact    === "number") ? p.audioReact    : 0.0;
     },
-    description: "Plasma — classic demoscene 4-sinusoid color ripple. Animates with u_time × speed; scale controls wavelength; paletteOffset rotates the hue mapping. Wire into VisualOutput. Looks great with Audio-reactivity bridge feeding speed off a clock."
+    description: "Plasma — classic demoscene 4-sinusoid color ripple. Animates with u_time × speed; scale controls wavelength; paletteOffset rotates the hue mapping. audioReact (Phase 6.5.2): how much the audio output master peak modulates the animation speed (0 = pure time, 1 = peak doubles speed at full-scale audio, etc.). Wire into VisualOutput; play any patch to see the plasma pulse with audio."
   },
 
   /* Phase 6.4 — Checkerboard. Two-color N×N grid. Used for
@@ -29281,6 +29297,25 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     size: RIG_MAX_DISPLAYS * 16,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
   });
+  // Phase 6.5.2 — global audio uniform buffer. 16 scalar slots
+  // mirroring the SAB's scalar section. Bound at @binding(3) in
+  // every shader-frag bind layout (standard / feedback / composition)
+  // so any shader-frag WGSL can declare:
+  //   struct AudioU { values: array<vec4f, 4> };
+  //   @group(0) @binding(3) var<uniform> u_audio: AudioU;
+  // and read scalars as u_audio.values[i/4][i%4]. Per-frame copy
+  // from SAB happens in renderVisualFrame() right before encoding
+  // shader passes (see _writeAudioUniform).
+  // 64 B = 16 × f32 = 4 × vec4f (vec4f alignment is mandatory in
+  // uniform-buffer arrays).
+  Visual.audioUniformBuffer = Visual.device.createBuffer({
+    label: "audio-uniform",
+    size: 64,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+  });
+  // Reusable scratch for the per-frame copy. Avoids a Float32Array
+  // alloc each frame; we just memcpy from SAB then writeBuffer.
+  Visual.audioUniformScratch = new Float32Array(16);
 }
 
 /* ----- Phase 6.6.4 — calibration warp pipeline ------------------------ */
@@ -30856,12 +30891,41 @@ function _fnv1a(s) {
  * Composition nodes in 6.4.x that consume input textures will need a
  * different layout (texture + sampler + uniform); they'll define
  * their own cache keys to avoid colliding with this one. */
+/* Phase 6.5.2 — read the SAB's 16 scalar slots into the global GPU
+ * audio uniform buffer. Runs once per frame from renderVisualFrame().
+ * Cheap (one writeBuffer of 64 B); always runs when device + buffer
+ * exist, even if no shader reads u_audio. Shaders that don't declare
+ * @binding(3) in WGSL just ignore the bound buffer. */
+function _writeAudioUniform() {
+  if (!Visual.device || !Visual.audioUniformBuffer || !Visual.audioUniformScratch) return;
+  if (audioBridge.available) {
+    // Copy scalar section into the scratch we own; we can't pass an
+    // SAB-backed Float32Array directly to writeBuffer in some browsers.
+    for (let i = 0; i < 16; i++) {
+      Visual.audioUniformScratch[i] = audioBridge.floats[AUDIO_BRIDGE_SCALAR_BASE + i];
+    }
+  } else {
+    // Bridge unavailable -> zero out so shaders behave deterministically.
+    for (let i = 0; i < 16; i++) Visual.audioUniformScratch[i] = 0;
+  }
+  Visual.device.queue.writeBuffer(
+    Visual.audioUniformBuffer, 0,
+    Visual.audioUniformScratch.buffer,
+    Visual.audioUniformScratch.byteOffset,
+    Visual.audioUniformScratch.byteLength
+  );
+}
+
 function _ensureStandardShaderLayout() {
   if (Visual.standardShaderBgl) return;
   Visual.standardShaderBgl = Visual.device.createBindGroupLayout({
     label: "shader-frag-standard-bgl",
     entries: [
-      { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } }
+      { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+      // Phase 6.5.2 — audio uniform always bound. Shaders that don't
+      // declare it in WGSL just ignore it (WebGPU treats extra bind
+      // layout entries as harmless when the shader doesn't sample).
+      { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } }
     ]
   });
   Visual.standardShaderPipelineLayout = Visual.device.createPipelineLayout({
@@ -30883,7 +30947,10 @@ function _ensureFeedbackShaderLayout() {
     entries: [
       { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
       { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d-array" } },
-      { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } }
+      { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+      // Phase 6.5.2 — audio uniform at binding 3 (same convention
+      // as standard / composition layouts).
+      { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } }
     ]
   });
   Visual.feedbackShaderPipelineLayout = Visual.device.createPipelineLayout({
@@ -30910,7 +30977,9 @@ function _ensureCompositionShaderLayout() {
     entries: [
       { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
       { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d-array" } },
-      { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } }
+      { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+      // Phase 6.5.2 — audio uniform at binding 3.
+      { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } }
     ]
   });
   Visual.compositionShaderPipelineLayout = Visual.device.createPipelineLayout({
@@ -31035,6 +31104,11 @@ function _ensureShaderInstance(nodeId, def, srcNode) {
       size:  bytes,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
     });
+    // Phase 6.5.2 — audio uniform buffer is bound at binding 3 in all
+    // three layouts. Provide the same buffer regardless of bind layout.
+    const audioBuf = Visual.audioUniformBuffer
+      ? { binding: 3, resource: { buffer: Visual.audioUniformBuffer } }
+      : null;
     let bg;
     if (bindLayout === "feedback" && feedbackView && samplerRef) {
       bg = Visual.device.createBindGroup({
@@ -31043,8 +31117,9 @@ function _ensureShaderInstance(nodeId, def, srcNode) {
         entries: [
           { binding: 0, resource: { buffer: buf } },
           { binding: 1, resource: feedbackView },
-          { binding: 2, resource: samplerRef }
-        ]
+          { binding: 2, resource: samplerRef },
+          audioBuf
+        ].filter(Boolean)
       });
     } else if (bindLayout === "composition" && compositionView && samplerRef) {
       bg = Visual.device.createBindGroup({
@@ -31053,14 +31128,18 @@ function _ensureShaderInstance(nodeId, def, srcNode) {
         entries: [
           { binding: 0, resource: { buffer: buf } },
           { binding: 1, resource: compositionView },
-          { binding: 2, resource: samplerRef }
-        ]
+          { binding: 2, resource: samplerRef },
+          audioBuf
+        ].filter(Boolean)
       });
     } else {
       bg = Visual.device.createBindGroup({
         label: "shader-frag-bg-" + nodeId,
         layout: Visual.standardShaderBgl,
-        entries: [{ binding: 0, resource: { buffer: buf } }]
+        entries: [
+          { binding: 0, resource: { buffer: buf } },
+          audioBuf
+        ].filter(Boolean)
       });
     }
     inst = {
@@ -33026,6 +33105,12 @@ function renderVisualFrame() {
   const now = performance.now();
   const dtSec = Visual.lastFrameT > 0 ? (now - Visual.lastFrameT) * 0.001 : 0;
   Visual.lastFrameT = now;
+
+  // Phase 6.5.2 — copy SAB scalar slots into the global audio
+  // uniform buffer ONCE per frame. Cheap (16 f32 = 64 B writeBuffer)
+  // so we always do it; shaders that don't read u_audio just ignore
+  // the bound buffer. Reads are tear-free at 32-bit alignment.
+  _writeAudioUniform();
 
   const enc = Visual.device.createCommandEncoder({ label: "visual-frame" });
 
