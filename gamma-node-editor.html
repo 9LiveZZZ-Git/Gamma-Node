@@ -13344,8 +13344,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
      * detection result into its slot; operator()() returns the
      * whole struct so downstream nodes can read individual fields
      * via the codegen's outs[].access pattern. No per-sample work
-     * inside the class -- pure storage. */
-    float v_[13] = {0};
+     * inside the class -- pure storage.
+     *
+     * v0.3.7 — added "present" (0 or 1) at slot 13 as a clean binary
+     * gate: 1 when any hand is detected, 0 otherwise. The h1_open
+     * gate from v0.3.6 dropped to zero on a closed fist even with
+     * the hand clearly tracked, so it wasn't a reliable "is anything
+     * there" trigger -- "present" fixes that. */
+    float v_[14] = {0};
 public:
     void setNumHands(float v) { v_[0]  = v; }
     void setH1X(float v)      { v_[1]  = v; }
@@ -13360,13 +13366,14 @@ public:
     void setH2Pinch(float v)  { v_[10] = v; }
     void setH2Open(float v)   { v_[11] = v; }
     void setH2Rot(float v)    { v_[12] = v; }
+    void setPresent(float v)  { v_[13] = v; }
     struct Out {
         float numHands, h1_x, h1_y, h1_z, h1_pinch, h1_open, h1_rot,
-              h2_x, h2_y, h2_z, h2_pinch, h2_open, h2_rot;
+              h2_x, h2_y, h2_z, h2_pinch, h2_open, h2_rot, present;
     };
     Out operator()() {
-        return { v_[0], v_[1], v_[2], v_[3], v_[4], v_[5], v_[6],
-                 v_[7], v_[8], v_[9], v_[10], v_[11], v_[12] };
+        return { v_[0],  v_[1],  v_[2],  v_[3],  v_[4],  v_[5],  v_[6],
+                 v_[7],  v_[8],  v_[9],  v_[10], v_[11], v_[12], v_[13] };
     }
 };`,
     kind: "ai-vision-canvas",
@@ -13375,6 +13382,11 @@ public:
       { n: "out",      t: "texture" },
       // Multi-output struct fields — codegen reads ".field" off the
       // operator()() return value for each downstream sample.
+      // v0.3.7 — "present" is a binary 0/1 gate (1 when any hand is
+      // detected, 0 otherwise). Use this when you want a clean
+      // "tracking is alive" trigger that doesn't depend on gesture
+      // pose -- closed fist still reads as 1.
+      { n: "present",  t: "param", access: ".present" },
       { n: "numHands", t: "param", access: ".numHands" },
       { n: "h1_x",     t: "param", access: ".h1_x" },
       { n: "h1_y",     t: "param", access: ".h1_y" },
@@ -13396,7 +13408,7 @@ public:
       lineWidth: 2.5, dotRadius: 4,
       // Live param values (JS-driven; auto-exposed as setters so the
       // worklet can receive them per frame via postMessage).
-      numHands: 0,
+      present: 0, numHands: 0,
       h1_x: 0,     h1_y: 0,     h1_z: 0,
       h1_pinch: 0, h1_open: 0,  h1_rot: 0,
       h2_x: 0,     h2_y: 0,     h2_z: 0,
@@ -13405,6 +13417,7 @@ public:
     methods: {
       maxHands: null, minConfidence: null, bgMode: null, mirrored: null,
       lineWidth: null, dotRadius: null,
+      present: "setPresent",
       numHands: "setNumHands",
       h1_x: "setH1X", h1_y: "setH1Y", h1_z: "setH1Z",
       h1_pinch: "setH1Pinch", h1_open: "setH1Open", h1_rot: "setH1Rot",
@@ -13416,9 +13429,9 @@ public:
     uiOnlyParams: ["maxHands", "minConfidence", "bgMode", "mirrored", "lineWidth", "dotRadius"],
     // Auto-expose every live-value port so the audio worklet receives
     // them via the standard setter dispatch table -- same path Slider
-    // uses, just 13 setters per HandLandmarker instead of 1.
+    // uses.
     autoExpose: [
-      "numHands",
+      "present", "numHands",
       "h1_x", "h1_y", "h1_z", "h1_pinch", "h1_open", "h1_rot",
       "h2_x", "h2_y", "h2_z", "h2_pinch", "h2_open", "h2_rot"
     ],
@@ -23099,9 +23112,8 @@ const _demos = [
       state.edges.push({ from: { node: mulF,  port: "out"     }, to: { node: addF, port: "a" } });
       state.edges.push({ from: { node: addF,  port: "out"     }, to: { node: sine, port: "freq" } });
 
-      // h1_y (0=top, 1=bottom) → BiquadLP cutoff. We want hand UP = bright,
-      // hand DOWN = closed, so invert via (1 - y). Cheapest mapping: Mul -1
-      // then Add 1 → range 0..1; another Mul 8000 + Add 200 → 200..8200 Hz.
+      // h1_y (0=top, 1=bottom) → BiquadLP cutoff. Hand UP = bright,
+      // hand DOWN = closed. Invert via (1 - y), then map 0..1 → 200..8200 Hz.
       const inv   = makeNode("Mul",      40, 380, { b: -1 });
       const inv2  = makeNode("Add",     220, 380, { b: 1 });
       const mulC  = makeNode("Mul",     400, 380, { b: 8000 });
@@ -23111,15 +23123,20 @@ const _demos = [
       state.edges.push({ from: { node: inv2,  port: "out" }, to: { node: mulC, port: "a" } });
       state.edges.push({ from: { node: mulC,  port: "out" }, to: { node: addC, port: "a" } });
 
-      // h1_open (0=fist, 1=spread) gates amplitude via a final Mul.
+      // v0.3.7 — presence-gated amplitude. HandLandmarker.present is
+      // 1 when any hand is tracked, 0 otherwise. Multiply through a
+      // 0.5 scale so the gated tone sits at a comfortable level
+      // (Sine is ±1 peak; ×0.5 → ±0.5 → ~ -6 dBFS).
       const filt = makeNode("BiquadLP", 760, 240, { cutoff: 1200, q: 1.4 });
+      const lvl  = makeNode("Mul",      940, 380, { b: 0.5 });
       const amp  = makeNode("Mul",      940, 240);
       const out  = makeNode("Output",  1120, 240);
-      state.edges.push({ from: { node: sine, port: "out" }, to: { node: filt, port: "in" } });
-      state.edges.push({ from: { node: addC, port: "out" }, to: { node: filt, port: "cutoff" } });
-      state.edges.push({ from: { node: filt, port: "out" }, to: { node: amp,  port: "a" } });
-      state.edges.push({ from: { node: hands, port: "h1_open" }, to: { node: amp,  port: "b" } });
-      state.edges.push({ from: { node: amp,  port: "out" }, to: { node: out,  port: "L" } });
+      state.edges.push({ from: { node: sine, port: "out"     }, to: { node: filt, port: "in"     } });
+      state.edges.push({ from: { node: addC, port: "out"     }, to: { node: filt, port: "cutoff" } });
+      state.edges.push({ from: { node: filt, port: "out"     }, to: { node: amp,  port: "a"      } });
+      state.edges.push({ from: { node: hands, port: "present" }, to: { node: lvl,  port: "a"     } });
+      state.edges.push({ from: { node: lvl,  port: "out"     }, to: { node: amp,  port: "b"      } });
+      state.edges.push({ from: { node: amp,  port: "out"     }, to: { node: out,  port: "L"      } });
     }
   },
 
@@ -33266,6 +33283,10 @@ function _handLandmarkerValue(node, portName) {
   }
   if (!entry.ready || !entry.latest) return 0;
   const hands = entry.latest.landmarks || [];
+  // v0.3.7 — binary "is anything being tracked" gate. Useful for
+  // triggering a synth on as soon as a hand enters the camera and
+  // muting it when the hand leaves, regardless of gesture pose.
+  if (portName === "present")  return hands.length > 0 ? 1 : 0;
   if (portName === "numHands") return hands.length;
   const m = portName.match(/^h(\d+)_(.+)$/);
   if (!m) return 0;
@@ -35633,7 +35654,7 @@ function _pushLiveControlsToWorklet() {
   if (live.length === 0) return;
   const setterIndex = _refreshLiveControlSetters();
   const HAND_PORTS = [
-    "numHands",
+    "present", "numHands",
     "h1_x", "h1_y", "h1_z", "h1_pinch", "h1_open", "h1_rot",
     "h2_x", "h2_y", "h2_z", "h2_pinch", "h2_open", "h2_rot"
   ];
