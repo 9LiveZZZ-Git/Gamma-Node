@@ -33641,7 +33641,12 @@ function _findUpstreamVideoSource(nodeId) {
     if (src && src.ready && src.videoEl && src.videoEl.readyState >= 2) {
       return { kind: "video", videoEl: src.videoEl, srcNodeId: srcNode.id };
     }
-    return null;
+    // v0.3.13 — wire exists but the upstream video element isn't
+    // decoded yet (VideoFile still loading, Webcam permission still
+    // pending). Return "pending" so the caller knows to WAIT instead
+    // of falling back to own getUserMedia. The detection loop retries
+    // each tick until the upstream is ready.
+    return { kind: "pending", srcNodeId: srcNode.id, srcType: srcNode.type };
   }
   return { kind: "texture", srcNodeId: srcNode.id, srcType: srcNode.type };
 }
@@ -33746,26 +33751,11 @@ async function _ensureMediapipeSource(nodeId, entry) {
     entry.videoEl         = upstream.videoEl;
     entry.sharedVideoEl   = true;
     entry.useTextureSource = false;
+    entry.upstreamNodeId  = upstream.srcNodeId;
     return upstream.videoEl;
   }
   if (upstream && upstream.kind === "texture") {
-    // Texture-source path: allocate a WebGPU-context'd canvas that the
-    // render loop fills with the upstream layer's content each frame.
-    // MediaPipe's detectForVideo accepts HTMLCanvasElement directly,
-    // so we pass this canvas instead of a videoEl.
-    const w = Visual.fbWidth  || 1920;
-    const h = Visual.fbHeight || 1080;
-    entry.gpuInputCanvas = document.createElement("canvas");
-    entry.gpuInputCanvas.width  = w;
-    entry.gpuInputCanvas.height = h;
-    entry.gpuInputCtx = entry.gpuInputCanvas.getContext("webgpu");
-    if (entry.gpuInputCtx && Visual.device) {
-      entry.gpuInputCtx.configure({
-        device: Visual.device,
-        format: Visual.presentationFormat,
-        alphaMode: "premultiplied"
-      });
-    }
+    _allocateGpuInputCanvas(entry);
     entry.useTextureSource = true;
     entry.upstreamNodeId   = upstream.srcNodeId;
     entry.sharedVideoEl    = false;
@@ -33774,11 +33764,50 @@ async function _ensureMediapipeSource(nodeId, entry) {
                 upstream.srcType + "(" + upstream.srcNodeId + ")");
     return null;
   }
-  // Fallback: own camera.
+  if (upstream && upstream.kind === "pending") {
+    // v0.3.13 — wire exists to a video source that's still loading
+    // (VideoFile decoding, Webcam permission pending, etc). Defer:
+    // don't open own camera, don't allocate anything yet. The
+    // detection loop's _resolveSourceForTick will retry each frame
+    // until the upstream becomes ready, then transition the entry
+    // into "video" mode.
+    entry.awaitingUpstream = true;
+    entry.upstreamNodeId   = upstream.srcNodeId;
+    entry.sharedVideoEl    = false;
+    entry.useTextureSource = false;
+    entry.videoEl          = null;
+    console.log("[landmark] node " + nodeId + " waiting for " +
+                upstream.srcType + "(" + upstream.srcNodeId + ") to load");
+    return null;
+  }
+  // No wire: own camera (the v0.3.6 default).
   await _ensureMediapipeCamera(entry);
   entry.sharedVideoEl    = false;
   entry.useTextureSource = false;
   return entry.videoEl;
+}
+
+/* v0.3.13 — allocate the WebGPU-context'd canvas the render path
+ * blits the upstream's framebuffer/scratch layer into each frame.
+ * Factored out of _ensureMediapipeSource so both the init path and
+ * the deferred "now ready" transition in the detection loop can
+ * call it. */
+function _allocateGpuInputCanvas(entry) {
+  if (entry.gpuInputCanvas) return entry.gpuInputCanvas;
+  const w = Visual.fbWidth  || 1920;
+  const h = Visual.fbHeight || 1080;
+  entry.gpuInputCanvas = document.createElement("canvas");
+  entry.gpuInputCanvas.width  = w;
+  entry.gpuInputCanvas.height = h;
+  entry.gpuInputCtx = entry.gpuInputCanvas.getContext("webgpu");
+  if (entry.gpuInputCtx && Visual.device) {
+    entry.gpuInputCtx.configure({
+      device: Visual.device,
+      format: Visual.presentationFormat,
+      alphaMode: "premultiplied"
+    });
+  }
+  return entry.gpuInputCanvas;
 }
 
 async function _ensureHandLandmarker(nodeId, params) {
@@ -33931,13 +33960,46 @@ function _drawHandLandmarkerOverlay(entry, params) {
  * for the wired-param resolver to pick up. Cancelled by dispose. */
 function _startMediapipeLoop(nodeId) {
   const entry = _mediapipeNodes.get(nodeId);
-  // v0.3.12 — texture-source mode has gpuInputCanvas instead of
-  // videoEl; either input is valid.
-  if (!entry || !entry.detector || (!entry.videoEl && !entry.gpuInputCanvas)) return;
+  // v0.3.13 — the loop runs even with no input source initially.
+  // awaitingUpstream means "wire exists, upstream not ready yet" --
+  // the loop will resolve it once the upstream's videoEl loads.
+  if (!entry || !entry.detector ||
+      (!entry.videoEl && !entry.gpuInputCanvas && !entry.awaitingUpstream)) return;
   let lastVideoTimeMs = -1;
   const tick = () => {
     const e = _mediapipeNodes.get(nodeId);
     if (!e || !e.detector) return;  // disposed
+    // v0.3.13 — if we're still waiting for the upstream to load,
+    // re-resolve each tick. As soon as the upstream's videoEl is
+    // decoded (or becomes a texture source), transition the entry
+    // into the appropriate mode + carry on.
+    if (e.awaitingUpstream) {
+      const upstream = _findUpstreamVideoSource(nodeId);
+      if (upstream && upstream.kind === "video") {
+        e.videoEl          = upstream.videoEl;
+        e.sharedVideoEl    = true;
+        e.useTextureSource = false;
+        e.awaitingUpstream = false;
+        console.log("[landmark] node " + nodeId + " upstream ready (video)");
+      } else if (upstream && upstream.kind === "texture") {
+        _allocateGpuInputCanvas(e);
+        e.useTextureSource = true;
+        e.awaitingUpstream = false;
+        console.log("[landmark] node " + nodeId + " upstream ready (texture)");
+      } else if (!upstream) {
+        // Wire was removed. Fall back to own camera.
+        _ensureMediapipeCamera(e).then(() => {
+          e.sharedVideoEl    = false;
+          e.useTextureSource = false;
+          e.awaitingUpstream = false;
+        }).catch(err => console.warn("[landmark] fallback camera failed:", err));
+      }
+      // else: still pending. Skip this tick.
+      if (e.awaitingUpstream) {
+        e.rafHandle = requestAnimationFrame(tick);
+        return;
+      }
+    }
     const drawNow = () => {
       if (!e.drawCanvas) return;
       const liveNode = state && Array.isArray(state.nodes)
