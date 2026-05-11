@@ -13053,15 +13053,18 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       { n: "speed",         t: "param" },
       { n: "scale",         t: "param" },
       { n: "paletteOffset", t: "param" },
-      // Phase 6.5.2 — audio reactivity. 0 = legacy time-only animation,
-      // larger values multiply the SAB master-peak slot into the
-      // speed term, so audio pulses make the plasma swirl faster.
-      { n: "audioReact",    t: "param" }
+      // Phase 6.5.2 — audio reactivity (master output peak).
+      { n: "audioReact",    t: "param" },
+      // Phase 6.5.3 — bass-band reactivity. Averages FFT bins 0..7
+      // (~20 Hz - 80 Hz log-spaced) and adds the result × bassReact
+      // to the animation speed. Lets the plasma pulse with kick drums
+      // independently from the overall peak.
+      { n: "bassReact",     t: "param" }
     ],
     outs: [{ n: "out", t: "texture" }],
-    params: { speed: 1.0, scale: 1.0, paletteOffset: 0.0, audioReact: 0.0 },
+    params: { speed: 1.0, scale: 1.0, paletteOffset: 0.0, audioReact: 0.0, bassReact: 0.0 },
     methods: {},
-    uniformBytes: 80,
+    uniformBytes: 96,
     wgsl:
 `struct U {
   u_resolution: vec4f,
@@ -13071,15 +13074,29 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   u_view:       vec4f,
   u_world_uv:   vec4f,
   params:       vec4f,    // x=speed, y=scale, z=paletteOffset, w=audioReact
+  params2:      vec4f,    // x=bassReact, yzw=_
 };
 @group(0) @binding(0) var<uniform> u: U;
 
-// Phase 6.5.2 — audio uniform. Slot 0 currently mirrors the worklet's
-// master output peak (max |L|, |R| over the latest quantum, 0..1).
-// Slots 1-15 reserved for future EnvFollow / Clock / per-band FFT
-// bridge nodes (Phase 6.5.3+).
-struct AudioU { values: array<vec4<f32>, 4> };
+// Phase 6.5.2 / 6.5.3 — audio uniform.
+//   values[0].x  = worklet master output peak this quantum (0..1)
+//   values[0].yzw and values[1..3] reserved for future scalar slots
+//   fft[k/4][k%4] = 256 log-spaced FFT magnitude bins (0..1)
+struct AudioU {
+  values: array<vec4<f32>, 4>,
+  fft:    array<vec4<f32>, 64>,
+};
 @group(0) @binding(3) var<uniform> u_audio: AudioU;
+
+// Read FFT bin k (0..255) as a scalar.
+fn fft_bin(k: u32) -> f32 {
+  let v = u_audio.fft[k / 4u];
+  let lane = k & 3u;
+  if (lane == 0u) { return v.x; }
+  if (lane == 1u) { return v.y; }
+  if (lane == 2u) { return v.z; }
+  return v.w;
+}
 
 struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
 
@@ -13097,12 +13114,16 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
 fn fs_main(in: VsOut) -> @location(0) vec4f {
   let world_uv = mix(u.u_world_uv.xy, u.u_world_uv.zw, in.uv);
   let p = (world_uv - vec2f(0.5)) * u.params.y * 8.0;
-  // params.w = audioReact (0..N). Multiplied into the master-peak
-  // bridge slot so the user can scale how much audio drives the
-  // animation. 0 = pure time-based (legacy behavior), 1 = peak
-  // adds 1× to base speed, 2 = doubles it, etc.
+  // params.w = audioReact, params2.x = bassReact.
+  // peak_speed scales with the master-peak bridge slot;
+  // bass_speed averages the first 8 log-spaced FFT bins (~20-80 Hz)
+  // so kick drums pulse the plasma independently of the overall peak.
   let peak_speed = u.params.w * u_audio.values[0].x;
-  let t = u.u_time * (u.params.x + peak_speed);
+  var bass: f32 = 0.0;
+  for (var i: u32 = 0u; i < 8u; i = i + 1u) { bass = bass + fft_bin(i); }
+  bass = bass * 0.125;
+  let bass_speed = u.params2.x * bass;
+  let t = u.u_time * (u.params.x + peak_speed + bass_speed);
   var v: f32 = 0.0;
   v = v + sin(p.x * 1.5 + t);
   v = v + sin(p.y * 1.5 + t * 1.3);
@@ -13121,8 +13142,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       scratch[17] = (typeof p.scale         === "number") ? p.scale         : 1.0;
       scratch[18] = (typeof p.paletteOffset === "number") ? p.paletteOffset : 0.0;
       scratch[19] = (typeof p.audioReact    === "number") ? p.audioReact    : 0.0;
+      scratch[20] = (typeof p.bassReact     === "number") ? p.bassReact     : 0.0;
+      scratch[21] = 0; scratch[22] = 0; scratch[23] = 0;
     },
-    description: "Plasma — classic demoscene 4-sinusoid color ripple. Animates with u_time × speed; scale controls wavelength; paletteOffset rotates the hue mapping. audioReact (Phase 6.5.2): how much the audio output master peak modulates the animation speed (0 = pure time, 1 = peak doubles speed at full-scale audio, etc.). Wire into VisualOutput; play any patch to see the plasma pulse with audio."
+    description: "Plasma — classic demoscene 4-sinusoid color ripple. Animates with u_time × speed; scale controls wavelength; paletteOffset rotates the hue mapping. audioReact (Phase 6.5.2): how much the audio output master peak modulates the animation speed (0 = none, 1 = peak adds 1× to speed, etc.). bassReact (Phase 6.5.3): same but driven by the average of FFT bins 0..7 (~20-80 Hz log-spaced), so kick drums pulse the plasma independently of overall level. Wire into VisualOutput; play any patch to see the plasma pulse with audio."
   },
 
   /* Phase 6.4 — Checkerboard. Two-color N×N grid. Used for
@@ -29297,25 +29320,28 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     size: RIG_MAX_DISPLAYS * 16,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
   });
-  // Phase 6.5.2 — global audio uniform buffer. 16 scalar slots
-  // mirroring the SAB's scalar section. Bound at @binding(3) in
-  // every shader-frag bind layout (standard / feedback / composition)
-  // so any shader-frag WGSL can declare:
-  //   struct AudioU { values: array<vec4f, 4> };
+  // Phase 6.5.2 + 6.5.3 — global audio uniform buffer. 16 scalar
+  // slots + 256 FFT bins, bound at @binding(3) in every shader-frag
+  // bind layout (standard / feedback / composition). Shader-frags
+  // declare the struct with the fields they want:
+  //   struct AudioU {
+  //     values: array<vec4<f32>, 4>,    // 16 scalars (slots 0-15)
+  //     fft:    array<vec4<f32>, 64>,   // 256 log-spaced FFT bins
+  //   };
   //   @group(0) @binding(3) var<uniform> u_audio: AudioU;
-  // and read scalars as u_audio.values[i/4][i%4]. Per-frame copy
-  // from SAB happens in renderVisualFrame() right before encoding
-  // shader passes (see _writeAudioUniform).
-  // 64 B = 16 × f32 = 4 × vec4f (vec4f alignment is mandatory in
-  // uniform-buffer arrays).
+  // Scalars and FFT can both be sourced (per-quantum master peak in
+  // slot 0 from 6.5.2; per-frame log-spaced FFT bins from 6.5.3 below).
+  // 1088 B total = 64 B scalars + 1024 B FFT. Per-frame copy
+  // from SAB happens in renderVisualFrame() before any shader pass
+  // encodes (see _writeAudioUniform).
   Visual.audioUniformBuffer = Visual.device.createBuffer({
     label: "audio-uniform",
-    size: 64,
+    size: 1088,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
   });
-  // Reusable scratch for the per-frame copy. Avoids a Float32Array
-  // alloc each frame; we just memcpy from SAB then writeBuffer.
-  Visual.audioUniformScratch = new Float32Array(16);
+  // Reusable scratch for the per-frame copy. 272 f32 = 16 scalars +
+  // 256 FFT bins. Avoids a Float32Array alloc each frame.
+  Visual.audioUniformScratch = new Float32Array(272);
 }
 
 /* ----- Phase 6.6.4 — calibration warp pipeline ------------------------ */
@@ -30891,28 +30917,70 @@ function _fnv1a(s) {
  * Composition nodes in 6.4.x that consume input textures will need a
  * different layout (texture + sampler + uniform); they'll define
  * their own cache keys to avoid colliding with this one. */
-/* Phase 6.5.2 — read the SAB's 16 scalar slots into the global GPU
- * audio uniform buffer. Runs once per frame from renderVisualFrame().
- * Cheap (one writeBuffer of 64 B); always runs when device + buffer
- * exist, even if no shader reads u_audio. Shaders that don't declare
- * @binding(3) in WGSL just ignore the bound buffer. */
+/* Phase 6.5.3 — refresh the SAB FFT region from the main-thread
+ * analyser. The 2048-point fftAnalyser pair gives 1024 source bins;
+ * we downsample to 256 log-spaced bins (one per ~1/26th of an
+ * octave), max-pool L+R per bin, normalize to 0..1. Result lands in
+ * the SAB so the per-frame GPU copy below picks it up consistently
+ * with the scalar path. */
+let _fftScratchL = null;
+let _fftScratchR = null;
+function _updateAudioFft() {
+  if (!audioBridge.available) return;
+  const aL = previewState.fftAnalyserL;
+  const aR = previewState.fftAnalyserR;
+  if (!aL || !aR) return;
+  const binCount = aL.frequencyBinCount;
+  if (!_fftScratchL || _fftScratchL.length !== binCount) {
+    _fftScratchL = new Uint8Array(binCount);
+    _fftScratchR = new Uint8Array(binCount);
+  }
+  aL.getByteFrequencyData(_fftScratchL);
+  aR.getByteFrequencyData(_fftScratchR);
+  const ctx = previewState.audioCtx;
+  const sr  = (ctx && ctx.sampleRate) || 48000;
+  const fMin = 20.0;
+  const fMax = Math.min(20000.0, sr * 0.5);
+  const logRange = Math.log(fMax / fMin);
+  const fftSize  = aL.fftSize;
+  for (let k = 0; k < AUDIO_BRIDGE_FFT_COUNT; k++) {
+    const freqLo = fMin * Math.exp(logRange * k       / AUDIO_BRIDGE_FFT_COUNT);
+    const freqHi = fMin * Math.exp(logRange * (k + 1) / AUDIO_BRIDGE_FFT_COUNT);
+    let binLo = (freqLo * fftSize / sr) | 0;
+    let binHi = Math.max(binLo + 1, Math.ceil(freqHi * fftSize / sr));
+    if (binHi > binCount) binHi = binCount;
+    let peak = 0;
+    for (let b = binLo; b < binHi; b++) {
+      const v = _fftScratchL[b] > _fftScratchR[b] ? _fftScratchL[b] : _fftScratchR[b];
+      if (v > peak) peak = v;
+    }
+    audioBridge.floats[AUDIO_BRIDGE_FFT_BASE + k] = peak * (1.0 / 255.0);
+  }
+}
+
+/* Phase 6.5.2 + 6.5.3 — read SAB scalar slots + FFT bins into the
+ * global GPU audio uniform buffer. Runs once per frame from
+ * renderVisualFrame(). One writeBuffer of 1088 B; always runs when
+ * device + buffer exist, even if no shader reads u_audio. */
 function _writeAudioUniform() {
   if (!Visual.device || !Visual.audioUniformBuffer || !Visual.audioUniformScratch) return;
+  const sc = Visual.audioUniformScratch;
   if (audioBridge.available) {
-    // Copy scalar section into the scratch we own; we can't pass an
-    // SAB-backed Float32Array directly to writeBuffer in some browsers.
+    // Copy scalar section (16 f32) from SAB.
     for (let i = 0; i < 16; i++) {
-      Visual.audioUniformScratch[i] = audioBridge.floats[AUDIO_BRIDGE_SCALAR_BASE + i];
+      sc[i] = audioBridge.floats[AUDIO_BRIDGE_SCALAR_BASE + i];
+    }
+    // Copy FFT section (256 f32) right after scalars in the scratch.
+    for (let i = 0; i < 256; i++) {
+      sc[16 + i] = audioBridge.floats[AUDIO_BRIDGE_FFT_BASE + i];
     }
   } else {
     // Bridge unavailable -> zero out so shaders behave deterministically.
-    for (let i = 0; i < 16; i++) Visual.audioUniformScratch[i] = 0;
+    for (let i = 0; i < 272; i++) sc[i] = 0;
   }
   Visual.device.queue.writeBuffer(
     Visual.audioUniformBuffer, 0,
-    Visual.audioUniformScratch.buffer,
-    Visual.audioUniformScratch.byteOffset,
-    Visual.audioUniformScratch.byteLength
+    sc.buffer, sc.byteOffset, sc.byteLength
   );
 }
 
@@ -33106,10 +33174,12 @@ function renderVisualFrame() {
   const dtSec = Visual.lastFrameT > 0 ? (now - Visual.lastFrameT) * 0.001 : 0;
   Visual.lastFrameT = now;
 
-  // Phase 6.5.2 — copy SAB scalar slots into the global audio
-  // uniform buffer ONCE per frame. Cheap (16 f32 = 64 B writeBuffer)
-  // so we always do it; shaders that don't read u_audio just ignore
-  // the bound buffer. Reads are tear-free at 32-bit alignment.
+  // Phase 6.5.3 — refresh FFT bins in the SAB from the dedicated
+  // analyser pair, THEN copy the whole SAB audio section (scalars +
+  // FFT) into the GPU uniform buffer. Order matters: _updateAudioFft
+  // writes to SAB.fft, _writeAudioUniform copies SAB.scalars +
+  // SAB.fft into the GPU buffer.
+  _updateAudioFft();
   _writeAudioUniform();
 
   const enc = Visual.device.createCommandEncoder({ label: "visual-frame" });
@@ -34433,12 +34503,26 @@ async function ensureAudioWorklet() {
   // 0 — we do attack/release in the render loop.
   analyserL.fftSize = 16384; analyserL.smoothingTimeConstant = 0;
   analyserR.fftSize = 16384; analyserR.smoothingTimeConstant = 0;
+  // Phase 6.5.3 — separate analyser pair for visual FFT reactivity.
+  // 2048 fftSize = 1024 bins, ~23 Hz/bin at 48 kHz, ~43 ms window.
+  // Snappy for transient response (kicks register on the frame they
+  // hit, instead of smearing across 340 ms like the meter analyser).
+  // smoothingTimeConstant = 0.4 gives some inter-frame smoothing so
+  // visualizers don't flicker on every sample-level glitch.
+  const fftAnalyserL = previewState.audioCtx.createAnalyser();
+  const fftAnalyserR = previewState.audioCtx.createAnalyser();
+  fftAnalyserL.fftSize = 2048; fftAnalyserL.smoothingTimeConstant = 0.4;
+  fftAnalyserR.fftSize = 2048; fftAnalyserR.smoothingTimeConstant = 0.4;
   node.connect(splitter);
   splitter.connect(analyserL, 0);
   splitter.connect(analyserR, 1);
+  splitter.connect(fftAnalyserL, 0);
+  splitter.connect(fftAnalyserR, 1);
   node.connect(previewState.audioCtx.destination);
   previewState.analyserL = analyserL;
   previewState.analyserR = analyserR;
+  previewState.fftAnalyserL = fftAnalyserL;
+  previewState.fftAnalyserR = fftAnalyserR;
   startMeterLoop();
 
   // Phase 6.5.1 — hand the shared bridge SAB to the worklet. Safe to
