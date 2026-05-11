@@ -13329,31 +13329,100 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
    * → SAB → worklet → C++ setter bridge (Phase 6.5+ follow-on). */
   HandLandmarker: {
     category: "AI", color: COLOR.ai, header: null,
-    cppType: "",
+    // v0.3.6 — cppType + helperClass so HandLandmarker outputs reach
+    // the audio side too. The class has 13 setters (one per output
+    // value) and a struct-returning operator()() so the existing
+    // multi-output codegen path wires e.g. h1_pinch → BiquadLP.cutoff
+    // at sample rate the same way Slider → BiquadLP.cutoff already
+    // works. JS pushes the latest detection values to each setter
+    // every render frame via _pushLiveControlsToWorklet (sub-1ms,
+    // a single quantum's worth of latency to audio).
+    cppType: "GammaHandLandmarkerSource",
+    helperClass:
+`class GammaHandLandmarkerSource {
+    /* JS-driven value sink. Each setter parks the latest MediaPipe
+     * detection result into its slot; operator()() returns the
+     * whole struct so downstream nodes can read individual fields
+     * via the codegen's outs[].access pattern. No per-sample work
+     * inside the class -- pure storage. */
+    float v_[13] = {0};
+public:
+    void setNumHands(float v) { v_[0]  = v; }
+    void setH1X(float v)      { v_[1]  = v; }
+    void setH1Y(float v)      { v_[2]  = v; }
+    void setH1Z(float v)      { v_[3]  = v; }
+    void setH1Pinch(float v)  { v_[4]  = v; }
+    void setH1Open(float v)   { v_[5]  = v; }
+    void setH1Rot(float v)    { v_[6]  = v; }
+    void setH2X(float v)      { v_[7]  = v; }
+    void setH2Y(float v)      { v_[8]  = v; }
+    void setH2Z(float v)      { v_[9]  = v; }
+    void setH2Pinch(float v)  { v_[10] = v; }
+    void setH2Open(float v)   { v_[11] = v; }
+    void setH2Rot(float v)    { v_[12] = v; }
+    struct Out {
+        float numHands, h1_x, h1_y, h1_z, h1_pinch, h1_open, h1_rot,
+              h2_x, h2_y, h2_z, h2_pinch, h2_open, h2_rot;
+    };
+    Out operator()() {
+        return { v_[0], v_[1], v_[2], v_[3], v_[4], v_[5], v_[6],
+                 v_[7], v_[8], v_[9], v_[10], v_[11], v_[12] };
+    }
+};`,
     kind: "ai-vision-canvas",
-    ins: [
-      // No texture input -- the node manages its own camera stream
-      // internally (or shares an existing Webcam node's stream
-      // automatically). maxHands / minConfidence steer the detector
-      // config at init time. bgMode toggles whether the texture output
-      // shows the camera frame underneath the landmark overlay (1) or
-      // only the overlay on a transparent background (0, for blending
-      // over a different source via BlendShader).
-    ],
+    ins: [],
     outs: [
-      // v0.3.3 — texture output: camera + landmark overlay (or just
-      // overlay if bgMode=0). Wire to VisualOutput to see what the
-      // detector is seeing.
       { n: "out",      t: "texture" },
-      { n: "numHands", t: "param" },
-      { n: "h1_x",     t: "param" }, { n: "h1_y",    t: "param" }, { n: "h1_z",    t: "param" },
-      { n: "h1_pinch", t: "param" }, { n: "h1_open", t: "param" }, { n: "h1_rot",  t: "param" },
-      { n: "h2_x",     t: "param" }, { n: "h2_y",    t: "param" }, { n: "h2_z",    t: "param" },
-      { n: "h2_pinch", t: "param" }, { n: "h2_open", t: "param" }, { n: "h2_rot",  t: "param" }
+      // Multi-output struct fields — codegen reads ".field" off the
+      // operator()() return value for each downstream sample.
+      { n: "numHands", t: "param", access: ".numHands" },
+      { n: "h1_x",     t: "param", access: ".h1_x" },
+      { n: "h1_y",     t: "param", access: ".h1_y" },
+      { n: "h1_z",     t: "param", access: ".h1_z" },
+      { n: "h1_pinch", t: "param", access: ".h1_pinch" },
+      { n: "h1_open",  t: "param", access: ".h1_open" },
+      { n: "h1_rot",   t: "param", access: ".h1_rot" },
+      { n: "h2_x",     t: "param", access: ".h2_x" },
+      { n: "h2_y",     t: "param", access: ".h2_y" },
+      { n: "h2_z",     t: "param", access: ".h2_z" },
+      { n: "h2_pinch", t: "param", access: ".h2_pinch" },
+      { n: "h2_open",  t: "param", access: ".h2_open" },
+      { n: "h2_rot",   t: "param", access: ".h2_rot" }
     ],
-    params: { maxHands: 2, minConfidence: 0.5, bgMode: 1, mirrored: 1, lineWidth: 2.5, dotRadius: 4 },
-    methods: { maxHands: null, minConfidence: null, bgMode: null, mirrored: null, lineWidth: null, dotRadius: null },
-    description: "Real-time hand-landmark detection via MediaPipe (WASM+GPU). Outputs (1) a texture showing the camera feed with a skeleton overlay drawn on top of it, color-coded by handedness (phosphor=left, cyan=right), and (2) per-hand position / pinch / openness / rotation as param wires. Wire `out` → VisualOutput to see what the detector sees; wire e.g. `h1_pinch` → Plasma.speed for gesture control. First use prompts for camera permission + downloads ~8MB of model + WASM (cached after). bgMode=0 makes the overlay transparent for blending over a separate source."
+    params: {
+      // UI-only config params (steer the detector + the canvas overlay
+      // style; not exposed as audio setters).
+      maxHands: 2, minConfidence: 0.5, bgMode: 1, mirrored: 1,
+      lineWidth: 2.5, dotRadius: 4,
+      // Live param values (JS-driven; auto-exposed as setters so the
+      // worklet can receive them per frame via postMessage).
+      numHands: 0,
+      h1_x: 0,     h1_y: 0,     h1_z: 0,
+      h1_pinch: 0, h1_open: 0,  h1_rot: 0,
+      h2_x: 0,     h2_y: 0,     h2_z: 0,
+      h2_pinch: 0, h2_open: 0,  h2_rot: 0
+    },
+    methods: {
+      maxHands: null, minConfidence: null, bgMode: null, mirrored: null,
+      lineWidth: null, dotRadius: null,
+      numHands: "setNumHands",
+      h1_x: "setH1X", h1_y: "setH1Y", h1_z: "setH1Z",
+      h1_pinch: "setH1Pinch", h1_open: "setH1Open", h1_rot: "setH1Rot",
+      h2_x: "setH2X", h2_y: "setH2Y", h2_z: "setH2Z",
+      h2_pinch: "setH2Pinch", h2_open: "setH2Open", h2_rot: "setH2Rot"
+    },
+    // UI-only params don't show up in the Monitor's exposed-setter
+    // panel + don't get included in collectExposedSetters.
+    uiOnlyParams: ["maxHands", "minConfidence", "bgMode", "mirrored", "lineWidth", "dotRadius"],
+    // Auto-expose every live-value port so the audio worklet receives
+    // them via the standard setter dispatch table -- same path Slider
+    // uses, just 13 setters per HandLandmarker instead of 1.
+    autoExpose: [
+      "numHands",
+      "h1_x", "h1_y", "h1_z", "h1_pinch", "h1_open", "h1_rot",
+      "h2_x", "h2_y", "h2_z", "h2_pinch", "h2_open", "h2_rot"
+    ],
+    description: "Real-time hand-landmark detection via MediaPipe (WASM+GPU). Outputs (1) a texture showing the camera feed with a skeleton overlay drawn on top, colour-coded by handedness (phosphor=left, cyan=right), and (2) per-hand position / pinch / openness / rotation as param wires that drive BOTH shader uniforms AND audio-node params at sample rate. Wire `out` → VisualOutput to see what the detector sees; wire e.g. `h1_pinch` → BiquadLP.cutoff for gesture-controlled filter sweeps. First use prompts for camera permission + downloads ~8MB of model + WASM (cached after). bgMode=0 makes the overlay transparent for blending over a separate source."
   },
 
   /* Gradient — 2-color linear blend along a configurable angle.
@@ -22968,6 +23037,89 @@ const _demos = [
       });
       const vo    = makeNode("VisualOutput",   360, 80, { display: 0 });
       state.edges.push({ from: { node: hands, port: "out" }, to: { node: vo, port: "in" } });
+    }
+  },
+
+  /* v0.3.6 — Gesture-controlled audio demo. Closes Path A
+   * (live-control → JS-side push → worklet setter → C++ class) by
+   * driving an actual audio chain from MediaPipe values:
+   *   h1_pinch  →  Sine.freq    (mapped through Mul + Add to a
+   *                              useful Hz range; pinch tighter to
+   *                              lower the pitch, spread to raise)
+   *   h1_y      →  BiquadLP.cutoff (hand height = filter cutoff,
+   *                                 wrist down = closed, wrist up
+   *                                 = open)
+   *   h1_open   →  Mul.b        (gate: fist mutes, spread fingers
+   *                              open up the amplitude)
+   * Plus the visual side: HandLandmarker.out → VisualOutput so the
+   * user sees their hand tracked while playing the synth.
+   *
+   * Press ▶ to compile + play. First load: camera permission +
+   * MediaPipe model download + Gamma compile. Then make sounds with
+   * your hand. */
+  {
+    id: "gesture-synth",
+    name: "Gesture Synth",
+    sub: "pinch + wave → audible",
+    type: "advanced",
+    thumb: `<svg viewBox="0 0 100 44">
+      <rect width="100" height="44" fill="rgba(0,0,0,0.85)"/>
+      <g stroke="rgba(200,232,90,0.9)" stroke-width="0.8" stroke-linecap="round" fill="rgba(200,232,90,0.9)">
+        <circle cx="22" cy="22" r="0.9"/>
+        <circle cx="18" cy="14" r="0.7"/>
+        <circle cx="22" cy="10" r="0.7"/>
+        <circle cx="26" cy="12" r="0.7"/>
+        <line x1="22" y1="22" x2="18" y2="14" stroke-width="0.6"/>
+        <line x1="22" y1="22" x2="22" y2="10" stroke-width="0.6"/>
+        <line x1="22" y1="22" x2="26" y2="12" stroke-width="0.6"/>
+      </g>
+      <!-- arrow → -->
+      <path d="M 38 22 L 56 22 M 50 18 L 56 22 L 50 26"
+            stroke="rgba(178,100,200,0.85)" stroke-width="1.0" fill="none" stroke-linecap="round"/>
+      <!-- waveform -->
+      <path d="M 60 22 Q 65 14 70 22 T 80 22 T 90 22"
+            stroke="rgba(131,232,255,0.9)" stroke-width="1.2" fill="none" stroke-linecap="round"/>
+      <text x="50" y="40" text-anchor="middle"
+            font-family="monospace" font-size="4.2" fill="rgba(178,100,200,0.75)"
+            letter-spacing="0.10em">GESTURE → AUDIO</text>
+    </svg>`,
+    build: () => {
+      const hands = makeNode("HandLandmarker", 40,  60, {
+        maxHands: 1, minConfidence: 0.5, bgMode: 1, mirrored: 1
+      });
+      const vo    = makeNode("VisualOutput",   360, 60, { display: 0 });
+      state.edges.push({ from: { node: hands, port: "out" }, to: { node: vo, port: "in" } });
+
+      // pinch (~0..0.30) → freq via a Mul (gain 2000) + Add (base 220).
+      // Tight pinch ≈ 220 Hz, full spread ≈ 220 + 0.30*2000 = 820 Hz.
+      const sine  = makeNode("Sine",      40, 240, { freq: 220 });
+      const mulF  = makeNode("Mul",      220, 240, { b: 2000 });   // scale pinch
+      const addF  = makeNode("Add",      400, 240, { b: 220 });    // base freq
+      state.edges.push({ from: { node: hands, port: "h1_pinch" }, to: { node: mulF, port: "a" } });
+      state.edges.push({ from: { node: mulF,  port: "out"     }, to: { node: addF, port: "a" } });
+      state.edges.push({ from: { node: addF,  port: "out"     }, to: { node: sine, port: "freq" } });
+
+      // h1_y (0=top, 1=bottom) → BiquadLP cutoff. We want hand UP = bright,
+      // hand DOWN = closed, so invert via (1 - y). Cheapest mapping: Mul -1
+      // then Add 1 → range 0..1; another Mul 8000 + Add 200 → 200..8200 Hz.
+      const inv   = makeNode("Mul",      40, 380, { b: -1 });
+      const inv2  = makeNode("Add",     220, 380, { b: 1 });
+      const mulC  = makeNode("Mul",     400, 380, { b: 8000 });
+      const addC  = makeNode("Add",     580, 380, { b: 200 });
+      state.edges.push({ from: { node: hands, port: "h1_y" }, to: { node: inv,  port: "a" } });
+      state.edges.push({ from: { node: inv,   port: "out" }, to: { node: inv2, port: "a" } });
+      state.edges.push({ from: { node: inv2,  port: "out" }, to: { node: mulC, port: "a" } });
+      state.edges.push({ from: { node: mulC,  port: "out" }, to: { node: addC, port: "a" } });
+
+      // h1_open (0=fist, 1=spread) gates amplitude via a final Mul.
+      const filt = makeNode("BiquadLP", 760, 240, { cutoff: 1200, q: 1.4 });
+      const amp  = makeNode("Mul",      940, 240);
+      const out  = makeNode("Output",  1120, 240);
+      state.edges.push({ from: { node: sine, port: "out" }, to: { node: filt, port: "in" } });
+      state.edges.push({ from: { node: addC, port: "out" }, to: { node: filt, port: "cutoff" } });
+      state.edges.push({ from: { node: filt, port: "out" }, to: { node: amp,  port: "a" } });
+      state.edges.push({ from: { node: hands, port: "h1_open" }, to: { node: amp,  port: "b" } });
+      state.edges.push({ from: { node: amp,  port: "out" }, to: { node: out,  port: "L" } });
     }
   },
 
@@ -35408,7 +35560,94 @@ function _visualRenderTick(t) {
   // function early-outs when no RigGizmo node exists in the patch
   // so this is effectively free for patches that don't use it.
   _drawVisualOverlay();
+  // v0.3.6 — Path A live-control bridge. Push the latest MediaPipe
+  // (and future LFO / EnvFollow / etc) values into the audio worklet
+  // via setter postMessages. No-op when audio preview isn't playing
+  // OR when no live-control nodes have wires to audio-rate consumers.
+  _pushLiveControlsToWorklet();
   _visualRafHandle = requestAnimationFrame(_visualRenderTick);
+}
+
+/* v0.3.6 — Path A live-control bridge (rAF cadence).
+ *
+ * For every node in the patch that's a "live JS-driven control
+ * source" (HandLandmarker so far; PoseLandmarker / FaceLandmarker /
+ * future audio-rate LFOs slot in next), find its setter indices in
+ * the worklet's dispatch table + post each updated value via the
+ * standard {type:"set", index, value} message that Slider already
+ * uses.
+ *
+ * Cost: 13 postMessages per HandLandmarker per frame (~780/sec at
+ * 60fps for one detector). Web Audio handles thousands easily; the
+ * actual latency from gesture → audio is one quantum (~2.7 ms at
+ * 48 kHz × 128-sample quantum).
+ *
+ * Only fires when:
+ *   - The preview is playing (workletNode + state === "playing")
+ *   - The patch contains a live-control source
+ *   - The source has at least one wire to a downstream audio-side
+ *     node (skipped if the source's outputs only feed shader params)
+ *
+ * The "wired to audio" filter avoids spamming postMessage for nodes
+ * whose outputs only drive shader uniforms (no setter exists in the
+ * worklet for those -- the wire resolves entirely in JS via the
+ * shader-side wired-param resolver). */
+let _liveControlSettersCache = { generation: -1, indices: null };
+function _refreshLiveControlSetters() {
+  // Recompute when the patch shape changes (we increment a generation
+  // counter; lightweight check below). For now we just rebuild every
+  // call -- collectExposedSetters is O(nodes * params), small for
+  // typical patches.
+  const setters = collectExposedSetters();
+  const map = new Map();          // nodeId -> { key -> setterIndex }
+  for (let i = 0; i < setters.length; i++) {
+    const s = setters[i];
+    if (!s.nodeId) continue;
+    let inner = map.get(s.nodeId);
+    if (!inner) { inner = {}; map.set(s.nodeId, inner); }
+    inner[s.key] = i;
+  }
+  return map;
+}
+
+function _isLiveControlPortWiredToAudio(nodeId, port) {
+  if (typeof state === "undefined" || !state || !Array.isArray(state.edges) || !Array.isArray(state.nodes)) return false;
+  for (let i = 0; i < state.edges.length; i++) {
+    const e = state.edges[i];
+    if (!e || !e.from || !e.to) continue;
+    if (e.from.node !== nodeId || e.from.port !== port) continue;
+    const target = state.nodes.find(n => n.id === e.to.node);
+    if (!target) continue;
+    const def = TYPES[target.type];
+    // Has cppType → participates in audio codegen → setter exists in worklet.
+    if (def && def.cppType) return true;
+  }
+  return false;
+}
+
+function _pushLiveControlsToWorklet() {
+  if (!previewState || previewState.state !== "playing" || !previewState.workletNode) return;
+  if (typeof state === "undefined" || !state || !Array.isArray(state.nodes)) return;
+  // Find any HandLandmarker (or future live-control) nodes.
+  const live = state.nodes.filter(n => n && n.type === "HandLandmarker");
+  if (live.length === 0) return;
+  const setterIndex = _refreshLiveControlSetters();
+  const HAND_PORTS = [
+    "numHands",
+    "h1_x", "h1_y", "h1_z", "h1_pinch", "h1_open", "h1_rot",
+    "h2_x", "h2_y", "h2_z", "h2_pinch", "h2_open", "h2_rot"
+  ];
+  for (const node of live) {
+    const innerMap = setterIndex.get(node.id);
+    if (!innerMap) continue;
+    for (const port of HAND_PORTS) {
+      const idx = innerMap[port];
+      if (typeof idx !== "number") continue;
+      if (!_isLiveControlPortWiredToAudio(node.id, port)) continue;
+      const value = _handLandmarkerValue(node, port);
+      previewState.workletNode.port.postMessage({ type: "set", index: idx, value: value });
+    }
+  }
 }
 
 function startVisualRenderLoop() {
