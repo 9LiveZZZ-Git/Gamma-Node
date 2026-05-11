@@ -1911,10 +1911,19 @@
   }
 
   /* Phase 6.6.13 — touch pads for theater navigation. Hidden by
-   * default; .theater-touch on body shows them. body.theater-touch
-   * is added by _wireTheaterInput when navigator.maxTouchPoints > 0
-   * AND the rig is in theater mode. Pads sit at the bottom corners
-   * with a generous tap target for thumb reach on a held tablet. */
+   * default. v0.3.1 — now require LIVE MODE in addition to theater +
+   * touch-capable: outside Live Mode, the pads were overlaying the
+   * editor canvas + capturing pointer events that should have hit
+   * the node graph, AND distracting from the editing flow on hybrid
+   * (touch + mouse) devices like Chromebooks. Pressing L brings them
+   * up alongside the visual-only fullscreen view, which is the
+   * moment they're actually useful.
+   *
+   * Three required body classes:
+   *   - theater-mode          (rig preview = theater)
+   *   - theater-touch         (device is touch-capable AND in theater)
+   *   - live-mode             (L is pressed — visual-only fullscreen)
+   * All three must be present for the pads to render. */
   .theater-pad {
     display: none;
     position: fixed;
@@ -1931,7 +1940,7 @@
     user-select: none;
     -webkit-user-select: none;
   }
-  body.theater-mode.theater-touch .theater-pad { display: block; }
+  body.theater-mode.theater-touch.live-mode .theater-pad { display: block; }
   #theater-pad-move { left: 28px; }
   #theater-pad-look { right: 28px; }
   .theater-pad-knob {
@@ -2583,7 +2592,13 @@
     box-shadow: 0 8px 38px rgba(200, 232, 90, 0.55), 0 4px 18px rgba(0,0,0,0.6);
   }
   body.viewer-mode:not(.viewer-playing) #btn-viewer-play { display: inline-flex; }
+  /* viewer-credit lives in the body as a sibling of #app, so without
+     an explicit default display rule it falls into the normal flow
+     and pushes the editor's header / footer chrome around. Hidden by
+     default; only shown in viewer-mode where it's positioned fixed. */
+  .viewer-credit { display: none; }
   body.viewer-mode .viewer-credit {
+    display: block;
     position: fixed;
     left: 18px;
     bottom: 18px;
@@ -33690,31 +33705,44 @@ function _encodeShaderFragPassForPlan(enc, entry, dtSec) {
   // not, kick off the getUserMedia request (idempotent) and skip the
   // frame -- framebuffer layer keeps its prior content, recipient
   // composition shaders see the previous frame.
+  //
+  // Multi-display distribution (v0.3.1): this function runs once per
+  // (source × consumerVO) pair (e.g. 26x for a Webcam wired to an
+  // AlloSphere rig). Each VO gets its own instance + uniform buffer +
+  // bind group, so the per-display pose / world_uv preamble lands
+  // correctly. But device.importExternalTexture would also fire 26x
+  // per frame for the SAME source video frame -- redundant. We cache
+  // the imported handle in Visual._frameVideoTextures (cleared each
+  // renderVisualFrame) so the first pass imports + populates the
+  // cache, and the other N-1 passes reuse the same handle. The bind
+  // group itself still has to be per-VO (different uniform buffer
+  // per VO instance) but the external texture handle is shared.
   let bindGroupForPass = inst.bindGroup;
   if (def.bindLayout === "video-source") {
     const src = _videoSources.get(node.id);
     if (!src) {
-      // First-time init: trigger the async getUserMedia request.
-      // No frame this tick; the next render that finds src.ready
-      // proceeds normally.
       _ensureWebcamStream(node.id);
       return false;
     }
     if (!src.ready || !src.videoEl || src.videoEl.readyState < 2) return false;
-    let extTex;
-    try {
-      extTex = Visual.device.importExternalTexture({ source: src.videoEl });
-    } catch (e) {
-      // importExternalTexture can throw if the video frame isn't
-      // ready yet despite readyState >= 2 (race during the very first
-      // few frames). Skip silently, retry next tick.
-      return false;
+    if (!Visual._frameVideoTextures) Visual._frameVideoTextures = new Map();
+    let extTex = Visual._frameVideoTextures.get(node.id);
+    if (!extTex) {
+      try {
+        extTex = Visual.device.importExternalTexture({ source: src.videoEl });
+      } catch (e) {
+        // importExternalTexture can throw if the video frame isn't
+        // ready yet despite readyState >= 2 (race during the very
+        // first few frames). Skip silently, retry next tick.
+        return false;
+      }
+      Visual._frameVideoTextures.set(node.id, extTex);
     }
     const audioBuf = Visual.audioUniformBuffer
       ? { binding: 3, resource: { buffer: Visual.audioUniformBuffer } }
       : null;
     bindGroupForPass = Visual.device.createBindGroup({
-      label: "shader-frag-videosource-bg-" + node.id + "-frame",
+      label: "shader-frag-videosource-bg-" + node.id + "-vo-" + consumerVO.id,
       layout: Visual.videoSourceShaderBgl,
       entries: [
         { binding: 0, resource: { buffer: inst.uniformBuffer } },
@@ -34744,6 +34772,11 @@ function renderVisualFrame() {
   const now = performance.now();
   const dtSec = Visual.lastFrameT > 0 ? (now - Visual.lastFrameT) * 0.001 : 0;
   Visual.lastFrameT = now;
+
+  // v0.3.1 — clear the per-frame external-texture cache. Video-source
+  // shader-frags import once per node here, then reuse the handle
+  // across every consumer VO's pass (N×fan-out collapses to 1×import).
+  if (Visual._frameVideoTextures) Visual._frameVideoTextures.clear();
 
   // Phase 6.5.3 + 6.5.4 — refresh FFT bins in the SAB from the
   // main-thread analyser, then write the SAB audio + JS-side
