@@ -22403,6 +22403,15 @@ const _demos = [
       <line x1="0" y1="38" x2="100" y2="38" stroke="var(--phosphor)" stroke-width="0.4" opacity="0.4"/>
     </svg>`,
     build: () => {
+      // v0.2.16 polished arrangement -- per-track effects chains,
+      // proper parallel FX sends, glue compression on the master bus,
+      // and stereo placement so the elements occupy distinct space.
+      //
+      // Signal layout (left → right in the patch):
+      //   Sequencers (col 1) → Voices (col 2) → Per-voice mults (col 3)
+      //   → Sub-busses + FX chains (col 4)
+      //   → Master mix (4 channels) → Master comp → Limiters → Output
+
       // ── Tempo + drum patterns ─────────────────────────────
       const clk = makeNode("MasterClock", 40, 40, { bpm: 124 });
 
@@ -22450,59 +22459,98 @@ const _demos = [
       state.edges.push({ from: { node: percOsc, port: "out" }, to: { node: percMul, port: "a" } });
       state.edges.push({ from: { node: percEnv, port: "out" }, to: { node: percMul, port: "b" } });
 
-      // ── Drum submix (AudioBus 4-channel) ──────────────────
-      const drumBus = makeNode("AudioBus", 800, 200, { lvl1: 1.0, lvl2: 0.7, lvl3: 0.5, lvl4: 0.5 });
-      state.edges.push({ from: { node: kickMul,  port: "out" }, to: { node: drumBus, port: "in1" } });
-      state.edges.push({ from: { node: snareMul, port: "out" }, to: { node: drumBus, port: "in2" } });
-      state.edges.push({ from: { node: hatMul,   port: "out" }, to: { node: drumBus, port: "in3" } });
-      state.edges.push({ from: { node: percMul,  port: "out" }, to: { node: drumBus, port: "in4" } });
+      // ── Drum submix + glue compression ────────────────────
+      // 4-channel bus sums all drums, then a Compressor adds gentle
+      // glue (2.5:1 above 0.6 threshold, 1.3× makeup) so transients
+      // sit together instead of stacking peaks.
+      const drumBus  = makeNode("AudioBus",   800, 200, { lvl1: 1.0, lvl2: 0.85, lvl3: 0.55, lvl4: 0.55 });
+      const drumComp = makeNode("Compressor", 980, 200, { threshold: 0.6, ratio: 2.5, attack: 6, release: 90, makeup: 1.3 });
+      state.edges.push({ from: { node: kickMul,  port: "out" }, to: { node: drumBus,  port: "in1" } });
+      state.edges.push({ from: { node: snareMul, port: "out" }, to: { node: drumBus,  port: "in2" } });
+      state.edges.push({ from: { node: hatMul,   port: "out" }, to: { node: drumBus,  port: "in3" } });
+      state.edges.push({ from: { node: percMul,  port: "out" }, to: { node: drumBus,  port: "in4" } });
+      state.edges.push({ from: { node: drumBus,  port: "out" }, to: { node: drumComp, port: "in" } });
 
-      // ── Bass: bar-driven repeating root note ──────────────
+      // ── Parallel FX send: snare + perc -> PlateReverb ─────
+      // True parallel send: reverbBus sums the "wet candidates", the
+      // PlateReverb runs at mix=1.0 (fully wet, no dry pass-through),
+      // and its output joins the master mix as its own channel
+      // alongside the dry drumComp. Kick stays bone-dry so the low
+      // end doesn't get smeared by reverb diffusion.
+      const reverbBus = makeNode("AudioBus",   980, 320, { lvl1: 1.0, lvl2: 0.7, lvl3: 0, lvl4: 0 });
+      const reverb    = makeNode("PlateReverb",1160, 320, { decay: 0.7, mix: 1.0 });
+      state.edges.push({ from: { node: snareMul,  port: "out" }, to: { node: reverbBus, port: "in1" } });
+      state.edges.push({ from: { node: percMul,   port: "out" }, to: { node: reverbBus, port: "in2" } });
+      state.edges.push({ from: { node: reverbBus, port: "out" }, to: { node: reverb,    port: "in"  } });
+
+      // ── Bass: HP-clean -> LP -> compressor (controlled low end) ─
       const bassSeq = makeNode("StepSeq16", 220, 480, {
         steps: [true,false,false,true,false,false,true,false,
                 true,false,false,true,false,true,false,false]
       });
-      const bassOsc = makeNode("Sine",       420, 480, { freq: 82.4 });   // E2
-      const bassEnv = makeNode("AD",         420, 540, { attack: 0.005, decay: 0.30 });
-      const bassMul = makeNode("Mul",        600, 500);
-      const bassLp  = makeNode("BiquadLP",   760, 500, { cutoff: 700, q: 2.0 });
-      state.edges.push({ from: { node: clk,     port: "sixteenth" }, to: { node: bassSeq, port: "clock" } });
-      state.edges.push({ from: { node: bassSeq, port: "out"      }, to: { node: bassEnv, port: "trig"  } });
-      state.edges.push({ from: { node: bassOsc, port: "out"      }, to: { node: bassMul, port: "a"     } });
-      state.edges.push({ from: { node: bassEnv, port: "out"      }, to: { node: bassMul, port: "b"     } });
-      state.edges.push({ from: { node: bassMul, port: "out"      }, to: { node: bassLp,  port: "in"    } });
+      const bassOsc  = makeNode("Sine",       420, 480, { freq: 82.4 });   // E2
+      const bassEnv  = makeNode("AD",         420, 540, { attack: 0.005, decay: 0.30 });
+      const bassMul  = makeNode("Mul",        600, 500);
+      const bassHp   = makeNode("BiquadHP",   760, 500, { cutoff: 45,  q: 0.7 });   // sub-clean
+      const bassLp   = makeNode("BiquadLP",   920, 500, { cutoff: 700, q: 2.0 });   // body resonance
+      const bassComp = makeNode("Compressor",1080, 500, { threshold: 0.55, ratio: 3, attack: 4, release: 70, makeup: 1.25 });
+      state.edges.push({ from: { node: clk,     port: "sixteenth" }, to: { node: bassSeq,  port: "clock" } });
+      state.edges.push({ from: { node: bassSeq, port: "out"      }, to: { node: bassEnv,  port: "trig"  } });
+      state.edges.push({ from: { node: bassOsc, port: "out"      }, to: { node: bassMul,  port: "a"     } });
+      state.edges.push({ from: { node: bassEnv, port: "out"      }, to: { node: bassMul,  port: "b"     } });
+      state.edges.push({ from: { node: bassMul, port: "out"      }, to: { node: bassHp,   port: "in"    } });
+      state.edges.push({ from: { node: bassHp,  port: "out"      }, to: { node: bassLp,   port: "in"    } });
+      state.edges.push({ from: { node: bassLp,  port: "out"      }, to: { node: bassComp, port: "in"    } });
 
-      // ── Pad: two slightly detuned Sines through a low-pass ─
-      const padA = makeNode("Sine",     420, 640, { freq: 220.0 });   // A3
-      const padB = makeNode("Sine",     420, 700, { freq: 220.4 });   // A3 + cents
-      const padSum = makeNode("Add",    600, 660);
-      const padLp  = makeNode("BiquadLP", 760, 660, { cutoff: 1400, q: 0.7 });
-      state.edges.push({ from: { node: padA, port: "out" }, to: { node: padSum, port: "a" } });
-      state.edges.push({ from: { node: padB, port: "out" }, to: { node: padSum, port: "b" } });
-      state.edges.push({ from: { node: padSum, port: "out" }, to: { node: padLp, port: "in" } });
+      // ── Pad: detuned Sines -> LP -> Tremolo -> tempo delay ─
+      // Tremolo adds slow amplitude motion (0.4 Hz, 18% depth) so the
+      // sustained tone breathes; TempoSyncDelay locked to a 1/8 note
+      // adds rhythmic echoes that lock to the kick pattern.
+      const padA       = makeNode("Sine",          420, 640, { freq: 220.0 });   // A3
+      const padB       = makeNode("Sine",          420, 700, { freq: 220.4 });   // A3 + ~3 cents detune
+      const padSum     = makeNode("Add",           600, 660);
+      const padLp      = makeNode("BiquadLP",      760, 660, { cutoff: 1400, q: 0.7 });
+      const padTrem    = makeNode("Tremolo",       920, 660, { rate: 0.4, depth: 0.18 });
+      const padDelay   = makeNode("TempoSyncDelay",1080, 660, { division: 0.5, feedback: 0.42, mix: 0.22 });
+      state.edges.push({ from: { node: padA,     port: "out" }, to: { node: padSum,   port: "a" } });
+      state.edges.push({ from: { node: padB,     port: "out" }, to: { node: padSum,   port: "b" } });
+      state.edges.push({ from: { node: padSum,   port: "out" }, to: { node: padLp,    port: "in" } });
+      state.edges.push({ from: { node: padLp,    port: "out" }, to: { node: padTrem,  port: "in" } });
+      state.edges.push({ from: { node: padTrem,  port: "out" }, to: { node: padDelay, port: "in" } });
+      // Wire MasterClock.bpm into the delay so changing tempo keeps it locked.
+      state.edges.push({ from: { node: clk, port: "bpm" }, to: { node: padDelay, port: "bpm" } });
 
-      // ── Melodic submix (bass + pad + spare slots) ─────────
-      const melBus = makeNode("AudioBus", 960, 580, { lvl1: 0.9, lvl2: 0.4, lvl3: 0, lvl4: 0 });
-      state.edges.push({ from: { node: bassLp, port: "out" }, to: { node: melBus, port: "in1" } });
-      state.edges.push({ from: { node: padLp,  port: "out" }, to: { node: melBus, port: "in2" } });
+      // ── Master mix (4 channels, panned for stereo placement) ─
+      //   ch1 = drum bus (post-comp)   center
+      //   ch2 = reverb return           slight left wash (0.4)
+      //   ch3 = bass (post-comp)        center
+      //   ch4 = pad (post-delay)        slight right (0.65)
+      const mix = makeNode("MasterMix", 1320, 360, {
+        lvl1: 1.0,  lvl2: 0.5,  lvl3: 0.9,  lvl4: 0.7,
+        pan1: 0.5,  pan2: 0.4,  pan3: 0.5,  pan4: 0.65,
+        master: 0.85
+      });
+      state.edges.push({ from: { node: drumComp, port: "out" }, to: { node: mix, port: "in1" } });
+      state.edges.push({ from: { node: reverb,   port: "out" }, to: { node: mix, port: "in2" } });
+      state.edges.push({ from: { node: bassComp, port: "out" }, to: { node: mix, port: "in3" } });
+      state.edges.push({ from: { node: padDelay, port: "out" }, to: { node: mix, port: "in4" } });
 
-      // ── FX send: drum bus -> PlateReverb (parallel) ───────
-      const reverb = makeNode("PlateReverb", 960, 200, { decay: 0.7, mix: 0.35 });
-      state.edges.push({ from: { node: drumBus, port: "out" }, to: { node: reverb, port: "in" } });
+      // ── Master bus polish: glue compression then brick-wall limit ─
+      // Per-channel master compressor (gentle 2:1 above 0.7 with slow
+      // attack so transients are preserved, fast release for transparency)
+      // then a Limiter as a safety net before the output. Limiter
+      // threshold is linear amplitude, not dB.
+      const masterCompL = makeNode("Compressor", 1500, 320, { threshold: 0.7, ratio: 2, attack: 10, release: 100, makeup: 1.1 });
+      const masterCompR = makeNode("Compressor", 1500, 400, { threshold: 0.7, ratio: 2, attack: 10, release: 100, makeup: 1.1 });
+      state.edges.push({ from: { node: mix, port: "L" }, to: { node: masterCompL, port: "in" } });
+      state.edges.push({ from: { node: mix, port: "R" }, to: { node: masterCompR, port: "in" } });
 
-      // ── Master compressor + limiter + output ──────────────
-      const mix  = makeNode("MasterMix", 1160, 360, { lvl1: 1.0, lvl2: 0.6, lvl3: 0.9, lvl4: 0, pan1: 0.5, pan2: 0.5, pan3: 0.5, pan4: 0.5, master: 0.85 });
-      state.edges.push({ from: { node: drumBus, port: "out" }, to: { node: mix, port: "in1" } });
-      state.edges.push({ from: { node: reverb,  port: "out" }, to: { node: mix, port: "in2" } });
-      state.edges.push({ from: { node: melBus,  port: "out" }, to: { node: mix, port: "in3" } });
+      const limL = makeNode("Limiter", 1680, 320, { threshold: 0.95, attack: 1, release: 80 });
+      const limR = makeNode("Limiter", 1680, 400, { threshold: 0.95, attack: 1, release: 80 });
+      state.edges.push({ from: { node: masterCompL, port: "out" }, to: { node: limL, port: "in" } });
+      state.edges.push({ from: { node: masterCompR, port: "out" }, to: { node: limR, port: "in" } });
 
-      // Limiter threshold is linear amplitude (0..1+), not dB.
-      const limL = makeNode("Limiter", 1340, 320, { threshold: 0.9, release: 80 });
-      const limR = makeNode("Limiter", 1340, 400, { threshold: 0.9, release: 80 });
-      state.edges.push({ from: { node: mix, port: "L" }, to: { node: limL, port: "in" } });
-      state.edges.push({ from: { node: mix, port: "R" }, to: { node: limR, port: "in" } });
-
-      const out = makeNode("OutputStereo", 1520, 360);
+      const out = makeNode("OutputStereo", 1860, 360);
       state.edges.push({ from: { node: limL, port: "out" }, to: { node: out, port: "L" } });
       state.edges.push({ from: { node: limR, port: "out" }, to: { node: out, port: "R" } });
     }
@@ -29438,13 +29486,23 @@ const Visual = {
   // consumer's composition pass reads it.
   compositionShaderBgl: null,
   compositionShaderPipelineLayout: null,
-  // Scratch render-target texture (Phase 6.6.30). Separate from
-  // framebuffer so composition can read it while the framebuffer is
-  // an attachment without WebGPU subresource-conflict issues.
-  // SCRATCH_BUDGET layers; allocated in _allocateFramebuffer.
-  scratchTexture:        null,
-  scratchArrayView:      null,
-  scratchLayerViews:     [],
+  // Scratch render-target textures (Phase 6.6.30 + v0.2.16 ping-pong).
+  // Two scratch textures (A and B) so a deep composition chain doesn't
+  // hit the WebGPU same-pass texture-binding-vs-render-attachment rule:
+  // a composition node at chain-depth d WRITES to one scratch texture
+  // and READS the other within its single render pass, never the same.
+  // Parity rule (see _buildRenderPlan):
+  //   readKey  = (depth     % 2 === 0) ? "a" : "b"
+  //   writeKey = ((depth-1) % 2 === 0) ? "a" : "b"   (only for scratch)
+  // So depth 0 reads A; depth 1 writes A and reads B; depth 2 writes B
+  // and reads A; etc. WebGPU sees distinct textures per pass.
+  // SCRATCH_BUDGET layers per texture; both allocated in _allocateFramebuffer.
+  scratchTextureA:        null,
+  scratchArrayViewA:      null,
+  scratchLayerViewsA:     [],
+  scratchTextureB:        null,
+  scratchArrayViewB:      null,
+  scratchLayerViewsB:     [],
 
   // Per-node-instance render state. Map<nodeId, { uniformBuffer,
   // bindGroup, scratch }>. uniformBuffer is the GPU-side state that
@@ -29630,15 +29688,19 @@ function _allocateFramebuffer() {
   if (Visual.feedbackArray) {
     try { Visual.feedbackArray.destroy(); } catch (_) {}
   }
-  if (Visual.scratchTexture) {
-    try { Visual.scratchTexture.destroy(); } catch (_) {}
+  if (Visual.scratchTextureA) {
+    try { Visual.scratchTextureA.destroy(); } catch (_) {}
+  }
+  if (Visual.scratchTextureB) {
+    try { Visual.scratchTextureB.destroy(); } catch (_) {}
   }
   // Phase 6.6.30 — framebuffer + feedbackArray sized to rig display
   // count only (reverted v0.2.4's over-allocation). Scratch lives in
-  // a SEPARATE Visual.scratchTexture (allocated below). Lets each
-  // VO's composition pass read scratch in the SAME frame without
-  // the WebGPU same-texture-attachment-and-binding conflict that
-  // an over-allocated framebuffer would have hit.
+  // TWO SEPARATE textures (A + B, allocated below); deep composition
+  // chains ping-pong between them so each pass reads from one and
+  // writes to the other -- preserves the same-frame read invariant
+  // without violating WebGPU's same-pass texture-binding-vs-
+  // render-attachment rule that an in-place scratch chain would hit.
   const SCRATCH_BUDGET = 8;
   const displayCount = Math.max(1, (state && state.rig && Array.isArray(state.rig.displays) && state.rig.displays.length) || 1);
   Visual.rigDisplayCount = displayCount;
@@ -29683,34 +29745,47 @@ function _allocateFramebuffer() {
     label: "feedback-array",
     dimension: "2d-array"
   });
-  // Phase 6.6.30 — separate scratch render-target texture for
-  // composition node inputs. SCRATCH_BUDGET layers, isolated from
-  // the framebuffer so composition shaders can sample it while the
-  // framebuffer is bound as a render attachment. Per-VO render
-  // loop overwrites these slots before each consumer's composition
-  // pass, so the same slot can be reused across N consumer VOs --
-  // SCRATCH_BUDGET only needs to cover ONE consumer's chain width,
-  // not N consumers × width.
-  Visual.scratchTexture = Visual.device.createTexture({
-    label: "visual-scratch-array-" + SCRATCH_BUDGET + "x-" + Visual.resolutionKey,
-    size: [Visual.fbWidth, Visual.fbHeight, SCRATCH_BUDGET],
-    dimension: "2d",
-    format: Visual.fbFormat,
-    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
-  });
-  Visual.scratchArrayView = Visual.scratchTexture.createView({
-    label: "scratch-array",
-    dimension: "2d-array"
-  });
-  Visual.scratchLayerViews = [];
-  for (let i = 0; i < SCRATCH_BUDGET; i++) {
-    Visual.scratchLayerViews.push(Visual.scratchTexture.createView({
-      label: "scratch-layer-" + i,
+  // Phase 6.6.30 + v0.2.16 — two scratch render-target textures (A + B)
+  // for composition node inputs. SCRATCH_BUDGET layers each, isolated
+  // from the framebuffer. Deep composition chains ping-pong between
+  // A and B per chain-depth: each composition pass binds ONE for read
+  // and attaches the OTHER for write, so WebGPU never sees the same
+  // texture as both TextureBinding and RenderAttachment in one pass.
+  // Per-VO render loop overwrites these slots before each consumer's
+  // composition pass, so the same slot can be reused across N consumer
+  // VOs -- SCRATCH_BUDGET only needs to cover ONE consumer's chain
+  // width per texture, not N consumers × width.
+  function allocScratch(key) {
+    const tex = Visual.device.createTexture({
+      label: "visual-scratch-" + key + "-array-" + SCRATCH_BUDGET + "x-" + Visual.resolutionKey,
+      size: [Visual.fbWidth, Visual.fbHeight, SCRATCH_BUDGET],
       dimension: "2d",
-      baseArrayLayer: i,
-      arrayLayerCount: 1
-    }));
+      format: Visual.fbFormat,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
+    });
+    const arrayView = tex.createView({
+      label: "scratch-" + key + "-array",
+      dimension: "2d-array"
+    });
+    const layerViews = [];
+    for (let i = 0; i < SCRATCH_BUDGET; i++) {
+      layerViews.push(tex.createView({
+        label: "scratch-" + key + "-layer-" + i,
+        dimension: "2d",
+        baseArrayLayer: i,
+        arrayLayerCount: 1
+      }));
+    }
+    return { tex, arrayView, layerViews };
   }
+  const scA = allocScratch("a");
+  const scB = allocScratch("b");
+  Visual.scratchTextureA    = scA.tex;
+  Visual.scratchArrayViewA  = scA.arrayView;
+  Visual.scratchLayerViewsA = scA.layerViews;
+  Visual.scratchTextureB    = scB.tex;
+  Visual.scratchArrayViewB  = scB.arrayView;
+  Visual.scratchLayerViewsB = scB.layerViews;
   // Drop any cached shader instances since their feedback / composition
   // bind groups reference the now-destroyed views; they'll rebuild on
   // next render.
@@ -31808,9 +31883,14 @@ function _getShaderPipeline(wgsl, bindLayout) {
  * deterministic for a given node; non-deterministic output would
  * cause every frame to look up a new cache entry and trigger
  * an endless compile cascade. */
-function _ensureShaderInstance(nodeId, def, srcNode) {
+function _ensureShaderInstance(nodeId, def, srcNode, scratchReadKey) {
   let inst = Visual.shaderInstances.get(nodeId);
   const bindLayout = def.bindLayout || "standard";
+  // v0.2.16 — composition bind layout supports two scratch textures
+  // (A and B) for ping-pong; caller passes scratchReadKey ("a" or "b")
+  // to pick which one this instance binds for reading. Defaults to "a"
+  // for backwards compat with callers that don't pass it.
+  if (!scratchReadKey) scratchReadKey = "a";
   // Phase 6.6.23 — resolve dynamic WGSL. If the function throws,
   // log it once + bail; caller falls back gracefully (returns
   // null, _encodeShaderFragPassForVO checks for it).
@@ -31833,7 +31913,9 @@ function _ensureShaderInstance(nodeId, def, srcNode) {
   // doesn't match (fresh node, user edited params, framebuffer
   // resized so the view's stale, etc).
   const feedbackView    = bindLayout === "feedback"    ? Visual.feedbackArrayView : null;
-  const compositionView = bindLayout === "composition" ? Visual.scratchArrayView  : null;
+  const compositionView = bindLayout === "composition"
+    ? (scratchReadKey === "b" ? Visual.scratchArrayViewB : Visual.scratchArrayViewA)
+    : null;
   const samplerRef      = (bindLayout === "feedback" || bindLayout === "composition")
                           ? Visual.blitSampler : null;
   const layoutMismatch     = inst && inst._bindLayout !== bindLayout;
@@ -32746,27 +32828,35 @@ function _encodeVisualGraph(enc, dtSec) {
   return true;
 }
 
-/* Phase 6.6.30 — walk the patch graph from each VisualOutput and
- * build a per-VO render schedule plus a flat key->entry map for
- * texture-input resolution. Two big changes from v0.2.1's design:
+/* Phase 6.6.30 + v0.2.16 — walk the patch graph from each VisualOutput
+ * and build a per-VO render schedule plus a flat key->entry map for
+ * texture-input resolution. Three properties to maintain:
  *
- *   1. Scratch slots are RELATIVE indices (0..SCRATCH_BUDGET-1)
- *      into Visual.scratchTexture, not absolute framebuffer layers.
- *      The scratch counter resets to 0 for each VO so different
- *      consumers REUSE the same slots -- each VO overwrites the
- *      slots before its composition pass reads them.
+ *   1. Scratch slots are RELATIVE indices (0..SCRATCH_BUDGET-1) into
+ *      the per-parity scratch texture. Per-VO counters reset to 0,
+ *      with separate counters for "a" and "b" textures.
  *
- *   2. Per-VO schedule is post-order DFS (leaves first, target
- *      last) so by the time a composition pass runs, all its
- *      upstream scratch slots have been written this frame.
+ *   2. Per-VO schedule is post-order DFS (leaves first, target last)
+ *      so by the time a composition pass runs, all its upstream
+ *      scratch slots have been written this frame.
+ *
+ *   3. v0.2.16 — chain depth tracked recursively. depth=0 = direct
+ *      VO consumer (writes framebuffer). depth=N = N levels above
+ *      the VO in the chain (writes scratch). Each entry carries:
+ *        readKey  = (depth     % 2 === 0) ? "a" : "b"
+ *        writeKey = ((depth-1) % 2 === 0) ? "a" : "b"   (depth >= 1)
+ *      Composition shaders bind READ key for their texture and
+ *      attach a layer of the WRITE key's scratch texture. They are
+ *      always different parities, so WebGPU never sees the same
+ *      texture in both TextureBinding and RenderAttachment in one pass.
  *
  * planKey:    `${sourceNodeId}@${consumerVOId}` -- unique per
  *             (source × consumer VO) pair. Lookup target for
  *             _resolveTextureInputLayer.
- * planEntry:  { node, def, layerIdx, consumerVO, isScratch }.
- *             For isScratch, layerIdx is the relative scratch
- *             index. For direct, layerIdx is the framebuffer
- *             display layer. */
+ * planEntry:  { node, def, layerIdx, consumerVO, isScratch,
+ *               depth, readKey, writeKey }. layerIdx is RELATIVE to
+ *             whichever scratch texture writeKey selects (for
+ *             isScratch) or the framebuffer display layer (direct). */
 function _buildRenderPlan(visualOutputs) {
   const plan = new Map();
   const schedules = new Map();
@@ -32780,9 +32870,13 @@ function _buildRenderPlan(visualOutputs) {
   for (const vo of visualOutputs) {
     const sched = [];
     schedules.set(vo.id, sched);
-    let scratchCounter = 0;
+    // Per-parity scratch counters (v0.2.16). Each parity has up to
+    // SCRATCH_BUDGET slots; the per-VO walk uses one slot from the
+    // matching counter per scratch entry.
+    let counterA = 0;
+    let counterB = 0;
 
-    function walk(nodeId, isViaCompPort) {
+    function walk(nodeId, isViaCompPort, depth) {
       const node = state.nodes.find(n => n.id === nodeId);
       if (!node) return;
       const def = TYPES[node.type];
@@ -32792,11 +32886,26 @@ function _buildRenderPlan(visualOutputs) {
       const planKey = node.id + "@" + vo.id;
       if (plan.has(planKey)) return;
 
+      // readKey: which scratch texture THIS node reads from when it
+      //   binds the composition layout (= parity of depth).
+      // writeKey: which scratch texture THIS scratch entry writes to.
+      //   Always opposite parity of readKey so a single pass never
+      //   binds + attaches the same texture.
+      const readKey  = (depth      % 2 === 0) ? "a" : "b";
+      const writeKey = isViaCompPort
+        ? (((depth - 1) % 2 === 0) ? "a" : "b")
+        : null;
+
       let layerIdx;
       let isScratch;
       if (isViaCompPort) {
-        if (scratchCounter >= SCRATCH_BUDGET) return;
-        layerIdx = scratchCounter++;
+        if (writeKey === "a") {
+          if (counterA >= SCRATCH_BUDGET) return;
+          layerIdx = counterA++;
+        } else {
+          if (counterB >= SCRATCH_BUDGET) return;
+          layerIdx = counterB++;
+        }
         isScratch = true;
       } else {
         layerIdx = (vo.params && typeof vo.params.display === "number")
@@ -32806,7 +32915,7 @@ function _buildRenderPlan(visualOutputs) {
         isScratch = false;
       }
 
-      const entry = { node, def, layerIdx, consumerVO: vo, isScratch };
+      const entry = { node, def, layerIdx, consumerVO: vo, isScratch, depth, readKey, writeKey };
       plan.set(planKey, entry);
 
       // Recurse FIRST (post-order DFS) so leaves render before
@@ -32818,7 +32927,7 @@ function _buildRenderPlan(visualOutputs) {
             e && e.to && e.to.node === nodeId && e.to.port === port.n
           );
           if (!wire || !wire.from) continue;
-          walk(wire.from.node, true);
+          walk(wire.from.node, true, depth + 1);
         }
       }
       sched.push(entry);
@@ -32827,28 +32936,38 @@ function _buildRenderPlan(visualOutputs) {
     const incoming = state.edges.find(e =>
       e && e.to && e.to.node === vo.id && e.to.port === "in"
     );
-    if (incoming && incoming.from) walk(incoming.from.node, false);
+    if (incoming && incoming.from) walk(incoming.from.node, false, 0);
   }
   return { plan, schedules };
 }
 
-/* Phase 6.6.30 — render one plan entry. Handles BOTH the scratch
- * case (writes to Visual.scratchLayerViews[layerIdx] -- relative
+/* Phase 6.6.30 + v0.2.16 — render one plan entry. Handles BOTH the
+ * scratch case (writes to scratchLayerViewsA/B[layerIdx] -- relative
  * index 0..SCRATCH_BUDGET-1, used by composition reads in the same
  * frame) AND the direct VO case (writes to
  * Visual.framebufferLayerViews[layerIdx] -- absolute display layer).
  *
+ * v0.2.16 ping-pong: writeKey picks the scratch texture this pass
+ * writes to; readKey picks the scratch texture the bind group reads
+ * from. Always opposite parities so WebGPU never sees the same
+ * texture in both bindings within one pass. Instance key includes
+ * readKey so composition instances are cached per scratch-view they
+ * bind (instead of one shared bind group that could be stale).
+ *
  * Per-consumer instance key prevents collision between the same
  * source feeding multiple consumer VOs (each has its own uniform
- * buffer + pose). Scratch entries' bound texture (via composition
- * bind layout) is Visual.scratchArrayView; the writeUniforms-
- * resolved scratch indices are RELATIVE so the WGSL sample with
- * those indices reads the right scratch layer. */
+ * buffer + pose). The writeUniforms-resolved scratch indices are
+ * RELATIVE so the WGSL sample with those indices reads the right
+ * scratch layer in the bound parity. */
 function _encodeShaderFragPassForPlan(enc, entry, dtSec) {
-  const { node, def, layerIdx, consumerVO, isScratch } = entry;
-  const layerView = isScratch
-    ? Visual.scratchLayerViews[layerIdx]
-    : Visual.framebufferLayerViews[layerIdx];
+  const { node, def, layerIdx, consumerVO, isScratch, readKey, writeKey } = entry;
+  let layerView;
+  if (isScratch) {
+    const views = (writeKey === "a") ? Visual.scratchLayerViewsA : Visual.scratchLayerViewsB;
+    layerView = views[layerIdx];
+  } else {
+    layerView = Visual.framebufferLayerViews[layerIdx];
+  }
   if (!layerView) return false;
 
   // Instance key — direct entries use the consumer VO id (one
@@ -32856,12 +32975,19 @@ function _encodeShaderFragPassForPlan(enc, entry, dtSec) {
   // Scratch entries use a "scratch:" prefix so a node that's BOTH
   // direct-wired AND used as a composition input has two separate
   // instances (different bind layouts, different uniforms).
-  const instKey = isScratch
+  //
+  // v0.2.16 — composition bind layout needs distinct instances per
+  // readKey parity so each instance's bind group references the
+  // matching scratchArrayView. Append :rk-<a|b> when this node is a
+  // composition shader (its bind group binds a scratch texture).
+  const isComp = def.bindLayout === "composition";
+  let instKey = isScratch
     ? "scratch:" + node.id + ":" + consumerVO.id
     : consumerVO.id;
+  if (isComp) instKey += ":rk-" + readKey;
   // Phase 6.6.28 — wire-resolved params for the dynamic WGSL fn too.
   const nodeResolvedForInst = _nodeWithResolvedParams(node);
-  const inst = _ensureShaderInstance(instKey, def, nodeResolvedForInst);
+  const inst = _ensureShaderInstance(instKey, def, nodeResolvedForInst, readKey);
   if (!inst) return false;
   const pipeEntry = inst.pipelineEntry;
   if (!pipeEntry || !pipeEntry.pipeline) return false;
