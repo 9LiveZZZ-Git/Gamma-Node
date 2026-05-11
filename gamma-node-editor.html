@@ -13104,14 +13104,20 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
 };
 @group(0) @binding(0) var<uniform> u: U;
 
-// Phase 6.5.2 / 6.5.3 — audio uniform.
+// Phase 6.5.2 / 6.5.3 / 6.5.4 — audio uniform.
 //   values[0].x   = worklet master output peak this quantum (0..1)
-//   values[0].yzw, values[1..3] reserved for future audio-rate slots
+//   values[0].yzw, values[1..2.zyx] reserved for future audio-rate slots
+//   values[2].w   = MasterClock bpm                  (raw, e.g. 120.0)
+//   values[3].x   = MasterClock bar       envelope   (1 at downbeat -> ~0 between bars)
+//   values[3].y   = MasterClock beat      envelope   (1 at every beat)
+//   values[3].z   = MasterClock sixteenth envelope   (1 every 1/16 note)
+//   values[3].w   = MasterClock phase (0..1 ramp per beat, continuous)
 //   fft[k/4][k%4] = 256 log-spaced FFT magnitude bins (0..1)
-// Tempo / clock signals do NOT live in this uniform anymore --
-// MasterClock node outputs flow through the wired-param resolver
-// instead, so shaders read them via their normal t="param"
-// inputs (see Plasma's clockReact below for the convention).
+// The clock slots are populated by the first MasterClock node in the
+// patch (none -> zero). Any shader can read u_audio.values[3].y for
+// "pulse on every beat" without needing a wired clockReact param.
+// The wired path (e.g. MasterClock.beat -> Plasma.clockReact) still
+// works -- it just lives in u.params2.y instead of u_audio.
 struct AudioU {
   values: array<vec4<f32>, 4>,
   fft:    array<vec4<f32>, 64>,
@@ -27729,6 +27735,45 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   return vec4f(s, s, s, 1.0);
 }
 
+Audio + clock uniform (always bound at @group(0) @binding(3)):
+A second uniform carries global audio + tempo signals. Declare it
+optionally — shaders that don't need it can skip the struct entirely.
+
+    struct AudioU {
+      values: array<vec4<f32>, 4>,   // 16 scalar slots
+      fft:    array<vec4<f32>, 64>,  // 256 log-spaced FFT bins
+    };
+    @group(0) @binding(3) var<uniform> u_audio: AudioU;
+
+Slot assignments (read AS-IS, no further mapping needed):
+    values[0].x   = master output peak this quantum    (0..1)
+    values[2].w   = MasterClock bpm                    (raw, e.g. 120.0)
+    values[3].x   = MasterClock bar       envelope     (1 at downbeat -> ~0)
+    values[3].y   = MasterClock beat      envelope     (pulses each beat)
+    values[3].z   = MasterClock sixteenth envelope     (pulses every 1/16)
+    values[3].w   = MasterClock phase                  (continuous 0..1 ramp / beat)
+    fft[k/4u][k%4u] for k in 0..255                    = log-spaced 20Hz..Nyquist (0..1)
+
+The clock slots are populated by the first MasterClock node in the
+patch (no MasterClock -> zero). This means you can write audio-reactive
+or tempo-synced shaders WITHOUT exposing a clockReact param + asking
+the user to wire it — just read u_audio.values[3].y directly. A common
+pattern: amplify the cubic-decay envelope into a flash that pulses on
+each beat:
+    let beat_pulse = u_audio.values[3].y;       // 1.0 at the beat, ~0 between
+    let beat_flash = beat_pulse * beat_pulse;   // sharpen the decay
+    color = color + vec3f(beat_flash * 0.3);    // additive flash
+
+To read an FFT bin as a plain scalar:
+    fn fft_bin(k: u32) -> f32 {
+      let v = u_audio.fft[k / 4u];
+      let lane = k & 3u;
+      if (lane == 0u) { return v.x; }
+      if (lane == 1u) { return v.y; }
+      if (lane == 2u) { return v.z; }
+      return v.w;
+    }
+
 Hot reload is automatic: any edit to the WGSL body re-hashes into a
 fresh pipeline-cache entry, async-compiles, and swaps onto live
 shader-frag nodes on the next frame — the old pipeline keeps rendering
@@ -30072,20 +30117,24 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     size: RIG_MAX_DISPLAYS * 16,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
   });
-  // Phase 6.5.2 + 6.5.3 — global audio uniform buffer. 16 scalar
-  // slots + 256 FFT bins, bound at @binding(3) in every shader-frag
-  // bind layout (standard / feedback / composition). Shader-frags
-  // declare the struct with the fields they want:
+  // Phase 6.5.2 + 6.5.3 + 6.5.4 — global audio uniform buffer.
+  // 16 scalar slots + 256 FFT bins, bound at @binding(3) in every
+  // shader-frag bind layout (standard / feedback / composition).
+  // Shader-frags declare the struct with the fields they want:
   //   struct AudioU {
   //     values: array<vec4<f32>, 4>,    // 16 scalars (slots 0-15)
   //     fft:    array<vec4<f32>, 64>,   // 256 log-spaced FFT bins
   //   };
   //   @group(0) @binding(3) var<uniform> u_audio: AudioU;
-  // Scalars and FFT can both be sourced (per-quantum master peak in
-  // slot 0 from 6.5.2; per-frame log-spaced FFT bins from 6.5.3 below).
-  // 1088 B total = 64 B scalars + 1024 B FFT. Per-frame copy
-  // from SAB happens in renderVisualFrame() before any shader pass
-  // encodes (see _writeAudioUniform).
+  // Slot assignments:
+  //   values[0].x   = master output peak this quantum (worklet, 6.5.2)
+  //   values[2].w   = MasterClock bpm                              (6.5.4)
+  //   values[3].xyz = MasterClock bar / beat / sixteenth envelopes (6.5.4)
+  //   values[3].w   = MasterClock 0..1 phase ramp                  (6.5.4)
+  //   fft[0..63]    = 256 log-spaced FFT magnitude bins (6.5.3)
+  // 1088 B total = 64 B scalars + 1024 B FFT. Per-frame copy from
+  // SAB happens in renderVisualFrame() before any shader pass
+  // encodes (see _writeAudioUniform + _writeClockUniformSlots).
   Visual.audioUniformBuffer = Visual.device.createBuffer({
     label: "audio-uniform",
     size: 1088,
@@ -31710,10 +31759,11 @@ function _updateAudioFft() {
   }
 }
 
-/* Phase 6.5.2 + 6.5.3 — read SAB scalar slots + FFT bins into the
- * global GPU audio uniform buffer. Runs once per frame from
- * renderVisualFrame(). One writeBuffer of 1088 B; always runs when
- * device + buffer exist, even if no shader reads u_audio. */
+/* Phase 6.5.2 + 6.5.3 + 6.5.4 — read SAB scalar slots + FFT bins
+ * into the global GPU audio uniform buffer + overlay the JS-side
+ * MasterClock state. Runs once per frame from renderVisualFrame().
+ * One writeBuffer of 1088 B; always runs when device + buffer exist,
+ * even if no shader reads u_audio. */
 function _writeAudioUniform() {
   if (!Visual.device || !Visual.audioUniformBuffer || !Visual.audioUniformScratch) return;
   const sc = Visual.audioUniformScratch;
@@ -31730,10 +31780,52 @@ function _writeAudioUniform() {
     // Bridge unavailable -> zero out so shaders behave deterministically.
     for (let i = 0; i < 272; i++) sc[i] = 0;
   }
+  // Phase 6.5.4 — overlay global clock values from the FIRST
+  // MasterClock node in the patch. Runs even when the audio bridge
+  // isn't available, since clock state is main-thread derived (no
+  // worklet roundtrip). Lets any shader read u_audio.values[2..3]
+  // for tempo-sync without needing a wired clockReact param.
+  _writeClockUniformSlots(sc);
   Visual.device.queue.writeBuffer(
     Visual.audioUniformBuffer, 0,
     sc.buffer, sc.byteOffset, sc.byteLength
   );
+}
+
+/* Phase 6.5.4 — surface MasterClock as global audio-uniform scalars.
+ * Layout (4 slots in values[2].w + 4 in values[3]):
+ *   slot 11 (values[2].w) = bpm        (raw, e.g. 120.0)
+ *   slot 12 (values[3].x) = bar        (cubic-decay envelope, 1.0 at downbeat → ~0 just before next bar)
+ *   slot 13 (values[3].y) = beat       (cubic-decay envelope per beat)
+ *   slot 14 (values[3].z) = sixteenth  (cubic-decay envelope per 1/16 note — high-frequency shimmer)
+ *   slot 15 (values[3].w) = phase      (continuous 0..1 ramp within current beat)
+ *
+ * Source is the FIRST MasterClock node in state.nodes (lookup via
+ * state.nodes.find). Multiple MasterClocks aren't really sensible
+ * (patches should have one tempo); the first wins.
+ *
+ * No MasterClock in patch -> slots zero so shaders see "no tempo."
+ * This means even unwired shaders can opt into tempo reactivity by
+ * reading u_audio.values[3] in their WGSL -- no registry change
+ * needed, no explicit clockReact wire required. The wired-param
+ * path (Plasma.clockReact from MasterClock.beat, etc.) keeps working
+ * unchanged; this is a parallel/complementary path. */
+function _writeClockUniformSlots(sc) {
+  // Defensive default if patch state isn't ready.
+  if (typeof state === "undefined" || !state || !Array.isArray(state.nodes)) {
+    sc[11] = 0; sc[12] = 0; sc[13] = 0; sc[14] = 0; sc[15] = 0;
+    return;
+  }
+  const mc = state.nodes.find(n => n && n.type === "MasterClock");
+  if (!mc) {
+    sc[11] = 0; sc[12] = 0; sc[13] = 0; sc[14] = 0; sc[15] = 0;
+    return;
+  }
+  sc[11] = _masterClockOutputValue(mc, "bpm");
+  sc[12] = _masterClockOutputValue(mc, "bar");
+  sc[13] = _masterClockOutputValue(mc, "beat");
+  sc[14] = _masterClockOutputValue(mc, "sixteenth");
+  sc[15] = _masterClockOutputValue(mc, "phase");
 }
 
 function _ensureStandardShaderLayout() {
@@ -34040,11 +34132,14 @@ function renderVisualFrame() {
   const dtSec = Visual.lastFrameT > 0 ? (now - Visual.lastFrameT) * 0.001 : 0;
   Visual.lastFrameT = now;
 
-  // Phase 6.5.3 — refresh FFT bins in the SAB from the main-thread
-  // analyser, THEN copy the whole SAB audio section into the GPU
-  // uniform buffer. MasterClock-driven values flow through the
-  // wired-param resolver in _resolveNodeParams instead of the SAB
-  // (Phase 6.5.4 redesign), so no clock-specific writer here.
+  // Phase 6.5.3 + 6.5.4 — refresh FFT bins in the SAB from the
+  // main-thread analyser, then write the SAB audio + JS-side
+  // MasterClock state into the GPU audio uniform. Clock state lives
+  // in u_audio.values[2].w (bpm) + values[3] (bar/beat/sixteenth/phase)
+  // -- see _writeClockUniformSlots for the layout. The wired-param
+  // path (Plasma.clockReact <- MasterClock.beat) keeps working
+  // unchanged via _resolveNodeParams; this is a parallel path that
+  // lets unwired shaders also tempo-sync.
   _updateAudioFft();
   _writeAudioUniform();
 
