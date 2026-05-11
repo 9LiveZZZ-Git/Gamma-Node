@@ -33606,28 +33606,51 @@ async function _ensureVideoFile(nodeId, params) {
   return entry;
 }
 
-/* v0.3.11 — locate an upstream video <element> for a landmark node's
- * "video" texture input. Resolves the wire to the source node id,
- * looks up _videoSources, returns the active <video> element if
- * ready. Returns null when the wire is absent OR the source isn't
- * initialized yet OR the source's stream/element isn't ready. The
- * landmark init helper falls back to its own getUserMedia in that
- * case. */
-function _findUpstreamVideoEl(nodeId) {
+/* v0.3.12 — resolve a landmark node's "video" texture input. Three
+ * possible source kinds:
+ *
+ *   { kind: "video",   videoEl, srcNodeId }
+ *     Upstream is a video-element source (Webcam / VideoFile etc) +
+ *     the element has a frame ready. MediaPipe samples videoEl
+ *     directly -- zero extra GPU work.
+ *
+ *   { kind: "texture", srcNodeId, srcType }
+ *     Upstream is any other shader-frag node (Plasma, Butterflies,
+ *     BlendShader, Gradient, etc). Its output lives on a framebuffer
+ *     / scratch GPU layer; the landmark blits that layer to a per-
+ *     node WebGPU canvas each frame + feeds the canvas to MediaPipe.
+ *     The bgMode=1 overlay draws the same canvas content so the
+ *     display matches what the detector saw.
+ *
+ *   null
+ *     No wire on the "video" input. Caller falls back to its own
+ *     getUserMedia camera. */
+function _findUpstreamVideoSource(nodeId) {
   if (typeof state === "undefined" || !state || !Array.isArray(state.edges)) return null;
   const edge = state.edges.find(e =>
     e && e.to && e.to.node === nodeId && e.to.port === "video");
   if (!edge || !edge.from) return null;
-  // Kick the source's init (idempotent) so it warms up alongside us.
   const srcNode = state.nodes && state.nodes.find(n => n.id === edge.from.node);
-  if (srcNode) {
+  if (!srcNode) return null;
+  const srcDef = TYPES[srcNode.type];
+  const isVideoElementSource = srcDef && srcDef.bindLayout === "video-source";
+  if (isVideoElementSource) {
     if (srcNode.type === "VideoFile")   _ensureVideoFile(srcNode.id, srcNode.params || {});
     else if (srcNode.type === "Webcam") _ensureWebcamStream(srcNode.id);
+    const src = _videoSources.get(srcNode.id);
+    if (src && src.ready && src.videoEl && src.videoEl.readyState >= 2) {
+      return { kind: "video", videoEl: src.videoEl, srcNodeId: srcNode.id };
+    }
+    return null;
   }
-  const src = _videoSources.get(edge.from.node);
-  if (!src || !src.ready || !src.videoEl) return null;
-  if (src.videoEl.readyState < 2) return null;
-  return src.videoEl;
+  return { kind: "texture", srcNodeId: srcNode.id, srcType: srcNode.type };
+}
+
+/* Back-compat wrapper -- still used by external call sites that only
+ * care about the videoEl case. */
+function _findUpstreamVideoEl(nodeId) {
+  const src = _findUpstreamVideoSource(nodeId);
+  return (src && src.kind === "video") ? src.videoEl : null;
 }
 
 /* =========================================================================
@@ -33703,21 +33726,58 @@ async function _ensureMediapipeCamera(entry) {
   return stream;
 }
 
-/* v0.3.11 — pick the right video source for a landmark detector.
- * Checks for an upstream wire to the node's "video" texture input
- * first; if a Webcam / VideoFile / etc is wired in AND ready, we
- * borrow its <video> element + mark sharedVideoEl=true so cleanup
- * doesn't tear down a stream another node owns. Otherwise we open
- * our own getUserMedia camera (the v0.3.6 behaviour). */
+/* v0.3.12 — pick the right input source for a landmark detector.
+ * Three branches:
+ *   1. "video"   — upstream is video-element-backed (Webcam/VideoFile)
+ *                  → borrow its <video> element, mark sharedVideoEl
+ *                  so cleanup doesn't tear down a stream another node
+ *                  owns. MediaPipe samples videoEl directly.
+ *   2. "texture" — upstream is any other shader-frag (Plasma /
+ *                  Butterflies / BlendShader / Gradient etc) → set up
+ *                  a per-landmark WebGPU canvas (entry.gpuInputCanvas).
+ *                  The render path blits the upstream's framebuffer
+ *                  layer into this canvas each frame; MediaPipe + the
+ *                  drawCanvas bg both read the canvas content.
+ *   3. fallback  — no wire OR upstream not ready → open own getUserMedia
+ *                  camera (the v0.3.6 default). */
 async function _ensureMediapipeSource(nodeId, entry) {
-  const upstream = _findUpstreamVideoEl(nodeId);
-  if (upstream) {
-    entry.videoEl       = upstream;
-    entry.sharedVideoEl = true;
-    return upstream;
+  const upstream = _findUpstreamVideoSource(nodeId);
+  if (upstream && upstream.kind === "video") {
+    entry.videoEl         = upstream.videoEl;
+    entry.sharedVideoEl   = true;
+    entry.useTextureSource = false;
+    return upstream.videoEl;
   }
+  if (upstream && upstream.kind === "texture") {
+    // Texture-source path: allocate a WebGPU-context'd canvas that the
+    // render loop fills with the upstream layer's content each frame.
+    // MediaPipe's detectForVideo accepts HTMLCanvasElement directly,
+    // so we pass this canvas instead of a videoEl.
+    const w = Visual.fbWidth  || 1920;
+    const h = Visual.fbHeight || 1080;
+    entry.gpuInputCanvas = document.createElement("canvas");
+    entry.gpuInputCanvas.width  = w;
+    entry.gpuInputCanvas.height = h;
+    entry.gpuInputCtx = entry.gpuInputCanvas.getContext("webgpu");
+    if (entry.gpuInputCtx && Visual.device) {
+      entry.gpuInputCtx.configure({
+        device: Visual.device,
+        format: Visual.presentationFormat,
+        alphaMode: "premultiplied"
+      });
+    }
+    entry.useTextureSource = true;
+    entry.upstreamNodeId   = upstream.srcNodeId;
+    entry.sharedVideoEl    = false;
+    entry.videoEl          = null;
+    console.log("[landmark] node " + nodeId + " using TEXTURE source from " +
+                upstream.srcType + "(" + upstream.srcNodeId + ")");
+    return null;
+  }
+  // Fallback: own camera.
   await _ensureMediapipeCamera(entry);
-  entry.sharedVideoEl = false;
+  entry.sharedVideoEl    = false;
+  entry.useTextureSource = false;
   return entry.videoEl;
 }
 
@@ -33871,40 +33931,46 @@ function _drawHandLandmarkerOverlay(entry, params) {
  * for the wired-param resolver to pick up. Cancelled by dispose. */
 function _startMediapipeLoop(nodeId) {
   const entry = _mediapipeNodes.get(nodeId);
-  if (!entry || !entry.detector || !entry.videoEl) return;
+  // v0.3.12 — texture-source mode has gpuInputCanvas instead of
+  // videoEl; either input is valid.
+  if (!entry || !entry.detector || (!entry.videoEl && !entry.gpuInputCanvas)) return;
   let lastVideoTimeMs = -1;
   const tick = () => {
     const e = _mediapipeNodes.get(nodeId);
-    if (!e || !e.detector || !e.videoEl) return;  // disposed
-    const v = e.videoEl;
-    // Only run inference when the source video has a NEW frame --
-    // currentTime advances when the browser pulls a fresh decoded
-    // frame from the camera. Avoids re-inferencing the same frame
-    // 60x/sec on a 30fps camera (which is wasted work + spurious
-    // "frame not ready" warnings from MediaPipe).
-    if (v.readyState >= 2 && v.currentTime !== lastVideoTimeMs) {
-      lastVideoTimeMs = v.currentTime;
-      try {
-        e.latest = e.detector.detectForVideo(v, performance.now());
-        // v0.3.3 — also paint the visualization canvas. The render
-        // path picks it up via copyExternalImageToTexture into the
-        // assigned framebuffer / scratch layer next frame. Live
-        // params (bgMode / mirrored / line styling) read fresh from
-        // state.nodes each tick so UI edits take effect without
-        // re-initializing the detector.
-        if (e.drawCanvas) {
-          const liveNode = state && Array.isArray(state.nodes)
-            ? state.nodes.find(n => n.id === nodeId) : null;
-          const liveParams = liveNode ? liveNode.params : e.params;
-          if (e.kind === "hand")             _drawHandLandmarkerOverlay(e, liveParams);
-          else if (e.kind === "handkeyboard")  _drawHandKeyboardOverlay(e, liveParams);
-          else if (e.kind === "pose")          _drawPoseLandmarkerOverlay(e, liveParams);
-          else if (e.kind === "face")          _drawFaceLandmarkerOverlay(e, liveParams);
-        }
-      } catch (err) {
-        // First-frame races: detector not ready, video not ready,
-        // GPU upload mid-flight. Silent skip; the loop will retry
-        // next rAF tick.
+    if (!e || !e.detector) return;  // disposed
+    const drawNow = () => {
+      if (!e.drawCanvas) return;
+      const liveNode = state && Array.isArray(state.nodes)
+        ? state.nodes.find(n => n.id === nodeId) : null;
+      const liveParams = liveNode ? liveNode.params : e.params;
+      if (e.kind === "hand")              _drawHandLandmarkerOverlay(e, liveParams);
+      else if (e.kind === "handkeyboard") _drawHandKeyboardOverlay(e, liveParams);
+      else if (e.kind === "pose")         _drawPoseLandmarkerOverlay(e, liveParams);
+      else if (e.kind === "face")         _drawFaceLandmarkerOverlay(e, liveParams);
+    };
+    if (e.useTextureSource) {
+      // Texture-source path: gpuInputCanvas updates every visual
+      // frame (driven by the main render encoder, not the camera).
+      // Just run detection every rAF tick.
+      if (e.gpuInputCanvas) {
+        try {
+          e.latest = e.detector.detectForVideo(e.gpuInputCanvas, performance.now());
+          drawNow();
+        } catch (err) { /* silent first-frame race */ }
+      }
+    } else {
+      // Video-element path. Only run inference when the source video
+      // has a NEW frame -- currentTime advances when the browser pulls
+      // a fresh decoded frame from the camera. Avoids re-inferencing
+      // the same frame 60x/sec on a 30fps camera (which is wasted
+      // work + spurious "frame not ready" warnings from MediaPipe).
+      const v = e.videoEl;
+      if (v && v.readyState >= 2 && v.currentTime !== lastVideoTimeMs) {
+        lastVideoTimeMs = v.currentTime;
+        try {
+          e.latest = e.detector.detectForVideo(v, performance.now());
+          drawNow();
+        } catch (err) { /* silent first-frame race */ }
       }
     }
     e.rafHandle = requestAnimationFrame(tick);
@@ -33931,6 +33997,14 @@ function _disposeMediapipeNode(nodeId) {
       try { entry.videoEl.srcObject = null; entry.videoEl.pause(); } catch (_) {}
     }
   }
+  // v0.3.12 — texture-source path: unconfigure the WebGPU context on
+  // the per-node input canvas so its swap-chain resources are released.
+  if (entry.gpuInputCtx) {
+    try { entry.gpuInputCtx.unconfigure(); } catch (_) {}
+  }
+  entry.gpuInputCanvas    = null;
+  entry.gpuInputCtx       = null;
+  entry.gpuInputBindGroup = null;
   _mediapipeNodes.delete(nodeId);
 }
 
@@ -34071,6 +34145,15 @@ function _drawPoseLandmarkerOverlay(entry, params) {
 
   if (bgMode === 0) {
     ctx.clearRect(0, 0, w, h);
+  } else if (entry.useTextureSource && entry.gpuInputCanvas) {
+    // v0.3.12 — bg comes from the upstream shader-frag (Plasma /
+    // Butterflies / etc) blitted to entry.gpuInputCanvas earlier in
+    // the same visual frame. Mirror transform is applied here so
+    // the landmark coord mirroring (in the loop below) lines up.
+    ctx.save();
+    if (mirrored > 0.5) { ctx.translate(w, 0); ctx.scale(-1, 1); }
+    ctx.drawImage(entry.gpuInputCanvas, 0, 0, w, h);
+    ctx.restore();
   } else if (entry.videoEl && entry.videoEl.readyState >= 2) {
     ctx.save();
     if (mirrored > 0.5) { ctx.translate(w, 0); ctx.scale(-1, 1); }
@@ -34210,6 +34293,15 @@ function _drawFaceLandmarkerOverlay(entry, params) {
 
   if (bgMode === 0) {
     ctx.clearRect(0, 0, w, h);
+  } else if (entry.useTextureSource && entry.gpuInputCanvas) {
+    // v0.3.12 — bg comes from the upstream shader-frag (Plasma /
+    // Butterflies / etc) blitted to entry.gpuInputCanvas earlier in
+    // the same visual frame. Mirror transform is applied here so
+    // the landmark coord mirroring (in the loop below) lines up.
+    ctx.save();
+    if (mirrored > 0.5) { ctx.translate(w, 0); ctx.scale(-1, 1); }
+    ctx.drawImage(entry.gpuInputCanvas, 0, 0, w, h);
+    ctx.restore();
   } else if (entry.videoEl && entry.videoEl.readyState >= 2) {
     ctx.save();
     if (mirrored > 0.5) { ctx.translate(w, 0); ctx.scale(-1, 1); }
@@ -35430,6 +35522,72 @@ function _encodeShaderFragPassForPlan(enc, entry, dtSec) {
       return false;
     }
     if (!e.ready || !e.drawCanvas) return false;
+
+    // v0.3.12 — texture-source path. If the landmark's "video" input
+    // is wired to a non-video shader-frag (Plasma / Butterflies /
+    // BlendShader / Gradient), the upstream node renders to a GPU
+    // layer (assigned by the plan walker). Blit that layer into
+    // entry.gpuInputCanvas so both MediaPipe + the bgMode=1 drawCanvas
+    // composite can read its content. The blit lands in the same
+    // command encoder as the rest of the visual frame, so timing is
+    // implicit (upstream's render pass appears earlier in the
+    // schedule and finishes before this blit runs).
+    if (e.useTextureSource && e.upstreamNodeId && e.gpuInputCtx) {
+      const planMap = Visual._currentRenderPlan;
+      const srcEntry = planMap && planMap.get(e.upstreamNodeId + "@" + consumerVO.id);
+      if (srcEntry) {
+        let srcView = null;
+        if (srcEntry.isScratch) {
+          const views = srcEntry.writeKey === "a"
+            ? Visual.scratchLayerViewsA : Visual.scratchLayerViewsB;
+          srcView = views[srcEntry.layerIdx];
+        } else {
+          srcView = Visual.framebufferLayerViews[srcEntry.layerIdx];
+        }
+        if (srcView) {
+          // (Re)build the bind group when the source view changes
+          // (e.g. resolution change reallocated the framebuffer, or
+          // the plan ping-pong'd the source to a different scratch
+          // parity).
+          if (!e.gpuInputBindGroup || e._gpuInputSrcView !== srcView) {
+            try {
+              e.gpuInputBindGroup = Visual.device.createBindGroup({
+                label: "ai-vision-input-bg-" + node.id,
+                layout: Visual.blitBindGroupLayout,
+                entries: [
+                  { binding: 0, resource: srcView },
+                  { binding: 1, resource: Visual.blitSampler }
+                ]
+              });
+              e._gpuInputSrcView = srcView;
+            } catch (err) {
+              e.gpuInputBindGroup = null;
+            }
+          }
+          if (e.gpuInputBindGroup) {
+            let canvasView = null;
+            try { canvasView = e.gpuInputCtx.getCurrentTexture().createView(); }
+            catch (_) { canvasView = null; }
+            if (canvasView) {
+              const pass = enc.beginRenderPass({
+                label: "ai-vision-input-blit-" + node.id,
+                colorAttachments: [{
+                  view: canvasView,
+                  clearValue: { r: 0, g: 0, b: 0, a: 1 },
+                  loadOp: "clear",
+                  storeOp: "store"
+                }]
+              });
+              pass.setPipeline(Visual.blitPipeline);
+              pass.setBindGroup(0, e.gpuInputBindGroup);
+              pass.draw(3);
+              pass.end();
+            }
+          }
+        }
+      }
+    }
+
     const destTexture = isScratch
       ? (writeKey === "a" ? Visual.scratchTextureA : Visual.scratchTextureB)
       : Visual.framebuffer;
