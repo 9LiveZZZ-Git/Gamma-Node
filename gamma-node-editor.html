@@ -421,6 +421,26 @@
     border-color: var(--accent);
     background: rgba(200, 232, 90, 0.10);
   }
+  /* Phase 6.7.3 — recording-state pill. Red on red so it's
+     unambiguous mid-set even glanced at peripheral vision. */
+  .visual-hud-pill.recording {
+    color: #ff4d4d;
+    border-color: #ff4d4d;
+    background: rgba(255, 77, 77, 0.10);
+    font-variant-numeric: tabular-nums;
+    animation: hud-rec-pulse 1.4s ease-in-out infinite;
+  }
+  @keyframes hud-rec-pulse {
+    0%,100% { box-shadow: 0 0 0 0 rgba(255, 77, 77, 0.0); }
+    50%     { box-shadow: 0 0 0 3px rgba(255, 77, 77, 0.25); }
+  }
+  /* Phase 6.7.1 — hide-graph toggle. Drops the entire node-graph
+     surface (#canvas-world contains nodes + wires SVG) but keeps the
+     header / palette / properties / HUD visible. Less aggressive than
+     Live Mode (which collapses the whole editor); useful when you
+     want the visual layer prominent during authoring without losing
+     the toolbar. */
+  body.graph-hidden #canvas-world { display: none; }
   .node.no-output-warn {
     border-color: var(--gate);
     box-shadow: 0 0 0 1px var(--gate), 0 0 14px rgba(216, 160, 48, 0.35);
@@ -6108,6 +6128,12 @@
                 title="Frame rate (rAF cadence). Stays at — fps until shader nodes drive an animation loop in Phase 6.1.7+.">— fps</span>
           <button class="visual-hud-pill visual-hud-icon" id="freeze-btn" type="button"
                   title="Freeze visual updates (audio keeps running). Useful for inspecting a single frame mid-set.">❄</button>
+          <button class="visual-hud-pill visual-hud-icon" id="graph-hide-pill" type="button"
+                  title="Hide node graph (H) — drops the graph surface, keeps header / palette / HUD visible. Lighter than Live Mode.">⊟</button>
+          <button class="visual-hud-pill visual-hud-icon" id="snap-btn" type="button"
+                  title="Capture frame → downloads a PNG of the visible canvas at its current resolution.">📷</button>
+          <button class="visual-hud-pill visual-hud-icon" id="video-rec-pill" type="button"
+                  title="Start video capture — records the canvas (+ audio if a preview is playing) to a .webm file. Click again to stop.">●</button>
         </div>
         <div class="view-hud" id="view-hud" title="Click to reset view (or press 0)">100%</div>
       </div>
@@ -34321,6 +34347,241 @@ window.addEventListener("pointermove", () => {
 // handlers register so we can early-return cleanly without fighting
 // them). Done at the bottom of this script block.
 
+/* =========================================================================
+ * Phase 6.7.1 — Hide-graph toggle (H key)
+ *
+ * Body class `graph-hidden` drops #canvas-world (the node-graph surface
+ * with nodes + wires SVG). Header, palette, properties pane, bottom
+ * tabs, and the visual HUD all stay visible -- the WebGPU canvas
+ * underneath is now unobstructed, perfect for showing visuals without
+ * fully committing to Live Mode (which collapses the entire editor).
+ *
+ * Same input-guard pattern as Live Mode (L key):
+ *   - Skip when typing in a text input
+ *   - Skip when audio preview is playing (H is also mapped to MIDI A4
+ *     in QWERTY_TO_MIDI, line ~36883 -- a ringing-out note wins)
+ * ======================================================================== */
+
+let graphHidden = false;
+function isGraphHidden() { return graphHidden; }
+function setGraphHidden(on) {
+  on = !!on;
+  if (on === graphHidden) return;
+  graphHidden = on;
+  document.body.classList.toggle("graph-hidden", graphHidden);
+  const pill = document.getElementById("graph-hide-pill");
+  if (pill) {
+    pill.classList.toggle("active", graphHidden);
+    pill.textContent = graphHidden ? "▣" : "⊟";
+  }
+}
+function toggleGraphHidden() { setGraphHidden(!graphHidden); }
+
+/* =========================================================================
+ * Phase 6.7.2 — Capture frame → PNG
+ *
+ * Snapshots the visible WebGPU canvas. Resolution = canvas drawing-buffer
+ * size (window inner-W/H × devicePixelRatio per sizeVisualCanvas). On a
+ * Retina iPad / 4K display this is already >= 1080p; on standard 1080p
+ * monitors it matches the screen.
+ *
+ * Note about render-resolution: Visual.fbWidth × Visual.fbHeight is the
+ * OFFSCREEN framebuffer size (the user-selectable 1080p/1440p/4K/8K
+ * pipeline cap). The visible canvas downsamples or upsamples that to
+ * fit the viewport. For now we capture the visible canvas; a follow-up
+ * could compose to a fbWidth×fbHeight target for true 4K screenshots
+ * regardless of viewport size. ~95% of the cases this already covers.
+ *
+ * Implementation: WebGPU's canvas context is preserved across frames
+ * by default with `preserveDrawingBuffer` semantics handled via
+ * `alphaMode: "premultiplied"` configure. We wait one rAF so the
+ * canvas has the freshest frame, then `toBlob('image/png')`. */
+async function captureVisualFrame() {
+  if (!Visual.canvas) return;
+  // One rAF tick so the canvas has the latest rendered frame.
+  await new Promise(r => requestAnimationFrame(r));
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  // Toast the user that capture is running -- toBlob can take 30-200 ms
+  // on 4K+; without a hint they wonder if the click registered.
+  const pill = document.getElementById("snap-btn");
+  const original = pill ? pill.textContent : null;
+  if (pill) { pill.textContent = "…"; pill.classList.add("active"); }
+  try {
+    await new Promise((resolve, reject) => {
+      Visual.canvas.toBlob((blob) => {
+        if (!blob) { reject(new Error("toBlob returned null")); return; }
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "gamma-frame-" + stamp + ".png";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 2000);
+        resolve();
+      }, "image/png");
+    });
+  } catch (e) {
+    console.warn("[capture] frame failed:", e);
+  } finally {
+    if (pill) {
+      pill.textContent = original;
+      pill.classList.remove("active");
+    }
+  }
+}
+
+/* =========================================================================
+ * Phase 6.7.3 — Capture video → WebM (MediaRecorder)
+ *
+ * Toggle button: first click starts recording (canvas video + audio if a
+ * preview is playing), second click stops + triggers a .webm download.
+ * The HUD pill turns red + counts elapsed seconds while recording, with
+ * a soft pulse animation so it's unambiguously "live" mid-set.
+ *
+ * Video: canvas.captureStream(60) gives a continuous 60 fps track of
+ * everything WebGPU draws to the visible canvas. Captures the
+ * displayed image -- so warp + edge-blend + rig-composite all land in
+ * the recording exactly as they appear on screen.
+ *
+ * Audio: if previewState.workletNode exists, we connect() it to a
+ * MediaStreamDestinationNode in the same AudioContext. The connect()
+ * is additive (the worklet's existing connection to ctx.destination
+ * stays live, so audio still plays through speakers during recording).
+ * No audio preview -> video-only recording. */
+let _videoRecorder = null;
+let _videoChunks = null;
+let _videoStartT = 0;
+let _videoTimer = null;
+let _videoAudioTap = null;   // { dest, srcNode } so we can disconnect on stop
+let _videoMimeType = "video/webm";
+
+function _pickWebmMimeType() {
+  if (typeof MediaRecorder === "undefined") return null;
+  const candidates = [
+    "video/webm;codecs=vp9,opus",
+    "video/webm;codecs=vp8,opus",
+    "video/webm;codecs=vp9",
+    "video/webm;codecs=vp8",
+    "video/webm"
+  ];
+  for (const m of candidates) {
+    try { if (MediaRecorder.isTypeSupported(m)) return m; } catch (_) {}
+  }
+  return null;
+}
+
+function captureVideoToggle() {
+  if (_videoRecorder) {
+    stopVideoCapture();
+  } else {
+    startVideoCapture();
+  }
+}
+
+function startVideoCapture() {
+  if (!Visual.canvas) return;
+  const mime = _pickWebmMimeType();
+  if (!mime) {
+    console.warn("[capture] no supported WebM mime-type for MediaRecorder in this browser");
+    return;
+  }
+  _videoMimeType = mime;
+  let stream;
+  try {
+    stream = Visual.canvas.captureStream(60);
+  } catch (e) {
+    console.warn("[capture] canvas.captureStream failed:", e);
+    return;
+  }
+  // Tap the audio worklet if a preview is running. dest is in the same
+  // AudioContext as the worklet -- no resampling, sample-accurate sync.
+  const ctx  = previewState && previewState.audioCtx;
+  const node = previewState && previewState.workletNode;
+  if (ctx && node) {
+    try {
+      const dest = ctx.createMediaStreamDestination();
+      node.connect(dest);
+      for (const t of dest.stream.getAudioTracks()) stream.addTrack(t);
+      _videoAudioTap = { dest, srcNode: node };
+    } catch (e) {
+      console.warn("[capture] audio tap failed (recording video-only):", e);
+      _videoAudioTap = null;
+    }
+  } else {
+    _videoAudioTap = null;
+  }
+  let rec;
+  try {
+    rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 8_000_000 });
+  } catch (e) {
+    console.warn("[capture] MediaRecorder constructor failed:", e);
+    _disposeVideoAudioTap();
+    return;
+  }
+  _videoRecorder = rec;
+  _videoChunks = [];
+  rec.ondataavailable = (ev) => { if (ev.data && ev.data.size > 0) _videoChunks.push(ev.data); };
+  rec.onstop = () => {
+    const blob = new Blob(_videoChunks, { type: mime });
+    _videoChunks = null;
+    if (blob.size > 0) {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      a.download = "gamma-capture-" + stamp + ".webm";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+    }
+    _disposeVideoAudioTap();
+    _videoRecorder = null;
+    _updateVideoUi(false);
+  };
+  rec.start(1000);  // 1s chunks -- safer for long recordings (memory cap)
+  _videoStartT = performance.now();
+  _updateVideoUi(true);
+  if (_videoTimer) clearInterval(_videoTimer);
+  _videoTimer = setInterval(_updateVideoElapsed, 250);
+}
+
+function stopVideoCapture() {
+  if (!_videoRecorder) return;
+  try { _videoRecorder.stop(); } catch (e) { console.warn("[capture] recorder.stop:", e); }
+  if (_videoTimer) { clearInterval(_videoTimer); _videoTimer = null; }
+}
+
+function _disposeVideoAudioTap() {
+  if (!_videoAudioTap) return;
+  try { _videoAudioTap.srcNode.disconnect(_videoAudioTap.dest); }
+  catch (_) {}
+  _videoAudioTap = null;
+}
+
+function _updateVideoUi(recording) {
+  const pill = document.getElementById("video-rec-pill");
+  if (!pill) return;
+  pill.classList.toggle("recording", recording);
+  if (recording) {
+    pill.textContent = "● 00:00";
+    pill.title = "Stop recording — writes .webm to your Downloads";
+  } else {
+    pill.textContent = "●";
+    pill.title = "Start video capture — records canvas + audio to a .webm file. Click again to stop.";
+  }
+}
+
+function _updateVideoElapsed() {
+  const pill = document.getElementById("video-rec-pill");
+  if (!pill || !_videoRecorder) return;
+  const s = Math.floor((performance.now() - _videoStartT) / 1000);
+  const mm = String(Math.floor(s / 60)).padStart(2, "0");
+  const ss = String(s % 60).padStart(2, "0");
+  pill.textContent = "● " + mm + ":" + ss;
+}
+
 const PREVIEW = {
   // URL of the pre-built Gamma static-library tarball. Produce locally
   // via wasm-build/build-gamma-wasm.sh and host it under /assets/ on the
@@ -41228,6 +41489,34 @@ ensureGPUDevice();
       e.preventDefault();
       setLiveMode(false);
     }
+  });
+}
+
+/* Phase 6.7.1 + 6.7.2 + 6.7.3 — wire the three visual-HUD pills:
+ *   ⊟ / ▣  → hide-graph toggle (also bare H hotkey)
+ *   📷    → capture frame to PNG
+ *   ●     → start/stop video capture (.webm)
+ * Hotkey guards mirror the Live-Mode L pattern: skip modifier-chord,
+ * skip text-input typing, skip when audio preview is playing (H is
+ * MIDI A4 on the QWERTY keymap). */
+{
+  const hidePill   = document.getElementById("graph-hide-pill");
+  const snapBtn    = document.getElementById("snap-btn");
+  const recPill    = document.getElementById("video-rec-pill");
+  if (hidePill) hidePill.addEventListener("click", () => toggleGraphHidden());
+  if (snapBtn)  snapBtn.addEventListener("click",  () => captureVisualFrame());
+  if (recPill)  recPill.addEventListener("click",  () => captureVideoToggle());
+  // Initialize the rec pill title (the "stop" state) so screen readers
+  // pick it up before the first click.
+  _updateVideoUi(false);
+  window.addEventListener("keydown", (e) => {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key !== "h" && e.key !== "H") return;
+    if (isTextInput(document.activeElement)) return;
+    // Audio runtime wins: H plays MIDI A4 when the preview is running.
+    if (typeof previewState !== "undefined" && previewState && previewState.state === "playing") return;
+    e.preventDefault();
+    toggleGraphHidden();
   });
 }
 
