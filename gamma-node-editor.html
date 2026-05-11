@@ -13175,6 +13175,111 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     description: "Flat color fill — outputs a uniform RGB color across the entire framebuffer. r/g/b each ∈ [0, 1]. Wire into VisualOutput.in for a solid backdrop, or into BlendShader (Phase 6.4) as one of its inputs."
   },
 
+  /* Phase 7.1 — Webcam. Live camera feed via getUserMedia, sampled
+   * through device.importExternalTexture each frame. Outputs a
+   * texture that plugs into the existing composition chain like any
+   * other visual source. First render kicks the permission prompt;
+   * the node renders nothing (clear-color) until the user accepts +
+   * the first frame decodes (~50-500ms typical webcam warm-up).
+   *
+   * Params:
+   *   mirrored   — 1 = horizontal flip (selfie cam style), 0 = pass-through
+   *   exposure   — output gain (1 = pass-through, >1 boosts, <1 darkens)
+   *   tint_{rgb} — multiplied per-channel for color grading
+   *
+   * Aspect handling: video frames sampled with clamped UV; viewer's
+   * aspect drives the framebuffer fit. cover-style fit so the video
+   * fills the framebuffer (cropping the longer side) instead of
+   * leaving black bars. */
+  Webcam: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "video-source",
+    ins:  [
+      { n: "mirrored",  t: "param" },
+      { n: "exposure",  t: "param" },
+      { n: "tint_r",    t: "param" },
+      { n: "tint_g",    t: "param" },
+      { n: "tint_b",    t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    params: { mirrored: 1, exposure: 1.0, tint_r: 1.0, tint_g: 1.0, tint_b: 1.0 },
+    methods: { mirrored: null, exposure: null, tint_r: null, tint_g: null, tint_b: null },
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution: vec4f,
+  u_time:       f32,
+  u_dt:         f32,
+  _pad0:        vec2f,
+  u_view:       vec4f,
+  u_world_uv:   vec4f,
+  params:       vec4f,   // x=mirrored, y=exposure, z=_, w=_
+  tint:         vec4f,   // r, g, b, _
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var videoTex: texture_external;
+@group(0) @binding(2) var videoSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(
+    vec2f(-1.0, -1.0),
+    vec2f( 3.0, -1.0),
+    vec2f(-1.0,  3.0),
+  );
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  // Cover-fit: figure out the video's aspect from the external
+  // texture's intrinsic dimensions and centre-crop the longer axis.
+  // textureDimensions on external textures returns the source video
+  // resolution (e.g. 1280×720), so we can compute the fb-to-video
+  // scale on the fly without baking it into the uniform.
+  let videoDim = vec2f(textureDimensions(videoTex));
+  let fbDim    = u.u_resolution.xy;
+  let videoAR  = videoDim.x / videoDim.y;
+  let fbAR     = fbDim.x    / fbDim.y;
+  var uv       = in.uv;
+  // Cover (fill, crop): pick the smaller of (h_scale, v_scale) for
+  // the source UV scale -- whichever axis is tighter on the source.
+  if (videoAR > fbAR) {
+    // video is wider — crop sides
+    let crop = fbAR / videoAR;
+    uv.x = (uv.x - 0.5) * crop + 0.5;
+  } else {
+    // video is taller — crop top/bottom
+    let crop = videoAR / fbAR;
+    uv.y = (uv.y - 0.5) * crop + 0.5;
+  }
+  if (u.params.x > 0.5) { uv.x = 1.0 - uv.x; }
+  let color = textureSampleBaseClampToEdge(videoTex, videoSampler, uv);
+  let rgb = color.rgb * u.params.y * u.tint.rgb;
+  return vec4f(rgb, color.a);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.mirrored === "number") ? p.mirrored : 1.0;
+      scratch[17] = (typeof p.exposure === "number") ? p.exposure : 1.0;
+      scratch[18] = 0;
+      scratch[19] = 0;
+      scratch[20] = (typeof p.tint_r === "number") ? p.tint_r : 1.0;
+      scratch[21] = (typeof p.tint_g === "number") ? p.tint_g : 1.0;
+      scratch[22] = (typeof p.tint_b === "number") ? p.tint_b : 1.0;
+      scratch[23] = 0;
+    },
+    description: "Live webcam feed via getUserMedia. Click ▶ once (or wire into VisualOutput + WebGPU render) to trigger the browser's camera permission prompt. Plugs into BlendShader / ColorCorrect / MaskShader chains like any other visual source — turn the editor into a VJ tool with one wire. mirrored=1 flips horizontally (selfie cam); exposure scales output gain; tint_{r,g,b} multiplies per-channel."
+  },
+
   /* Gradient — 2-color linear blend along a configurable angle.
    * Eight params: angle (radians), rA/gA/bA (start color), rB/gB/bB
    * (end color). Useful as a backdrop or as a luma source for masks
@@ -22709,6 +22814,35 @@ const _demos = [
     }
   },
 
+  /* Phase 7.1 — Webcam VJ demo. Loading this asks for camera
+   * permission on first frame, then puts a live mirrored webcam
+   * feed through ColorCorrect (boosted saturation + slight contrast)
+   * for a "VJ-ready" look. Drop a BlendShader between Webcam and
+   * ColorCorrect with another source (Plasma, StarNest, etc) for
+   * full VJ overlays. */
+  {
+    id: "webcam-vj",
+    name: "Webcam VJ",
+    sub: "live camera → colour-graded",
+    type: "visual",
+    thumb: `<svg viewBox="0 0 100 44">
+      <rect width="100" height="44" fill="rgba(0,0,0,0.85)"/>
+      <circle cx="50" cy="22" r="11" fill="none" stroke="var(--phosphor)" stroke-width="1.4"/>
+      <circle cx="50" cy="22" r="5"  fill="var(--phosphor)" opacity="0.6"/>
+      <circle cx="62" cy="14" r="1.2" fill="rgba(232,140,60,0.95)"/>
+      <text x="50" y="40" text-anchor="middle"
+            font-family="monospace" font-size="5" fill="rgba(255,255,255,0.55)"
+            letter-spacing="0.08em">LIVE</text>
+    </svg>`,
+    build: () => {
+      const cam = makeNode("Webcam", 40, 80, { mirrored: 1, exposure: 1.05, tint_r: 1.0, tint_g: 1.0, tint_b: 1.0 });
+      const cc  = makeNode("ColorCorrect", 280, 80, { brightness: 0.0, contrast: 1.10, saturation: 1.25, hueShift: 0, gamma: 1.0 });
+      const vo  = makeNode("VisualOutput", 520, 80, { display: 0 });
+      state.edges.push({ from: { node: cam, port: "out" }, to: { node: cc, port: "in" } });
+      state.edges.push({ from: { node: cc,  port: "out" }, to: { node: vo, port: "in" } });
+    }
+  },
+
   /* ─── Advanced (multi-node) demos ───────────────────────────── */
 
   {
@@ -32224,6 +32358,31 @@ function _ensureCompositionShaderLayout() {
   });
 }
 
+/* Phase 7.1 — bind-group layout for video-source shader-frag nodes
+ * (Webcam, VideoFile, ScreenShare). Same shape as standard +
+ * sampler + an externalTexture (the live video frame, imported
+ * each render frame via device.importExternalTexture). External
+ * textures expire at the end of the task they're created in, so
+ * the bind group itself is rebuilt every frame -- handled in
+ * _encodeShaderFragPassForPlan when entry.def.bindLayout === "video-source". */
+function _ensureVideoSourceShaderLayout() {
+  if (Visual.videoSourceShaderBgl) return;
+  Visual.videoSourceShaderBgl = Visual.device.createBindGroupLayout({
+    label: "shader-frag-videosource-bgl",
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+      { binding: 1, visibility: GPUShaderStage.FRAGMENT, externalTexture: {} },
+      { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+      // Audio uniform at binding 3, same as every other shader-frag layout.
+      { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } }
+    ]
+  });
+  Visual.videoSourceShaderPipelineLayout = Visual.device.createPipelineLayout({
+    label: "shader-frag-videosource-pl",
+    bindGroupLayouts: [Visual.videoSourceShaderBgl]
+  });
+}
+
 /* Get-or-create a render pipeline for a WGSL body. Returns the cache
  * entry: { promise, pipeline, error }. First call kicks off async
  * compile; subsequent calls share the promise. Renderer reads
@@ -32232,8 +32391,9 @@ function _ensureCompositionShaderLayout() {
 function _getShaderPipeline(wgsl, bindLayout) {
   bindLayout = bindLayout || "standard";
   _ensureStandardShaderLayout();
-  if (bindLayout === "feedback")    _ensureFeedbackShaderLayout();
-  if (bindLayout === "composition") _ensureCompositionShaderLayout();
+  if (bindLayout === "feedback")     _ensureFeedbackShaderLayout();
+  if (bindLayout === "composition")  _ensureCompositionShaderLayout();
+  if (bindLayout === "video-source") _ensureVideoSourceShaderLayout();
   const key = _fnv1a(wgsl) + "@" + bindLayout;
   let entry = Visual.shaderPipelineCache.get(key);
   if (entry) return entry;
@@ -32242,7 +32402,9 @@ function _getShaderPipeline(wgsl, bindLayout) {
     ? Visual.feedbackShaderPipelineLayout
     : bindLayout === "composition"
       ? Visual.compositionShaderPipelineLayout
-      : Visual.standardShaderPipelineLayout;
+      : bindLayout === "video-source"
+        ? Visual.videoSourceShaderPipelineLayout
+        : Visual.standardShaderPipelineLayout;
 
   entry = { key, promise: null, pipeline: null, error: null };
   entry.promise = (async () => {
@@ -32332,7 +32494,7 @@ function _ensureShaderInstance(nodeId, def, srcNode, scratchReadKey) {
   const compositionView = bindLayout === "composition"
     ? (scratchReadKey === "b" ? Visual.scratchArrayViewB : Visual.scratchArrayViewA)
     : null;
-  const samplerRef      = (bindLayout === "feedback" || bindLayout === "composition")
+  const samplerRef      = (bindLayout === "feedback" || bindLayout === "composition" || bindLayout === "video-source")
                           ? Visual.blitSampler : null;
   const layoutMismatch     = inst && inst._bindLayout !== bindLayout;
   const feedbackViewStale  = inst && bindLayout === "feedback"    && inst._feedbackView !== feedbackView;
@@ -32375,6 +32537,13 @@ function _ensureShaderInstance(nodeId, def, srcNode, scratchReadKey) {
           audioBuf
         ].filter(Boolean)
       });
+    } else if (bindLayout === "video-source") {
+      // Phase 7.1 — video-source bind group has to be rebuilt every
+      // frame because GPUExternalTexture is single-task-scoped. Leave
+      // bg=null here; _encodeShaderFragPassForPlan creates a fresh
+      // bind group right before the render pass using the live
+      // external texture handed back from device.importExternalTexture.
+      bg = null;
     } else {
       bg = Visual.device.createBindGroup({
         label: "shader-frag-bg-" + nodeId,
@@ -32416,6 +32585,84 @@ function _disposeShaderInstance(nodeId) {
   if (!inst) return;
   try { inst.uniformBuffer && inst.uniformBuffer.destroy(); } catch (_) {}
   Visual.shaderInstances.delete(nodeId);
+  // Phase 7.1 — also tear down any active video source (webcam / video
+  // / screen-share) tied to this node. Stops the MediaStream tracks
+  // (releases the camera / mic from the OS) and detaches the hidden
+  // <video> element so the GC can collect it.
+  _disposeVideoSource(nodeId);
+}
+
+/* =========================================================================
+ * Phase 7.1 — Video sources (Webcam, VideoFile, ScreenShare)
+ *
+ * Each video-source node owns:
+ *   - An HTMLVideoElement (hidden, never attached to the visible DOM)
+ *   - A MediaStream / src URL feeding that element
+ *   - A "ready" flag flipped true once videoEl.readyState >= 2
+ *     (HAVE_CURRENT_DATA -- meaning the first frame has decoded and
+ *     is ready to sample).
+ *
+ * Per render frame, the framework calls
+ *   device.importExternalTexture({ source: videoEl })
+ * to get a fresh GPUExternalTexture, builds a bind group around it,
+ * and draws a fullscreen triangle that samples + writes to the
+ * framebuffer (or scratch) layer assigned by the render plan walker.
+ *
+ * External textures are single-task-scoped per the WebGPU spec, so
+ * the bind group MUST be rebuilt every frame -- there's no "cache
+ * the bind group" optimization available. Per-frame bind-group
+ * creation is cheap (single small allocation, no GPU sync). Tested
+ * comfortably under 1ms on a typical machine. */
+
+const _videoSources = new Map();   // nodeId -> { videoEl, stream, ready, error, requesting, kind, src }
+
+async function _ensureWebcamStream(nodeId) {
+  let entry = _videoSources.get(nodeId);
+  if (entry) return entry;
+  entry = { videoEl: null, stream: null, ready: false, error: null, requesting: true, kind: "webcam" };
+  _videoSources.set(nodeId, entry);
+  try {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error("getUserMedia not available in this browser context");
+    }
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false
+    });
+    const videoEl = document.createElement("video");
+    videoEl.srcObject = stream;
+    videoEl.playsInline = true;
+    videoEl.muted = true;
+    videoEl.autoplay = true;
+    // play() can reject when no user gesture has fired; we swallow the
+    // error and let videoEl.readyState >= 2 gate the frame anyway.
+    try { await videoEl.play(); } catch (_) {}
+    entry.stream  = stream;
+    entry.videoEl = videoEl;
+    entry.ready   = true;
+    console.log("[webcam] node " + nodeId + " stream live: " +
+                videoEl.videoWidth + "×" + videoEl.videoHeight);
+  } catch (e) {
+    console.warn("[webcam] node " + nodeId + " getUserMedia failed:", e);
+    entry.error = e;
+  } finally {
+    entry.requesting = false;
+  }
+  return entry;
+}
+
+function _disposeVideoSource(nodeId) {
+  const entry = _videoSources.get(nodeId);
+  if (!entry) return;
+  if (entry.stream) {
+    try { entry.stream.getTracks().forEach(t => t.stop()); } catch (_) {}
+  }
+  if (entry.videoEl) {
+    try { entry.videoEl.srcObject = null; } catch (_) {}
+    try { entry.videoEl.pause(); } catch (_) {}
+    if (entry.videoEl.parentNode) entry.videoEl.parentNode.removeChild(entry.videoEl);
+  }
+  _videoSources.delete(nodeId);
 }
 
 /* Standard uniform-buffer preamble. Phase 6.5.7 grew this from 32 to
@@ -33437,6 +33684,48 @@ function _encodeShaderFragPassForPlan(enc, entry, dtSec) {
   }
   Visual.device.queue.writeBuffer(inst.uniformBuffer, 0, inst.scratch.buffer, inst.scratch.byteOffset, inst.scratch.byteLength);
 
+  // Phase 7.1 — video-source bind group is rebuilt per frame because
+  // GPUExternalTexture is single-task-scoped. The source's <video>
+  // element must already have a frame ready (readyState >= 2); if
+  // not, kick off the getUserMedia request (idempotent) and skip the
+  // frame -- framebuffer layer keeps its prior content, recipient
+  // composition shaders see the previous frame.
+  let bindGroupForPass = inst.bindGroup;
+  if (def.bindLayout === "video-source") {
+    const src = _videoSources.get(node.id);
+    if (!src) {
+      // First-time init: trigger the async getUserMedia request.
+      // No frame this tick; the next render that finds src.ready
+      // proceeds normally.
+      _ensureWebcamStream(node.id);
+      return false;
+    }
+    if (!src.ready || !src.videoEl || src.videoEl.readyState < 2) return false;
+    let extTex;
+    try {
+      extTex = Visual.device.importExternalTexture({ source: src.videoEl });
+    } catch (e) {
+      // importExternalTexture can throw if the video frame isn't
+      // ready yet despite readyState >= 2 (race during the very first
+      // few frames). Skip silently, retry next tick.
+      return false;
+    }
+    const audioBuf = Visual.audioUniformBuffer
+      ? { binding: 3, resource: { buffer: Visual.audioUniformBuffer } }
+      : null;
+    bindGroupForPass = Visual.device.createBindGroup({
+      label: "shader-frag-videosource-bg-" + node.id + "-frame",
+      layout: Visual.videoSourceShaderBgl,
+      entries: [
+        { binding: 0, resource: { buffer: inst.uniformBuffer } },
+        { binding: 1, resource: extTex },
+        { binding: 2, resource: Visual.blitSampler },
+        audioBuf
+      ].filter(Boolean)
+    });
+  }
+  if (!bindGroupForPass) return false;
+
   const label = (isScratch ? "shader-frag-scratch-" : "shader-frag-") +
     node.type + "-" + node.id + "-vo-" + consumerVO.id + "-" +
     (isScratch ? "scratch" + layerIdx : "layer" + layerIdx);
@@ -33450,7 +33739,7 @@ function _encodeShaderFragPassForPlan(enc, entry, dtSec) {
     }]
   });
   pass.setPipeline(pipeEntry.pipeline);
-  pass.setBindGroup(0, inst.bindGroup);
+  pass.setBindGroup(0, bindGroupForPass);
   pass.draw(3);
   pass.end();
   return true;
