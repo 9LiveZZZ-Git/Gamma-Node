@@ -9452,7 +9452,7 @@ public:
     methods: { bpm: "setBpm" },
     gateMethods: { trig: "reset" },
     autoExpose: ["bpm"],
-    description: "Master clock. Outputs BPM (param), bar/beat/quarter/eighth/sixteenth gate ticks, and a 0..1 phase ramp per beat. trig resets the clock to bar 1. Wire any tick output into a gate input (AD.trig, sequencer step) for tempo-locked rhythms."
+    description: "Master clock. Outputs BPM (param), bar/beat/quarter/eighth/sixteenth tick outputs, and a 0..1 phase ramp per beat. trig resets the clock to bar 1. Wire any tick output into a gate input (AD.trig, sequencer step) for tempo-locked rhythms, OR into any shader-frag param port (Plasma.clockReact, etc.) for visual tempo sync — the framework substitutes a cubic-decay envelope per subdivision for tick outputs, the raw 0..1 ramp for phase, the static value for bpm (Phase 6.5.4). Single source of truth for tempo across audio + visual sides of the patch."
   },
 
   /* Phase 5.5 — tempo-locked LFO. Cheaper than MasterClock when you
@@ -12671,41 +12671,6 @@ public:
     description: "Patch-level rig HUD — overlays display tiles with labels (index/name), warp/blend status badges, and audio-reactive highlights. Drop one in the patch to enable; only the first RigGizmo's params take effect (the node is global). Tile preview only — non-tile modes hide the overlay."
   },
 
-  /* Phase 6.5.4 — VisualClock. Patch-level node that computes
-   * bar / beat / quarter-beat / total-beats from a user-set BPM
-   * each frame, writes them into the audio bridge SAB at scalar
-   * slots 12-15. Shaders read via:
-   *   u_audio.values[3].x  = bar phase 0..1
-   *   u_audio.values[3].y  = beat phase 0..1
-   *   u_audio.values[3].z  = quarter phase 0..1 (16th-note grid)
-   *   u_audio.values[3].w  = total beats since epoch (free-running)
-   * No audio inputs -- this is JS-side time → uniform, runs even
-   * without an audio patch playing. When MasterClock is also in
-   * the patch, a follow-on ticket (6.5.4.1) will let MasterClock
-   * override these slots with its audio-rate tick values for
-   * sample-accurate tempo sync. For now, the JS clock is the
-   * authoritative source.
-   *
-   * Multiple VisualClocks: only the first one in patch order
-   * drives the slots (same convention as RigGizmo). */
-  VisualClock: {
-    category: "Visual", color: COLOR.visual, header: null,
-    cppType: "",
-    ins:  [],
-    outs: [],
-    params: {
-      bpm: 120,
-      // beats per bar (4 = standard, 3 = waltz, 7 = odd time)
-      bar: 4,
-      // optional starting beat offset (in beats). Lets you "phase
-      // shift" the clock so the downbeat lands at a different
-      // wall-clock time. Useful for syncing two patches by hand.
-      phase: 0
-    },
-    methods: { bpm: null, bar: null, phase: null },
-    description: "VisualClock — patch-level tempo source for visuals. Computes bar/beat/quarter/totalBeats each frame from BPM, writes to audio-bridge SAB slots 12-15. Shaders read via u_audio.values[3]: .x=bar phase 0..1, .y=beat phase 0..1, .z=quarter (16th-note) phase 0..1, .w=running total beats. bpm: tempo (120 default). bar: beats per bar (4 default). phase: starting beat offset in beats. Multiple VisualClocks: first one wins."
-  },
-
   /* Phase 6.6.25 — Mesh Text. Converted from the original 2D
    * overlay form into a proper shader-frag whose output goes to
    * a VisualOutput, so text now renders on the dome surface,
@@ -13093,9 +13058,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       // Phase 6.5.3 — bass-band reactivity from FFT bins 0..7
       // (~20-80 Hz). Kick drums pulse plasma independent of level.
       { n: "bassReact",     t: "param" },
-      // Phase 6.5.4 — VisualClock beat reactivity. Adds a
-      // beat-synced "kick" pulse to the animation speed. Drop a
-      // VisualClock node + set its BPM; plasma syncs to the bar.
+      // Phase 6.5.4 — clock-driven speed boost. Wire MasterClock.beat
+      // here for a cubic-decay pulse on every beat; MasterClock.phase
+      // for a continuous 0..1 ramp per beat. Manual constant in the
+      // props panel also works.
       { n: "clockReact",    t: "param" }
     ],
     outs: [{ n: "out", t: "texture" }],
@@ -13115,14 +13081,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
 };
 @group(0) @binding(0) var<uniform> u: U;
 
-// Phase 6.5.2 / 6.5.3 / 6.5.4 — audio uniform.
+// Phase 6.5.2 / 6.5.3 — audio uniform.
 //   values[0].x   = worklet master output peak this quantum (0..1)
-//   values[0].yzw, values[1..2] reserved for future scalar slots
-//   values[3].x   = VisualClock bar phase   (0..1, repeats per bar)
-//   values[3].y   = VisualClock beat phase  (0..1, repeats per beat)
-//   values[3].z   = VisualClock quarter phase (0..1, 16th-note grid)
-//   values[3].w   = VisualClock total beats since epoch (free-running)
+//   values[0].yzw, values[1..3] reserved for future audio-rate slots
 //   fft[k/4][k%4] = 256 log-spaced FFT magnitude bins (0..1)
+// Tempo / clock signals do NOT live in this uniform anymore --
+// MasterClock node outputs flow through the wired-param resolver
+// instead, so shaders read them via their normal t="param"
+// inputs (see Plasma's clockReact below for the convention).
 struct AudioU {
   values: array<vec4<f32>, 4>,
   fft:    array<vec4<f32>, 64>,
@@ -13156,20 +13122,20 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   let world_uv = mix(u.u_world_uv.xy, u.u_world_uv.zw, in.uv);
   let p = (world_uv - vec2f(0.5)) * u.params.y * 8.0;
   // params.w = audioReact, params2.x = bassReact, params2.y = clockReact.
-  // peak_speed scales with the master-peak bridge slot;
-  // bass_speed averages the first 8 log-spaced FFT bins (~20-80 Hz);
-  // clock_kick is a beat-synced cubic decay envelope (1.0 at beat=0,
-  //   0 at beat=1) driven by a VisualClock node in the patch — adds
-  //   a metronomic pulse independent of audio level.
+  // peak_speed: scales with the master-peak audio bridge slot;
+  // bass_speed: average of FFT bins 0..7 (~20-80 Hz) -- kick drums;
+  // clock_speed: the clockReact value AS-IS. When MasterClock.beat
+  //   is wired to Plasma.clockReact, the framework substitutes a
+  //   cubic-decay beat envelope (1 at downbeat, ~0 between beats),
+  //   producing the same on-the-beat pulse. When MasterClock.phase
+  //   is wired instead, it's a continuous 0..1 ramp per beat. Or
+  //   manual constant via the props panel.
   let peak_speed = u.params.w * u_audio.values[0].x;
   var bass: f32 = 0.0;
   for (var i: u32 = 0u; i < 8u; i = i + 1u) { bass = bass + fft_bin(i); }
   bass = bass * 0.125;
   let bass_speed = u.params2.x * bass;
-  let beat_phase = u_audio.values[3].y;
-  let one_minus_beat = 1.0 - beat_phase;
-  let kick_env = one_minus_beat * one_minus_beat * one_minus_beat;
-  let clock_speed = u.params2.y * kick_env;
+  let clock_speed = u.params2.y;
   let t = u.u_time * (u.params.x + peak_speed + bass_speed + clock_speed);
   var v: f32 = 0.0;
   v = v + sin(p.x * 1.5 + t);
@@ -13193,7 +13159,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       scratch[21] = (typeof p.clockReact    === "number") ? p.clockReact    : 0.0;
       scratch[22] = 0; scratch[23] = 0;
     },
-    description: "Plasma — classic demoscene 4-sinusoid color ripple. Animates with u_time × speed; scale controls wavelength; paletteOffset rotates the hue mapping. audioReact (Phase 6.5.2): scales the audio master peak into the animation speed. bassReact (Phase 6.5.3): same but from FFT bins 0..7 (~20-80 Hz). clockReact (Phase 6.5.4): adds a cubic-decay kick envelope synced to VisualClock's beat phase — drop a VisualClock node, set its BPM, and the plasma will pulse on every beat with no audio needed."
+    description: "Plasma — classic demoscene 4-sinusoid color ripple. Animates with u_time × speed; scale controls wavelength; paletteOffset rotates the hue mapping. audioReact (Phase 6.5.2): scales the audio master peak into the animation speed. bassReact (Phase 6.5.3): same but from FFT bins 0..7 (~20-80 Hz). clockReact (Phase 6.5.4): added directly to the speed term — wire MasterClock.beat → Plasma.clockReact for an on-the-beat cubic-decay pulse, MasterClock.phase for a continuous 0..1 ramp per beat, or set a manual constant in the props panel. Single MasterClock per patch drives all visual + audio nodes."
   },
 
   /* Phase 6.4 — Checkerboard. Two-color N×N grid. Used for
@@ -30965,40 +30931,6 @@ function _fnv1a(s) {
  * Composition nodes in 6.4.x that consume input textures will need a
  * different layout (texture + sampler + uniform); they'll define
  * their own cache keys to avoid colliding with this one. */
-/* Phase 6.5.4 — VisualClock SAB writer. Looks for a VisualClock
- * node in the patch and writes its derived bar / beat / quarter /
- * totalBeats values to scalar slots 12-15. No clock node -> zeros
- * (deterministic baseline; shaders that read those slots see 0
- * instead of stale data from a previous patch's clock). */
-function _updateVisualClock() {
-  if (!audioBridge.available) return;
-  if (typeof state === "undefined" || !state || !Array.isArray(state.nodes)) return;
-  const idx12 = AUDIO_BRIDGE_SCALAR_BASE + 12;
-  const vc = state.nodes.find(n => n && n.type === "VisualClock");
-  if (!vc) {
-    audioBridge.floats[idx12 + 0] = 0;
-    audioBridge.floats[idx12 + 1] = 0;
-    audioBridge.floats[idx12 + 2] = 0;
-    audioBridge.floats[idx12 + 3] = 0;
-    return;
-  }
-  const p     = vc.params || {};
-  const bpm   = Math.max(1, (typeof p.bpm   === "number") ? p.bpm   : 120);
-  const bpb   = Math.max(1, Math.floor((typeof p.bar === "number") ? p.bar : 4));
-  const phs0  = (typeof p.phase === "number") ? p.phase : 0;
-  const tSec  = performance.now() * 0.001;
-  const totalBeats = tSec * (bpm / 60.0) + phs0;
-  // Modulo helpers — wrap into [0, 1) even for negative phase offsets.
-  const wrap01 = (x) => { const w = x - Math.floor(x); return w; };
-  const beatPhase    = wrap01(totalBeats);
-  const barPhase     = wrap01(totalBeats / bpb);
-  const quarterPhase = wrap01(totalBeats * 4.0);   // 4 quarter-beats (16th-notes) per beat
-  audioBridge.floats[idx12 + 0] = barPhase;
-  audioBridge.floats[idx12 + 1] = beatPhase;
-  audioBridge.floats[idx12 + 2] = quarterPhase;
-  audioBridge.floats[idx12 + 3] = totalBeats;
-}
-
 /* Phase 6.5.3 — refresh the SAB FFT region from the main-thread
  * analyser. The 2048-point fftAnalyser pair gives 1024 source bins;
  * we downsample to 256 log-spaced bins (one per ~1/26th of an
@@ -31874,10 +31806,68 @@ function _resolveNodeParams(node) {
         ? src.params.value : 0;
       out[port.n] = v;
     }
+    else if (src.type === "MasterClock") {
+      // Phase 6.5.4 — JS-side MasterClock mirror. Reads the source
+      // MasterClock node's bpm param + uses performance.now() as
+      // the epoch to compute the current value for whichever
+      // output port the wire is from (bar / beat / quarter /
+      // eighth / sixteenth / phase / bpm). Sub-ms drift vs the
+      // sample-accurate C++ MasterClock in the worklet -- ample
+      // for visual reactivity at 60 fps.
+      out[port.n] = _masterClockOutputValue(src, wire.from.port);
+    }
     // Future source types (Knob, audio-rate LFO via SAB, etc.) plug
     // in here.
   }
   return out;
+}
+
+/* Phase 6.5.4 — JS-side MasterClock value computation. Mirrors the
+ * C++ GammaMasterClock helper class (registry line ~9405) but uses
+ * performance.now() as the time source instead of audio sample
+ * counts. Returns a different shape per output port:
+ *
+ *   bpm                          → the static bpm param (constant)
+ *   phase                        → 0..1 ramp within current beat
+ *                                  (linear, matches C++ behavior)
+ *   bar / beat / quarter /       → cubic-decay envelope per subdivision
+ *   eighth / sixteenth             (1.0 at the rising edge, ~0 just
+ *                                  before next edge). Different from
+ *                                  the C++ form (which emits a
+ *                                  one-sample 1.0 pulse) -- the
+ *                                  envelope shape is more useful for
+ *                                  shader uniforms than a sparse gate.
+ *
+ * Periods:
+ *   bar       = 4 beats
+ *   beat      = 1 beat
+ *   quarter   = 1 beat  (quarter-note = beat; matches C++ naming)
+ *   eighth    = 0.5 beat
+ *   sixteenth = 0.25 beat
+ *
+ * Drift vs the audio-side C++ MasterClock: both sides use BPM-based
+ * time math; the C++ side uses sample-accurate sampleCount/sampleRate,
+ * we use wall-clock performance.now(). At 48 kHz typical clock-drift
+ * is sub-ms per minute -- imperceptible for visuals. Sample-accurate
+ * audio-driven sync (worklet writes ticks to SAB) is a follow-on
+ * ticket once we have wasm-export plumbing. */
+function _masterClockOutputValue(node, portName) {
+  const bpm = Math.max(1, (node && node.params && typeof node.params.bpm === "number") ? node.params.bpm : 120);
+  const startT = (typeof Visual !== "undefined" && Visual && Visual.startTime) ? Visual.startTime : 0;
+  const tSec = (performance.now() - startT) * 0.001;
+  const totalBeats = tSec * (bpm / 60.0);
+  if (portName === "bpm")   return bpm;
+  if (portName === "phase") return totalBeats - Math.floor(totalBeats);
+  const fracOf = (period) => {
+    const x = totalBeats / period;
+    return x - Math.floor(x);
+  };
+  if (portName === "bar")       { const f = fracOf(4.0);   const m = 1.0 - f; return m * m * m; }
+  if (portName === "beat")      { const f = fracOf(1.0);   const m = 1.0 - f; return m * m * m; }
+  if (portName === "quarter")   { const f = fracOf(1.0);   const m = 1.0 - f; return m * m * m; }
+  if (portName === "eighth")    { const f = fracOf(0.5);   const m = 1.0 - f; return m * m * m; }
+  if (portName === "sixteenth") { const f = fracOf(0.25);  const m = 1.0 - f; return m * m * m; }
+  return 0;
 }
 
 /* Phase 6.6.28 — wrap a node so its .params reads return the wire-
@@ -33256,12 +33246,12 @@ function renderVisualFrame() {
   const dtSec = Visual.lastFrameT > 0 ? (now - Visual.lastFrameT) * 0.001 : 0;
   Visual.lastFrameT = now;
 
-  // Phase 6.5.3 / 6.5.4 — refresh FFT bins + VisualClock slots in
-  // the SAB from the main-thread sources, THEN copy the whole SAB
-  // audio section into the GPU uniform buffer. Order matters: SAB
-  // writers run first, then _writeAudioUniform reads what they wrote.
+  // Phase 6.5.3 — refresh FFT bins in the SAB from the main-thread
+  // analyser, THEN copy the whole SAB audio section into the GPU
+  // uniform buffer. MasterClock-driven values flow through the
+  // wired-param resolver in _resolveNodeParams instead of the SAB
+  // (Phase 6.5.4 redesign), so no clock-specific writer here.
   _updateAudioFft();
-  _updateVisualClock();
   _writeAudioUniform();
 
   const enc = Visual.device.createCommandEncoder({ label: "visual-frame" });
