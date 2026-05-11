@@ -13690,6 +13690,85 @@ public:
     description: "468-point face mesh + 52 blendshape coefficients via MediaPipe. We surface the most expressive 14 blendshapes (jaw open, smile, frown, pucker, blinks, brow movement, cheek puff) as 0..1 param wires. Drive a filter cutoff from a grin, gate a shader brightness with a blink, sweep a delay's feedback with brow movement. First use downloads ~6MB of model. bgMode=1 shows camera + mesh overlay; bgMode=0 is overlay-only."
   },
 
+  /* HandKeyboard (v0.3.10) — MediaPipe hand tracking → musical scale.
+   *
+   * Same detector + ai-vision-canvas pipeline as HandLandmarker but
+   * the resolver maps hand x-position (0..1 across the camera frame)
+   * to a scale-degree index, then to a MIDI note + frequency. Outputs:
+   *   gate (1 when hand tracked, 0 when not — drives envelope trigs)
+   *   freq (Hz, the currently-pointed note)
+   *   midi (the same note as a MIDI number, for downstream re-mapping)
+   *   present (alias of gate)
+   *   out  (camera + hand skeleton + scale-zone guide lines)
+   *
+   * Params:
+   *   scaleRoot   MIDI note for the bottom-left zone (default 60 = C4)
+   *   scaleMode   major | minor | pentatonic | chromatic
+   *   octaves     1..4 (how many octaves span the camera horizontally)
+   *   mirrored    1 = selfie cam flip (matches your hand to display)
+   *
+   * Wire freq → Sine.freq, gate → AD.trig: classic mono synth voice
+   * controlled by hand position. Pentatonic mode + 2 octaves on a
+   * spread arm-reach is comfortable for live "playing" gestures. */
+  HandKeyboard: {
+    category: "AI", color: COLOR.ai, header: null,
+    cppType: "GammaHandKeyboardSource",
+    helperClass:
+`class GammaHandKeyboardSource {
+    /* JS pushes gate / freq / midi each frame. operator()() returns
+     * the struct so each downstream consumer reads its own field at
+     * sample rate. note_idx is the integer step within the chosen
+     * scale (0..totalSteps-1); useful for indexing wavetables /
+     * triggering per-step events. */
+    float v_[5] = {0};
+public:
+    void setPresent(float v)  { v_[0] = v; }
+    void setGate(float v)     { v_[1] = v; }
+    void setFreq(float v)     { v_[2] = v; }
+    void setMidi(float v)     { v_[3] = v; }
+    void setNoteIdx(float v)  { v_[4] = v; }
+    struct Out { float present, gate, freq, midi, note_idx; };
+    Out operator()() { return { v_[0], v_[1], v_[2], v_[3], v_[4] }; }
+};`,
+    kind: "ai-vision-canvas",
+    ins: [],
+    outs: [
+      { n: "out",      t: "texture" },
+      { n: "present",  t: "param", access: ".present"  },
+      // gate intentionally typed as "audio" not "param" -- wires to
+      // AD.trig / Env.trig (gate ports) accept audio-typed signals
+      // via SIGNAL_PORT_TYPES, and an audio-typed gate output reads
+      // sample-by-sample at the worklet's quantum so envelope retrig
+      // happens within ~3ms of the hand entering / leaving frame.
+      { n: "gate",     t: "audio", access: ".gate"     },
+      { n: "freq",     t: "param", access: ".freq"     },
+      { n: "midi",     t: "param", access: ".midi"     },
+      { n: "note_idx", t: "param", access: ".note_idx" }
+    ],
+    params: {
+      // Config / mapping (UI-only).
+      scaleRoot: 60, scaleMode: "pentatonic", octaves: 2,
+      maxHands: 1, minConfidence: 0.5, bgMode: 1, mirrored: 1,
+      lineWidth: 2.5, dotRadius: 4,
+      // Live values (JS-driven; auto-exposed).
+      present: 0, gate: 0, freq: 220, midi: 60, note_idx: 0
+    },
+    methods: {
+      scaleRoot: null, scaleMode: null, octaves: null,
+      maxHands: null, minConfidence: null, bgMode: null, mirrored: null,
+      lineWidth: null, dotRadius: null,
+      present: "setPresent", gate: "setGate",
+      freq: "setFreq", midi: "setMidi", note_idx: "setNoteIdx"
+    },
+    paramOptions: { scaleMode: ["major", "minor", "pentatonic", "chromatic"] },
+    uiOnlyParams: [
+      "scaleRoot", "scaleMode", "octaves",
+      "maxHands", "minConfidence", "bgMode", "mirrored", "lineWidth", "dotRadius"
+    ],
+    autoExpose: ["present", "gate", "freq", "midi", "note_idx"],
+    description: "MediaPipe hand tracking → musical scale. x-position across the camera selects a step in the chosen scale (major/minor/pentatonic/chromatic) over N octaves; outputs the matching gate + freq + MIDI note. Wire freq → Sine.freq and gate → AD.trig for a mono hand-synth voice. Camera + skeleton + scale-zone guide lines render to `out` so you can SEE where each note lives in the frame."
+  },
+
   /* Gradient — 2-color linear blend along a configurable angle.
    * Eight params: angle (radians), rA/gA/bA (start color), rB/gB/bB
    * (end color). Useful as a backdrop or as a luma source for masks
@@ -23389,6 +23468,74 @@ const _demos = [
       state.edges.push({ from: { node: hands, port: "present" }, to: { node: lvl,  port: "a"     } });
       state.edges.push({ from: { node: lvl,  port: "out"     }, to: { node: amp,  port: "b"      } });
       state.edges.push({ from: { node: amp,  port: "out"     }, to: { node: out,  port: "L"      } });
+    }
+  },
+
+  /* Hand Piano (v0.3.10) — HandKeyboard plays scale notes from
+   * hand x-position. Same gate / freq pair you'd get from KeyboardIn,
+   * but driven by where your hand points across the camera frame.
+   *
+   * Pentatonic mode (minor) × 2 octaves → 10 zones across the screen.
+   * Sweep your hand left-to-right and you walk up the scale; raise /
+   * lower for tonal contour (h1_y modulates the filter). gate drives
+   * an AD envelope so each note has a pluck attack — much more
+   * musical than a continuous tone. */
+  {
+    id: "hand-piano",
+    name: "Hand Piano",
+    sub: "hand-x → scale notes",
+    type: "advanced",
+    thumb: `<svg viewBox="0 0 100 44">
+      <rect width="100" height="44" fill="rgba(0,0,0,0.85)"/>
+      <!-- piano keys -->
+      <g fill="rgba(200,232,90,0.18)" stroke="rgba(178,100,200,0.45)" stroke-width="0.4">
+        <rect x="10" y="24" width="9" height="16"/>
+        <rect x="19" y="24" width="9" height="16"/>
+        <rect x="28" y="24" width="9" height="16"/>
+        <rect x="37" y="24" width="9" height="16"/>
+        <rect x="46" y="24" width="9" height="16"/>
+        <rect x="55" y="24" width="9" height="16"/>
+        <rect x="64" y="24" width="9" height="16"/>
+        <rect x="73" y="24" width="9" height="16"/>
+        <rect x="82" y="24" width="9" height="16"/>
+      </g>
+      <!-- one highlighted key -->
+      <rect x="46" y="24" width="9" height="16" fill="rgba(200,232,90,0.55)" stroke="rgba(200,232,90,0.95)" stroke-width="0.6"/>
+      <!-- hand sketch -->
+      <g stroke="rgba(131,232,255,0.95)" stroke-width="0.7" stroke-linecap="round" fill="rgba(131,232,255,0.95)">
+        <line x1="50" y1="20" x2="50" y2="10" stroke-width="0.5"/>
+        <circle cx="50" cy="20" r="1.0"/>
+        <circle cx="50" cy="10" r="0.8"/>
+      </g>
+    </svg>`,
+    build: () => {
+      // HandKeyboard: pentatonic × 2 octaves, rooted at A3 (69 - 12 = 57)
+      // so the comfortable midrange sits where most hands naturally rest.
+      const kb   = makeNode("HandKeyboard", 40, 60, {
+        scaleRoot: 57, scaleMode: "pentatonic", octaves: 2,
+        maxHands: 1, minConfidence: 0.5, bgMode: 1, mirrored: 1
+      });
+      const vo   = makeNode("VisualOutput", 360, 60, { display: 0 });
+      state.edges.push({ from: { node: kb, port: "out" }, to: { node: vo, port: "in" } });
+
+      // Sine voice — kb.freq → Sine.freq, kb.gate triggers an AD envelope
+      // that gates the amplitude.
+      const sine = makeNode("Sine",      40, 240, { freq: 220 });
+      const env  = makeNode("AD",       220, 240, { attack: 0.005, decay: 0.45 });
+      const amp  = makeNode("Mul",      420, 240);
+      const lvl  = makeNode("Mul",      420, 340, { b: 0.5 });
+
+      state.edges.push({ from: { node: kb,   port: "freq" }, to: { node: sine, port: "freq" } });
+      state.edges.push({ from: { node: kb,   port: "gate" }, to: { node: env,  port: "trig" } });
+      state.edges.push({ from: { node: sine, port: "out"  }, to: { node: amp,  port: "a"    } });
+      state.edges.push({ from: { node: env,  port: "out"  }, to: { node: lvl,  port: "a"    } });
+      state.edges.push({ from: { node: lvl,  port: "out"  }, to: { node: amp,  port: "b"    } });
+
+      // Light low-pass filter to round off the edges, then Output.
+      const filt = makeNode("BiquadLP", 600, 240, { cutoff: 3500, q: 0.7 });
+      const out  = makeNode("Output",   780, 240);
+      state.edges.push({ from: { node: amp,  port: "out" }, to: { node: filt, port: "in" } });
+      state.edges.push({ from: { node: filt, port: "out" }, to: { node: out,  port: "L"  } });
     }
   },
 
@@ -33486,9 +33633,10 @@ function _startMediapipeLoop(nodeId) {
           const liveNode = state && Array.isArray(state.nodes)
             ? state.nodes.find(n => n.id === nodeId) : null;
           const liveParams = liveNode ? liveNode.params : e.params;
-          if (e.kind === "hand") _drawHandLandmarkerOverlay(e, liveParams);
-          else if (e.kind === "pose") _drawPoseLandmarkerOverlay(e, liveParams);
-          else if (e.kind === "face") _drawFaceLandmarkerOverlay(e, liveParams);
+          if (e.kind === "hand")             _drawHandLandmarkerOverlay(e, liveParams);
+          else if (e.kind === "handkeyboard")  _drawHandKeyboardOverlay(e, liveParams);
+          else if (e.kind === "pose")          _drawPoseLandmarkerOverlay(e, liveParams);
+          else if (e.kind === "face")          _drawFaceLandmarkerOverlay(e, liveParams);
         }
       } catch (err) {
         // First-frame races: detector not ready, video not ready,
@@ -33845,6 +33993,158 @@ function _faceLandmarkerValue(node, portName) {
   if (portName === "face_y") return faces[0][1] ? faces[0][1].y : 0;
   // Blendshape lookup -- categoryName matches our port name verbatim.
   return _faceBlendshape(r, portName);
+}
+
+/* =========================================================================
+ * v0.3.10 — HandKeyboard (MediaPipe hand-x → musical scale)
+ *
+ * Same MediaPipe HandLandmarker detector as the HandLandmarker node,
+ * but the resolver maps wrist x-position (after mirror handling) to
+ * a scale-degree index → MIDI note → frequency. The canvas overlay
+ * draws hand skeleton + thin vertical guide lines marking each
+ * scale-step zone, so the user can see at a glance where to point
+ * the hand for each note. */
+
+const _SCALE_INTERVALS = {
+  major:      [0, 2, 4, 5, 7, 9, 11],
+  minor:      [0, 2, 3, 5, 7, 8, 10],
+  pentatonic: [0, 3, 5, 7, 10],           // minor pentatonic — friendlier for live noodling
+  chromatic:  [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+};
+
+async function _ensureHandKeyboard(nodeId, params) {
+  let entry = _mediapipeNodes.get(nodeId);
+  if (entry) return entry;
+  entry = {
+    kind: "handkeyboard", detector: null, videoEl: null, stream: null,
+    latest: null, ready: false, requesting: true, error: null, rafHandle: null,
+    drawCanvas: null, drawCtx: null, params: params || {}
+  };
+  _mediapipeNodes.set(nodeId, entry);
+  try {
+    const { HandLandmarker, filesets } = await _loadMediaPipeVision();
+    await _ensureMediapipeCamera(entry);
+    entry.detector = await HandLandmarker.createFromOptions(filesets, {
+      baseOptions: {
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+        delegate: "GPU"
+      },
+      runningMode: "VIDEO",
+      numHands: Math.max(1, Math.min(4, (params && params.maxHands) || 1)),
+      minHandDetectionConfidence: (params && typeof params.minConfidence === "number") ? params.minConfidence : 0.5,
+      minHandPresenceConfidence: 0.5,
+      minTrackingConfidence: 0.5
+    });
+    const w = Visual.fbWidth  || 1920;
+    const h = Visual.fbHeight || 1080;
+    entry.drawCanvas = document.createElement("canvas");
+    entry.drawCanvas.width  = w;
+    entry.drawCanvas.height = h;
+    entry.drawCtx = entry.drawCanvas.getContext("2d", { alpha: true });
+    entry.ready = true;
+    console.log("[handkeyboard] node " + nodeId + " ready (canvas=" + w + "×" + h + ")");
+    _startMediapipeLoop(nodeId);
+  } catch (e) {
+    console.warn("[handkeyboard] init failed for node " + nodeId + ":", e);
+    entry.error = e;
+  } finally {
+    entry.requesting = false;
+  }
+  return entry;
+}
+
+/* Compute (noteIdx, midi, freq) for a given x-position + scale config.
+ * x is clamped to [0, 1] after mirror handling by the caller. Returns
+ * null when the scale lookup is empty (defensive; should never happen
+ * with the registry default of "pentatonic"). */
+function _handKeyboardScaleMap(x, params) {
+  const mode      = (params && params.scaleMode) || "pentatonic";
+  const octaves   = Math.max(1, Math.min(4, (params && params.octaves) || 2));
+  const scaleRoot = (params && typeof params.scaleRoot === "number") ? params.scaleRoot : 60;
+  const scale     = _SCALE_INTERVALS[mode] || _SCALE_INTERVALS.pentatonic;
+  if (!scale.length) return null;
+  const totalSteps = scale.length * octaves;
+  let step = Math.floor(x * totalSteps);
+  if (step < 0) step = 0;
+  if (step >= totalSteps) step = totalSteps - 1;
+  const octave        = Math.floor(step / scale.length);
+  const stepInOctave  = step % scale.length;
+  const midi          = scaleRoot + octave * 12 + scale[stepInOctave];
+  const freq          = 440 * Math.pow(2, (midi - 69) / 12);
+  return { noteIdx: step, midi, freq, totalSteps };
+}
+
+function _drawHandKeyboardOverlay(entry, params) {
+  // First draw the standard hand-tracking overlay (camera + skeleton).
+  _drawHandLandmarkerOverlay(entry, params);
+  const ctx = entry.drawCtx;
+  const cvs = entry.drawCanvas;
+  if (!ctx || !cvs) return;
+  const w = cvs.width, h = cvs.height;
+  const mode = (params && params.scaleMode) || "pentatonic";
+  const scale = _SCALE_INTERVALS[mode] || _SCALE_INTERVALS.pentatonic;
+  const octaves = Math.max(1, Math.min(4, (params && params.octaves) || 2));
+  const totalSteps = scale.length * octaves;
+  if (totalSteps < 1) return;
+  // Highlight the active zone first so the skeleton draws over it.
+  const r = entry.latest;
+  let activeStep = -1;
+  if (r && r.landmarks && r.landmarks.length > 0) {
+    const hand = r.landmarks[0];
+    if (hand && hand.length > 0) {
+      let hx = hand[0].x;
+      const mirrored = (params && params.mirrored) ? 1 : 0;
+      if (mirrored) hx = 1.0 - hx;
+      if (hx >= 0 && hx <= 1) {
+        activeStep = Math.min(totalSteps - 1, Math.floor(hx * totalSteps));
+      }
+    }
+  }
+  if (activeStep >= 0) {
+    const zoneL = (activeStep    ) / totalSteps * w;
+    const zoneR = (activeStep + 1) / totalSteps * w;
+    ctx.fillStyle = "rgba(200, 232, 90, 0.18)";
+    ctx.fillRect(zoneL, 0, zoneR - zoneL, h);
+  }
+  // Zone divider lines + octave dividers (heavier).
+  ctx.strokeStyle = "rgba(178, 100, 200, 0.40)";
+  ctx.lineWidth = 1;
+  for (let i = 1; i < totalSteps; i++) {
+    const isOctaveBoundary = (i % scale.length === 0);
+    ctx.lineWidth = isOctaveBoundary ? 2 : 1;
+    ctx.strokeStyle = isOctaveBoundary
+      ? "rgba(178, 100, 200, 0.75)"
+      : "rgba(178, 100, 200, 0.30)";
+    const x = (i / totalSteps) * w;
+    ctx.beginPath();
+    ctx.moveTo(x, h * 0.78);
+    ctx.lineTo(x, h);
+    ctx.stroke();
+  }
+}
+
+function _handKeyboardValue(node, portName) {
+  const entry = _mediapipeNodes.get(node.id);
+  if (!entry) { _ensureHandKeyboard(node.id, node.params || {}); return 0; }
+  if (!entry.ready || !entry.latest) return 0;
+  const hands = entry.latest.landmarks || [];
+  const present = hands.length > 0 ? 1 : 0;
+  if (portName === "present" || portName === "gate") return present;
+  if (!present) return 0;
+  const hand = hands[0];
+  if (!hand || hand.length < 21) return 0;
+  // Use wrist (0) x — palm center would be more stable but wrist
+  // is more responsive for "pointing" gestures.
+  let x = hand[0].x;
+  const mirrored = (node.params && node.params.mirrored) ? 1 : 0;
+  if (mirrored) x = 1.0 - x;
+  if (x < 0) x = 0; if (x > 1) x = 1;
+  const mapped = _handKeyboardScaleMap(x, node.params || {});
+  if (!mapped) return 0;
+  if (portName === "freq")     return mapped.freq;
+  if (portName === "midi")     return mapped.midi;
+  if (portName === "note_idx") return mapped.noteIdx;
+  return 0;
 }
 
 /* Standard uniform-buffer preamble. Phase 6.5.7 grew this from 32 to
@@ -34425,6 +34725,9 @@ function _resolveNodeParams(node) {
     else if (src.type === "FaceLandmarker") {
       out[port.n] = _faceLandmarkerValue(src, wire.from.port);
     }
+    else if (src.type === "HandKeyboard") {
+      out[port.n] = _handKeyboardValue(src, wire.from.port);
+    }
     // Future source types (Knob, audio-rate LFO via SAB, etc.) plug
     // in here.
   }
@@ -34851,9 +35154,10 @@ function _encodeShaderFragPassForPlan(enc, entry, dtSec) {
     const e = _mediapipeNodes.get(node.id);
     if (!e) {
       // Dispatch by node type to the right MediaPipe init helper.
-      if (node.type === "PoseLandmarker") _ensurePoseLandmarker(node.id, node.params || {});
+      if (node.type === "PoseLandmarker")      _ensurePoseLandmarker(node.id, node.params || {});
       else if (node.type === "FaceLandmarker") _ensureFaceLandmarker(node.id, node.params || {});
-      else _ensureHandLandmarker(node.id, node.params || {});
+      else if (node.type === "HandKeyboard")   _ensureHandKeyboard(node.id, node.params || {});
+      else                                     _ensureHandLandmarker(node.id, node.params || {});
       return false;
     }
     if (!e.ready || !e.drawCanvas) return false;
@@ -36190,14 +36494,18 @@ const _FACE_LIVE_PORTS = [
   "browInnerUp",
   "cheekPuff"
 ];
+const _HANDKB_LIVE_PORTS = [
+  "present", "gate", "freq", "midi", "note_idx"
+];
 
 function _pushLiveControlsToWorklet() {
   if (!previewState || previewState.state !== "playing" || !previewState.workletNode) return;
   if (typeof state === "undefined" || !state || !Array.isArray(state.nodes)) return;
-  const hands = state.nodes.filter(n => n && n.type === "HandLandmarker");
-  const poses = state.nodes.filter(n => n && n.type === "PoseLandmarker");
-  const faces = state.nodes.filter(n => n && n.type === "FaceLandmarker");
-  if (hands.length === 0 && poses.length === 0 && faces.length === 0) return;
+  const hands  = state.nodes.filter(n => n && n.type === "HandLandmarker");
+  const poses  = state.nodes.filter(n => n && n.type === "PoseLandmarker");
+  const faces  = state.nodes.filter(n => n && n.type === "FaceLandmarker");
+  const handkb = state.nodes.filter(n => n && n.type === "HandKeyboard");
+  if (hands.length === 0 && poses.length === 0 && faces.length === 0 && handkb.length === 0) return;
   const setterIndex = _refreshLiveControlSetters();
   // v0.3.8 — push EVERY live port that has a setter index in the
   // worklet's dispatch table, regardless of whether the wire goes
@@ -36216,9 +36524,10 @@ function _pushLiveControlsToWorklet() {
       });
     }
   };
-  for (const node of hands) push(node, _HAND_LIVE_PORTS, _handLandmarkerValue);
-  for (const node of poses) push(node, _POSE_LIVE_PORTS, _poseLandmarkerValue);
-  for (const node of faces) push(node, _FACE_LIVE_PORTS, _faceLandmarkerValue);
+  for (const node of hands)  push(node, _HAND_LIVE_PORTS,    _handLandmarkerValue);
+  for (const node of poses)  push(node, _POSE_LIVE_PORTS,    _poseLandmarkerValue);
+  for (const node of faces)  push(node, _FACE_LIVE_PORTS,    _faceLandmarkerValue);
+  for (const node of handkb) push(node, _HANDKB_LIVE_PORTS,  _handKeyboardValue);
 }
 
 function startVisualRenderLoop() {
