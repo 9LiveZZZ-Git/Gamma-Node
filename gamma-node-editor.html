@@ -6421,6 +6421,16 @@
             <span class="export-action-name">Save generated C++ as <code id="exp-header-name">.h</code></span>
             <span class="export-action-sub">Just the patch class as emitted by codegen — drop into an AlloLib project's audio callback or any host that follows the SPEC §4 contract. Errors surface as a <code>// ❌</code> comment block in the file (cycle without Delay1, etc).</span>
           </button>
+          <button class="export-action" id="exp-standalone-html">
+            <span class="export-action-name">Export standalone <code>.html</code> (patch + runtime)</span>
+            <span class="export-action-sub">Single self-contained <code>.html</code> file: a copy of this editor with the current patch baked in as an embedded JSON block. Open it anywhere a Chromium-based browser runs and the patch loads automatically. Auto-Live-Mode option opens the visual layer fullscreen on launch.</span>
+          </button>
+          <div class="export-display-row">
+            <label style="display:flex;align-items:center;gap:6px;color:var(--text-2);font-size:11px;flex:1;font-family:var(--font-mono);">
+              <input type="checkbox" id="exp-standalone-livemode" checked style="width:14px;height:14px;" />
+              Auto-enter Live Mode on open
+            </label>
+          </div>
         </div>
 
         <!-- Visual capture --------------------------------------------- -->
@@ -27280,106 +27290,86 @@ document.getElementById("btn-load").addEventListener("click", () => {
   document.getElementById("file-input").click();
 });
 
+/* v0.2.23 — extracted from the file-input handler's onload body so
+ * the same migration + state-setup path runs whether the patch comes
+ * from a user-selected .gpatch file OR from a `<script id="gamma-
+ * embedded-patch">` tag baked into a standalone HTML export. The
+ * `filename` arg labels the source in state.filename + drives the
+ * patchName fallback when the loaded JSON didn't carry one. */
+function _applyLoadedPatch(loaded, filename) {
+  if (!loaded || !loaded.nodes || !loaded.edges) throw new Error("missing nodes/edges");
+  state = Object.assign({ version: 2, patchName: "MyPatch", exposed: {}, groups: [] }, loaded);
+  if (!Array.isArray(state.groups)) state.groups = [];
+  if (!state.rig || !Array.isArray(state.rig.displays)) state.rig = defaultRig();
+  if (typeof state.rig.shaderCenterYaw   !== "number") state.rig.shaderCenterYaw   = 0;
+  if (typeof state.rig.shaderCenterPitch !== "number") state.rig.shaderCenterPitch = 0;
+  state.rig.surface = _migrateRigSurface(state.rig.surface
+    || (RIG_TEMPLATES[state.rig.templateKey] && RIG_TEMPLATES[state.rig.templateKey].surface)
+    || null);
+  if (!Array.isArray(state.rig.sweetSpot) || state.rig.sweetSpot.length !== 3) {
+    state.rig.sweetSpot = _deriveSweetSpot(state.rig.surface);
+  }
+  if (typeof state.rig.surfaceVisible !== "boolean") state.rig.surfaceVisible = true;
+  state.rig.displays.forEach(d => {
+    if (!("warpMesh" in d) || (d.warpMesh !== null && !_validateWarpMesh(d.warpMesh))) {
+      d.warpMesh = null;
+    }
+    d.edgeBlend = _migrateEdgeBlend(d.edgeBlend);
+    if (!d.keystoneCorners || typeof d.keystoneCorners !== "object") {
+      d.keystoneCorners = { tlx: 0, tly: 0, trx: 0, try_: 0, blx: 0, bly: 0, brx: 0, bry: 0 };
+    } else {
+      d.keystoneCorners.tlx  = +(d.keystoneCorners.tlx)  || 0;
+      d.keystoneCorners.tly  = +(d.keystoneCorners.tly)  || 0;
+      d.keystoneCorners.trx  = +(d.keystoneCorners.trx)  || 0;
+      d.keystoneCorners.try_ = +(d.keystoneCorners.try_) || 0;
+      d.keystoneCorners.blx  = +(d.keystoneCorners.blx)  || 0;
+      d.keystoneCorners.bly  = +(d.keystoneCorners.bly)  || 0;
+      d.keystoneCorners.brx  = +(d.keystoneCorners.brx)  || 0;
+      d.keystoneCorners.bry  = +(d.keystoneCorners.bry)  || 0;
+    }
+    if (!('bezierCorrections' in d)) d.bezierCorrections = null;
+    if (d.bezierCorrections && (!Array.isArray(d.bezierCorrections.ctrl) ||
+        !Number.isInteger(d.bezierCorrections.cols) ||
+        !Number.isInteger(d.bezierCorrections.rows))) {
+      d.bezierCorrections = null;
+    }
+  });
+  state.nodes.forEach(n => {
+    if (n.type === "VisualOutput") {
+      if (!n.params) n.params = {};
+      if (typeof n.params.display !== "number") n.params.display = 0;
+    }
+  });
+  const fname = filename || "embedded.gpatch";
+  state.filename = fname;
+  const stem = fname.replace(/\.[^.]+$/, "");
+  if (!loaded.patchName) state.patchName = stem.replace(/[^A-Za-z0-9_]/g, "_");
+  let maxId = 0;
+  state.nodes.forEach(n => {
+    const m = parseInt(String(n.id).replace(/\D/g, ""), 10);
+    if (m > maxId) maxId = m;
+  });
+  nextId = maxId + 1;
+  clearSelection();
+  undoStack.length = 0;
+  redoStack.length = 0;
+  resetView();
+  if (typeof _updateProjectionPill === "function") _updateProjectionPill();
+  if (Visual && Visual.theaterCam && state.rig && Array.isArray(state.rig.sweetSpot)) {
+    Visual.theaterCam.pos[0] = state.rig.sweetSpot[0];
+    Visual.theaterCam.pos[1] = state.rig.sweetSpot[1];
+    Visual.theaterCam.pos[2] = state.rig.sweetSpot[2];
+  }
+  render();
+}
+
 document.getElementById("file-input").addEventListener("change", ev => {
   const file = ev.target.files[0];
   if (!file) return;
   const reader = new FileReader();
   reader.onload = () => {
     try {
-      const loaded = JSON.parse(reader.result);
-      if (!loaded.nodes || !loaded.edges) throw new Error("missing nodes/edges");
-      state = Object.assign({ version: 2, patchName: "MyPatch", exposed: {}, groups: [] }, loaded);
-      // Older .gpatch files (pre-grouping) won't have a groups field;
-      // make sure it's at least an array so render / save paths can
-      // iterate without null checks.
-      if (!Array.isArray(state.groups)) state.groups = [];
-      // Phase 6.5 — synthesize the default 1-display rig for patches
-      // saved before the rig data layer existed. Any VisualOutput
-      // nodes without a `display` param land on display 0 of that
-      // synthesized rig, preserving exact pre-6.5 behavior.
-      if (!state.rig || !Array.isArray(state.rig.displays)) {
-        state.rig = defaultRig();
-      }
-      // Phase 6.5.15+ — synthesize shader-center fields for older rigs.
-      if (typeof state.rig.shaderCenterYaw   !== "number") state.rig.shaderCenterYaw   = 0;
-      if (typeof state.rig.shaderCenterPitch !== "number") state.rig.shaderCenterPitch = 0;
-      // Phase 6.6.14 — synthesize screen-surface + sweet-spot for
-      // pre-6.6.14 rigs. Pull the surface from the patch's
-      // templateKey if it matches a known template; otherwise fall
-      // back to "free" surface and origin sweet-spot.
-      state.rig.surface = _migrateRigSurface(state.rig.surface
-        || (RIG_TEMPLATES[state.rig.templateKey] && RIG_TEMPLATES[state.rig.templateKey].surface)
-        || null);
-      if (!Array.isArray(state.rig.sweetSpot) || state.rig.sweetSpot.length !== 3) {
-        state.rig.sweetSpot = _deriveSweetSpot(state.rig.surface);
-      }
-      // Phase 6.6.15 — surfaceVisible toggle (default ON for old patches).
-      if (typeof state.rig.surfaceVisible !== "boolean") state.rig.surfaceVisible = true;
-      // Phase 6.6 — synthesize calibration warp + edge-blend fields
-      // on every display so the render path can read them without
-      // null checks. Pre-6.6 patches get warpMesh=null (no warp) +
-      // default edgeBlend. Garbage meshes (validation fails) silently
-      // drop to null rather than crashing the warp pass.
-      state.rig.displays.forEach(d => {
-        if (!("warpMesh" in d) || (d.warpMesh !== null && !_validateWarpMesh(d.warpMesh))) {
-          d.warpMesh = null;
-        }
-        d.edgeBlend = _migrateEdgeBlend(d.edgeBlend);
-        // Phase 6.6.20.16 — keystoneCorners backfill for old patches
-        // that pre-date AI v3. Default all zeros.
-        if (!d.keystoneCorners || typeof d.keystoneCorners !== "object") {
-          d.keystoneCorners = { tlx: 0, tly: 0, trx: 0, try_: 0, blx: 0, bly: 0, brx: 0, bry: 0 };
-        } else {
-          d.keystoneCorners.tlx  = +(d.keystoneCorners.tlx)  || 0;
-          d.keystoneCorners.tly  = +(d.keystoneCorners.tly)  || 0;
-          d.keystoneCorners.trx  = +(d.keystoneCorners.trx)  || 0;
-          d.keystoneCorners.try_ = +(d.keystoneCorners.try_) || 0;
-          d.keystoneCorners.blx  = +(d.keystoneCorners.blx)  || 0;
-          d.keystoneCorners.bly  = +(d.keystoneCorners.bly)  || 0;
-          d.keystoneCorners.brx  = +(d.keystoneCorners.brx)  || 0;
-          d.keystoneCorners.bry  = +(d.keystoneCorners.bry)  || 0;
-        }
-        // Phase 6.6.20.17 — bezierCorrections backfill (AI v4). null
-        // means "no Bezier adjustments"; lazy-inits when first
-        // non-zero delta applied during fine-tune.
-        if (!('bezierCorrections' in d)) d.bezierCorrections = null;
-        if (d.bezierCorrections && (!Array.isArray(d.bezierCorrections.ctrl) ||
-            !Number.isInteger(d.bezierCorrections.cols) ||
-            !Number.isInteger(d.bezierCorrections.rows))) {
-          // Garbage shape — drop.
-          d.bezierCorrections = null;
-        }
-      });
-      state.nodes.forEach(n => {
-        if (n.type === "VisualOutput") {
-          if (!n.params) n.params = {};
-          if (typeof n.params.display !== "number") n.params.display = 0;
-        }
-      });
-      state.filename = file.name;
-      const stem = file.name.replace(/\.[^.]+$/, "");
-      if (!loaded.patchName) state.patchName = stem.replace(/[^A-Za-z0-9_]/g, "_");
-      let max = 0;
-      state.nodes.forEach(n => { const m = parseInt(String(n.id).replace(/\D/g, ""), 10); if (m > max) max = m; });
-      nextId = max + 1;
-      clearSelection();
-      undoStack.length = 0;
-      redoStack.length = 0;
-      resetView();
-      // Phase 6.6.13 — sync the projection pill + body classes after
-      // load so theater-mode pointer-events flip correctly when the
-      // patch comes in already in theater preview.
-      if (typeof _updateProjectionPill === "function") _updateProjectionPill();
-      // Phase 6.6.14 — spawn the theater camera at the rig's sweet
-      // spot. Patch authors may have intended a specific viewing
-      // position; re-loading should put the user there before they
-      // start exploring.
-      if (Visual && Visual.theaterCam && state.rig && Array.isArray(state.rig.sweetSpot)) {
-        Visual.theaterCam.pos[0] = state.rig.sweetSpot[0];
-        Visual.theaterCam.pos[1] = state.rig.sweetSpot[1];
-        Visual.theaterCam.pos[2] = state.rig.sweetSpot[2];
-      }
-      render();
+      _applyLoadedPatch(JSON.parse(reader.result), file.name);
     } catch (err) {
       alert("Could not load file: " + err.message);
     }
@@ -27387,6 +27377,7 @@ document.getElementById("file-input").addEventListener("change", ev => {
   reader.readAsText(file);
   ev.target.value = "";
 });
+
 
 copyBtn.addEventListener("click", () => {
   const which = document.querySelector(".tab.active").dataset.tab;
@@ -35510,6 +35501,89 @@ async function audioBufferToMp3Blob(audioBuffer, bitrateKbps) {
 }
 
 /* =========================================================================
+ * v0.2.23 — Standalone HTML export
+ *
+ * Bakes the current patch into a self-contained copy of the editor
+ * HTML. Fetches our own HTML via fetch(location.href), injects a
+ * `<script type="application/json" id="gamma-embedded-patch">` block
+ * carrying state JSON, and downloads the result. The loader at the
+ * very bottom of the script body (search for "Standalone HTML loader")
+ * picks up the embed and calls _applyLoadedPatch before the first
+ * render — so opening the exported file replaces the demo patch with
+ * the embedded one.
+ *
+ * Browser autoplay restrictions still apply: audio won't start until
+ * the user clicks ▶ in the exported file (same as the editor). The
+ * autoLiveMode option auto-enters Live Mode after device acquisition
+ * so the visual layer fills the screen on open without a manual
+ * toggle. Press L to flip back to the editor.
+ *
+ * Caveats vs. the roadmap §9 "pre-warmed WGSL pipeline cache" spec:
+ * the cache is per-device, can't be serialized portably. WGSL hashes
+ * (the cache keys) are the same regardless, so first-frame compile
+ * latency on the exported file is identical to the editor's. */
+async function exportStandaloneHtml(options) {
+  options = options || {};
+  const autoLiveMode = !!options.autoLiveMode;
+  // 1. Fetch our own HTML. fetch on a file:// URL works in Chromium
+  //    when the page is served from http(s) -- if the user opens
+  //    the editor by double-clicking a local file, this can fail
+  //    with a "CORS" / "file scheme" error. Tested working from a
+  //    static http server (python -m http.server / npx serve).
+  let html;
+  try {
+    const res = await fetch(location.href, { cache: "no-cache" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    html = await res.text();
+  } catch (e) {
+    throw new Error("Could not fetch self HTML (" + e.message +
+      "). If you opened the editor as a file:// URL, serve it from a " +
+      "static server instead (python -m http.server) and try again.");
+  }
+  if (!/<\/body>/i.test(html)) {
+    throw new Error("Self HTML missing </body> -- unexpected file shape");
+  }
+  // 2. Build the embed. A literal close-script tag inside the JSON
+  //    would close the parent script prematurely; escape with
+  //    backslash-slash so the HTML parser sees text but the JSON
+  //    round-trip preserves the bytes. Note: even THIS source file
+  //    has to write the close tag as "<\/script>" everywhere it
+  //    appears literally in a JS string or comment, otherwise the
+  //    editor's own <script> block would close right here.
+  const patchJson = JSON.stringify(state, _omitRuntimeKeys, 2);
+  const safeJson = patchJson.replace(/<\/script/gi, "<\\/script");
+  const cfgJson  = JSON.stringify({ autoLiveMode, exportedAt: new Date().toISOString(),
+                                    fromVersion: (typeof APP_VERSION !== "undefined" ? APP_VERSION : "?") });
+  const CLOSE = "<\/script>";   // see comment above
+  const embed =
+    '<script type="application/json" id="gamma-embedded-patch">\n' + safeJson + '\n' + CLOSE + '\n' +
+    '<script type="application/json" id="gamma-embedded-config">\n' + cfgJson  + '\n' + CLOSE + '\n';
+  // 3. Strip any embed left over from a previous export so a user
+  //    can re-export a standalone -> regular patch -> standalone
+  //    cycle without compounding embeds. Match the lazy variant
+  //    of the script-with-id pattern.
+  html = html.replace(
+    /<script[^>]+id\s*=\s*["']gamma-embedded-(?:patch|config)["'][^>]*>[\s\S]*?<\/script>\s*/gi,
+    ""
+  );
+  // 4. Insert the fresh embed right before </body>.
+  html = html.replace(/<\/body>/i, embed + "</body>");
+  // 5. Update <title> to make standalones easier to identify in
+  //    history/tab strips. Falls back silently if no title tag.
+  const className = ((state && state.patchName) || "MyPatch")
+    .replace(/[^A-Za-z0-9_-]/g, "");
+  html = html.replace(
+    /<title>[^<]*<\/title>/i,
+    "<title>" + className + " — Gamma Node patch</title>"
+  );
+  return {
+    html,
+    filename: "gamma-standalone-" + className + ".html",
+    size: html.length
+  };
+}
+
+/* =========================================================================
  * v0.2.19 — Export center modal control
  * ======================================================================== */
 
@@ -42453,6 +42527,58 @@ window.addEventListener("keydown", (ev) => {
   }
 });
 
+/* v0.2.23 — Standalone HTML loader. The Export → Standalone HTML
+ * flow bakes the current patch into a fresh copy of this file as a
+ * `<script type="application/json" id="gamma-embedded-patch">` tag.
+ * On reopen, that tag's presence is the cue to replace the default
+ * freshState() patch with the embedded one BEFORE the first render.
+ * If the tag is absent (normal editor load) this is a no-op.
+ *
+ * Auto Live-Mode: an optional sidecar tag `gamma-embedded-config`
+ * carries the export-time preferences. Today supports
+ * { autoLiveMode: true } so the standalone opens fullscreen visuals
+ * by default. Press L to toggle back to the editor either way. */
+(function _maybeLoadEmbeddedPatch() {
+  const tag = document.getElementById("gamma-embedded-patch");
+  if (!tag) return;
+  try {
+    const loaded = JSON.parse(tag.textContent);
+    if (!loaded || !loaded.nodes || !loaded.edges) {
+      console.warn("[standalone] embedded patch missing nodes/edges; falling back to default");
+      return;
+    }
+    const fname = loaded.filename ||
+      ((loaded.patchName ? String(loaded.patchName) : "embedded") + ".gpatch");
+    _applyLoadedPatch(loaded, fname);
+    console.log("[standalone] embedded patch loaded: " + (loaded.patchName || "(unnamed)"));
+  } catch (e) {
+    console.warn("[standalone] embedded patch parse failed; using default:", e);
+    return;
+  }
+  // Optional auto-Live-Mode after the editor's first render finishes
+  // + WebGPU has had a moment to acquire the device. Fires after
+  // setLiveMode is defined (Phase 6.7.5 -- declared above this block).
+  const cfgTag = document.getElementById("gamma-embedded-config");
+  if (cfgTag) {
+    try {
+      const cfg = JSON.parse(cfgTag.textContent);
+      if (cfg && cfg.autoLiveMode) {
+        // Delay so WebGPU + audio context init can settle.
+        setTimeout(() => {
+          if (typeof setLiveMode === "function") setLiveMode(true);
+        }, 600);
+      }
+    } catch (e) {
+      console.warn("[standalone] embedded config parse failed:", e);
+    }
+  }
+})();
+
+// _applyLoadedPatch already calls render() when it succeeds. Calling
+// render() unconditionally below would be redundant in the embedded
+// case but is needed for the default (no-embedded-patch) load. The
+// extra call is cheap (DOM diff already done) so we keep it for the
+// simpler control flow.
 render();
 
 /* Phase 6.1.2 — kick off WebGPU device acquisition. Lazy enough that
@@ -42561,6 +42687,30 @@ ensureGPUDevice();
       const realBtn = document.getElementById("btn-save");
       if (realBtn) realBtn.click();
       _setExportStatus("Saved .gpatch", "success");
+    });
+  }
+  const standaloneBtn = document.getElementById("exp-standalone-html");
+  if (standaloneBtn) {
+    standaloneBtn.addEventListener("click", async () => {
+      standaloneBtn.disabled = true;
+      const nameEl = standaloneBtn.querySelector(".export-action-name");
+      const orig = nameEl ? nameEl.textContent : null;
+      try {
+        if (nameEl) nameEl.textContent = "Building standalone HTML…";
+        _setExportStatus("Fetching editor HTML + injecting patch JSON…");
+        const liveBox = document.getElementById("exp-standalone-livemode");
+        const autoLiveMode = !!(liveBox && liveBox.checked);
+        const out = await exportStandaloneHtml({ autoLiveMode });
+        _downloadBlob(new Blob([out.html], { type: "text/html" }), out.filename);
+        const mb = (out.size / (1024 * 1024)).toFixed(2);
+        _setExportStatus("Saved " + out.filename + " (" + mb + " MB)", "success");
+      } catch (e) {
+        console.warn("[export] standalone HTML failed:", e);
+        _setExportStatus("Standalone export failed: " + (e && e.message || e), "error");
+      } finally {
+        standaloneBtn.disabled = false;
+        if (nameEl && orig) nameEl.textContent = orig;
+      }
     });
   }
   const saveHeaderBtn = document.getElementById("exp-save-header");
