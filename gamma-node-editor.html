@@ -18158,22 +18158,31 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     description: "Recombine RGBA from up to 4 different texture sources. Each output channel (R / G / B / A) picks both a SOURCE (wire srcR / srcG / srcB / srcA) and a CHANNEL of that source (pickR / pickG / pickB / pickA — picks R, G, B, A, or Luma of the corresponding source). With all four srcs wired to the same upstream and picks at default RGBA, output = input (identity). Use cases: pull alpha from a key node while keeping color from the unkeyed source; assemble an image from per-channel masks; swap channels (wire same src to all 4, set pickR=B and pickB=R for an R↔B swap). Unwired sources fall back to layer 0."
   },
 
-  /* v0.3.28 — ColorCurves. Sprint-2 sub-sprint: per-channel curve LUT.
-   * Four 16-point curves -- master (applied to all channels first),
-   * then R / G / B individually. Each curve is a 16-entry lookup table
-   * sampled with linear interpolation between adjacent points; identity
-   * default is a linear ramp (each point[i] = i/15) so all-default
-   * state is pass-through.
+  /* v0.3.29 — ColorCurves. Per-channel paint-drawable curve LUT.
    *
-   * UI: dedicated modal opened from the props pane (similar pattern to
-   * EnvDraw / AutomationLane). 4 channel tabs select which curve is
-   * being edited; non-active curves render as faint overlays in their
-   * channel color so the user sees the full grade in context.
+   * Four 64-point curves (Master applied first to all channels, then
+   * R / G / B individually). 64 entries gives smooth photo-quality
+   * grades -- bumped from 16 in v0.3.28 after the curves felt too
+   * coarse for serious work. Each curve sampled per-pixel with
+   * linear interp between adjacent points; identity default is a
+   * linear ramp (point[i] = i/63) so all-default state is pass-
+   * through.
    *
-   * Storage: node.params holds four 16-element float arrays
-   * (curveMaster, curveR, curveG, curveB). writeUniforms packs each
-   * into 4 vec4f slots so the shader can index into them. Total
-   * uniform: preamble (64B) + params (16B) + 4 * 4 vec4f (256B) = 336B. */
+   * UI: dedicated modal opened from the props pane. PAINT-DRAWABLE
+   * -- click+drag along the curve to redraw it directly (no per-
+   * point handles to chase down). Points between consecutive
+   * pointer events are linearly interpolated so fast drags don't
+   * leave gaps. "Smooth" button applies a 3-tap moving average for
+   * cleanup. 4 channel tabs (Master / R / G / B) pick which curve
+   * is being painted; the other three render as faint overlays so
+   * the full grade reads in context.
+   *
+   * Uniform layout: preamble (64 B) + params (16 B) + 4 curves
+   * (4 * array<vec4f, 16> = 4 * 256 B = 1024 B) = 1104 B total.
+   * WGSL accesses points via dynamic uniform indexing
+   * (u.curveM[block][component]) which avoids a 64-entry inline
+   * unpack -- crucial when each fragment does 6 LUT samples
+   * (master applied to each channel, then per-channel curve). */
   ColorCurves: {
     category: "Visual", color: COLOR.visual, header: null,
     cppType: "",
@@ -18186,16 +18195,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     textureInputSlots: { in: 16 },
     params: {
       inLayer: 0,
-      // Default = identity ramp on every channel. The modal's Reset
-      // button restores these exact values.
-      curveMaster: [0/15, 1/15, 2/15, 3/15, 4/15, 5/15, 6/15, 7/15, 8/15, 9/15, 10/15, 11/15, 12/15, 13/15, 14/15, 15/15],
-      curveR:      [0/15, 1/15, 2/15, 3/15, 4/15, 5/15, 6/15, 7/15, 8/15, 9/15, 10/15, 11/15, 12/15, 13/15, 14/15, 15/15],
-      curveG:      [0/15, 1/15, 2/15, 3/15, 4/15, 5/15, 6/15, 7/15, 8/15, 9/15, 10/15, 11/15, 12/15, 13/15, 14/15, 15/15],
-      curveB:      [0/15, 1/15, 2/15, 3/15, 4/15, 5/15, 6/15, 7/15, 8/15, 9/15, 10/15, 11/15, 12/15, 13/15, 14/15, 15/15]
+      // 64-point identity ramps. Modal's Reset button restores these
+      // exact values. IIFEs keep the registry literal readable.
+      curveMaster: (function(){ const a = new Array(64); for (let i = 0; i < 64; i++) a[i] = i / 63; return a; })(),
+      curveR:      (function(){ const a = new Array(64); for (let i = 0; i < 64; i++) a[i] = i / 63; return a; })(),
+      curveG:      (function(){ const a = new Array(64); for (let i = 0; i < 64; i++) a[i] = i / 63; return a; })(),
+      curveB:      (function(){ const a = new Array(64); for (let i = 0; i < 64; i++) a[i] = i / 63; return a; })()
     },
     methods: {},
     uiOnlyParams: ["curveMaster", "curveR", "curveG", "curveB"],
-    uniformBytes: 336,
+    uniformBytes: 1104,
     wgsl:
 `struct U {
   u_resolution:  vec4f,
@@ -18206,10 +18215,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   u_view:        vec4f,
   u_world_uv:    vec4f,
   params:        vec4f,    // x=inLayer, yzw=_
-  curveM:        array<vec4f, 4>,
-  curveR:        array<vec4f, 4>,
-  curveG:        array<vec4f, 4>,
-  curveB:        array<vec4f, 4>,
+  curveM:        array<vec4f, 16>,
+  curveR:        array<vec4f, 16>,
+  curveG:        array<vec4f, 16>,
+  curveB:        array<vec4f, 16>,
 };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
@@ -18227,23 +18236,31 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
   return out;
 }
 
-// Sample a 16-point LUT packed as 4 vec4f at normalized position
-// t in [0, 1]. Linear interp between adjacent points. Unpack into
-// a function-scope array<f32, 16> so dynamic indexing works (WGSL
-// allows dynamic subscripts on function-scope variables; uniform
-// vec4 dynamic indexing is also legal but unpack-then-mix reads
-// cleaner + lets us reuse the helper across all 4 curves).
-fn sample_lut(t: f32, c0: vec4f, c1: vec4f, c2: vec4f, c3: vec4f) -> f32 {
-  var arr: array<f32, 16>;
-  arr[0]  = c0.x; arr[1]  = c0.y; arr[2]  = c0.z; arr[3]  = c0.w;
-  arr[4]  = c1.x; arr[5]  = c1.y; arr[6]  = c1.z; arr[7]  = c1.w;
-  arr[8]  = c2.x; arr[9]  = c2.y; arr[10] = c2.z; arr[11] = c2.w;
-  arr[12] = c3.x; arr[13] = c3.y; arr[14] = c3.z; arr[15] = c3.w;
-  let xf   = clamp(t, 0.0, 1.0) * 15.0;
+// Sample one of the four curves. curve_id picks which (0=M, 1=R,
+// 2=G, 3=B); t in [0, 1] is the input value. WGSL allows dynamic
+// indexing on uniform arrays + vec components, so we look up
+// directly without copying a function-scope array first. Two
+// (block, component) decompositions of i0 and i1 -- u.curveX[i/4]
+// is a vec4f, [i%4] picks one of its four entries.
+fn sample_curve(t: f32, curve_id: u32) -> f32 {
+  let xf   = clamp(t, 0.0, 1.0) * 63.0;
   let i0   = i32(floor(xf));
   let frac = xf - f32(i0);
-  let i1   = min(i0 + 1, 15);
-  return mix(arr[i0], arr[i1], frac);
+  let i1   = min(i0 + 1, 63);
+  let b0 = i0 / 4; let c0 = i0 % 4;
+  let b1 = i1 / 4; let c1 = i1 % 4;
+  var v0: f32 = 0.0;
+  var v1: f32 = 0.0;
+  if (curve_id == 0u) {
+    v0 = u.curveM[b0][c0];  v1 = u.curveM[b1][c1];
+  } else if (curve_id == 1u) {
+    v0 = u.curveR[b0][c0];  v1 = u.curveR[b1][c1];
+  } else if (curve_id == 2u) {
+    v0 = u.curveG[b0][c0];  v1 = u.curveG[b1][c1];
+  } else {
+    v0 = u.curveB[b0][c0];  v1 = u.curveB[b1][c1];
+  }
+  return mix(v0, v1, frac);
 }
 
 @fragment
@@ -18251,35 +18268,36 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   let layer = u32(max(0.0, u.params.x));
   let c = textureSampleLevel(fbHistory, fbSampler, in.uv, layer, 0.0).rgb;
   // Master first -- applied identically to all three channels.
-  let mR = sample_lut(c.r, u.curveM[0], u.curveM[1], u.curveM[2], u.curveM[3]);
-  let mG = sample_lut(c.g, u.curveM[0], u.curveM[1], u.curveM[2], u.curveM[3]);
-  let mB = sample_lut(c.b, u.curveM[0], u.curveM[1], u.curveM[2], u.curveM[3]);
+  let mR = sample_curve(c.r, 0u);
+  let mG = sample_curve(c.g, 0u);
+  let mB = sample_curve(c.b, 0u);
   // Then per-channel curves.
-  let oR = sample_lut(mR, u.curveR[0], u.curveR[1], u.curveR[2], u.curveR[3]);
-  let oG = sample_lut(mG, u.curveG[0], u.curveG[1], u.curveG[2], u.curveG[3]);
-  let oB = sample_lut(mB, u.curveB[0], u.curveB[1], u.curveB[2], u.curveB[3]);
+  let oR = sample_curve(mR, 1u);
+  let oG = sample_curve(mG, 2u);
+  let oB = sample_curve(mB, 3u);
   return vec4f(clamp(vec3f(oR, oG, oB), vec3f(0.0), vec3f(1.0)), 1.0);
 }`,
     writeUniforms(node, scratch) {
       const p = node.params || {};
       scratch[16] = (typeof p.inLayer === "number") ? p.inLayer : 0;
       scratch[17] = 0; scratch[18] = 0; scratch[19] = 0;
-      // Pack each 16-entry curve into 4 consecutive vec4f scratch
-      // slots. Defensive against malformed / truncated arrays from
-      // hand-edited JSON loads -- missing entries fall back to the
-      // identity ramp at that position.
+      // Each curve packs 64 entries into 16 consecutive vec4f slots
+      // (64 floats). Layout: curveM at 20..83, curveR at 84..147,
+      // curveG at 148..211, curveB at 212..275. Total uniform floats
+      // used: 16 (preamble) + 4 (params) + 4*64 = 276. uniformBytes
+      // = 276 * 4 = 1104.
       const packCurve = (arr, baseOff) => {
-        const a = (Array.isArray(arr) && arr.length >= 16) ? arr : null;
-        for (let i = 0; i < 16; i++) {
-          scratch[baseOff + i] = a ? a[i] : (i / 15);
+        const a = (Array.isArray(arr) && arr.length >= 64) ? arr : null;
+        for (let i = 0; i < 64; i++) {
+          scratch[baseOff + i] = a ? a[i] : (i / 63);
         }
       };
-      packCurve(p.curveMaster, 20);
-      packCurve(p.curveR,      36);
-      packCurve(p.curveG,      52);
-      packCurve(p.curveB,      68);
+      packCurve(p.curveMaster,  20);
+      packCurve(p.curveR,       84);
+      packCurve(p.curveG,      148);
+      packCurve(p.curveB,      212);
     },
-    description: "Per-channel curve LUT for fine-grained color grading. Edit four 16-point curves: Master (applied first, all channels equally) then R / G / B individually. Click 'Edit curves…' in the props pane to open the curve editor; drag the 16 control points up/down to reshape. Identity-default is a linear ramp (pass-through). Composes after Master then per-channel — same order Davinci uses on the Color page. Use cases: S-curve contrast push, channel-specific shadow/highlight tints, color-temperature shifts via opposing R/B curves."
+    description: "Per-channel paint-drawable curve LUT for color grading. Edit four 64-point curves: Master (applied first, all channels equally) then R / G / B individually. Click 'Edit curves…' in the props pane to open the modal; click+drag along the plot to redraw the curve directly (paint mode, like Photoshop's pencil — no per-point handles to chase). 'Smooth' applies a 3-tap moving average for cleanup. Identity default is a linear ramp (pass-through). Composes Master-then-per-channel, the standard pro color-grading pipeline order. Use cases: S-curve contrast push, channel-specific shadow/highlight tints, color-temperature shifts via opposing R/B curves."
   },
 
   /* ---- B1: Math, single-arg trig (cmath) ---- */
@@ -25030,16 +25048,17 @@ const _demos = [
       <path d="M 0 32 Q 30 12 50 30 T 100 28" stroke="rgba(255,200,120,0.5)" stroke-width="0.9" fill="none"/>
     </svg>`,
     build: () => {
-      // v0.3.28 — soft S-curve preset for the ColorCurves master
-      // channel. 40% blend between the identity ramp and a
-      // smoothstep -- gentle contrast push that nudges shadows down +
-      // highlights up without crushing either end. Identity-default
-      // on R/G/B leaves color cast to the ChannelMix downstream.
-      const identityCurve16 = () => Array.from({ length: 16 }, (_, i) => i / 15);
-      const sCurve16 = () => {
-        const a = new Array(16);
-        for (let i = 0; i < 16; i++) {
-          const x  = i / 15;
+      // v0.3.29 — soft S-curve preset for the ColorCurves master
+      // channel at 64-point fidelity. 40% blend between the identity
+      // ramp and a smoothstep -- gentle contrast push that nudges
+      // shadows down + highlights up without crushing either end.
+      // Identity-default on R/G/B leaves color cast to the ChannelMix
+      // downstream.
+      const identityCurveN = () => Array.from({ length: 64 }, (_, i) => i / 63);
+      const sCurveN = () => {
+        const a = new Array(64);
+        for (let i = 0; i < 64; i++) {
+          const x  = i / 63;
           const ss = x * x * (3 - 2 * x);   // smoothstep(0, 1, x)
           a[i] = x + 0.4 * (ss - x);        // 40% toward the smoothstep
         }
@@ -25050,10 +25069,10 @@ const _demos = [
       const p   = makeNode("Plasma",       280,  60, { speed: 1.0, scale: 1.0, clockReact: 0.6 });
       const l   = makeNode("Levels",       540,  60, { inBlack: 0.15, inWhite: 0.95, gamma: 0.9, outBlack: 0.0, outWhite: 1.0 });
       const cc  = makeNode("ColorCurves",  800,  60, {
-        curveMaster: sCurve16(),
-        curveR: identityCurve16(),
-        curveG: identityCurve16(),
-        curveB: identityCurve16()
+        curveMaster: sCurveN(),
+        curveR: identityCurveN(),
+        curveG: identityCurveN(),
+        curveB: identityCurveN()
       });
       const mul = makeNode("Mul",          340, 320, { b: 120 });
       const h   = makeNode("HsvShift",    1060,  60, { hueShift: 0, sat: 1.2, val: 1.0 });
@@ -27757,13 +27776,14 @@ function renderProps() {
         <button class="btn primary" id="btn-open-envdraw" style="width: 100%;">Edit envelope${len ? ` · sustain ${sIdx}/${len-1} · A ${aT}s · R ${rT}s` : ""}</button>
       </div>`;
     }
-    // v0.3.28 — ColorCurves: 4-channel LUT editor in a dedicated modal.
+    // v0.3.29 — ColorCurves: 4-channel paint-drawable LUT editor.
     // Summary line shows which channels have been touched (not identity).
     if (node.type === "ColorCurves") {
+      const N = 64;
       const isIdentity = (arr) => {
-        if (!Array.isArray(arr) || arr.length !== 16) return true;
-        for (let i = 0; i < 16; i++) {
-          if (Math.abs(arr[i] - i / 15) > 0.001) return false;
+        if (!Array.isArray(arr) || arr.length !== N) return true;
+        for (let i = 0; i < N; i++) {
+          if (Math.abs(arr[i] - i / (N - 1)) > 0.002) return false;
         }
         return true;
       };
@@ -44829,31 +44849,32 @@ function closeEnvDrawModal() {
  * curveG / curveB which writeUniforms packs into vec4f slots.
  * ======================================================================== */
 
-const CURVES_N = 16;   // points per curve, fixed at 16
+const CURVES_N = 64;   // points per curve, bumped from 16 in v0.3.29 for paint-quality fidelity
 
-function defaultCurve16() {
+function defaultCurveN() {
   const a = new Array(CURVES_N);
   for (let i = 0; i < CURVES_N; i++) a[i] = i / (CURVES_N - 1);
   return a;
 }
 
-// Active-channel state lives on the modal's pane element so it
-// survives pointer-event re-entries cleanly.
+// Channel descriptors. Color values are tuned so the inactive
+// overlays read cleanly without distracting from the active curve.
 const COLOR_CURVES_CHANNELS = [
-  { key: "curveMaster", label: "Master", color: "rgba(220, 220, 220, 0.9)", faint: "rgba(220, 220, 220, 0.25)" },
-  { key: "curveR",      label: "R",      color: "rgba(255,  90,  90, 0.9)", faint: "rgba(255,  90,  90, 0.25)" },
-  { key: "curveG",      label: "G",      color: "rgba(110, 220,  90, 0.9)", faint: "rgba(110, 220,  90, 0.25)" },
-  { key: "curveB",      label: "B",      color: "rgba( 90, 160, 255, 0.9)", faint: "rgba( 90, 160, 255, 0.25)" }
+  { key: "curveMaster", label: "Master", color: "rgba(220, 220, 220, 0.95)", faint: "rgba(220, 220, 220, 0.22)" },
+  { key: "curveR",      label: "R",      color: "rgba(255,  90,  90, 0.95)", faint: "rgba(255,  90,  90, 0.22)" },
+  { key: "curveG",      label: "G",      color: "rgba(110, 220,  90, 0.95)", faint: "rgba(110, 220,  90, 0.22)" },
+  { key: "curveB",      label: "B",      color: "rgba( 90, 160, 255, 0.95)", faint: "rgba( 90, 160, 255, 0.22)" }
 ];
 
 function openColorCurvesModal(nodeId) {
   const node = state.nodes.find(n => n.id === nodeId);
   if (!node || !node.params) return;
   // Ensure all four curves exist + are well-formed; default any
-  // missing or mis-shaped slot to identity.
+  // missing or mis-shaped slot (incl. legacy 16-point arrays from
+  // v0.3.28 patches) to a fresh 64-point identity.
   for (const ch of COLOR_CURVES_CHANNELS) {
     if (!Array.isArray(node.params[ch.key]) || node.params[ch.key].length !== CURVES_N) {
-      node.params[ch.key] = defaultCurve16();
+      node.params[ch.key] = defaultCurveN();
     }
   }
   const titleEl = document.getElementById("colorcurves-modal-title");
@@ -44878,18 +44899,21 @@ function closeColorCurvesModal() {
 })();
 
 function buildColorCurvesPane(node) {
-  const W = 540, H = 280;
-  const pad = 16;
+  const W = 600, H = 320;
+  const pad = 18;
   const plotW = W - pad * 2;
   const plotH = H - pad * 2;
-  // Pointer-capture state. activeIdx is the channel index (0..3)
-  // currently being edited; dragIdx is the LUT index of the point
-  // currently under pointer capture (-1 = none).
+  // Paint-mode state. activeIdx is which channel is being edited.
+  // painting=true between pointerdown and pointerup. lastIdx/lastVal
+  // hold the previous pointer-frame's (LUT index, value) so we can
+  // linearly fill the gap on fast drags (no skipped points).
   let activeIdx = 0;
-  let dragIdx   = -1;
+  let painting  = false;
+  let lastIdx   = -1;
+  let lastVal   = 0;
 
-  const xForI = (i) => pad + (i / (CURVES_N - 1)) * plotW;
-  const yForV = (v) => pad + (1 - v) * plotH;
+  const xForI = (i)  => pad + (i / (CURVES_N - 1)) * plotW;
+  const yForV = (v)  => pad + (1 - v) * plotH;
   const vForY = (cy) => 1 - (cy - pad) / plotH;
   const iForX = (cx) => Math.round(((cx - pad) / plotW) * (CURVES_N - 1));
 
@@ -44903,7 +44927,7 @@ function buildColorCurvesPane(node) {
   });
   tabsHtml += '</div>';
 
-  // Grid lines (8x8) + identity diagonal as a faint guide.
+  // 8x8 grid + identity diagonal as a faint guide.
   let gridHtml = '';
   for (let g = 1; g < 8; g++) {
     const gx = pad + (g / 8) * plotW;
@@ -44914,53 +44938,62 @@ function buildColorCurvesPane(node) {
   const identityDiag = `<line x1="${pad}" y1="${H - pad}" x2="${W - pad}" y2="${pad}" stroke="rgba(255,255,255,0.12)" stroke-dasharray="3,3" />`;
 
   pane.innerHTML = tabsHtml +
-    '<svg class="curve-draw-svg" viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" style="user-select:none;cursor:crosshair;">' +
+    '<svg class="curve-draw-svg" viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" style="user-select:none;cursor:crosshair;touch-action:none;">' +
       gridHtml +
       identityDiag +
-      // 4 curve paths + 1 active-point overlay group, rebuilt on every paint.
+      // 4 channel curves overlaid (inactive faint, active bold) +
+      // 8 anchor markers along the active curve as visual reference
+      // (no longer draggable -- they just hint at where the eighths
+      // are along the input range).
       '<g class="cc-curves"></g>' +
-      '<g class="cc-points"></g>' +
+      '<g class="cc-anchors"></g>' +
     '</svg>' +
     '<div class="curve-draw-actions">' +
+      '<button class="btn" id="btn-cc-smooth">Smooth</button>' +
       '<button class="btn" id="btn-cc-reset">Reset channel</button>' +
       '<button class="btn" id="btn-cc-reset-all">Reset all</button>' +
       '<span style="flex:1;"></span>' +
       '<button class="btn primary" id="btn-cc-done">Done</button>' +
     '</div>';
 
-  const svg     = pane.querySelector(".curve-draw-svg");
-  const curvesG = pane.querySelector(".cc-curves");
-  const pointsG = pane.querySelector(".cc-points");
-  const tabBtns = pane.querySelectorAll("[data-cc-tab]");
+  const svg      = pane.querySelector(".curve-draw-svg");
+  const curvesG  = pane.querySelector(".cc-curves");
+  const anchorsG = pane.querySelector(".cc-anchors");
+  const tabBtns  = pane.querySelectorAll("[data-cc-tab]");
 
   function repaint() {
-    // Curves: render inactive in faint color, active in full color.
+    // All 4 curves drawn through every point (the 64-point line is
+    // already smooth at this resolution -- no need for spline math).
+    // Inactive curves render faint, active bold.
     let curvesSvg = '';
     COLOR_CURVES_CHANNELS.forEach((ch, idx) => {
       const arr = node.params[ch.key];
       const stroke = (idx === activeIdx) ? ch.color : ch.faint;
-      const width  = (idx === activeIdx) ? 1.8 : 1.0;
+      const width  = (idx === activeIdx) ? 2.0 : 1.0;
       let d = '';
       for (let i = 0; i < CURVES_N; i++) {
         const x = xForI(i).toFixed(1);
         const y = yForV(arr[i]).toFixed(1);
         d += (i === 0 ? 'M' : 'L') + x + ',' + y + ' ';
       }
-      curvesSvg += `<path d="${d}" stroke="${stroke}" stroke-width="${width}" fill="none" />`;
+      curvesSvg += `<path d="${d}" stroke="${stroke}" stroke-width="${width}" fill="none" stroke-linejoin="round" />`;
     });
     curvesG.innerHTML = curvesSvg;
 
-    // Points: only the active curve's are drawn (draggable).
+    // Anchor markers: 8 dots along the active curve at i = 0, 9, 18,
+    // 27, 36, 45, 54, 63 (every ~9th point). Purely visual -- they
+    // hint at where the 1/8 input divisions are. NOT draggable in
+    // paint mode -- drag the line directly.
     const active = COLOR_CURVES_CHANNELS[activeIdx];
     const arr = node.params[active.key];
-    let pointsSvg = '';
-    for (let i = 0; i < CURVES_N; i++) {
+    let anchorsSvg = '';
+    for (let k = 0; k < 8; k++) {
+      const i = Math.round(k * (CURVES_N - 1) / 7);
       const x = xForI(i).toFixed(1);
       const y = yForV(arr[i]).toFixed(1);
-      const r = (i === dragIdx) ? 6 : 4;
-      pointsSvg += `<circle cx="${x}" cy="${y}" r="${r}" fill="${active.color}" stroke="rgba(0,0,0,0.5)" stroke-width="0.8" data-cc-pt="${i}" />`;
+      anchorsSvg += `<circle cx="${x}" cy="${y}" r="2.5" fill="${active.color}" stroke="rgba(0,0,0,0.4)" stroke-width="0.6" pointer-events="none" />`;
     }
-    pointsG.innerHTML = pointsSvg;
+    anchorsG.innerHTML = anchorsSvg;
   }
 
   function setActive(idx) {
@@ -44972,18 +45005,30 @@ function buildColorCurvesPane(node) {
     repaint();
   }
 
-  // Pointer drag: pointerdown finds the nearest control point (by
-  // x-axis quantization), captures it, then pointermove updates that
-  // point's y value until pointerup releases.
-  function pickPointAt(cx, cy) {
+  // Paint mode: pointerdown / move / up. The pointerdown sets the
+  // first point; each subsequent pointermove paints from the
+  // previous (lastIdx, lastVal) to the current (i, v), filling in
+  // every LUT index between them with a linearly-interpolated value
+  // so fast drags don't leave the curve gappy.
+  function paintAt(cx, cy) {
+    if (!painting) return;
     const i = Math.max(0, Math.min(CURVES_N - 1, iForX(cx)));
-    return i;
-  }
-  function applyDragAt(cx, cy) {
-    if (dragIdx < 0) return;
     const v = Math.max(0, Math.min(1, vForY(cy)));
-    const active = COLOR_CURVES_CHANNELS[activeIdx];
-    node.params[active.key][dragIdx] = v;
+    const arr = node.params[COLOR_CURVES_CHANNELS[activeIdx].key];
+    if (lastIdx < 0 || lastIdx === i) {
+      arr[i] = v;
+    } else {
+      // Walk from lastIdx + step toward i, inclusive of i.
+      const step = i > lastIdx ? 1 : -1;
+      const dist = Math.abs(i - lastIdx);
+      for (let k = 1; k <= dist; k++) {
+        const j = lastIdx + k * step;
+        const t = k / dist;
+        arr[j] = lastVal + (v - lastVal) * t;
+      }
+    }
+    lastIdx = i;
+    lastVal = v;
     repaint();
   }
 
@@ -44991,22 +45036,29 @@ function buildColorCurvesPane(node) {
     const rect = svg.getBoundingClientRect();
     const cx = ((e.clientX - rect.left) / rect.width)  * W;
     const cy = ((e.clientY - rect.top)  / rect.height) * H;
-    dragIdx = pickPointAt(cx, cy);
+    painting = true;
+    lastIdx  = -1;   // first frame uses just the down position
     svg.setPointerCapture(e.pointerId);
-    applyDragAt(cx, cy);
+    paintAt(cx, cy);
+    e.preventDefault();
   });
   svg.addEventListener("pointermove", (e) => {
-    if (dragIdx < 0) return;
+    if (!painting) return;
     const rect = svg.getBoundingClientRect();
     const cx = ((e.clientX - rect.left) / rect.width)  * W;
     const cy = ((e.clientY - rect.top)  / rect.height) * H;
-    applyDragAt(cx, cy);
+    paintAt(cx, cy);
   });
-  svg.addEventListener("pointerup", () => {
-    dragIdx = -1;
-    repaint();
-  });
-  svg.addEventListener("pointercancel", () => { dragIdx = -1; repaint(); });
+  function endPaint() {
+    if (painting) {
+      pushHistory("colorcurves:paint:" + node.id + ":" + COLOR_CURVES_CHANNELS[activeIdx].key);
+    }
+    painting = false;
+    lastIdx  = -1;
+  }
+  svg.addEventListener("pointerup", endPaint);
+  svg.addEventListener("pointercancel", endPaint);
+  svg.addEventListener("pointerleave", endPaint);
 
   // Tab clicks.
   tabBtns.forEach(btn => {
@@ -45016,19 +45068,33 @@ function buildColorCurvesPane(node) {
     });
   });
 
+  // Smooth: 3-tap moving average pass over the active curve. Useful
+  // after a shaky paint stroke -- runs once per click; click again
+  // for more smoothing. Endpoints are anchored (i=0, i=63) so the
+  // curve doesn't drift away from clean 0..1 range.
+  pane.querySelector("#btn-cc-smooth").addEventListener("click", () => {
+    const arr = node.params[COLOR_CURVES_CHANNELS[activeIdx].key];
+    const next = arr.slice();
+    for (let i = 1; i < CURVES_N - 1; i++) {
+      next[i] = (arr[i - 1] + arr[i] + arr[i + 1]) / 3;
+    }
+    node.params[COLOR_CURVES_CHANNELS[activeIdx].key] = next;
+    pushHistory("colorcurves:smooth:" + node.id + ":" + COLOR_CURVES_CHANNELS[activeIdx].key);
+    repaint();
+  });
+
   // Reset buttons.
   pane.querySelector("#btn-cc-reset").addEventListener("click", () => {
-    node.params[COLOR_CURVES_CHANNELS[activeIdx].key] = defaultCurve16();
+    node.params[COLOR_CURVES_CHANNELS[activeIdx].key] = defaultCurveN();
     pushHistory("colorcurves:reset:" + node.id + ":" + COLOR_CURVES_CHANNELS[activeIdx].key);
     repaint();
   });
   pane.querySelector("#btn-cc-reset-all").addEventListener("click", () => {
-    for (const ch of COLOR_CURVES_CHANNELS) node.params[ch.key] = defaultCurve16();
+    for (const ch of COLOR_CURVES_CHANNELS) node.params[ch.key] = defaultCurveN();
     pushHistory("colorcurves:reset-all:" + node.id);
     repaint();
   });
   pane.querySelector("#btn-cc-done").addEventListener("click", () => {
-    pushHistory("colorcurves:edit:" + node.id);
     closeColorCurvesModal();
   });
 
