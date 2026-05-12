@@ -26100,32 +26100,31 @@ const _demos = [
     }
   },
   {
-    /* v0.3.31 — Matrix CRT demo. Showcases the new full Lottes CRT
-     * shader by feeding MatrixRain through it. The green-on-black
-     * digital-rain content is the canonical CRT subject -- you get
-     * the iconic Wachowski-film "this is what hackers see" aesthetic
-     * out of the box.
+    /* v0.3.35 — Matrix CRT demo, rebuilt from a hand-tuned user patch
+     * (matrix___defocus.gpatch). Bigger MatrixRain (512x64 grid with
+     * 8 streams per column), Pixelate downsample to chunky 8-px cells
+     * BEFORE the CRT pass (so the CRT scanlines and mask sit over
+     * proper retro-pixel-art chunks), CRT-processed result blended
+     * 50/50 with the un-CRT'd pixelated rain (visible character
+     * structure stays sharp + the CRT layer adds the phosphor halo
+     * and warp on top), Defocus tail (radius=0 default so it's a
+     * chain-able no-op the user can dial up for a "lens out of
+     * focus" look without breaking the chain).
      *
-     * CRT params tuned for the Matrix look:
-     * - virtualW=320, virtualH=240: classic NTSC/arcade emulated
-     *   resolution. Sub-pixels the MatrixRain framebuffer so the
-     *   glyphs read as proper chunky CRT characters.
-     * - maskType=3 (VGA-stretched): diagonal RGB stripes, the
-     *   most "monitor" of the four masks, sits well over green text.
-     * - curvature=0.05: gentle barrel bulge -- not so aggressive it
-     *   distracts, enough to read as a tube.
-     * - bloomAmount=0.18: stronger than Lottes' 1/16 default so the
-     *   bright leading characters bloom into the iconic phosphor halo.
-     * - brightness=1.15: pre-mask boost to compensate for the mask's
-     *   inherent ~50% darkening.
+     * Chain:
+     *   MatrixRain -> Pixelate -> CRT ---+
+     *                      \             +--> BlendShader --> Defocus --> Output
+     *                       `------------'  (mix=0.5, mode=normal)
      *
-     * Wire MasterClock.beat -> CRT.brightness via a downstream chain
-     * for tempo-locked brightness pulses if you want it audio-reactive;
-     * for now the demo stays clock-free so the steady CRT presence
-     * reads cleanly. */
+     * The Pixelate output is wired to BOTH the CRT's input AND the
+     * BlendShader's inB, so blendshader interpolates the CRT'd output
+     * (inA) with the raw-pixelated source (inB) at mix=0.5. This
+     * cuts the CRT's signature ~50% darkening that the shadow mask
+     * causes while keeping all the CRT character (phosphor halo,
+     * scanlines, curvature). */
     id: "matrix-crt",
     name: "Matrix CRT",
-    sub: "digital rain on a vintage tube",
+    sub: "blended rain · pixelate · CRT · defocus",
     type: "visual",
     thumb: `<svg viewBox="0 0 100 44">
       <rect width="100" height="44" fill="rgba(0,8,0,0.95)"/>
@@ -26176,15 +26175,17 @@ const _demos = [
       <rect width="100" height="44" fill="url(#dg-crt-vig)"/>
     </svg>`,
     build: () => {
-      const mr  = makeNode("MatrixRain",   40,  60, {
-        cellsX: 48, cellsY: 28,
-        streamsPerCol: 2, trailLen: 14,
-        speed: 1.0, brightness: 1.4, headBoost: 2.6,
-        colorR: 0.0, colorG: 1.0, colorB: 0.3
+      // Node positions match the source patch (matrix___defocus.gpatch).
+      const mr = makeNode("MatrixRain",   40,   83, {
+        // Dense grid -- 512 columns of 64 rows, 8 streams per column.
+        // streamsPerCol clamps to 8 in the shader so this is the max.
+        cellsX: 512, cellsY: 64,
+        streamsPerCol: 8, trailLen: 16,
+        speed: 1.0, brightness: 1.0, headBoost: 4.0,
+        colorR: 0.0, colorG: 1.0, colorB: 0.2
       });
-      const crt = makeNode("CRT",         320,  60, {
-        // Lottes defaults tuned for the green-on-black Matrix look --
-        // see top-of-demo comment for the rationale.
+      const px  = makeNode("Pixelate",   100,  324, { cellSize: 8 });
+      const crt = makeNode("CRT",        310,  265, {
         virtualW: 320, virtualH: 240,
         curvature: 0.05,
         scanlineHardness: -8.0,
@@ -26193,11 +26194,25 @@ const _demos = [
         maskStrength: 0.85,
         brightness: 1.15,
         bloomAmount: 0.18,
-        shape: 2.0
+        shape: 2.0,
+        halationAmount: 0.04,
+        halationRadius: 10,
+        beamDynamics: 0.5,
+        temperature: 0
       });
-      const v = makeNode("VisualOutput",  580,  60, { display: 0 });
-      state.edges.push({ from: { node: mr,  port: "out" }, to: { node: crt, port: "in" } });
-      state.edges.push({ from: { node: crt, port: "out" }, to: { node: v,   port: "in" } });
+      const bl  = makeNode("BlendShader", 355,  62, { mix: 0.5, mode: 0 });
+      const fc  = makeNode("Defocus",     529, 167, { radius: 0, bokeh: 0.2 });
+      const v   = makeNode("VisualOutput", 717, 84, { display: 0 });
+
+      // Visual chain (matches the source patch's edges verbatim).
+      state.edges.push({ from: { node: mr,  port: "out" }, to: { node: px,  port: "in"  } });
+      state.edges.push({ from: { node: px,  port: "out" }, to: { node: crt, port: "in"  } });
+      // BlendShader inputs: CRT'd version on inA, raw pixelate on inB.
+      // mix=0.5 + mode=0 (normal/lerp) means 50/50 blend.
+      state.edges.push({ from: { node: crt, port: "out" }, to: { node: bl,  port: "inA" } });
+      state.edges.push({ from: { node: px,  port: "out" }, to: { node: bl,  port: "inB" } });
+      state.edges.push({ from: { node: bl,  port: "out" }, to: { node: fc,  port: "in"  } });
+      state.edges.push({ from: { node: fc,  port: "out" }, to: { node: v,   port: "in"  } });
     }
   },
   {
