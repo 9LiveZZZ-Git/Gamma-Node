@@ -7133,7 +7133,7 @@
  * Pages deploy workflow (.github/workflows/pages.yml). The string
  * after the equals sign is what the workflow's sed targets — don't
  * change the format of this line. */
-const APP_VERSION = "0.3.30";
+const APP_VERSION = "0.3.31";
 
 /* =========================================================================
  * Node type registry — covers ~55 Gamma DSP classes
@@ -17694,6 +17694,338 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       scratch[27] = (typeof p.bias === "number") ? p.bias : 0;
     },
     description: "User-defined 3x3 convolution kernel — the escape hatch when you know the matrix you want. 9 weight params (w00..w22, row-major) define the kernel; gain scales the result; bias adds a constant. Identity default = center pixel only (pass-through). Recipes: Laplacian edge-detect (w11=-4, w01=w10=w12=w21=1, rest=0); emboss (w00=-2, w11=1, w22=2, gain=1, bias=0.5); box blur (all=1/9, gain=1); sharpen (w11=5, w01=w10=w12=w21=-1, rest=0)."
+  },
+
+  /* =========================================================================
+   * v0.3.31 — CRT shader, full Lottes implementation.
+   *
+   * Port of Timothy Lottes' CRT shader from libretro/common-shaders
+   * (crt-lottes.cg). High-fidelity single-pass CRT emulation: barrel-
+   * warped frame, per-scanline gaussian weight, horizontal pixel
+   * filtering (3-tap + 5-tap rows), soft bloom (5-row pyramid of
+   * 5/7/7/7/5 taps), and four shadow-mask variants (slot mask,
+   * aperture grille, VGA-stretched, VGA-stretched-2x).
+   *
+   * Math comes verbatim from Lottes' .cg source -- the same constants
+   * (hardScan=-8, hardPix=-3, warpX=0.031, warpY=0.041, maskDark=0.5,
+   * maskLight=1.5, shape=2.0, bloom=1/16) are the defaults here so
+   * the look matches the libretro reference. Gamma handled via the
+   * cheap c*c <-> sqrt approximation (gamma 2.0; close enough to
+   * sRGB at typical CRT brightness ranges + saves the sRGB-decode
+   * lookup cost on the ~40 texture fetches per fragment).
+   *
+   * Cost: ~42 texture samples per fragment (11 for Tri scanline
+   * sampling + 31 for Bloom). Heavy but tractable -- at 1080p on a
+   * mid-range discrete GPU it lands around 4-6 ms. Set bloomAmount
+   * = 0 to skip the bloom phase entirely if you're frame-budget
+   * constrained.
+   *
+   * virtualW / virtualH set the EMULATED pixel grid (default
+   * 320x240 = NES / arcade era). The input texture is sampled as
+   * if it had this resolution -- so any upstream chain renders to
+   * the framebuffer at full res, then this node pretends it's a
+   * lower-res signal driving the CRT. Crank to 640x480 / 1280x720
+   * for cleaner CRT-on-modern-content looks.
+   *
+   * Reference: github.com/libretro/common-shaders/blob/master/crt/
+   *            shaders/crt-lottes.cg (Timothy Lottes, AMD, 2014).
+   * ======================================================================== */
+  CRT: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "in",                t: "texture" },
+      { n: "virtualW",          t: "param" },
+      { n: "virtualH",          t: "param" },
+      { n: "curvature",         t: "param" },
+      { n: "scanlineHardness",  t: "param" },
+      { n: "pixelHardness",     t: "param" },
+      { n: "maskType",          t: "param" },
+      { n: "maskStrength",      t: "param" },
+      { n: "brightness",        t: "param" },
+      { n: "bloomAmount",       t: "param" },
+      { n: "shape",             t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16 },
+    paramOptions: { maskType: ["none", "slot-mask", "aperture-grille", "VGA-stretched", "VGA-stretched-2x"] },
+    params: {
+      inLayer: 0,
+      // 320x240 = classic NES / arcade era. The whole point of the
+      // CRT shader is faking low-res content on a high-res panel;
+      // setting this to 1920x1080 makes the effects subtle.
+      virtualW: 320, virtualH: 240,
+      // Lottes' constants verbatim. curvature single-axis here;
+      // the WGSL splits it into x/y internally with the same 0.031/
+      // 0.041 ratio (1.3x for y).
+      curvature: 0.031,
+      scanlineHardness: -8.0,
+      pixelHardness: -3.0,
+      maskType: 3,           // VGA-stretched -- the most "modern CRT" look
+      maskStrength: 1.0,
+      brightness: 1.0,
+      bloomAmount: 0.0625,   // 1/16, Lottes default
+      shape: 2.0             // gaussian shape exponent
+    },
+    methods: {},
+    uniformBytes: 112,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inLayer, y=virtualW, z=virtualH, w=curvature
+  params2:       vec4f,    // x=scanHardness, y=pixHardness, z=maskType, w=maskStrength
+  params3:       vec4f,    // x=brightness, y=bloomAmount, z=shape, w=_
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+// === Lottes CRT building blocks (ported from crt-lottes.cg). ===
+
+// Cheap gamma 2.0 approximation. Matched ToLinear/ToSrgb pair so the
+// bloom + scan math runs in linear-ish space without the cost of
+// proper sRGB decode (~5x speedup on the 42-sample per-pixel budget).
+fn to_linear(c: vec3f) -> vec3f { return c * c; }
+fn to_srgb(c: vec3f) -> vec3f   { return sqrt(max(c, vec3f(0.0))); }
+
+// Generalized Gaussian. shape=2 = standard gaussian; lower shape
+// (~1.3) gives wider tails (softer look); higher (~4) gives squarer
+// pulses (sharper scanlines).
+fn gaus(pos: f32, scale: f32, shape: f32) -> f32 {
+  return exp2(scale * pow(abs(pos), shape));
+}
+
+// Distance from the current UV to the nearest emulated-texel center,
+// in emulated-pixel units. Range roughly [-0.5, 0.5] per axis.
+fn dist_pix(pos: vec2f, tex_size: vec2f) -> vec2f {
+  let p = pos * tex_size;
+  return -((p - floor(p)) - vec2f(0.5));
+}
+
+// Point-sample the upstream framebuffer at one emulated-texel offset
+// from pos, with the brightness boost + ToLinear baked in.
+fn fetch_pix(pos: vec2f, off: vec2f, layer: u32, tex_size: vec2f, bright: f32) -> vec3f {
+  let p = (floor(pos * tex_size + off) + vec2f(0.5)) / tex_size;
+  let c = textureSampleLevel(fbHistory, fbSampler, p, layer, 0.0).rgb;
+  return to_linear(c) * bright;
+}
+
+// 3-tap horizontal gaussian (used for the +/-1 scanlines either side
+// of the active line).
+fn horz3(pos: vec2f, off: f32, layer: u32, tex_size: vec2f, scale: f32, shape: f32, bright: f32) -> vec3f {
+  let b = fetch_pix(pos, vec2f(-1.0, off), layer, tex_size, bright);
+  let c = fetch_pix(pos, vec2f( 0.0, off), layer, tex_size, bright);
+  let d = fetch_pix(pos, vec2f( 1.0, off), layer, tex_size, bright);
+  let dst = dist_pix(pos, tex_size).x;
+  let wb = gaus(dst - 1.0, scale, shape);
+  let wc = gaus(dst + 0.0, scale, shape);
+  let wd = gaus(dst + 1.0, scale, shape);
+  return (b * wb + c * wc + d * wd) / (wb + wc + wd);
+}
+
+// 5-tap horizontal gaussian (used for the active scanline -- one
+// extra tap each side gives smoother color in the focal row).
+fn horz5(pos: vec2f, off: f32, layer: u32, tex_size: vec2f, scale: f32, shape: f32, bright: f32) -> vec3f {
+  let a = fetch_pix(pos, vec2f(-2.0, off), layer, tex_size, bright);
+  let b = fetch_pix(pos, vec2f(-1.0, off), layer, tex_size, bright);
+  let c = fetch_pix(pos, vec2f( 0.0, off), layer, tex_size, bright);
+  let d = fetch_pix(pos, vec2f( 1.0, off), layer, tex_size, bright);
+  let e = fetch_pix(pos, vec2f( 2.0, off), layer, tex_size, bright);
+  let dst = dist_pix(pos, tex_size).x;
+  let wa = gaus(dst - 2.0, scale, shape);
+  let wb = gaus(dst - 1.0, scale, shape);
+  let wc = gaus(dst + 0.0, scale, shape);
+  let wd = gaus(dst + 1.0, scale, shape);
+  let we = gaus(dst + 2.0, scale, shape);
+  return (a * wa + b * wb + c * wc + d * wd + e * we) / (wa + wb + wc + wd + we);
+}
+
+// 7-tap horizontal gaussian for the bloom phase. Wider kernel +
+// softer hardness (hardBloomPix = -1.5 by default) for the diffuse
+// halo around bright phosphors.
+fn horz7(pos: vec2f, off: f32, layer: u32, tex_size: vec2f, scale: f32, shape: f32, bright: f32) -> vec3f {
+  let a = fetch_pix(pos, vec2f(-3.0, off), layer, tex_size, bright);
+  let b = fetch_pix(pos, vec2f(-2.0, off), layer, tex_size, bright);
+  let c = fetch_pix(pos, vec2f(-1.0, off), layer, tex_size, bright);
+  let d = fetch_pix(pos, vec2f( 0.0, off), layer, tex_size, bright);
+  let e = fetch_pix(pos, vec2f( 1.0, off), layer, tex_size, bright);
+  let f = fetch_pix(pos, vec2f( 2.0, off), layer, tex_size, bright);
+  let g = fetch_pix(pos, vec2f( 3.0, off), layer, tex_size, bright);
+  let dst = dist_pix(pos, tex_size).x;
+  let wa = gaus(dst - 3.0, scale, shape);
+  let wb = gaus(dst - 2.0, scale, shape);
+  let wc = gaus(dst - 1.0, scale, shape);
+  let wd = gaus(dst + 0.0, scale, shape);
+  let we = gaus(dst + 1.0, scale, shape);
+  let wf = gaus(dst + 2.0, scale, shape);
+  let wg = gaus(dst + 3.0, scale, shape);
+  return (a * wa + b * wb + c * wc + d * wd + e * we + f * wf + g * wg)
+       / (wa + wb + wc + wd + we + wf + wg);
+}
+
+// Scanline weight at vertical offset 'off' from the current line.
+// dst is signed distance to the nearest scanline center in emulated
+// pixels; Gaus shapes the falloff. (No backticks in WGSL comments --
+// they close the JS template literal.)
+fn scan_w(pos: vec2f, off: f32, tex_size: vec2f, scale: f32, shape: f32) -> f32 {
+  let dst = dist_pix(pos, tex_size).y;
+  return gaus(dst + off, scale, shape);
+}
+
+// Shadow mask -- the RGB-phosphor pattern overlaid on the picture.
+// pos here is fragment-space (output pixel coords), not UV -- the
+// mask is tied to physical screen pixels so it doesn't move when
+// the warp shifts the source UV.
+//   1 = slot mask (RGB triplets in offset rows, like classic NTSC)
+//   2 = aperture grille (continuous vertical RGB columns, Sony Trinitron)
+//   3 = VGA-stretched (diagonal RGB stripes; the most "modern PC CRT" look)
+//   4 = VGA-stretched at 2x vertical -- coarser version of #3
+fn shadow_mask(in_pos: vec2f, mask_type: i32, mask_dark: f32, mask_light: f32) -> vec3f {
+  var mask = vec3f(mask_dark);
+  var pos = in_pos;
+  if (mask_type == 1) {
+    var mask_line = mask_light;
+    var odd: f32 = 0.0;
+    if (fract(pos.x / 6.0) < 0.5) { odd = 1.0; }
+    if (fract((pos.y + odd) / 2.0) < 0.5) { mask_line = mask_dark; }
+    let px = fract(pos.x / 3.0);
+    if      (px < 0.333) { mask.r = mask_light; }
+    else if (px < 0.666) { mask.g = mask_light; }
+    else                 { mask.b = mask_light; }
+    mask = mask * mask_line;
+  } else if (mask_type == 2) {
+    let px = fract(pos.x / 3.0);
+    if      (px < 0.333) { mask.r = mask_light; }
+    else if (px < 0.666) { mask.g = mask_light; }
+    else                 { mask.b = mask_light; }
+  } else if (mask_type == 3) {
+    pos.x = pos.x + pos.y * 3.0;
+    let px = fract(pos.x / 6.0);
+    if      (px < 0.333) { mask.r = mask_light; }
+    else if (px < 0.666) { mask.g = mask_light; }
+    else                 { mask.b = mask_light; }
+  } else if (mask_type == 4) {
+    let pf = floor(pos * vec2f(1.0, 0.5));
+    let p2x = pf.x + pf.y * 3.0;
+    let px = fract(p2x / 6.0);
+    if      (px < 0.333) { mask.r = mask_light; }
+    else if (px < 0.666) { mask.g = mask_light; }
+    else                 { mask.b = mask_light; }
+  }
+  return mask;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layer        = u32(max(0.0, u.params.x));
+  let virt_w       = max(u.params.y, 1.0);
+  let virt_h       = max(u.params.z, 1.0);
+  let virt_size    = vec2f(virt_w, virt_h);
+  let curvature    = max(u.params.w, 0.0);
+  let scan_hard    = u.params2.x;
+  let pix_hard     = u.params2.y;
+  let mask_type    = i32(u.params2.z + 0.5);
+  let mask_str     = clamp(u.params2.w, 0.0, 1.0);
+  let bright       = max(u.params3.x, 0.0);
+  let bloom_amt    = max(u.params3.y, 0.0);
+  let gauss_shape  = max(u.params3.z, 0.5);
+
+  // Barrel warp -- pulls UV in toward center based on distance from
+  // the opposite axis, mimicking the bulge of a CRT glass tube.
+  // Lottes splits warp into x/y; we apply a 1.3x ratio between them
+  // (matches his 0.031/0.041 default ratio).
+  var p = in.uv * 2.0 - vec2f(1.0);
+  let warp_v = vec2f(curvature, curvature * 1.3225806);   // 0.041/0.031 = 1.3225
+  p = p * vec2f(1.0 + (p.y * p.y) * warp_v.x,
+                1.0 + (p.x * p.x) * warp_v.y);
+  let warped = p * 0.5 + vec2f(0.5);
+
+  // Outside the warped frame: black bezel. Without this you'd see
+  // wraparound or mirrored edges in the curved-corner regions.
+  if (warped.x < 0.0 || warped.x > 1.0 || warped.y < 0.0 || warped.y > 1.0) {
+    return vec4f(0.0, 0.0, 0.0, 1.0);
+  }
+
+  // === Tri: 3 horizontal rows combined by scanline weight. ===
+  // Active row uses Horz5 (5-tap) for cleaner color; +/-1 rows use
+  // Horz3 (3-tap) since their contribution is heavily attenuated by
+  // the scanline weighting anyway.
+  let row_a = horz3(warped, -1.0, layer, virt_size, pix_hard, gauss_shape, bright);
+  let row_b = horz5(warped,  0.0, layer, virt_size, pix_hard, gauss_shape, bright);
+  let row_c = horz3(warped,  1.0, layer, virt_size, pix_hard, gauss_shape, bright);
+  let w_a = scan_w(warped, -1.0, virt_size, scan_hard, gauss_shape);
+  let w_b = scan_w(warped,  0.0, virt_size, scan_hard, gauss_shape);
+  let w_c = scan_w(warped,  1.0, virt_size, scan_hard, gauss_shape);
+  var color = row_a * w_a + row_b * w_b + row_c * w_c;
+
+  // === Bloom: 5-row pyramid (5/7/7/7/5 taps) with softer scanline
+  // weights (hardBloomScan = -2). Skipped at bloom_amt=0 to save
+  // ~31 texture samples. ===
+  if (bloom_amt > 0.001) {
+    let bloom_pix  = -1.5;
+    let bloom_scan = -2.0;
+    let bl_a = horz5(warped, -2.0, layer, virt_size, bloom_pix, gauss_shape, bright);
+    let bl_b = horz7(warped, -1.0, layer, virt_size, bloom_pix, gauss_shape, bright);
+    let bl_c = horz7(warped,  0.0, layer, virt_size, bloom_pix, gauss_shape, bright);
+    let bl_d = horz7(warped,  1.0, layer, virt_size, bloom_pix, gauss_shape, bright);
+    let bl_e = horz5(warped,  2.0, layer, virt_size, bloom_pix, gauss_shape, bright);
+    let bw_a = scan_w(warped, -2.0, virt_size, bloom_scan, gauss_shape);
+    let bw_b = scan_w(warped, -1.0, virt_size, bloom_scan, gauss_shape);
+    let bw_c = scan_w(warped,  0.0, virt_size, bloom_scan, gauss_shape);
+    let bw_d = scan_w(warped,  1.0, virt_size, bloom_scan, gauss_shape);
+    let bw_e = scan_w(warped,  2.0, virt_size, bloom_scan, gauss_shape);
+    let bloom = bl_a * bw_a + bl_b * bw_b + bl_c * bw_c + bl_d * bw_d + bl_e * bw_e;
+    color = color + bloom * bloom_amt;
+  }
+
+  // === Shadow mask: physical-pixel grid (not UV), so it doesn't
+  // move when the warp shifts the source. ===
+  if (mask_type > 0) {
+    let frag_xy = in.uv * u.u_resolution.xy;
+    let m = shadow_mask(frag_xy, mask_type, 0.5, 1.5);
+    color = color * mix(vec3f(1.0), m, mask_str);
+  }
+
+  // sRGB encode (matches the c*c ToLinear in fetch_pix).
+  let out_c = to_srgb(color);
+  return vec4f(clamp(out_c, vec3f(0.0), vec3f(1.0)), 1.0);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inLayer          === "number") ? p.inLayer          : 0;
+      scratch[17] = (typeof p.virtualW         === "number") ? p.virtualW         : 320;
+      scratch[18] = (typeof p.virtualH         === "number") ? p.virtualH         : 240;
+      scratch[19] = (typeof p.curvature        === "number") ? p.curvature        : 0.031;
+      scratch[20] = (typeof p.scanlineHardness === "number") ? p.scanlineHardness : -8.0;
+      scratch[21] = (typeof p.pixelHardness    === "number") ? p.pixelHardness    : -3.0;
+      scratch[22] = (typeof p.maskType         === "number") ? p.maskType         : 3;
+      scratch[23] = (typeof p.maskStrength     === "number") ? p.maskStrength     : 1.0;
+      scratch[24] = (typeof p.brightness       === "number") ? p.brightness       : 1.0;
+      scratch[25] = (typeof p.bloomAmount      === "number") ? p.bloomAmount      : 0.0625;
+      scratch[26] = (typeof p.shape            === "number") ? p.shape            : 2.0;
+      scratch[27] = 0;
+    },
+    description: "High-fidelity CRT emulation — full port of Timothy Lottes' crt-lottes shader from libretro/common-shaders. Single pass with barrel warp + scanline gaussian + 5-row bloom pyramid + four mask variants. virtualW/H sets the emulated resolution (320x240 = arcade/NES; bump to 640x480 or higher for modern-content CRT looks). curvature: barrel-distort intensity (0 = flat, 0.031 = Lottes default, 0.1 = pronounced). scanlineHardness: negative; more negative = sharper scanlines (-8 default). pixelHardness: negative; horizontal pixel pop (-3 default). maskType: 0=none, 1=slot, 2=aperture grille (Trinitron), 3=VGA-stretched (default), 4=VGA-stretched-2x. bloomAmount: phosphor glow (0 = skip, saves ~31 samples/fragment; 1/16 = Lottes default). shape: gaussian exponent (2 = standard; 1.3 softer, 4 sharper). ~42 texture samples per fragment; 1080p budget ~4-6 ms on mid-range discrete GPU."
   },
 
   /* =========================================================================
