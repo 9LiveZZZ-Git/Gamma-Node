@@ -17638,6 +17638,505 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     description: "Filter-mode picker for the sample step. Doesn't resample — the framebuffer array is fixed-resolution — but lets the chain swap between linear (default smooth filtering) and nearest (snap-to-texel, preserves pixel art through downstream linear-filter chains). Useful as a chain stabilizer: Pixelate → Resize(nearest) → Blur keeps the chunky pixels readable after blur, vs Pixelate → Blur which smears the pixel grid into mush."
   },
 
+  /* =========================================================================
+   * v0.3.26 — Video-edit suite, sprint 2: Color (6 of 8 nodes).
+   *
+   * Per-pixel color math. Same composition shader-frag shape as the
+   * Transform suite -- 1 texture in, 1 out, identity-default state
+   * is pass-through. ColorCurves + HueCurves are deferred to a
+   * follow-up sub-sprint because they need a curve-editor UI in the
+   * props pane (16-point LUT with draggable control points).
+   *
+   * Coverage rationale: we already have ColorCorrect (kitchen-sink:
+   * brightness + contrast + saturation + hueShift + gamma in one
+   * node). The new individual nodes are for users who want fewer
+   * knobs per node with finer slider granularity per param, or who
+   * want to wire MasterClock / Slider to ONE specific param without
+   * the rest tagging along.
+   * ======================================================================== */
+
+  /* BrightnessContrast — additive brightness, multiplicative contrast
+   * around 0.5, output gamma. Identity defaults: 0 / 1 / 1. */
+  BrightnessContrast: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "in",         t: "texture" },
+      { n: "brightness", t: "param" },
+      { n: "contrast",   t: "param" },
+      { n: "gamma",      t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16 },
+    params: { inLayer: 0, brightness: 0.0, contrast: 1.0, gamma: 1.0 },
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inLayer, y=brightness, z=contrast, w=gamma
+  _pad1:         vec4f,
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layer = u32(max(0.0, u.params.x));
+  var c = textureSampleLevel(fbHistory, fbSampler, in.uv, layer, 0.0).rgb;
+  // Contrast around 0.5 (the perceptual midpoint), then brightness offset.
+  c = (c - vec3f(0.5)) * u.params.z + vec3f(0.5) + vec3f(u.params.y);
+  // Gamma (clamp denominator + clamp post-pow to keep negatives + inf out).
+  let g = max(u.params.w, 0.001);
+  c = pow(max(c, vec3f(0.0)), vec3f(1.0 / g));
+  return vec4f(clamp(c, vec3f(0.0), vec3f(1.0)), 1.0);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inLayer    === "number") ? p.inLayer    : 0;
+      scratch[17] = (typeof p.brightness === "number") ? p.brightness : 0.0;
+      scratch[18] = (typeof p.contrast   === "number") ? p.contrast   : 1.0;
+      scratch[19] = (typeof p.gamma      === "number") ? p.gamma      : 1.0;
+    },
+    description: "Brightness + contrast + gamma in one focused node. brightness: additive offset (-1..+1, 0 = neutral). contrast: multiplier around 0.5 (1 = neutral, 2 = double, 0.5 = half). gamma: output gamma (1 = linear, <1 darkens midtones, >1 brightens). All-default state is pass-through. Use this instead of ColorCorrect when you want one knob per node + want to wire MasterClock / Slider to ONE specific param without the rest tagging along."
+  },
+
+  /* Levels — classic photo-grading levels tool. Per-master input
+   * black/white/gamma + output black/white remap. */
+  Levels: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "in",       t: "texture" },
+      { n: "inBlack",  t: "param" },
+      { n: "inWhite",  t: "param" },
+      { n: "gamma",    t: "param" },
+      { n: "outBlack", t: "param" },
+      { n: "outWhite", t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16 },
+    params: { inLayer: 0, inBlack: 0.0, inWhite: 1.0, gamma: 1.0, outBlack: 0.0, outWhite: 1.0 },
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inLayer, y=inBlack, z=inWhite, w=gamma
+  params2:       vec4f,    // x=outBlack, y=outWhite, zw=_
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layer = u32(max(0.0, u.params.x));
+  let inBlk = u.params.y;
+  let inWht = u.params.z;
+  let gamma = max(u.params.w, 0.001);
+  let outBlk = u.params2.x;
+  let outWht = u.params2.y;
+  var c = textureSampleLevel(fbHistory, fbSampler, in.uv, layer, 0.0).rgb;
+  // Remap input range to [0, 1]. Guard divide-by-zero when user
+  // drags inBlack >= inWhite (degenerate -- produces a hard threshold).
+  let span = max(inWht - inBlk, 0.0001);
+  c = clamp((c - vec3f(inBlk)) / span, vec3f(0.0), vec3f(1.0));
+  // Apply gamma to the normalized signal.
+  c = pow(c, vec3f(1.0 / gamma));
+  // Remap to output range.
+  c = c * (outWht - outBlk) + vec3f(outBlk);
+  return vec4f(clamp(c, vec3f(0.0), vec3f(1.0)), 1.0);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inLayer  === "number") ? p.inLayer  : 0;
+      scratch[17] = (typeof p.inBlack  === "number") ? p.inBlack  : 0.0;
+      scratch[18] = (typeof p.inWhite  === "number") ? p.inWhite  : 1.0;
+      scratch[19] = (typeof p.gamma    === "number") ? p.gamma    : 1.0;
+      scratch[20] = (typeof p.outBlack === "number") ? p.outBlack : 0.0;
+      scratch[21] = (typeof p.outWhite === "number") ? p.outWhite : 1.0;
+      scratch[22] = 0; scratch[23] = 0;
+    },
+    description: "Photo-grading levels: remap input range [inBlack, inWhite] through a gamma curve onto output range [outBlack, outWhite]. Identity default = 0, 1, 1, 0, 1 (pass-through). inBlack > 0 clips shadows; inWhite < 1 clips highlights; gamma <1 darkens midtones, >1 brightens. outBlack > 0 floors blacks (washed-out look), outWhite < 1 caps highlights."
+  },
+
+  /* HsvShift — global hue rotate + saturation + value scale.
+   * Lighter-weight than ColorCorrect when you only want HSV. */
+  HsvShift: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "in",       t: "texture" },
+      { n: "hueShift", t: "param" },
+      { n: "sat",      t: "param" },
+      { n: "val",      t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16 },
+    params: { inLayer: 0, hueShift: 0.0, sat: 1.0, val: 1.0 },
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inLayer, y=hueShiftDeg, z=sat, w=val
+  _pad1:         vec4f,
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+// RGB <-> HSV from Sam Hocevar's reference (lolengine.net 2013).
+// Branch-free, decent speed, good for in-shader use.
+fn rgb2hsv(c: vec3f) -> vec3f {
+  let K = vec4f(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+  let p = mix(vec4f(c.bg, K.wz), vec4f(c.gb, K.xy), step(c.b, c.g));
+  let q = mix(vec4f(p.xyw, c.r), vec4f(c.r, p.yzx), step(p.x, c.r));
+  let d = q.x - min(q.w, q.y);
+  let e = 1.0e-10;
+  return vec3f(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
+}
+
+fn hsv2rgb(c: vec3f) -> vec3f {
+  let K = vec4f(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+  let p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+  return c.z * mix(K.xxx, clamp(p - K.xxx, vec3f(0.0), vec3f(1.0)), c.y);
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layer    = u32(max(0.0, u.params.x));
+  let hueShift = u.params.y / 360.0;   // degrees -> fraction of full hue circle
+  let sat_g    = max(u.params.z, 0.0);
+  let val_g    = max(u.params.w, 0.0);
+  var c = textureSampleLevel(fbHistory, fbSampler, in.uv, layer, 0.0).rgb;
+  var hsv = rgb2hsv(c);
+  hsv.x = fract(hsv.x + hueShift);
+  hsv.y = clamp(hsv.y * sat_g, 0.0, 1.0);
+  hsv.z = hsv.z * val_g;
+  c = hsv2rgb(hsv);
+  return vec4f(clamp(c, vec3f(0.0), vec3f(1.0)), 1.0);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inLayer  === "number") ? p.inLayer  : 0;
+      scratch[17] = (typeof p.hueShift === "number") ? p.hueShift : 0.0;
+      scratch[18] = (typeof p.sat      === "number") ? p.sat      : 1.0;
+      scratch[19] = (typeof p.val      === "number") ? p.val      : 1.0;
+    },
+    description: "HSV space color shift. hueShift in degrees (±180 wraps full circle). sat: 0 = grayscale, 1 = neutral, >1 boosts. val: 0 = black, 1 = neutral, >1 brightens (clipped at 1). All-default state is pass-through. Useful when you want clock-driven hue rotation without dragging contrast / gamma along for the ride."
+  },
+
+  /* Invert — RGB invert with a mix knob (0 = pass-through, 1 = full
+   * invert). Default mix is 0 to honor the identity-default rule. */
+  Invert: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "in",  t: "texture" },
+      { n: "mix", t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16 },
+    params: { inLayer: 0, mix: 1.0 },
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inLayer, y=mix (0=pass-through, 1=full invert), zw=_
+  _pad1:         vec4f,
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layer = u32(max(0.0, u.params.x));
+  let m     = clamp(u.params.y, 0.0, 1.0);
+  let c     = textureSampleLevel(fbHistory, fbSampler, in.uv, layer, 0.0).rgb;
+  let inv   = vec3f(1.0) - c;
+  return vec4f(mix(c, inv, m), 1.0);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inLayer === "number") ? p.inLayer : 0;
+      scratch[17] = (typeof p.mix     === "number") ? p.mix     : 1.0;
+      scratch[18] = 0; scratch[19] = 0;
+    },
+    description: "RGB invert. mix scalars between original (0) and full invert (1, the photographic negative). Default mix = 1.0 so a freshly-dropped Invert node actually inverts; flip to 0 for pass-through. Wire MasterClock to mix for rhythmic invert flashes; wire EnvFollow for amplitude-reactive negation."
+  },
+
+  /* ChannelMix — 3x3 RGB matrix. Identity defaults to the I matrix
+   * (diagonal = 1, off-diagonal = 0). Use for channel swaps,
+   * black-and-white film conversion (custom luminance weights),
+   * desaturation, sepia, color-space approximations. */
+  ChannelMix: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "in",  t: "texture" },
+      { n: "rr", t: "param" }, { n: "rg", t: "param" }, { n: "rb", t: "param" },
+      { n: "gr", t: "param" }, { n: "gg", t: "param" }, { n: "gb", t: "param" },
+      { n: "br", t: "param" }, { n: "bg", t: "param" }, { n: "bb", t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16 },
+    params: {
+      inLayer: 0,
+      rr: 1.0, rg: 0.0, rb: 0.0,
+      gr: 0.0, gg: 1.0, gb: 0.0,
+      br: 0.0, bg: 0.0, bb: 1.0
+    },
+    methods: {},
+    uniformBytes: 112,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inLayer, y=rr, z=rg, w=rb
+  params2:       vec4f,    // x=gr, y=gg, z=gb, w=br
+  params3:       vec4f,    // x=bg, y=bb, zw=_
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layer = u32(max(0.0, u.params.x));
+  let c = textureSampleLevel(fbHistory, fbSampler, in.uv, layer, 0.0).rgb;
+  // Each output channel = dot product of input RGB with that row.
+  let m_r = vec3f(u.params.y,  u.params.z,  u.params.w);   // rr, rg, rb
+  let m_g = vec3f(u.params2.x, u.params2.y, u.params2.z);  // gr, gg, gb
+  let m_b = vec3f(u.params2.w, u.params3.x, u.params3.y);  // br, bg, bb
+  let out_c = vec3f(dot(c, m_r), dot(c, m_g), dot(c, m_b));
+  return vec4f(clamp(out_c, vec3f(0.0), vec3f(1.0)), 1.0);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inLayer === "number") ? p.inLayer : 0;
+      scratch[17] = (typeof p.rr      === "number") ? p.rr      : 1.0;
+      scratch[18] = (typeof p.rg      === "number") ? p.rg      : 0.0;
+      scratch[19] = (typeof p.rb      === "number") ? p.rb      : 0.0;
+      scratch[20] = (typeof p.gr      === "number") ? p.gr      : 0.0;
+      scratch[21] = (typeof p.gg      === "number") ? p.gg      : 1.0;
+      scratch[22] = (typeof p.gb      === "number") ? p.gb      : 0.0;
+      scratch[23] = (typeof p.br      === "number") ? p.br      : 0.0;
+      scratch[24] = (typeof p.bg      === "number") ? p.bg      : 0.0;
+      scratch[25] = (typeof p.bb      === "number") ? p.bb      : 1.0;
+      scratch[26] = 0; scratch[27] = 0;
+    },
+    description: "3x3 RGB channel mixer. Each output channel is a weighted sum of input RGB: out.r = rr*in.r + rg*in.g + rb*in.b, same for G and B. Identity default = I matrix (pass-through). Recipes: black-and-white via (rr=gg=bb=0.2126, _g=_g=0.7152, _b=0.0722) on all rows gives Rec.709 luma in all channels. Sepia ~= (0.393, 0.769, 0.189 / 0.349, 0.686, 0.168 / 0.272, 0.534, 0.131). RB channel swap = swap rr/rb and br/bb rows."
+  },
+
+  /* ChannelCombiner — pick output channels from any of 4 separate
+   * texture inputs, each input's specific channel. Use cases: blend
+   * pre-keyed alpha from one source with color from another; assemble
+   * a final image from individual channel masks. */
+  ChannelCombiner: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "srcR",  t: "texture" },
+      { n: "srcG",  t: "texture" },
+      { n: "srcB",  t: "texture" },
+      { n: "srcA",  t: "texture" },
+      { n: "pickR", t: "param" },
+      { n: "pickG", t: "param" },
+      { n: "pickB", t: "param" },
+      { n: "pickA", t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { srcR: 16, srcG: 17, srcB: 18, srcA: 19 },
+    paramOptions: {
+      pickR: ["R", "G", "B", "A", "Luma"],
+      pickG: ["R", "G", "B", "A", "Luma"],
+      pickB: ["R", "G", "B", "A", "Luma"],
+      pickA: ["R", "G", "B", "A", "Luma"]
+    },
+    params: {
+      layerR: 0, layerG: 0, layerB: 0, layerA: 0,
+      pickR: 0, pickG: 1, pickB: 2, pickA: 3
+    },
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=layerR, y=layerG, z=layerB, w=layerA
+  params2:       vec4f,    // x=pickR, y=pickG, z=pickB, w=pickA
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+// Pick one channel by index: 0=R, 1=G, 2=B, 3=A, 4=Luma.
+fn pick_chan(s: vec4f, idx: i32) -> f32 {
+  if (idx == 1) { return s.g; }
+  if (idx == 2) { return s.b; }
+  if (idx == 3) { return s.a; }
+  if (idx == 4) { return dot(s.rgb, vec3f(0.2126, 0.7152, 0.0722)); }
+  return s.r;   // default + idx == 0
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let lR = u32(max(0.0, u.params.x));
+  let lG = u32(max(0.0, u.params.y));
+  let lB = u32(max(0.0, u.params.z));
+  let lA = u32(max(0.0, u.params.w));
+  let pR = i32(u.params2.x + 0.5);
+  let pG = i32(u.params2.y + 0.5);
+  let pB = i32(u.params2.z + 0.5);
+  let pA = i32(u.params2.w + 0.5);
+  let sR = textureSampleLevel(fbHistory, fbSampler, in.uv, lR, 0.0);
+  let sG = textureSampleLevel(fbHistory, fbSampler, in.uv, lG, 0.0);
+  let sB = textureSampleLevel(fbHistory, fbSampler, in.uv, lB, 0.0);
+  let sA = textureSampleLevel(fbHistory, fbSampler, in.uv, lA, 0.0);
+  return vec4f(
+    pick_chan(sR, pR),
+    pick_chan(sG, pG),
+    pick_chan(sB, pB),
+    pick_chan(sA, pA)
+  );
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.layerR === "number") ? p.layerR : 0;
+      scratch[17] = (typeof p.layerG === "number") ? p.layerG : 0;
+      scratch[18] = (typeof p.layerB === "number") ? p.layerB : 0;
+      scratch[19] = (typeof p.layerA === "number") ? p.layerA : 0;
+      scratch[20] = (typeof p.pickR  === "number") ? p.pickR  : 0;
+      scratch[21] = (typeof p.pickG  === "number") ? p.pickG  : 1;
+      scratch[22] = (typeof p.pickB  === "number") ? p.pickB  : 2;
+      scratch[23] = (typeof p.pickA  === "number") ? p.pickA  : 3;
+    },
+    description: "Recombine RGBA from up to 4 different texture sources. Each output channel (R / G / B / A) picks both a SOURCE (wire srcR / srcG / srcB / srcA) and a CHANNEL of that source (pickR / pickG / pickB / pickA — picks R, G, B, A, or Luma of the corresponding source). With all four srcs wired to the same upstream and picks at default RGBA, output = input (identity). Use cases: pull alpha from a key node while keeping color from the unkeyed source; assemble an image from per-channel masks; swap channels (wire same src to all 4, set pickR=B and pickB=R for an R↔B swap). Unwired sources fall back to layer 0."
+  },
+
   /* ---- B1: Math, single-arg trig (cmath) ---- */
   Sin:    { category: "Math", color: COLOR.math, header: "cmath", cppType: "", ins: [{n:"in", t:"audio"}], outs: [{n:"out", t:"audio"}], params: {}, template: "sinf({in})",   description: "sin(x), x in radians" },
   Cos:    { category: "Math", color: COLOR.math, header: "cmath", cppType: "", ins: [{n:"in", t:"audio"}], outs: [{n:"out", t:"audio"}], params: {}, template: "cosf({in})",   description: "cos(x), x in radians" },
