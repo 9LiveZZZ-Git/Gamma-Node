@@ -430,6 +430,28 @@
     font-variant-numeric: tabular-nums;
     animation: hud-rec-pulse 1.4s ease-in-out infinite;
   }
+  /* v0.3.47 -- OSC bridge status pill. Greyed out when idle / no
+     daemon detected; phosphor-tinted on connected; warn-amber on
+     "disabled" (daemon running but --noOsc); error-red on socket
+     error. Same shape as the other HUD pills. */
+  .visual-hud-pill.osc-pill.connected {
+    color: var(--phosphor);
+    border-color: var(--phosphor-dim);
+    background: rgba(200, 232, 90, 0.08);
+  }
+  .visual-hud-pill.osc-pill.connecting {
+    color: var(--text-2);
+    border-color: var(--border-strong);
+    opacity: 0.75;
+  }
+  .visual-hud-pill.osc-pill.disabled {
+    color: var(--gate);
+    border-color: rgba(216, 160, 48, 0.4);
+  }
+  .visual-hud-pill.osc-pill.error {
+    color: #ff7a7a;
+    border-color: rgba(255, 122, 122, 0.5);
+  }
   @keyframes hud-rec-pulse {
     0%,100% { box-shadow: 0 0 0 0 rgba(255, 77, 77, 0.0); }
     50%     { box-shadow: 0 0 0 3px rgba(255, 77, 77, 0.25); }
@@ -6394,6 +6416,8 @@
                 title="Frame rate (rAF cadence). Stays at — fps until shader nodes drive an animation loop in Phase 6.1.7+.">— fps</span>
           <button class="visual-hud-pill visual-hud-icon" id="perf-pill" type="button"
                   title="Toggle performance overlay (Shift+P) — live frame time, draw calls, render passes, pipeline cache. Informational; zero cost when closed.">📊</button>
+          <button class="visual-hud-pill visual-hud-icon osc-pill" id="osc-pill" type="button"
+                  title="OSC bridge idle. Start gamma-compile-server (>=0.3.0) and the editor will auto-connect.">📡</button>
           <button class="visual-hud-pill visual-hud-icon" id="freeze-btn" type="button"
                   title="Freeze visual updates (audio keeps running). Useful for inspecting a single frame mid-set.">❄</button>
           <button class="visual-hud-pill visual-hud-icon" id="graph-hide-pill" type="button"
@@ -9782,6 +9806,98 @@ public:
     autoExpose: ["value"],
     uiOnlyParams: ["min", "max", "curve", "curveTable"],
     description: "On-screen slider → param-rate float output. Set min/max + curve (linear/log/exp/s-curve/custom) in the ramp editor. Drag in the Monitor's Controls panel. Wire out into any param input. (Type was 'audio' before Phase 6.6.24 — interconnected with audio/gate/clock via SIGNAL_PORT_TYPES, so old patches keep working.)"
+  },
+
+  /* v0.3.47 -- OscIn. External OSC source. The gamma-compile-server's
+   * OSC bridge (UDP listener on port 9000 by default, WebSocket
+   * fan-out to the editor) forwards inbound OSC messages here; this
+   * node exposes the first four numeric args as v1..v4 param outputs
+   * that can be wired into anything in the patch -- audio Sliders,
+   * shader uniforms, MIDI gates, BiquadLP cutoffs, the lot.
+   *
+   * The address field is the OSC address pattern this node listens
+   * to. Exact match (e.g. "/synth/freq") or single-segment wildcards
+   * ("/synth/*" matches "/synth/freq" + "/synth/cutoff" but NOT
+   * "/synth/sub/freq"). "?" matches one character.
+   *
+   * On the audio side this is a GammaSlider-shaped class with four
+   * setters; the editor pushes incoming OSC arg values via setter
+   * postMessages to the worklet (same path Slider drags use) so
+   * downstream C++ classes see them update each quantum.
+   *
+   * On the visual side the wired-param resolver reads node.params.v1..v4
+   * directly (no SAB round-trip needed -- the param is already the
+   * live value). Drop one of these on any shader node's reactive
+   * input and you've got a TouchOSC layout driving the visual layer. */
+  OscIn: {
+    category: "Convert", color: COLOR.convert, header: null,
+    cppType: "GammaOscIn",
+    helperClass:
+`class GammaOscIn {
+    float v1_ = 0.f;
+    float v2_ = 0.f;
+    float v3_ = 0.f;
+    float v4_ = 0.f;
+public:
+    void setV1(float v) { v1_ = v; }
+    void setV2(float v) { v2_ = v; }
+    void setV3(float v) { v3_ = v; }
+    void setV4(float v) { v4_ = v; }
+    struct Out { float v1, v2, v3, v4; };
+    Out operator()() { Out o; o.v1 = v1_; o.v2 = v2_; o.v3 = v3_; o.v4 = v4_; return o; }
+};`,
+    ins: [],
+    outs: [
+      { n: "v1", t: "param", access: ".v1" },
+      { n: "v2", t: "param", access: ".v2" },
+      { n: "v3", t: "param", access: ".v3" },
+      { n: "v4", t: "param", access: ".v4" }
+    ],
+    params: {
+      address: "/gamma/in",
+      v1: 0, v2: 0, v3: 0, v4: 0
+    },
+    methods: { v1: "setV1", v2: "setV2", v3: "setV3", v4: "setV4" },
+    autoExpose: ["v1", "v2", "v3", "v4"],
+    uiOnlyParams: ["address"],
+    description: "External OSC input. Subscribes to an OSC address pattern via the gamma-compile-server's OSC bridge; exposes the first four numeric args of each matching message as v1..v4 param outputs. Address supports exact match (\"/synth/freq\"), single-segment wildcard (\"/synth/*\"), and '?' for single-char (\"/cc/??\"). For full wildcards across segments use the daemon's UDP port (9000 by default) -- the bridge fans-out to every connected client. To use: start gamma-compile-server (the editor's status pill turns from grey to phosphor when the OSC bridge is reachable), set this node's address, point your OSC source at udp://<server-host>:9000."
+  },
+
+  /* v0.3.47 -- OscOut. Sends outbound OSC messages from the editor
+   * through the compile-server's bridge. JS-side only -- no codegen,
+   * no audio-worklet path. Each rAF tick the editor reads the current
+   * JS-side value of each wired v1..v4 input (Slider.value,
+   * HandLandmarker.h1_pinch, OscIn.v1, MasterClock.beat, etc) and
+   * forwards them as an OSC bundle when any have changed.
+   *
+   * host + port override the daemon's default destination (configured
+   * via --oscOutHost / --oscOutPort flags). Leave both blank to send
+   * to the daemon's default target. The whole message is suppressed
+   * when no inputs are wired, so an idle OscOut node is silent.
+   *
+   * Note: audio-side-only signals (e.g. an LFO compiled into the
+   * worklet that has no JS-readable mirror) currently can't be sent
+   * via OscOut. Wire through an intermediate Slider if you need that;
+   * a SAB-mirror path for arbitrary audio-rate sources is a future
+   * follow-up. */
+  OscOut: {
+    category: "Convert", color: COLOR.convert, header: null,
+    cppType: "",
+    ins: [
+      { n: "v1", t: "param" },
+      { n: "v2", t: "param" },
+      { n: "v3", t: "param" },
+      { n: "v4", t: "param" }
+    ],
+    outs: [],
+    params: {
+      address: "/gamma/out",
+      host: "",
+      port: 0
+    },
+    methods: {},
+    uiOnlyParams: ["address", "host", "port"],
+    description: "Send OSC messages to an external app via the gamma-compile-server's OSC bridge. Each frame the editor reads the JS-side resolved value of every wired v1..v4 input + sends them as a single OSC message at the configured address. host + port override the daemon's default destination (leave blank to use the --oscOutHost / --oscOutPort defaults). Only forwards messages when at least one input value has changed since the last tick -- silent when idle. Audio-side-only signals can't be sent directly; wire through a Slider first if you need an audio-only source on OSC."
   },
 
   /* Custom ramp / curve shaper. Takes any 0..1 signal in, applies the
@@ -42210,6 +42326,14 @@ function _resolveNodeParams(node) {
       // entry.latest, this resolver reads it.
       out[port.n] = _blobTrackerValue(src, wire.from.port);
     }
+    else if (src.type === "OscIn") {
+      // v0.3.47 -- external OSC source. node.params.{v1,v2,v3,v4}
+      // are kept current by _dispatchOscIn whenever a WS message
+      // arrives. The visual side reads them directly here; the audio
+      // side gets the same values pushed via _pushLiveControlsToWorklet.
+      const v = src.params && src.params[wire.from.port];
+      out[port.n] = (typeof v === "number") ? v : 0;
+    }
     // Future source types (Knob, audio-rate LFO via SAB, etc.) plug
     // in here.
   }
@@ -43998,6 +44122,11 @@ function _visualRenderTick(t) {
   // via setter postMessages. No-op when audio preview isn't playing
   // OR when no live-control nodes have wires to audio-rate consumers.
   _pushLiveControlsToWorklet();
+  // v0.3.47 -- OSC outbound. Reads JS-side values of OscOut nodes'
+  // wired inputs + sends via WS to the compile-server bridge. Cheap:
+  // change-detection skips identical messages so an idle OscOut is
+  // silent. Bails immediately if no OscOut nodes are in the patch.
+  _tickOscOut();
   // v0.3.16 — VideoFile retrigger from gate input. Cheap (one wire
   // lookup per VideoFile node, typically zero); runs every frame.
   _tickVideoFileTrigs();
@@ -44116,6 +44245,312 @@ function _pushLiveControlsToWorklet() {
   for (const node of faces)  push(node, _FACE_LIVE_PORTS,    _faceLandmarkerValue);
   for (const node of handkb) push(node, _HANDKB_LIVE_PORTS,  _handKeyboardValue);
   for (const node of blobs)  push(node, _BLOB_LIVE_PORTS,    _blobTrackerValue);
+
+  // v0.3.47 -- OscIn live-control. The values v1..v4 are already in
+  // node.params (set by _dispatchOscIn when WS messages arrive); the
+  // push here simply forwards them to the worklet so the C++ class's
+  // member values stay in sync. Same shape as Slider's "drag updates
+  // the value, push setter" path, just driven by network instead of
+  // mouse.
+  const oscIns = state.nodes.filter(n => n && n.type === "OscIn");
+  for (const node of oscIns) {
+    push(node, _OSC_IN_LIVE_PORTS, (n, port) => {
+      const v = n && n.params && n.params[port];
+      return typeof v === "number" ? v : 0;
+    });
+  }
+}
+const _OSC_IN_LIVE_PORTS = ["v1", "v2", "v3", "v4"];
+
+/* =========================================================================
+ * v0.3.47 -- OSC client glue
+ *
+ * Connects to the gamma-compile-server's /osc WebSocket endpoint as
+ * soon as the server is detected (same probeLocalServer() path the
+ * compile flow uses). Receives inbound OSC messages + dispatches
+ * them to matching OscIn nodes; reads outbound values from OscOut
+ * nodes each rAF tick + forwards via WS. Reconnects on close.
+ *
+ * The status pill in the visual HUD (📡) goes from grey (idle) to
+ * phosphor (connected) to red (error). Click for a small modal
+ * with the daemon's reported config (inbound UDP port, default
+ * outbound target).
+ *
+ * Address-pattern matching: identical semantics to the codec on the
+ * server side -- exact match, '*' = any chars within one path part,
+ * '?' = one char. Cross-segment wildcards left for a follow-up. */
+
+const _oscState = {
+  ws: null,
+  status: "idle",          // idle | connecting | connected | error | disabled
+  helloInfo: null,         // hello payload {oscInPort, defaultOut, version}
+  endpoint: null,          // ws://... URL
+  reconnectTimer: null,
+  // Cache of last-sent values per OscOut node to suppress unchanged
+  // messages. Map<node.id, number[]>.
+  outLast: new Map()
+};
+
+function _oscWsUrl(httpEndpoint) {
+  if (!httpEndpoint) return null;
+  return httpEndpoint.replace(/^https:/, "wss:").replace(/^http:/, "ws:") + "/osc";
+}
+
+async function _ensureOscConnection() {
+  // Already connected?
+  if (_oscState.ws && _oscState.ws.readyState === 1) return;
+  if (_oscState.ws && _oscState.ws.readyState === 0) return;  // connecting
+  // Need a compile-server endpoint. probeLocalServer is idempotent
+  // (returns cached status after first call) so calling here is cheap.
+  await probeLocalServer();
+  if (!localServerEndpoint) {
+    _oscState.status = "idle";
+    _updateOscPill();
+    return;
+  }
+  // /health tells us if the bridge is enabled on this daemon. Older
+  // daemons (pre v0.3.0) won't have the osc key -- treat as disabled.
+  let oscEnabled = false;
+  try {
+    const h = await fetch(localServerEndpoint + "/health", { signal: AbortSignal.timeout(2000) }).then(r => r.json());
+    oscEnabled = !!(h && h.osc && h.osc.enabled);
+  } catch (_) { /* leave disabled */ }
+  if (!oscEnabled) {
+    _oscState.status = "disabled";
+    _updateOscPill();
+    return;
+  }
+
+  const wsUrl = _oscWsUrl(localServerEndpoint);
+  _oscState.endpoint = wsUrl;
+  _oscState.status = "connecting";
+  _updateOscPill();
+  let ws;
+  try { ws = new WebSocket(wsUrl); }
+  catch (e) { _oscState.status = "error"; _updateOscPill(); console.warn("[osc] ws ctor failed:", e); return; }
+  _oscState.ws = ws;
+  ws.onopen = () => {
+    _oscState.status = "connected";
+    _updateOscPill();
+    _rebuildOscSubscriptions();
+  };
+  ws.onclose = () => {
+    _oscState.ws = null;
+    _oscState.helloInfo = null;
+    // Don't drop to "idle" if we got an error first -- preserve the
+    // last error indicator for a beat so the user sees it.
+    if (_oscState.status !== "error") _oscState.status = "idle";
+    _updateOscPill();
+    if (!_oscState.reconnectTimer) {
+      _oscState.reconnectTimer = setTimeout(() => {
+        _oscState.reconnectTimer = null;
+        _ensureOscConnection();
+      }, 2000);
+    }
+  };
+  ws.onerror = () => {
+    _oscState.status = "error";
+    _updateOscPill();
+  };
+  ws.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); }
+    catch (_) { return; }
+    if (!msg || typeof msg !== "object") return;
+    if (msg.type === "hello") {
+      _oscState.helloInfo = msg;
+      _updateOscPill();
+    } else if (msg.type === "in") {
+      _dispatchOscIn(msg.address, msg.args || []);
+    } else if (msg.type === "in-bundle") {
+      const msgs = msg.messages || [];
+      for (const m of msgs) _dispatchOscIn(m.address, m.args || []);
+    } else if (msg.type === "error") {
+      console.warn("[osc] bridge error (" + (msg.where || "?") + "):", msg.message);
+    }
+  };
+}
+
+function _matchesOscPattern(pattern, address) {
+  if (!pattern || !address) return false;
+  if (pattern === address) return true;
+  // Same simplified subset as the server-side codec: '*' = [^/]*,
+  // '?' = [^/]; everything else literal.
+  let re = "^";
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (c === "*") re += "[^/]*";
+    else if (c === "?") re += "[^/]";
+    else if ("/^$.|+()[]{}\\".includes(c)) re += "\\" + c;
+    else re += c;
+  }
+  re += "$";
+  try { return new RegExp(re).test(address); } catch (_) { return false; }
+}
+
+function _dispatchOscIn(address, args) {
+  if (typeof state === "undefined" || !state || !Array.isArray(state.nodes)) return;
+  for (const node of state.nodes) {
+    if (!node || node.type !== "OscIn") continue;
+    const pattern = (node.params && node.params.address) || "";
+    if (!_matchesOscPattern(pattern, address)) continue;
+    if (!node.params) node.params = {};
+    // Coerce up to 4 numeric args; non-numeric / missing → 0.
+    for (let k = 0; k < 4; k++) {
+      const portName = "v" + (k + 1);
+      const raw = (k < args.length) ? args[k] : 0;
+      const num = (typeof raw === "number") ? raw : (typeof raw === "boolean" ? (raw ? 1 : 0) : 0);
+      node.params[portName] = num;
+    }
+  }
+  // The standard rAF push (_pushLiveControlsToWorklet) will pick up
+  // the new values + forward them to the audio worklet on the next
+  // frame. Visual side reads node.params directly via the resolver,
+  // so it's already current.
+}
+
+function _rebuildOscSubscriptions() {
+  if (!_oscState.ws || _oscState.ws.readyState !== 1) return;
+  if (typeof state === "undefined" || !state || !Array.isArray(state.nodes)) return;
+  const patterns = new Set();
+  for (const n of state.nodes) {
+    if (n && n.type === "OscIn" && n.params && typeof n.params.address === "string") {
+      if (n.params.address.startsWith("/")) patterns.add(n.params.address);
+    }
+  }
+  // Always sent (even if empty) so the bridge knows our intent. The
+  // bridge currently fans-out unconditionally; this is for diagnostic
+  // purposes + a future filter-on-server optimization.
+  try {
+    _oscState.ws.send(JSON.stringify({ type: "subscribe", patterns: [...patterns] }));
+  } catch (_) {}
+}
+
+/* Read the JS-side current value of a wire's source. Mirrors the
+ * dispatch in _resolveNodeParams but for outbound use cases where
+ * we want a single value (vs the full param-substitution). Returns
+ * null when the source is audio-only (no JS mirror) so the caller
+ * can skip rather than send a stale value. */
+function _readWireJsSideValue(wire) {
+  if (!wire || !wire.from) return null;
+  const src = state.nodes.find(n => n && n.id === wire.from.node);
+  if (!src) return null;
+  if (src.type === "Slider") {
+    const v = src.params && src.params.value;
+    return typeof v === "number" ? v : null;
+  }
+  if (src.type === "OscIn") {
+    const v = src.params && src.params[wire.from.port];
+    return typeof v === "number" ? v : null;
+  }
+  if (src.type === "MasterClock") {
+    return _masterClockOutputValue(src, wire.from.port);
+  }
+  if (src.type === "HandLandmarker") return _handLandmarkerValue(src, wire.from.port);
+  if (src.type === "PoseLandmarker") return _poseLandmarkerValue(src, wire.from.port);
+  if (src.type === "FaceLandmarker") return _faceLandmarkerValue(src, wire.from.port);
+  if (src.type === "HandKeyboard")   return _handKeyboardValue(src, wire.from.port);
+  if (src.type === "BlobTracker")    return _blobTrackerValue(src, wire.from.port);
+  return null;
+}
+
+function _tickOscOut() {
+  if (!_oscState.ws || _oscState.ws.readyState !== 1) return;
+  if (typeof state === "undefined" || !state || !Array.isArray(state.nodes)) return;
+  const nodes = state.nodes.filter(n => n && n.type === "OscOut");
+  if (nodes.length === 0) return;
+  for (const node of nodes) {
+    const address = node.params && node.params.address;
+    if (typeof address !== "string" || !address.startsWith("/")) continue;
+    // Read wired v1..v4 values. Drop the message if NONE are wired
+    // (an OscOut sitting in a patch unwired shouldn't generate
+    // network traffic at 60 Hz).
+    const values = [];
+    let anyWired = false;
+    for (let k = 0; k < 4; k++) {
+      const portName = "v" + (k + 1);
+      const wire = state.edges.find(e =>
+        e && e.to && e.to.node === node.id && e.to.port === portName
+      );
+      if (!wire) { values.push(null); continue; }
+      anyWired = true;
+      const v = _readWireJsSideValue(wire);
+      values.push(typeof v === "number" && isFinite(v) ? v : null);
+    }
+    if (!anyWired) continue;
+    // Trim trailing nulls so we send the right arg count. A wired
+    // input with no JS-readable source surfaces as null mid-array; we
+    // substitute 0 in that case so receiver sees a consistent arg
+    // count. (Trimming only happens at the tail.)
+    while (values.length > 0 && values[values.length - 1] === null) values.pop();
+    const cleanArgs = values.map(v => v === null ? 0 : v);
+    // Change-detect: skip the message when ALL args match the last
+    // sent values within float-epsilon. Saves a flood of identical
+    // messages when nothing is actually moving.
+    const last = _oscState.outLast.get(node.id);
+    let changed = !last || last.length !== cleanArgs.length;
+    if (!changed) {
+      for (let i = 0; i < cleanArgs.length; i++) {
+        if (Math.abs(last[i] - cleanArgs[i]) > 1e-6) { changed = true; break; }
+      }
+    }
+    if (!changed) continue;
+    _oscState.outLast.set(node.id, cleanArgs.slice());
+    const payload = { type: "send", address, args: cleanArgs };
+    const host = node.params.host;
+    const port = Number(node.params.port);
+    if (host && typeof host === "string" && host.trim()) payload.host = host.trim();
+    if (port && Number.isFinite(port) && port > 0) payload.port = port;
+    try { _oscState.ws.send(JSON.stringify(payload)); }
+    catch (_) {}
+  }
+}
+
+function _updateOscPill() {
+  const pill = document.getElementById("osc-pill");
+  if (!pill) return;
+  const s = _oscState.status;
+  pill.classList.remove("connected", "connecting", "error", "disabled");
+  if (s === "connected" || s === "connecting" || s === "error" || s === "disabled") {
+    pill.classList.add(s);
+  }
+  if (s === "connected" && _oscState.helloInfo) {
+    const hi = _oscState.helloInfo;
+    pill.title = "OSC bridge connected\n" +
+                 "Inbound:  udp://<server>:" + hi.oscInPort + "\n" +
+                 "Outbound: udp://" + (hi.defaultOut && hi.defaultOut.host) + ":" + (hi.defaultOut && hi.defaultOut.port) + " (default)\n" +
+                 "Bridge version: " + (hi.version || "?") + "\n" +
+                 "Use OscIn / OscOut nodes to route messages.";
+  } else if (s === "connecting") {
+    pill.title = "Connecting to OSC bridge...";
+  } else if (s === "error") {
+    pill.title = "OSC bridge error -- check that gamma-compile-server is running. The bridge attaches to the same daemon as /compile.";
+  } else if (s === "disabled") {
+    pill.title = "OSC bridge is disabled on the running daemon (--noOsc flag). Restart gamma-compile-server without --noOsc to enable.";
+  } else {
+    pill.title = "OSC bridge idle. Start gamma-compile-server (>=0.3.0) and the editor will auto-connect.";
+  }
+}
+
+/* Re-probe on patch changes so adding an OscIn / OscOut node triggers
+ * a connection attempt + re-subscribes. Hook from the editor's
+ * existing patch-change notifier. */
+function _onOscPatchChange() {
+  if (typeof state === "undefined" || !state || !Array.isArray(state.nodes)) return;
+  const hasOscNode = state.nodes.some(n => n && (n.type === "OscIn" || n.type === "OscOut"));
+  if (hasOscNode) {
+    _ensureOscConnection();
+    _rebuildOscSubscriptions();
+  }
+}
+
+// Kick the connection on first load -- harmless if no server is up
+// (probe just times out). Also trigger when probeLocalServer
+// completes for the first time after a Play click.
+if (typeof window !== "undefined") {
+  window.addEventListener("DOMContentLoaded", () => {
+    setTimeout(_ensureOscConnection, 300);
+  });
 }
 
 /* v0.3.16 — VideoFile retrigger from its gate input. Each frame we
