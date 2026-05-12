@@ -14156,6 +14156,126 @@ public:
     description: "MediaPipe hand tracking → musical scale. x-position across the camera selects a step in the chosen scale (major/minor/pentatonic/chromatic) over N octaves; outputs the matching gate + freq + MIDI note. Wire freq → Sine.freq and gate → AD.trig for a mono hand-synth voice. Camera + skeleton + scale-zone guide lines render to `out` so you can SEE where each note lives in the frame."
   },
 
+  /* v0.3.37 -- BlobTracker. Classical-CV blob detection + temporal
+   * tracking. Three detection modes: luma threshold (find bright OR
+   * dark regions), color match (find pixels close to a target RGB),
+   * and motion (frame-differencing to find moving regions). Connected-
+   * components pass on a downsampled 160x90 mask gives stable per-
+   * blob centroid + bounding box + area. Greedy nearest-neighbor
+   * matching across frames assigns stable IDs to up to 4 simultaneous
+   * blobs; exponential smoothing keeps positions stable.
+   *
+   * Same ai-vision-canvas pattern as MediaPipe landmarks but no ML
+   * model -- just clean classical CV. Output ports follow the same
+   * convention so wiring is consistent with HandLandmarker /
+   * PoseLandmarker (present + numBlobs + bN_x / bN_y / bN_size).
+   * Render path mirrors the landmarks too: source video as
+   * background, bounding box + centroid + stable ID labelled on top,
+   * with the standard mirror flag for selfie-cam UX. */
+  BlobTracker: {
+    category: "AI", color: COLOR.ai, header: null,
+    cppType: "GammaBlobTrackerSource",
+    helperClass:
+`class GammaBlobTrackerSource {
+    /* JS-driven value sink. Same shape as the MediaPipe landmark
+     * sources -- each setter parks the latest detection field into
+     * its slot; operator()() returns the whole struct so downstream
+     * nodes read individual blobs via the codegen's outs[].access
+     * pattern. */
+    float v_[14] = {0};
+public:
+    void setPresent(float v)   { v_[0]  = v; }
+    void setNumBlobs(float v)  { v_[1]  = v; }
+    void setB1X(float v)       { v_[2]  = v; }
+    void setB1Y(float v)       { v_[3]  = v; }
+    void setB1Size(float v)    { v_[4]  = v; }
+    void setB2X(float v)       { v_[5]  = v; }
+    void setB2Y(float v)       { v_[6]  = v; }
+    void setB2Size(float v)    { v_[7]  = v; }
+    void setB3X(float v)       { v_[8]  = v; }
+    void setB3Y(float v)       { v_[9]  = v; }
+    void setB3Size(float v)    { v_[10] = v; }
+    void setB4X(float v)       { v_[11] = v; }
+    void setB4Y(float v)       { v_[12] = v; }
+    void setB4Size(float v)    { v_[13] = v; }
+    struct Out {
+        float present, numBlobs,
+              b1_x, b1_y, b1_size,
+              b2_x, b2_y, b2_size,
+              b3_x, b3_y, b3_size,
+              b4_x, b4_y, b4_size;
+    };
+    Out operator()() {
+        return { v_[0],  v_[1],  v_[2],  v_[3],  v_[4],
+                 v_[5],  v_[6],  v_[7],  v_[8],  v_[9],
+                 v_[10], v_[11], v_[12], v_[13] };
+    }
+};`,
+    kind: "ai-vision-canvas",
+    ins: [{ n: "video", t: "texture" }],
+    outs: [
+      { n: "out",       t: "texture" },
+      { n: "present",   t: "param", access: ".present" },
+      { n: "numBlobs",  t: "param", access: ".numBlobs" },
+      { n: "b1_x",      t: "param", access: ".b1_x" },
+      { n: "b1_y",      t: "param", access: ".b1_y" },
+      { n: "b1_size",   t: "param", access: ".b1_size" },
+      { n: "b2_x",      t: "param", access: ".b2_x" },
+      { n: "b2_y",      t: "param", access: ".b2_y" },
+      { n: "b2_size",   t: "param", access: ".b2_size" },
+      { n: "b3_x",      t: "param", access: ".b3_x" },
+      { n: "b3_y",      t: "param", access: ".b3_y" },
+      { n: "b3_size",   t: "param", access: ".b3_size" },
+      { n: "b4_x",      t: "param", access: ".b4_x" },
+      { n: "b4_y",      t: "param", access: ".b4_y" },
+      { n: "b4_size",   t: "param", access: ".b4_size" }
+    ],
+    params: {
+      // UI-only config.
+      mode: 0,                  // 0=luma, 1=color, 2=motion
+      threshold: 0.6,           // luma threshold OR motion threshold (mode-dependent)
+      targetR: 1.0, targetG: 0.2, targetB: 0.2,
+      colorTolerance: 0.25,
+      minBlobSize: 30,          // pixels in the 160x90 sample grid (~2% of frame)
+      maxBlobs: 4,
+      smoothing: 0.6,           // exponential alpha; 0 = no smoothing, 0.9 = heavy
+      mirrored: 1,
+      bgMode: 1,                // 0=clear, 1=video, 2=mask preview
+      lineWidth: 2.5, dotRadius: 5,
+      // Live (auto-exposed).
+      present: 0, numBlobs: 0,
+      b1_x: 0, b1_y: 0, b1_size: 0,
+      b2_x: 0, b2_y: 0, b2_size: 0,
+      b3_x: 0, b3_y: 0, b3_size: 0,
+      b4_x: 0, b4_y: 0, b4_size: 0
+    },
+    methods: {
+      mode: null, threshold: null,
+      targetR: null, targetG: null, targetB: null, colorTolerance: null,
+      minBlobSize: null, maxBlobs: null, smoothing: null,
+      mirrored: null, bgMode: null, lineWidth: null, dotRadius: null,
+      present: "setPresent", numBlobs: "setNumBlobs",
+      b1_x: "setB1X", b1_y: "setB1Y", b1_size: "setB1Size",
+      b2_x: "setB2X", b2_y: "setB2Y", b2_size: "setB2Size",
+      b3_x: "setB3X", b3_y: "setB3Y", b3_size: "setB3Size",
+      b4_x: "setB4X", b4_y: "setB4Y", b4_size: "setB4Size"
+    },
+    paramOptions: { mode: ["luma", "color", "motion"] },
+    uiOnlyParams: [
+      "mode", "threshold", "targetR", "targetG", "targetB", "colorTolerance",
+      "minBlobSize", "maxBlobs", "smoothing",
+      "mirrored", "bgMode", "lineWidth", "dotRadius"
+    ],
+    autoExpose: [
+      "present", "numBlobs",
+      "b1_x", "b1_y", "b1_size",
+      "b2_x", "b2_y", "b2_size",
+      "b3_x", "b3_y", "b3_size",
+      "b4_x", "b4_y", "b4_size"
+    ],
+    description: "Classical-CV blob tracker. Detects up to 4 simultaneous blobs via thresholded connected-components analysis on a downsampled 160×90 mask of the input. Three modes: 'luma' = pixels above the threshold (find bright spots, or invert threshold sign for dark regions); 'color' = pixels within colorTolerance of (targetR, targetG, targetB) in RGB-distance space (find e.g. a red ball); 'motion' = frame-differencing on luma (any moving region above threshold). Per-blob outputs: x/y centroid in [0,1] UV and size as fraction of frame area. Greedy nearest-neighbor matching across frames assigns stable IDs; exponential smoothing on x/y/size keeps positions stable. minBlobSize is in 160×90 grid pixels (~14400 total; 30 = ~0.2% min coverage). Renders to `out` with the source video as background plus per-blob bounding box + centroid + ID label colored by HSL hue cycle. No ML model required -- runs on any browser, no permission prompts beyond getUserMedia."
+  },
+
   /* Gradient — 2-color linear blend along a configurable angle.
    * Eight params: angle (radians), rA/gA/bA (start color), rB/gB/bB
    * (end color). Useful as a backdrop or as a luma source for masks
@@ -38865,6 +38985,428 @@ function _handKeyboardValue(node, portName) {
   return 0;
 }
 
+/* =========================================================================
+ * v0.3.37 -- BlobTracker. Classical-CV blob detection + temporal
+ * tracking with stable IDs and exponential smoothing.
+ *
+ * Pipeline per frame (all CPU-side):
+ *   1. Sample source video onto a 160x90 work canvas (~14k px; fast
+ *      to getImageData + iterate).
+ *   2. Build a 1-bit mask based on the active detection mode:
+ *      - luma: pixel.luma >= threshold
+ *      - color: rgb-distance to (targetR/G/B) <= colorTolerance
+ *      - motion: |pixel.luma - prevFrame.luma| > threshold
+ *   3. Two-pass connected-components via union-find on the mask.
+ *   4. Compute area + centroid + bounding box per component;
+ *      filter by minBlobSize; sort by area descending; keep top N.
+ *   5. Greedy nearest-neighbor match to previous frame's blobs
+ *      (within a max distance) -- carries stable id + age.
+ *   6. Exponential smoothing on x, y, size.
+ *
+ * Performance: ~1-2 ms per frame on a modern machine. Sub-rAF cost
+ * even at 60fps. No model download, no ML, no permission prompts
+ * beyond the regular getUserMedia (only fires when no upstream
+ * video is wired). ======================================================================== */
+
+const _BLOB_GRID_W = 160;
+const _BLOB_GRID_H = 90;
+
+async function _ensureBlobTracker(nodeId, params) {
+  let entry = _mediapipeNodes.get(nodeId);
+  if (entry) return entry;
+  entry = {
+    kind: "blob",
+    videoEl: null, stream: null,
+    latest: null, ready: false, requesting: true, error: null, rafHandle: null,
+    drawCanvas: null, drawCtx: null,
+    smallCanvas: null, smallCtx: null,
+    prevFrameLuma: null,
+    tracked: [],            // [{id, x, y, size, minX, minY, maxX, maxY, age}]
+    nextId: 1,
+    params: params || {}
+  };
+  _mediapipeNodes.set(nodeId, entry);
+  try {
+    // Source resolution: same path MediaPipe uses -- supports
+    // upstream Webcam / VideoFile / ScreenShare wires + falls back
+    // to own getUserMedia camera. Sets entry.videoEl + sharedVideoEl
+    // flag.
+    await _ensureMediapipeSource(nodeId, entry);
+    const w = Visual.fbWidth  || 1920;
+    const h = Visual.fbHeight || 1080;
+    entry.drawCanvas = document.createElement("canvas");
+    entry.drawCanvas.width  = w;
+    entry.drawCanvas.height = h;
+    entry.drawCtx = entry.drawCanvas.getContext("2d", { alpha: true });
+    // Small work canvas for downsampled pixel access. willReadFrequently
+    // is the spec'd hint for getImageData-heavy paths (Chrome 110+).
+    entry.smallCanvas = document.createElement("canvas");
+    entry.smallCanvas.width  = _BLOB_GRID_W;
+    entry.smallCanvas.height = _BLOB_GRID_H;
+    entry.smallCtx = entry.smallCanvas.getContext("2d", {
+      alpha: false, willReadFrequently: true
+    });
+    entry.ready = true;
+    console.log("[blobtracker] node " + nodeId + " ready (grid=" +
+                _BLOB_GRID_W + "x" + _BLOB_GRID_H + ", canvas=" + w + "x" + h + ")");
+    _startBlobTrackerLoop(nodeId);
+  } catch (e) {
+    console.warn("[blobtracker] init failed for node " + nodeId + ":", e);
+    entry.error = e;
+  } finally {
+    entry.requesting = false;
+  }
+  return entry;
+}
+
+/* Per-frame detection rAF. Cancels cleanly via dispose; no work when
+ * the source video isn't decoded yet. */
+function _startBlobTrackerLoop(nodeId) {
+  const entry = _mediapipeNodes.get(nodeId);
+  if (!entry) return;
+  function tick() {
+    if (!_mediapipeNodes.has(nodeId)) return;   // disposed
+    const e = _mediapipeNodes.get(nodeId);
+    if (e !== entry) return;
+    try {
+      if (e.videoEl && e.videoEl.readyState >= 2 && e.videoEl.videoWidth > 0) {
+        _processBlobFrame(e);
+      }
+      _drawBlobOverlay(e, e.params);
+    } catch (err) {
+      // Don't kill the loop on a single bad frame; just log + retry.
+      console.warn("[blobtracker] tick error:", err);
+    }
+    e.rafHandle = requestAnimationFrame(tick);
+  }
+  entry.rafHandle = requestAnimationFrame(tick);
+}
+
+/* Sample the video, threshold, label connected components, match to
+ * previous frame's blobs. Writes entry.latest = { blobs: [...] }. */
+function _processBlobFrame(entry) {
+  const sm = entry.smallCanvas;
+  const ctx = entry.smallCtx;
+  const W = sm.width, H = sm.height;
+  const params = entry.params || {};
+
+  // Mirror flag only applies when source is the OWN getUserMedia
+  // selfie cam -- upstream wires (VideoFile, Webcam shared, texture
+  // sources) are already authored at their intended orientation.
+  const isOwnCamera = !entry.useTextureSource && !entry.sharedVideoEl;
+  const mirrorParam = (typeof params.mirrored === "number") ? params.mirrored : 1;
+  const mirrored = isOwnCamera ? mirrorParam : 0;
+
+  // Sample video onto the small work canvas. The aspect-fit on the
+  // overlay is centered (letterbox style), but for blob detection
+  // we stretch-fit to fill the whole 160x90 grid -- centroid x/y
+  // map straight back to [0, 1] UV on the source's content rect.
+  ctx.save();
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, W, H);
+  if (mirrored > 0.5) { ctx.translate(W, 0); ctx.scale(-1, 1); }
+  // Source can be the videoEl OR the gpuInputCanvas (texture-source path).
+  const src = (entry.useTextureSource && entry.gpuInputCanvas) ? entry.gpuInputCanvas
+                                                                : entry.videoEl;
+  if (src) {
+    try { ctx.drawImage(src, 0, 0, W, H); } catch (_) {}
+  }
+  ctx.restore();
+
+  let imgData;
+  try { imgData = ctx.getImageData(0, 0, W, H); } catch (_) { return; }
+  const px = imgData.data;
+  const total = W * H;
+
+  // Build the mask based on detection mode.
+  const mode      = (typeof params.mode      === "number") ? params.mode      : 0;
+  const threshold = (typeof params.threshold === "number") ? params.threshold : 0.6;
+  const tgtR      = ((typeof params.targetR === "number") ? params.targetR : 1.0) * 255;
+  const tgtG      = ((typeof params.targetG === "number") ? params.targetG : 0.2) * 255;
+  const tgtB      = ((typeof params.targetB === "number") ? params.targetB : 0.2) * 255;
+  const colTol    = ((typeof params.colorTolerance === "number") ? params.colorTolerance : 0.25) * 255;
+
+  const mask = new Uint8Array(total);
+  if (mode === 1) {
+    // Color match.
+    const tolSq = colTol * colTol * 3;
+    for (let i = 0, j = 0; i < px.length; i += 4, j++) {
+      const dr = px[i]     - tgtR;
+      const dg = px[i + 1] - tgtG;
+      const db = px[i + 2] - tgtB;
+      mask[j] = (dr * dr + dg * dg + db * db) <= tolSq ? 1 : 0;
+    }
+  } else if (mode === 2) {
+    // Motion: |this frame luma - last frame luma| > threshold.
+    if (!entry.prevFrameLuma || entry.prevFrameLuma.length !== total) {
+      entry.prevFrameLuma = new Uint8Array(total);
+    }
+    const mt = threshold * 64;   // 0..1 -> 0..64 luma diff (8-bit space)
+    const prev = entry.prevFrameLuma;
+    for (let i = 0, j = 0; i < px.length; i += 4, j++) {
+      const luma = (px[i] * 0.2126 + px[i + 1] * 0.7152 + px[i + 2] * 0.0722) | 0;
+      const diff = luma > prev[j] ? luma - prev[j] : prev[j] - luma;
+      mask[j] = diff > mt ? 1 : 0;
+      prev[j] = luma;
+    }
+  } else {
+    // Luma threshold.
+    const lt = threshold * 255;
+    for (let i = 0, j = 0; i < px.length; i += 4, j++) {
+      const luma = px[i] * 0.2126 + px[i + 1] * 0.7152 + px[i + 2] * 0.0722;
+      mask[j] = luma >= lt ? 1 : 0;
+    }
+  }
+
+  // Connected components via union-find. 4-connectivity (left + up
+  // neighbors during raster scan). labelParent[i] = parent of label i;
+  // findRoot collapses paths.
+  const labels = new Int32Array(total);
+  const parent = [0];
+  function findRoot(l) {
+    let r = l;
+    while (parent[r] !== r) r = parent[r];
+    // Path compression
+    let cur = l;
+    while (parent[cur] !== r) { const next = parent[cur]; parent[cur] = r; cur = next; }
+    return r;
+  }
+  function unite(a, b) {
+    const ra = findRoot(a);
+    const rb = findRoot(b);
+    if (ra === rb) return;
+    if (ra < rb) parent[rb] = ra;
+    else         parent[ra] = rb;
+  }
+  let nextLabel = 1;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const idx = y * W + x;
+      if (!mask[idx]) continue;
+      const left = x > 0 ? labels[idx - 1] : 0;
+      const up   = y > 0 ? labels[idx - W] : 0;
+      if (left && up) {
+        labels[idx] = left < up ? left : up;
+        if (left !== up) unite(left, up);
+      } else if (left) {
+        labels[idx] = left;
+      } else if (up) {
+        labels[idx] = up;
+      } else {
+        labels[idx] = nextLabel;
+        parent[nextLabel] = nextLabel;
+        nextLabel++;
+      }
+    }
+  }
+
+  // Accumulate per-component stats.
+  const stats = new Map();
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const idx = y * W + x;
+      const l = labels[idx];
+      if (!l) continue;
+      const r = findRoot(l);
+      let s = stats.get(r);
+      if (!s) { s = { area: 0, sx: 0, sy: 0, mnX: x, mnY: y, mxX: x, mxY: y }; stats.set(r, s); }
+      s.area++;
+      s.sx += x;
+      s.sy += y;
+      if (x < s.mnX) s.mnX = x;
+      if (x > s.mxX) s.mxX = x;
+      if (y < s.mnY) s.mnY = y;
+      if (y > s.mxY) s.mxY = y;
+    }
+  }
+
+  // Filter + sort + cap.
+  const minSz = Math.max(1, (typeof params.minBlobSize === "number") ? params.minBlobSize : 30);
+  const maxBlobs = Math.max(1, Math.min(4, (typeof params.maxBlobs === "number") ? params.maxBlobs : 4));
+  const found = [];
+  for (const s of stats.values()) {
+    if (s.area < minSz) continue;
+    found.push({
+      x: s.sx / s.area / W,
+      y: s.sy / s.area / H,
+      size: s.area / total,
+      minX: s.mnX / W, minY: s.mnY / H,
+      maxX: (s.mxX + 1) / W, maxY: (s.mxY + 1) / H
+    });
+  }
+  found.sort((a, b) => b.size - a.size);
+  const topN = found.slice(0, maxBlobs);
+
+  // Greedy nearest-neighbor track-association. Each new blob picks
+  // the closest still-unmatched previous blob within MAX_MATCH_DIST.
+  // Un-matched previous blobs decay out; un-matched new blobs get a
+  // fresh ID.
+  const smoothing = Math.max(0, Math.min(0.95,
+    (typeof params.smoothing === "number") ? params.smoothing : 0.6));
+  const MAX_MATCH_DIST_SQ = 0.15 * 0.15;   // 15% of frame width
+  const prev = entry.tracked || [];
+  const used = new Uint8Array(prev.length);
+  const next = [];
+  for (const b of topN) {
+    let bestIdx = -1, bestD = MAX_MATCH_DIST_SQ;
+    for (let i = 0; i < prev.length; i++) {
+      if (used[i]) continue;
+      const dx = prev[i].x - b.x;
+      const dy = prev[i].y - b.y;
+      const d = dx * dx + dy * dy;
+      if (d < bestD) { bestD = d; bestIdx = i; }
+    }
+    if (bestIdx >= 0) {
+      used[bestIdx] = 1;
+      const p = prev[bestIdx];
+      next.push({
+        id:   p.id,
+        x:    p.x    * smoothing + b.x    * (1 - smoothing),
+        y:    p.y    * smoothing + b.y    * (1 - smoothing),
+        size: p.size * smoothing + b.size * (1 - smoothing),
+        minX: b.minX, minY: b.minY, maxX: b.maxX, maxY: b.maxY,
+        age:  p.age + 1
+      });
+    } else {
+      next.push({
+        id:   entry.nextId++,
+        x:    b.x, y: b.y, size: b.size,
+        minX: b.minX, minY: b.minY, maxX: b.maxX, maxY: b.maxY,
+        age:  1
+      });
+    }
+  }
+  // Stable ordering: keep blobs in id order so b1 / b2 / etc don't
+  // flip across frames when sizes shift.
+  next.sort((a, b) => a.id - b.id);
+  entry.tracked = next;
+  entry.latest = { blobs: next };
+}
+
+/* Draw the source video as background + bounding box + centroid +
+ * stable id label per tracked blob. Mirrors the landmark-overlay
+ * pattern: clean letterboxed source + colored overlays per blob. */
+function _drawBlobOverlay(entry, params) {
+  const ctx = entry.drawCtx;
+  const cvs = entry.drawCanvas;
+  if (!ctx || !cvs) return;
+  const w = cvs.width, h = cvs.height;
+  params = params || {};
+  const bgMode = (typeof params.bgMode === "number") ? params.bgMode : 1;
+  const isOwnCamera = !entry.useTextureSource && !entry.sharedVideoEl;
+  const mirrored = isOwnCamera ? ((typeof params.mirrored === "number") ? params.mirrored : 1) : 0;
+  const lineWidth = (typeof params.lineWidth === "number") ? params.lineWidth : 2.5;
+  const dotRadius = (typeof params.dotRadius === "number") ? params.dotRadius : 5;
+
+  let fit;
+  if (bgMode === 0) {
+    ctx.clearRect(0, 0, w, h);
+    fit = { dx: 0, dy: 0, dw: w, dh: h };
+  } else if (bgMode === 2 && entry.smallCanvas) {
+    // Mask preview: upscale the small canvas (last thresholded view)
+    // to drawCanvas. Useful for tuning threshold + targetRGB live.
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, w, h);
+    fit = _videoFitRect(entry.smallCanvas, w, h);
+    ctx.save();
+    if (mirrored > 0.5) { ctx.translate(w, 0); ctx.scale(-1, 1); }
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(entry.smallCanvas, fit.dx, fit.dy, fit.dw, fit.dh);
+    ctx.restore();
+  } else if (entry.useTextureSource && entry.gpuInputCanvas) {
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, w, h);
+    fit = _videoFitRect(entry.gpuInputCanvas, w, h);
+    ctx.save();
+    if (mirrored > 0.5) { ctx.translate(w, 0); ctx.scale(-1, 1); }
+    ctx.drawImage(entry.gpuInputCanvas, fit.dx, fit.dy, fit.dw, fit.dh);
+    ctx.restore();
+  } else if (entry.videoEl && entry.videoEl.readyState >= 2) {
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, w, h);
+    fit = _videoFitRect(entry.videoEl, w, h);
+    ctx.save();
+    if (mirrored > 0.5) { ctx.translate(w, 0); ctx.scale(-1, 1); }
+    ctx.drawImage(entry.videoEl, fit.dx, fit.dy, fit.dw, fit.dh);
+    ctx.restore();
+  } else {
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, w, h);
+    fit = { dx: 0, dy: 0, dw: w, dh: h };
+  }
+  entry._lastFit = fit;
+
+  const result = entry.latest;
+  if (!result || !result.blobs || result.blobs.length === 0) return;
+
+  ctx.lineWidth = lineWidth;
+  ctx.lineCap = "round";
+  ctx.font = "bold 16px monospace";
+  ctx.textBaseline = "top";
+
+  for (let i = 0; i < result.blobs.length; i++) {
+    const b = result.blobs[i];
+    // Color cycle by id; 60-degree HSL hue steps give 6 distinct
+    // colors before repeating (more than the 4-blob cap).
+    const hue = ((b.id - 1) * 67) % 360;
+    const stroke = "hsla(" + hue + ", 90%, 65%, 0.95)";
+    const fill   = "hsla(" + hue + ", 90%, 65%, 0.95)";
+    ctx.strokeStyle = stroke;
+    ctx.fillStyle   = fill;
+
+    // Bounding box. Mirror flips the rect's x positions.
+    let mnX = b.minX, mxX = b.maxX;
+    if (mirrored > 0.5) { mnX = 1.0 - b.maxX; mxX = 1.0 - b.minX; }
+    const bx = fit.dx + mnX * fit.dw;
+    const by = fit.dy + b.minY * fit.dh;
+    const bw = (mxX - mnX) * fit.dw;
+    const bh = (b.maxY - b.minY) * fit.dh;
+    ctx.strokeRect(bx, by, bw, bh);
+
+    // Centroid dot.
+    let cx = b.x;
+    if (mirrored > 0.5) cx = 1.0 - cx;
+    const px = fit.dx + cx * fit.dw;
+    const py = fit.dy + b.y * fit.dh;
+    ctx.beginPath();
+    ctx.arc(px, py, dotRadius, 0, Math.PI * 2);
+    ctx.fill();
+
+    // ID label.
+    ctx.fillStyle = "rgba(0, 0, 0, 0.6)";
+    const label = "#" + b.id + "  " + (b.size * 100).toFixed(1) + "%";
+    const m = ctx.measureText(label);
+    ctx.fillRect(bx + 2, by + 2, m.width + 8, 20);
+    ctx.fillStyle = stroke;
+    ctx.fillText(label, bx + 6, by + 4);
+  }
+}
+
+/* Wire-resolver: read a per-port value off the latest blob detection.
+ * Same convention as _handLandmarkerValue: returns 0 when no detection
+ * is ready yet. */
+function _blobTrackerValue(node, portName) {
+  const entry = _mediapipeNodes.get(node.id);
+  if (!entry) { _ensureBlobTracker(node.id, node.params || {}); return 0; }
+  if (!entry.ready || !entry.latest) return 0;
+  const blobs = entry.latest.blobs || [];
+  if (portName === "present")  return blobs.length > 0 ? 1 : 0;
+  if (portName === "numBlobs") return blobs.length;
+  // bN_x / bN_y / bN_size for N in 1..4.
+  const m = portName.match(/^b([1-4])_(x|y|size)$/);
+  if (m) {
+    const idx = parseInt(m[1], 10) - 1;
+    const field = m[2];
+    if (idx >= 0 && idx < blobs.length) {
+      const b = blobs[idx];
+      if (field === "x")    return b.x;
+      if (field === "y")    return b.y;
+      if (field === "size") return b.size;
+    }
+  }
+  return 0;
+}
+
 /* Standard uniform-buffer preamble. Phase 6.5.7 grew this from 32 to
  * 64 bytes to add per-display awareness (u_view + u_world_uv). The
  * full layout (16 floats = 64 bytes):
@@ -39446,6 +39988,12 @@ function _resolveNodeParams(node) {
     else if (src.type === "HandKeyboard") {
       out[port.n] = _handKeyboardValue(src, wire.from.port);
     }
+    else if (src.type === "BlobTracker") {
+      // v0.3.37 -- classical-CV blob detection. Same JS-driven pattern
+      // as the MediaPipe landmarks; per-frame rAF loop updates
+      // entry.latest, this resolver reads it.
+      out[port.n] = _blobTrackerValue(src, wire.from.port);
+    }
     // Future source types (Knob, audio-rate LFO via SAB, etc.) plug
     // in here.
   }
@@ -39871,10 +40419,11 @@ function _encodeShaderFragPassForPlan(enc, entry, dtSec) {
   if (def.kind === "ai-vision-canvas") {
     const e = _mediapipeNodes.get(node.id);
     if (!e) {
-      // Dispatch by node type to the right MediaPipe init helper.
+      // Dispatch by node type to the right init helper.
       if (node.type === "PoseLandmarker")      _ensurePoseLandmarker(node.id, node.params || {});
       else if (node.type === "FaceLandmarker") _ensureFaceLandmarker(node.id, node.params || {});
       else if (node.type === "HandKeyboard")   _ensureHandKeyboard(node.id, node.params || {});
+      else if (node.type === "BlobTracker")    _ensureBlobTracker(node.id, node.params || {});
       else                                     _ensureHandLandmarker(node.id, node.params || {});
       return false;
     }
@@ -41298,6 +41847,13 @@ const _FACE_LIVE_PORTS = [
 const _HANDKB_LIVE_PORTS = [
   "present", "gate", "freq", "midi", "note_idx"
 ];
+const _BLOB_LIVE_PORTS = [
+  "present", "numBlobs",
+  "b1_x", "b1_y", "b1_size",
+  "b2_x", "b2_y", "b2_size",
+  "b3_x", "b3_y", "b3_size",
+  "b4_x", "b4_y", "b4_size"
+];
 
 function _pushLiveControlsToWorklet() {
   if (!previewState || previewState.state !== "playing" || !previewState.workletNode) return;
@@ -41306,7 +41862,8 @@ function _pushLiveControlsToWorklet() {
   const poses  = state.nodes.filter(n => n && n.type === "PoseLandmarker");
   const faces  = state.nodes.filter(n => n && n.type === "FaceLandmarker");
   const handkb = state.nodes.filter(n => n && n.type === "HandKeyboard");
-  if (hands.length === 0 && poses.length === 0 && faces.length === 0 && handkb.length === 0) return;
+  const blobs  = state.nodes.filter(n => n && n.type === "BlobTracker");
+  if (hands.length === 0 && poses.length === 0 && faces.length === 0 && handkb.length === 0 && blobs.length === 0) return;
   const setterIndex = _refreshLiveControlSetters();
   // v0.3.8 — push EVERY live port that has a setter index in the
   // worklet's dispatch table, regardless of whether the wire goes
@@ -41329,6 +41886,7 @@ function _pushLiveControlsToWorklet() {
   for (const node of poses)  push(node, _POSE_LIVE_PORTS,    _poseLandmarkerValue);
   for (const node of faces)  push(node, _FACE_LIVE_PORTS,    _faceLandmarkerValue);
   for (const node of handkb) push(node, _HANDKB_LIVE_PORTS,  _handKeyboardValue);
+  for (const node of blobs)  push(node, _BLOB_LIVE_PORTS,    _blobTrackerValue);
 }
 
 /* v0.3.16 — VideoFile retrigger from its gate input. Each frame we
