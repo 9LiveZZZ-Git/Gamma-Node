@@ -16061,37 +16061,55 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     description: "NoiseShader — simplex 2D fBm output as grayscale [0, 1]. scale: primary frequency in world-UV units; octaves: roughness layers (1..8, each adds half-amplitude detail at double frequency); seedX/Y: shift the noise field. Useful as a height field, mask, or modulator into other shaders."
   },
 
-  /* v0.3.20 — MatrixRain. Matrix-style digital-rain shader. Vertical
-   * streaks of glyphs fall across the surface; each cell shows a
-   * procedural binary 5x7 bit pattern that swaps every ~0.7s, keyed
-   * by (cell, slow time). Surface-aware via the standard frag_to_global
-   * + surface_uv_norm pair so the rain tiles cleanly across every rig
-   * topology (sphere / cylinder / swept-arc / swept-vertical).
+  /* v0.3.21 — MatrixRain. High-fidelity classic Matrix digital-rain
+   * shader. Reuses the editor's built-in 40-glyph 5x7 ASCII font (the
+   * same one GammaScreensaver uses) so cells show recognizable
+   * letters + digits, not random noise. Three rendering touches make
+   * it read as the *classic* Wachowski-style cascade rather than a
+   * generic stream-of-pixels:
    *
-   * Adapted from the Shadertoy reference (FabriceNeyret2-style Matrix
-   * rain, CELLS = 64x30, FALLERS = 14, FALLERHEIGHT = 12). The original
-   * sampled an iChannel0 font atlas for glyphs; we substitute a hash-
-   * driven 5x7 binary grid that reads visually identical at typical
-   * cell sizes. */
+   *   1. Bright leading head. Each falling streak's head cell renders
+   *      in near-white (pale green); the rest of the trail fades from
+   *      that into the streak color (default green) over `trailLen`
+   *      cells. The head also gets a brightness boost (headBoost
+   *      param) so it pops on dark backgrounds.
+   *
+   *   2. Smooth quadratic trail fade. Distance from head -> intensity
+   *      uses fade^2 instead of linear, matching the Matrix film's
+   *      perceptual roll-off (each character in the trail dims fast
+   *      then settles).
+   *
+   *   3. Per-cell glyph swap. Characters within a single trail
+   *      shuffle on their own staggered timeline (per-cell hash adds
+   *      a phase offset) so the streak doesn't look like one frozen
+   *      column of letters scrolling -- the *character* at each row
+   *      also flickers, just like the film.
+   *
+   * Surface-aware via the standard frag_to_global + surface_uv_norm
+   * pair so the rain tiles cleanly across every rig topology
+   * (sphere / cylinder / swept-arc / swept-vertical) without polar
+   * bunching or projector-seam splits. */
   MatrixRain: {
     category: "Visual", color: COLOR.visual, header: null,
     cppType: "",
     kind: "shader-frag",
     ins: [
-      { n: "cellsX",       t: "param" },
-      { n: "cellsY",       t: "param" },
-      { n: "fallers",      t: "param" },
-      { n: "fallerHeight", t: "param" },
-      { n: "speed",        t: "param" },
-      { n: "brightness",   t: "param" },
-      { n: "colorR",       t: "param" },
-      { n: "colorG",       t: "param" },
-      { n: "colorB",       t: "param" }
+      { n: "cellsX",        t: "param" },
+      { n: "cellsY",        t: "param" },
+      { n: "streamsPerCol", t: "param" },
+      { n: "trailLen",      t: "param" },
+      { n: "speed",         t: "param" },
+      { n: "brightness",    t: "param" },
+      { n: "headBoost",     t: "param" },
+      { n: "colorR",        t: "param" },
+      { n: "colorG",        t: "param" },
+      { n: "colorB",        t: "param" }
     ],
     outs: [{ n: "out", t: "texture" }],
     params: {
-      cellsX: 64, cellsY: 30, fallers: 14, fallerHeight: 12,
-      speed: 1.0, brightness: 1.0,
+      cellsX: 64, cellsY: 40,
+      streamsPerCol: 2, trailLen: 14,
+      speed: 1.0, brightness: 1.0, headBoost: 2.0,
       colorR: 0.0, colorG: 1.0, colorB: 0.0
     },
     methods: {},
@@ -16105,8 +16123,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   u_fov_v_deg:    f32,
   u_view:         vec4f,
   u_world_uv:     vec4f,
-  params:         vec4f,   // x=cellsX, y=cellsY, z=fallers, w=fallerHeight
-  params2:        vec4f,   // x=speed, y=brightness, zw=_
+  params:         vec4f,   // x=cellsX, y=cellsY, z=streamsPerCol, w=trailLen
+  params2:        vec4f,   // x=speed, y=brightness, z=headBoost, w=_
   color:          vec4f,   // x=R, y=G, z=B, w=_
   u_surface:      vec4f,
   u_surface_path: vec4f,
@@ -16185,36 +16203,67 @@ fn surface_uv_norm(yaw_deg: f32, pitch_deg: f32) -> vec2f {
   return vec2f(u_norm, v_norm);
 }
 
-// Floor-mod (GLSL semantics). WGSL's % is truncated; for the per-cell
-// hash where the input can be negative (cos returns [-1, 1]) we need
-// the proper floor-mod to keep results non-negative.
-fn mod_f(a: f32, b: f32) -> f32 {
-  return a - b * floor(a / b);
-}
-
+fn mod_f(a: f32, b: f32) -> f32 { return a - b * floor(a / b); }
 fn hash21(p: vec2f) -> f32 {
   return fract(sin(dot(p, vec2f(127.1, 311.7))) * 43758.5453);
 }
 
-// Per-faller speed (matches the original Shadertoy constants so visual
-// cadence is preserved). Output range ~[0.30, 0.40].
-fn faller_speed(col: f32, faller: f32) -> f32 {
-  return mod_f(cos(col * 363.435 + faller * 234.323), 0.1) + 0.3;
-}
+// 5x7 ASCII font -- A-Z (0-25), 0-9 (26-35), space/dash/period/!
+// (36-39). Same bitmap data the GammaScreensaver shader uses; each
+// u32 row encodes 5 column bits with MSB = col 0 (so col x is bit
+// 4-x). 40 glyphs * 7 rows = 280 entries.
+const FONT: array<u32, 280> = array<u32, 280>(
+  14u, 17u, 17u, 31u, 17u, 17u, 17u,   // A
+  30u, 17u, 17u, 30u, 17u, 17u, 30u,   // B
+  14u, 17u, 16u, 16u, 16u, 17u, 14u,   // C
+  30u, 17u, 17u, 17u, 17u, 17u, 30u,   // D
+  31u, 16u, 16u, 30u, 16u, 16u, 31u,   // E
+  31u, 16u, 16u, 30u, 16u, 16u, 16u,   // F
+  14u, 17u, 16u, 23u, 17u, 17u, 14u,   // G
+  17u, 17u, 17u, 31u, 17u, 17u, 17u,   // H
+  31u,  4u,  4u,  4u,  4u,  4u, 31u,   // I
+   7u,  2u,  2u,  2u,  2u, 18u, 12u,   // J
+  17u, 18u, 20u, 24u, 20u, 18u, 17u,   // K
+  16u, 16u, 16u, 16u, 16u, 16u, 31u,   // L
+  17u, 27u, 21u, 17u, 17u, 17u, 17u,   // M
+  17u, 25u, 21u, 19u, 17u, 17u, 17u,   // N
+  14u, 17u, 17u, 17u, 17u, 17u, 14u,   // O
+  30u, 17u, 17u, 30u, 16u, 16u, 16u,   // P
+  14u, 17u, 17u, 17u, 21u, 18u, 13u,   // Q
+  30u, 17u, 17u, 30u, 20u, 18u, 17u,   // R
+  15u, 16u, 16u, 14u,  1u,  1u, 30u,   // S
+  31u,  4u,  4u,  4u,  4u,  4u,  4u,   // T
+  17u, 17u, 17u, 17u, 17u, 17u, 14u,   // U
+  17u, 17u, 17u, 17u, 17u, 10u,  4u,   // V
+  17u, 17u, 17u, 17u, 21u, 21u, 10u,   // W
+  17u, 17u, 10u,  4u, 10u, 17u, 17u,   // X
+  17u, 17u, 10u,  4u,  4u,  4u,  4u,   // Y
+  31u,  2u,  4u,  8u, 16u, 16u, 31u,   // Z
+  14u, 17u, 19u, 21u, 25u, 17u, 14u,   // 0
+   4u, 12u,  4u,  4u,  4u,  4u, 14u,   // 1
+  14u, 17u,  1u,  2u,  4u,  8u, 31u,   // 2
+  30u,  1u,  1u, 14u,  1u,  1u, 30u,   // 3
+   2u,  6u, 10u, 18u, 31u,  2u,  2u,   // 4
+  31u, 16u, 16u, 30u,  1u,  1u, 30u,   // 5
+  14u, 17u, 16u, 30u, 17u, 17u, 14u,   // 6
+  31u,  1u,  2u,  4u,  8u,  8u,  8u,   // 7
+  14u, 17u, 17u, 14u, 17u, 17u, 14u,   // 8
+  14u, 17u, 17u, 15u,  1u, 17u, 14u,   // 9
+   0u,  0u,  0u,  0u,  0u,  0u,  0u,   // (space, glyph 36 -- skipped at sample time)
+   0u,  0u,  0u, 14u,  0u,  0u,  0u,   // dash
+   0u,  0u,  0u,  0u,  0u, 12u, 12u,   // period
+   4u,  4u,  4u,  4u,  4u,  0u,  4u    // !
+);
 
-// Procedural glyph -- stand-in for the original iChannel0 font atlas.
-// Each cell shows a 5x7 binary bit grid keyed by (cell, slow time);
-// glyphs re-shuffle every ~0.7s like the original. step(0.45) tunes
-// the on-pixel ratio so glyphs read as dense characters, not stipple.
-fn glyph(cell: vec2f, sub_pix: vec2f, t_slow: f32) -> f32 {
-  let grid = floor(sub_pix * vec2f(5.0, 7.0));
-  if (grid.x < 0.0 || grid.x >= 5.0 || grid.y < 0.0 || grid.y >= 7.0) {
-    return 0.0;
-  }
-  let cellSeed = hash21(cell);
-  let glyphId  = floor(cellSeed * 256.0 + t_slow + hash21(cell.yx) * 5.0);
-  let bit      = hash21(grid + vec2f(glyphId * 0.371, glyphId * 0.179));
-  return step(0.45, bit);
+// Sample the glyph at integer grid (x in [0,5), y in [0,7)) for the
+// given glyph id (mod 36 keeps it in A-Z / 0-9; space and punctuation
+// would leave large dark gaps in trails, breaking the cascade look).
+fn glyph_bit(gx: i32, gy: i32, id: u32) -> f32 {
+  if (gx < 0 || gx > 4 || gy < 0 || gy > 6) { return 0.0; }
+  let g = id % 36u;
+  let row = FONT[g * 7u + u32(gy)];
+  let bit = (row >> u32(4 - gx)) & 1u;
+  return f32(bit);
 }
 
 @fragment
@@ -16226,63 +16275,106 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   let ang = frag_to_global_angles(in.uv);
   let suv = surface_uv_norm(ang.x, ang.y);
 
-  let cellsX       = max(2.0, floor(u.params.x));
-  let cellsY       = max(2.0, floor(u.params.y));
-  let fallersN     = max(1.0, floor(u.params.z));
-  let fallerHeight = max(2.0, u.params.w);
-  let speed        = max(u.params2.x, 0.0);
-  let brightness   = max(u.params2.y, 0.0);
+  let cellsX        = max(2.0, floor(u.params.x));
+  let cellsY        = max(2.0, floor(u.params.y));
+  let streamsPerCol = clamp(floor(u.params.z), 1.0, 8.0);
+  let trailLen      = max(2.0, u.params.w);
+  let speed         = max(u.params2.x, 0.0);
+  let brightness    = max(u.params2.y, 0.0);
+  let headBoost     = max(u.params2.z, 1.0);
 
   let cells     = vec2f(cellsX, cellsY);
   let inv_cells = 1.0 / cells;
   let pix_raw   = vec2f(mod_f(suv.x, inv_cells.x), mod_f(suv.y, inv_cells.y));
   let cell      = floor(suv * cells);
-  // Match original: pix scaled to [0.1, 0.9] horizontally with 10%
-  // gutter, [0, 1] vertically. Gutter fakes inter-glyph gaps so the
-  // rain doesn't read as a continuous wall of pixels.
-  let sub_pix = pix_raw * cells * vec2f(0.8, 1.0) + vec2f(0.1, 0.0);
+  // Sub-pixel within the cell, scaled with a small horizontal gutter
+  // (5% each side) so adjacent glyphs don't kiss + a 15% top/bottom
+  // gutter so the cascade reads as a stack of discrete characters.
+  let cell_uv   = pix_raw * cells;
+  let sub_pix   = vec2f(cell_uv.x * 0.9 + 0.05,
+                        cell_uv.y * 0.85 + 0.075);
+  // Integer grid coords inside the 5x7 glyph cell.
+  let gx        = i32(floor(sub_pix.x * 5.0));
+  let gy        = i32(floor(sub_pix.y * 7.0));
 
-  let t      = u.u_time * speed;
-  let t_slow = floor(t * 1.5);                  // ~0.7s glyph swap
-  let c      = glyph(cell, sub_pix, t_slow);
+  let t = u.u_time * speed;
 
-  // Falling-streak intensity. Each faller is a sliver 1 cell tall
-  // moving through fallerHeight rows over time. Hard upper bound of
-  // 32 on the loop is well above any reasonable params.fallers value
-  // and lets WGSL constant-fold the iteration count.
-  var b_val: f32 = 0.0;
-  let max_fallers = i32(fallersN);
-  for (var i: i32 = 0; i < 32; i = i + 1) {
-    if (i >= max_fallers) { break; }
-    let i_f = f32(i);
-    let f   = 3.0 - cell.y * 0.05 -
-              mod_f((t + i_f * 3534.34) * faller_speed(cell.x, i_f), fallerHeight);
-    if (f > 0.0 && f < 1.0) {
-      b_val = b_val + f;
+  // Streak head + intensity. For each (column, stream) pair we compute
+  // the head's current y position from a per-stream phase + speed,
+  // then derive distance-from-head at this cell. Multiple streams per
+  // column give Matrix-density without tiling.
+  //
+  // Cycle is trailLen + cellsY + buffer so a stream's head fully
+  // crosses + exits before re-spawning at the top; otherwise back-to-
+  // back streams would merge into one continuous bar.
+  let cycle      = cellsY + trailLen + 6.0;
+  var intensity: f32 = 0.0;
+  var head_mix:  f32 = 0.0;
+  let max_streams = i32(streamsPerCol);
+  for (var k: i32 = 0; k < 8; k = k + 1) {
+    if (k >= max_streams) { break; }
+    let k_f       = f32(k);
+    // Per-(col, stream) speed in [0.25, 0.65] cells/sec.
+    let seed      = vec2f(cell.x, k_f);
+    let col_speed = 0.25 + abs(mod_f(cos(seed.x * 363.435 + seed.y * 234.323), 0.4));
+    // Phase: uniform random offset within the cycle so streams don't
+    // sync across columns.
+    let phase     = hash21(seed) * cycle;
+    let head_y    = mod_f(t * col_speed + phase, cycle);
+    let dist      = head_y - cell.y;
+    if (dist >= 0.0 && dist <= trailLen) {
+      // Quadratic fade -- more aggressive than linear so cells close
+      // to the head dominate visually. Matches the film's roll-off.
+      let fade   = 1.0 - dist / trailLen;
+      let smooth = fade * fade;
+      intensity  = max(intensity, smooth);
+      // Head mask: distance to head, linearly fading over the first
+      // ~1 cell. step(dist, 1.0) would be hard-binary; the gradient
+      // softens the head highlight.
+      let head_w = clamp(1.0 - dist, 0.0, 1.0);
+      head_mix   = max(head_mix, head_w);
     }
   }
 
-  let intensity = c * b_val * brightness;
-  let col       = u.color.rgb * intensity;
-  return vec4f(col, 1.0);
+  // Per-cell glyph id with staggered timing so trail characters
+  // shuffle on their own clocks. Cells with a faster glyph-swap rate
+  // look "alive" -- the iconic Matrix character flicker.
+  let cell_seed   = hash21(cell);
+  let swap_rate   = 1.0 + cell_seed * 3.5;       // 1.0..4.5 Hz per cell
+  let glyph_time  = floor(t * swap_rate + cell_seed * 17.0);
+  let glyph_id    = u32(hash21(vec2f(cell.x, cell.y + glyph_time)) * 100.0);
+
+  let g = glyph_bit(gx, gy, glyph_id);
+
+  // Color: trail color (default green) lerped toward near-white at
+  // the head. headBoost scales the head's overall intensity so it
+  // pops + reads as the "leading character."
+  let trail_color = u.color.rgb;
+  let head_color  = vec3f(0.85, 1.0, 0.9);
+  let pixel_color = mix(trail_color, head_color, head_mix);
+  let head_amp    = 1.0 + head_mix * (headBoost - 1.0);
+
+  let out_intensity = g * intensity * head_amp * brightness;
+  let result        = pixel_color * out_intensity;
+  return vec4f(result, 1.0);
 }`,
     writeUniforms(node, scratch) {
       const p = node.params || {};
-      scratch[16] = (typeof p.cellsX       === "number") ? p.cellsX       : 64;
-      scratch[17] = (typeof p.cellsY       === "number") ? p.cellsY       : 30;
-      scratch[18] = (typeof p.fallers      === "number") ? p.fallers      : 14;
-      scratch[19] = (typeof p.fallerHeight === "number") ? p.fallerHeight : 12;
-      scratch[20] = (typeof p.speed        === "number") ? p.speed        : 1.0;
-      scratch[21] = (typeof p.brightness   === "number") ? p.brightness   : 1.0;
-      scratch[22] = 0;
+      scratch[16] = (typeof p.cellsX        === "number") ? p.cellsX        : 64;
+      scratch[17] = (typeof p.cellsY        === "number") ? p.cellsY        : 40;
+      scratch[18] = (typeof p.streamsPerCol === "number") ? p.streamsPerCol : 2;
+      scratch[19] = (typeof p.trailLen      === "number") ? p.trailLen      : 14;
+      scratch[20] = (typeof p.speed         === "number") ? p.speed         : 1.0;
+      scratch[21] = (typeof p.brightness    === "number") ? p.brightness    : 1.0;
+      scratch[22] = (typeof p.headBoost     === "number") ? p.headBoost     : 2.0;
       scratch[23] = 0;
-      scratch[24] = (typeof p.colorR       === "number") ? p.colorR       : 0.0;
-      scratch[25] = (typeof p.colorG       === "number") ? p.colorG       : 1.0;
-      scratch[26] = (typeof p.colorB       === "number") ? p.colorB       : 0.0;
+      scratch[24] = (typeof p.colorR        === "number") ? p.colorR        : 0.0;
+      scratch[25] = (typeof p.colorG        === "number") ? p.colorG        : 1.0;
+      scratch[26] = (typeof p.colorB        === "number") ? p.colorB        : 0.0;
       scratch[27] = 0;
       _packSurfaceUniforms(scratch, 28);
     },
-    description: "Matrix-style digital rain: vertical streaks of procedural glyphs fall across the rig surface, classic Shadertoy aesthetic. cellsX/Y set the character grid density (default 64×30); fallers is the number of simultaneous falling streaks; fallerHeight scales each streak's vertical extent; speed multiplies time; brightness scales overall intensity; colorR/G/B set the streak color (default green). Surface-aware via the standard gnomonic + Lambert mapping so it projects correctly on sphere / cylinder / swept-arc / swept-vertical rigs without polar bunching or seam splits. Glyphs are hash-generated 5×7 bit patterns that swap every ~0.7s — no external font texture needed."
+    description: "Classic Matrix digital rain. Vertical cascades of A-Z / 0-9 glyphs fall across the rig surface; each streak has a bright near-white leading character that fades into the streak color (default green) over `trailLen` cells. cellsX/Y set the character grid density (default 64×40); streamsPerCol controls density (1-4 simultaneous streams per column, default 2); trailLen is the trail length in cells; speed multiplies time; brightness scales overall intensity; headBoost is how much brighter the head reads vs the trail (default 2×); colorR/G/B is the streak color. Glyphs swap per-cell on staggered timelines so trails flicker with character-level life. Surface-aware via the standard gnomonic + Lambert mapping — no polar bunching or seam splits on sphere / cylinder / swept-arc / swept-vertical rigs."
   },
 
   /* Phase 6.3.2 — FeedbackShader (visual Delay1). The "ping-pong"
