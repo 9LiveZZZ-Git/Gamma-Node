@@ -13327,7 +13327,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       { n: "exposure", t: "param" },
       { n: "tint_r",   t: "param" },
       { n: "tint_g",   t: "param" },
-      { n: "tint_b",   t: "param" }
+      { n: "tint_b",   t: "param" },
+      // v0.3.16 — gate input. On rising edge (e.g. from MasterClock.bar
+      // / .beat / .sixteenth / .phase or a Button.trig) the video seeks
+      // back to currentTime = 0. Wire MasterClock.bar → trig for a clip
+      // that re-syncs on every bar.
+      { n: "trig",     t: "gate" }
     ],
     outs: [{ n: "out", t: "texture" }],
     params: {
@@ -13335,11 +13340,18 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       // v0.3.15 — transport state, persisted with the patch.
       paused: 0,
       playbackRate: 1.0,
+      // v0.3.16 — audio playback of the file's audio track. Plays
+      // through the browser's default audio device (NOT through the
+      // patch's audio worklet yet -- a wire-routable audio outlet
+      // that integrates with codegen is the next ticket). audioEnabled
+      // mutes the track when 0; volume scales when enabled.
+      audioEnabled: 1,
+      volume: 1.0,
       mirrored: 0, exposure: 1.0,
       tint_r: 1.0, tint_g: 1.0, tint_b: 1.0
     },
-    methods: { fileUrl: null, paused: null, playbackRate: null, mirrored: null, exposure: null, tint_r: null, tint_g: null, tint_b: null },
-    uiOnlyParams: ["fileUrl", "paused", "playbackRate"],
+    methods: { fileUrl: null, paused: null, playbackRate: null, audioEnabled: null, volume: null, mirrored: null, exposure: null, tint_r: null, tint_g: null, tint_b: null },
+    uiOnlyParams: ["fileUrl", "paused", "playbackRate", "audioEnabled", "volume"],
     uniformBytes: 96,
     // Same WGSL as Webcam -- pipeline cache hashes the source so
     // both nodes share the compiled pipeline.
@@ -26274,6 +26286,27 @@ function renderProps() {
                <button class="btn" data-vf-rate="2.0"  title="2×"    style="flex:1;font-size:10px;">2×</button>
                <button class="btn" data-vf-rate="4.0"  title="4×"    style="flex:1;font-size:10px;">4×</button>
              </div>`;
+    // v0.3.16 — audio section. Plays the file's audio track through
+    // the browser's default audio device. NOT routed through the
+    // patch's audio worklet yet -- that's the v0.3.17 ticket; the
+    // wire-routable `audio` outlet will need worklet input-count
+    // changes + per-VideoFile codegen channel allocation.
+    const audioOn = !node.params || node.params.audioEnabled !== 0;
+    const vol = (node.params && typeof node.params.volume === "number")
+      ? node.params.volume : 1.0;
+    html += `<div class="prop-section" style="margin-top:14px;">Audio
+               <span style="font-weight:normal;font-size:10px;color:var(--text-2);opacity:0.7;">(direct to speakers — wire-routable outlet WIP)</span>
+             </div>
+             <div style="display:flex;align-items:center;gap:8px;">
+               <button class="btn ${audioOn ? "primary" : ""}" id="btn-videofile-mute"
+                       title="Toggle audio playback" style="min-width:48px;">${audioOn ? "🔊 on" : "🔇 off"}</button>
+               <input id="videofile-volume" type="range" min="0" max="1" step="0.01" value="${vol}"
+                      style="flex:1;" ${audioOn ? "" : "disabled"} />
+               <span style="font-family:var(--font-mono);font-size:11px;color:var(--text-2);min-width:32px;text-align:right;">${Math.round(vol * 100)}%</span>
+             </div>
+             <div style="margin-top:6px;font-size:10px;color:var(--text-2);opacity:0.6;line-height:1.4;">
+               Wire MasterClock.bar/.beat → <code>trig</code> input on this node to retrigger the clip from currentTime=0 on every pulse.
+             </div>`;
   }
   propsEl.innerHTML = html;
 
@@ -26342,6 +26375,37 @@ function renderProps() {
         applyRate(b.getAttribute('data-vf-rate'));
       });
     });
+    // v0.3.16 — audio toggle + volume slider wiring. The mute toggle
+    // flips params.audioEnabled (persists), then live-applies
+    // videoEl.muted. The volume slider is param-rate (not per-sample);
+    // dragging it pushes immediately to videoEl.volume.
+    const applyMute = (audioOn) => {
+      if (!node.params) node.params = {};
+      node.params.audioEnabled = audioOn ? 1 : 0;
+      const v = getVideoEl();
+      if (v) { try { v.muted = !audioOn; } catch (_) {} }
+      renderProps();
+    };
+    const applyVolume = (vol) => {
+      vol = Math.max(0, Math.min(1, Number(vol) || 0));
+      if (!node.params) node.params = {};
+      node.params.volume = vol;
+      const v = getVideoEl();
+      if (v) { try { v.volume = vol; } catch (_) {} }
+      // No renderProps() here -- the slider drag would lose focus on
+      // every input event. The displayed % only refreshes when the
+      // user releases the slider (via 'change' event below).
+    };
+    const muteBtn = propsEl.querySelector('#btn-videofile-mute');
+    const volSlider = propsEl.querySelector('#videofile-volume');
+    if (muteBtn) muteBtn.addEventListener('click', () => {
+      const audioOn = !(node.params && node.params.audioEnabled !== 0);
+      applyMute(audioOn);
+    });
+    if (volSlider) {
+      volSlider.addEventListener('input', () => applyVolume(volSlider.value));
+      volSlider.addEventListener('change', () => renderProps());
+    }
   }
 
   // VideoFile pick-button wiring.
@@ -33681,7 +33745,15 @@ async function _ensureVideoFile(nodeId, params) {
     const videoEl = document.createElement("video");
     videoEl.src         = fileUrl;
     videoEl.playsInline = true;
-    videoEl.muted       = true;
+    // v0.3.16 — audio playback. The default browser policy requires a
+    // user gesture before audio plays; the user picking the file (or
+    // hitting any transport button) qualifies, so unmuted autoplay
+    // usually succeeds. If the policy blocks playback, the video
+    // continues silent + frames keep decoding, which is fine.
+    const audioOn = !params || params.audioEnabled !== 0;
+    const vol     = (params && typeof params.volume === "number") ? params.volume : 1.0;
+    videoEl.muted       = !audioOn;
+    videoEl.volume      = Math.max(0, Math.min(1, vol));
     videoEl.loop        = true;
     videoEl.autoplay    = true;
     // Important: importExternalTexture requires the video to have
@@ -37110,6 +37182,9 @@ function _visualRenderTick(t) {
   // via setter postMessages. No-op when audio preview isn't playing
   // OR when no live-control nodes have wires to audio-rate consumers.
   _pushLiveControlsToWorklet();
+  // v0.3.16 — VideoFile retrigger from gate input. Cheap (one wire
+  // lookup per VideoFile node, typically zero); runs every frame.
+  _tickVideoFileTrigs();
   _visualRafHandle = requestAnimationFrame(_visualRenderTick);
 }
 
@@ -37216,6 +37291,64 @@ function _pushLiveControlsToWorklet() {
   for (const node of poses)  push(node, _POSE_LIVE_PORTS,    _poseLandmarkerValue);
   for (const node of faces)  push(node, _FACE_LIVE_PORTS,    _faceLandmarkerValue);
   for (const node of handkb) push(node, _HANDKB_LIVE_PORTS,  _handKeyboardValue);
+}
+
+/* v0.3.16 — VideoFile retrigger from its gate input. Each frame we
+ * look for a wire feeding the VideoFile's `trig` input, sample the
+ * upstream value, + detect a rising edge across frames. On rising
+ * edge we seek the video element back to currentTime = 0.
+ *
+ * Note: `_resolveNodeParams` deliberately skips gate-typed ports
+ * (they have different semantics from param/audio/clock), so this
+ * function reads the trig wire directly. Source kinds handled:
+ *
+ *   MasterClock.{bar,beat,quarter,eighth,sixteenth,phase}
+ *     Cubic-decay envelope; peaks at 1.0 on rising edge + decays
+ *     toward 0. We detect the > 0.5 threshold crossing.
+ *
+ *   Button.trig / generic param sources
+ *     Same threshold semantics.
+ *
+ * Any other source type falls through to no-op. */
+const _videoFileTrigState = new Map();   // nodeId -> last sampled trig value
+function _tickVideoFileTrigs() {
+  if (typeof state === "undefined" || !state || !Array.isArray(state.nodes)) return;
+  for (const node of state.nodes) {
+    if (!node || node.type !== "VideoFile") continue;
+    const src = _videoSources.get(node.id);
+    if (!src || !src.videoEl) continue;
+    // Find the wire feeding `trig`.
+    const wire = state.edges && state.edges.find(e =>
+      e && e.to && e.to.node === node.id && e.to.port === "trig");
+    if (!wire || !wire.from) {
+      // No wire -- clear any retained state so a future wire-add doesn't
+      // see a stale "lastValue" that suppresses the first edge.
+      _videoFileTrigState.delete(node.id);
+      continue;
+    }
+    const srcNode = state.nodes.find(n => n && n.id === wire.from.node);
+    if (!srcNode) continue;
+    let v = 0;
+    if (srcNode.type === "MasterClock") {
+      v = _masterClockOutputValue(srcNode, wire.from.port);
+    } else if (srcNode.type === "Slider") {
+      v = (srcNode.params && typeof srcNode.params.value === "number")
+        ? srcNode.params.value : 0;
+    } else if (srcNode.type === "HandLandmarker") {
+      v = _handLandmarkerValue(srcNode, wire.from.port);
+    } else if (srcNode.type === "PoseLandmarker") {
+      v = _poseLandmarkerValue(srcNode, wire.from.port);
+    } else if (srcNode.type === "FaceLandmarker") {
+      v = _faceLandmarkerValue(srcNode, wire.from.port);
+    } else if (srcNode.type === "HandKeyboard") {
+      v = _handKeyboardValue(srcNode, wire.from.port);
+    }
+    const last = _videoFileTrigState.get(node.id) || 0;
+    _videoFileTrigState.set(node.id, v);
+    if (last <= 0.5 && v > 0.5) {
+      try { src.videoEl.currentTime = 0; } catch (_) {}
+    }
+  }
 }
 
 function startVisualRenderLoop() {
