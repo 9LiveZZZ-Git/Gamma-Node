@@ -14260,7 +14260,7 @@ public:
       b3_x: "setB3X", b3_y: "setB3Y", b3_size: "setB3Size",
       b4_x: "setB4X", b4_y: "setB4Y", b4_size: "setB4Size"
     },
-    paramOptions: { mode: ["luma", "color", "motion"] },
+    paramOptions: { mode: ["luma", "color", "motion", "value"] },
     uiOnlyParams: [
       "mode", "threshold", "targetR", "targetG", "targetB", "colorTolerance",
       "minBlobSize", "maxBlobs", "smoothing",
@@ -14273,7 +14273,7 @@ public:
       "b3_x", "b3_y", "b3_size",
       "b4_x", "b4_y", "b4_size"
     ],
-    description: "Classical-CV blob tracker. Detects up to 4 simultaneous blobs via thresholded connected-components analysis on a downsampled 160×90 mask of the input. Three modes: 'luma' = pixels above the threshold (find bright spots, or invert threshold sign for dark regions); 'color' = pixels within colorTolerance of (targetR, targetG, targetB) in RGB-distance space (find e.g. a red ball); 'motion' = frame-differencing on luma (any moving region above threshold). Per-blob outputs: x/y centroid in [0,1] UV and size as fraction of frame area. Greedy nearest-neighbor matching across frames assigns stable IDs; exponential smoothing on x/y/size keeps positions stable. minBlobSize is in 160×90 grid pixels (~14400 total; 30 = ~0.2% min coverage). Renders to `out` with the source video as background plus per-blob bounding box + centroid + ID label colored by HSL hue cycle. No ML model required -- runs on any browser, no permission prompts beyond getUserMedia."
+    description: "Classical-CV blob tracker. Detects up to 4 simultaneous blobs via thresholded connected-components analysis on a downsampled 160×90 mask of the input. Four modes: 'luma' = Rec.709-weighted luminance (find bright spots in real-world video); 'color' = pixels within colorTolerance of (targetR, targetG, targetB) in RGB-distance space (find e.g. a red ball); 'motion' = frame-differencing on luma (any moving region above threshold); 'value' = max(R, G, B) per pixel — picks up SATURATED COLORS regardless of hue, where luma underweights red (0.21) and blue (0.07) into invisibility. Use 'value' for synthetic content like ShapeTunnel / Plasma / Butterflies where shapes are vivid colors. Per-blob outputs: x/y centroid in [0,1] UV and size as fraction of frame area. Greedy nearest-neighbor matching across frames assigns stable IDs; exponential smoothing on x/y/size keeps positions stable. minBlobSize is in 160×90 grid pixels (~14400 total; 30 = ~0.2% min coverage). Renders to `out` with the source video as background plus per-blob bounding box + centroid + ID label colored by HSL hue cycle. No ML model required -- runs on any browser, no permission prompts beyond getUserMedia."
   },
 
   /* Gradient — 2-color linear blend along a configurable angle.
@@ -27475,10 +27475,18 @@ const _demos = [
       // upstream wire means it falls into the texture-source path
       // (same convention as HandLandmarker etc) -- the own-camera
       // path is bypassed, no webcam permission prompt for this demo.
+      //
+      // mode=3 ('value' / max-channel) is the right choice for
+      // ShapeTunnel's saturated colored shapes. Rec.709 luma
+      // (mode=0) would weight red and blue too low (0.21 and 0.07
+      // respectively) -- a fully-bright red shape would peak at
+      // luma=0.21, below threshold 0.35, and miss detection
+      // entirely. Max-channel treats all hues equally so every
+      // bright shape gets caught.
       const bt  = makeNode("BlobTracker",  340,  80, {
-        mode: 0, threshold: 0.35,
-        minBlobSize: 80, maxBlobs: 4,
-        smoothing: 0.7,
+        mode: 3, threshold: 0.45,
+        minBlobSize: 40, maxBlobs: 4,
+        smoothing: 0.55,
         mirrored: 0,
         bgMode: 1,
         lineWidth: 3.0, dotRadius: 6
@@ -39549,8 +39557,25 @@ function _processBlobFrame(entry) {
       mask[j] = diff > mt ? 1 : 0;
       prev[j] = luma;
     }
+  } else if (mode === 3) {
+    // v0.3.41 -- 'value' mode (HSV value / max-channel). Picks up
+    // saturated colors regardless of hue. Rec.709 luma's weighting
+    // (R=0.21, G=0.72, B=0.07) makes red and especially blue shapes
+    // invisible to the 'luma' threshold even when fully bright; max
+    // channel treats them equally. Best mode for synthetic colorful
+    // content (ShapeTunnel / Plasma / Butterflies); use 'luma' for
+    // real-world camera content where luminance is the natural axis.
+    const vt = threshold * 255;
+    for (let i = 0, j = 0; i < px.length; i += 4, j++) {
+      const r = px[i], g = px[i + 1], b = px[i + 2];
+      const v = r > g ? (r > b ? r : b) : (g > b ? g : b);
+      mask[j] = v >= vt ? 1 : 0;
+    }
   } else {
-    // Luma threshold.
+    // Luma threshold (default). Rec.709 weighted -- good for real
+    // video where luminance is the perceptually natural axis. For
+    // colorful synthetic content prefer mode='value' which weights
+    // all hues equally.
     const lt = threshold * 255;
     for (let i = 0, j = 0; i < px.length; i += 4, j++) {
       const luma = px[i] * 0.2126 + px[i + 1] * 0.7152 + px[i + 2] * 0.0722;
