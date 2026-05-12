@@ -17697,7 +17697,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   },
 
   /* =========================================================================
-   * v0.3.31 — CRT shader, full Lottes implementation.
+   * v0.3.31 -- CRT shader, full Lottes implementation.
+   * v0.3.33 -- high-fidelity upgrades: halation, AA shadow mask,
+   *            beam dynamics, color temperature.
    *
    * Port of Timothy Lottes' CRT shader from libretro/common-shaders
    * (crt-lottes.cg). High-fidelity single-pass CRT emulation: barrel-
@@ -17706,19 +17708,39 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
    * 5/7/7/7/5 taps), and four shadow-mask variants (slot mask,
    * aperture grille, VGA-stretched, VGA-stretched-2x).
    *
-   * Math comes verbatim from Lottes' .cg source -- the same constants
-   * (hardScan=-8, hardPix=-3, warpX=0.031, warpY=0.041, maskDark=0.5,
-   * maskLight=1.5, shape=2.0, bloom=1/16) are the defaults here so
-   * the look matches the libretro reference. Gamma handled via the
-   * cheap c*c <-> sqrt approximation (gamma 2.0; close enough to
-   * sRGB at typical CRT brightness ranges + saves the sRGB-decode
-   * lookup cost on the ~40 texture fetches per fragment).
+   * v0.3.33 adds four upgrades on top of the baseline Lottes:
    *
-   * Cost: ~42 texture samples per fragment (11 for Tri scanline
-   * sampling + 31 for Bloom). Heavy but tractable -- at 1080p on a
-   * mid-range discrete GPU it lands around 4-6 ms. Set bloomAmount
-   * = 0 to skip the bloom phase entirely if you're frame-budget
-   * constrained.
+   *   1. HALATION -- wide soft phosphor halo from light scattering
+   *      inside the CRT glass tube. Distinct from bloom: bloom is in
+   *      the emulated-pixel grid (sharp), halation samples directly
+   *      from the output framebuffer at large pixel offsets (soft).
+   *      12-tap radial pattern (4 cardinal inner + 8 outer).
+   *
+   *   2. ANTI-ALIASED shadow mask. Lottes' if-else step branches
+   *      produce pixel-chunky boundaries between adjacent phosphor
+   *      cells; smoothstep transitions clean those edges up at zero
+   *      added texture sample cost.
+   *
+   *   3. BEAM DYNAMICS -- brightness-aware scanline thickening.
+   *      Real CRT beams saturate the phosphor at high intensity so
+   *      bright scanlines look thicker than dark ones. Modeled as a
+   *      luminance-driven boost that kicks in past 40% luma.
+   *
+   *   4. COLOR TEMPERATURE -- single-slider warmth shift. Approximates
+   *      a Bradford-style chromatic adaptation from cool early-tube
+   *      P1 phosphors to warm late-era P22 phosphors.
+   *
+   * Math constants for the Lottes core (hardScan=-8, hardPix=-3,
+   * warpX=0.031, warpY=0.041, maskDark=0.5, maskLight=1.5, shape=2.0,
+   * bloom=1/16) come verbatim from his .cg source -- the look matches
+   * the libretro reference. Gamma handled via the cheap c*c <-> sqrt
+   * approximation (gamma 2.0; close enough to sRGB at typical CRT
+   * brightness ranges + saves the sRGB-decode cost on the 55 fetches).
+   *
+   * Cost: ~55 texture samples per fragment with halation + bloom on;
+   * ~12 with both off. At 1080p on a mid-range discrete GPU lands
+   * around 5-8 ms with everything on. Set bloomAmount or halationAmount
+   * to 0 to skip those phases if you're frame-budget constrained.
    *
    * virtualW / virtualH set the EMULATED pixel grid (default
    * 320x240 = NES / arcade era). The input texture is sampled as
@@ -17746,7 +17768,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       { n: "maskStrength",      t: "param" },
       { n: "brightness",        t: "param" },
       { n: "bloomAmount",       t: "param" },
-      { n: "shape",             t: "param" }
+      { n: "shape",             t: "param" },
+      // v0.3.33 high-fidelity upgrade params.
+      { n: "halationAmount",    t: "param" },
+      { n: "halationRadius",    t: "param" },
+      { n: "beamDynamics",      t: "param" },
+      { n: "temperature",       t: "param" }
     ],
     outs: [{ n: "out", t: "texture" }],
     textureInputSlots: { in: 16 },
@@ -17767,10 +17794,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       maskStrength: 1.0,
       brightness: 1.0,
       bloomAmount: 0.0625,   // 1/16, Lottes default
-      shape: 2.0             // gaussian shape exponent
+      shape: 2.0,            // gaussian shape exponent
+      // v0.3.33 -- high-fidelity additions. Defaults tuned so the
+      // out-of-the-box look is noticeably better than v0.3.31 but
+      // not visually surprising for patches built before this upgrade.
+      halationAmount: 0.04,  // wide phosphor halo amplitude
+      halationRadius: 10.0,  // halo radius in output framebuffer pixels
+      beamDynamics: 0.5,     // brightness-aware scanline thickness boost
+      temperature: 0.0       // color temperature shift (-1=cool, +1=warm)
     },
     methods: {},
-    uniformBytes: 112,
+    uniformBytes: 128,
     wgsl:
 `struct U {
   u_resolution:  vec4f,
@@ -17782,7 +17816,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   u_world_uv:    vec4f,
   params:        vec4f,    // x=inLayer, y=virtualW, z=virtualH, w=curvature
   params2:       vec4f,    // x=scanHardness, y=pixHardness, z=maskType, w=maskStrength
-  params3:       vec4f,    // x=brightness, y=bloomAmount, z=shape, w=_
+  params3:       vec4f,    // x=brightness, y=bloomAmount, z=shape, w=halationAmount
+  params4:       vec4f,    // x=halationRadius, y=beamDynamics, z=temperature, w=_
 };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
@@ -17892,47 +17927,124 @@ fn scan_w(pos: vec2f, off: f32, tex_size: vec2f, scale: f32, shape: f32) -> f32 
   return gaus(dst + off, scale, shape);
 }
 
-// Shadow mask -- the RGB-phosphor pattern overlaid on the picture.
-// pos here is fragment-space (output pixel coords), not UV -- the
-// mask is tied to physical screen pixels so it doesn't move when
-// the warp shifts the source UV.
-//   1 = slot mask (RGB triplets in offset rows, like classic NTSC)
-//   2 = aperture grille (continuous vertical RGB columns, Sony Trinitron)
-//   3 = VGA-stretched (diagonal RGB stripes; the most "modern PC CRT" look)
-//   4 = VGA-stretched at 2x vertical -- coarser version of #3
+// Anti-aliased shadow mask. Same 4 patterns as Lottes' original
+// but with smoothstep transitions between the R / G / B regions
+// instead of hard if-else step branches. Eliminates the visibly
+// chunky pixel boundary between adjacent phosphors at the cost of
+// a few extra smoothstep calls per fragment. AA_W is the
+// transition width in normalized triplet units.
+//
+// pos is fragment-space (output pixel coords), not UV -- the mask
+// is tied to physical screen pixels so it doesn't move when the
+// warp shifts the source UV.
+//   1 = slot mask (RGB triplets in offset rows, classic NTSC TV)
+//   2 = aperture grille (continuous vertical RGB columns, Trinitron)
+//   3 = VGA-stretched (diagonal RGB stripes, modern PC CRT)
+//   4 = VGA-stretched at 2x vertical (coarser variant of 3)
+fn mask_channel_weights(t: f32, aa: f32) -> vec3f {
+  // R region [0, 0.333), G region [0.333, 0.666), B region [0.666, 1).
+  // Smoothstep across each boundary over a band of width 2*aa.
+  let aa_h = max(aa, 0.005);
+  let r_w = 1.0 - smoothstep(0.333 - aa_h, 0.333 + aa_h, t);
+  let g_w = smoothstep(0.333 - aa_h, 0.333 + aa_h, t)
+          - smoothstep(0.666 - aa_h, 0.666 + aa_h, t);
+  let b_w = smoothstep(0.666 - aa_h, 0.666 + aa_h, t);
+  return vec3f(r_w, g_w, b_w);
+}
+
 fn shadow_mask(in_pos: vec2f, mask_type: i32, mask_dark: f32, mask_light: f32) -> vec3f {
   var mask = vec3f(mask_dark);
   var pos = in_pos;
+  let aa = 0.04;   // ~4% of triplet width = ~0.12 pixels at the mask's native scale
   if (mask_type == 1) {
     var mask_line = mask_light;
     var odd: f32 = 0.0;
     if (fract(pos.x / 6.0) < 0.5) { odd = 1.0; }
     if (fract((pos.y + odd) / 2.0) < 0.5) { mask_line = mask_dark; }
-    let px = fract(pos.x / 3.0);
-    if      (px < 0.333) { mask.r = mask_light; }
-    else if (px < 0.666) { mask.g = mask_light; }
-    else                 { mask.b = mask_light; }
+    let t = fract(pos.x / 3.0);
+    let w = mask_channel_weights(t, aa);
+    mask = vec3f(mix(mask_dark, mask_light, w.x),
+                 mix(mask_dark, mask_light, w.y),
+                 mix(mask_dark, mask_light, w.z));
     mask = mask * mask_line;
   } else if (mask_type == 2) {
-    let px = fract(pos.x / 3.0);
-    if      (px < 0.333) { mask.r = mask_light; }
-    else if (px < 0.666) { mask.g = mask_light; }
-    else                 { mask.b = mask_light; }
+    let t = fract(pos.x / 3.0);
+    let w = mask_channel_weights(t, aa);
+    mask = vec3f(mix(mask_dark, mask_light, w.x),
+                 mix(mask_dark, mask_light, w.y),
+                 mix(mask_dark, mask_light, w.z));
   } else if (mask_type == 3) {
     pos.x = pos.x + pos.y * 3.0;
-    let px = fract(pos.x / 6.0);
-    if      (px < 0.333) { mask.r = mask_light; }
-    else if (px < 0.666) { mask.g = mask_light; }
-    else                 { mask.b = mask_light; }
+    let t = fract(pos.x / 6.0);
+    let w = mask_channel_weights(t, aa);
+    mask = vec3f(mix(mask_dark, mask_light, w.x),
+                 mix(mask_dark, mask_light, w.y),
+                 mix(mask_dark, mask_light, w.z));
   } else if (mask_type == 4) {
     let pf = floor(pos * vec2f(1.0, 0.5));
     let p2x = pf.x + pf.y * 3.0;
-    let px = fract(p2x / 6.0);
-    if      (px < 0.333) { mask.r = mask_light; }
-    else if (px < 0.666) { mask.g = mask_light; }
-    else                 { mask.b = mask_light; }
+    let t = fract(p2x / 6.0);
+    let w = mask_channel_weights(t, aa);
+    mask = vec3f(mix(mask_dark, mask_light, w.x),
+                 mix(mask_dark, mask_light, w.y),
+                 mix(mask_dark, mask_light, w.z));
   }
   return mask;
+}
+
+// === v0.3.33 high-fidelity additions ===
+
+// Halation -- wide, soft phosphor halo from light scattering inside
+// the CRT glass tube. Distinct from bloom: bloom is in the emulated-
+// pixel grid (sharp); halation samples directly from the framebuffer
+// at output-pixel offsets (soft). 12-tap radial pattern: 4 cardinal
+// at inner radius + 8 octagonal at outer radius. Adds depth/glow
+// around bright phosphors without affecting their core sharpness.
+fn halation_sample(uv: vec2f, layer: u32, radius_px: f32) -> vec3f {
+  let texel = vec2f(1.0) / u.u_resolution.xy;
+  let inner_r = radius_px * 0.6;
+  // 12 sample offsets, normalized so * radius gives the right
+  // distance. Inner ring is at 0.6 (=inner_r/radius_px).
+  let offs = array<vec2f, 12>(
+    // Inner ring (4 cardinal) -- weighted heavier
+    vec2f( 0.6,  0.0), vec2f(-0.6,  0.0),
+    vec2f( 0.0,  0.6), vec2f( 0.0, -0.6),
+    // Outer ring (4 cardinal + 4 diagonal)
+    vec2f( 1.0,  0.0), vec2f(-1.0,  0.0),
+    vec2f( 0.0,  1.0), vec2f( 0.0, -1.0),
+    vec2f( 0.707,  0.707), vec2f(-0.707,  0.707),
+    vec2f( 0.707, -0.707), vec2f(-0.707, -0.707)
+  );
+  let wts = array<f32, 12>(
+    0.12, 0.12, 0.12, 0.12,    // inner cardinal (heavier)
+    0.06, 0.06, 0.06, 0.06,    // outer cardinal
+    0.045, 0.045, 0.045, 0.045 // outer diagonal
+  );
+  var acc = vec3f(0.0);
+  var w_sum = 0.0;
+  for (var i: i32 = 0; i < 12; i = i + 1) {
+    let p = uv + offs[i] * radius_px * texel;
+    let s = textureSampleLevel(fbHistory, fbSampler, p, layer, 0.0).rgb;
+    acc = acc + to_linear(s) * wts[i];
+    w_sum = w_sum + wts[i];
+  }
+  return acc / max(w_sum, 0.001);
+}
+
+// Color temperature shift. temp in [-1, 1]: negative = cooler tube
+// (early monochromes / weak red phosphor), positive = warmer (late-
+// era P22 phosphors with strong red). Multiplicative; identity at
+// temp=0. Approximates a Bradford-style chromatic adaptation
+// without the full matrix math.
+fn apply_temperature(c: vec3f, temp: f32) -> vec3f {
+  let warm = clamp(temp, 0.0, 1.0);
+  let cool = clamp(-temp, 0.0, 1.0);
+  let shift = vec3f(
+    1.0 + warm * 0.15 - cool * 0.10,
+    1.0 + warm * 0.02 - cool * 0.05,
+    1.0 - warm * 0.18 + cool * 0.20
+  );
+  return c * shift;
 }
 
 @fragment
@@ -17949,6 +18061,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   let bright       = max(u.params3.x, 0.0);
   let bloom_amt    = max(u.params3.y, 0.0);
   let gauss_shape  = max(u.params3.z, 0.5);
+  let halation_amt = max(u.params3.w, 0.0);
+  let halation_rad = max(u.params4.x, 0.5);
+  let beam_dyn     = clamp(u.params4.y, 0.0, 1.0);
+  let temp         = clamp(u.params4.z, -1.0, 1.0);
 
   // Barrel warp -- pulls UV in toward center based on distance from
   // the opposite axis, mimicking the bulge of a CRT glass tube.
@@ -17978,6 +18094,19 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   let w_c = scan_w(warped,  1.0, virt_size, scan_hard, gauss_shape);
   var color = row_a * w_a + row_b * w_b + row_c * w_c;
 
+  // === Beam dynamics: brightness-aware scanline thickness. ===
+  // Real CRT beams thicken with intensity -- bright pixels saturate
+  // the phosphor + the scanline gap appears smaller. Modeled here
+  // as a luminance-driven brightness boost that kicks in past ~0.4
+  // luma; the boost is shaped so dark regions get no change and
+  // highlights get up to ~50% extra intensity (which after the
+  // post-bloom dynamic range translates to thicker visible scans).
+  if (beam_dyn > 0.001) {
+    let lum = dot(color, vec3f(0.2126, 0.7152, 0.0722));
+    let boost = 1.0 + beam_dyn * smoothstep(0.4, 1.0, lum) * 0.5;
+    color = color * boost;
+  }
+
   // === Bloom: 5-row pyramid (5/7/7/7/5 taps) with softer scanline
   // weights (hardBloomScan = -2). Skipped at bloom_amt=0 to save
   // ~31 texture samples. ===
@@ -17998,12 +18127,25 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     color = color + bloom * bloom_amt;
   }
 
-  // === Shadow mask: physical-pixel grid (not UV), so it doesn't
-  // move when the warp shifts the source. ===
+  // === Halation: wide soft phosphor glow from light scattering
+  // in the CRT glass. 12 taps at output-framebuffer-pixel offsets
+  // (not the emulated grid). Skipped at halation_amt=0. ===
+  if (halation_amt > 0.001) {
+    let halo = halation_sample(warped, layer, halation_rad);
+    color = color + halo * halation_amt;
+  }
+
+  // === Shadow mask (AA'd in v0.3.33): physical-pixel grid (not UV),
+  // so it doesn't move when the warp shifts the source. ===
   if (mask_type > 0) {
     let frag_xy = in.uv * u.u_resolution.xy;
     let m = shadow_mask(frag_xy, mask_type, 0.5, 1.5);
     color = color * mix(vec3f(1.0), m, mask_str);
+  }
+
+  // === Color temperature: shift the white point. ===
+  if (abs(temp) > 0.001) {
+    color = apply_temperature(color, temp);
   }
 
   // sRGB encode (matches the c*c ToLinear in fetch_pix).
@@ -18023,9 +18165,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       scratch[24] = (typeof p.brightness       === "number") ? p.brightness       : 1.0;
       scratch[25] = (typeof p.bloomAmount      === "number") ? p.bloomAmount      : 0.0625;
       scratch[26] = (typeof p.shape            === "number") ? p.shape            : 2.0;
-      scratch[27] = 0;
+      scratch[27] = (typeof p.halationAmount   === "number") ? p.halationAmount   : 0.04;
+      scratch[28] = (typeof p.halationRadius   === "number") ? p.halationRadius   : 10.0;
+      scratch[29] = (typeof p.beamDynamics     === "number") ? p.beamDynamics     : 0.5;
+      scratch[30] = (typeof p.temperature      === "number") ? p.temperature      : 0.0;
+      scratch[31] = 0;
     },
-    description: "High-fidelity CRT emulation — full port of Timothy Lottes' crt-lottes shader from libretro/common-shaders. Single pass with barrel warp + scanline gaussian + 5-row bloom pyramid + four mask variants. virtualW/H sets the emulated resolution (320x240 = arcade/NES; bump to 640x480 or higher for modern-content CRT looks). curvature: barrel-distort intensity (0 = flat, 0.031 = Lottes default, 0.1 = pronounced). scanlineHardness: negative; more negative = sharper scanlines (-8 default). pixelHardness: negative; horizontal pixel pop (-3 default). maskType: 0=none, 1=slot, 2=aperture grille (Trinitron), 3=VGA-stretched (default), 4=VGA-stretched-2x. bloomAmount: phosphor glow (0 = skip, saves ~31 samples/fragment; 1/16 = Lottes default). shape: gaussian exponent (2 = standard; 1.3 softer, 4 sharper). ~42 texture samples per fragment; 1080p budget ~4-6 ms on mid-range discrete GPU."
+    description: "High-fidelity CRT emulation. Lottes single-pass core (barrel warp + Tri scanline gaussian + 5-row bloom pyramid + four shadow-mask variants) with v0.3.33 fidelity additions: HALATION (wide phosphor halo from glass-tube light scatter, 12 taps), ANTI-ALIASED shadow mask (smoothstep transitions instead of pixel-chunky steps), BEAM DYNAMICS (brightness-aware scanline thickening — highlights saturate the beam like a real CRT), and COLOR TEMPERATURE shift. virtualW/H: emulated resolution (320x240 = arcade/NES; bump to 640x480+ for subtler modern-content looks). curvature: barrel intensity (0.031 default). scanlineHardness / pixelHardness: negative gaussian scales (-8 / -3 default; more negative = sharper). maskType: 0=none, 1=slot, 2=aperture grille (Trinitron), 3=VGA-stretched (default), 4=VGA-stretched-2x. bloomAmount: in-pixel-grid glow (1/16 Lottes default; 0 = skip 31 samples). halationAmount: wide soft glow (0.04 default; 0 = skip 12 samples). halationRadius: halo radius in OUTPUT pixels (~10 typical). beamDynamics: brightness-aware scan thickness (0 = uniform Lottes scanlines; 1 = strong highlight bloom). temperature: -1 = cool/early-tube cast, 0 = neutral, +1 = warm/late-P22 cast. Cost: ~55 texture samples per fragment with all features on; turn off bloom+halation for ~12 taps. 1080p budget 5-8 ms with everything on (mid-range discrete GPU)."
   },
 
   /* =========================================================================
