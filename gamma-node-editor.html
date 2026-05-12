@@ -20190,6 +20190,578 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   },
 
   /* =========================================================================
+   * v0.3.43 -- Video-edit suite, sprint 6: Composite extensions.
+   *
+   * Six composition shader-frag nodes that fill out the canonical
+   * compositing toolbox alongside BlendShader (which covers the
+   * general-purpose Merge / blend-modes case). These add:
+   *
+   *   - Dissolve: single-mix cross-fade (saves a click + makes the
+   *     intent explicit when "I just want a fade" is the whole task).
+   *   - ChannelCombiner: re-route per-channel data between up to four
+   *     texture inputs. Foundation for any "build my own RGBA from
+   *     pieces" workflow.
+   *   - ChannelBooleans: per-channel arithmetic between two inputs
+   *     (add / subtract / multiply / divide / min / max / diff /
+   *     screen).
+   *   - MatteCombine: set operations on two single-channel masks.
+   *   - AlphaCompose: canonical alpha-over with straight /
+   *     premultiplied switches on both input and output.
+   *   - Premultiply: standalone premultiply / unpremultiply utility.
+   *
+   * All six use the standard composition bindLayout (texture array
+   * at binding 1, sampler at binding 2). Identity defaults where the
+   * concept allows: Dissolve mix=0 passes A through; ChannelBooleans
+   * op=2 (multiply) with one all-ones input passes the other through;
+   * Premultiply mode=0 (premultiply) with alpha=1 passes through. */
+
+  /* Dissolve -- two-input cross-fade by a single mix scalar. The
+   * canonical "fade between A and B" node. BlendShader can do this
+   * (mode=normal, mix=0..1) but the dedicated entry is faster to
+   * find + reads more clearly in a saved patch. */
+  Dissolve: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "inA", t: "texture" },
+      { n: "inB", t: "texture" },
+      { n: "mix", t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { inA: 16, inB: 17 },
+    params: {
+      inALayer: 0, inBLayer: 1,
+      mix: 0.0
+    },
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inALayer, y=inBLayer, z=mix, w=_
+  params2:       vec4f,
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layerA = u32(max(0.0, u.params.x));
+  let layerB = u32(max(0.0, u.params.y));
+  let mix_t  = clamp(u.params.z, 0.0, 1.0);
+  let cA = textureSampleLevel(fbHistory, fbSampler, in.uv, layerA, 0.0);
+  let cB = textureSampleLevel(fbHistory, fbSampler, in.uv, layerB, 0.0);
+  return mix(cA, cB, mix_t);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inALayer === "number") ? p.inALayer : 0;
+      scratch[17] = (typeof p.inBLayer === "number") ? p.inBLayer : 1;
+      scratch[18] = (typeof p.mix      === "number") ? p.mix      : 0.0;
+      scratch[19] = 0;
+      scratch[20] = 0; scratch[21] = 0; scratch[22] = 0; scratch[23] = 0;
+    },
+    description: "Cross-fade two textures by a single mix scalar. Output = lerp(inA, inB, mix). At mix=0 output = inA (identity for inA); at mix=1 output = inB; intermediate values blend linearly. BlendShader with mode=normal does the same math, but Dissolve is the canonical short-name entry for fade transitions in compositing patches. Per-pixel linear interpolation -- no special handling of alpha (premultiply both inputs upstream if you want correct alpha-aware fades)."
+  },
+
+  /* ChannelCombiner -- four texture inputs, per-output-channel source
+   * picker + per-output-channel source-channel picker. Lets you build
+   * an arbitrary RGBA out of pieces from different textures. */
+  ChannelCombiner: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "srcR",   t: "texture" },
+      { n: "srcG",   t: "texture" },
+      { n: "srcB",   t: "texture" },
+      { n: "srcA",   t: "texture" },
+      { n: "pickR",  t: "param" },
+      { n: "pickG",  t: "param" },
+      { n: "pickB",  t: "param" },
+      { n: "pickA",  t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { srcR: 16, srcG: 17, srcB: 18, srcA: 19 },
+    paramOptions: {
+      pickR: ["R", "G", "B", "A", "luma", "0", "1"],
+      pickG: ["R", "G", "B", "A", "luma", "0", "1"],
+      pickB: ["R", "G", "B", "A", "luma", "0", "1"],
+      pickA: ["R", "G", "B", "A", "luma", "0", "1"]
+    },
+    params: {
+      srcRLayer: 0, srcGLayer: 0, srcBLayer: 0, srcALayer: 0,
+      pickR: 0,   // R
+      pickG: 1,   // G
+      pickB: 2,   // B
+      pickA: 3    // A
+    },
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=srcRLayer, y=srcGLayer, z=srcBLayer, w=srcALayer
+  params2:       vec4f,    // x=pickR, y=pickG, z=pickB, w=pickA
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+fn pick_channel(c: vec4f, mode: i32) -> f32 {
+  if (mode == 0) { return c.r; }
+  if (mode == 1) { return c.g; }
+  if (mode == 2) { return c.b; }
+  if (mode == 3) { return c.a; }
+  if (mode == 4) { return dot(c.rgb, vec3f(0.2126, 0.7152, 0.0722)); }
+  if (mode == 5) { return 0.0; }
+  return 1.0;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let lR = u32(max(0.0, u.params.x));
+  let lG = u32(max(0.0, u.params.y));
+  let lB = u32(max(0.0, u.params.z));
+  let lA = u32(max(0.0, u.params.w));
+  let pR = i32(u.params2.x + 0.5);
+  let pG = i32(u.params2.y + 0.5);
+  let pB = i32(u.params2.z + 0.5);
+  let pA = i32(u.params2.w + 0.5);
+  let cR = textureSampleLevel(fbHistory, fbSampler, in.uv, lR, 0.0);
+  let cG = textureSampleLevel(fbHistory, fbSampler, in.uv, lG, 0.0);
+  let cB = textureSampleLevel(fbHistory, fbSampler, in.uv, lB, 0.0);
+  let cA = textureSampleLevel(fbHistory, fbSampler, in.uv, lA, 0.0);
+  return vec4f(
+    pick_channel(cR, pR),
+    pick_channel(cG, pG),
+    pick_channel(cB, pB),
+    pick_channel(cA, pA)
+  );
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.srcRLayer === "number") ? p.srcRLayer : 0;
+      scratch[17] = (typeof p.srcGLayer === "number") ? p.srcGLayer : 0;
+      scratch[18] = (typeof p.srcBLayer === "number") ? p.srcBLayer : 0;
+      scratch[19] = (typeof p.srcALayer === "number") ? p.srcALayer : 0;
+      scratch[20] = (typeof p.pickR === "number") ? p.pickR : 0;
+      scratch[21] = (typeof p.pickG === "number") ? p.pickG : 1;
+      scratch[22] = (typeof p.pickB === "number") ? p.pickB : 2;
+      scratch[23] = (typeof p.pickA === "number") ? p.pickA : 3;
+    },
+    description: "Recombine R/G/B/A from up to four separate input textures. Each output channel takes its value from a chosen source texture (srcR / srcG / srcB / srcA) and a chosen source channel (pickR / pickG / pickB / pickA = R, G, B, A, luma, 0, or 1). Default state at all-default-wires-into-same-texture passes through unchanged (pickR=R, pickG=G, pickB=B, pickA=A). Use cases: copy alpha from a mask into a color image (wire color into srcR/G/B, mask into srcA, pickA=R or luma); build a thermal/IR fake-color image from a luma source; pack three single-channel masks into RGB; swap channels (BGR/RGB); zero out a channel entirely. All four texture inputs are independent -- wire one or wire four."
+  },
+
+  /* ChannelBooleans -- per-channel arithmetic between two inputs.
+   * Eight ops: add, subtract, multiply, divide, min, max, difference,
+   * screen. Per-channel toggle so RGB can use one op and A another. */
+  ChannelBooleans: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "inA",       t: "texture" },
+      { n: "inB",       t: "texture" },
+      { n: "opRGB",     t: "param" },
+      { n: "opA",       t: "param" },
+      { n: "amount",    t: "param" },
+      { n: "clampOut",  t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { inA: 16, inB: 17 },
+    paramOptions: {
+      opRGB: ["add", "subtract", "multiply", "divide", "min", "max", "difference", "screen"],
+      opA:   ["add", "subtract", "multiply", "divide", "min", "max", "difference", "screen", "fromA", "fromB"]
+    },
+    params: {
+      inALayer: 0, inBLayer: 1,
+      opRGB: 2,        // multiply (identity when inB=1)
+      opA: 8,          // fromA -- pass A's alpha through
+      amount: 1.0,     // lerp(inA, op(inA,inB), amount); 0 = pass inA, 1 = full op
+      clampOut: 1
+    },
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inALayer, y=inBLayer, z=opRGB, w=opA
+  params2:       vec4f,    // x=amount, y=clampOut, zw=_
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+fn do_op(a: f32, b: f32, mode: i32) -> f32 {
+  if (mode == 0) { return a + b; }
+  if (mode == 1) { return a - b; }
+  if (mode == 2) { return a * b; }
+  if (mode == 3) { return a / max(b, 1.0e-5); }
+  if (mode == 4) { return min(a, b); }
+  if (mode == 5) { return max(a, b); }
+  if (mode == 6) { return abs(a - b); }
+  if (mode == 7) { return 1.0 - (1.0 - a) * (1.0 - b); }
+  if (mode == 8) { return a; }
+  return b;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layerA = u32(max(0.0, u.params.x));
+  let layerB = u32(max(0.0, u.params.y));
+  let opRGB  = i32(u.params.z + 0.5);
+  let opA    = i32(u.params.w + 0.5);
+  let amt    = clamp(u.params2.x, 0.0, 1.0);
+  let do_clamp = u.params2.y > 0.5;
+  let cA = textureSampleLevel(fbHistory, fbSampler, in.uv, layerA, 0.0);
+  let cB = textureSampleLevel(fbHistory, fbSampler, in.uv, layerB, 0.0);
+  let r = do_op(cA.r, cB.r, opRGB);
+  let g = do_op(cA.g, cB.g, opRGB);
+  let b = do_op(cA.b, cB.b, opRGB);
+  let a = do_op(cA.a, cB.a, opA);
+  var c_out = vec4f(r, g, b, a);
+  c_out = mix(cA, c_out, amt);
+  if (do_clamp) { c_out = clamp(c_out, vec4f(0.0), vec4f(1.0)); }
+  return c_out;
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inALayer === "number") ? p.inALayer : 0;
+      scratch[17] = (typeof p.inBLayer === "number") ? p.inBLayer : 1;
+      scratch[18] = (typeof p.opRGB    === "number") ? p.opRGB    : 2;
+      scratch[19] = (typeof p.opA      === "number") ? p.opA      : 8;
+      scratch[20] = (typeof p.amount   === "number") ? p.amount   : 1.0;
+      scratch[21] = (typeof p.clampOut === "number") ? p.clampOut : 1;
+      scratch[22] = 0; scratch[23] = 0;
+    },
+    description: "Per-channel arithmetic between two inputs. opRGB applies to the R, G, B channels; opA applies to alpha independently (with bonus 'fromA' and 'fromB' modes that pass an input's alpha straight through). Ops: add (sum), subtract (A-B), multiply (A*B), divide (A/B), min (darker), max (lighter), difference (|A-B|), screen (1 - (1-A)(1-B), inverse-multiply). amount blends back toward inA: 0 = pass inA unchanged; 1 = full op result; intermediate fades. clampOut clamps to [0,1] -- turn off for HDR/extended-range workflow. Use cases: shadow extraction (multiply against a luma mask), difference matte (op=difference), highlight retention (screen + alpha-mask compose)."
+  },
+
+  /* MatteCombine -- set operations on two single-channel masks.
+   * Treats each input's alpha channel (or red if alpha is unset)
+   * as the mask, applies the chosen set operation, outputs a
+   * grayscale + alpha-mirror mask. */
+  MatteCombine: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "inA",     t: "texture" },
+      { n: "inB",     t: "texture" },
+      { n: "op",      t: "param" },
+      { n: "channel", t: "param" },
+      { n: "invert",  t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { inA: 16, inB: 17 },
+    paramOptions: {
+      op: ["union", "intersect", "subtractAB", "subtractBA", "exclusiveOr", "average"],
+      channel: ["alpha", "luma", "R", "G", "B"]
+    },
+    params: {
+      inALayer: 0, inBLayer: 1,
+      op: 0,           // union
+      channel: 0,      // alpha
+      invert: 0
+    },
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inALayer, y=inBLayer, z=op, w=channel
+  params2:       vec4f,    // x=invert, yzw=_
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+fn read_mask(c: vec4f, channel: i32) -> f32 {
+  if (channel == 1) { return dot(c.rgb, vec3f(0.2126, 0.7152, 0.0722)); }
+  if (channel == 2) { return c.r; }
+  if (channel == 3) { return c.g; }
+  if (channel == 4) { return c.b; }
+  return c.a;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layerA  = u32(max(0.0, u.params.x));
+  let layerB  = u32(max(0.0, u.params.y));
+  let op_kind = i32(u.params.z + 0.5);
+  let channel = i32(u.params.w + 0.5);
+  let invert  = u.params2.x > 0.5;
+  let cA = textureSampleLevel(fbHistory, fbSampler, in.uv, layerA, 0.0);
+  let cB = textureSampleLevel(fbHistory, fbSampler, in.uv, layerB, 0.0);
+  let a = read_mask(cA, channel);
+  let b = read_mask(cB, channel);
+  var m: f32;
+  if (op_kind == 0)      { m = max(a, b); }                   // union
+  else if (op_kind == 1) { m = min(a, b); }                   // intersect
+  else if (op_kind == 2) { m = max(a - b, 0.0); }             // subtractAB (A not B)
+  else if (op_kind == 3) { m = max(b - a, 0.0); }             // subtractBA (B not A)
+  else if (op_kind == 4) { m = a + b - 2.0 * a * b; }         // XOR / exclusion
+  else                   { m = 0.5 * (a + b); }               // average
+  if (invert) { m = 1.0 - m; }
+  m = clamp(m, 0.0, 1.0);
+  return vec4f(vec3f(m), m);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inALayer === "number") ? p.inALayer : 0;
+      scratch[17] = (typeof p.inBLayer === "number") ? p.inBLayer : 1;
+      scratch[18] = (typeof p.op       === "number") ? p.op       : 0;
+      scratch[19] = (typeof p.channel  === "number") ? p.channel  : 0;
+      scratch[20] = (typeof p.invert   === "number") ? p.invert   : 0;
+      scratch[21] = 0; scratch[22] = 0; scratch[23] = 0;
+    },
+    description: "Combine two single-channel masks via set operations. op picks the operation: union (max -- pixel is masked if either input is); intersect (min -- both inputs must agree); subtractAB (A but not B -- erase B-region from A); subtractBA (B but not A); exclusiveOr (XOR -- masked if exactly one input is, neither when both agree); average (50/50 blend). channel picks which channel of each input is treated as the mask value: alpha, luma (Rec.709), R, G, or B. invert flips the final result. Output is a grayscale + alpha-mirror mask. Use cases: combine two RectangleMask + EllipseMask into a complex region; subtract a hole from a mask; XOR two masks for an outline."
+  },
+
+  /* AlphaCompose -- explicit alpha-over composite with separate
+   * straight/premultiplied switches for input and output. The
+   * canonical "A on top of B" node; complements BlendShader's more
+   * general mode-driven blends. */
+  AlphaCompose: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "foreground",      t: "texture" },
+      { n: "background",      t: "texture" },
+      { n: "fgPremultiplied", t: "param" },
+      { n: "outPremultiplied", t: "param" },
+      { n: "opacity",         t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { foreground: 16, background: 17 },
+    params: {
+      fgLayer: 0, bgLayer: 1,
+      fgPremultiplied: 0,
+      outPremultiplied: 0,
+      opacity: 1.0
+    },
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=fgLayer, y=bgLayer, z=fgPremultiplied, w=outPremultiplied
+  params2:       vec4f,    // x=opacity, yzw=_
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let fgLayer = u32(max(0.0, u.params.x));
+  let bgLayer = u32(max(0.0, u.params.y));
+  let fgPre   = u.params.z > 0.5;
+  let outPre  = u.params.w > 0.5;
+  let opacity = clamp(u.params2.x, 0.0, 1.0);
+  let cFg = textureSampleLevel(fbHistory, fbSampler, in.uv, fgLayer, 0.0);
+  let cBg = textureSampleLevel(fbHistory, fbSampler, in.uv, bgLayer, 0.0);
+  // Convert fg to premultiplied form, then apply opacity by
+  // scaling both fg.a and fg.rgb together.
+  var fg_rgb_pm = select(cFg.rgb * cFg.a, cFg.rgb, fgPre);
+  var fg_a      = cFg.a * opacity;
+  fg_rgb_pm     = fg_rgb_pm * opacity;
+  // Background -- composite math runs in premultiplied space.
+  // Standard alpha-over: out_pm = fg_pm + bg_pm * (1 - fg_a).
+  let bg_rgb_pm = cBg.rgb * cBg.a;
+  let bg_a      = cBg.a;
+  let out_a      = fg_a + bg_a * (1.0 - fg_a);
+  let out_rgb_pm = fg_rgb_pm + bg_rgb_pm * (1.0 - fg_a);
+  // Convert back to straight alpha unless the user wanted
+  // premultiplied output.
+  var out_rgb = out_rgb_pm;
+  if (!outPre) {
+    out_rgb = select(out_rgb_pm / out_a, vec3f(0.0), out_a < 1.0e-5);
+  }
+  return vec4f(out_rgb, out_a);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.fgLayer          === "number") ? p.fgLayer          : 0;
+      scratch[17] = (typeof p.bgLayer          === "number") ? p.bgLayer          : 1;
+      scratch[18] = (typeof p.fgPremultiplied  === "number") ? p.fgPremultiplied  : 0;
+      scratch[19] = (typeof p.outPremultiplied === "number") ? p.outPremultiplied : 0;
+      scratch[20] = (typeof p.opacity          === "number") ? p.opacity          : 1.0;
+      scratch[21] = 0; scratch[22] = 0; scratch[23] = 0;
+    },
+    description: "Alpha-over composite -- the canonical 'foreground on top of background' compositing operation. Math is the Porter-Duff over: out_rgb = fg_rgb*fg_a + bg_rgb*bg_a*(1-fg_a); out_a = fg_a + bg_a*(1-fg_a). fgPremultiplied tells the node whether the foreground input already has its RGB scaled by alpha (output from MatteControl with premultiply=1, or from any node that emits premultiplied RGBA) or carries straight alpha (the usual case). outPremultiplied controls the output convention -- match what the downstream node expects. opacity scales the foreground alpha in [0,1] for fade-in / fade-out without re-rendering the input. Use cases: place a chroma-keyed subject over a background plate; layer multiple keyed elements; build a transparent overlay UI on top of a video stream."
+  },
+
+  /* Premultiply -- standalone premultiply / unpremultiply utility. */
+  Premultiply: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "in",   t: "texture" },
+      { n: "mode", t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16 },
+    paramOptions: { mode: ["premultiply", "unpremultiply"] },
+    params: {
+      inLayer: 0,
+      mode: 0       // premultiply
+    },
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inLayer, y=mode, zw=_
+  params2:       vec4f,
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layer = u32(max(0.0, u.params.x));
+  let mode  = i32(u.params.y + 0.5);
+  let c = textureSampleLevel(fbHistory, fbSampler, in.uv, layer, 0.0);
+  if (mode == 1) {
+    // Unpremultiply -- divide RGB by alpha. Guard against zero.
+    let rgb = select(c.rgb / c.a, vec3f(0.0), c.a < 1.0e-5);
+    return vec4f(rgb, c.a);
+  }
+  // Premultiply -- scale RGB by alpha.
+  return vec4f(c.rgb * c.a, c.a);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inLayer === "number") ? p.inLayer : 0;
+      scratch[17] = (typeof p.mode    === "number") ? p.mode    : 0;
+      scratch[18] = 0; scratch[19] = 0;
+      scratch[20] = 0; scratch[21] = 0; scratch[22] = 0; scratch[23] = 0;
+    },
+    description: "Switch RGBA between straight-alpha and premultiplied-alpha conventions. mode=premultiply scales RGB by alpha (canonical convention for correct alpha-over math + linear filtering); mode=unpremultiply divides RGB by alpha (recover the original color values from a premultiplied source). Use when a downstream node expects one convention but the input is the other. Zero-alpha pixels are clamped to (0,0,0) in unpremultiply mode rather than blowing up to infinity."
+  },
+
+  /* =========================================================================
    * v0.3.24 — Video-edit suite, sprint 1: Transform.
    *
    * Four composition shader-frag nodes covering the basic 2D transform
