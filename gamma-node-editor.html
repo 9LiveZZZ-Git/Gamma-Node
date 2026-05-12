@@ -17252,6 +17252,451 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   },
 
   /* =========================================================================
+   * v0.3.30 — Video-edit suite, sprint 3: Blur / Filter.
+   *
+   * Five composition shader-frag nodes covering the per-pixel
+   * convolution / order-statistic / morphological family. All
+   * follow the same 1-texture-in / 1-out pattern as sprints 1 + 2.
+   * Glow / SoftGlow deferred -- they need multi-pass infrastructure
+   * (bright-pass -> downsample-blur-upsample pyramid -> additive
+   * composite) which doesn't exist yet; for now express them as a
+   * chain of existing nodes (Levels-as-threshold -> Blur ->
+   * BlendShader in screen mode).
+   * ======================================================================== */
+
+  /* DirectionalBlur — 13-tap Gaussian-weighted samples along a single
+   * axis. Motion-blur look (horizontal scroll, vertical streaks, etc).
+   * Direction is angle in degrees; length is the half-extent of the
+   * blur kernel in framebuffer pixels. */
+  DirectionalBlur: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "in",     t: "texture" },
+      { n: "angle",  t: "param" },
+      { n: "length", t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16 },
+    params: { inLayer: 0, angle: 0, length: 0 },   // length=0 -> pass-through
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inLayer, y=angleDeg, z=lengthPx, w=_
+  _pad1:         vec4f,
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layer  = u32(max(0.0, u.params.x));
+  let angle  = u.params.y * 0.01745329;
+  let lenPx  = max(u.params.z, 0.0);
+  if (lenPx < 0.001) {
+    // Exact identity at length=0.
+    return textureSampleLevel(fbHistory, fbSampler, in.uv, layer, 0.0);
+  }
+  let texel = vec2f(1.0) / u.u_resolution.xy;
+  let dir   = vec2f(cos(angle), sin(angle));
+  // 13-tap Gaussian along the line, t in [-1, 1].
+  let offs = array<f32, 13>(-1.0, -0.83, -0.67, -0.5, -0.33, -0.17, 0.0, 0.17, 0.33, 0.5, 0.67, 0.83, 1.0);
+  let wts  = array<f32, 13>(0.020, 0.040, 0.066, 0.092, 0.114, 0.126, 0.131, 0.126, 0.114, 0.092, 0.066, 0.040, 0.020);
+  var acc = vec3f(0.0);
+  var w_sum = 0.0;
+  for (var i: i32 = 0; i < 13; i = i + 1) {
+    let off = dir * offs[i] * lenPx * texel;
+    acc = acc + textureSampleLevel(fbHistory, fbSampler, in.uv + off, layer, 0.0).rgb * wts[i];
+    w_sum = w_sum + wts[i];
+  }
+  return vec4f(acc / max(w_sum, 0.0001), 1.0);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inLayer === "number") ? p.inLayer : 0;
+      scratch[17] = (typeof p.angle   === "number") ? p.angle   : 0;
+      scratch[18] = (typeof p.length  === "number") ? p.length  : 0;
+      scratch[19] = 0;
+    },
+    description: "Single-axis Gaussian blur — motion-blur / streak look. angle: direction in degrees (0 = horizontal, 90 = vertical). length: kernel half-extent in framebuffer pixels (0 = pass-through). Identity default (length=0). Wire MasterClock.beat or a Slider to length for rhythmic motion-blur sweeps."
+  },
+
+  /* Defocus — circular kernel sample with optional highlight bloom.
+   * Looks like an out-of-focus camera lens (bokeh): bright pixels
+   * expand into uniform circles, dark areas stay blurred. */
+  Defocus: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "in",       t: "texture" },
+      { n: "radius",   t: "param" },
+      { n: "bokeh",    t: "param" }   // boost amount for bright pixels (0 = uniform disc, >0 = bokeh)
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16 },
+    params: { inLayer: 0, radius: 0, bokeh: 1.5 },   // radius=0 -> pass-through
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inLayer, y=radiusPx, z=bokehBoost, w=_
+  _pad1:         vec4f,
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layer  = u32(max(0.0, u.params.x));
+  let radius = max(u.params.y, 0.0);
+  let boost  = max(u.params.z, 0.0);
+  if (radius < 0.001) {
+    return textureSampleLevel(fbHistory, fbSampler, in.uv, layer, 0.0);
+  }
+  let texel = vec2f(1.0) / u.u_resolution.xy;
+  // 13-tap disk pattern: center + 6 inner-ring (0.5R hex) + 6 outer-ring (1.0R hex).
+  let offs = array<vec2f, 13>(
+    vec2f( 0.0,    0.0),
+    vec2f( 0.5,    0.0   ), vec2f(-0.5,    0.0   ),
+    vec2f( 0.25,   0.433 ), vec2f(-0.25,   0.433 ),
+    vec2f( 0.25,  -0.433 ), vec2f(-0.25,  -0.433 ),
+    vec2f( 1.0,    0.0   ), vec2f(-1.0,    0.0   ),
+    vec2f( 0.5,    0.866 ), vec2f(-0.5,    0.866 ),
+    vec2f( 0.5,   -0.866 ), vec2f(-0.5,   -0.866 )
+  );
+  // Inner ring slightly heavier than outer; matches the visual
+  // weight of a Gaussian-ish disk while keeping bright pixels'
+  // bokeh circles uniformly bright (no central hot-spot).
+  let wts = array<f32, 13>(
+    0.10,
+    0.10, 0.10, 0.10, 0.10, 0.10, 0.10,
+    0.05, 0.05, 0.05, 0.05, 0.05, 0.05
+  );
+  var acc = vec3f(0.0);
+  var w_sum = 0.0;
+  for (var i: i32 = 0; i < 13; i = i + 1) {
+    let off = offs[i] * radius * texel;
+    var c = textureSampleLevel(fbHistory, fbSampler, in.uv + off, layer, 0.0).rgb;
+    // Bokeh: bright pixels get a luminance-weighted boost so they
+    // bloom out into distinct discs (the classic out-of-focus
+    // highlight). boost=0 reduces to a uniform disc blur.
+    let lum = dot(c, vec3f(0.299, 0.587, 0.114));
+    c = c * (1.0 + boost * lum * lum);
+    acc = acc + c * wts[i];
+    w_sum = w_sum + wts[i];
+  }
+  let result = acc / max(w_sum, 0.0001);
+  // Tone-map back -- the bokeh boost can push values >1 which would
+  // clip ugly. Reinhard-style compression on highlights only.
+  return vec4f(result / (vec3f(1.0) + result * 0.3), 1.0);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inLayer === "number") ? p.inLayer : 0;
+      scratch[17] = (typeof p.radius  === "number") ? p.radius  : 0;
+      scratch[18] = (typeof p.bokeh   === "number") ? p.bokeh   : 1.5;
+      scratch[19] = 0;
+    },
+    description: "Out-of-focus lens blur (bokeh). radius: disc radius in framebuffer pixels (0 = pass-through). bokeh: highlight bloom boost — 0 reduces to uniform disc blur, higher values (1.5..3) give the classic camera-bokeh look where bright pixels expand into distinct uniform discs. Reinhard tone-mapping on the output prevents bloom clipping. Wire EnvFollow → radius for audio-reactive defocus."
+  },
+
+  /* Sharpen — unsharp mask. Subtracts a 4-tap cross-shaped blur from
+   * the center pixel, scales the difference, adds it back. amount=0
+   * is pass-through; typical useful range 0.3..2.0; >3 starts to
+   * artifact (halos around edges). */
+  Sharpen: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "in",     t: "texture" },
+      { n: "amount", t: "param" },
+      { n: "radius", t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16 },
+    params: { inLayer: 0, amount: 0, radius: 1 },   // amount=0 -> pass-through
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inLayer, y=amount, z=radiusPx, w=_
+  _pad1:         vec4f,
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layer  = u32(max(0.0, u.params.x));
+  let amount = u.params.y;
+  let radius = max(u.params.z, 0.5);
+  let texel  = vec2f(1.0) / u.u_resolution.xy;
+  let center = textureSampleLevel(fbHistory, fbSampler, in.uv, layer, 0.0).rgb;
+  if (abs(amount) < 0.001) { return vec4f(center, 1.0); }
+  // 4-tap cross blur estimate (cheap; sufficient for an unsharp mask).
+  let l = textureSampleLevel(fbHistory, fbSampler, in.uv + vec2f(-radius, 0.0) * texel, layer, 0.0).rgb;
+  let r = textureSampleLevel(fbHistory, fbSampler, in.uv + vec2f( radius, 0.0) * texel, layer, 0.0).rgb;
+  let t = textureSampleLevel(fbHistory, fbSampler, in.uv + vec2f( 0.0, -radius) * texel, layer, 0.0).rgb;
+  let b = textureSampleLevel(fbHistory, fbSampler, in.uv + vec2f( 0.0,  radius) * texel, layer, 0.0).rgb;
+  let blurred = (l + r + t + b) * 0.25;
+  let sharp = center + (center - blurred) * amount;
+  return vec4f(clamp(sharp, vec3f(0.0), vec3f(1.0)), 1.0);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inLayer === "number") ? p.inLayer : 0;
+      scratch[17] = (typeof p.amount  === "number") ? p.amount  : 0;
+      scratch[18] = (typeof p.radius  === "number") ? p.radius  : 1;
+      scratch[19] = 0;
+    },
+    description: "Unsharp-mask sharpening. amount: 0 = pass-through, typical 0.3..2.0 for sharper edges, >3 artifacts (halos). radius: edge-detection radius in framebuffer pixels — small (~1) emphasizes fine detail, larger (~3-5) emphasizes mid-frequency contrast. Subtracts a 4-tap cross blur from the center, multiplies the difference by amount, adds back. Cheap (5 samples per pixel)."
+  },
+
+  /* Morph — erode / dilate. Per-channel min (erode) or max (dilate)
+   * over a 3x3 kernel. Great for matte cleanup: erode shrinks alpha
+   * regions, dilate grows them. Also a stylized look on RGB
+   * (dilate spreads bright pixels, erode pulls them in). */
+  Morph: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "in",     t: "texture" },
+      { n: "radius", t: "param" },
+      { n: "mode",   t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16 },
+    paramOptions: { mode: ["erode", "dilate"] },
+    params: { inLayer: 0, radius: 0, mode: 0 },   // radius=0 -> pass-through
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inLayer, y=radiusPx, z=mode (0=erode, 1=dilate), w=_
+  _pad1:         vec4f,
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layer  = u32(max(0.0, u.params.x));
+  let radius = max(u.params.y, 0.0);
+  let dilate = i32(u.params.z + 0.5) == 1;
+  let texel  = vec2f(1.0) / u.u_resolution.xy;
+  if (radius < 0.001) {
+    return textureSampleLevel(fbHistory, fbSampler, in.uv, layer, 0.0);
+  }
+  var result = textureSampleLevel(fbHistory, fbSampler, in.uv, layer, 0.0).rgb;
+  // 3x3 kernel (8 neighbors + center). Per-channel reduce.
+  for (var y: i32 = -1; y <= 1; y = y + 1) {
+    for (var x: i32 = -1; x <= 1; x = x + 1) {
+      if (x == 0 && y == 0) { continue; }
+      let off = vec2f(f32(x), f32(y)) * radius * texel;
+      let s = textureSampleLevel(fbHistory, fbSampler, in.uv + off, layer, 0.0).rgb;
+      if (dilate) { result = max(result, s); }
+      else        { result = min(result, s); }
+    }
+  }
+  return vec4f(result, 1.0);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inLayer === "number") ? p.inLayer : 0;
+      scratch[17] = (typeof p.radius  === "number") ? p.radius  : 0;
+      scratch[18] = (typeof p.mode    === "number") ? p.mode    : 0;
+      scratch[19] = 0;
+    },
+    description: "Morphological erode / dilate over a 3x3 kernel. radius: kernel-tap offset in framebuffer pixels (0 = pass-through). mode: 'erode' takes per-channel min (shrinks bright regions, grows dark gaps); 'dilate' takes per-channel max (grows bright regions, shrinks dark gaps). Classic alpha-mask cleanup pair: erode-then-dilate (opening) removes small bright specks, dilate-then-erode (closing) fills small dark gaps. Also a stylized look on RGB content."
+  },
+
+  /* CustomFilter — user-defined 3x3 convolution kernel. The escape
+   * hatch for "I know the kernel I want." Defaults to identity
+   * (center=1, rest=0). 9 weight sliders + gain + bias in the
+   * props pane; ChannelMix-style identity-default. */
+  CustomFilter: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "in",  t: "texture" },
+      { n: "w00", t: "param" }, { n: "w01", t: "param" }, { n: "w02", t: "param" },
+      { n: "w10", t: "param" }, { n: "w11", t: "param" }, { n: "w12", t: "param" },
+      { n: "w20", t: "param" }, { n: "w21", t: "param" }, { n: "w22", t: "param" },
+      { n: "gain", t: "param" },
+      { n: "bias", t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16 },
+    params: {
+      inLayer: 0,
+      w00: 0, w01: 0, w02: 0,
+      w10: 0, w11: 1, w12: 0,
+      w20: 0, w21: 0, w22: 0,
+      gain: 1, bias: 0
+    },
+    methods: {},
+    uniformBytes: 112,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inLayer, y=w00, z=w01, w=w02
+  params2:       vec4f,    // x=w10, y=w11, z=w12, w=w20
+  params3:       vec4f,    // x=w21, y=w22, z=gain, w=bias
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layer = u32(max(0.0, u.params.x));
+  let texel = vec2f(1.0) / u.u_resolution.xy;
+  let gain  = u.params3.z;
+  let bias  = u.params3.w;
+  // Unrolled 3x3 convolution.
+  let s00 = textureSampleLevel(fbHistory, fbSampler, in.uv + vec2f(-1.0, -1.0) * texel, layer, 0.0).rgb;
+  let s01 = textureSampleLevel(fbHistory, fbSampler, in.uv + vec2f( 0.0, -1.0) * texel, layer, 0.0).rgb;
+  let s02 = textureSampleLevel(fbHistory, fbSampler, in.uv + vec2f( 1.0, -1.0) * texel, layer, 0.0).rgb;
+  let s10 = textureSampleLevel(fbHistory, fbSampler, in.uv + vec2f(-1.0,  0.0) * texel, layer, 0.0).rgb;
+  let s11 = textureSampleLevel(fbHistory, fbSampler, in.uv + vec2f( 0.0,  0.0) * texel, layer, 0.0).rgb;
+  let s12 = textureSampleLevel(fbHistory, fbSampler, in.uv + vec2f( 1.0,  0.0) * texel, layer, 0.0).rgb;
+  let s20 = textureSampleLevel(fbHistory, fbSampler, in.uv + vec2f(-1.0,  1.0) * texel, layer, 0.0).rgb;
+  let s21 = textureSampleLevel(fbHistory, fbSampler, in.uv + vec2f( 0.0,  1.0) * texel, layer, 0.0).rgb;
+  let s22 = textureSampleLevel(fbHistory, fbSampler, in.uv + vec2f( 1.0,  1.0) * texel, layer, 0.0).rgb;
+  let acc = s00 * u.params.y  + s01 * u.params.z  + s02 * u.params.w  +
+            s10 * u.params2.x + s11 * u.params2.y + s12 * u.params2.z +
+            s20 * u.params2.w + s21 * u.params3.x + s22 * u.params3.y;
+  let out_c = acc * gain + vec3f(bias);
+  return vec4f(clamp(out_c, vec3f(0.0), vec3f(1.0)), 1.0);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inLayer === "number") ? p.inLayer : 0;
+      scratch[17] = (typeof p.w00 === "number") ? p.w00 : 0;
+      scratch[18] = (typeof p.w01 === "number") ? p.w01 : 0;
+      scratch[19] = (typeof p.w02 === "number") ? p.w02 : 0;
+      scratch[20] = (typeof p.w10 === "number") ? p.w10 : 0;
+      scratch[21] = (typeof p.w11 === "number") ? p.w11 : 1;
+      scratch[22] = (typeof p.w12 === "number") ? p.w12 : 0;
+      scratch[23] = (typeof p.w20 === "number") ? p.w20 : 0;
+      scratch[24] = (typeof p.w21 === "number") ? p.w21 : 0;
+      scratch[25] = (typeof p.w22 === "number") ? p.w22 : 0;
+      scratch[26] = (typeof p.gain === "number") ? p.gain : 1;
+      scratch[27] = (typeof p.bias === "number") ? p.bias : 0;
+    },
+    description: "User-defined 3x3 convolution kernel — the escape hatch when you know the matrix you want. 9 weight params (w00..w22, row-major) define the kernel; gain scales the result; bias adds a constant. Identity default = center pixel only (pass-through). Recipes: Laplacian edge-detect (w11=-4, w01=w10=w12=w21=1, rest=0); emboss (w00=-2, w11=1, w22=2, gain=1, bias=0.5); box blur (all=1/9, gain=1); sharpen (w11=5, w01=w10=w12=w21=-1, rest=0)."
+  },
+
+  /* =========================================================================
    * v0.3.24 — Video-edit suite, sprint 1: Transform.
    *
    * Four composition shader-frag nodes covering the basic 2D transform
