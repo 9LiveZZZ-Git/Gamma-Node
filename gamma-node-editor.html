@@ -19422,6 +19422,774 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   },
 
   /* =========================================================================
+   * v0.3.42 -- Video-edit suite, sprint 5: Mask + Matte + Keyer.
+   *
+   * Eight composition shader-frag nodes covering two complementary
+   * classes:
+   *
+   *   MASK GENERATORS output a grayscale (R=G=B=A) mask texture
+   *   describing where pixels are "in" (1.0) vs "out" (0.0). Wire
+   *   into BlendShader.mask, MaskShader, or any downstream node
+   *   that consumes a single-channel signal.
+   *
+   *   KEYERS take an input texture + output the input RGBA with
+   *   alpha replaced by a keying decision. Wire to BlendShader for
+   *   transparent compositing over a different background.
+   *
+   * All mask SDFs are aspect-corrected so circles stay circular on
+   * widescreen framebuffers. Smoothstep falloffs everywhere -- no
+   * hard edges. ======================================================================== */
+
+  /* RectangleMask -- rounded-rect SDF generator. No texture input.
+   * Outputs grayscale mask + alpha-channel mirror so it can drive
+   * either alpha-aware (BlendShader.mask) or luma-aware downstream
+   * nodes. */
+  RectangleMask: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    ins: [
+      { n: "centerX",  t: "param" },
+      { n: "centerY",  t: "param" },
+      { n: "halfW",    t: "param" },
+      { n: "halfH",    t: "param" },
+      { n: "rounding", t: "param" },
+      { n: "feather",  t: "param" },
+      { n: "invert",   t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    params: {
+      centerX: 0.5, centerY: 0.5,
+      halfW: 0.3, halfH: 0.2,
+      rounding: 0.0,
+      feather: 0.005,
+      invert: 0
+    },
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=centerX, y=centerY, z=halfW, w=halfH
+  params2:       vec4f,    // x=rounding, y=feather, z=invert, w=_
+};
+@group(0) @binding(0) var<uniform> u: U;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let cx = u.params.x;
+  let cy = u.params.y;
+  let hw = max(u.params.z, 0.001);
+  let hh = max(u.params.w, 0.001);
+  let rounding = clamp(u.params2.x, 0.0, min(hw, hh));
+  let feather  = max(u.params2.y, 0.0001);
+  let invert   = u.params2.z > 0.5;
+
+  // Aspect-correct so the rect stays rect on widescreen + the
+  // rounded corners are true circular arcs.
+  let aspect = u.u_resolution.x / max(u.u_resolution.y, 1.0);
+  let p = (in.uv - vec2f(cx, cy)) * vec2f(aspect, 1.0);
+  // Standard SDF for rounded rect (Inigo Quilez).
+  let q = abs(p) - (vec2f(hw, hh) - vec2f(rounding));
+  let sd = min(max(q.x, q.y), 0.0) + length(max(q, vec2f(0.0))) - rounding;
+
+  // sd < 0 = inside; > 0 = outside. Smoothstep falloff over feather.
+  var mask = 1.0 - smoothstep(0.0, feather, sd);
+  if (invert) { mask = 1.0 - mask; }
+  return vec4f(vec3f(mask), mask);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.centerX  === "number") ? p.centerX  : 0.5;
+      scratch[17] = (typeof p.centerY  === "number") ? p.centerY  : 0.5;
+      scratch[18] = (typeof p.halfW    === "number") ? p.halfW    : 0.3;
+      scratch[19] = (typeof p.halfH    === "number") ? p.halfH    : 0.2;
+      scratch[20] = (typeof p.rounding === "number") ? p.rounding : 0.0;
+      scratch[21] = (typeof p.feather  === "number") ? p.feather  : 0.005;
+      scratch[22] = (typeof p.invert   === "number") ? p.invert   : 0;
+      scratch[23] = 0;
+    },
+    description: "Rounded-rect mask generator. centerX/Y is the rect center in [0,1] UV; halfW/H is the half-size (so the rect spans [center-half, center+half]). rounding is the corner radius in aspect-corrected normalized units (0 = sharp corners; halfW or halfH = full ellipse). feather is the smoothstep transition width (~0.005 default for hard edges; ~0.05 for very soft). invert flips inside/outside. Output is a grayscale + alpha mirror -- wire into BlendShader.mask for stencil compositing or MaskShader for direct alpha-multiply on a color source."
+  },
+
+  /* EllipseMask -- aspect-corrected ellipse / circle SDF generator. */
+  EllipseMask: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    ins: [
+      { n: "centerX", t: "param" },
+      { n: "centerY", t: "param" },
+      { n: "radiusX", t: "param" },
+      { n: "radiusY", t: "param" },
+      { n: "feather", t: "param" },
+      { n: "invert",  t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    params: {
+      centerX: 0.5, centerY: 0.5,
+      radiusX: 0.25, radiusY: 0.25,
+      feather: 0.005,
+      invert: 0
+    },
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=centerX, y=centerY, z=radiusX, w=radiusY
+  params2:       vec4f,    // x=feather, y=invert, zw=_
+};
+@group(0) @binding(0) var<uniform> u: U;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let cx = u.params.x;
+  let cy = u.params.y;
+  let rx = max(u.params.z, 0.001);
+  let ry = max(u.params.w, 0.001);
+  let feather = max(u.params2.x, 0.0001);
+  let invert  = u.params2.y > 0.5;
+
+  let aspect = u.u_resolution.x / max(u.u_resolution.y, 1.0);
+  let p = (in.uv - vec2f(cx, cy)) * vec2f(aspect, 1.0);
+  // Approximate SDF for an ellipse (exact form is iterative).
+  // length(p / radii) - 1 gives the implicit boundary; scaling by
+  // the smaller radius converts implicit distance back to roughly
+  // world-distance for the feather smoothstep.
+  let implicit = length(p / vec2f(rx, ry)) - 1.0;
+  let sd = implicit * min(rx, ry);
+
+  var mask = 1.0 - smoothstep(0.0, feather, sd);
+  if (invert) { mask = 1.0 - mask; }
+  return vec4f(vec3f(mask), mask);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.centerX === "number") ? p.centerX : 0.5;
+      scratch[17] = (typeof p.centerY === "number") ? p.centerY : 0.5;
+      scratch[18] = (typeof p.radiusX === "number") ? p.radiusX : 0.25;
+      scratch[19] = (typeof p.radiusY === "number") ? p.radiusY : 0.25;
+      scratch[20] = (typeof p.feather === "number") ? p.feather : 0.005;
+      scratch[21] = (typeof p.invert  === "number") ? p.invert  : 0;
+      scratch[22] = 0; scratch[23] = 0;
+    },
+    description: "Aspect-corrected ellipse / circle mask. centerX/Y is the ellipse center in [0,1] UV; radiusX/Y is the half-axis lengths. Set radiusX = radiusY for a true circle (stays circular on widescreen because of internal aspect correction). feather is the smoothstep transition width. invert flips inside/outside. Output is grayscale + alpha-mirror like RectangleMask -- composable into any downstream mask consumer."
+  },
+
+  /* PolygonMask -- regular N-sided polygon SDF. */
+  PolygonMask: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    ins: [
+      { n: "centerX",  t: "param" },
+      { n: "centerY",  t: "param" },
+      { n: "radius",   t: "param" },
+      { n: "sides",    t: "param" },
+      { n: "rotation", t: "param" },
+      { n: "feather",  t: "param" },
+      { n: "invert",   t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    params: {
+      centerX: 0.5, centerY: 0.5,
+      radius: 0.25,
+      sides: 6,
+      rotation: 0.0,
+      feather: 0.005,
+      invert: 0
+    },
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=centerX, y=centerY, z=radius, w=sides
+  params2:       vec4f,    // x=rotation (deg), y=feather, z=invert, w=_
+};
+@group(0) @binding(0) var<uniform> u: U;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let cx       = u.params.x;
+  let cy       = u.params.y;
+  let radius   = max(u.params.z, 0.001);
+  let sides    = max(floor(u.params.w), 3.0);
+  let rotation = u.params2.x * 0.01745329;
+  let feather  = max(u.params2.y, 0.0001);
+  let invert   = u.params2.z > 0.5;
+
+  let aspect = u.u_resolution.x / max(u.u_resolution.y, 1.0);
+  let p = (in.uv - vec2f(cx, cy)) * vec2f(aspect, 1.0);
+
+  // Regular polygon SDF: for each fragment, find which "edge" of the
+  // polygon it's closest to (by snapping the polar angle to the
+  // nearest edge-bisector), then signed-distance is the projection
+  // onto that edge's normal minus the apothem (radius * cos(half
+  // angle)).
+  let two_pi = 6.28318530;
+  let edge_step = two_pi / sides;
+  let ang = atan2(p.y, p.x) - rotation;
+  let snapped = floor((ang + 0.5 * edge_step) / edge_step) * edge_step + rotation;
+  let normal = vec2f(cos(snapped), sin(snapped));
+  let apothem = radius * cos(0.5 * edge_step);
+  let sd = dot(p, normal) - apothem;
+
+  var mask = 1.0 - smoothstep(0.0, feather, sd);
+  if (invert) { mask = 1.0 - mask; }
+  return vec4f(vec3f(mask), mask);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.centerX  === "number") ? p.centerX  : 0.5;
+      scratch[17] = (typeof p.centerY  === "number") ? p.centerY  : 0.5;
+      scratch[18] = (typeof p.radius   === "number") ? p.radius   : 0.25;
+      scratch[19] = (typeof p.sides    === "number") ? p.sides    : 6;
+      scratch[20] = (typeof p.rotation === "number") ? p.rotation : 0.0;
+      scratch[21] = (typeof p.feather  === "number") ? p.feather  : 0.005;
+      scratch[22] = (typeof p.invert   === "number") ? p.invert   : 0;
+      scratch[23] = 0;
+    },
+    description: "Regular N-sided polygon mask. centerX/Y is the center in [0,1] UV; radius is the circumscribed-circle radius (distance from center to vertex). sides controls the polygon: 3 = triangle, 4 = square (rotation=45 for diamond), 5 = pentagon, 6 = hexagon, ... up to ~32 for near-circle. rotation in degrees. feather is the smoothstep transition width. invert flips inside/outside. Output is grayscale + alpha mirror. Aspect-corrected so the polygon stays regular on widescreen framebuffers."
+  },
+
+  /* RangeMask -- threshold a channel (luma / R / G / B) of the input
+   * into a mask. Pixels with the chosen channel value in [low, high]
+   * become 1.0; outside the range becomes 0.0; smoothstep softness
+   * on both boundaries. */
+  RangeMask: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "in",       t: "texture" },
+      { n: "mode",     t: "param" },
+      { n: "low",      t: "param" },
+      { n: "high",     t: "param" },
+      { n: "softness", t: "param" },
+      { n: "invert",   t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16 },
+    paramOptions: { mode: ["luma", "R", "G", "B"] },
+    params: {
+      inLayer: 0,
+      mode: 0,        // 0=luma, 1=R, 2=G, 3=B
+      low: 0.25,
+      high: 0.75,
+      softness: 0.02,
+      invert: 0
+    },
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inLayer, y=mode, z=low, w=high
+  params2:       vec4f,    // x=softness, y=invert, zw=_
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layer    = u32(max(0.0, u.params.x));
+  let mode     = i32(u.params.y + 0.5);
+  let lo       = u.params.z;
+  let hi       = u.params.w;
+  let soft     = max(u.params2.x, 0.0001);
+  let invert   = u.params2.y > 0.5;
+  let c = textureSampleLevel(fbHistory, fbSampler, in.uv, layer, 0.0);
+  var v: f32;
+  if (mode == 1)      { v = c.r; }
+  else if (mode == 2) { v = c.g; }
+  else if (mode == 3) { v = c.b; }
+  else                { v = dot(c.rgb, vec3f(0.2126, 0.7152, 0.0722)); }
+  // Bandpass: ramp up from lo, ramp down at hi.
+  let in_lo = smoothstep(lo - soft, lo + soft, v);
+  let in_hi = 1.0 - smoothstep(hi - soft, hi + soft, v);
+  var mask = in_lo * in_hi;
+  if (invert) { mask = 1.0 - mask; }
+  return vec4f(vec3f(mask), mask);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inLayer  === "number") ? p.inLayer  : 0;
+      scratch[17] = (typeof p.mode     === "number") ? p.mode     : 0;
+      scratch[18] = (typeof p.low      === "number") ? p.low      : 0.25;
+      scratch[19] = (typeof p.high     === "number") ? p.high     : 0.75;
+      scratch[20] = (typeof p.softness === "number") ? p.softness : 0.02;
+      scratch[21] = (typeof p.invert   === "number") ? p.invert   : 0;
+      scratch[22] = 0; scratch[23] = 0;
+    },
+    description: "Threshold a channel of the input into a mask. mode picks the channel: 'luma' (Rec.709 weighted RGB), 'R', 'G', 'B'. Pixels with that channel value in [low, high] map to 1.0; outside the range maps to 0.0 with smoothstep softness on both edges. invert flips inside/outside. Output is grayscale + alpha mirror. Use cases: extract shadows (mode=luma, low=0, high=0.3), extract highlights (low=0.7, high=1), extract a specific color band via per-channel mode."
+  },
+
+  /* LumaKeyer -- replace alpha with a luma-bandpass keying decision.
+   * Output preserves input RGB; alpha follows the keyer math. Wire
+   * to BlendShader for transparent compositing over a different bg. */
+  LumaKeyer: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "in",       t: "texture" },
+      { n: "low",      t: "param" },
+      { n: "high",     t: "param" },
+      { n: "softness", t: "param" },
+      { n: "invert",   t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16 },
+    params: {
+      inLayer: 0,
+      low: 0.0,
+      high: 1.0,
+      softness: 0.02,
+      invert: 0
+    },
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inLayer, y=low, z=high, w=softness
+  params2:       vec4f,    // x=invert, yzw=_
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layer    = u32(max(0.0, u.params.x));
+  let lo       = u.params.y;
+  let hi       = u.params.z;
+  let soft     = max(u.params.w, 0.0001);
+  let invert   = u.params2.x > 0.5;
+  let c = textureSampleLevel(fbHistory, fbSampler, in.uv, layer, 0.0);
+  let luma = dot(c.rgb, vec3f(0.2126, 0.7152, 0.0722));
+  let in_lo = smoothstep(lo - soft, lo + soft, luma);
+  let in_hi = 1.0 - smoothstep(hi - soft, hi + soft, luma);
+  var alpha = in_lo * in_hi;
+  if (invert) { alpha = 1.0 - alpha; }
+  return vec4f(c.rgb, alpha * c.a);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inLayer  === "number") ? p.inLayer  : 0;
+      scratch[17] = (typeof p.low      === "number") ? p.low      : 0.0;
+      scratch[18] = (typeof p.high     === "number") ? p.high     : 1.0;
+      scratch[19] = (typeof p.softness === "number") ? p.softness : 0.02;
+      scratch[20] = (typeof p.invert   === "number") ? p.invert   : 0;
+      scratch[21] = 0; scratch[22] = 0; scratch[23] = 0;
+    },
+    description: "Luma-bandpass keyer. Output preserves RGB; alpha is the bandpass result: pixels with Rec.709 luma in [low, high] keep alpha=1, outside the range get alpha=0, smoothstep softness on both edges. invert flips (alpha=0 inside the band, 1 outside -- band-stop). Identity at low=0, high=1, invert=0. Wire to BlendShader for keyed compositing over a different bg. Use cases: silhouette extraction (low=0, high=0.4) drops dark pixels; highlight isolation (low=0.7, high=1) keeps only bright."
+  },
+
+  /* ChromaKeyer -- green/blue/red-screen keying via HSV color
+   * distance. Pixels with hue+saturation close to (targetR/G/B) get
+   * alpha=0 (keyed out); pixels far from the key get alpha=1 (kept).
+   * Optional spill suppression desaturates near-key residuals. */
+  ChromaKeyer: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "in",              t: "texture" },
+      { n: "targetR",         t: "param" },
+      { n: "targetG",         t: "param" },
+      { n: "targetB",         t: "param" },
+      { n: "tolerance",       t: "param" },
+      { n: "softness",        t: "param" },
+      { n: "spillSuppress",   t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16 },
+    params: {
+      inLayer: 0,
+      targetR: 0.0, targetG: 1.0, targetB: 0.0,   // classic chroma green
+      tolerance: 0.15,
+      softness: 0.05,
+      spillSuppress: 0.5
+    },
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inLayer, y=targetR, z=targetG, w=targetB
+  params2:       vec4f,    // x=tolerance, y=softness, z=spillSuppress, w=_
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+// RGB -> HSV (Sam Hocevar, lolengine.net 2013). Branch-free.
+fn rgb2hsv(c: vec3f) -> vec3f {
+  let K = vec4f(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+  let p = mix(vec4f(c.bg, K.wz), vec4f(c.gb, K.xy), step(c.b, c.g));
+  let q = mix(vec4f(p.xyw, c.r), vec4f(c.r, p.yzx), step(p.x, c.r));
+  let d = q.x - min(q.w, q.y);
+  let e = 1.0e-10;
+  return vec3f(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layer  = u32(max(0.0, u.params.x));
+  let target = vec3f(u.params.y, u.params.z, u.params.w);
+  let tol    = max(u.params2.x, 0.0001);
+  let soft   = max(u.params2.y, 0.0001);
+  let spill  = clamp(u.params2.z, 0.0, 1.0);
+
+  let c = textureSampleLevel(fbHistory, fbSampler, in.uv, layer, 0.0);
+  let hsv = rgb2hsv(c.rgb);
+  let tgt_hsv = rgb2hsv(target);
+
+  // Hue distance: circular, so take the shorter arc.
+  let h_raw = abs(hsv.x - tgt_hsv.x);
+  let h_dist = min(h_raw, 1.0 - h_raw);
+  // Combined chroma distance: hue weighted heavily, saturation
+  // weighted less. Value (brightness) ignored -- a dark green
+  // shadow should still key as green.
+  let dist = h_dist * 2.0 + abs(hsv.y - tgt_hsv.y) * 0.5;
+  // keyed=0 means matches target (transparent); keyed=1 means kept.
+  let keyed = smoothstep(tol, tol + soft, dist);
+
+  // Spill suppression: desaturate the residual near-target pixels
+  // on the EDGE between keyed and kept (where keyed ~= 0.5). Reduces
+  // the green tint that bleeds onto foreground hair / edges.
+  var rgb = c.rgb;
+  if (spill > 0.001) {
+    let edge_factor = (1.0 - keyed) * keyed * 4.0;   // peaks at 1 when keyed=0.5
+    let amt = clamp(edge_factor * spill, 0.0, 1.0);
+    let lum = dot(rgb, vec3f(0.2126, 0.7152, 0.0722));
+    rgb = mix(rgb, vec3f(lum), amt);
+  }
+  return vec4f(rgb, keyed * c.a);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inLayer        === "number") ? p.inLayer        : 0;
+      scratch[17] = (typeof p.targetR        === "number") ? p.targetR        : 0.0;
+      scratch[18] = (typeof p.targetG        === "number") ? p.targetG        : 1.0;
+      scratch[19] = (typeof p.targetB        === "number") ? p.targetB        : 0.0;
+      scratch[20] = (typeof p.tolerance      === "number") ? p.tolerance      : 0.15;
+      scratch[21] = (typeof p.softness       === "number") ? p.softness       : 0.05;
+      scratch[22] = (typeof p.spillSuppress  === "number") ? p.spillSuppress  : 0.5;
+      scratch[23] = 0;
+    },
+    description: "Chroma keyer for green/blue/red-screen compositing. Converts input to HSV, computes distance from the target color (hue weighted 4x heavier than saturation; value ignored so dark-green shadows still key correctly), then alpha = smoothstep(tolerance, tolerance + softness, dist). target* defaults to pure chroma green (0, 1, 0); switch to (0, 0, 1) for blue screen or (1, 0, 0) for red. tolerance ~= 0.15 is a good middle ground; raise for permissive keying, lower for strict. spillSuppress desaturates pixels on the keyed-vs-kept edge band (where green bleeds onto foreground hair / edges); 0 disables, 1 = full edge desaturation."
+  },
+
+  /* DifferenceKeyer -- two-input keyer. Compares input against a
+   * reference 'clean plate'; pixels close to the reference get
+   * alpha=0 (background), pixels different get alpha=1 (foreground).
+   * Useful when no chroma screen is available (architectural shots,
+   * static-camera live action). */
+  DifferenceKeyer: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "in",        t: "texture" },
+      { n: "reference", t: "texture" },
+      { n: "threshold", t: "param" },
+      { n: "softness",  t: "param" },
+      { n: "invert",    t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16, reference: 17 },
+    params: {
+      inLayer: 0, refLayer: 1,
+      threshold: 0.15,
+      softness: 0.05,
+      invert: 0
+    },
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inLayer, y=refLayer, z=threshold, w=softness
+  params2:       vec4f,    // x=invert, yzw=_
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let inLayer  = u32(max(0.0, u.params.x));
+  let refLayer = u32(max(0.0, u.params.y));
+  let thresh   = u.params.z;
+  let soft     = max(u.params.w, 0.0001);
+  let invert   = u.params2.x > 0.5;
+  let cIn  = textureSampleLevel(fbHistory, fbSampler, in.uv, inLayer,  0.0);
+  let cRef = textureSampleLevel(fbHistory, fbSampler, in.uv, refLayer, 0.0);
+  // Euclidean RGB distance. length(x.rgb-y.rgb) ranges 0..sqrt(3)
+  // -- normalize threshold parameter so 0..1 covers the useful range.
+  let diff = length(cIn.rgb - cRef.rgb);
+  var alpha = smoothstep(thresh - soft, thresh + soft, diff);
+  if (invert) { alpha = 1.0 - alpha; }
+  return vec4f(cIn.rgb, alpha * cIn.a);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inLayer   === "number") ? p.inLayer   : 0;
+      scratch[17] = (typeof p.refLayer  === "number") ? p.refLayer  : 1;
+      scratch[18] = (typeof p.threshold === "number") ? p.threshold : 0.15;
+      scratch[19] = (typeof p.softness  === "number") ? p.softness  : 0.05;
+      scratch[20] = (typeof p.invert    === "number") ? p.invert    : 0;
+      scratch[21] = 0; scratch[22] = 0; scratch[23] = 0;
+    },
+    description: "Two-input difference keyer. Compares 'in' against 'reference' (a clean-plate / empty-scene capture); pixels within `threshold` Euclidean RGB distance of the reference are keyed out (alpha=0, treated as background); pixels different from the reference are kept (alpha=1, treated as foreground). Best when the camera is static + you can grab a frame before the subject enters. invert flips. Use cases: architectural compositing, live-event keying without a chroma screen, motion isolation against a known still."
+  },
+
+  /* MatteControl -- alpha matte cleanup. Choke (erode the matte
+   * inward), spread (dilate the matte outward), gamma adjustment
+   * on the alpha curve, and optional premultiplied-alpha output.
+   * Wire AFTER any keyer to clean up the resulting matte. */
+  MatteControl: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "in",          t: "texture" },
+      { n: "choke",       t: "param" },
+      { n: "spread",      t: "param" },
+      { n: "gamma",       t: "param" },
+      { n: "premultiply", t: "param" },
+      { n: "radius",      t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16 },
+    params: {
+      inLayer: 0,
+      choke: 0.0,           // 0..1 -- how much to erode the alpha matte
+      spread: 0.0,          // 0..1 -- how much to dilate the alpha matte
+      gamma: 1.0,           // alpha curve (1 = linear; <1 softens; >1 sharpens)
+      premultiply: 0,       // 0 = straight alpha; 1 = pre-multiplied RGB by alpha
+      radius: 1.0           // morph kernel radius in framebuffer pixels
+    },
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inLayer, y=choke, z=spread, w=gamma
+  params2:       vec4f,    // x=premultiply, y=radius, zw=_
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layer    = u32(max(0.0, u.params.x));
+  let choke    = clamp(u.params.y, 0.0, 1.0);
+  let spread   = clamp(u.params.z, 0.0, 1.0);
+  let gamma    = max(u.params.w, 0.001);
+  let premult  = u.params2.x > 0.5;
+  let radius   = max(u.params2.y, 0.0);
+
+  let c = textureSampleLevel(fbHistory, fbSampler, in.uv, layer, 0.0);
+  var alpha = c.a;
+
+  // Morphological alpha cleanup. 8-tap 3x3 kernel; min for erode
+  // (choke), max for dilate (spread). Mix per-fragment so both
+  // can apply at controlled amounts.
+  if (radius > 0.001 && (choke > 0.001 || spread > 0.001)) {
+    let texel = vec2f(1.0) / u.u_resolution.xy;
+    var amin = alpha;
+    var amax = alpha;
+    for (var y: i32 = -1; y <= 1; y = y + 1) {
+      for (var x: i32 = -1; x <= 1; x = x + 1) {
+        if (x == 0 && y == 0) { continue; }
+        let off = vec2f(f32(x), f32(y)) * radius * texel;
+        let na = textureSampleLevel(fbHistory, fbSampler, in.uv + off, layer, 0.0).a;
+        amin = min(amin, na);
+        amax = max(amax, na);
+      }
+    }
+    alpha = mix(alpha, amin, choke);
+    alpha = mix(alpha, amax, spread);
+  }
+
+  // Gamma curve on alpha. >1 sharpens the matte edge (harder
+  // transition); <1 softens.
+  alpha = pow(clamp(alpha, 0.0, 1.0), 1.0 / gamma);
+
+  var rgb = c.rgb;
+  if (premult) { rgb = rgb * alpha; }
+  return vec4f(rgb, alpha);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inLayer     === "number") ? p.inLayer     : 0;
+      scratch[17] = (typeof p.choke       === "number") ? p.choke       : 0.0;
+      scratch[18] = (typeof p.spread      === "number") ? p.spread      : 0.0;
+      scratch[19] = (typeof p.gamma       === "number") ? p.gamma       : 1.0;
+      scratch[20] = (typeof p.premultiply === "number") ? p.premultiply : 0;
+      scratch[21] = (typeof p.radius      === "number") ? p.radius      : 1.0;
+      scratch[22] = 0; scratch[23] = 0;
+    },
+    description: "Alpha matte cleanup. Wire AFTER any keyer (LumaKeyer / ChromaKeyer / DifferenceKeyer) to tighten the resulting matte. choke (0..1) erodes the matte inward -- removes alpha noise / fringes / spill at the keyed boundary. spread (0..1) dilates the matte outward -- fills small holes inside the foreground. radius is the morph kernel sample distance in framebuffer pixels (1 = single-pixel, 3 = chunky). gamma applies a power curve to the cleaned alpha (>1 = sharper edge transition; <1 = softer). premultiply switches between straight alpha (RGB unchanged, alpha separate) and premultiplied alpha (RGB pre-multiplied by alpha) for downstream compositors that expect one or the other."
+  },
+
+  /* =========================================================================
    * v0.3.24 — Video-edit suite, sprint 1: Transform.
    *
    * Four composition shader-frag nodes covering the basic 2D transform
