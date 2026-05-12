@@ -13332,11 +13332,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     outs: [{ n: "out", t: "texture" }],
     params: {
       fileUrl: "",
+      // v0.3.15 — transport state, persisted with the patch.
+      paused: 0,
+      playbackRate: 1.0,
       mirrored: 0, exposure: 1.0,
       tint_r: 1.0, tint_g: 1.0, tint_b: 1.0
     },
-    methods: { fileUrl: null, mirrored: null, exposure: null, tint_r: null, tint_g: null, tint_b: null },
-    uiOnlyParams: ["fileUrl"],
+    methods: { fileUrl: null, paused: null, playbackRate: null, mirrored: null, exposure: null, tint_r: null, tint_g: null, tint_b: null },
+    uiOnlyParams: ["fileUrl", "paused", "playbackRate"],
     uniformBytes: 96,
     // Same WGSL as Webcam -- pipeline cache hashes the source so
     // both nodes share the compiled pipeline.
@@ -26242,11 +26245,104 @@ function renderProps() {
           ? "Local file loaded (blob URL — session-only)"
           : "URL: " + escapeText(curUrl.length > 60 ? curUrl.slice(0, 57) + "…" : curUrl))
       : "No file picked yet. Click below to browse or paste a URL above.";
+    const paused = !!(node.params && node.params.paused);
+    const rate = (node.params && typeof node.params.playbackRate === "number")
+      ? node.params.playbackRate : 1.0;
     html += `<div class="prop-section">Video source</div>
              <div class="prop-inline" style="margin-bottom:8px;color:var(--text-2);font-size:11px;">${summary}</div>
              <button class="btn primary" id="btn-videofile-pick" style="width:100%;">📁 Pick video file…</button>`;
+    // v0.3.15 — transport controls. Direct buttons that manipulate
+    // the underlying HTMLVideoElement via _videoSources.get(node.id).
+    // params.paused + params.playbackRate persist with the patch so
+    // a saved-then-reopened patch resumes in the user's chosen state.
+    html += `<div class="prop-section" style="margin-top:14px;">Transport</div>
+             <div style="display:grid;grid-template-columns:repeat(5, 1fr);gap:6px;">
+               <button class="btn" id="btn-videofile-stop"    title="Stop &amp; rewind to 0">⏮</button>
+               <button class="btn" id="btn-videofile-back"    title="Skip back 5 s">⏪</button>
+               <button class="btn primary" id="btn-videofile-playpause" title="Play / Pause (space)">${paused ? "▶" : "⏸"}</button>
+               <button class="btn" id="btn-videofile-forward" title="Skip forward 5 s">⏩</button>
+               <button class="btn" id="btn-videofile-end"     title="Jump to end">⏭</button>
+             </div>
+             <div style="display:flex;align-items:center;gap:8px;margin-top:8px;font-family:var(--font-mono);font-size:11px;color:var(--text-2);">
+               <span style="min-width:48px;">rate ${rate.toFixed(2)}×</span>
+               <input id="videofile-rate" type="range" min="0.10" max="4.00" step="0.05" value="${rate}" style="flex:1;" />
+             </div>
+             <div style="display:flex;gap:4px;margin-top:6px;">
+               <button class="btn" data-vf-rate="0.25" title="0.25×" style="flex:1;font-size:10px;">¼×</button>
+               <button class="btn" data-vf-rate="0.5"  title="0.5×"  style="flex:1;font-size:10px;">½×</button>
+               <button class="btn" data-vf-rate="1.0"  title="1×"    style="flex:1;font-size:10px;">1×</button>
+               <button class="btn" data-vf-rate="2.0"  title="2×"    style="flex:1;font-size:10px;">2×</button>
+               <button class="btn" data-vf-rate="4.0"  title="4×"    style="flex:1;font-size:10px;">4×</button>
+             </div>`;
   }
   propsEl.innerHTML = html;
+
+  // v0.3.15 — VideoFile transport-button wiring. Direct manipulation
+  // of the underlying HTMLVideoElement (via _videoSources lookup).
+  // params.paused / params.playbackRate persist in the patch; the
+  // currentTime nudges are transient (browser tracks them).
+  if (node.type === "VideoFile") {
+    const getVideoEl = () => {
+      const src = _videoSources.get(node.id);
+      return src && src.videoEl;
+    };
+    const applyPaused = (paused) => {
+      if (!node.params) node.params = {};
+      node.params.paused = paused ? 1 : 0;
+      const v = getVideoEl();
+      if (v) { if (paused) { try { v.pause(); } catch (_) {} } else { try { v.play(); } catch (_) {} } }
+      // Re-render to flip the ▶/⏸ button glyph + persist.
+      renderProps();
+    };
+    const applyRate = (rate) => {
+      rate = Math.max(0.10, Math.min(4.0, Number(rate) || 1.0));
+      if (!node.params) node.params = {};
+      node.params.playbackRate = rate;
+      const v = getVideoEl();
+      if (v) { try { v.playbackRate = rate; } catch (_) {} }
+      renderProps();
+    };
+    const ppBtn   = propsEl.querySelector('#btn-videofile-playpause');
+    const stopBtn = propsEl.querySelector('#btn-videofile-stop');
+    const backBtn = propsEl.querySelector('#btn-videofile-back');
+    const fwdBtn  = propsEl.querySelector('#btn-videofile-forward');
+    const endBtn  = propsEl.querySelector('#btn-videofile-end');
+    const rateSlider = propsEl.querySelector('#videofile-rate');
+    if (ppBtn) ppBtn.addEventListener('click', () => {
+      applyPaused(!(node.params && node.params.paused));
+    });
+    if (stopBtn) stopBtn.addEventListener('click', () => {
+      const v = getVideoEl();
+      if (v) { try { v.currentTime = 0; } catch (_) {} }
+      applyPaused(true);
+    });
+    if (backBtn) backBtn.addEventListener('click', () => {
+      const v = getVideoEl();
+      if (v) { try { v.currentTime = Math.max(0, (v.currentTime || 0) - 5); } catch (_) {} }
+    });
+    if (fwdBtn) fwdBtn.addEventListener('click', () => {
+      const v = getVideoEl();
+      if (v) {
+        try { v.currentTime = Math.min(v.duration || Infinity, (v.currentTime || 0) + 5); } catch (_) {}
+      }
+    });
+    if (endBtn) endBtn.addEventListener('click', () => {
+      const v = getVideoEl();
+      if (v && Number.isFinite(v.duration)) {
+        // Subtract a tiny epsilon so loop kicks in cleanly instead of
+        // sticking at exactly duration.
+        try { v.currentTime = Math.max(0, v.duration - 0.05); } catch (_) {}
+      }
+    });
+    if (rateSlider) rateSlider.addEventListener('input', () => {
+      applyRate(rateSlider.value);
+    });
+    propsEl.querySelectorAll('[data-vf-rate]').forEach(b => {
+      b.addEventListener('click', () => {
+        applyRate(b.getAttribute('data-vf-rate'));
+      });
+    });
+  }
 
   // VideoFile pick-button wiring.
   const pickBtn = propsEl.querySelector('#btn-videofile-pick');
@@ -33598,12 +33694,22 @@ async function _ensureVideoFile(nodeId, params) {
       videoEl.addEventListener("error", onError, { once: true });
       setTimeout(() => resolve(), 5000);   // safety: assume it eventually loads
     });
-    try { await videoEl.play(); } catch (_) {}
+    // v0.3.15 — apply transport params on init.
+    if (params && typeof params.playbackRate === "number" && params.playbackRate > 0) {
+      videoEl.playbackRate = params.playbackRate;
+    }
+    if (params && params.paused) {
+      try { videoEl.pause(); } catch (_) {}
+    } else {
+      try { await videoEl.play(); } catch (_) {}
+    }
     entry.videoEl = videoEl;
     entry.ready = true;
     console.log("[videofile] node " + nodeId + " playing " +
                 fileUrl.slice(0, 80) + " (" +
-                (videoEl.videoWidth || "?") + "×" + (videoEl.videoHeight || "?") + ")");
+                (videoEl.videoWidth || "?") + "×" + (videoEl.videoHeight || "?") +
+                " @ " + (videoEl.playbackRate || 1).toFixed(2) + "x" +
+                (params && params.paused ? ", paused" : "") + ")");
   } catch (e) {
     console.warn("[videofile] init failed for node " + nodeId + ":", e);
     entry.error = e;
@@ -33904,7 +34010,14 @@ function _drawHandLandmarkerOverlay(entry, params) {
   const w = cvs.width, h = cvs.height;
   const result = entry.latest;
   const bgMode = (params && typeof params.bgMode === "number") ? params.bgMode : 1;
-  const mirrored = (params && typeof params.mirrored === "number") ? params.mirrored : 1;
+  const _mirrorParam = (params && typeof params.mirrored === "number") ? params.mirrored : 1;
+  // v0.3.15 — mirror is a selfie-cam convenience only. When the
+  // landmark is fed by an upstream wire (Webcam / VideoFile / any
+  // shader-frag texture), the source already controls its own
+  // orientation, so we display it as-is. Mirror only applies to the
+  // own-getUserMedia fallback (no upstream).
+  const _isOwnCamera = !entry.useTextureSource && !entry.sharedVideoEl;
+  const mirrored = _isOwnCamera ? _mirrorParam : 0;
   const lineWidth = (params && typeof params.lineWidth === "number") ? params.lineWidth : 2.5;
   const dotRadius = (params && typeof params.dotRadius === "number") ? params.dotRadius : 4;
 
@@ -34264,7 +34377,14 @@ function _drawPoseLandmarkerOverlay(entry, params) {
   const w = cvs.width, h = cvs.height;
   const result = entry.latest;
   const bgMode = (params && typeof params.bgMode === "number") ? params.bgMode : 1;
-  const mirrored = (params && typeof params.mirrored === "number") ? params.mirrored : 1;
+  const _mirrorParam = (params && typeof params.mirrored === "number") ? params.mirrored : 1;
+  // v0.3.15 — mirror is a selfie-cam convenience only. When the
+  // landmark is fed by an upstream wire (Webcam / VideoFile / any
+  // shader-frag texture), the source already controls its own
+  // orientation, so we display it as-is. Mirror only applies to the
+  // own-getUserMedia fallback (no upstream).
+  const _isOwnCamera = !entry.useTextureSource && !entry.sharedVideoEl;
+  const mirrored = _isOwnCamera ? _mirrorParam : 0;
   const lineWidth = (params && typeof params.lineWidth === "number") ? params.lineWidth : 3;
   const dotRadius = (params && typeof params.dotRadius === "number") ? params.dotRadius : 5;
 
@@ -34413,7 +34533,14 @@ function _drawFaceLandmarkerOverlay(entry, params) {
   const w = cvs.width, h = cvs.height;
   const result = entry.latest;
   const bgMode = (params && typeof params.bgMode === "number") ? params.bgMode : 1;
-  const mirrored = (params && typeof params.mirrored === "number") ? params.mirrored : 1;
+  const _mirrorParam = (params && typeof params.mirrored === "number") ? params.mirrored : 1;
+  // v0.3.15 — mirror is a selfie-cam convenience only. When the
+  // landmark is fed by an upstream wire (Webcam / VideoFile / any
+  // shader-frag texture), the source already controls its own
+  // orientation, so we display it as-is. Mirror only applies to the
+  // own-getUserMedia fallback (no upstream).
+  const _isOwnCamera = !entry.useTextureSource && !entry.sharedVideoEl;
+  const mirrored = _isOwnCamera ? _mirrorParam : 0;
   const dotRadius = (params && typeof params.dotRadius === "number") ? params.dotRadius : 1.5;
 
   if (bgMode === 0) {
