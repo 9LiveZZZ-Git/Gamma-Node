@@ -13214,12 +13214,29 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   Webcam: {
     category: "Visual", color: COLOR.visual, header: null,
     // v0.3.19 — Webcam doubles as a wire-routable audio source. cppType
-    // declares a GammaVideoSrc member; helperClass attaches to VideoFile
-    // and dedups (only one emission across all VideoFile + Webcam nodes).
-    // Audio outs are silent until the user enables audio in the props
-    // pane -- that triggers a stream-rebuild with `audio: true` and
-    // routes the mic track through a ChannelMerger -> worklet input 1.
+    // declares a GammaVideoSrc member; helperClass is duplicated across
+    // VideoFile / Webcam / ScreenShare with identical content + dedup'd
+    // by class name in generateCode -- a patch with only a Webcam (no
+    // VideoFile) still gets the class definition emitted. Audio outs
+    // are silent until the user enables audio in the props pane.
     cppType: "GammaVideoSrc",
+    helperClass:
+`class GammaVideoSrc {
+    /* See VideoFile entry for full comment. Duplicate of the same
+     * class definition; generateCode dedups by class name so only one
+     * copy reaches the C++ output even when a patch has multiple
+     * video sources of mixed type. */
+    float l_ = 0.f;
+    float r_ = 0.f;
+public:
+    void setL(float v) { l_ = v; }
+    void setR(float v) { r_ = v; }
+    void setSample(float l, float r) { l_ = l; r_ = r; }
+    struct Out { float l, r; };
+    Out operator()() {
+        Out o; o.l = l_; o.r = r_; return o;
+    }
+};`,
     kind: "shader-frag",
     bindLayout: "video-source",
     ins:  [
@@ -13480,6 +13497,157 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       scratch[23] = 0;
     },
     description: "Plays back a video file as a texture. Click the node's 'Pick file…' button in the props panel to load a local video, or paste an http(s) URL into fileUrl. Loops indefinitely; same WGSL pipeline as Webcam (shared compiled pipeline). Wire `out` → BlendShader / VisualOutput, or wire into the `video` input of any MediaPipe landmark node to run detection on the file's frames instead of the live camera. mirrored=1 flips horizontally; exposure scales output gain; tint_{r,g,b} multiplies per-channel."
+  },
+
+  /* v0.3.22 — ScreenShare. getDisplayMedia()-backed video source: lets
+   * the user pick a screen, window, or browser tab and feed it through
+   * the patch's visual + audio graph like any other video node.
+   *
+   * Architecture mirrors Webcam / VideoFile:
+   *   - cppType: GammaVideoSrc -- the same C++ helper class (dedup'd by
+   *     name from the VideoFile entry's helperClass). Wire-routable audio
+   *     out via outL/outR exactly like the other two.
+   *   - kind: shader-frag + bindLayout: "video-source" -- same WGSL +
+   *     contain-fit letterbox shader as Webcam/VideoFile; the pipeline
+   *     cache hashes the source so all three share one compiled artifact.
+   *
+   * Critical caveat: getDisplayMedia() MUST be invoked from a user
+   * gesture (the spec requires it; browsers reject auto-invocation).
+   * So we DON'T auto-init from the render loop -- the user must hit
+   * the "Pick screen / window / tab…" button in the props pane.
+   *
+   * Selection lifecycle:
+   *   - User picks → MediaStream returned → videoEl bound to it →
+   *     rendering kicks in next frame.
+   *   - User stops sharing via the browser's "Stop sharing" UI →
+   *     videoTrack.onended fires → _disposeVideoSource clears the
+   *     entry → render falls back to blank.
+   *   - User picks a different source (re-click the button) → existing
+   *     stream disposed → fresh pick.
+   *
+   * Audio: getDisplayMedia({ audio: true }) gives system audio on
+   * supported platforms (Chrome / Edge on Windows when sharing a tab
+   * or window with "Share audio" checked; not all permutations).
+   * Where supported, the audio track is routed through GammaVideoSrc
+   * exactly like VideoFile's MES path -- pipe outL/outR through
+   * BiquadLP / Reverb / MasterMix or feed it to the screen recorder
+   * for tutorials with patched-in DSP. */
+  ScreenShare: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "GammaVideoSrc",
+    // Duplicate of VideoFile / Webcam helperClass; dedup'd by class
+    // name so a ScreenShare-only patch still gets the C++ definition.
+    helperClass:
+`class GammaVideoSrc {
+    /* See VideoFile entry for full comment. Duplicate definition;
+     * generateCode dedups by class name. */
+    float l_ = 0.f;
+    float r_ = 0.f;
+public:
+    void setL(float v) { l_ = v; }
+    void setR(float v) { r_ = v; }
+    void setSample(float l, float r) { l_ = l; r_ = r; }
+    struct Out { float l, r; };
+    Out operator()() {
+        Out o; o.l = l_; o.r = r_; return o;
+    }
+};`,
+    kind: "shader-frag",
+    bindLayout: "video-source",
+    ins: [
+      { n: "mirrored", t: "param" },
+      { n: "exposure", t: "param" },
+      { n: "tint_r",   t: "param" },
+      { n: "tint_g",   t: "param" },
+      { n: "tint_b",   t: "param" }
+    ],
+    outs: [
+      { n: "out",  t: "texture" },
+      { n: "outL", t: "audio", access: ".l" },
+      { n: "outR", t: "audio", access: ".r" }
+    ],
+    params: {
+      // Mirror defaults OFF for screenshare (text would be backwards
+      // otherwise -- the mirror flag is purely a selfie-cam convenience).
+      mirrored: 0,
+      exposure: 1.0,
+      tint_r: 1.0, tint_g: 1.0, tint_b: 1.0,
+      // Audio defaults ON since screen-share audio is the marquee use
+      // case (recording tutorials, capturing system sound). The browser
+      // permission flow is the gate -- the user explicitly checks "Share
+      // audio" in the picker, so we don't need a second opt-in.
+      audioEnabled: 1,
+      volume: 1.0
+    },
+    methods: { mirrored: null, exposure: null, tint_r: null, tint_g: null, tint_b: null, audioEnabled: null, volume: null },
+    uiOnlyParams: ["audioEnabled", "volume"],
+    uniformBytes: 96,
+    // Same WGSL as Webcam / VideoFile -- pipeline cache shares the
+    // compiled pipeline across all three video-source nodes.
+    wgsl:
+`struct U {
+  u_resolution: vec4f,
+  u_time:       f32,
+  u_dt:         f32,
+  _pad0:        vec2f,
+  u_view:       vec4f,
+  u_world_uv:   vec4f,
+  params:       vec4f,   // x=mirrored, y=exposure, z=_, w=_
+  tint:         vec4f,   // r, g, b, _
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var videoTex: texture_external;
+@group(0) @binding(2) var videoSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(
+    vec2f(-1.0, -1.0),
+    vec2f( 3.0, -1.0),
+    vec2f(-1.0,  3.0),
+  );
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  // v0.3.18 contain letterbox; see Webcam shader for the full comment.
+  let videoDim = vec2f(textureDimensions(videoTex));
+  let fbDim    = u.u_resolution.xy;
+  let videoAR  = videoDim.x / videoDim.y;
+  let fbAR     = fbDim.x    / fbDim.y;
+  var uv       = in.uv;
+  if (videoAR > fbAR) {
+    uv.y = (uv.y - 0.5) * (videoAR / fbAR) + 0.5;
+  } else {
+    uv.x = (uv.x - 0.5) * (fbAR / videoAR) + 0.5;
+  }
+  if (u.params.x > 0.5) { uv.x = 1.0 - uv.x; }
+  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+    return vec4f(0.0, 0.0, 0.0, 0.0);
+  }
+  let color = textureSampleBaseClampToEdge(videoTex, videoSampler, uv);
+  let rgb = color.rgb * u.params.y * u.tint.rgb;
+  return vec4f(rgb, color.a);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.mirrored === "number") ? p.mirrored : 0;
+      scratch[17] = (typeof p.exposure === "number") ? p.exposure : 1.0;
+      scratch[18] = 0;
+      scratch[19] = 0;
+      scratch[20] = (typeof p.tint_r === "number") ? p.tint_r : 1.0;
+      scratch[21] = (typeof p.tint_g === "number") ? p.tint_g : 1.0;
+      scratch[22] = (typeof p.tint_b === "number") ? p.tint_b : 1.0;
+      scratch[23] = 0;
+    },
+    description: "Screen / window / browser-tab share via getDisplayMedia. Click the node's 'Pick screen / window / tab…' button in the props pane to open the browser's source picker (this requires a user gesture per the spec — auto-init from the render loop is not allowed). Same letterbox WGSL pipeline as Webcam / VideoFile. Stops automatically when the user clicks the browser's 'Stop sharing' UI. Wire `out` → BlendShader / VisualOutput / any landmark node. Audio outL/outR are populated when the user checks 'Share audio' in the picker (Chrome / Edge on Windows; the option appears for tab + window shares, not full-screen on most setups)."
   },
 
   /* Phase 7.1b — HandLandmarker (MediaPipe Tasks Vision).
@@ -26699,6 +26867,46 @@ function renderProps() {
                outL/outR carry the file's stereo audio (sample-accurate, ~3 ms quantum) — pipe through any Gamma audio node.
              </div>`;
   }
+  // v0.3.22 — ScreenShare props panel. Mirrors the VideoFile pattern
+  // (pick button + status line + audio toggle) but with a "Stop"
+  // button replacing transport controls (live stream -- no scrubbing).
+  // The pick button is the user gesture that lets getDisplayMedia()
+  // open the source picker; we can't auto-init from the render loop.
+  if (node.type === "ScreenShare") {
+    const entry = _videoSources.get(node.id);
+    const isActive = !!(entry && entry.videoEl && entry.ready);
+    const audioTracks = isActive && entry.stream ? entry.stream.getAudioTracks().length : 0;
+    const summary = isActive
+      ? `Sharing ${entry.videoEl.videoWidth || "?"}×${entry.videoEl.videoHeight || "?"}` +
+        (audioTracks ? " (with system audio)" : " (video only — re-pick + check 'Share audio' in the dialog for sound)")
+      : "Not sharing. Click below to pick a screen / window / browser tab.";
+    const audioOn = !node.params || node.params.audioEnabled !== 0;
+    const hasAudioWire = (typeof state !== "undefined" && state &&
+      Array.isArray(state.edges) && state.edges.some(e =>
+        e && e.from && e.from.node === node.id &&
+        (e.from.port === "outL" || e.from.port === "outR")));
+    html += `<div class="prop-section">Screen source</div>
+             <div class="prop-inline" style="margin-bottom:8px;color:var(--text-2);font-size:11px;">${escapeText(summary)}</div>
+             <button class="btn primary" id="btn-screenshare-pick" style="width:100%;">${isActive ? "🔄 Re-pick source…" : "📺 Pick screen / window / tab…"}</button>`;
+    if (isActive) {
+      html += `<button class="btn" id="btn-screenshare-stop" style="width:100%;margin-top:6px;">⏹ Stop sharing</button>`;
+    }
+    html += `<div class="prop-section" style="margin-top:14px;">Audio
+               ${hasAudioWire
+                 ? `<span style="font-weight:normal;font-size:10px;color:var(--accent-2,#a07cff);opacity:0.95;">(patch-routed via outL/outR)</span>`
+                 : `<span style="font-weight:normal;font-size:10px;color:var(--text-2);opacity:0.7;">(request system audio; wire outL/outR to route through patch)</span>`}
+             </div>
+             <div style="display:flex;align-items:center;gap:8px;">
+               <button class="btn ${audioOn ? "primary" : ""}" id="btn-screenshare-audio"
+                       title="Request system audio on the next 'Pick source' (browser may still refuse for full-screen shares)" style="min-width:48px;">${audioOn ? "🔊 request" : "🔇 video only"}</button>
+               <span style="font-family:var(--font-mono);font-size:10px;color:var(--text-2);flex:1;line-height:1.3;">
+                 ${audioTracks > 0 ? "✓ audio track live" : (isActive ? "no audio in current share" : "next pick will request system audio")}
+               </span>
+             </div>
+             <div style="margin-top:6px;font-size:10px;color:var(--text-2);opacity:0.6;line-height:1.4;">
+               Chrome / Edge on Windows show a "Share audio" checkbox when sharing a <em>tab</em> or <em>window</em>. Full-screen shares typically can't capture audio. Toggling the request flag mid-share has no effect — re-pick to apply.
+             </div>`;
+  }
   propsEl.innerHTML = html;
 
   // v0.3.15 — VideoFile transport-button wiring. Direct manipulation
@@ -26838,6 +27046,39 @@ function renderProps() {
         render();
       });
       input.click();
+    });
+  }
+
+  // v0.3.22 — ScreenShare button wiring. The pick handler is the
+  // user-gesture frame that getDisplayMedia() requires; the stop
+  // handler tears down the stream without rebuilding. Audio-request
+  // toggle just flips the param for the NEXT pick (you can't change
+  // the audio constraint on an active stream).
+  if (node.type === "ScreenShare") {
+    const ssPick = propsEl.querySelector('#btn-screenshare-pick');
+    if (ssPick) ssPick.addEventListener('click', async () => {
+      _disposeVideoSource(node.id);
+      try {
+        await _ensureScreenShareStream(node.id);
+      } catch (e) {
+        console.warn("[screenshare] pick failed:", e);
+      }
+      pushHistory("screenshare-pick:" + node.id);
+      renderProps();
+      render();
+    });
+    const ssStop = propsEl.querySelector('#btn-screenshare-stop');
+    if (ssStop) ssStop.addEventListener('click', () => {
+      _disposeVideoSource(node.id);
+      pushHistory("screenshare-stop:" + node.id);
+      renderProps();
+      render();
+    });
+    const ssAudio = propsEl.querySelector('#btn-screenshare-audio');
+    if (ssAudio) ssAudio.addEventListener('click', () => {
+      if (!node.params) node.params = {};
+      node.params.audioEnabled = (node.params.audioEnabled === 0) ? 1 : 0;
+      renderProps();
     });
   }
 
@@ -34090,7 +34331,7 @@ function _videoAudioSrcNodes() {
   if (typeof state === "undefined" || !state) return [];
   if (!Array.isArray(state.nodes) || !Array.isArray(state.edges)) return [];
   return state.nodes
-    .filter(n => n && (n.type === "VideoFile" || n.type === "Webcam"))
+    .filter(n => n && (n.type === "VideoFile" || n.type === "Webcam" || n.type === "ScreenShare"))
     .filter(n => state.edges.some(e =>
       e && e.from && e.from.node === n.id &&
       (e.from.port === "outL" || e.from.port === "outR")
@@ -34151,6 +34392,98 @@ async function _ensureWebcamStream(nodeId) {
     entry.error = e;
   } finally {
     entry.requesting = false;
+  }
+  return entry;
+}
+
+/* v0.3.22 — ScreenShare init. getDisplayMedia() opens the browser's
+ * source picker (full screen / window / tab). Per the spec this MUST
+ * be invoked from a user gesture -- the props-pane "Pick source"
+ * button is that gesture; we never call this from the render loop or
+ * any setInterval timer (Chrome rejects with "Permission denied" if
+ * the call frame isn't gesture-tagged).
+ *
+ * Different from Webcam in three ways:
+ *   1. Different stream source: getDisplayMedia, not getUserMedia.
+ *   2. User-controlled lifecycle: the browser's "Stop sharing" UI
+ *      ends the track outside our control. We hook videoTrack.onended
+ *      to clean up + re-render the props pane so the user sees the
+ *      "not sharing" state.
+ *   3. Audio behavior: getDisplayMedia({ audio: true }) gives system
+ *      audio on tab + window shares (Chrome / Edge on Windows when
+ *      the user checks "Share audio" in the picker). Where the
+ *      browser refuses audio, the stream has no audio tracks and the
+ *      routing path is a silent no-op. */
+async function _ensureScreenShareStream(nodeId) {
+  let entry = _videoSources.get(nodeId);
+  if (entry) return entry;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+    console.warn("[screenshare] getDisplayMedia not available in this browser");
+    return null;
+  }
+  // Resolve the node so we can honor its audio toggle.
+  const node = (typeof state !== "undefined" && state && Array.isArray(state.nodes))
+    ? state.nodes.find(n => n && n.id === nodeId) : null;
+  const audioWanted = !!(node && node.params && node.params.audioEnabled);
+  entry = { videoEl: null, stream: null, ready: false, error: null, requesting: true, kind: "screen", _audioWanted: audioWanted };
+  _videoSources.set(nodeId, entry);
+  try {
+    const stream = await navigator.mediaDevices.getDisplayMedia({
+      video: { width: { ideal: 1920 }, height: { ideal: 1080 } },
+      audio: audioWanted
+    });
+    // Wire the user's "Stop sharing" button (browser UI) so we tear
+    // down our entry the moment they end the share. Without this the
+    // patch would keep referencing a stopped stream + render nothing.
+    const videoTrack = stream.getVideoTracks()[0];
+    if (videoTrack) {
+      videoTrack.addEventListener("ended", () => {
+        console.log("[screenshare] node " + nodeId + " ended (user stopped sharing)");
+        _disposeVideoSource(nodeId);
+        if (typeof renderProps === "function") {
+          try { renderProps(); } catch (_) {}
+        }
+        if (typeof render === "function") {
+          try { render(); } catch (_) {}
+        }
+      });
+    }
+    const videoEl = document.createElement("video");
+    videoEl.srcObject   = stream;
+    videoEl.playsInline = true;
+    videoEl.muted       = true;     // audio path goes through Web Audio (MSS); muting the el avoids browser double-playback
+    videoEl.autoplay    = true;
+    try { await videoEl.play(); } catch (_) {}
+    entry.stream  = stream;
+    entry.videoEl = videoEl;
+    entry.ready   = true;
+    console.log("[screenshare] node " + nodeId + " sharing " +
+                videoEl.videoWidth + "×" + videoEl.videoHeight +
+                (audioWanted && stream.getAudioTracks().length
+                  ? " (with system audio: 1 track)"
+                  : " (no audio)"));
+    // Hook into the worklet's video-audio merger if the patch is
+    // already playing -- same idempotent path Webcam / VideoFile use.
+    if (typeof ensureVideoAudioConnected === "function" &&
+        typeof previewState !== "undefined" && previewState && previewState.workletNode) {
+      try { ensureVideoAudioConnected(); } catch (e) {
+        console.warn("[screenshare] post-init routing failed:", e);
+      }
+    }
+  } catch (e) {
+    // Cancel button in the picker rejects the promise; that's expected
+    // (not a real error). Log quietly + clear the entry so the next
+    // click re-opens the picker.
+    if (e && e.name === "NotAllowedError") {
+      console.log("[screenshare] node " + nodeId + " picker dismissed");
+    } else {
+      console.warn("[screenshare] node " + nodeId + " getDisplayMedia failed:", e);
+    }
+    entry.error = e;
+    _videoSources.delete(nodeId);
+    return null;
+  } finally {
+    if (entry) entry.requesting = false;
   }
   return entry;
 }
@@ -34311,8 +34644,17 @@ function _findUpstreamVideoSource(nodeId) {
         !(srcNode.params && srcNode.params.fileUrl)) {
       return null;
     }
-    if (srcNode.type === "VideoFile")   _ensureVideoFile(srcNode.id, srcNode.params || {});
-    else if (srcNode.type === "Webcam") _ensureWebcamStream(srcNode.id);
+    // v0.3.22 — ScreenShare has no fileUrl + requires a user gesture
+    // to init (so we don't auto-call _ensureScreenShareStream here).
+    // Treat "no stream yet" the same as VideoFile with empty fileUrl:
+    // the wire silently falls back until the user clicks pick.
+    if (srcNode.type === "ScreenShare" && !_videoSources.has(srcNode.id)) {
+      return null;
+    }
+    if (srcNode.type === "VideoFile")        _ensureVideoFile(srcNode.id, srcNode.params || {});
+    else if (srcNode.type === "Webcam")      _ensureWebcamStream(srcNode.id);
+    // ScreenShare: no auto-init -- existing stream picked up via
+    // _videoSources lookup below.
     const src = _videoSources.get(srcNode.id);
     if (src && src.ready && src.videoEl && src.videoEl.readyState >= 2) {
       return { kind: "video", videoEl: src.videoEl, srcNodeId: srcNode.id };
@@ -36566,8 +36908,13 @@ function _encodeShaderFragPassForPlan(enc, entry, dtSec) {
     if (!src) {
       // v0.3.11 — dispatch by node type: VideoFile loads from a URL,
       // Webcam (default) opens getUserMedia.
-      if (node.type === "VideoFile") _ensureVideoFile(node.id, node.params || {});
-      else                            _ensureWebcamStream(node.id);
+      // v0.3.22 — ScreenShare is gesture-gated; we DON'T auto-init
+      // it here (browsers reject getDisplayMedia() outside a user
+      // gesture frame). The node renders nothing until the user
+      // clicks "Pick screen / window / tab…" in the props pane.
+      if (node.type === "VideoFile")       _ensureVideoFile(node.id, node.params || {});
+      else if (node.type === "ScreenShare") { /* deferred to user gesture */ }
+      else                                  _ensureWebcamStream(node.id);
       return false;
     }
     // v0.3.11 — if the source's params changed (e.g. VideoFile fileUrl
@@ -41411,6 +41758,16 @@ async function ensureVideoAudioConnected() {
           }
           mes = previewState.audioCtx.createMediaStreamSource(srcEntry.stream);
           // No direct-playback path for Webcam — would create echo.
+        } else if (node.type === "ScreenShare") {
+          if (!srcEntry.stream || srcEntry.stream.getAudioTracks().length === 0) {
+            console.log("[videosrc] ScreenShare node " + node.id + " has no audio track (the user didn't check 'Share audio' or the browser refused it); skip routing");
+            continue;
+          }
+          mes = previewState.audioCtx.createMediaStreamSource(srcEntry.stream);
+          // v0.3.22 — ScreenShare also skips direct-playback. With
+          // most "share audio" use cases the user is recording, so
+          // they want patch processing only -- direct playback of
+          // system audio plus the worklet's output would double up.
         } else {
           continue;
         }
