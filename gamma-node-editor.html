@@ -7112,7 +7112,7 @@
  * Pages deploy workflow (.github/workflows/pages.yml). The string
  * after the equals sign is what the workflow's sed targets — don't
  * change the format of this line. */
-const APP_VERSION = "0.3.16";
+const APP_VERSION = "0.3.17";
 
 /* =========================================================================
  * Node type registry — covers ~55 Gamma DSP classes
@@ -34070,6 +34070,38 @@ const _HAND_CONNECTIONS = [
   [0,17]                            // wrist-to-pinky-base (palm edge)
 ];
 
+/* v0.3.17 — aspect-preserving "contain" fit for landmark debug
+ * overlays. Returns the destination rect (dx, dy, dw, dh) sized to
+ * fit `source` (HTMLVideoElement or HTMLCanvasElement) into a w×h
+ * canvas without warping. Bars (if any) are centered + the caller
+ * is responsible for clearing them to a bg color (we paint black
+ * first when bgMode === 1, so the letterbox bars are black).
+ *
+ * Why "contain" instead of "cover":
+ *   - Landmark x/y arrive normalized 0..1 relative to the source
+ *     frame. Cover-cropping would push landmarks off the canvas
+ *     sides; contain keeps every detection visible + aligned with
+ *     the visible bg.
+ *   - The user's mental model is "this is the frame MediaPipe saw"
+ *     -- showing the full frame matches that, with bars instead
+ *     of cropping.
+ *
+ * Same-aspect inputs (camera 16:9 into 16:9 canvas, gpuInputCanvas
+ * sized to Visual.fbWidth × fbHeight into landmark drawCanvas sized
+ * identically) return { dx: 0, dy: 0, dw: w, dh: h } -- no bars. */
+function _videoFitRect(source, w, h) {
+  if (!source) return { dx: 0, dy: 0, dw: w, dh: h };
+  const sw = source.videoWidth  || source.width  || 0;
+  const sh = source.videoHeight || source.height || 0;
+  if (sw <= 0 || sh <= 0) return { dx: 0, dy: 0, dw: w, dh: h };
+  const srcAR = sw / sh;
+  const dstAR = w  / h;
+  let dw, dh;
+  if (srcAR > dstAR) { dw = w; dh = w / srcAR; }
+  else               { dh = h; dw = h * srcAR; }
+  return { dx: (w - dw) / 2, dy: (h - dh) / 2, dw, dh };
+}
+
 /* Draw the latest detection onto the entry's 2D canvas. Called from
  * the detection rAF loop after detectForVideo. bgMode = 1 paints the
  * source video frame first (camera + overlay); bgMode = 0 leaves the
@@ -34093,23 +34125,38 @@ function _drawHandLandmarkerOverlay(entry, params) {
   const lineWidth = (params && typeof params.lineWidth === "number") ? params.lineWidth : 2.5;
   const dotRadius = (params && typeof params.dotRadius === "number") ? params.dotRadius : 4;
 
+  // v0.3.17 — letterbox the bg + remap landmark coords into the same
+  // fit rect so dots line up with the visible video content. Now also
+  // handles texture-source bg (gpuInputCanvas, blitted from upstream
+  // shader-frag the same frame) -- previously Hand's draw missed this
+  // case + showed an empty bg when fed from Plasma / Butterflies / etc.
+  let fit;
   if (bgMode === 0) {
     ctx.clearRect(0, 0, w, h);
-  } else if (entry.videoEl && entry.videoEl.readyState >= 2) {
-    // drawImage with explicit dimensions performs bilinear scaling
-    // from the camera native (typically 1280×720) up to canvas
-    // (typically 1920×1080+). Mirror by flipping the transform.
+    fit = { dx: 0, dy: 0, dw: w, dh: h };
+  } else if (entry.useTextureSource && entry.gpuInputCanvas) {
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, w, h);
+    fit = _videoFitRect(entry.gpuInputCanvas, w, h);
     ctx.save();
-    if (mirrored > 0.5) {
-      ctx.translate(w, 0);
-      ctx.scale(-1, 1);
-    }
-    ctx.drawImage(entry.videoEl, 0, 0, w, h);
+    if (mirrored > 0.5) { ctx.translate(w, 0); ctx.scale(-1, 1); }
+    ctx.drawImage(entry.gpuInputCanvas, fit.dx, fit.dy, fit.dw, fit.dh);
+    ctx.restore();
+  } else if (entry.videoEl && entry.videoEl.readyState >= 2) {
+    // Black-fill first so any letterbox bars are visible.
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, w, h);
+    fit = _videoFitRect(entry.videoEl, w, h);
+    ctx.save();
+    if (mirrored > 0.5) { ctx.translate(w, 0); ctx.scale(-1, 1); }
+    ctx.drawImage(entry.videoEl, fit.dx, fit.dy, fit.dw, fit.dh);
     ctx.restore();
   } else {
     ctx.fillStyle = "#000";
     ctx.fillRect(0, 0, w, h);
+    fit = { dx: 0, dy: 0, dw: w, dh: h };
   }
+  entry._lastFit = fit;   // stashed for HandKeyboard zone overlay.
   if (!result || !result.landmarks) return;
   ctx.lineWidth = lineWidth;
   ctx.lineCap   = "round";
@@ -34134,8 +34181,8 @@ function _drawHandLandmarkerOverlay(entry, params) {
       let ax = hand[a].x, bx = hand[b].x;
       if (mirrored > 0.5) { ax = 1.0 - ax; bx = 1.0 - bx; }
       ctx.beginPath();
-      ctx.moveTo(ax * w, hand[a].y * h);
-      ctx.lineTo(bx * w, hand[b].y * h);
+      ctx.moveTo(fit.dx + ax * fit.dw, fit.dy + hand[a].y * fit.dh);
+      ctx.lineTo(fit.dx + bx * fit.dw, fit.dy + hand[b].y * fit.dh);
       ctx.stroke();
     }
     // Landmark dots. Wrist (0) bigger, fingertips bigger than knuckles.
@@ -34147,7 +34194,7 @@ function _drawHandLandmarkerOverlay(entry, params) {
               : (j === 4 || j === 8 || j === 12 || j === 16 || j === 20) ? dotRadius * 1.2
               : dotRadius;
       ctx.beginPath();
-      ctx.arc(x * w, lm.y * h, r, 0, Math.PI * 2);
+      ctx.arc(fit.dx + x * fit.dw, fit.dy + lm.y * fit.dh, r, 0, Math.PI * 2);
       ctx.fill();
     }
   }
@@ -34460,26 +34507,38 @@ function _drawPoseLandmarkerOverlay(entry, params) {
   const lineWidth = (params && typeof params.lineWidth === "number") ? params.lineWidth : 3;
   const dotRadius = (params && typeof params.dotRadius === "number") ? params.dotRadius : 5;
 
+  // v0.3.17 — letterbox the bg + remap landmark coords into the same
+  // fit rect so dots line up with the visible video content.
+  let fit;
   if (bgMode === 0) {
     ctx.clearRect(0, 0, w, h);
+    fit = { dx: 0, dy: 0, dw: w, dh: h };
   } else if (entry.useTextureSource && entry.gpuInputCanvas) {
     // v0.3.12 — bg comes from the upstream shader-frag (Plasma /
     // Butterflies / etc) blitted to entry.gpuInputCanvas earlier in
     // the same visual frame. Mirror transform is applied here so
     // the landmark coord mirroring (in the loop below) lines up.
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, w, h);
+    fit = _videoFitRect(entry.gpuInputCanvas, w, h);
     ctx.save();
     if (mirrored > 0.5) { ctx.translate(w, 0); ctx.scale(-1, 1); }
-    ctx.drawImage(entry.gpuInputCanvas, 0, 0, w, h);
+    ctx.drawImage(entry.gpuInputCanvas, fit.dx, fit.dy, fit.dw, fit.dh);
     ctx.restore();
   } else if (entry.videoEl && entry.videoEl.readyState >= 2) {
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, w, h);
+    fit = _videoFitRect(entry.videoEl, w, h);
     ctx.save();
     if (mirrored > 0.5) { ctx.translate(w, 0); ctx.scale(-1, 1); }
-    ctx.drawImage(entry.videoEl, 0, 0, w, h);
+    ctx.drawImage(entry.videoEl, fit.dx, fit.dy, fit.dw, fit.dh);
     ctx.restore();
   } else {
     ctx.fillStyle = "#000";
     ctx.fillRect(0, 0, w, h);
+    fit = { dx: 0, dy: 0, dw: w, dh: h };
   }
+  entry._lastFit = fit;
   if (!result || !result.landmarks || result.landmarks.length === 0) return;
   const skeletonColor   = "rgb(131, 232, 255)";   // cyan
   const jointColor      = "rgb(200, 232, 90)";    // phosphor
@@ -34496,8 +34555,8 @@ function _drawPoseLandmarkerOverlay(entry, params) {
       let ax = pa.x, bx = pb.x;
       if (mirrored > 0.5) { ax = 1.0 - ax; bx = 1.0 - bx; }
       ctx.beginPath();
-      ctx.moveTo(ax * w, pa.y * h);
-      ctx.lineTo(bx * w, pb.y * h);
+      ctx.moveTo(fit.dx + ax * fit.dw, fit.dy + pa.y * fit.dh);
+      ctx.lineTo(fit.dx + bx * fit.dw, fit.dy + pb.y * fit.dh);
       ctx.stroke();
     }
     ctx.fillStyle = jointColor;
@@ -34511,7 +34570,7 @@ function _drawPoseLandmarkerOverlay(entry, params) {
       if (mirrored > 0.5) x = 1.0 - x;
       const r = (j === 0) ? dotRadius * 1.4 : dotRadius;
       ctx.beginPath();
-      ctx.arc(x * w, lm.y * h, r, 0, Math.PI * 2);
+      ctx.arc(fit.dx + x * fit.dw, fit.dy + lm.y * fit.dh, r, 0, Math.PI * 2);
       ctx.fill();
     }
   }
@@ -34615,26 +34674,38 @@ function _drawFaceLandmarkerOverlay(entry, params) {
   const mirrored = _isOwnCamera ? _mirrorParam : 0;
   const dotRadius = (params && typeof params.dotRadius === "number") ? params.dotRadius : 1.5;
 
+  // v0.3.17 — letterbox the bg + remap landmark coords into the same
+  // fit rect so dots line up with the visible video content.
+  let fit;
   if (bgMode === 0) {
     ctx.clearRect(0, 0, w, h);
+    fit = { dx: 0, dy: 0, dw: w, dh: h };
   } else if (entry.useTextureSource && entry.gpuInputCanvas) {
     // v0.3.12 — bg comes from the upstream shader-frag (Plasma /
     // Butterflies / etc) blitted to entry.gpuInputCanvas earlier in
     // the same visual frame. Mirror transform is applied here so
     // the landmark coord mirroring (in the loop below) lines up.
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, w, h);
+    fit = _videoFitRect(entry.gpuInputCanvas, w, h);
     ctx.save();
     if (mirrored > 0.5) { ctx.translate(w, 0); ctx.scale(-1, 1); }
-    ctx.drawImage(entry.gpuInputCanvas, 0, 0, w, h);
+    ctx.drawImage(entry.gpuInputCanvas, fit.dx, fit.dy, fit.dw, fit.dh);
     ctx.restore();
   } else if (entry.videoEl && entry.videoEl.readyState >= 2) {
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, w, h);
+    fit = _videoFitRect(entry.videoEl, w, h);
     ctx.save();
     if (mirrored > 0.5) { ctx.translate(w, 0); ctx.scale(-1, 1); }
-    ctx.drawImage(entry.videoEl, 0, 0, w, h);
+    ctx.drawImage(entry.videoEl, fit.dx, fit.dy, fit.dw, fit.dh);
     ctx.restore();
   } else {
     ctx.fillStyle = "#000";
     ctx.fillRect(0, 0, w, h);
+    fit = { dx: 0, dy: 0, dw: w, dh: h };
   }
+  entry._lastFit = fit;
   if (!result || !result.faceLandmarks) return;
   // Draw the 468-point mesh as a phosphor dot cloud. Light alpha so
   // the face stays readable underneath.
@@ -34646,7 +34717,7 @@ function _drawFaceLandmarkerOverlay(entry, params) {
       let x = lm.x;
       if (mirrored > 0.5) x = 1.0 - x;
       ctx.beginPath();
-      ctx.arc(x * w, lm.y * h, dotRadius, 0, Math.PI * 2);
+      ctx.arc(fit.dx + x * fit.dw, fit.dy + lm.y * fit.dh, dotRadius, 0, Math.PI * 2);
       ctx.fill();
     }
   }
@@ -34785,11 +34856,17 @@ function _drawHandKeyboardOverlay(entry, params) {
       }
     }
   }
+  // v0.3.17 — overlay zones in the letterboxed source rect (stashed
+  // by the base draw above), not the full canvas. The wrist x in the
+  // scale-map call below is in source-normalized [0,1] space, so the
+  // zone the wrist lights up has to be drawn inside the same source
+  // rect or the overlay drifts off the wrist position.
+  const fit = entry._lastFit || { dx: 0, dy: 0, dw: w, dh: h };
   if (activeStep >= 0) {
-    const zoneL = (activeStep    ) / totalSteps * w;
-    const zoneR = (activeStep + 1) / totalSteps * w;
+    const zoneL = fit.dx + (activeStep    ) / totalSteps * fit.dw;
+    const zoneR = fit.dx + (activeStep + 1) / totalSteps * fit.dw;
     ctx.fillStyle = "rgba(200, 232, 90, 0.18)";
-    ctx.fillRect(zoneL, 0, zoneR - zoneL, h);
+    ctx.fillRect(zoneL, fit.dy, zoneR - zoneL, fit.dh);
   }
   // Zone divider lines + octave dividers (heavier).
   ctx.strokeStyle = "rgba(178, 100, 200, 0.40)";
@@ -34800,10 +34877,10 @@ function _drawHandKeyboardOverlay(entry, params) {
     ctx.strokeStyle = isOctaveBoundary
       ? "rgba(178, 100, 200, 0.75)"
       : "rgba(178, 100, 200, 0.30)";
-    const x = (i / totalSteps) * w;
+    const x = fit.dx + (i / totalSteps) * fit.dw;
     ctx.beginPath();
-    ctx.moveTo(x, h * 0.78);
-    ctx.lineTo(x, h);
+    ctx.moveTo(x, fit.dy + fit.dh * 0.78);
+    ctx.lineTo(x, fit.dy + fit.dh);
     ctx.stroke();
   }
 }
