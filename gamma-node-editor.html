@@ -452,6 +452,19 @@
     color: #ff7a7a;
     border-color: rgba(255, 122, 122, 0.5);
   }
+  /* v0.3.48 -- Learn-mode pulse on the OSC pill. Distinct from the
+     red "recording" pulse: phosphor + slightly faster cadence so the
+     two never get mistaken for each other mid-set. */
+  .visual-hud-pill.osc-pill.learn {
+    color: var(--phosphor);
+    border-color: var(--phosphor);
+    background: rgba(200, 232, 90, 0.15);
+    animation: osc-learn-pulse 1.0s ease-in-out infinite;
+  }
+  @keyframes osc-learn-pulse {
+    0%,100% { box-shadow: 0 0 0 0 rgba(200, 232, 90, 0.0); }
+    50%     { box-shadow: 0 0 0 4px rgba(200, 232, 90, 0.30); }
+  }
   @keyframes hud-rec-pulse {
     0%,100% { box-shadow: 0 0 0 0 rgba(255, 77, 77, 0.0); }
     50%     { box-shadow: 0 0 0 3px rgba(255, 77, 77, 0.25); }
@@ -44288,7 +44301,14 @@ const _oscState = {
   reconnectTimer: null,
   // Cache of last-sent values per OscOut node to suppress unchanged
   // messages. Map<node.id, number[]>.
-  outLast: new Map()
+  outLast: new Map(),
+  // v0.3.48 -- "Learn" mode. When learnArmed is true, the next
+  // inbound OSC message creates an OscIn node at the canvas center
+  // with its address pre-filled. Lets the user discover incoming
+  // addresses without typing them by hand. Set via Shift+click on
+  // the 📡 HUD pill; cancelled by Escape or a successful capture.
+  learnArmed: false,
+  learnArmedAtMs: 0
 };
 
 function _oscWsUrl(httpEndpoint) {
@@ -44371,25 +44391,76 @@ async function _ensureOscConnection() {
   };
 }
 
+/* Full OSC 1.0 address-pattern matcher, identical semantics to the
+ * server-side codec. Supports:
+ *   ?           single char (not '/')
+ *   *           zero or more chars (not '/')
+ *   [abc]       character class, [a-z] ranges, [!abc] negation
+ *   {alt,erna,tives}   literal alternation
+ * Cached so repeated dispatch (every OSC message walks every OscIn)
+ * doesn't recompile the regex each time. */
+const _OSC_PATTERN_CACHE = new Map();
+const _OSC_PATTERN_CACHE_LIMIT = 256;
+function _patternToRegex(pattern) {
+  const cached = _OSC_PATTERN_CACHE.get(pattern);
+  if (cached) return cached;
+  let re = "^", i = 0;
+  while (i < pattern.length) {
+    const c = pattern[i];
+    if (c === "*") { re += "[^/]*"; i++; }
+    else if (c === "?") { re += "[^/]"; i++; }
+    else if (c === "[") {
+      const end = pattern.indexOf("]", i + 1);
+      if (end < 0) { re += "\\["; i++; }
+      else {
+        let body = pattern.slice(i + 1, end);
+        if (body.length === 0) re += "[^\\s\\S]";
+        else {
+          if (body[0] === "!") body = "^" + body.slice(1);
+          re += "[" + body.replace(/\\/g, "\\\\") + "]";
+        }
+        i = end + 1;
+      }
+    } else if (c === "{") {
+      const end = pattern.indexOf("}", i + 1);
+      if (end < 0) { re += "\\{"; i++; }
+      else {
+        const alts = pattern.slice(i + 1, end).split(",")
+          .map(s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+        re += "(?:" + alts.join("|") + ")";
+        i = end + 1;
+      }
+    } else if ("/^$.|+()\\".includes(c)) {
+      re += "\\" + c; i++;
+    } else { re += c; i++; }
+  }
+  re += "$";
+  let compiled;
+  try { compiled = new RegExp(re); }
+  catch (_) { compiled = /^.\B/; }   // matches nothing
+  if (_OSC_PATTERN_CACHE.size >= _OSC_PATTERN_CACHE_LIMIT) {
+    _OSC_PATTERN_CACHE.delete(_OSC_PATTERN_CACHE.keys().next().value);
+  }
+  _OSC_PATTERN_CACHE.set(pattern, compiled);
+  return compiled;
+}
 function _matchesOscPattern(pattern, address) {
   if (!pattern || !address) return false;
   if (pattern === address) return true;
-  // Same simplified subset as the server-side codec: '*' = [^/]*,
-  // '?' = [^/]; everything else literal.
-  let re = "^";
-  for (let i = 0; i < pattern.length; i++) {
-    const c = pattern[i];
-    if (c === "*") re += "[^/]*";
-    else if (c === "?") re += "[^/]";
-    else if ("/^$.|+()[]{}\\".includes(c)) re += "\\" + c;
-    else re += c;
-  }
-  re += "$";
-  try { return new RegExp(re).test(address); } catch (_) { return false; }
+  return _patternToRegex(pattern).test(address);
 }
 
 function _dispatchOscIn(address, args) {
   if (typeof state === "undefined" || !state || !Array.isArray(state.nodes)) return;
+  // v0.3.48 -- Learn mode. The first inbound message after arming
+  // creates a new OscIn node at the canvas center with the captured
+  // address. Pre-fills v1..v4 from the message args so the user sees
+  // them populated immediately.
+  if (_oscState.learnArmed) {
+    _captureOscToNewNode(address, args);
+    _oscState.learnArmed = false;
+    _updateOscPill();
+  }
   for (const node of state.nodes) {
     if (!node || node.type !== "OscIn") continue;
     const pattern = (node.params && node.params.address) || "";
@@ -44409,6 +44480,55 @@ function _dispatchOscIn(address, args) {
   // so it's already current.
 }
 
+function _captureOscToNewNode(address, args) {
+  if (typeof makeNode !== "function" || typeof state === "undefined") return;
+  // Place new node near the center of the visible canvas so the
+  // user sees it immediately. Falls back to (40, 40) if no view
+  // transform is available.
+  let x = 80, y = 80;
+  try {
+    const c = document.getElementById("canvas-world");
+    if (c) {
+      const r = c.getBoundingClientRect();
+      x = Math.max(40, Math.round(r.width  * 0.4));
+      y = Math.max(40, Math.round(r.height * 0.4));
+    }
+  } catch (_) {}
+  // Pre-populate v1..v4 from the captured args so the new node's
+  // properties pane shows the actual current values rather than
+  // four zeros.
+  const params = { address };
+  for (let k = 0; k < 4; k++) {
+    const raw = k < args.length ? args[k] : 0;
+    params["v" + (k + 1)] = (typeof raw === "number") ? raw : (typeof raw === "boolean" ? (raw ? 1 : 0) : 0);
+  }
+  try {
+    const id = makeNode("OscIn", x, y, params);
+    console.log("[osc] learn captured " + address + " -> new OscIn " + id);
+    // Force a redraw so the new node shows up before the next user
+    // interaction. The exact function name varies by editor era;
+    // try a couple of common ones.
+    if (typeof render === "function") render();
+    if (typeof renderProps === "function") renderProps();
+  } catch (e) {
+    console.warn("[osc] learn capture failed:", e);
+  }
+  _rebuildOscSubscriptions();
+}
+
+function _toggleOscLearn() {
+  // Need an open WS to learn. If not connected, kick a connect attempt
+  // + tell the user via the pill tooltip; arming without a stream is
+  // pointless.
+  if (!_oscState.ws || _oscState.ws.readyState !== 1) {
+    _ensureOscConnection();
+    return;
+  }
+  _oscState.learnArmed = !_oscState.learnArmed;
+  _oscState.learnArmedAtMs = performance.now();
+  _updateOscPill();
+}
+
 function _rebuildOscSubscriptions() {
   if (!_oscState.ws || _oscState.ws.readyState !== 1) return;
   if (typeof state === "undefined" || !state || !Array.isArray(state.nodes)) return;
@@ -44426,10 +44546,118 @@ function _rebuildOscSubscriptions() {
   } catch (_) {}
 }
 
+/* v0.3.48 -- JS-side mirrors for common audio-rate sources, used to
+ * give OscOut a way to forward Sine / Saw / Square / Phasor / AD
+ * values without forcing the user to wire through an intermediate
+ * Slider.
+ *
+ * Drift vs the actual audio-side compiled C++ class: the JS-side
+ * mirror runs at rAF cadence using performance.now() as the time
+ * source, so phase drifts vs the sample-accurate worklet path by
+ * sub-millisecond per minute -- imperceptible at OSC rates (~60 Hz).
+ * Anything more precise needs a SAB-based probe (logged as future
+ * ticket; see comment at the end of this section).
+ *
+ * State per node: { phase, lastT }. Phase is in [0,1) (revolutions,
+ * NOT radians) so the same value drives Sine via sin(2π·phase),
+ * Phasor as-is, Saw as 2·phase-1, Square as sign(phase-0.5).
+ *
+ * AD-class envelopes (AD, AR, ADSR) need gate-event tracking:
+ * we observe the upstream `trig` wire each frame, detect rising
+ * edges, then re-evaluate the envelope shape against time since
+ * trigger. The C++-side class is sample-accurate; we approximate
+ * with a piecewise math expression matching its public shape. */
+const _audioMirrorState = new Map();      // node.id -> { phase, lastT }
+const _envMirrorState   = new Map();      // node.id -> { trigT, lastGate }
+
+function _audioMirrorOscValue(node, port) {
+  // The oscillators all emit on a single port called "out". Bail
+  // for unexpected ports rather than returning a misleading value.
+  if (port !== "out") return null;
+  let st = _audioMirrorState.get(node.id);
+  const nowSec = performance.now() * 0.001;
+  if (!st) { st = { phase: 0, lastT: nowSec }; _audioMirrorState.set(node.id, st); }
+  const dtSec = Math.max(0, Math.min(0.25, nowSec - st.lastT));   // clamp to 250 ms in case of tab-freeze gap
+  st.lastT = nowSec;
+  // Resolve freq -- may itself be wired (through Slider etc), in
+  // which case follow it. Falls back to the node's static freq param.
+  let freq = 1.0;
+  const freqWire = state.edges && state.edges.find(e =>
+    e && e.to && e.to.node === node.id && e.to.port === "freq"
+  );
+  if (freqWire) {
+    const fv = _readWireJsSideValue(freqWire);
+    if (typeof fv === "number" && isFinite(fv)) freq = fv;
+  } else if (node.params && typeof node.params.freq === "number") {
+    freq = node.params.freq;
+  }
+  st.phase = (st.phase + freq * dtSec) % 1.0;
+  if (st.phase < 0) st.phase += 1.0;
+  if (node.type === "Sine")   return Math.sin(st.phase * 2 * Math.PI);
+  if (node.type === "Phasor") return st.phase;
+  if (node.type === "Saw")    return 2 * st.phase - 1;
+  if (node.type === "Square") return st.phase < 0.5 ? 1 : -1;
+  return null;
+}
+
+function _envMirrorValue(node, port) {
+  if (port !== "out") return null;
+  let st = _envMirrorState.get(node.id);
+  if (!st) { st = { trigT: -1e9, lastGate: 0 }; _envMirrorState.set(node.id, st); }
+  // Check the trig input -- if a wire is feeding it + the upstream
+  // value went 0 -> >0.5 between this frame and last, that's a
+  // rising-edge trigger.
+  const wire = state.edges && state.edges.find(e =>
+    e && e.to && e.to.node === node.id && e.to.port === "trig"
+  );
+  let curGate = 0;
+  if (wire) {
+    const gv = _readWireJsSideValue(wire);
+    curGate = (typeof gv === "number" && gv > 0.5) ? 1 : 0;
+  }
+  if (curGate && !st.lastGate) {
+    st.trigT = performance.now() * 0.001;
+  }
+  st.lastGate = curGate;
+  const dt = performance.now() * 0.001 - st.trigT;
+  if (dt < 0 || !isFinite(dt)) return 0;
+  const p = node.params || {};
+  // Times are seconds in the registry. AD: attack -> decay -> 0.
+  // AR: attack -> sustain (gate held) -> release. ADSR similar.
+  // We approximate AR/ADSR as AD when the gate is no longer high
+  // (the AD shape is the simplest right-after-trigger envelope).
+  const atk = Math.max(0.001, +p.attack || 0.01);
+  const dec = Math.max(0.001, +p.decay  || 0.1);
+  if (node.type === "AD") {
+    if (dt < atk) return dt / atk;
+    if (dt < atk + dec) return 1.0 - (dt - atk) / dec;
+    return 0;
+  }
+  if (node.type === "AR") {
+    const rel = Math.max(0.001, +p.release || dec);
+    if (dt < atk) return dt / atk;
+    return Math.exp(-(dt - atk) / rel);
+  }
+  if (node.type === "ADSR") {
+    const sus = Math.max(0, Math.min(1, +p.sustain || 0.6));
+    const rel = Math.max(0.001, +p.release || dec);
+    if (dt < atk) return dt / atk;
+    if (dt < atk + dec) {
+      // Decay phase: 1 -> sustain
+      const k = (dt - atk) / dec;
+      return 1 - k * (1 - sus);
+    }
+    if (curGate) return sus;
+    // Release once gate drops
+    return sus * Math.exp(-(dt - atk - dec) / rel);
+  }
+  return 0;
+}
+
 /* Read the JS-side current value of a wire's source. Mirrors the
  * dispatch in _resolveNodeParams but for outbound use cases where
  * we want a single value (vs the full param-substitution). Returns
- * null when the source is audio-only (no JS mirror) so the caller
+ * null when the source is audio-only with no JS mirror so the caller
  * can skip rather than send a stale value. */
 function _readWireJsSideValue(wire) {
   if (!wire || !wire.from) return null;
@@ -44451,6 +44679,78 @@ function _readWireJsSideValue(wire) {
   if (src.type === "FaceLandmarker") return _faceLandmarkerValue(src, wire.from.port);
   if (src.type === "HandKeyboard")   return _handKeyboardValue(src, wire.from.port);
   if (src.type === "BlobTracker")    return _blobTrackerValue(src, wire.from.port);
+  // v0.3.48 -- audio-rate JS mirrors. Adequate for sending Sine /
+  // Saw / Square / Phasor / AD-class envelopes through OscOut at
+  // visual-rate cadence. NOT suitable for sample-accurate audio
+  // analysis -- use a SAB-based probe path (future ticket) for that.
+  if (src.type === "Sine" || src.type === "Saw" || src.type === "Square" || src.type === "Phasor") {
+    return _audioMirrorOscValue(src, wire.from.port);
+  }
+  if (src.type === "AD" || src.type === "AR" || src.type === "ADSR") {
+    return _envMirrorValue(src, wire.from.port);
+  }
+  // Math template nodes (Mul / Add / Sub / etc.) recurse into their
+  // own inputs. Common patterns like "(Slider * 2 + 1) -> OscOut"
+  // work after this.
+  if (src.type === "Mul" || src.type === "Add" || src.type === "Sub" || src.type === "Div" ||
+      src.type === "Tanh" || src.type === "Abs" || src.type === "Neg" || src.type === "Inv") {
+    return _evalMathTemplateJsSide(src);
+  }
+  return null;
+}
+
+/* Evaluate a math-template node (Mul/Add/Sub/Div/Tanh/Abs/Neg/Inv)
+ * on the JS side by recursively reading its wired inputs. Returns
+ * null if any input dependency can't be JS-resolved. Mirrors the
+ * codegen-time inlining: Mul(a,b) emits "(a*b)", etc. */
+function _evalMathTemplateJsSide(node) {
+  if (!node) return null;
+  const valOf = (portName) => {
+    const wire = state.edges && state.edges.find(e =>
+      e && e.to && e.to.node === node.id && e.to.port === portName
+    );
+    if (wire) {
+      const v = _readWireJsSideValue(wire);
+      if (v === null || v === undefined) return null;
+      return v;
+    }
+    // Unwired: read static param value if present.
+    const p = node.params && node.params[portName];
+    return (typeof p === "number") ? p : null;
+  };
+  const a = valOf("a"), b = valOf("b"), inV = valOf("in");
+  if (node.type === "Mul") {
+    if (a === null || b === null) return null;
+    return a * b;
+  }
+  if (node.type === "Add") {
+    if (a === null || b === null) return null;
+    return a + b;
+  }
+  if (node.type === "Sub") {
+    if (a === null || b === null) return null;
+    return a - b;
+  }
+  if (node.type === "Div") {
+    if (a === null || b === null || Math.abs(b) < 1e-9) return null;
+    return a / b;
+  }
+  if (node.type === "Tanh") {
+    if (inV === null) return null;
+    return Math.tanh(inV);
+  }
+  if (node.type === "Abs") {
+    if (inV === null) return null;
+    return Math.abs(inV);
+  }
+  if (node.type === "Neg") {
+    if (inV === null) return null;
+    return -inV;
+  }
+  if (node.type === "Inv") {
+    if (inV === null || Math.abs(inV) < 1e-9) return null;
+    return 1.0 / inV;
+  }
   return null;
 }
 
@@ -44459,12 +44759,19 @@ function _tickOscOut() {
   if (typeof state === "undefined" || !state || !Array.isArray(state.nodes)) return;
   const nodes = state.nodes.filter(n => n && n.type === "OscOut");
   if (nodes.length === 0) return;
+
+  // Group messages by destination (host:port) so we can pack them
+  // into a single OSC bundle per destination. Bundles arrive atomically
+  // at the receiver -- important when an animation wants several
+  // params to move in lockstep (e.g. RGB color triplet).
+  // Map<destKey, { host?, port?, messages: [{address, args}] }>
+  const destBuckets = new Map();
+  const destKey = (h, p) => (h || "") + ":" + (p || "");
+
   for (const node of nodes) {
     const address = node.params && node.params.address;
     if (typeof address !== "string" || !address.startsWith("/")) continue;
-    // Read wired v1..v4 values. Drop the message if NONE are wired
-    // (an OscOut sitting in a patch unwired shouldn't generate
-    // network traffic at 60 Hz).
+    // Read wired v1..v4 values. Drop the message if NONE are wired.
     const values = [];
     let anyWired = false;
     for (let k = 0; k < 4; k++) {
@@ -44478,15 +44785,11 @@ function _tickOscOut() {
       values.push(typeof v === "number" && isFinite(v) ? v : null);
     }
     if (!anyWired) continue;
-    // Trim trailing nulls so we send the right arg count. A wired
-    // input with no JS-readable source surfaces as null mid-array; we
-    // substitute 0 in that case so receiver sees a consistent arg
-    // count. (Trimming only happens at the tail.)
+    // Trim trailing nulls. Mid-array nulls (wired source had no
+    // JS mirror) become 0 so the arg count stays consistent.
     while (values.length > 0 && values[values.length - 1] === null) values.pop();
     const cleanArgs = values.map(v => v === null ? 0 : v);
-    // Change-detect: skip the message when ALL args match the last
-    // sent values within float-epsilon. Saves a flood of identical
-    // messages when nothing is actually moving.
+    // Change-detect against last-sent values for this node.
     const last = _oscState.outLast.get(node.id);
     let changed = !last || last.length !== cleanArgs.length;
     if (!changed) {
@@ -44496,11 +44799,35 @@ function _tickOscOut() {
     }
     if (!changed) continue;
     _oscState.outLast.set(node.id, cleanArgs.slice());
-    const payload = { type: "send", address, args: cleanArgs };
-    const host = node.params.host;
-    const port = Number(node.params.port);
-    if (host && typeof host === "string" && host.trim()) payload.host = host.trim();
-    if (port && Number.isFinite(port) && port > 0) payload.port = port;
+    // Destination -- per-node overrides win; otherwise bridge default.
+    const host = (node.params.host && typeof node.params.host === "string" && node.params.host.trim()) || "";
+    const portRaw = Number(node.params.port);
+    const port = (Number.isFinite(portRaw) && portRaw > 0) ? portRaw : 0;
+    const key = destKey(host, port);
+    let bucket = destBuckets.get(key);
+    if (!bucket) {
+      bucket = { messages: [] };
+      if (host) bucket.host = host;
+      if (port) bucket.port = port;
+      destBuckets.set(key, bucket);
+    }
+    bucket.messages.push({ address, args: cleanArgs });
+  }
+
+  // Flush each destination. Single message -> {type:"send"}; multiple
+  // messages -> {type:"send-bundle"} so the receiving app gets them
+  // atomically. Either form goes out as one UDP datagram on the
+  // bridge side.
+  for (const bucket of destBuckets.values()) {
+    if (bucket.messages.length === 0) continue;
+    let payload;
+    if (bucket.messages.length === 1) {
+      payload = { type: "send", address: bucket.messages[0].address, args: bucket.messages[0].args };
+    } else {
+      payload = { type: "send-bundle", messages: bucket.messages };
+    }
+    if (bucket.host) payload.host = bucket.host;
+    if (bucket.port) payload.port = bucket.port;
     try { _oscState.ws.send(JSON.stringify(payload)); }
     catch (_) {}
   }
@@ -44510,17 +44837,27 @@ function _updateOscPill() {
   const pill = document.getElementById("osc-pill");
   if (!pill) return;
   const s = _oscState.status;
-  pill.classList.remove("connected", "connecting", "error", "disabled");
+  pill.classList.remove("connected", "connecting", "error", "disabled", "learn");
   if (s === "connected" || s === "connecting" || s === "error" || s === "disabled") {
     pill.classList.add(s);
   }
+  // Learn mode overrides the connected visual so users can see at a
+  // glance that the next message will be captured.
+  if (_oscState.learnArmed) {
+    pill.classList.add("learn");
+    pill.title = "OSC Learn armed -- send a message from your controller now. The captured address will become a new OscIn node. (Shift+click to cancel, or press Escape.)";
+    pill.textContent = "📡…";
+    return;
+  }
+  pill.textContent = "📡";
   if (s === "connected" && _oscState.helloInfo) {
     const hi = _oscState.helloInfo;
     pill.title = "OSC bridge connected\n" +
                  "Inbound:  udp://<server>:" + hi.oscInPort + "\n" +
                  "Outbound: udp://" + (hi.defaultOut && hi.defaultOut.host) + ":" + (hi.defaultOut && hi.defaultOut.port) + " (default)\n" +
-                 "Bridge version: " + (hi.version || "?") + "\n" +
-                 "Use OscIn / OscOut nodes to route messages.";
+                 "Bridge version: " + (hi.version || "?") + "\n\n" +
+                 "Click = create OscIn / OscOut nodes from the palette.\n" +
+                 "Shift+click = Learn mode: next OSC message becomes a new OscIn node.";
   } else if (s === "connecting") {
     pill.title = "Connecting to OSC bridge...";
   } else if (s === "error") {
@@ -44546,10 +44883,34 @@ function _onOscPatchChange() {
 
 // Kick the connection on first load -- harmless if no server is up
 // (probe just times out). Also trigger when probeLocalServer
-// completes for the first time after a Play click.
+// completes for the first time after a Play click. Wires the 📡
+// pill: bare click is a hook for a future modal (open the OSC config
+// panel); Shift+click toggles Learn mode for capturing addresses.
+// Esc cancels Learn while it's armed.
 if (typeof window !== "undefined") {
   window.addEventListener("DOMContentLoaded", () => {
     setTimeout(_ensureOscConnection, 300);
+    const pill = document.getElementById("osc-pill");
+    if (pill) {
+      pill.addEventListener("click", (e) => {
+        if (e.shiftKey) {
+          e.preventDefault();
+          _toggleOscLearn();
+        } else {
+          // Bare click currently just triggers a re-connect attempt
+          // (helpful when the daemon was started AFTER the editor
+          // page loaded). A more elaborate config modal could land
+          // here in a follow-up.
+          _ensureOscConnection();
+        }
+      });
+    }
+    window.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && _oscState.learnArmed) {
+        _oscState.learnArmed = false;
+        _updateOscPill();
+      }
+    });
   });
 }
 
