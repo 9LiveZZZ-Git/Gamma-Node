@@ -17230,6 +17230,414 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     description: "Blur — 13-tap radial Gaussian approximation in one pass. inLayer: source display index. radius: blur radius in framebuffer pixels (~95% quality of true separable 2-pass Gaussian for typical screensaver radii; one pass keeps it cheap)."
   },
 
+  /* =========================================================================
+   * v0.3.24 — Fusion-inspired video-edit suite, sprint 1: Transform.
+   *
+   * Four composition shader-frag nodes that match Fusion's Transform
+   * category. All use bindLayout: "composition" + textureInputSlots
+   * pattern -- standard 1-texture-in / 1-texture-out shape, the `in`
+   * port's framebuffer layer auto-resolves into params.x (inLayer)
+   * at render time (see _resolveTextureInputLayer).
+   *
+   * Identity-default convention: every param's default value yields
+   * pass-through behavior when first dropped. Lets a user mid-chain
+   * insert a Transform without breaking the existing look until they
+   * touch a slider. Documented in ROADMAP §5.2 design conventions.
+   * ======================================================================== */
+
+  /* Transform — Fusion DVE. Translate / rotate / scale around an
+   * anchor, with four edge modes for out-of-bounds samples. */
+  Transform: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "in",         t: "texture" },
+      { n: "rotateDeg",  t: "param" },
+      { n: "scaleX",     t: "param" },
+      { n: "scaleY",     t: "param" },
+      { n: "anchorX",    t: "param" },
+      { n: "anchorY",    t: "param" },
+      { n: "translateX", t: "param" },
+      { n: "translateY", t: "param" },
+      { n: "edgeMode",   t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16 },
+    paramOptions: { edgeMode: ["clamp", "wrap", "black", "mirror"] },
+    params: {
+      inLayer: 0,
+      rotateDeg: 0,
+      scaleX: 1.0, scaleY: 1.0,
+      anchorX: 0.5, anchorY: 0.5,
+      translateX: 0.0, translateY: 0.0,
+      edgeMode: 0
+    },
+    methods: {},
+    uniformBytes: 112,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inLayer, y=rotateDeg, z=scaleX, w=scaleY
+  params2:       vec4f,    // x=anchorX, y=anchorY, z=translateX, w=translateY
+  params3:       vec4f,    // x=edgeMode, yzw=_
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+// Mirror-repeat for one axis: maps any real value into [0, 1] with a
+// triangle wave (period 2, reflects at integer boundaries).
+fn mirror_uv(uv: vec2f) -> vec2f {
+  let m = uv - 2.0 * floor(uv * 0.5);   // mod 2 -> [0, 2)
+  return select(m, 2.0 - m, m > vec2f(1.0));
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layer       = u32(max(0.0, u.params.x));
+  let rot_rad     = -u.params.y * 0.01745329;       // negate: inverse-map output -> input
+  let scale       = vec2f(max(u.params.z, 0.0001), max(u.params.w, 0.0001));
+  let anchor      = vec2f(u.params2.x, u.params2.y);
+  let translate   = vec2f(u.params2.z, u.params2.w);
+  let edge        = i32(u.params3.x + 0.5);
+
+  // Inverse-map: shift to anchor, undo translate, rotate by -theta,
+  // undo scale, shift back. Output uv -> source uv.
+  var p = in.uv - anchor;
+  p = p - translate;
+  let cr = cos(rot_rad); let sr = sin(rot_rad);
+  let pr = vec2f(cr * p.x - sr * p.y, sr * p.x + cr * p.y);
+  let ps = pr / scale;
+  var sample_uv = ps + anchor;
+
+  // Edge handling. edge=0 clamp, 1 wrap, 2 black, 3 mirror.
+  let outside = sample_uv.x < 0.0 || sample_uv.x > 1.0 ||
+                sample_uv.y < 0.0 || sample_uv.y > 1.0;
+  if (outside) {
+    if (edge == 1) {
+      sample_uv = sample_uv - floor(sample_uv);
+    } else if (edge == 2) {
+      return vec4f(0.0, 0.0, 0.0, 0.0);
+    } else if (edge == 3) {
+      sample_uv = mirror_uv(sample_uv);
+    } else {
+      sample_uv = clamp(sample_uv, vec2f(0.0), vec2f(1.0));
+    }
+  }
+  return textureSampleLevel(fbHistory, fbSampler, sample_uv, layer, 0.0);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inLayer    === "number") ? p.inLayer    : 0;
+      scratch[17] = (typeof p.rotateDeg  === "number") ? p.rotateDeg  : 0;
+      scratch[18] = (typeof p.scaleX     === "number") ? p.scaleX     : 1.0;
+      scratch[19] = (typeof p.scaleY     === "number") ? p.scaleY     : 1.0;
+      scratch[20] = (typeof p.anchorX    === "number") ? p.anchorX    : 0.5;
+      scratch[21] = (typeof p.anchorY    === "number") ? p.anchorY    : 0.5;
+      scratch[22] = (typeof p.translateX === "number") ? p.translateX : 0.0;
+      scratch[23] = (typeof p.translateY === "number") ? p.translateY : 0.0;
+      scratch[24] = (typeof p.edgeMode   === "number") ? p.edgeMode   : 0;
+      scratch[25] = 0; scratch[26] = 0; scratch[27] = 0;
+    },
+    description: "Fusion DVE: translate, rotate, and scale the input around an anchor point. translateX/Y are in normalized [0, 1] framebuffer units (0.1 shifts 10% of frame width); rotateDeg is degrees CCW; scaleX/Y scale around anchor (1.0 = identity); anchorX/Y is the pivot in [0, 1] (default 0.5, 0.5 = center). edgeMode picks out-of-bounds behavior: clamp (edge pixels stretch), wrap (tile), black (transparent), mirror (reflect). All-default state is pass-through."
+  },
+
+  /* Crop — rect bounds in normalized UV. Outside the rect emits the
+   * configured bg color (transparent by default so a downstream
+   * BlendShader / Merge handles the composite cleanly). Softness
+   * feathers the rect edges over a normalized falloff distance. */
+  Crop: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "in",       t: "texture" },
+      { n: "cropX",    t: "param" },
+      { n: "cropY",    t: "param" },
+      { n: "cropW",    t: "param" },
+      { n: "cropH",    t: "param" },
+      { n: "softness", t: "param" },
+      { n: "bgR",      t: "param" },
+      { n: "bgG",      t: "param" },
+      { n: "bgB",      t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16 },
+    params: {
+      inLayer: 0,
+      cropX: 0.0, cropY: 0.0,
+      cropW: 1.0, cropH: 1.0,
+      softness: 0.0,
+      bgR: 0.0, bgG: 0.0, bgB: 0.0
+    },
+    methods: {},
+    uniformBytes: 112,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inLayer, y=cropX, z=cropY, w=cropW
+  params2:       vec4f,    // x=cropH, y=softness, zw=_
+  params3:       vec4f,    // x=bgR, y=bgG, z=bgB, w=_
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layer    = u32(max(0.0, u.params.x));
+  let cx       = u.params.y;
+  let cy       = u.params.z;
+  let cw       = u.params.w;
+  let ch       = u.params2.x;
+  let softness = max(u.params2.y, 0.0001);   // tiny floor so smoothstep stays well-defined when soft=0
+
+  let uv = in.uv;
+  // Distance from each edge (normalized to softness). Inside = positive.
+  let dx_left  = (uv.x - cx) / softness;
+  let dx_right = (cx + cw - uv.x) / softness;
+  let dy_top   = (uv.y - cy) / softness;
+  let dy_bot   = (cy + ch - uv.y) / softness;
+  // smoothstep falls to 0 at the edge; product gives a single mask
+  // value that's 1 inside, 0 outside, smooth at the boundary.
+  let fx = smoothstep(0.0, 1.0, min(dx_left, dx_right));
+  let fy = smoothstep(0.0, 1.0, min(dy_top, dy_bot));
+  let mask = clamp(fx * fy, 0.0, 1.0);
+
+  let c  = textureSampleLevel(fbHistory, fbSampler, uv, layer, 0.0);
+  // Bg alpha follows the mask inverse so the cropped region punches
+  // through to alpha=0 (transparent) -- BlendShader composite friendly.
+  let bg = vec4f(u.params3.x, u.params3.y, u.params3.z, 0.0);
+  return mix(bg, c, mask);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inLayer  === "number") ? p.inLayer  : 0;
+      scratch[17] = (typeof p.cropX    === "number") ? p.cropX    : 0.0;
+      scratch[18] = (typeof p.cropY    === "number") ? p.cropY    : 0.0;
+      scratch[19] = (typeof p.cropW    === "number") ? p.cropW    : 1.0;
+      scratch[20] = (typeof p.cropH    === "number") ? p.cropH    : 1.0;
+      scratch[21] = (typeof p.softness === "number") ? p.softness : 0.0;
+      scratch[22] = 0; scratch[23] = 0;
+      scratch[24] = (typeof p.bgR      === "number") ? p.bgR      : 0.0;
+      scratch[25] = (typeof p.bgG      === "number") ? p.bgG      : 0.0;
+      scratch[26] = (typeof p.bgB      === "number") ? p.bgB      : 0.0;
+      scratch[27] = 0;
+    },
+    description: "Fusion Crop: rect bounds in normalized [0, 1] UV. Inside the rect samples the input; outside emits the configured bg color with alpha=0 (transparent so a downstream BlendShader composites cleanly). cropX/Y is the top-left corner; cropW/H is the rect size. softness feathers the rect edges over a normalized falloff distance (0 = hard edges; 0.05 ~= ~5% of frame width feather). Default rect 0,0,1,1 is pass-through."
+  },
+
+  /* Letterbox — fit input to a target aspect ratio inside the framebuffer.
+   * Pillarbox (vertical bars) when target_aspect < framebuffer_aspect;
+   * letterbox (horizontal bars) when >. Bars take a user color. The input
+   * gets stretched into the target rect at full UV [0, 1]. */
+  Letterbox: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "in",      t: "texture" },
+      { n: "aspectW", t: "param" },
+      { n: "aspectH", t: "param" },
+      { n: "barR",    t: "param" },
+      { n: "barG",    t: "param" },
+      { n: "barB",    t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16 },
+    params: {
+      inLayer: 0,
+      aspectW: 16, aspectH: 9,
+      barR: 0.0, barG: 0.0, barB: 0.0
+    },
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inLayer, y=aspectW, z=aspectH, w=_
+  bar:           vec4f,    // x=R, y=G, z=B, w=_
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layer    = u32(max(0.0, u.params.x));
+  let aw       = max(u.params.y, 0.001);
+  let ah       = max(u.params.z, 0.001);
+  let target_ar = aw / ah;
+  let fb_ar    = u.u_resolution.x / max(u.u_resolution.y, 0.001);
+
+  // Centered rect with target aspect, contained inside the framebuffer.
+  var rect_w = 1.0;
+  var rect_h = 1.0;
+  if (fb_ar > target_ar) {
+    // Framebuffer is wider than target -- pillarbox.
+    rect_w = target_ar / fb_ar;
+  } else {
+    // Framebuffer is taller -- letterbox.
+    rect_h = fb_ar / target_ar;
+  }
+  let rect_x = (1.0 - rect_w) * 0.5;
+  let rect_y = (1.0 - rect_h) * 0.5;
+
+  let uv = in.uv;
+  if (uv.x < rect_x || uv.x > rect_x + rect_w ||
+      uv.y < rect_y || uv.y > rect_y + rect_h) {
+    return vec4f(u.bar.x, u.bar.y, u.bar.z, 1.0);
+  }
+  // Inside: remap uv to full [0, 1] across the rect and sample.
+  let in_uv = vec2f((uv.x - rect_x) / rect_w, (uv.y - rect_y) / rect_h);
+  return textureSampleLevel(fbHistory, fbSampler, in_uv, layer, 0.0);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inLayer === "number") ? p.inLayer : 0;
+      scratch[17] = (typeof p.aspectW === "number") ? p.aspectW : 16;
+      scratch[18] = (typeof p.aspectH === "number") ? p.aspectH : 9;
+      scratch[19] = 0;
+      scratch[20] = (typeof p.barR    === "number") ? p.barR    : 0.0;
+      scratch[21] = (typeof p.barG    === "number") ? p.barG    : 0.0;
+      scratch[22] = (typeof p.barB    === "number") ? p.barB    : 0.0;
+      scratch[23] = 0;
+    },
+    description: "Fusion Letterbox: contain-fit the input into a target aspect ratio inside the framebuffer. When framebuffer is wider than target → pillarbox (vertical bars left+right); when taller → letterbox (horizontal bars top+bottom). aspectW/H express the target ratio (16, 9 = widescreen; 4, 3 = retro 4:3; 1, 1 = square). The input is stretched into the target rect at full UV [0, 1]. barR/G/B picks the bar color (default black)."
+  },
+
+  /* Resize — filter-mode picker for the sample step. Mostly useful as
+   * a "preserve pixel art through downstream linear-filter chains"
+   * helper: insert Resize(mode=nearest) after a Pixelate / low-res
+   * shader, then Blur / ColorCorrect downstream won't smear the
+   * chunky pixels into smooth gradients. Doesn't change resolution
+   * (the framebuffer array is fixed-size) -- just affects sampler
+   * behavior at this point in the chain. */
+  Resize: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "in",   t: "texture" },
+      { n: "mode", t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16 },
+    paramOptions: { mode: ["linear", "nearest"] },
+    params: { inLayer: 0, mode: 0 },
+    methods: {},
+    uniformBytes: 80,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inLayer, y=mode (0=linear, 1=nearest), zw=_
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layer = u32(max(0.0, u.params.x));
+  let mode  = u32(u.params.y + 0.5);
+  var uv    = in.uv;
+  if (mode == 1u) {
+    // Nearest-neighbor: snap to texel center. The fbSampler is set
+    // up linear, but snapping the UV gives the same result as a
+    // nearest filter (the sampled point lands exactly on a texel
+    // center so linear interpolation degenerates to picking that
+    // texel's value).
+    let texel = vec2f(1.0) / max(u.u_resolution.xy, vec2f(1.0));
+    uv = (floor(uv / texel) + vec2f(0.5)) * texel;
+  }
+  return textureSampleLevel(fbHistory, fbSampler, uv, layer, 0.0);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inLayer === "number") ? p.inLayer : 0;
+      scratch[17] = (typeof p.mode    === "number") ? p.mode    : 0;
+      scratch[18] = 0; scratch[19] = 0;
+    },
+    description: "Fusion Resize (filter mode picker). Doesn't resample — the framebuffer array is fixed-resolution — but lets the chain swap between linear (default smooth filtering) and nearest (snap-to-texel, preserves pixel art through downstream linear-filter chains). Useful as a chain stabilizer: Pixelate → Resize(nearest) → Blur keeps the chunky pixels readable after blur, vs Pixelate → Blur which smears the pixel grid into mush."
+  },
+
   /* ---- B1: Math, single-arg trig (cmath) ---- */
   Sin:    { category: "Math", color: COLOR.math, header: "cmath", cppType: "", ins: [{n:"in", t:"audio"}], outs: [{n:"out", t:"audio"}], params: {}, template: "sinf({in})",   description: "sin(x), x in radians" },
   Cos:    { category: "Math", color: COLOR.math, header: "cmath", cppType: "", ins: [{n:"in", t:"audio"}], outs: [{n:"out", t:"audio"}], params: {}, template: "cosf({in})",   description: "cos(x), x in radians" },
