@@ -18249,6 +18249,785 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   },
 
   /* =========================================================================
+   * v0.3.36 -- Video-edit suite, sprint 4: Effect / Stylize.
+   *
+   * Seven composition shader-frag nodes covering the "give me a look"
+   * stylize category. All single-pass, identity-default state is
+   * pass-through across the board (per the design conventions in
+   * ROADMAP §5.2). Math choices are principled where it matters
+   * (proper sRGB gamma on color-grading paths, physically-motivated
+   * radial falloffs on lens-mimicking nodes); cheap approximations
+   * only where the visual difference is imperceptible.
+   * ======================================================================== */
+
+  /* Vignette -- radial darkening, photography-style. Distance from
+   * a configurable center, smoothstep falloff with controllable
+   * radius + softness + intensity. Roundness param interpolates
+   * between true-circle (0) and "extended/squarish" (1) falloff
+   * via an Lp-norm trick. Color param controls what the picture
+   * darkens TO (black by default; warm grey or cool blue for
+   * cinematic looks). */
+  Vignette: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "in",        t: "texture" },
+      { n: "centerX",   t: "param" },
+      { n: "centerY",   t: "param" },
+      { n: "radius",    t: "param" },
+      { n: "softness",  t: "param" },
+      { n: "intensity", t: "param" },
+      { n: "roundness", t: "param" },
+      { n: "colorR",    t: "param" },
+      { n: "colorG",    t: "param" },
+      { n: "colorB",    t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16 },
+    params: {
+      inLayer: 0,
+      centerX: 0.5, centerY: 0.5,
+      radius: 0.7,
+      softness: 0.4,
+      intensity: 0.0,    // 0 = pass-through; identity default
+      roundness: 0.0,    // 0 = circle (Euclidean), 1 = squarish (Lp norm with p=4)
+      colorR: 0.0, colorG: 0.0, colorB: 0.0
+    },
+    methods: {},
+    uniformBytes: 112,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inLayer, y=centerX, z=centerY, w=radius
+  params2:       vec4f,    // x=softness, y=intensity, z=roundness, w=_
+  params3:       vec4f,    // x=colorR, y=colorG, z=colorB, w=_
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layer = u32(max(0.0, u.params.x));
+  let cx    = u.params.y;
+  let cy    = u.params.z;
+  let r     = max(u.params.w, 0.001);
+  let soft  = max(u.params2.x, 0.001);
+  let amt   = clamp(u.params2.y, 0.0, 1.0);
+  let round = clamp(u.params2.z, 0.0, 1.0);
+
+  let c = textureSampleLevel(fbHistory, fbSampler, in.uv, layer, 0.0);
+
+  // Distance from center, with aspect correction so a circle on a
+  // 16:9 framebuffer is a true circle not an ellipse. delta is in
+  // square-pixel units relative to height.
+  let aspect = u.u_resolution.x / max(u.u_resolution.y, 1.0);
+  let delta = (in.uv - vec2f(cx, cy)) * vec2f(aspect, 1.0);
+  // Lp-norm distance: p=2 (Euclidean circle) when round=0, p=4
+  // (squarish corner) when round=1. Linearly interpolating the
+  // exponent gives a clean roundness slider.
+  let p_exp = mix(2.0, 4.0, round);
+  let dist = pow(pow(abs(delta.x), p_exp) + pow(abs(delta.y), p_exp), 1.0 / p_exp);
+
+  // Smoothstep darken: 0 inside the radius, ramping to 1 over soft.
+  let v = smoothstep(r, r + soft, dist) * amt;
+  let vig_color = vec3f(u.params3.x, u.params3.y, u.params3.z);
+  let out_c = mix(c.rgb, vig_color, v);
+  return vec4f(out_c, c.a);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inLayer   === "number") ? p.inLayer   : 0;
+      scratch[17] = (typeof p.centerX   === "number") ? p.centerX   : 0.5;
+      scratch[18] = (typeof p.centerY   === "number") ? p.centerY   : 0.5;
+      scratch[19] = (typeof p.radius    === "number") ? p.radius    : 0.7;
+      scratch[20] = (typeof p.softness  === "number") ? p.softness  : 0.4;
+      scratch[21] = (typeof p.intensity === "number") ? p.intensity : 0.0;
+      scratch[22] = (typeof p.roundness === "number") ? p.roundness : 0.0;
+      scratch[23] = 0;
+      scratch[24] = (typeof p.colorR    === "number") ? p.colorR    : 0.0;
+      scratch[25] = (typeof p.colorG    === "number") ? p.colorG    : 0.0;
+      scratch[26] = (typeof p.colorB    === "number") ? p.colorB    : 0.0;
+      scratch[27] = 0;
+    },
+    description: "Photographic vignette — radial darkening (or color shift) toward the corners. centerX/Y: vignette center in [0,1] UV (default 0.5, 0.5). radius: inner edge of falloff (within this distance, image is untouched). softness: width of the smoothstep falloff. intensity: 0 = pass-through (identity), 1 = full darken to colorRGB at the corners. roundness: 0 = true circle (aspect-corrected so it's circular on widescreen framebuffers, not elliptical), 1 = squarish Lp-norm shape (extended into corners). colorR/G/B: what the picture darkens TO (default black; warm grey for cinematic, dark blue for night-look)."
+  },
+
+  /* ChromaticAberration -- radial RGB channel separation. Models lens
+   * dispersion: red light bends less than blue, so red goes outward
+   * and blue goes inward relative to the optical axis (center). The
+   * effect grows with distance from center (no aberration at the
+   * sweet spot, maximum at the edges) following a power curve. */
+  ChromaticAberration: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "in",            t: "texture" },
+      { n: "amount",        t: "param" },
+      { n: "falloffPower",  t: "param" },
+      { n: "centerX",       t: "param" },
+      { n: "centerY",       t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16 },
+    params: {
+      inLayer: 0,
+      amount: 0.0,        // 0 = identity; ~0.01 subtle, ~0.05 noticeable, ~0.15 pronounced
+      falloffPower: 2.0,  // distance^p: 2 = quadratic (physical lens), 1 = linear, 4 = sharper at edges
+      centerX: 0.5, centerY: 0.5
+    },
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inLayer, y=amount, z=falloffPower, w=_
+  params2:       vec4f,    // x=centerX, y=centerY, zw=_
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layer  = u32(max(0.0, u.params.x));
+  let amount = u.params.y;
+  let pow_x  = max(u.params.z, 0.1);
+  let cx     = u.params2.x;
+  let cy     = u.params2.y;
+
+  if (abs(amount) < 0.0001) {
+    return textureSampleLevel(fbHistory, fbSampler, in.uv, layer, 0.0);
+  }
+
+  // Radial direction from center to this fragment.
+  let centered = in.uv - vec2f(cx, cy);
+  let dist = length(centered);
+  // Falloff: 0 at center, 1 at distance 0.7 (~corner of normalized
+  // square). Power curve gives finer control over edge falloff.
+  let falloff = pow(min(dist / 0.7, 1.0), pow_x);
+  // Direction unit vector (safe at center via small epsilon).
+  let dir = centered / max(dist, 1e-6);
+  // Per-channel offset: R outward, B inward, G centered.
+  let off_r =  dir * amount * falloff;
+  let off_b = -dir * amount * falloff;
+
+  let r = textureSampleLevel(fbHistory, fbSampler, in.uv + off_r, layer, 0.0).r;
+  let g = textureSampleLevel(fbHistory, fbSampler, in.uv,         layer, 0.0).g;
+  let b = textureSampleLevel(fbHistory, fbSampler, in.uv + off_b, layer, 0.0).b;
+  let a = textureSampleLevel(fbHistory, fbSampler, in.uv,         layer, 0.0).a;
+  return vec4f(r, g, b, a);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inLayer       === "number") ? p.inLayer       : 0;
+      scratch[17] = (typeof p.amount        === "number") ? p.amount        : 0.0;
+      scratch[18] = (typeof p.falloffPower  === "number") ? p.falloffPower  : 2.0;
+      scratch[19] = 0;
+      scratch[20] = (typeof p.centerX       === "number") ? p.centerX       : 0.5;
+      scratch[21] = (typeof p.centerY       === "number") ? p.centerY       : 0.5;
+      scratch[22] = 0; scratch[23] = 0;
+    },
+    description: "Radial chromatic aberration — models lens dispersion. Red shifts outward, blue inward; green stays at the unshifted position. amount: maximum offset in normalized UV (0 = pass-through; 0.01 subtle, 0.05 noticeable, 0.15 pronounced). falloffPower: distance^p shape (2 = quadratic / physically motivated, 1 = linear, 4 = sharper edge-only). centerX/Y: optical axis (default 0.5, 0.5 = frame center). Identity at amount=0."
+  },
+
+  /* FilmGrain -- animated procedural noise. Hash-based per-pixel
+   * dither at the OUTPUT framebuffer resolution scaled to a
+   * configurable cell size, animated via u.u_time. Optional
+   * luminance-weighted strength (more grain in shadows than
+   * highlights, mimicking real silver-halide film). Chroma /
+   * mono mix controls whether the grain is monochromatic
+   * (single noise value applied to all 3 channels) or chromatic
+   * (independent noise per channel; reads as colored speckle). */
+  FilmGrain: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "in",                t: "texture" },
+      { n: "amount",            t: "param" },
+      { n: "grainSize",         t: "param" },
+      { n: "chromaMix",         t: "param" },
+      { n: "speed",             t: "param" },
+      { n: "luminanceWeight",   t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16 },
+    params: {
+      inLayer: 0,
+      amount: 0.0,           // 0 = identity; 0.05 subtle, 0.15 noticeable, 0.3 heavy
+      grainSize: 1.5,        // grain cell size in framebuffer pixels (1 = per-pixel, 3 = chunky)
+      chromaMix: 0.3,        // 0 = pure mono noise, 1 = full chromatic noise
+      speed: 24.0,           // animation rate (frames-per-second feel; 24 = filmic)
+      luminanceWeight: 0.6   // 0 = uniform grain, 1 = much more grain in shadows
+    },
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inLayer, y=amount, z=grainSize, w=chromaMix
+  params2:       vec4f,    // x=speed, y=luminanceWeight, zw=_
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+// 3D hash for animated grain. The 3rd dimension is time (in
+// quantized frame steps) so the grain re-shuffles per frame.
+// Triple-prime constants for good distribution.
+fn hash13(p: vec3f) -> f32 {
+  return fract(sin(dot(p, vec3f(127.1, 311.7, 74.7))) * 43758.5453);
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layer       = u32(max(0.0, u.params.x));
+  let amount      = u.params.y;
+  let grain_size  = max(u.params.z, 0.5);
+  let chroma_mix  = clamp(u.params.w, 0.0, 1.0);
+  let speed       = max(u.params2.x, 0.1);
+  let lum_weight  = clamp(u.params2.y, 0.0, 1.0);
+
+  let c = textureSampleLevel(fbHistory, fbSampler, in.uv, layer, 0.0);
+  if (abs(amount) < 0.0001) { return c; }
+
+  // Quantize the UV to grain cells. Cell size in framebuffer pixels.
+  let cell_uv = floor(in.uv * u.u_resolution.xy / grain_size);
+  // Time step: u.u_time * speed, floored to discrete "film frames".
+  let t_step = floor(u.u_time * speed);
+
+  // Mono noise (single value per cell).
+  let n_mono = hash13(vec3f(cell_uv.x, cell_uv.y, t_step)) - 0.5;
+  // Chroma noise (per-channel independent).
+  let n_r = hash13(vec3f(cell_uv.x, cell_uv.y, t_step +   1.7)) - 0.5;
+  let n_g = hash13(vec3f(cell_uv.x, cell_uv.y, t_step +   3.3)) - 0.5;
+  let n_b = hash13(vec3f(cell_uv.x, cell_uv.y, t_step +   7.1)) - 0.5;
+  let n_chroma = vec3f(n_r, n_g, n_b);
+  let n = mix(vec3f(n_mono), n_chroma, chroma_mix);
+
+  // Luminance weighting: shadows get more grain than highlights
+  // (real film's grain visibility curve). lum_weight=0 disables.
+  let lum = dot(c.rgb, vec3f(0.2126, 0.7152, 0.0722));
+  let lum_mod = mix(1.0, 1.0 - 0.7 * lum, lum_weight);
+
+  let out_rgb = c.rgb + n * amount * lum_mod;
+  return vec4f(clamp(out_rgb, vec3f(0.0), vec3f(1.0)), c.a);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inLayer          === "number") ? p.inLayer          : 0;
+      scratch[17] = (typeof p.amount           === "number") ? p.amount           : 0.0;
+      scratch[18] = (typeof p.grainSize        === "number") ? p.grainSize        : 1.5;
+      scratch[19] = (typeof p.chromaMix        === "number") ? p.chromaMix        : 0.3;
+      scratch[20] = (typeof p.speed            === "number") ? p.speed            : 24.0;
+      scratch[21] = (typeof p.luminanceWeight  === "number") ? p.luminanceWeight  : 0.6;
+      scratch[22] = 0; scratch[23] = 0;
+    },
+    description: "Animated film grain. Hash-based noise quantized to configurable cell size, re-shuffled per discrete time step (mimics film's per-frame grain pattern). amount: noise intensity (0 = identity, 0.05 subtle, 0.15 noticeable, 0.3 heavy). grainSize: grain cell in framebuffer pixels (1 = per-pixel chatter, 3 = chunky, 6 = visible grain spots). chromaMix: 0 = monochromatic (same noise to all channels), 1 = independent per-channel (colored speckle). speed: animation rate in frames-per-second feel (24 = filmic motion-picture). luminanceWeight: shadows get more grain than highlights (mimics real silver-halide film's grain visibility curve); 0 = uniform, 1 = strong shadow-bias."
+  },
+
+  /* HotSpot -- lens flare anchor. A bright point with radial
+   * gaussian falloff plus an optional anamorphic horizontal streak
+   * (the "blue beam" from sci-fi lens flares). Composed ADDITIVELY
+   * over the input -- intended to be wired AFTER a darker pass so
+   * the flare reads as light. Doesn't sample the input at offsets;
+   * just adds a procedural flare to the existing color. */
+  HotSpot: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "in",              t: "texture" },
+      { n: "centerX",         t: "param" },
+      { n: "centerY",         t: "param" },
+      { n: "coreRadius",      t: "param" },
+      { n: "intensity",       t: "param" },
+      { n: "colorR",          t: "param" },
+      { n: "colorG",          t: "param" },
+      { n: "colorB",          t: "param" },
+      { n: "spikeAngle",      t: "param" },
+      { n: "spikeLength",     t: "param" },
+      { n: "spikeIntensity",  t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16 },
+    params: {
+      inLayer: 0,
+      centerX: 0.5, centerY: 0.5,
+      coreRadius: 0.05,
+      intensity: 0.0,       // 0 = identity
+      colorR: 1.0, colorG: 0.85, colorB: 0.6,   // warm white-ish (sun)
+      spikeAngle: 0.0,      // degrees; 0 = horizontal anamorphic streak
+      spikeLength: 0.4,
+      spikeIntensity: 0.7
+    },
+    methods: {},
+    uniformBytes: 128,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inLayer, y=centerX, z=centerY, w=coreRadius
+  params2:       vec4f,    // x=intensity, y=colorR, z=colorG, w=colorB
+  params3:       vec4f,    // x=spikeAngle (deg), y=spikeLength, z=spikeIntensity, w=_
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layer   = u32(max(0.0, u.params.x));
+  let cx      = u.params.y;
+  let cy      = u.params.z;
+  let core_r  = max(u.params.w, 0.001);
+  let amt     = max(u.params2.x, 0.0);
+  let flare_c = vec3f(u.params2.y, u.params2.z, u.params2.w);
+  let spike_deg     = u.params3.x;
+  let spike_len     = max(u.params3.y, 0.001);
+  let spike_int     = max(u.params3.z, 0.0);
+
+  let c = textureSampleLevel(fbHistory, fbSampler, in.uv, layer, 0.0);
+  if (amt < 0.0001) { return c; }
+
+  // Aspect-correct distance from center so the core is circular.
+  let aspect = u.u_resolution.x / max(u.u_resolution.y, 1.0);
+  let centered = (in.uv - vec2f(cx, cy)) * vec2f(aspect, 1.0);
+
+  // Gaussian core. Power-2 falloff at distance / core_r.
+  let core_d = length(centered) / core_r;
+  let core_gauss = exp(-core_d * core_d);
+
+  // Anamorphic streak: rotate the fragment into spike-local space,
+  // gaussian falloff along the perpendicular axis (sharp streak),
+  // exponential falloff along the parallel axis (long beam).
+  let ang = spike_deg * 0.01745329;
+  let cs = cos(ang); let sn = sin(ang);
+  let local = vec2f(cs * centered.x + sn * centered.y,
+                   -sn * centered.x + cs * centered.y);
+  // streak: thin in y (perpendicular), long in x (parallel)
+  let streak_perp = local.y / 0.01;         // 0.01 = streak thinness
+  let streak_par  = local.x / spike_len;
+  let streak = exp(-streak_perp * streak_perp) * exp(-streak_par * streak_par * 0.3);
+
+  let flare = flare_c * (core_gauss + streak * spike_int) * amt;
+  return vec4f(c.rgb + flare, c.a);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inLayer         === "number") ? p.inLayer         : 0;
+      scratch[17] = (typeof p.centerX         === "number") ? p.centerX         : 0.5;
+      scratch[18] = (typeof p.centerY         === "number") ? p.centerY         : 0.5;
+      scratch[19] = (typeof p.coreRadius      === "number") ? p.coreRadius      : 0.05;
+      scratch[20] = (typeof p.intensity       === "number") ? p.intensity       : 0.0;
+      scratch[21] = (typeof p.colorR          === "number") ? p.colorR          : 1.0;
+      scratch[22] = (typeof p.colorG          === "number") ? p.colorG          : 0.85;
+      scratch[23] = (typeof p.colorB          === "number") ? p.colorB          : 0.6;
+      scratch[24] = (typeof p.spikeAngle      === "number") ? p.spikeAngle      : 0.0;
+      scratch[25] = (typeof p.spikeLength     === "number") ? p.spikeLength     : 0.4;
+      scratch[26] = (typeof p.spikeIntensity  === "number") ? p.spikeIntensity  : 0.7;
+      scratch[27] = 0;
+    },
+    description: "Lens flare anchor. Adds a bright point with gaussian core + optional anamorphic horizontal streak (the 'blue beam' from sci-fi lens flares) ADDITIVELY over the input. centerX/Y: flare position in UV. coreRadius: gaussian core size (0.05 = small bright sun, 0.2 = large sky glow). intensity: 0 = identity, 1 = full brightness. colorR/G/B: flare tint (default warm white = sun-like). spikeAngle: anamorphic streak angle in degrees (0 = horizontal). spikeLength: streak extent in normalized UV. spikeIntensity: streak brightness relative to the core. Identity at intensity=0."
+  },
+
+  /* LightRays -- crepuscular rays / god rays. Per-fragment march
+   * from this pixel back toward a source point, accumulating
+   * brightness with exponential decay along the way. Reads
+   * brightness from the upstream framebuffer at each step; bright
+   * areas near the light source contribute most. Classic post-FX
+   * approach (Mitchell 2007, Sousa 2008). */
+  LightRays: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "in",            t: "texture" },
+      { n: "centerX",       t: "param" },
+      { n: "centerY",       t: "param" },
+      { n: "intensity",     t: "param" },
+      { n: "decay",         t: "param" },
+      { n: "density",       t: "param" },
+      { n: "exposure",      t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16 },
+    params: {
+      inLayer: 0,
+      centerX: 0.5, centerY: 0.3,   // light source position (default upper-center for "sky")
+      intensity: 0.0,                // 0 = identity
+      decay: 0.96,                   // per-step brightness retention (closer to 1 = longer rays)
+      density: 0.9,                  // step length factor (1 = full distance, 0.5 = tighter samples)
+      exposure: 0.25                 // final composite scale on the ray accumulation
+    },
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inLayer, y=centerX, z=centerY, w=intensity
+  params2:       vec4f,    // x=decay, y=density, z=exposure, w=_
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layer    = u32(max(0.0, u.params.x));
+  let cx       = u.params.y;
+  let cy       = u.params.z;
+  let amt      = max(u.params.w, 0.0);
+  let decay    = clamp(u.params2.x, 0.0, 0.999);
+  let density  = clamp(u.params2.y, 0.05, 2.0);
+  let exposure = max(u.params2.z, 0.0);
+
+  let base = textureSampleLevel(fbHistory, fbSampler, in.uv, layer, 0.0);
+  if (amt < 0.0001) { return base; }
+
+  // Step from the fragment toward the light source. 32 samples is
+  // enough for smooth rays without obvious banding.
+  let NUM_SAMPLES: i32 = 32;
+  let n_f = f32(NUM_SAMPLES);
+  let center = vec2f(cx, cy);
+  let delta = (center - in.uv) * (density / n_f);
+
+  var uv = in.uv;
+  var illum = 1.0;
+  var acc = vec3f(0.0);
+  for (var i: i32 = 0; i < NUM_SAMPLES; i = i + 1) {
+    uv = uv + delta;
+    let s = textureSampleLevel(fbHistory, fbSampler, uv, layer, 0.0).rgb;
+    acc = acc + s * illum;
+    illum = illum * decay;
+  }
+  // Normalize by sample count + scale by exposure + intensity.
+  let rays = acc * (exposure / n_f);
+  return vec4f(base.rgb + rays * amt, base.a);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inLayer    === "number") ? p.inLayer    : 0;
+      scratch[17] = (typeof p.centerX    === "number") ? p.centerX    : 0.5;
+      scratch[18] = (typeof p.centerY    === "number") ? p.centerY    : 0.3;
+      scratch[19] = (typeof p.intensity  === "number") ? p.intensity  : 0.0;
+      scratch[20] = (typeof p.decay      === "number") ? p.decay      : 0.96;
+      scratch[21] = (typeof p.density    === "number") ? p.density    : 0.9;
+      scratch[22] = (typeof p.exposure   === "number") ? p.exposure   : 0.25;
+      scratch[23] = 0;
+    },
+    description: "Crepuscular rays / god rays — radial light scatter from a configurable source point. Per-fragment marches 32 samples back toward the source, accumulating brightness with exponential decay; bright areas near the source produce visible 'beams' through the rest of the frame. centerX/Y: light source UV (default 0.5, 0.3 = upper-center sky position). intensity: 0 = identity, 1 = full strength. decay: per-step brightness retention (0.96 = subtle long rays, 0.85 = sharper short rays). density: step length factor (1 = full march, 0.5 = tighter sampling near source). exposure: final composite scale. Best when upstream has high-contrast bright spots (sun, lit windows, plasma highlights) — the rays form from whatever is bright at each step's UV. ~32 texture samples per fragment when active."
+  },
+
+  /* Vortex -- radial twirl / swirl. Rotates the sample UV around
+   * a center by an angle that grows with distance from center,
+   * bounded by a falloff radius. Looks like swirling water or a
+   * black hole's accretion disk distortion. */
+  Vortex: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "in",        t: "texture" },
+      { n: "centerX",   t: "param" },
+      { n: "centerY",   t: "param" },
+      { n: "strength",  t: "param" },
+      { n: "radius",    t: "param" },
+      { n: "falloff",   t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16 },
+    params: {
+      inLayer: 0,
+      centerX: 0.5, centerY: 0.5,
+      strength: 0.0,    // 0 = identity; angle scale in radians
+      radius: 0.5,      // effect extent in normalized UV
+      falloff: 2.0      // power curve on the (1 - distance/radius) envelope (2 = smooth, 1 = linear)
+    },
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inLayer, y=centerX, z=centerY, w=strength
+  params2:       vec4f,    // x=radius, y=falloff, zw=_
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layer    = u32(max(0.0, u.params.x));
+  let cx       = u.params.y;
+  let cy       = u.params.z;
+  let strength = u.params.w;
+  let radius   = max(u.params2.x, 0.001);
+  let falloff  = max(u.params2.y, 0.1);
+
+  if (abs(strength) < 0.0001) {
+    return textureSampleLevel(fbHistory, fbSampler, in.uv, layer, 0.0);
+  }
+
+  // Aspect-correct centered coords so the swirl is circular.
+  let aspect = u.u_resolution.x / max(u.u_resolution.y, 1.0);
+  let centered = (in.uv - vec2f(cx, cy)) * vec2f(aspect, 1.0);
+  let dist = length(centered);
+
+  // Envelope: max rotation at center, falls to 0 at radius edge.
+  let env = pow(max(1.0 - dist / radius, 0.0), falloff);
+  let theta = strength * env;
+  let cs = cos(theta); let sn = sin(theta);
+
+  // Rotate the centered coord by -theta (inverse-mapping output -> input).
+  let rotated = vec2f(cs * centered.x - sn * centered.y,
+                      sn * centered.x + cs * centered.y);
+  // Un-aspect + re-translate to UV.
+  let sample_uv = rotated / vec2f(aspect, 1.0) + vec2f(cx, cy);
+
+  return textureSampleLevel(fbHistory, fbSampler, sample_uv, layer, 0.0);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inLayer   === "number") ? p.inLayer   : 0;
+      scratch[17] = (typeof p.centerX   === "number") ? p.centerX   : 0.5;
+      scratch[18] = (typeof p.centerY   === "number") ? p.centerY   : 0.5;
+      scratch[19] = (typeof p.strength  === "number") ? p.strength  : 0.0;
+      scratch[20] = (typeof p.radius    === "number") ? p.radius    : 0.5;
+      scratch[21] = (typeof p.falloff   === "number") ? p.falloff   : 2.0;
+      scratch[22] = 0; scratch[23] = 0;
+    },
+    description: "Radial twirl — rotates sample UV around a center by an angle that grows with distance, bounded by a falloff envelope. strength: max rotation in radians at the center (0 = identity; PI = half-turn; 4*PI = aggressive swirl). centerX/Y: swirl center. radius: effect extent in UV; beyond this distance the swirl tapers to 0. falloff: power curve on the (1 - d/r) envelope (2 = smooth, 1 = linear, 4 = sharp center). Wire MasterClock.phase * 4 → strength for continuous rotation; clock.bar → strength for rhythmic swirls."
+  },
+
+  /* PseudoColor -- luma-driven gradient remap. Maps grayscale
+   * luminance through a 3-stop gradient (shadow / mid / highlight)
+   * to produce false-color looks. midpoint param adjusts where
+   * the mid color sits on the 0..1 luma axis. Useful for
+   * heat-map / thermal / infrared / hot-cold visualizations. */
+  PseudoColor: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "in",         t: "texture" },
+      { n: "shadowR",    t: "param" },
+      { n: "shadowG",    t: "param" },
+      { n: "shadowB",    t: "param" },
+      { n: "midR",       t: "param" },
+      { n: "midG",       t: "param" },
+      { n: "midB",       t: "param" },
+      { n: "highR",      t: "param" },
+      { n: "highG",      t: "param" },
+      { n: "highB",      t: "param" },
+      { n: "midpoint",   t: "param" },
+      { n: "mix",        t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16 },
+    params: {
+      inLayer: 0,
+      // Default = "thermal/infrared" preset: deep blue -> magenta -> warm yellow.
+      shadowR: 0.0, shadowG: 0.0, shadowB: 0.3,
+      midR:    0.7, midG:    0.0, midB:    0.5,
+      highR:   1.0, highG:   0.9, highB:   0.2,
+      midpoint: 0.5,
+      mix: 0.0           // 0 = identity (pass through original); 1 = full pseudo-color remap
+    },
+    methods: {},
+    uniformBytes: 128,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inLayer, y=shadowR, z=shadowG, w=shadowB
+  params2:       vec4f,    // x=midR, y=midG, z=midB, w=highR
+  params3:       vec4f,    // x=highG, y=highB, z=midpoint, w=mix
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layer    = u32(max(0.0, u.params.x));
+  let shadow_c = vec3f(u.params.y,  u.params.z,  u.params.w);
+  let mid_c    = vec3f(u.params2.x, u.params2.y, u.params2.z);
+  let high_c   = vec3f(u.params2.w, u.params3.x, u.params3.y);
+  let midpt    = clamp(u.params3.z, 0.05, 0.95);
+  let amt      = clamp(u.params3.w, 0.0, 1.0);
+
+  let c = textureSampleLevel(fbHistory, fbSampler, in.uv, layer, 0.0);
+  if (amt < 0.0001) { return c; }
+
+  // Rec.709 luminance.
+  let lum = clamp(dot(c.rgb, vec3f(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
+
+  // Piecewise interpolation between (shadow, mid, high) anchored at
+  // (0, midpt, 1). Smoothstep gives the bands a soft transition.
+  var remap: vec3f;
+  if (lum < midpt) {
+    let t = lum / max(midpt, 0.0001);
+    remap = mix(shadow_c, mid_c, smoothstep(0.0, 1.0, t));
+  } else {
+    let t = (lum - midpt) / max(1.0 - midpt, 0.0001);
+    remap = mix(mid_c, high_c, smoothstep(0.0, 1.0, t));
+  }
+  return vec4f(mix(c.rgb, remap, amt), c.a);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inLayer  === "number") ? p.inLayer  : 0;
+      scratch[17] = (typeof p.shadowR  === "number") ? p.shadowR  : 0.0;
+      scratch[18] = (typeof p.shadowG  === "number") ? p.shadowG  : 0.0;
+      scratch[19] = (typeof p.shadowB  === "number") ? p.shadowB  : 0.3;
+      scratch[20] = (typeof p.midR     === "number") ? p.midR     : 0.7;
+      scratch[21] = (typeof p.midG     === "number") ? p.midG     : 0.0;
+      scratch[22] = (typeof p.midB     === "number") ? p.midB     : 0.5;
+      scratch[23] = (typeof p.highR    === "number") ? p.highR    : 1.0;
+      scratch[24] = (typeof p.highG    === "number") ? p.highG    : 0.9;
+      scratch[25] = (typeof p.highB    === "number") ? p.highB    : 0.2;
+      scratch[26] = (typeof p.midpoint === "number") ? p.midpoint : 0.5;
+      scratch[27] = (typeof p.mix      === "number") ? p.mix      : 0.0;
+    },
+    description: "Luma-driven false-color remap (thermal / infrared / heat-map looks). Maps Rec.709 luminance through a 3-stop gradient: shadow color at luma=0, mid color at luma=midpoint, high color at luma=1, with smoothstep transitions between bands. mix: 0 = identity (pass-through), 1 = full remap. Default palette is a thermal-IR preset: deep blue shadows → magenta midtones → warm yellow highlights. For sepia: shadow=(0.3, 0.1, 0.05), mid=(0.7, 0.5, 0.3), high=(1.0, 0.95, 0.8). For X-ray: invert luma upstream then remap with shadow=black, mid=cyan, high=white. midpoint shifts where the mid color anchors on the 0..1 luma axis."
+  },
+
+  /* =========================================================================
    * v0.3.24 — Video-edit suite, sprint 1: Transform.
    *
    * Four composition shader-frag nodes covering the basic 2D transform
