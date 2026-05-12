@@ -33568,13 +33568,20 @@ async function _ensureVideoFile(nodeId, params) {
     entry = null;
   }
   if (entry) return entry;
+  // v0.3.14 — silent no-op when fileUrl is empty. The previous behaviour
+  // logged a noisy "fileUrl is empty" error every render frame the user
+  // had a VideoFile with no file picked yet. Now we just leave the node
+  // unregistered; downstream landmarks treat "no _videoSources entry"
+  // as "no upstream" + fall back to own cam (or wait, depending on flow).
+  // The moment the user picks a file, _ensureVideoFile is re-called with
+  // a non-empty URL + falls through to the real init below.
+  if (!fileUrl) return null;
   entry = {
     videoEl: null, stream: null, ready: false, error: null,
     requesting: true, kind: "videofile", fileUrl, objectUrl: null
   };
   _videoSources.set(nodeId, entry);
   try {
-    if (!fileUrl) throw new Error("fileUrl param is empty — pick a file in the props panel");
     const videoEl = document.createElement("video");
     videoEl.src         = fileUrl;
     videoEl.playsInline = true;
@@ -33635,17 +33642,23 @@ function _findUpstreamVideoSource(nodeId) {
   const srcDef = TYPES[srcNode.type];
   const isVideoElementSource = srcDef && srcDef.bindLayout === "video-source";
   if (isVideoElementSource) {
+    // v0.3.14 — if the source is a VideoFile with no file picked yet,
+    // it has nothing to offer; treat as no-wire so downstream landmarks
+    // keep using their own webcam (or whatever was previously bound)
+    // instead of tearing it down + waiting on an empty source.
+    if (srcNode.type === "VideoFile" &&
+        !(srcNode.params && srcNode.params.fileUrl)) {
+      return null;
+    }
     if (srcNode.type === "VideoFile")   _ensureVideoFile(srcNode.id, srcNode.params || {});
     else if (srcNode.type === "Webcam") _ensureWebcamStream(srcNode.id);
     const src = _videoSources.get(srcNode.id);
     if (src && src.ready && src.videoEl && src.videoEl.readyState >= 2) {
       return { kind: "video", videoEl: src.videoEl, srcNodeId: srcNode.id };
     }
-    // v0.3.13 — wire exists but the upstream video element isn't
-    // decoded yet (VideoFile still loading, Webcam permission still
-    // pending). Return "pending" so the caller knows to WAIT instead
-    // of falling back to own getUserMedia. The detection loop retries
-    // each tick until the upstream is ready.
+    // Wire exists but the upstream video element isn't decoded yet
+    // (VideoFile still loading, Webcam permission still pending).
+    // "pending" tells callers to WAIT instead of falling back.
     return { kind: "pending", srcNodeId: srcNode.id, srcType: srcNode.type };
   }
   return { kind: "texture", srcNodeId: srcNode.id, srcType: srcNode.type };
@@ -33960,79 +33973,129 @@ function _drawHandLandmarkerOverlay(entry, params) {
  * for the wired-param resolver to pick up. Cancelled by dispose. */
 function _startMediapipeLoop(nodeId) {
   const entry = _mediapipeNodes.get(nodeId);
-  // v0.3.13 — the loop runs even with no input source initially.
-  // awaitingUpstream means "wire exists, upstream not ready yet" --
-  // the loop will resolve it once the upstream's videoEl loads.
-  if (!entry || !entry.detector ||
-      (!entry.videoEl && !entry.gpuInputCanvas && !entry.awaitingUpstream)) return;
+  if (!entry || !entry.detector) return;
   let lastVideoTimeMs = -1;
-  const tick = () => {
-    const e = _mediapipeNodes.get(nodeId);
-    if (!e || !e.detector) return;  // disposed
-    // v0.3.13 — if we're still waiting for the upstream to load,
-    // re-resolve each tick. As soon as the upstream's videoEl is
-    // decoded (or becomes a texture source), transition the entry
-    // into the appropriate mode + carry on.
-    if (e.awaitingUpstream) {
-      const upstream = _findUpstreamVideoSource(nodeId);
-      if (upstream && upstream.kind === "video") {
-        e.videoEl          = upstream.videoEl;
-        e.sharedVideoEl    = true;
-        e.useTextureSource = false;
-        e.awaitingUpstream = false;
-        console.log("[landmark] node " + nodeId + " upstream ready (video)");
-      } else if (upstream && upstream.kind === "texture") {
+  // v0.3.14 — full dynamic source resolution per tick. Tracks the
+  // current "source key" (a hashable identity for the active source)
+  // and transitions when it changes. Covers: wire added after init,
+  // wire removed after init, fileUrl changed, source ready / not
+  // ready / re-loading.
+  //
+  // Initial source key derives from whatever _ensureMediapipeSource
+  // already set up during init -- so the first tick doesn't tear
+  // down the just-allocated camera/canvas.
+  function initialSourceKey(e) {
+    if (e.awaitingUpstream)  return "pending:" + e.upstreamNodeId;
+    if (e.useTextureSource)  return "texture:" + e.upstreamNodeId;
+    if (e.sharedVideoEl)     return "video:"   + e.upstreamNodeId;
+    if (e.videoEl)           return "owncam";
+    return null;
+  }
+  let lastSourceKey = initialSourceKey(entry);
+  let transitioning = false;
+
+  function sourceKey(upstream) {
+    if (!upstream)                  return "owncam";
+    if (upstream.kind === "video")  return "video:"   + upstream.srcNodeId;
+    if (upstream.kind === "texture") return "texture:" + upstream.srcNodeId;
+    if (upstream.kind === "pending") return "pending:" + upstream.srcNodeId;
+    return "owncam";
+  }
+
+  async function transition(e, upstream) {
+    transitioning = true;
+    try {
+      // Tear down the previous source.
+      if (e.stream && !e.sharedVideoEl) {
+        try { e.stream.getTracks().forEach(t => t.stop()); } catch (_) {}
+      }
+      if (e.gpuInputCtx) {
+        try { e.gpuInputCtx.unconfigure(); } catch (_) {}
+      }
+      e.stream            = null;
+      e.videoEl           = null;
+      e.gpuInputCanvas    = null;
+      e.gpuInputCtx       = null;
+      e.gpuInputBindGroup = null;
+      e._gpuInputSrcView  = null;
+      e.sharedVideoEl     = false;
+      e.useTextureSource  = false;
+      e.upstreamNodeId    = null;
+
+      if (!upstream) {
+        // No wire → own getUserMedia camera.
+        await _ensureMediapipeCamera(e);
+      } else if (upstream.kind === "video") {
+        e.videoEl        = upstream.videoEl;
+        e.sharedVideoEl  = true;
+        e.upstreamNodeId = upstream.srcNodeId;
+        console.log("[landmark] node " + nodeId + " → video source " +
+                    upstream.srcType + "(" + upstream.srcNodeId + ")");
+      } else if (upstream.kind === "texture") {
         _allocateGpuInputCanvas(e);
         e.useTextureSource = true;
-        e.awaitingUpstream = false;
-        console.log("[landmark] node " + nodeId + " upstream ready (texture)");
-      } else if (!upstream) {
-        // Wire was removed. Fall back to own camera.
-        _ensureMediapipeCamera(e).then(() => {
-          e.sharedVideoEl    = false;
-          e.useTextureSource = false;
-          e.awaitingUpstream = false;
-        }).catch(err => console.warn("[landmark] fallback camera failed:", err));
+        e.upstreamNodeId   = upstream.srcNodeId;
+        console.log("[landmark] node " + nodeId + " → texture source " +
+                    upstream.srcType + "(" + upstream.srcNodeId + ")");
+      } else if (upstream.kind === "pending") {
+        // Wire exists but upstream's videoEl isn't decoded yet. Don't
+        // allocate anything; just wait. Next tick will retry.
+        e.upstreamNodeId = upstream.srcNodeId;
       }
-      // else: still pending. Skip this tick.
-      if (e.awaitingUpstream) {
-        e.rafHandle = requestAnimationFrame(tick);
-        return;
-      }
+    } finally {
+      transitioning = false;
+      lastVideoTimeMs = -1;   // reset for new video stream's currentTime baseline
     }
-    const drawNow = () => {
-      if (!e.drawCanvas) return;
-      const liveNode = state && Array.isArray(state.nodes)
-        ? state.nodes.find(n => n.id === nodeId) : null;
-      const liveParams = liveNode ? liveNode.params : e.params;
-      if (e.kind === "hand")              _drawHandLandmarkerOverlay(e, liveParams);
-      else if (e.kind === "handkeyboard") _drawHandKeyboardOverlay(e, liveParams);
-      else if (e.kind === "pose")         _drawPoseLandmarkerOverlay(e, liveParams);
-      else if (e.kind === "face")         _drawFaceLandmarkerOverlay(e, liveParams);
-    };
+  }
+
+  const drawNow = (e) => {
+    if (!e.drawCanvas) return;
+    const liveNode = state && Array.isArray(state.nodes)
+      ? state.nodes.find(n => n.id === nodeId) : null;
+    const liveParams = liveNode ? liveNode.params : e.params;
+    if (e.kind === "hand")              _drawHandLandmarkerOverlay(e, liveParams);
+    else if (e.kind === "handkeyboard") _drawHandKeyboardOverlay(e, liveParams);
+    else if (e.kind === "pose")         _drawPoseLandmarkerOverlay(e, liveParams);
+    else if (e.kind === "face")         _drawFaceLandmarkerOverlay(e, liveParams);
+  };
+
+  const tick = () => {
+    const e = _mediapipeNodes.get(nodeId);
+    if (!e || !e.detector) return;   // disposed
+    const upstream = _findUpstreamVideoSource(nodeId);
+    const key = sourceKey(upstream);
+    if (key !== lastSourceKey && !transitioning) {
+      lastSourceKey = key;
+      transition(e, upstream)
+        .catch(err => console.warn("[landmark] transition failed:", err))
+        .finally(() => { e.rafHandle = requestAnimationFrame(tick); });
+      return;
+    }
+    if (transitioning) {
+      // Don't double-arm; the transition's finally re-schedules.
+      return;
+    }
+    // Pending state has no source to detect on yet.
+    if (upstream && upstream.kind === "pending") {
+      e.rafHandle = requestAnimationFrame(tick);
+      return;
+    }
+    // Detection.
     if (e.useTextureSource) {
-      // Texture-source path: gpuInputCanvas updates every visual
-      // frame (driven by the main render encoder, not the camera).
-      // Just run detection every rAF tick.
       if (e.gpuInputCanvas) {
         try {
           e.latest = e.detector.detectForVideo(e.gpuInputCanvas, performance.now());
-          drawNow();
-        } catch (err) { /* silent first-frame race */ }
+          drawNow(e);
+        } catch (_) {}
       }
     } else {
-      // Video-element path. Only run inference when the source video
-      // has a NEW frame -- currentTime advances when the browser pulls
-      // a fresh decoded frame from the camera. Avoids re-inferencing
-      // the same frame 60x/sec on a 30fps camera (which is wasted
-      // work + spurious "frame not ready" warnings from MediaPipe).
       const v = e.videoEl;
       if (v && v.readyState >= 2 && v.currentTime !== lastVideoTimeMs) {
         lastVideoTimeMs = v.currentTime;
         try {
           e.latest = e.detector.detectForVideo(v, performance.now());
-          drawNow();
-        } catch (err) { /* silent first-frame race */ }
+          drawNow(e);
+        } catch (_) {}
       }
     }
     e.rafHandle = requestAnimationFrame(tick);
