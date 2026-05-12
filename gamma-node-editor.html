@@ -16689,6 +16689,280 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     description: "Classic Matrix digital rain. Vertical cascades of A-Z / 0-9 glyphs fall across the rig surface; each streak has a bright near-white leading character that fades into the streak color (default green) over `trailLen` cells. cellsX/Y set the character grid density (default 64×40); streamsPerCol controls density (1-4 simultaneous streams per column, default 2); trailLen is the trail length in cells; speed multiplies time; brightness scales overall intensity; headBoost is how much brighter the head reads vs the trail (default 2×); colorR/G/B is the streak color. Glyphs swap per-cell on staggered timelines so trails flicker with character-level life. Surface-aware via the standard gnomonic + Lambert mapping — no polar bunching or seam splits on sphere / cylinder / swept-arc / swept-vertical rigs."
   },
 
+  /* v0.3.38 -- ShapeTunnel. Pseudo-3D scene generator: random SDF
+   * primitives (sphere / box / torus / octahedron) flying past a
+   * camera through an infinite tunnel. Per-fragment ray-march
+   * (analytic SDF union, 48 max steps, 8 simultaneous shapes).
+   * Each shape's Z position cycles through the tunnel over time;
+   * when a shape crosses the near plane it re-spawns at the far
+   * plane with new randomized (x, y, type, color, rotation) via
+   * hash-of-(shape_id, lap_count).
+   *
+   * Audio/reactive integration: camOffsetX/Y let upstream control
+   * sources (BlobTracker, HandLandmarker, MasterClock) drive the
+   * camera position laterally. Wire BlobTracker.b1_x through a
+   * Sub(0.5) + Mul(scale) chain into camOffsetX for "tracked
+   * blob steers the camera" effects.
+   *
+   * Cost: ~48 SDF evals * 8 shapes per step worst-case = ~3000
+   * ops/fragment in cluttered regions, but rays missing all shapes
+   * advance fast (big SDF distance per step) so empty rays bail
+   * in 5-10 steps. ~6-10 ms at 1080p on mid-range discrete GPU. */
+  ShapeTunnel: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    ins: [
+      { n: "speed",         t: "param" },
+      { n: "density",       t: "param" },
+      { n: "tunnelRadius",  t: "param" },
+      { n: "fogDensity",    t: "param" },
+      { n: "camOffsetX",    t: "param" },
+      { n: "camOffsetY",    t: "param" },
+      { n: "baseHue",       t: "param" },
+      { n: "shapeMix",      t: "param" },
+      { n: "seedOffset",    t: "param" },
+      { n: "fov",           t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    params: {
+      speed: 1.0,
+      density: 8,         // 4..12 shapes simultaneously
+      tunnelRadius: 4.0,  // corridor width
+      fogDensity: 0.12,   // exponential distance fog
+      camOffsetX: 0.0,    // -1..1 lateral camera shift (drive from BlobTracker etc)
+      camOffsetY: 0.0,
+      baseHue: 220.0,     // 0..360 base color hue (cool blue default)
+      shapeMix: 1.0,      // 0 = spheres only; 1 = mixed types
+      seedOffset: 0.42,
+      fov: 60.0
+    },
+    methods: {},
+    uniformBytes: 112,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=speed, y=density, z=tunnelRadius, w=fogDensity
+  params2:       vec4f,    // x=camOffsetX, y=camOffsetY, z=baseHue (deg), w=shapeMix
+  params3:       vec4f,    // x=seedOffset, y=fov, zw=_
+};
+@group(0) @binding(0) var<uniform> u: U;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+// === Hash helpers ===
+fn hash21(p: vec2f) -> f32 {
+  return fract(sin(dot(p, vec2f(127.1, 311.7))) * 43758.5453);
+}
+fn hash22(p: vec2f) -> vec2f {
+  return vec2f(hash21(p), hash21(p + vec2f(17.4, 27.1)));
+}
+
+// === SDF primitives (Inigo Quilez's standard set) ===
+fn sdf_sphere(p: vec3f, r: f32) -> f32 {
+  return length(p) - r;
+}
+fn sdf_box(p: vec3f, s: vec3f) -> f32 {
+  let q = abs(p) - s;
+  return length(max(q, vec3f(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0);
+}
+fn sdf_torus(p: vec3f, big_r: f32, small_r: f32) -> f32 {
+  let q = vec2f(length(p.xz) - big_r, p.y);
+  return length(q) - small_r;
+}
+fn sdf_octa(p: vec3f, s: f32) -> f32 {
+  return (abs(p.x) + abs(p.y) + abs(p.z) - s) * 0.5773502;
+}
+
+// === Rotation helpers ===
+fn rot_y(p: vec3f, a: f32) -> vec3f {
+  let c = cos(a); let s = sin(a);
+  return vec3f(c * p.x + s * p.z, p.y, -s * p.x + c * p.z);
+}
+fn rot_x(p: vec3f, a: f32) -> vec3f {
+  let c = cos(a); let s = sin(a);
+  return vec3f(p.x, c * p.y - s * p.z, s * p.y + c * p.z);
+}
+
+// === HSV -> RGB (Sam Hocevar lolengine.net 2013) ===
+fn hsv2rgb(h: f32, s: f32, v: f32) -> vec3f {
+  let k = vec4f(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+  let p = abs(fract(vec3f(h, h, h) + k.xyz) * 6.0 - vec3f(k.w));
+  return v * mix(vec3f(k.x), clamp(p - vec3f(k.x), vec3f(0.0), vec3f(1.0)), s);
+}
+
+// Compute the SDF for one shape at this point + return its hue too.
+// Returns vec2(distance, hue_0_to_1).
+fn shape_sdf(p: vec3f, shape_id: i32, t: f32, density: f32, period: f32,
+             tunnel_R: f32, shape_mix: f32, seed_off: f32) -> vec2f {
+  let i_f = f32(shape_id);
+  let base_off = i_f / density * period;
+  let phase = t + base_off + seed_off * period;
+  let lap = floor(phase / period);
+  let frac_in_lap = fract(phase / period);
+
+  // Shape's Z position: far plane at phase=0 -> near plane at phase=1.
+  // Place far plane at +period, near at -2 (just behind camera at z=-1).
+  let z_pos = mix(-2.0, period, 1.0 - frac_in_lap);
+
+  // Re-randomize (x, y, type, hue, rotation) every lap.
+  let seed = vec2f(i_f, lap) + vec2f(seed_off * 91.7, 0.0);
+  let rand_xy = (hash22(seed) - vec2f(0.5)) * tunnel_R * 1.6;
+  let size_var = 0.4 + hash21(seed + vec2f(7.3, 0.0)) * 0.7;
+  let hue_var  = hash21(seed + vec2f(11.1, 0.0));
+  let rot_a    = hash21(seed + vec2f(13.7, 0.0)) * 6.28318 + t * (0.4 + hash21(seed + vec2f(17.3, 0.0)) * 0.6);
+  let type_f   = hash21(seed + vec2f(19.1, 0.0)) * 4.0;
+  let shape_type = i32(mix(0.0, type_f, shape_mix));   // 0 when shape_mix=0 -> all spheres
+
+  // Translate point to shape-local space + rotate.
+  var p_local = p - vec3f(rand_xy.x, rand_xy.y, z_pos);
+  p_local = rot_y(p_local, rot_a);
+  p_local = rot_x(p_local, rot_a * 0.7);
+
+  var d: f32;
+  if (shape_type == 0) {
+    d = sdf_sphere(p_local, size_var * 0.5);
+  } else if (shape_type == 1) {
+    d = sdf_box(p_local, vec3f(size_var * 0.35));
+  } else if (shape_type == 2) {
+    d = sdf_torus(p_local, size_var * 0.42, size_var * 0.14);
+  } else {
+    d = sdf_octa(p_local, size_var * 0.55);
+  }
+  return vec2f(d, hue_var);
+}
+
+// Union of all N shapes. Returns (min_distance, hue_of_closest).
+fn scene_sdf(p: vec3f, t: f32, density: f32, period: f32,
+             tunnel_R: f32, shape_mix: f32, seed_off: f32) -> vec2f {
+  var best_d = 1e9;
+  var best_h = 0.0;
+  let n = i32(clamp(density, 1.0, 12.0));
+  for (var i: i32 = 0; i < 12; i = i + 1) {
+    if (i >= n) { break; }
+    let info = shape_sdf(p, i, t, density, period, tunnel_R, shape_mix, seed_off);
+    if (info.x < best_d) {
+      best_d = info.x;
+      best_h = info.y;
+    }
+  }
+  return vec2f(best_d, best_h);
+}
+
+// SDF normal via central differences -- 6 extra scene evals per
+// shaded fragment. Heavy but needed for proper lighting; the
+// shader bails on misses before this gets called.
+fn scene_normal(p: vec3f, t: f32, density: f32, period: f32,
+                tunnel_R: f32, shape_mix: f32, seed_off: f32) -> vec3f {
+  let eps = 0.001;
+  let dx = scene_sdf(p + vec3f(eps, 0.0, 0.0), t, density, period, tunnel_R, shape_mix, seed_off).x
+         - scene_sdf(p - vec3f(eps, 0.0, 0.0), t, density, period, tunnel_R, shape_mix, seed_off).x;
+  let dy = scene_sdf(p + vec3f(0.0, eps, 0.0), t, density, period, tunnel_R, shape_mix, seed_off).x
+         - scene_sdf(p - vec3f(0.0, eps, 0.0), t, density, period, tunnel_R, shape_mix, seed_off).x;
+  let dz = scene_sdf(p + vec3f(0.0, 0.0, eps), t, density, period, tunnel_R, shape_mix, seed_off).x
+         - scene_sdf(p - vec3f(0.0, 0.0, eps), t, density, period, tunnel_R, shape_mix, seed_off).x;
+  return normalize(vec3f(dx, dy, dz));
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let t          = u.u_time * u.params.x;
+  let density    = clamp(u.params.y, 4.0, 12.0);
+  let tunnel_R   = max(u.params.z, 0.5);
+  let fog_d      = max(u.params.w, 0.0);
+  let cam_x      = clamp(u.params2.x, -1.5, 1.5) * tunnel_R * 0.5;
+  let cam_y      = clamp(u.params2.y, -1.5, 1.5) * tunnel_R * 0.5;
+  let base_hue   = u.params2.z / 360.0;
+  let shape_mix  = clamp(u.params2.w, 0.0, 1.0);
+  let seed_off   = u.params3.x;
+  let fov_rad    = max(u.params3.y, 1.0) * 0.01745329;
+
+  // Period: how far apart shapes are spaced in Z. tunnel_R * 6 keeps
+  // density visually consistent across different tunnel widths.
+  let period = tunnel_R * 6.0;
+
+  // Ray setup -- pinhole camera.
+  let aspect = u.u_resolution.x / max(u.u_resolution.y, 1.0);
+  let ndc = vec2f((in.uv.x - 0.5) * 2.0 * aspect,
+                  (0.5 - in.uv.y) * 2.0);
+  let f_inv = 1.0 / tan(fov_rad * 0.5);
+  let ray_dir = normalize(vec3f(ndc.x, ndc.y, f_inv));
+  let ray_orig = vec3f(cam_x, cam_y, -1.0);
+
+  // Ray march. Bail early on far plane miss; converge on hit.
+  var z_total = 0.0;
+  var hit = false;
+  var hit_hue = 0.0;
+  var hit_p   = vec3f(0.0);
+  for (var i_step: i32 = 0; i_step < 48; i_step = i_step + 1) {
+    let p = ray_orig + ray_dir * z_total;
+    let info = scene_sdf(p, t, density, period, tunnel_R, shape_mix, seed_off);
+    if (info.x < 0.002) {
+      hit = true;
+      hit_hue = info.y;
+      hit_p = p;
+      break;
+    }
+    z_total = z_total + info.x * 0.9;
+    if (z_total > period + 3.0) { break; }
+  }
+
+  // Background: deep tunnel haze. Subtle radial vignette toward
+  // center reads as "looking down a corridor."
+  let radial = length(ndc) * 0.5;
+  let bg = vec3f(0.015, 0.02, 0.05) * (1.0 - clamp(radial * 0.4, 0.0, 0.7));
+  if (!hit) { return vec4f(bg, 1.0); }
+
+  // Lambert shading + rim light.
+  let n = scene_normal(hit_p, t, density, period, tunnel_R, shape_mix, seed_off);
+  let light_dir = normalize(vec3f(0.4, 0.6, -0.7));
+  let lambert = max(dot(n, light_dir), 0.0);
+  let rim = pow(1.0 - max(dot(n, -ray_dir), 0.0), 2.5);
+  let ambient = 0.18;
+  let lit = ambient + lambert * 0.7 + rim * 0.4;
+
+  let albedo = hsv2rgb(fract(base_hue + hit_hue * 0.6), 0.85, 1.0);
+  var color = albedo * lit;
+
+  // Distance fog. Shapes far from camera fade into the bg.
+  let fog_t = 1.0 - exp(-z_total * fog_d);
+  color = mix(color, bg, fog_t);
+
+  return vec4f(color, 1.0);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.speed         === "number") ? p.speed         : 1.0;
+      scratch[17] = (typeof p.density       === "number") ? p.density       : 8;
+      scratch[18] = (typeof p.tunnelRadius  === "number") ? p.tunnelRadius  : 4.0;
+      scratch[19] = (typeof p.fogDensity    === "number") ? p.fogDensity    : 0.12;
+      scratch[20] = (typeof p.camOffsetX    === "number") ? p.camOffsetX    : 0.0;
+      scratch[21] = (typeof p.camOffsetY    === "number") ? p.camOffsetY    : 0.0;
+      scratch[22] = (typeof p.baseHue       === "number") ? p.baseHue       : 220.0;
+      scratch[23] = (typeof p.shapeMix      === "number") ? p.shapeMix      : 1.0;
+      scratch[24] = (typeof p.seedOffset    === "number") ? p.seedOffset    : 0.42;
+      scratch[25] = (typeof p.fov           === "number") ? p.fov           : 60.0;
+      scratch[26] = 0; scratch[27] = 0;
+    },
+    description: "Pseudo-3D infinite-tunnel scene generator. Random SDF primitives (sphere / box / torus / octahedron) fly past the camera through a corridor; per-fragment ray-march (48 steps, up to 12 simultaneous shapes) gives proper depth, occlusion, and Lambert + rim lighting. Each shape cycles through the tunnel and re-randomizes its (x, y, type, color, rotation) every lap via hash-of-(shape_id, lap_count). speed: flying rate (audio-reactive via wire). density: 4-12 shapes in flight. tunnelRadius: corridor width (shape spread). fogDensity: exponential distance fog. camOffsetX/Y: lateral camera shift in [-1, 1] — wire BlobTracker.b1_x or HandLandmarker.h1_x through Sub(0.5)+Mul(2) for camera-follows-tracking effects. baseHue: 0-360 deg base color hue (220 = cool blue default; 0 = warm red). shapeMix: 0 = spheres only, 1 = full mix of all four primitives. seedOffset: shifts the random sequence (try different values for fresh-feeling spawns). fov: camera field of view."
+  },
+
   /* Phase 6.3.2 — FeedbackShader (visual Delay1). The "ping-pong"
    * shader that reads its own previous frame and blends it with a
    * generative pattern. Used for trails, reaction-diffusion, decay
@@ -27112,6 +27386,119 @@ const _demos = [
       state.edges.push({ from: { node: px,  port: "out" }, to: { node: bl,  port: "inB" } });
       state.edges.push({ from: { node: bl,  port: "out" }, to: { node: fc,  port: "in"  } });
       state.edges.push({ from: { node: fc,  port: "out" }, to: { node: v,   port: "in"  } });
+    }
+  },
+  {
+    /* v0.3.38 -- Tunnel CRT demo. Showcases three v0.3.3x features
+     * at once: the new BlobTracker (v0.3.37 classical-CV blob
+     * detection), the new ShapeTunnel (v0.3.38 ray-marched SDF
+     * pseudo-3D flying shapes), and the existing CRT shader stack
+     * (v0.3.31-34 high-fidelity emulation).
+     *
+     * Chain:
+     *   BlobTracker --b1_x--> Sub(0.5) --> Mul(2.5) --> ShapeTunnel.camOffsetX
+     *              `--b1_y--> Sub(0.5) --> Mul(-2.5) -> ShapeTunnel.camOffsetY
+     *                                                  (negate Y because
+     *                                                   screen-down = world-up)
+     *   ShapeTunnel --> CRT --> VisualOutput
+     *
+     * The BlobTracker watches the user's own webcam in luma mode --
+     * any bright object (face / lamp / phone screen / palm) becomes
+     * b1, drives the camera offset through the math chain, which
+     * shifts the ShapeTunnel viewpoint laterally. Then the whole
+     * scene runs through the CRT shader for the vintage tube look.
+     *
+     * Move a bright object left/right/up/down in front of your
+     * camera and the SDF tunnel pans to follow. Hide the object,
+     * camera centers. The CRT layer means it looks like a 1980s
+     * sci-fi movie set throughout.
+     *
+     * BlobTracker params tuned for this:
+     *  - mode=0 (luma), threshold=0.65: pick up the brightest
+     *    thing in view -- works in any lit room.
+     *  - smoothing=0.7: heavy temporal damping so the camera
+     *    doesn't jitter from frame-to-frame noise.
+     *  - bgMode=0: the BlobTracker's debug overlay is hidden
+     *    (its texture out isn't in the chain anyway). */
+    id: "tunnel-crt",
+    name: "Tunnel CRT",
+    sub: "blob-tracked camera · SDF tunnel · CRT",
+    type: "visual",
+    thumb: `<svg viewBox="0 0 100 44">
+      <defs>
+        <radialGradient id="dg-tcrt" cx="0.5" cy="0.5" r="0.9">
+          <stop offset="0"   stop-color="rgba(60, 180, 255, 0.85)"/>
+          <stop offset="0.5" stop-color="rgba(120, 90, 220, 0.85)"/>
+          <stop offset="1"   stop-color="rgba(8, 4, 20, 1.0)"/>
+        </radialGradient>
+      </defs>
+      <rect width="100" height="44" fill="url(#dg-tcrt)"/>
+      <!-- distant tunnel point -->
+      <circle cx="50" cy="22" r="3" fill="rgba(180, 220, 255, 0.9)"/>
+      <!-- mid-distance shapes (octahedra) -->
+      <polygon points="30,18 35,22 30,26 25,22" fill="rgba(255, 180, 90, 0.85)" stroke="rgba(255,255,255,0.4)" stroke-width="0.4"/>
+      <polygon points="70,18 75,22 70,26 65,22" fill="rgba(220, 90, 200, 0.85)" stroke="rgba(255,255,255,0.4)" stroke-width="0.4"/>
+      <!-- near shapes -->
+      <circle cx="20" cy="30" r="5" fill="rgba(120, 230, 180, 0.9)" stroke="rgba(255,255,255,0.4)" stroke-width="0.4"/>
+      <rect x="76" y="6" width="8" height="8" fill="rgba(255, 200, 80, 0.9)" stroke="rgba(255,255,255,0.4)" stroke-width="0.4" transform="rotate(20 80 10)"/>
+      <!-- scanline overlay -->
+      <g stroke="rgba(0, 0, 0, 0.35)" stroke-width="1">
+        <line x1="0" y1="6"  x2="100" y2="6"  />
+        <line x1="0" y1="14" x2="100" y2="14" />
+        <line x1="0" y1="22" x2="100" y2="22" />
+        <line x1="0" y1="30" x2="100" y2="30" />
+        <line x1="0" y1="38" x2="100" y2="38" />
+      </g>
+    </svg>`,
+    build: () => {
+      // Layout columns: tracker on the left, math chain in the
+      // middle, generator + CRT + output on the right.
+      const bt    = makeNode("BlobTracker",   40,  80, {
+        mode: 0, threshold: 0.65,
+        minBlobSize: 60, maxBlobs: 1,
+        smoothing: 0.7,
+        mirrored: 1, bgMode: 0,    // hide overlay (texture out unused)
+        lineWidth: 2.5, dotRadius: 5
+      });
+      // Convert b1_x in [0, 1] -> [-1.25, 1.25] for camOffsetX.
+      // Chain: (b1_x - 0.5) * 2.5
+      const subX  = makeNode("Sub",          340,  60, { b: 0.5 });
+      const mulX  = makeNode("Mul",          480,  60, { b: 2.5 });
+      // Same for Y but negated (screen-down means world-up).
+      const subY  = makeNode("Sub",          340, 200, { b: 0.5 });
+      const mulY  = makeNode("Mul",          480, 200, { b: -2.5 });
+      // The generator. seedOffset tweaks the shape spawn pattern;
+      // baseHue is set for a cool sci-fi palette.
+      const st    = makeNode("ShapeTunnel",  640, 120, {
+        speed: 0.8, density: 8, tunnelRadius: 4.0,
+        fogDensity: 0.13,
+        camOffsetX: 0.0, camOffsetY: 0.0,
+        baseHue: 215.0, shapeMix: 1.0,
+        seedOffset: 0.42, fov: 65.0
+      });
+      const crt   = makeNode("CRT",          900, 120, {
+        virtualW: 480, virtualH: 360,   // a touch finer than 320x240 -- the SDF detail benefits
+        curvature: 0.04,
+        scanlineHardness: -8.0, pixelHardness: -3.0,
+        maskType: 3, maskStrength: 0.75,
+        brightness: 1.1, bloomAmount: 0.14, shape: 2.0,
+        halationAmount: 0.05, halationRadius: 12,
+        beamDynamics: 0.45, temperature: -0.15,   // slight cool cast for sci-fi
+        convergence: 0.4, persistence: 0.25       // both new v0.3.34 features dialed up
+      });
+      const v     = makeNode("VisualOutput", 1180, 120, { display: 0 });
+
+      // Wire X axis: blob_x -> sub -> mul -> tunnel.camOffsetX
+      state.edges.push({ from: { node: bt,   port: "b1_x" }, to: { node: subX, port: "a" } });
+      state.edges.push({ from: { node: subX, port: "out"  }, to: { node: mulX, port: "a" } });
+      state.edges.push({ from: { node: mulX, port: "out"  }, to: { node: st,   port: "camOffsetX" } });
+      // Wire Y axis: blob_y -> sub -> mul -> tunnel.camOffsetY
+      state.edges.push({ from: { node: bt,   port: "b1_y" }, to: { node: subY, port: "a" } });
+      state.edges.push({ from: { node: subY, port: "out"  }, to: { node: mulY, port: "a" } });
+      state.edges.push({ from: { node: mulY, port: "out"  }, to: { node: st,   port: "camOffsetY" } });
+      // Visual chain: tunnel -> CRT -> output
+      state.edges.push({ from: { node: st,   port: "out"  }, to: { node: crt,  port: "in" } });
+      state.edges.push({ from: { node: crt,  port: "out"  }, to: { node: v,    port: "in" } });
     }
   },
   {
