@@ -16061,6 +16061,230 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     description: "NoiseShader — simplex 2D fBm output as grayscale [0, 1]. scale: primary frequency in world-UV units; octaves: roughness layers (1..8, each adds half-amplitude detail at double frequency); seedX/Y: shift the noise field. Useful as a height field, mask, or modulator into other shaders."
   },
 
+  /* v0.3.20 — MatrixRain. Matrix-style digital-rain shader. Vertical
+   * streaks of glyphs fall across the surface; each cell shows a
+   * procedural binary 5x7 bit pattern that swaps every ~0.7s, keyed
+   * by (cell, slow time). Surface-aware via the standard frag_to_global
+   * + surface_uv_norm pair so the rain tiles cleanly across every rig
+   * topology (sphere / cylinder / swept-arc / swept-vertical).
+   *
+   * Adapted from the Shadertoy reference (FabriceNeyret2-style Matrix
+   * rain, CELLS = 64x30, FALLERS = 14, FALLERHEIGHT = 12). The original
+   * sampled an iChannel0 font atlas for glyphs; we substitute a hash-
+   * driven 5x7 binary grid that reads visually identical at typical
+   * cell sizes. */
+  MatrixRain: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    ins: [
+      { n: "cellsX",       t: "param" },
+      { n: "cellsY",       t: "param" },
+      { n: "fallers",      t: "param" },
+      { n: "fallerHeight", t: "param" },
+      { n: "speed",        t: "param" },
+      { n: "brightness",   t: "param" },
+      { n: "colorR",       t: "param" },
+      { n: "colorG",       t: "param" },
+      { n: "colorB",       t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    params: {
+      cellsX: 64, cellsY: 30, fallers: 14, fallerHeight: 12,
+      speed: 1.0, brightness: 1.0,
+      colorR: 0.0, colorG: 1.0, colorB: 0.0
+    },
+    methods: {},
+    uniformBytes: 144,
+    wgsl:
+`struct U {
+  u_resolution:   vec4f,
+  u_time:         f32,
+  u_dt:           f32,
+  u_layer:        f32,
+  u_fov_v_deg:    f32,
+  u_view:         vec4f,
+  u_world_uv:     vec4f,
+  params:         vec4f,   // x=cellsX, y=cellsY, z=fallers, w=fallerHeight
+  params2:        vec4f,   // x=speed, y=brightness, zw=_
+  color:          vec4f,   // x=R, y=G, z=B, w=_
+  u_surface:      vec4f,
+  u_surface_path: vec4f,
+};
+@group(0) @binding(0) var<uniform> u: U;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+fn frag_to_global_angles(uv: vec2f) -> vec2f {
+  // 6.6.20.24 -- proper gnomonic basis rotation (see WireframeCalibration).
+  let fov_h_rad = u.u_view.w   * 0.0174532925;
+  let fov_v_rad = u.u_fov_v_deg * 0.0174532925;
+  let local_x = (uv.x - 0.5) * 2.0 * tan(fov_h_rad * 0.5);
+  let local_y = (0.5 - uv.y) * 2.0 * tan(fov_v_rad * 0.5);
+  let yaw_rad   = u.u_view.x * 0.0174532925;
+  let pitch_rad = u.u_view.y * 0.0174532925;
+  let cy = cos(yaw_rad);   let sy = sin(yaw_rad);
+  let cp = cos(pitch_rad); let sp = sin(pitch_rad);
+  let fwd = vec3f(sy * cp, sp, cy * cp);
+  var up_ref = vec3f(0.0, 1.0, 0.0);
+  if (abs(fwd.y) > 0.999) { up_ref = vec3f(0.0, 0.0, 1.0); }
+  let right = normalize(cross(up_ref, fwd));
+  let up    = cross(fwd, right);
+  let dir = normalize(local_x * right + local_y * up + fwd);
+  let pitch_out = asin(clamp(dir.y, -1.0, 1.0));
+  let yaw_out   = atan2(dir.x, dir.z);
+  return vec2f(yaw_out * 57.29577951, pitch_out * 57.29577951);
+}
+
+fn surface_uv_norm(yaw_deg: f32, pitch_deg: f32) -> vec2f {
+  // Lambert cylindrical equal-area surface mapping (see Voronoi for
+  // the full comment). Returns normalized (u, v) on the active rig
+  // surface so cell layouts hold their aspect across topology.
+  let stype = u32(u.u_surface.x + 0.5);
+  let yawStart = u.u_surface_path.x;
+  let yawEnd   = u.u_surface_path.y;
+  let yawSpan  = max(yawEnd - yawStart, 0.001);
+  let yawWrap  = yaw_deg - 360.0 * floor((yaw_deg - yawStart) / 360.0);
+  let u_norm   = (yawWrap - yawStart) / yawSpan;
+  var v_norm: f32 = 0.5;
+  if (stype == 2u || stype == 4u) {
+    let R    = u.u_surface.y;
+    let yMin = u.u_surface.z;
+    let yMax = u.u_surface.w;
+    let pitchRad = pitch_deg * 0.01745329;
+    let cosP = cos(pitchRad);
+    var cy: f32 = 0.0;
+    if (abs(cosP) > 1e-4) {
+      cy = R * tan(pitchRad);
+    } else {
+      cy = sign(pitch_deg) * (abs(yMax) + abs(yMin)) * 100.0;
+    }
+    v_norm = (clamp(cy, yMin, yMax) - yMin) / max(yMax - yMin, 0.001);
+  } else {
+    var pStart: f32 = -90.0;
+    var pEnd:   f32 =  90.0;
+    if (stype == 3u) {
+      pStart = u.u_surface.z;
+      pEnd   = u.u_surface.w;
+    }
+    let sinStart = sin(pStart * 0.01745329);
+    let sinEnd   = sin(pEnd   * 0.01745329);
+    let sinP     = sin(pitch_deg * 0.01745329);
+    v_norm = (sinP - sinStart) / max(sinEnd - sinStart, 0.001);
+  }
+  return vec2f(u_norm, v_norm);
+}
+
+// Floor-mod (GLSL semantics). WGSL's % is truncated; for the per-cell
+// hash where the input can be negative (cos returns [-1, 1]) we need
+// the proper floor-mod to keep results non-negative.
+fn mod_f(a: f32, b: f32) -> f32 {
+  return a - b * floor(a / b);
+}
+
+fn hash21(p: vec2f) -> f32 {
+  return fract(sin(dot(p, vec2f(127.1, 311.7))) * 43758.5453);
+}
+
+// Per-faller speed (matches the original Shadertoy constants so visual
+// cadence is preserved). Output range ~[0.30, 0.40].
+fn faller_speed(col: f32, faller: f32) -> f32 {
+  return mod_f(cos(col * 363.435 + faller * 234.323), 0.1) + 0.3;
+}
+
+// Procedural glyph -- stand-in for the original iChannel0 font atlas.
+// Each cell shows a 5x7 binary bit grid keyed by (cell, slow time);
+// glyphs re-shuffle every ~0.7s like the original. step(0.45) tunes
+// the on-pixel ratio so glyphs read as dense characters, not stipple.
+fn glyph(cell: vec2f, sub_pix: vec2f, t_slow: f32) -> f32 {
+  let grid = floor(sub_pix * vec2f(5.0, 7.0));
+  if (grid.x < 0.0 || grid.x >= 5.0 || grid.y < 0.0 || grid.y >= 7.0) {
+    return 0.0;
+  }
+  let cellSeed = hash21(cell);
+  let glyphId  = floor(cellSeed * 256.0 + t_slow + hash21(cell.yx) * 5.0);
+  let bit      = hash21(grid + vec2f(glyphId * 0.371, glyphId * 0.179));
+  return step(0.45, bit);
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  // Surface-aware UV: cells follow equal-area parameterization of the
+  // current rig surface so the rain tiles cleanly across sphere /
+  // cylinder / swept rigs. Without this the polar bunching on a sphere
+  // would crush dozens of cells into one pixel at zenith / nadir.
+  let ang = frag_to_global_angles(in.uv);
+  let suv = surface_uv_norm(ang.x, ang.y);
+
+  let cellsX       = max(2.0, floor(u.params.x));
+  let cellsY       = max(2.0, floor(u.params.y));
+  let fallersN     = max(1.0, floor(u.params.z));
+  let fallerHeight = max(2.0, u.params.w);
+  let speed        = max(u.params2.x, 0.0);
+  let brightness   = max(u.params2.y, 0.0);
+
+  let cells     = vec2f(cellsX, cellsY);
+  let inv_cells = 1.0 / cells;
+  let pix_raw   = vec2f(mod_f(suv.x, inv_cells.x), mod_f(suv.y, inv_cells.y));
+  let cell      = floor(suv * cells);
+  // Match original: pix scaled to [0.1, 0.9] horizontally with 10%
+  // gutter, [0, 1] vertically. Gutter fakes inter-glyph gaps so the
+  // rain doesn't read as a continuous wall of pixels.
+  let sub_pix = pix_raw * cells * vec2f(0.8, 1.0) + vec2f(0.1, 0.0);
+
+  let t      = u.u_time * speed;
+  let t_slow = floor(t * 1.5);                  // ~0.7s glyph swap
+  let c      = glyph(cell, sub_pix, t_slow);
+
+  // Falling-streak intensity. Each faller is a sliver 1 cell tall
+  // moving through fallerHeight rows over time. Hard upper bound of
+  // 32 on the loop is well above any reasonable params.fallers value
+  // and lets WGSL constant-fold the iteration count.
+  var b_val: f32 = 0.0;
+  let max_fallers = i32(fallersN);
+  for (var i: i32 = 0; i < 32; i = i + 1) {
+    if (i >= max_fallers) { break; }
+    let i_f = f32(i);
+    let f   = 3.0 - cell.y * 0.05 -
+              mod_f((t + i_f * 3534.34) * faller_speed(cell.x, i_f), fallerHeight);
+    if (f > 0.0 && f < 1.0) {
+      b_val = b_val + f;
+    }
+  }
+
+  let intensity = c * b_val * brightness;
+  let col       = u.color.rgb * intensity;
+  return vec4f(col, 1.0);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.cellsX       === "number") ? p.cellsX       : 64;
+      scratch[17] = (typeof p.cellsY       === "number") ? p.cellsY       : 30;
+      scratch[18] = (typeof p.fallers      === "number") ? p.fallers      : 14;
+      scratch[19] = (typeof p.fallerHeight === "number") ? p.fallerHeight : 12;
+      scratch[20] = (typeof p.speed        === "number") ? p.speed        : 1.0;
+      scratch[21] = (typeof p.brightness   === "number") ? p.brightness   : 1.0;
+      scratch[22] = 0;
+      scratch[23] = 0;
+      scratch[24] = (typeof p.colorR       === "number") ? p.colorR       : 0.0;
+      scratch[25] = (typeof p.colorG       === "number") ? p.colorG       : 1.0;
+      scratch[26] = (typeof p.colorB       === "number") ? p.colorB       : 0.0;
+      scratch[27] = 0;
+      _packSurfaceUniforms(scratch, 28);
+    },
+    description: "Matrix-style digital rain: vertical streaks of procedural glyphs fall across the rig surface, classic Shadertoy aesthetic. cellsX/Y set the character grid density (default 64×30); fallers is the number of simultaneous falling streaks; fallerHeight scales each streak's vertical extent; speed multiplies time; brightness scales overall intensity; colorR/G/B set the streak color (default green). Surface-aware via the standard gnomonic + Lambert mapping so it projects correctly on sphere / cylinder / swept-arc / swept-vertical rigs without polar bunching or seam splits. Glyphs are hash-generated 5×7 bit patterns that swap every ~0.7s — no external font texture needed."
+  },
+
   /* Phase 6.3.2 — FeedbackShader (visual Delay1). The "ping-pong"
    * shader that reads its own previous frame and blends it with a
    * generative pattern. Used for trails, reaction-diffusion, decay
