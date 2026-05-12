@@ -17756,7 +17756,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     category: "Visual", color: COLOR.visual, header: null,
     cppType: "",
     kind: "shader-frag",
-    bindLayout: "composition",
+    bindLayout: "composition-feedback",
     ins: [
       { n: "in",                t: "texture" },
       { n: "virtualW",          t: "param" },
@@ -17773,7 +17773,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       { n: "halationAmount",    t: "param" },
       { n: "halationRadius",    t: "param" },
       { n: "beamDynamics",      t: "param" },
-      { n: "temperature",       t: "param" }
+      { n: "temperature",       t: "param" },
+      // v0.3.34 highest-fidelity upgrade params.
+      { n: "convergence",       t: "param" },
+      { n: "persistence",       t: "param" }
     ],
     outs: [{ n: "out", t: "texture" }],
     textureInputSlots: { in: 16 },
@@ -17795,16 +17798,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       brightness: 1.0,
       bloomAmount: 0.0625,   // 1/16, Lottes default
       shape: 2.0,            // gaussian shape exponent
-      // v0.3.33 -- high-fidelity additions. Defaults tuned so the
-      // out-of-the-box look is noticeably better than v0.3.31 but
-      // not visually surprising for patches built before this upgrade.
+      // v0.3.33 -- high-fidelity additions.
       halationAmount: 0.04,  // wide phosphor halo amplitude
       halationRadius: 10.0,  // halo radius in output framebuffer pixels
       beamDynamics: 0.5,     // brightness-aware scanline thickness boost
-      temperature: 0.0       // color temperature shift (-1=cool, +1=warm)
+      temperature: 0.0,      // color temperature shift (-1=cool, +1=warm)
+      // v0.3.34 -- highest-fidelity additions.
+      convergence: 0.0,      // RGB beam misalignment in output pixels (0 = perfect)
+      persistence: 0.0       // phosphor decay (0 = none, ~0.4 = subtle trail, 0.8 = strong)
     },
     methods: {},
-    uniformBytes: 128,
+    uniformBytes: 144,
     wgsl:
 `struct U {
   u_resolution:  vec4f,
@@ -17817,11 +17821,18 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   params:        vec4f,    // x=inLayer, y=virtualW, z=virtualH, w=curvature
   params2:       vec4f,    // x=scanHardness, y=pixHardness, z=maskType, w=maskStrength
   params3:       vec4f,    // x=brightness, y=bloomAmount, z=shape, w=halationAmount
-  params4:       vec4f,    // x=halationRadius, y=beamDynamics, z=temperature, w=_
+  params4:       vec4f,    // x=halationRadius, y=beamDynamics, z=temperature, w=convergence
+  params5:       vec4f,    // x=persistence, yzw=_
 };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
 @group(0) @binding(2) var fbSampler: sampler;
+// v0.3.34 -- second sampled texture for the phosphor-persistence
+// path. Bound via the composition-feedback hybrid layout; reads
+// last-frame composite output. Last frame's CRT result lives at the
+// same display layer as this frame's, so sampling u_layer at the
+// same UV gives the previous-frame value at the same screen pixel.
+@group(0) @binding(4) var fbFeedback: texture_2d_array<f32>;
 
 struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
 
@@ -17837,11 +17848,24 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
 
 // === Lottes CRT building blocks (ported from crt-lottes.cg). ===
 
-// Cheap gamma 2.0 approximation. Matched ToLinear/ToSrgb pair so the
-// bloom + scan math runs in linear-ish space without the cost of
-// proper sRGB decode (~5x speedup on the 42-sample per-pixel budget).
-fn to_linear(c: vec3f) -> vec3f { return c * c; }
-fn to_srgb(c: vec3f) -> vec3f   { return sqrt(max(c, vec3f(0.0))); }
+// v0.3.34 -- proper sRGB transfer functions. Piecewise linear at
+// dark values + power curve elsewhere, matching the IEC 61966-2-1
+// standard. ~5% more accurate than the c*c approximation we used
+// in v0.3.31-33, especially in shadow regions where bloom and
+// halation compound the gamma error.
+fn to_linear(c: vec3f) -> vec3f {
+  let cutoff = vec3f(0.04045);
+  let lo = c / 12.92;
+  let hi = pow((c + vec3f(0.055)) / 1.055, vec3f(2.4));
+  return select(hi, lo, c < cutoff);
+}
+fn to_srgb(c: vec3f) -> vec3f {
+  let c_safe = max(c, vec3f(0.0));
+  let cutoff = vec3f(0.0031308);
+  let lo = c_safe * 12.92;
+  let hi = 1.055 * pow(c_safe, vec3f(1.0 / 2.4)) - vec3f(0.055);
+  return select(hi, lo, c_safe < cutoff);
+}
 
 // Generalized Gaussian. shape=2 = standard gaussian; lower shape
 // (~1.3) gives wider tails (softer look); higher (~4) gives squarer
@@ -18047,6 +18071,22 @@ fn apply_temperature(c: vec3f, temp: f32) -> vec3f {
   return c * shift;
 }
 
+// === v0.3.34 highest-fidelity additions ===
+
+// Tri pass factored out so the convergence-error path can re-run it
+// three times with channel-specific UV offsets. Same math as the
+// Lottes Tri: Horz5 active row + Horz3 rows above/below, weighted
+// by scanline gaussian. 11 texture samples per call.
+fn tri_pass(uv: vec2f, layer: u32, virt_size: vec2f, pix_hard: f32, scan_hard: f32, gauss_shape: f32, bright: f32) -> vec3f {
+  let row_a = horz3(uv, -1.0, layer, virt_size, pix_hard, gauss_shape, bright);
+  let row_b = horz5(uv,  0.0, layer, virt_size, pix_hard, gauss_shape, bright);
+  let row_c = horz3(uv,  1.0, layer, virt_size, pix_hard, gauss_shape, bright);
+  let w_a = scan_w(uv, -1.0, virt_size, scan_hard, gauss_shape);
+  let w_b = scan_w(uv,  0.0, virt_size, scan_hard, gauss_shape);
+  let w_c = scan_w(uv,  1.0, virt_size, scan_hard, gauss_shape);
+  return row_a * w_a + row_b * w_b + row_c * w_c;
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4f {
   let layer        = u32(max(0.0, u.params.x));
@@ -18065,6 +18105,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   let halation_rad = max(u.params4.x, 0.5);
   let beam_dyn     = clamp(u.params4.y, 0.0, 1.0);
   let temp         = clamp(u.params4.z, -1.0, 1.0);
+  let convergence  = max(u.params4.w, 0.0);
+  let persistence  = clamp(u.params5.x, 0.0, 0.95);
 
   // Barrel warp -- pulls UV in toward center based on distance from
   // the opposite axis, mimicking the bulge of a CRT glass tube.
@@ -18086,13 +18128,25 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   // Active row uses Horz5 (5-tap) for cleaner color; +/-1 rows use
   // Horz3 (3-tap) since their contribution is heavily attenuated by
   // the scanline weighting anyway.
-  let row_a = horz3(warped, -1.0, layer, virt_size, pix_hard, gauss_shape, bright);
-  let row_b = horz5(warped,  0.0, layer, virt_size, pix_hard, gauss_shape, bright);
-  let row_c = horz3(warped,  1.0, layer, virt_size, pix_hard, gauss_shape, bright);
-  let w_a = scan_w(warped, -1.0, virt_size, scan_hard, gauss_shape);
-  let w_b = scan_w(warped,  0.0, virt_size, scan_hard, gauss_shape);
-  let w_c = scan_w(warped,  1.0, virt_size, scan_hard, gauss_shape);
-  var color = row_a * w_a + row_b * w_b + row_c * w_c;
+  //
+  // v0.3.34 -- convergence error: real CRT electron beams for R / G
+  // / B were slightly misaligned (a few thousandths of an inch). When
+  // convergence > 0 we run Tri three separate times with channel-
+  // specific UV offsets (R shifted left, B shifted right, G centered)
+  // and assemble the per-channel results. 22 extra texture samples
+  // when active; identity (single Tri) when convergence=0.
+  var color: vec3f;
+  if (convergence > 0.01) {
+    let texel_x = 1.0 / u.u_resolution.x;
+    let off_r = vec2f(-convergence * texel_x, 0.0);
+    let off_b = vec2f( convergence * texel_x, 0.0);
+    let r_tri = tri_pass(warped + off_r, layer, virt_size, pix_hard, scan_hard, gauss_shape, bright);
+    let g_tri = tri_pass(warped,         layer, virt_size, pix_hard, scan_hard, gauss_shape, bright);
+    let b_tri = tri_pass(warped + off_b, layer, virt_size, pix_hard, scan_hard, gauss_shape, bright);
+    color = vec3f(r_tri.r, g_tri.g, b_tri.b);
+  } else {
+    color = tri_pass(warped, layer, virt_size, pix_hard, scan_hard, gauss_shape, bright);
+  }
 
   // === Beam dynamics: brightness-aware scanline thickness. ===
   // Real CRT beams thicken with intensity -- bright pixels saturate
@@ -18148,7 +18202,25 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     color = apply_temperature(color, temp);
   }
 
-  // sRGB encode (matches the c*c ToLinear in fetch_pix).
+  // === v0.3.34 phosphor persistence: blend in last frame's output. ===
+  // Real CRT phosphors decay over a few milliseconds (P22 ~1-2 ms),
+  // so on a 60Hz display some of the previous frame's brightness
+  // carries into the current frame. We sample fbFeedback (last
+  // frame's composite output) at the CRT's OWN output display layer
+  // (u_layer = where this CRT pass writes -- NOT inLayer which is
+  // the upstream's input layer) so we read last frame's CRT result
+  // at the same screen position. Max-blend in linear space:
+  // preserves both new sharp content + old decaying brights, which
+  // is how real phosphor decay reads.
+  if (persistence > 0.001) {
+    let out_layer = u32(max(0.0, u.u_layer));
+    let prev_srgb = textureSampleLevel(fbFeedback, fbSampler, in.uv, out_layer, 0.0).rgb;
+    let prev_lin  = to_linear(prev_srgb);
+    color = max(color, prev_lin * persistence);
+  }
+
+  // sRGB encode (proper IEC 61966-2-1 transfer function, matching
+  // the decode in fetch_pix and persistence sample).
   let out_c = to_srgb(color);
   return vec4f(clamp(out_c, vec3f(0.0), vec3f(1.0)), 1.0);
 }`,
@@ -18169,9 +18241,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       scratch[28] = (typeof p.halationRadius   === "number") ? p.halationRadius   : 10.0;
       scratch[29] = (typeof p.beamDynamics     === "number") ? p.beamDynamics     : 0.5;
       scratch[30] = (typeof p.temperature      === "number") ? p.temperature      : 0.0;
-      scratch[31] = 0;
+      scratch[31] = (typeof p.convergence      === "number") ? p.convergence      : 0.0;
+      scratch[32] = (typeof p.persistence      === "number") ? p.persistence      : 0.0;
+      scratch[33] = 0; scratch[34] = 0; scratch[35] = 0;
     },
-    description: "High-fidelity CRT emulation. Lottes single-pass core (barrel warp + Tri scanline gaussian + 5-row bloom pyramid + four shadow-mask variants) with v0.3.33 fidelity additions: HALATION (wide phosphor halo from glass-tube light scatter, 12 taps), ANTI-ALIASED shadow mask (smoothstep transitions instead of pixel-chunky steps), BEAM DYNAMICS (brightness-aware scanline thickening — highlights saturate the beam like a real CRT), and COLOR TEMPERATURE shift. virtualW/H: emulated resolution (320x240 = arcade/NES; bump to 640x480+ for subtler modern-content looks). curvature: barrel intensity (0.031 default). scanlineHardness / pixelHardness: negative gaussian scales (-8 / -3 default; more negative = sharper). maskType: 0=none, 1=slot, 2=aperture grille (Trinitron), 3=VGA-stretched (default), 4=VGA-stretched-2x. bloomAmount: in-pixel-grid glow (1/16 Lottes default; 0 = skip 31 samples). halationAmount: wide soft glow (0.04 default; 0 = skip 12 samples). halationRadius: halo radius in OUTPUT pixels (~10 typical). beamDynamics: brightness-aware scan thickness (0 = uniform Lottes scanlines; 1 = strong highlight bloom). temperature: -1 = cool/early-tube cast, 0 = neutral, +1 = warm/late-P22 cast. Cost: ~55 texture samples per fragment with all features on; turn off bloom+halation for ~12 taps. 1080p budget 5-8 ms with everything on (mid-range discrete GPU)."
+    description: "Highest-fidelity CRT emulation. Lottes single-pass core (barrel warp + Tri scanline gaussian + 5-row bloom pyramid + four shadow-mask variants) + v0.3.33 additions (halation, AA mask, beam dynamics, color temperature) + v0.3.34 additions: CONVERGENCE ERROR (RGB beam misalignment via per-channel Tri offsets; +22 samples when active), PHOSPHOR PERSISTENCE (last-frame max-blend trail via the hybrid composition-feedback bind layout; +1 sample when active), and PROPER sRGB GAMMA (IEC 61966-2-1 transfer function in place of the v0.3.31-33 c*c approximation). virtualW/H: emulated resolution (320x240 = arcade/NES; bump for subtler modern-content looks). curvature: barrel intensity (0.031 default). scanlineHardness / pixelHardness: negative gaussian scales. maskType: 0=none, 1=slot, 2=aperture grille, 3=VGA-stretched (default), 4=VGA-stretched-2x. bloomAmount: in-pixel-grid glow (0 = skip 31 samples). halationAmount: wide soft glow (0 = skip 12 samples). beamDynamics: highlight scan thickening. temperature: -1 cool to +1 warm. convergence: RGB beam offset in OUTPUT pixels (0 = perfect; ~0.5 = subtle vintage; ~1.5 = pronounced fringing). persistence: phosphor decay (0 = none; ~0.4 = subtle trail like P22; ~0.8 = long-decay P39 phosphor look). Cost: ~12-90 samples per fragment depending on which features are on; 1080p budget 5-12 ms with everything maxed (mid-range discrete GPU). Royale-style multi-pass subpixel rendering deferred to multi-pass infrastructure ticket."
   },
 
   /* =========================================================================
@@ -33856,6 +33930,15 @@ const Visual = {
   // consumer's composition pass reads it.
   compositionShaderBgl: null,
   compositionShaderPipelineLayout: null,
+  // v0.3.34 -- composition + feedback hybrid bind layout. Binds BOTH
+  // the scratch texture (binding 1, same-frame upstream content like
+  // composition) AND the feedback array (binding 4, last-frame
+  // composite like feedback). The CRT shader uses this to read its
+  // upstream input for the live signal AND its own last-frame output
+  // for phosphor persistence trails in a single pass. Pipeline cache
+  // disambiguates via the layout tag in the hash key.
+  compositionFeedbackShaderBgl: null,
+  compositionFeedbackShaderPipelineLayout: null,
   // Scratch render-target textures (Phase 6.6.30 + v0.2.16 ping-pong).
   // Two scratch textures (A and B) so a deep composition chain doesn't
   // hit the WebGPU same-pass texture-binding-vs-render-attachment rule:
@@ -36254,6 +36337,35 @@ function _ensureCompositionShaderLayout() {
   });
 }
 
+/* v0.3.34 — composition + feedback hybrid bind layout. Composition's
+ * scratch texture at binding 1 (same-frame upstream input) PLUS the
+ * feedback array at binding 4 (last-frame composite). Shared sampler
+ * at binding 2 + audio uniform at binding 3 (same convention as the
+ * other layouts).
+ *
+ * Used by the CRT shader's phosphor-persistence path: the shader
+ * reads its live upstream signal via the scratch binding (just like
+ * any composition shader) AND samples last-frame output via the
+ * feedback binding to model phosphor decay. Single pass, no chained-
+ * node workaround. */
+function _ensureCompositionFeedbackShaderLayout() {
+  if (Visual.compositionFeedbackShaderBgl) return;
+  Visual.compositionFeedbackShaderBgl = Visual.device.createBindGroupLayout({
+    label: "shader-frag-compositionfeedback-bgl",
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+      { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d-array" } },
+      { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+      { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+      { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d-array" } }
+    ]
+  });
+  Visual.compositionFeedbackShaderPipelineLayout = Visual.device.createPipelineLayout({
+    label: "shader-frag-compositionfeedback-pl",
+    bindGroupLayouts: [Visual.compositionFeedbackShaderBgl]
+  });
+}
+
 /* Phase 7.1 — bind-group layout for video-source shader-frag nodes
  * (Webcam, VideoFile, ScreenShare). Same shape as standard +
  * sampler + an externalTexture (the live video frame, imported
@@ -36287,9 +36399,10 @@ function _ensureVideoSourceShaderLayout() {
 function _getShaderPipeline(wgsl, bindLayout) {
   bindLayout = bindLayout || "standard";
   _ensureStandardShaderLayout();
-  if (bindLayout === "feedback")     _ensureFeedbackShaderLayout();
-  if (bindLayout === "composition")  _ensureCompositionShaderLayout();
-  if (bindLayout === "video-source") _ensureVideoSourceShaderLayout();
+  if (bindLayout === "feedback")             _ensureFeedbackShaderLayout();
+  if (bindLayout === "composition")          _ensureCompositionShaderLayout();
+  if (bindLayout === "composition-feedback") _ensureCompositionFeedbackShaderLayout();
+  if (bindLayout === "video-source")         _ensureVideoSourceShaderLayout();
   const key = _fnv1a(wgsl) + "@" + bindLayout;
   let entry = Visual.shaderPipelineCache.get(key);
   if (entry) return entry;
@@ -36298,9 +36411,11 @@ function _getShaderPipeline(wgsl, bindLayout) {
     ? Visual.feedbackShaderPipelineLayout
     : bindLayout === "composition"
       ? Visual.compositionShaderPipelineLayout
-      : bindLayout === "video-source"
-        ? Visual.videoSourceShaderPipelineLayout
-        : Visual.standardShaderPipelineLayout;
+      : bindLayout === "composition-feedback"
+        ? Visual.compositionFeedbackShaderPipelineLayout
+        : bindLayout === "video-source"
+          ? Visual.videoSourceShaderPipelineLayout
+          : Visual.standardShaderPipelineLayout;
 
   entry = { key, promise: null, pipeline: null, error: null };
   entry.promise = (async () => {
@@ -36386,15 +36501,19 @@ function _ensureShaderInstance(nodeId, def, srcNode, scratchReadKey) {
   // Reallocate when the buffer size, bindLayout, or texture-view ref
   // doesn't match (fresh node, user edited params, framebuffer
   // resized so the view's stale, etc).
-  const feedbackView    = bindLayout === "feedback"    ? Visual.feedbackArrayView : null;
-  const compositionView = bindLayout === "composition"
+  const feedbackView    = (bindLayout === "feedback" || bindLayout === "composition-feedback")
+                          ? Visual.feedbackArrayView : null;
+  const compositionView = (bindLayout === "composition" || bindLayout === "composition-feedback")
     ? (scratchReadKey === "b" ? Visual.scratchArrayViewB : Visual.scratchArrayViewA)
     : null;
-  const samplerRef      = (bindLayout === "feedback" || bindLayout === "composition" || bindLayout === "video-source")
+  const samplerRef      = (bindLayout === "feedback" || bindLayout === "composition" ||
+                           bindLayout === "composition-feedback" || bindLayout === "video-source")
                           ? Visual.blitSampler : null;
   const layoutMismatch     = inst && inst._bindLayout !== bindLayout;
-  const feedbackViewStale  = inst && bindLayout === "feedback"    && inst._feedbackView !== feedbackView;
-  const compViewStale      = inst && bindLayout === "composition" && inst._compositionView !== compositionView;
+  const feedbackViewStale  = inst && (bindLayout === "feedback" || bindLayout === "composition-feedback")
+                                  && inst._feedbackView !== feedbackView;
+  const compViewStale      = inst && (bindLayout === "composition" || bindLayout === "composition-feedback")
+                                  && inst._compositionView !== compositionView;
   if (!inst || inst._uniformBytes !== def.uniformBytes || layoutMismatch || feedbackViewStale || compViewStale) {
     if (inst && inst.uniformBuffer) {
       try { inst.uniformBuffer.destroy(); } catch (_) {}
@@ -36431,6 +36550,22 @@ function _ensureShaderInstance(nodeId, def, srcNode, scratchReadKey) {
           { binding: 1, resource: compositionView },
           { binding: 2, resource: samplerRef },
           audioBuf
+        ].filter(Boolean)
+      });
+    } else if (bindLayout === "composition-feedback" && compositionView && feedbackView && samplerRef) {
+      // v0.3.34 -- composition + feedback hybrid. Bind composition's
+      // scratch at slot 1 (live upstream input) AND the feedback
+      // array at slot 4 (last-frame composite output). The CRT
+      // shader's phosphor-persistence path samples both.
+      bg = Visual.device.createBindGroup({
+        label: "shader-frag-compositionfeedback-bg-" + nodeId,
+        layout: Visual.compositionFeedbackShaderBgl,
+        entries: [
+          { binding: 0, resource: { buffer: buf } },
+          { binding: 1, resource: compositionView },
+          { binding: 2, resource: samplerRef },
+          audioBuf,
+          { binding: 4, resource: feedbackView }
         ].filter(Boolean)
       });
     } else if (bindLayout === "video-source") {
