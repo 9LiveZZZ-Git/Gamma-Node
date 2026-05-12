@@ -13213,7 +13213,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
    * leaving black bars. */
   Webcam: {
     category: "Visual", color: COLOR.visual, header: null,
-    cppType: "",
+    // v0.3.19 — Webcam doubles as a wire-routable audio source. cppType
+    // declares a GammaVideoSrc member; helperClass attaches to VideoFile
+    // and dedups (only one emission across all VideoFile + Webcam nodes).
+    // Audio outs are silent until the user enables audio in the props
+    // pane -- that triggers a stream-rebuild with `audio: true` and
+    // routes the mic track through a ChannelMerger -> worklet input 1.
+    cppType: "GammaVideoSrc",
     kind: "shader-frag",
     bindLayout: "video-source",
     ins:  [
@@ -13223,9 +13229,22 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       { n: "tint_g",    t: "param" },
       { n: "tint_b",    t: "param" }
     ],
-    outs: [{ n: "out", t: "texture" }],
-    params: { mirrored: 1, exposure: 1.0, tint_r: 1.0, tint_g: 1.0, tint_b: 1.0 },
-    methods: { mirrored: null, exposure: null, tint_r: null, tint_g: null, tint_b: null },
+    outs: [
+      { n: "out",  t: "texture" },
+      // v0.3.19 — audio outlets. Silent unless audioEnabled and the
+      // browser grants mic-with-video. Direct playback is NEVER on
+      // for Webcam (would create echo) -- the audio path is patch-
+      // routing only.
+      { n: "outL", t: "audio", access: ".l" },
+      { n: "outR", t: "audio", access: ".r" }
+    ],
+    params: {
+      mirrored: 1, exposure: 1.0, tint_r: 1.0, tint_g: 1.0, tint_b: 1.0,
+      audioEnabled: 0,   // off by default; enabling re-prompts getUserMedia
+      volume: 1.0        // applied to the routing path (not direct playback)
+    },
+    methods: { mirrored: null, exposure: null, tint_r: null, tint_g: null, tint_b: null, audioEnabled: null, volume: null },
+    uiOnlyParams: ["audioEnabled", "volume"],
     uniformBytes: 96,
     wgsl:
 `struct U {
@@ -13324,7 +13343,32 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
    * live camera. */
   VideoFile: {
     category: "Visual", color: COLOR.visual, header: null,
-    cppType: "",
+    // v0.3.19 — VideoFile is now ALSO a wire-routable audio source.
+    // GammaVideoSrc is a pass-through stereo container; the worklet
+    // calls setL/setR per sample with the file's audio track data,
+    // and the operator() returns Out{l,r} so downstream nodes can
+    // read outL / outR. helperClass below ships the class definition;
+    // Webcam (same cppType) dedups against it.
+    cppType: "GammaVideoSrc",
+    helperClass:
+`class GammaVideoSrc {
+    /* Stereo pass-through for video / mic audio routed through the
+     * worklet's input 1 (one stereo channel pair per source). The
+     * worklet writes inputs[1][2N] / [2N+1] to wasm buffers each
+     * quantum, then the wrapper's tick body calls setL/setR per
+     * sample BEFORE operator() reads gPatch. Consumers reach the
+     * latest sample via the .l / .r accessors on Out. */
+    float l_ = 0.f;
+    float r_ = 0.f;
+public:
+    void setL(float v) { l_ = v; }
+    void setR(float v) { r_ = v; }
+    void setSample(float l, float r) { l_ = l; r_ = r; }
+    struct Out { float l, r; };
+    Out operator()() {
+        Out o; o.l = l_; o.r = r_; return o;
+    }
+};`,
     kind: "shader-frag",
     bindLayout: "video-source",
     ins: [
@@ -13339,7 +13383,18 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       // that re-syncs on every bar.
       { n: "trig",     t: "gate" }
     ],
-    outs: [{ n: "out", t: "texture" }],
+    outs: [
+      { n: "out",  t: "texture" },
+      // v0.3.19 — wire-routable audio outlets. Wire outL/outR into any
+      // audio-rate node (Filter, Reverb, MasterMix, Output). When at
+      // least one wire exists from this node, direct playback through
+      // the browser default device is suppressed -- the patch IS the
+      // audio path. With no wires, the file plays through
+      // MES->Gain->ctx.destination (volume slider applies; the legacy
+      // v0.3.16 behavior).
+      { n: "outL", t: "audio", access: ".l" },
+      { n: "outR", t: "audio", access: ".r" }
+    ],
     params: {
       fileUrl: "",
       // v0.3.15 — transport state, persisted with the patch.
@@ -26294,26 +26349,38 @@ function renderProps() {
                <button class="btn" data-vf-rate="2.0"  title="2×"    style="flex:1;font-size:10px;">2×</button>
                <button class="btn" data-vf-rate="4.0"  title="4×"    style="flex:1;font-size:10px;">4×</button>
              </div>`;
-    // v0.3.16 — audio section. Plays the file's audio track through
-    // the browser's default audio device. NOT routed through the
-    // patch's audio worklet yet -- that's the v0.3.17 ticket; the
-    // wire-routable `audio` outlet will need worklet input-count
-    // changes + per-VideoFile codegen channel allocation.
+    // v0.3.19 — audio section. Two paths:
+    //   1. No audio wires from this node → direct playback (MES →
+    //      GainNode → ctx.destination). audioEnabled gates, volume
+    //      scales. Until the user hits ▶ Play, audio plays via the
+    //      videoEl directly (no Web Audio context yet).
+    //   2. Audio wires exist → patch is the audio path. Direct
+    //      playback muted; outL/outR feed the wire-routed processing.
+    //      audioEnabled/volume become moot for direct, but volume is
+    //      preserved for when the user removes the wire.
     const audioOn = !node.params || node.params.audioEnabled !== 0;
     const vol = (node.params && typeof node.params.volume === "number")
       ? node.params.volume : 1.0;
-    html += `<div class="prop-section" style="margin-top:14px;">Audio
-               <span style="font-weight:normal;font-size:10px;color:var(--text-2);opacity:0.7;">(direct to speakers — wire-routable outlet WIP)</span>
+    const hasAudioWire = (typeof state !== "undefined" && state &&
+      Array.isArray(state.edges) && state.edges.some(e =>
+        e && e.from && e.from.node === node.id &&
+        (e.from.port === "outL" || e.from.port === "outR")));
+    const statusHint = hasAudioWire
+      ? `<span style="font-weight:normal;font-size:10px;color:var(--accent-2,#a07cff);opacity:0.95;">(patch-routed via outL/outR — direct playback muted)</span>`
+      : `<span style="font-weight:normal;font-size:10px;color:var(--text-2);opacity:0.7;">(direct to speakers — wire outL/outR to route through patch)</span>`;
+    html += `<div class="prop-section" style="margin-top:14px;">Audio ${statusHint}
              </div>
              <div style="display:flex;align-items:center;gap:8px;">
                <button class="btn ${audioOn ? "primary" : ""}" id="btn-videofile-mute"
-                       title="Toggle audio playback" style="min-width:48px;">${audioOn ? "🔊 on" : "🔇 off"}</button>
+                       title="Toggle direct audio playback (ignored when patch-routed)" style="min-width:48px;"
+                       ${hasAudioWire ? "disabled" : ""}>${audioOn ? "🔊 on" : "🔇 off"}</button>
                <input id="videofile-volume" type="range" min="0" max="1" step="0.01" value="${vol}"
-                      style="flex:1;" ${audioOn ? "" : "disabled"} />
+                      style="flex:1;" ${(audioOn && !hasAudioWire) ? "" : "disabled"} />
                <span style="font-family:var(--font-mono);font-size:11px;color:var(--text-2);min-width:32px;text-align:right;">${Math.round(vol * 100)}%</span>
              </div>
              <div style="margin-top:6px;font-size:10px;color:var(--text-2);opacity:0.6;line-height:1.4;">
-               Wire MasterClock.bar/.beat → <code>trig</code> input on this node to retrigger the clip from currentTime=0 on every pulse.
+               Wire MasterClock.bar/.beat → <code>trig</code> to retrigger the clip from 0 on every pulse.
+               outL/outR carry the file's stereo audio (sample-accurate, ~3 ms quantum) — pipe through any Gamma audio node.
              </div>`;
   }
   propsEl.innerHTML = html;
@@ -26383,23 +26450,36 @@ function renderProps() {
         applyRate(b.getAttribute('data-vf-rate'));
       });
     });
-    // v0.3.16 — audio toggle + volume slider wiring. The mute toggle
-    // flips params.audioEnabled (persists), then live-applies
-    // videoEl.muted. The volume slider is param-rate (not per-sample);
-    // dragging it pushes immediately to videoEl.volume.
+    // v0.3.16 — audio toggle + volume slider wiring.
+    // v0.3.19 — when the patch is playing AND a MediaElementSource
+    // has been created (via ensureVideoAudioConnected), audio plays
+    // through Web Audio (MES → GainNode → ctx.destination). We
+    // update the GainNode via _updateVideoAudioGains. Fall back to
+    // direct videoEl.muted/volume when MES doesn't exist yet (no
+    // audioCtx — patch hasn't been played).
     const applyMute = (audioOn) => {
       if (!node.params) node.params = {};
       node.params.audioEnabled = audioOn ? 1 : 0;
-      const v = getVideoEl();
-      if (v) { try { v.muted = !audioOn; } catch (_) {} }
+      const src = _videoSources.get(node.id);
+      if (src && src._mediaSource && typeof _updateVideoAudioGains === "function") {
+        _updateVideoAudioGains();
+      } else {
+        const v = getVideoEl();
+        if (v) { try { v.muted = !audioOn; } catch (_) {} }
+      }
       renderProps();
     };
     const applyVolume = (vol) => {
       vol = Math.max(0, Math.min(1, Number(vol) || 0));
       if (!node.params) node.params = {};
       node.params.volume = vol;
-      const v = getVideoEl();
-      if (v) { try { v.volume = vol; } catch (_) {} }
+      const src = _videoSources.get(node.id);
+      if (src && src._mediaSource && typeof _updateVideoAudioGains === "function") {
+        _updateVideoAudioGains();
+      } else {
+        const v = getVideoEl();
+        if (v) { try { v.volume = vol; } catch (_) {} }
+      }
       // No renderProps() here -- the slider drag would lose focus on
       // every input event. The displayed % only refreshes when the
       // user releases the slider (via 'change' event below).
@@ -27238,6 +27318,18 @@ function generateCode() {
     const calls = micNodes.map(n => `${n.id}.setIn(v);`).join(" ");
     setters.push(`    void setMicInput(float v) { ${calls} }`);
   }
+
+  // v0.3.19 — VideoSrc per-source setters. For each VideoFile / Webcam
+  // node that has outgoing wires from outL or outR, emit one pair of
+  // setter methods (setVidL_N, setVidR_N) that route the worklet's
+  // input-1 channel data into the per-instance GammaVideoSrc member.
+  // Index N agrees with the JS-side _videoAudioSrcNodes() ordering;
+  // the wrapper's tick loop emits the matching per-sample dispatch.
+  const vidSrcNodes = (typeof _videoAudioSrcNodes === "function") ? _videoAudioSrcNodes() : [];
+  vidSrcNodes.forEach((n, idx) => {
+    setters.push(`    void setVidL_${idx}(float v) { ${n.id}.setL(v); }`);
+    setters.push(`    void setVidR_${idx}(float v) { ${n.id}.setR(v); }`);
+  });
 
   // Codegen context shared by every exprFor call in this build pass.
   const cgCtx = {
@@ -33670,10 +33762,43 @@ function _disposeShaderInstance(nodeId) {
 
 const _videoSources = new Map();   // nodeId -> { videoEl, stream, ready, error, requesting, kind, src }
 
+/* v0.3.19 — deterministic ordering of VideoFile / Webcam nodes that
+ * have outgoing audio wires from outL or outR. Both the JS-side audio
+ * router and the codegen use this exact ordering so the channel
+ * allocation agrees on which video source feeds setVidL_N / setVidR_N.
+ *
+ * Sorted by node ID (stable across runs); capped at MAX so the C++
+ * wrapper has a fixed dispatch table size. */
+const MAX_VIDEO_AUDIO_SRC = 4;
+function _videoAudioSrcNodes() {
+  if (typeof state === "undefined" || !state) return [];
+  if (!Array.isArray(state.nodes) || !Array.isArray(state.edges)) return [];
+  return state.nodes
+    .filter(n => n && (n.type === "VideoFile" || n.type === "Webcam"))
+    .filter(n => state.edges.some(e =>
+      e && e.from && e.from.node === n.id &&
+      (e.from.port === "outL" || e.from.port === "outR")
+    ))
+    .slice()
+    .sort((a, b) => String(a.id).localeCompare(String(b.id)))
+    .slice(0, MAX_VIDEO_AUDIO_SRC);
+}
+
 async function _ensureWebcamStream(nodeId) {
   let entry = _videoSources.get(nodeId);
+  // v0.3.19 — if the audio flag changed since the stream was created,
+  // tear down + re-request so the new audioTracks state takes effect.
+  // _audioWanted is stamped on the entry below; we read params via
+  // the live node so the toggle in the props pane drives this.
+  const node = (typeof state !== "undefined" && state && Array.isArray(state.nodes))
+    ? state.nodes.find(n => n && n.id === nodeId) : null;
+  const audioWanted = !!(node && node.params && node.params.audioEnabled);
+  if (entry && entry._audioWanted !== audioWanted) {
+    _disposeVideoSource(nodeId);
+    entry = null;
+  }
   if (entry) return entry;
-  entry = { videoEl: null, stream: null, ready: false, error: null, requesting: true, kind: "webcam" };
+  entry = { videoEl: null, stream: null, ready: false, error: null, requesting: true, kind: "webcam", _audioWanted: audioWanted };
   _videoSources.set(nodeId, entry);
   try {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -33681,7 +33806,7 @@ async function _ensureWebcamStream(nodeId) {
     }
     const stream = await navigator.mediaDevices.getUserMedia({
       video: { width: { ideal: 1280 }, height: { ideal: 720 } },
-      audio: false
+      audio: audioWanted
     });
     const videoEl = document.createElement("video");
     videoEl.srcObject = stream;
@@ -33695,7 +33820,16 @@ async function _ensureWebcamStream(nodeId) {
     entry.videoEl = videoEl;
     entry.ready   = true;
     console.log("[webcam] node " + nodeId + " stream live: " +
-                videoEl.videoWidth + "×" + videoEl.videoHeight);
+                videoEl.videoWidth + "×" + videoEl.videoHeight +
+                (audioWanted ? " (audio: " + stream.getAudioTracks().length + " track)" : ""));
+    // v0.3.19 — if Web Audio is up, re-route now that the stream
+    // (possibly with audio track) is live.
+    if (typeof ensureVideoAudioConnected === "function" &&
+        typeof previewState !== "undefined" && previewState && previewState.workletNode) {
+      try { ensureVideoAudioConnected(); } catch (e) {
+        console.warn("[webcam] post-init routing failed:", e);
+      }
+    }
   } catch (e) {
     console.warn("[webcam] node " + nodeId + " getUserMedia failed:", e);
     entry.error = e;
@@ -33708,6 +33842,21 @@ async function _ensureWebcamStream(nodeId) {
 function _disposeVideoSource(nodeId) {
   const entry = _videoSources.get(nodeId);
   if (!entry) return;
+  // v0.3.19 — tear down Web Audio routing first so the worklet's
+  // input 1 stops receiving samples from a stale source.
+  if (typeof previewState !== "undefined" && previewState && previewState.videoRoutings) {
+    const r = previewState.videoRoutings.get(nodeId);
+    if (r) {
+      try { r.splitter.disconnect(); } catch (_) {}
+      previewState.videoRoutings.delete(nodeId);
+    }
+  }
+  if (entry._directGain) {
+    try { entry._directGain.disconnect(); } catch (_) {}
+  }
+  if (entry._mediaSource) {
+    try { entry._mediaSource.disconnect(); } catch (_) {}
+  }
   if (entry.stream) {
     try { entry.stream.getTracks().forEach(t => t.stop()); } catch (_) {}
   }
@@ -33790,6 +33939,16 @@ async function _ensureVideoFile(nodeId, params) {
                 (videoEl.videoWidth || "?") + "×" + (videoEl.videoHeight || "?") +
                 " @ " + (videoEl.playbackRate || 1).toFixed(2) + "x" +
                 (params && params.paused ? ", paused" : "") + ")");
+    // v0.3.19 — if the audio context is already up (user hit Play
+    // before this VideoFile was initialized), re-run the routing so
+    // this new videoEl gets a MediaElementSource + connects to the
+    // worklet merger. Otherwise the next Play picks it up.
+    if (typeof ensureVideoAudioConnected === "function" &&
+        typeof previewState !== "undefined" && previewState && previewState.workletNode) {
+      try { ensureVideoAudioConnected(); } catch (e) {
+        console.warn("[videofile] post-init routing failed:", e);
+      }
+    }
   } catch (e) {
     console.warn("[videofile] init failed for node " + nodeId + ":", e);
     entry.error = e;
@@ -38261,7 +38420,11 @@ async function renderOfflineAudio(durationSec) {
   }
   const node = new AudioWorkletNode(offCtx, "gamma-preview-processor", {
     outputChannelCount: [numChannels],
-    numberOfInputs: 1,
+    // v0.3.19 — second input slot reserved for VideoSrc aggregate (see
+    // live-preview path). For offline render there are no Web Audio
+    // sources to feed it so it stays silent + the worklet's vid-buf
+    // writes turn into zero samples; harmless.
+    numberOfInputs: 2,
     numberOfOutputs: 1
   });
   node.connect(offCtx.destination);
@@ -39211,11 +39374,29 @@ function wrapForPreview(patchSource, className) {
     ? `        if (i < gMicLen) gPatch->setMicInput(gMicBuf[i]);
 `
     : "";
+  // v0.3.19 — VideoSrc per-sample dispatch. One pair of setVidL_N /
+  // setVidR_N calls per audio-wired VideoFile / Webcam node. The
+  // worklet's process() writes inputs[1][2N..2N+1] into the matching
+  // wasm buffer pair (gVidBufNL / gVidBufNR) at the top of each
+  // quantum; here we drain them per sample BEFORE gPatch's operator()
+  // runs so any downstream member node binds against the latest
+  // sample. gVidLen mirrors the actual worklet quantum size for
+  // safety against future quantum-length changes.
+  const vidWrapSrc = (typeof _videoAudioSrcNodes === "function") ? _videoAudioSrcNodes() : [];
+  const vidPrefix = vidWrapSrc.length
+    ? `        if (i < gVidLen) {
+${vidWrapSrc.map((n, idx) =>
+    `            gPatch->setVidL_${idx}(gVidBuf${idx}L[i]);
+            gPatch->setVidR_${idx}(gVidBuf${idx}R[i]);`
+  ).join('\n')}
+        }
+`
+    : "";
   const tickBody = isStereo
-    ? `${micPrefix}        auto p = (*gPatch)();
+    ? `${micPrefix}${vidPrefix}        auto p = (*gPatch)();
         outL[i] = p.first;
         outR[i] = p.second;`
-    : `${micPrefix}        float s = (*gPatch)();
+    : `${micPrefix}${vidPrefix}        float s = (*gPatch)();
         outL[i] = s;
         outR[i] = s;`;
 
@@ -39234,6 +39415,27 @@ PREVIEW_EXPORT(preview_set_mic_len) void preview_set_mic_len(int n) {
     if (n < 0) n = 0;
     if (n > 2048) n = 2048;
     gMicLen = n;
+}
+`
+    : "";
+
+  // v0.3.19 — VideoSrc per-source ring buffers. One stereo pair per
+  // audio-wired VideoFile / Webcam node. preview_get_vid_buf_N_l/r
+  // returns the buffer pointer (queried by the worklet after load);
+  // preview_set_vid_len mirrors the quantum size. Buffers sized 2048
+  // matching the mic-buf safety margin.
+  const vidGlobals = vidWrapSrc.length
+    ? vidWrapSrc.map((_, idx) =>
+        `static float gVidBuf${idx}L[2048];
+static float gVidBuf${idx}R[2048];
+PREVIEW_EXPORT(preview_get_vid_buf_${idx}_l) const float* preview_get_vid_buf_${idx}_l() { return gVidBuf${idx}L; }
+PREVIEW_EXPORT(preview_get_vid_buf_${idx}_r) const float* preview_get_vid_buf_${idx}_r() { return gVidBuf${idx}R; }`
+      ).join('\n') +
+      `\nstatic int gVidLen = 0;
+PREVIEW_EXPORT(preview_set_vid_len) void preview_set_vid_len(int n) {
+    if (n < 0) n = 0;
+    if (n > 2048) n = 2048;
+    gVidLen = n;
 }
 `
     : "";
@@ -39260,7 +39462,7 @@ static ${className}* gPatch = nullptr;
 
 extern "C" {
 
-${micGlobals}// Gamma's units cache per-sample increments at construction time from
+${micGlobals}${vidGlobals}// Gamma's units cache per-sample increments at construction time from
 // the global Domain. Without an explicit sample-rate set the Domain
 // defaults to 1.0, which makes Sine play at the wrong pitch and AD
 // complete its envelope in a single sample (audibly silent). The
@@ -39674,6 +39876,14 @@ class PreviewProcessor extends AudioWorkletProcessor {
     this.micBufPtr = 0;
     this.micSetLen = null;
     this.micEnabled = false;
+    // v0.3.19 — VideoSrc plumbing. After load, we scan wasm exports
+    // for preview_get_vid_buf_N_l / _r pairs and stash the pointers;
+    // process() then writes inputs[1] channels into them per quantum.
+    // vidBufPtrs is an array of { l: <ptr>, r: <ptr> } indexed by
+    // source N. vidSetLen mirrors the quantum length to gVidLen.
+    this.vidBufPtrs = [];
+    this.vidSetLen = null;
+    this.vidEnabled = false;
     // Phase 6.5.1 — audio bridge. The main thread allocates a SAB
     // and posts it once; the worklet keeps the views alive and
     // writes scalar values + (future) FFT bins per quantum. Null
@@ -39740,11 +39950,27 @@ class PreviewProcessor extends AudioWorkletProcessor {
     } else {
       this.micEnabled = false;
     }
+    // v0.3.19 — VideoSrc wiring. Enumerate exports for preview_get_vid_buf_N_l/r
+    // pairs (N = 0, 1, ...) until the chain breaks. preview_set_vid_len
+    // is shared across all sources. String concat (no template literals)
+    // because this code lives inside a String.raw template -- backticks
+    // would close the outer literal early.
+    this.vidBufPtrs = [];
+    let vIdx = 0;
+    while (exp["preview_get_vid_buf_" + vIdx + "_l"] && exp["preview_get_vid_buf_" + vIdx + "_r"]) {
+      this.vidBufPtrs.push({
+        l: exp["preview_get_vid_buf_" + vIdx + "_l"](),
+        r: exp["preview_get_vid_buf_" + vIdx + "_r"]()
+      });
+      vIdx++;
+    }
+    this.vidSetLen = exp.preview_set_vid_len || null;
+    this.vidEnabled = this.vidBufPtrs.length > 0 && !!this.vidSetLen;
     this.instance = instance;
     this.processCount = 0;
     this.diagSent = false;
     const exportNames = Object.keys(exp);
-    this.port.postMessage({ type: "loaded", exports: exportNames, micEnabled: this.micEnabled });
+    this.port.postMessage({ type: "loaded", exports: exportNames, micEnabled: this.micEnabled, vidEnabled: this.vidEnabled, vidCount: this.vidBufPtrs.length });
   }
   process(inputs, outputs) {
     const out = outputs[0];
@@ -39768,6 +39994,40 @@ class PreviewProcessor extends AudioWorkletProcessor {
         heap.set(inMic.subarray(0, len), off);
       }
       if (this.micSetLen) this.micSetLen(len);
+    }
+    // v0.3.19 — VideoSrc input. inputs[1] is the ChannelMerger output
+    // from ensureVideoAudioConnected; each source occupies a stereo
+    // pair (channels 2N, 2N+1). Write each pair into per-source wasm
+    // buffers; the C++ tick wrapper drains them via setVidL_N / _R.
+    if (this.vidEnabled) {
+      const vidIn = inputs[1];
+      let writeLen = 0;
+      if (vidIn && vidIn.length > 0) {
+        const heap = new Float32Array(this.memory.buffer);
+        for (let s = 0; s < this.vidBufPtrs.length; s++) {
+          const lCh = vidIn[s * 2];
+          const rCh = vidIn[s * 2 + 1];
+          // Empty channels (no source connected at that pair) are still
+          // declared by the merger; they read as zero-filled or
+          // undefined-length depending on Web Audio impl. Guard both.
+          if (lCh && lCh.length > 0) {
+            const len = Math.min(lCh.length, 2048);
+            heap.set(lCh.subarray(0, len), this.vidBufPtrs[s].l >> 2);
+            if (len > writeLen) writeLen = len;
+          }
+          if (rCh && rCh.length > 0) {
+            const len = Math.min(rCh.length, 2048);
+            heap.set(rCh.subarray(0, len), this.vidBufPtrs[s].r >> 2);
+            if (len > writeLen) writeLen = len;
+          }
+        }
+      }
+      // Pass actual write length, NOT a fallback to quantum size --
+      // if no source connected this quantum, we want the wasm tick
+      // to skip the setVidL/setVidR calls entirely (vs reading stale
+      // bytes from a previously-populated buffer, which would tick
+      // a one-quantum click).
+      if (this.vidSetLen) this.vidSetLen(writeLen);
     }
     this.tickFn(this.outLPtr, this.outRPtr, out[0].length);
     const heap = new Float32Array(this.memory.buffer);
@@ -39827,12 +40087,13 @@ async function ensureAudioWorklet() {
   await previewState.audioCtx.audioWorklet.addModule(url);
   const node = new AudioWorkletNode(previewState.audioCtx, "gamma-preview-processor", {
     outputChannelCount: [2],
-    // 1 input means inputs[0] in the worklet's process() is a real
-    // channel array (not undefined). The mic path only writes when
-    // a MediaStreamSource is actually connected — otherwise the
-    // input is an empty buffer and the worklet silently writes 0
-    // mic samples per tick.
-    numberOfInputs: 1,
+    // 1 input == mic (inputs[0]).
+    // v0.3.19 — second input slot is the VideoSrc aggregate (inputs[1]).
+    // A ChannelMerger combines all wire-routed VideoFile / Webcam audio
+    // sources here (up to MAX_VIDEO_AUDIO_SRC stereo pairs = 8 channels);
+    // see ensureVideoAudioConnected. Worklet's process() reads inputs[1]
+    // every quantum and writes into per-source wasm buffers.
+    numberOfInputs: 2,
     numberOfOutputs: 1
   });
 
@@ -40678,6 +40939,15 @@ async function previewCompileAndPlay() {
       // feed it into a patch that doesn't want it.
       disconnectMic();
     }
+    // v0.3.19 — Web Audio routing for VideoFile / Webcam audio outlets.
+    // The codegen produced setVidL_N / setVidR_N setters in the wasm
+    // for each audio-wired source; here we connect the matching
+    // MediaElementSource / MediaStreamSource through a ChannelMerger
+    // into the worklet's input 1. The worklet's load handler scans
+    // the wasm for preview_get_vid_buf_N_l/_r exports and starts
+    // writing inputs[1] into them per quantum.
+    try { await ensureVideoAudioConnected(); }
+    catch (e) { console.warn("[preview] videosrc routing failed:", e); }
     // v0.2.21 — clone for offline audio render before transfer.
     try { previewState.lastWasm = wasmBytes.slice(0); } catch (_) { previewState.lastWasm = null; }
     node.port.postMessage({ type: "load", wasmBytes }, [wasmBytes]);
@@ -40738,6 +41008,139 @@ async function ensureMicConnected() {
   previewState.micSource = src;
   previewState.micConnected = true;
   console.log("[preview] mic connected to worklet · device:", _micDeviceLabel);
+}
+
+/* v0.3.19 — VideoSrc routing. Wires each audio-wired VideoFile / Webcam
+ * node's MediaElementSource / MediaStreamSource through a ChannelMerger
+ * into the worklet's input 1. Each source occupies a stereo channel
+ * pair; channel index N matches the codegen setVidL_N / setVidR_N
+ * dispatch.
+ *
+ * Direct-playback path is also wired for VideoFile (MES → GainNode →
+ * ctx.destination) so the user can hear unprocessed audio when there
+ * are no audio wires. When wires exist, the GainNode is muted -- the
+ * patch is the audio path. Webcam skips direct playback entirely
+ * (would create echo with the user's own mic).
+ *
+ * Called from previewPlay after the worklet is ready, and whenever
+ * the patch shape changes (wire add/remove, fileUrl change). The
+ * function is idempotent + handles reroute / disconnect cases. */
+async function ensureVideoAudioConnected() {
+  if (!previewState || !previewState.workletNode || !previewState.audioCtx) return;
+  const vidNodes = (typeof _videoAudioSrcNodes === "function") ? _videoAudioSrcNodes() : [];
+
+  // No audio-wired video sources: tear down any prior merger so the
+  // worklet's input 1 stays silent.
+  if (vidNodes.length === 0) {
+    if (previewState.videoMerger) {
+      try { previewState.videoMerger.disconnect(); } catch (_) {}
+      previewState.videoMerger = null;
+    }
+    if (previewState.videoRoutings) {
+      previewState.videoRoutings.forEach(r => {
+        try { r.splitter.disconnect(); } catch (_) {}
+      });
+      previewState.videoRoutings.clear();
+    }
+    _updateVideoAudioGains();
+    return;
+  }
+
+  // Allocate or reuse the global merger feeding worklet input 1.
+  const numCh = MAX_VIDEO_AUDIO_SRC * 2;
+  if (!previewState.videoMerger) {
+    const merger = previewState.audioCtx.createChannelMerger(numCh);
+    merger.connect(previewState.workletNode, 0, 1);
+    previewState.videoMerger = merger;
+  }
+  if (!previewState.videoRoutings) previewState.videoRoutings = new Map();
+  if (!previewState.videoElSources) previewState.videoElSources = new Map();
+
+  // For each source, ensure routing at the correct channel pair.
+  for (let idx = 0; idx < vidNodes.length; idx++) {
+    const node = vidNodes[idx];
+    const existing = previewState.videoRoutings.get(node.id);
+    if (existing && existing.channelIdx === idx) continue;
+    if (existing) {
+      try { existing.splitter.disconnect(); } catch (_) {}
+      previewState.videoRoutings.delete(node.id);
+    }
+    // Get / lazy-init the MediaElementSource (VideoFile) or
+    // MediaStreamSource (Webcam). MES is one-shot per element so we
+    // cache it on _videoSources entry.
+    const srcEntry = _videoSources.get(node.id);
+    if (!srcEntry) continue;
+    let mes = srcEntry._mediaSource;
+    if (!mes) {
+      try {
+        if (node.type === "VideoFile") {
+          if (!srcEntry.videoEl) continue;
+          mes = previewState.audioCtx.createMediaElementSource(srcEntry.videoEl);
+          // Direct-playback path. GainNode value managed by
+          // _updateVideoAudioGains based on audioEnabled / volume /
+          // hasWire.
+          const gain = previewState.audioCtx.createGain();
+          gain.gain.value = 0;
+          mes.connect(gain);
+          gain.connect(previewState.audioCtx.destination);
+          srcEntry._directGain = gain;
+          // Suppress the videoEl's default audio output (now playing
+          // through Web Audio instead). For Safari the MES creation
+          // already does this; setting muted=true is belt-and-braces.
+          try { srcEntry.videoEl.muted = true; } catch (_) {}
+        } else if (node.type === "Webcam") {
+          if (!srcEntry.stream || srcEntry.stream.getAudioTracks().length === 0) {
+            console.log("[videosrc] Webcam node " + node.id + " has no audio track; skip routing");
+            continue;
+          }
+          mes = previewState.audioCtx.createMediaStreamSource(srcEntry.stream);
+          // No direct-playback path for Webcam — would create echo.
+        } else {
+          continue;
+        }
+        srcEntry._mediaSource = mes;
+      } catch (e) {
+        console.warn("[videosrc] media-source create failed for " + node.type + " " + node.id + ":", e);
+        continue;
+      }
+    }
+    // Routing: MES → ChannelSplitter (2) → ChannelMerger pair.
+    const splitter = previewState.audioCtx.createChannelSplitter(2);
+    try {
+      mes.connect(splitter);
+      splitter.connect(previewState.videoMerger, 0, idx * 2);
+      splitter.connect(previewState.videoMerger, 1, idx * 2 + 1);
+    } catch (e) {
+      console.warn("[videosrc] splitter wire failed:", e);
+      continue;
+    }
+    previewState.videoRoutings.set(node.id, { channelIdx: idx, splitter });
+    console.log("[videosrc] " + node.type + " " + node.id + " → worklet input 1 channels " + (idx*2) + "/" + (idx*2+1));
+  }
+
+  _updateVideoAudioGains();
+}
+
+/* v0.3.19 — refresh direct-playback gains from current node params.
+ * Called whenever audioEnabled / volume changes or the wire set
+ * changes. Wire-routed sources get gain=0 (the patch is the audio
+ * path); unrouted ones get audioEnabled ? volume : 0. */
+function _updateVideoAudioGains() {
+  if (typeof state === "undefined" || !state || !Array.isArray(state.nodes)) return;
+  const wiredIds = new Set((typeof _videoAudioSrcNodes === "function" ? _videoAudioSrcNodes() : []).map(n => n.id));
+  for (const node of state.nodes) {
+    if (!node || (node.type !== "VideoFile" && node.type !== "Webcam")) continue;
+    const srcEntry = _videoSources.get(node.id);
+    if (!srcEntry || !srcEntry._directGain) continue;
+    const audioOn = !(node.params && node.params.audioEnabled === 0);
+    const vol = (node.params && typeof node.params.volume === "number") ? node.params.volume : 1.0;
+    const hasWire = wiredIds.has(node.id);
+    // Webcam never plays directly (would echo). VideoFile plays
+    // directly only when there's no wire to the patch.
+    let v = 0;
+    if (node.type === "VideoFile" && !hasWire) v = audioOn ? vol : 0;
+    srcEntry._directGain.gain.value = v;
+  }
 }
 
 /* Cached audio-input device list, populated after first permission
@@ -41301,6 +41704,34 @@ function previewStop() {
   // otherwise the source's underlying MediaStreamTrack stays active
   // (different lifecycle) and the OS-level mic indicator stays on.
   disconnectMic();
+  // v0.3.19 — also tear down the VideoSrc routing chain so the
+  // ChannelMerger / GainNodes / MediaElementSources don't outlive
+  // the audio context. We can't recreate MES for the same videoEl
+  // later (one-shot per element); we clear the cached refs so a
+  // future Play+ensureVideoAudioConnected can reuse the videoEls
+  // (the existing _videoSources entries persist) with fresh MES.
+  if (previewState.videoMerger) {
+    try { previewState.videoMerger.disconnect(); } catch (_) {}
+    previewState.videoMerger = null;
+  }
+  if (previewState.videoRoutings) {
+    previewState.videoRoutings.forEach(r => {
+      try { r.splitter.disconnect(); } catch (_) {}
+    });
+    previewState.videoRoutings.clear();
+  }
+  // Clear per-source MES refs so the next Play creates fresh ones
+  // against the new audioCtx (MES is tied to its creation context).
+  _videoSources.forEach(entry => {
+    if (entry._mediaSource) {
+      try { entry._mediaSource.disconnect(); } catch (_) {}
+      entry._mediaSource = null;
+    }
+    if (entry._directGain) {
+      try { entry._directGain.disconnect(); } catch (_) {}
+      entry._directGain = null;
+    }
+  });
   if (previewState.workletNode) {
     previewState.workletNode.port.postMessage({ type: "stop" });
     previewState.workletNode.disconnect();
