@@ -59,6 +59,7 @@
     --transform:    #b974ff;     /* Phase 6.1.6 — mat4 (declared, used in Phase 7) */
     --mesh:         #ff9d3f;     /* Phase 6.1.6 — vertex buffer ref (declared, used in Phase 7) */
     --camera:       #ffd96a;     /* Sprint 7.5.3a — view+proj matrices (Camera → Scene) */
+    --light:        #f5e6c8;     /* Sprint 7.5.3c — light source (DirectionalLight → Scene) */
     --selected:     #4a8fdc;
     --danger:       #e24b4a;
     --info:         #83e8ff;
@@ -813,6 +814,9 @@
   /* Sprint 7.5.3a -- Camera port. Two concentric rings (dashed outer +
      solid inner) reads as "matrix data, not vertex data" visually. */
   .port.camera    { border-color: var(--camera);    border-style: double; border-width: 4px; }
+  /* Sprint 7.5.3c -- Light port. Same double-ring as camera but in a
+     softer cream — both are "global scene state, not per-vertex". */
+  .port.light     { border-color: var(--light);     border-style: double; border-width: 4px; }
   .port.connected.param { background: var(--param); border-style: solid; }
   .port.connected.gate  { background: var(--gate); }
   .port.connected.clock { background: var(--clock); border-style: solid; }
@@ -820,6 +824,7 @@
   .port.connected.transform { background: var(--transform); border-style: solid; }
   .port.connected.mesh      { background: var(--mesh);      border-style: solid; }
   .port.connected.camera    { background: var(--camera);    border-style: solid; }
+  .port.connected.light     { background: var(--light);     border-style: solid; }
   .port:hover { transform: translateY(-50%) scale(1.4); }
   /* Live snap target during a wire drag — when the dragged endpoint
    * is within a screen-radius of a type-compatible input port, that
@@ -10008,6 +10013,7 @@ public:
       { n: "mesh3",      t: "mesh" },
       { n: "mesh4",      t: "mesh" },
       { n: "camera",     t: "camera" },
+      { n: "light",      t: "light" },
       { n: "clearR",     t: "param" },
       { n: "clearG",     t: "param" },
       { n: "clearB",     t: "param" }
@@ -10202,6 +10208,93 @@ public:
     params: { x: 1, y: 1, z: 1, uniform: 0 },
     methods: {},
     description: "Scale a mesh along each axis. x/y/z are individual scale factors (1 = no change). Set `uniform` to any non-zero value to override the per-axis values with a single scale (handy when you want to drive size from one Slider). Wire `uniform` to MasterClock.beat-derived values for breath / pulse effects."
+  },
+
+  /* =========================================================================
+   * Sprint 7.5.3c -- Materials + lighting
+   *
+   * Materials are inline mesh-chain wrappers (mesh in -> mesh out)
+   * that tag the wrapped mesh with a surface-shading model. The
+   * Scene walker captures the outermost material in the chain + the
+   * encoder picks the matching fragment shader at draw time.
+   *
+   * Chain semantics:
+   *   Box -> PhongMat(color=red, shin=64) -> Rotate -> Scene
+   *   - Box's vertices flow up
+   *   - Rotate accumulates its local matrix into the model transform
+   *   - PhongMat tags the chain with the phong material
+   *   - Scene renders Box with Phong shading + the rotation applied
+   *
+   * Wrapping order: the OUTERMOST material wins (closest to Scene).
+   * Inner materials in nested wrappers are ignored. This matches the
+   * scene-graph "child overrides parent material" pattern inverted
+   * for the data-flow direction.
+   *
+   * No codegen for materials -- pure JS-side configuration; the WGSL
+   * fragment shaders live in _MESH_WGSL. ======================================================================== */
+  UnlitMat: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "material",
+    ins: [
+      { n: "mesh",      t: "mesh" },
+      { n: "r",         t: "param" },
+      { n: "g",         t: "param" },
+      { n: "b",         t: "param" },
+      { n: "vertexMix", t: "param" }
+    ],
+    outs: [{ n: "mesh", t: "mesh" }],
+    params: { r: 1.0, g: 1.0, b: 1.0, vertexMix: 0.0 },
+    methods: {},
+    description: "Unlit (no shading) surface material. Emits the material color as the surface RGB regardless of lighting / normals -- meshes appear flat-shaded. r/g/b in [0..1]. vertexMix in [0..1] blends from pure material color (0) to the mesh's per-vertex color (1) -- useful for tinting normal-derived colors on Sphere/Torus/Cylinder/Cone, or for keeping Box's per-face palette while applying a global tint. Wire the mesh chain through this node to apply the material; chain leaves the mesh through `mesh` output."
+  },
+
+  PhongMat: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "material",
+    ins: [
+      { n: "mesh",      t: "mesh" },
+      { n: "r",         t: "param" },
+      { n: "g",         t: "param" },
+      { n: "b",         t: "param" },
+      { n: "shininess", t: "param" },
+      { n: "ambient",   t: "param" },
+      { n: "vertexMix", t: "param" }
+    ],
+    outs: [{ n: "mesh", t: "mesh" }],
+    params: { r: 0.85, g: 0.85, b: 0.92, shininess: 32.0, ambient: 0.15, vertexMix: 0.0 },
+    methods: {},
+    description: "Blinn-Phong surface material with one directional light (wire a DirectionalLight into the Scene's `light` input; default light is warm-white from above-front). r/g/b is the diffuse base color. shininess controls specular highlight sharpness (1..256 typical, higher = tighter highlight). ambient (0..1) lifts the shadowed side so meshes don't go pitch-black -- bump up for a more 'cartoon shading' look. vertexMix in [0..1] blends the material color with the mesh's per-vertex color (0 = pure material; 1 = pure vertex-color; ~0.3 = nice 'colored highlights' look)."
+  },
+
+  /* DirectionalLight -- a single infinite-distance light source.
+   * dirX/dirY/dirZ is the direction TO the light from the scene
+   * (so dirY = 1 means the light is above, illuminating downward).
+   * Normalized internally; user can leave it un-normalized + the
+   * shader will handle it. colorR/G/B is the light color in [0..1].
+   * intensity scales the contribution -- bump it for HDR feels. */
+  DirectionalLight: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "light",
+    ins: [
+      { n: "dirX",      t: "param" },
+      { n: "dirY",      t: "param" },
+      { n: "dirZ",      t: "param" },
+      { n: "colorR",    t: "param" },
+      { n: "colorG",    t: "param" },
+      { n: "colorB",    t: "param" },
+      { n: "intensity", t: "param" }
+    ],
+    outs: [{ n: "light", t: "light" }],
+    params: {
+      dirX: 0.3, dirY: 1.0, dirZ: 0.4,
+      colorR: 1.0, colorG: 0.98, colorB: 0.92,
+      intensity: 1.0
+    },
+    methods: {},
+    description: "Infinite-distance directional light. dirX/Y/Z is the direction TO the light (so dirY=1 means light is directly above, illuminating downward). Normalized internally. colorR/G/B in [0..1]. intensity scales contribution (bump above 1 for HDR-feel; PhongMat clamps). Wire the `light` output into a Scene's `light` input. Currently one DirectionalLight per Scene; PointLight + multi-light support coming in a follow-up."
   },
 
   /* Custom ramp / curve shaper. Takes any 0..1 signal in, applies the
@@ -29839,6 +29932,107 @@ const _demos = [
     }
   },
 
+  /* Sprint 7.5.3c -- Lit Trio. Box, Sphere, Torus side-by-side
+   * with PhongMat applied (each a different color), one
+   * DirectionalLight overhead-front. Camera orbits slowly so the
+   * Phong specular highlight sweeps across the surfaces -- the
+   * clearest visual cue that lighting is actually working. */
+  {
+    id: "scene-3d-lit-trio",
+    name: "Lit Trio",
+    sub: "phong · box · sphere · torus",
+    type: "visual",
+    thumb: `<svg viewBox="0 0 100 44">
+      <defs>
+        <radialGradient id="dg-lit-sphere" cx="0.35" cy="0.35" r="0.7">
+          <stop offset="0" stop-color="rgba(255,255,255,0.95)"/>
+          <stop offset="0.5" stop-color="rgba(120,200,255,0.95)"/>
+          <stop offset="1" stop-color="rgba(40,80,160,1)"/>
+        </radialGradient>
+        <linearGradient id="dg-lit-box" x1="0" y1="0" x2="0.5" y2="1">
+          <stop offset="0" stop-color="rgba(255,200,180,0.95)"/>
+          <stop offset="1" stop-color="rgba(180,80,60,1)"/>
+        </linearGradient>
+      </defs>
+      <rect width="100" height="44" fill="rgba(8, 12, 24, 1)"/>
+      <!-- box -->
+      <polygon points="10,30 22,30 22,20 14,16 10,18" fill="url(#dg-lit-box)"
+               stroke="rgba(255,255,255,0.35)" stroke-width="0.5"/>
+      <polygon points="14,16 22,12 22,20" fill="rgba(255,235,210,0.9)"
+               stroke="rgba(255,255,255,0.35)" stroke-width="0.5"/>
+      <!-- sphere -->
+      <circle cx="48" cy="22" r="9" fill="url(#dg-lit-sphere)"/>
+      <ellipse cx="44" cy="18" rx="2.4" ry="1.6" fill="rgba(255,255,255,0.5)"/>
+      <!-- torus -->
+      <ellipse cx="82" cy="22" rx="9" ry="6"
+               fill="none" stroke="rgba(220,140,255,0.85)" stroke-width="3"/>
+      <ellipse cx="79" cy="20" rx="2.5" ry="1.5"
+               fill="none" stroke="rgba(255,255,255,0.5)" stroke-width="1.4"/>
+    </svg>`,
+    build: () => {
+      // Three primitives with distinct PhongMat colors
+      const box  = makeNode("Box",     40,  40, { width: 1, height: 1, depth: 1 });
+      const sph  = makeNode("Sphere",  40, 200, { radius: 0.7, stacks: 24, slices: 32 });
+      const tor  = makeNode("Torus",   40, 360, { majorRadius: 0.75, minorRadius: 0.22, majorSlices: 32, minorSlices: 16 });
+      // Materials (PhongMat -- each its own color).
+      // vertexMix kept at 0 so the material color shows pure; tweak
+      // to ~0.3 to see the per-vertex color blended with the
+      // material.
+      const mBox = makeNode("PhongMat",   240,  40, { r: 0.95, g: 0.45, b: 0.30, shininess: 24, ambient: 0.15, vertexMix: 0.0 });
+      const mSph = makeNode("PhongMat",   240, 200, { r: 0.40, g: 0.70, b: 0.95, shininess: 64, ambient: 0.18, vertexMix: 0.0 });
+      const mTor = makeNode("PhongMat",   240, 360, { r: 0.78, g: 0.42, b: 0.95, shininess: 48, ambient: 0.18, vertexMix: 0.0 });
+      // Spread them out along X.
+      const tBox = makeNode("Translate",  440,  40, { x: -2.6, y: 0, z: 0 });
+      const tSph = makeNode("Translate",  440, 200, { x:  0,   y: 0, z: 0 });
+      const tTor = makeNode("Translate",  440, 360, { x:  2.6, y: 0, z: 0 });
+      // Camera orbit so the specular sweeps -- slower than 3D Orbit
+      // (one revolution every 8 seconds = bpm=7.5 at 1 orbit/beat).
+      // Use bpm=30 with mul 0.25 to compose more naturally.
+      const clk    = makeNode("MasterClock", 660,  40, { bpm: 30 });
+      const mulQ   = makeNode("Mul",         840,  40, { b: 0.25 });   // 0.25 of phase per beat
+      const mulTau = makeNode("Mul",        1020,  40, { b: 6.283185307 });
+      const sinN   = makeNode("Sin",        1200,  40);
+      const cosN   = makeNode("Cos",        1200, 130);
+      const mulRx  = makeNode("Mul",        1360,  40, { b: 4.5 });
+      const mulRz  = makeNode("Mul",        1360, 130, { b: 4.5 });
+      const cam    = makeNode("Camera",      660, 240, {
+        posX: 0, posY: 1.2, posZ: 0,
+        targetX: 0, targetY: 0, targetZ: 0,
+        fov: 50, near: 0.1, far: 100, mode: 0
+      });
+      // Directional light: above-front, slight warm tint.
+      const light  = makeNode("DirectionalLight", 660, 400, {
+        dirX: 0.4, dirY: 1.0, dirZ: 0.5,
+        colorR: 1.0, colorG: 0.97, colorB: 0.85, intensity: 1.1
+      });
+      const scn    = makeNode("Scene",      1540, 200, { clearR: 0.03, clearG: 0.04, clearB: 0.07 });
+      const vo     = makeNode("VisualOutput", 1780, 200, { display: 0 });
+      // Mesh -> material -> translate chain.
+      state.edges.push({ from: { node: box, port: "mesh" }, to: { node: mBox, port: "mesh" } });
+      state.edges.push({ from: { node: sph, port: "mesh" }, to: { node: mSph, port: "mesh" } });
+      state.edges.push({ from: { node: tor, port: "mesh" }, to: { node: mTor, port: "mesh" } });
+      state.edges.push({ from: { node: mBox, port: "mesh" }, to: { node: tBox, port: "mesh" } });
+      state.edges.push({ from: { node: mSph, port: "mesh" }, to: { node: tSph, port: "mesh" } });
+      state.edges.push({ from: { node: mTor, port: "mesh" }, to: { node: tTor, port: "mesh" } });
+      // Camera orbit math.
+      state.edges.push({ from: { node: clk,    port: "phase" }, to: { node: mulQ,   port: "a" } });
+      state.edges.push({ from: { node: mulQ,   port: "out"   }, to: { node: mulTau, port: "a" } });
+      state.edges.push({ from: { node: mulTau, port: "out"   }, to: { node: sinN,   port: "in" } });
+      state.edges.push({ from: { node: mulTau, port: "out"   }, to: { node: cosN,   port: "in" } });
+      state.edges.push({ from: { node: sinN,   port: "out"   }, to: { node: mulRx,  port: "a" } });
+      state.edges.push({ from: { node: cosN,   port: "out"   }, to: { node: mulRz,  port: "a" } });
+      state.edges.push({ from: { node: mulRx,  port: "out"   }, to: { node: cam,    port: "posX" } });
+      state.edges.push({ from: { node: mulRz,  port: "out"   }, to: { node: cam,    port: "posZ" } });
+      // Scene wiring.
+      state.edges.push({ from: { node: tBox,  port: "mesh"   }, to: { node: scn, port: "mesh1" } });
+      state.edges.push({ from: { node: tSph,  port: "mesh"   }, to: { node: scn, port: "mesh2" } });
+      state.edges.push({ from: { node: tTor,  port: "mesh"   }, to: { node: scn, port: "mesh3" } });
+      state.edges.push({ from: { node: cam,   port: "camera" }, to: { node: scn, port: "camera" } });
+      state.edges.push({ from: { node: light, port: "light"  }, to: { node: scn, port: "light"  } });
+      state.edges.push({ from: { node: scn,   port: "out"    }, to: { node: vo,  port: "in" } });
+    }
+  },
+
   {
     id: "mesh-text",
     name: "Mesh Text",
@@ -31171,7 +31365,7 @@ const SIGNAL_PORT_TYPES = new Set(["audio", "param", "gate", "clock"]);
 // Sprint 7.5.3a -- camera is a new visual-side port type alongside
 // mesh + texture. Same strict-same-type rule applies. Cameras carry
 // view + projection matrices to a Scene sink.
-const VISUAL_PORT_TYPES = new Set(["texture", "transform", "mesh", "camera"]);
+const VISUAL_PORT_TYPES = new Set(["texture", "transform", "mesh", "camera", "light"]);
 function portsCompatible(srcType, dstType) {
   if (srcType === dstType) return true;
   if (SIGNAL_PORT_TYPES.has(srcType) && SIGNAL_PORT_TYPES.has(dstType)) return true;
@@ -31370,6 +31564,11 @@ function renderWires(temp) {
       // amber mesh wires + violet transform wires.
       html += `<path d="${path}" fill="none" stroke="var(--camera)" stroke-width="4" stroke-linecap="round" />`;
       html += `<path d="${path}" fill="none" stroke="var(--bg)"     stroke-width="1.5" stroke-linecap="round" />`;
+    } else if (t === "light") {
+      // Sprint 7.5.3c -- Light wire. Same double-stripe shape as
+      // camera but in cream, signaling "scene-global uniform data".
+      html += `<path d="${path}" fill="none" stroke="var(--light)" stroke-width="4" stroke-linecap="round" />`;
+      html += `<path d="${path}" fill="none" stroke="var(--bg)"    stroke-width="1.5" stroke-linecap="round" />`;
     } else if (t === "transform") {
       // Double-stripe like clock but in transform-violet to keep the
       // 4×4 mat semantics visually distinct from rhythmic data.
@@ -37652,6 +37851,9 @@ const Visual = {
   meshPipelineCache: new Map(),
   meshBindGroupLayout:    null,
   meshPipelineLayout:     null,
+  // Sprint 7.5.3c -- shared shader module (one WGSL compile per
+  // session; multiple fragment entry points dispatch by material).
+  meshShaderModule:       null,
   // Per-Scene-node uniform buffer holding camera viewProj + per-draw
   // model matrix. Allocated lazily per Scene node id. Map<nodeId, {
   //   uniformBuffer, scratch (Float32Array(32)) }>.
@@ -43248,7 +43450,7 @@ function _buildTransformMatrix(node) {
  * without it. */
 const _MESH_CHAIN_DEPTH_LIMIT = 16;
 
-function _walkMeshChain(nodeId, accMat, depth) {
+function _walkMeshChain(nodeId, accMat, accMaterial, depth) {
   if (depth > _MESH_CHAIN_DEPTH_LIMIT) {
     console.warn("[scene] mesh chain depth limit hit at node " + nodeId + " -- cycle?");
     return null;
@@ -43258,7 +43460,7 @@ function _walkMeshChain(nodeId, accMat, depth) {
   const def = TYPES[node.type];
   if (!def) return null;
   if (def.kind === "mesh-gen") {
-    return { node, def, transform: accMat };
+    return { node, def, transform: accMat, material: accMaterial };
   }
   if (def.kind === "mesh-transform") {
     const local = _buildTransformMatrix(node);
@@ -43271,7 +43473,52 @@ function _walkMeshChain(nodeId, accMat, depth) {
       e && e.to && e.to.node === node.id && e.to.port === "mesh"
     );
     if (!wire || !wire.from) return null;
-    return _walkMeshChain(wire.from.node, next, depth + 1);
+    return _walkMeshChain(wire.from.node, next, accMaterial, depth + 1);
+  }
+  if (def.kind === "material") {
+    // Sprint 7.5.3c -- material wrapper. The inner mesh is rendered
+    // with this material's surface shader. Outer material wins if
+    // multiple are stacked (closest to Scene -- the outermost
+    // wrapper -- is the one that applies). accMaterial is set on
+    // first encounter walking root-to-leaf; subsequent (inner)
+    // material wrappers are ignored.
+    const myMaterial = accMaterial || _buildMaterialDescriptor(node);
+    const wire = state.edges && state.edges.find(e =>
+      e && e.to && e.to.node === node.id && e.to.port === "mesh"
+    );
+    if (!wire || !wire.from) return null;
+    return _walkMeshChain(wire.from.node, accMat, myMaterial, depth + 1);
+  }
+  return null;
+}
+
+/* Resolve the params of a material node into a flat descriptor used
+ * by _encodeScenePass. Material types: "unlit", "phong". */
+function _buildMaterialDescriptor(matNode) {
+  const p = _resolveNodeParams(matNode);
+  if (matNode.type === "UnlitMat") {
+    return {
+      type: "unlit",
+      params: {
+        r: (typeof p.r === "number") ? p.r : 1.0,
+        g: (typeof p.g === "number") ? p.g : 1.0,
+        b: (typeof p.b === "number") ? p.b : 1.0,
+        vertexMix: (typeof p.vertexMix === "number") ? p.vertexMix : 0.0
+      }
+    };
+  }
+  if (matNode.type === "PhongMat") {
+    return {
+      type: "phong",
+      params: {
+        r: (typeof p.r === "number") ? p.r : 0.85,
+        g: (typeof p.g === "number") ? p.g : 0.85,
+        b: (typeof p.b === "number") ? p.b : 0.92,
+        vertexMix: (typeof p.vertexMix === "number") ? p.vertexMix : 0.0,
+        shininess: (typeof p.shininess === "number") ? Math.max(1.0, p.shininess) : 32.0,
+        ambient:   (typeof p.ambient   === "number") ? p.ambient   : 0.15
+      }
+    };
   }
   return null;
 }
@@ -43286,7 +43533,7 @@ function _resolveSceneMeshes(sceneNode) {
       e && e.to && e.to.node === sceneNode.id && e.to.port === port.n
     );
     if (!wire || !wire.from) continue;
-    const resolved = _walkMeshChain(wire.from.node, _mat4Identity(), 0);
+    const resolved = _walkMeshChain(wire.from.node, _mat4Identity(), null, 0);
     if (resolved) meshes.push(resolved);
   }
   return meshes;
@@ -43698,28 +43945,91 @@ function _buildRenderPlan(visualOutputs) {
  * The bind group layout has a single uniform buffer at @binding(0)
  * holding viewProj (mat4) + model (mat4) = 128 bytes. Per-mesh draws
  * overwrite the model portion + queue.writeBuffer before each draw. */
+/* Sprint 7.5.3c -- mesh shader module with one vertex shader + three
+ * fragment entry points so the pipeline cache can serve every
+ * material flavor from a single compiled module. Vertex layout
+ * grew to (pos.xyz, color.rgb, normal.xyz) -- 9 floats per vertex,
+ * stride 36 bytes -- so Phong has real surface normals to dot
+ * against the light direction. Normal is transformed by the model
+ * matrix here (works for rotation + uniform scale + translation;
+ * non-uniform scale gives slight inaccuracy, acceptable for sprint
+ * scope). Per-Scene + per-draw uniforms are split: viewProj +
+ * camera eye + light data stays constant for every draw in a
+ * Scene; model matrix + material params change per mesh. */
 const _MESH_WGSL =
-`struct U {
-  viewProj: mat4x4<f32>,
-  model:    mat4x4<f32>,
+`struct PerScene {
+  viewProj:   mat4x4<f32>,
+  lightDir:   vec4<f32>,   // .xyz = normalized direction TO the light (i.e., negation of incoming-light direction)
+  lightColor: vec4<f32>,   // .rgb = light color, .w = intensity
+  eye:        vec4<f32>,   // .xyz = camera world position (for view-vector / Blinn-Phong half-vector)
 };
-@group(0) @binding(0) var<uniform> u: U;
+struct PerDraw {
+  model:      mat4x4<f32>,
+  baseColor:  vec4<f32>,   // .rgb = material color, .a = vertex-color mix amount (0 = pure material color, 1 = pure vertex color)
+  matParams:  vec4<f32>,   // .x = shininess (Phong), .y = ambient, .zw = reserved
+};
+@group(0) @binding(0) var<uniform> uS: PerScene;
+@group(0) @binding(1) var<uniform> uD: PerDraw;
 
-struct VsIn  { @location(0) pos: vec3<f32>, @location(1) color: vec3<f32> };
-struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) color: vec3<f32> };
+struct VsIn  {
+  @location(0) pos:    vec3<f32>,
+  @location(1) color:  vec3<f32>,
+  @location(2) normal: vec3<f32>
+};
+struct VsOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) worldPos: vec3<f32>,
+  @location(1) color:    vec3<f32>,
+  @location(2) normal:   vec3<f32>
+};
 
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
   var out: VsOut;
-  let world = u.model * vec4<f32>(in.pos, 1.0);
-  out.pos   = u.viewProj * world;
-  out.color = in.color;
+  let world  = uD.model * vec4<f32>(in.pos, 1.0);
+  out.worldPos = world.xyz;
+  out.pos    = uS.viewProj * world;
+  out.color  = in.color;
+  let n4     = uD.model * vec4<f32>(in.normal, 0.0);
+  out.normal = normalize(n4.xyz);
   return out;
 }
 
+// Legacy unlit-vertex-color fallback. Default fragment when no
+// material is wired on a mesh-gen primitive -- preserves the
+// "you get colors immediately" behavior from sprints a + b.
 @fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+fn fs_unlit_vc(in: VsOut) -> @location(0) vec4<f32> {
   return vec4<f32>(in.color, 1.0);
+}
+
+// UnlitMat: solid material color, optionally mixed with vertex color
+// via baseColor.a. Default state (a=0) is pure material color.
+@fragment
+fn fs_unlit(in: VsOut) -> @location(0) vec4<f32> {
+  let c = mix(uD.baseColor.rgb, in.color, uD.baseColor.a);
+  return vec4<f32>(c, 1.0);
+}
+
+// PhongMat: Blinn-Phong with one directional light. ambient lifts
+// the shadowed side; diffuse is Lambert N·L; specular is (N·H)^shin.
+// View vector uses the camera eye in world space for accurate
+// half-vector reflection. baseColor.a still mixes between material
+// + vertex color so the user can tint normal-derived colors.
+@fragment
+fn fs_phong(in: VsOut) -> @location(0) vec4<f32> {
+  let n = normalize(in.normal);
+  let l = normalize(uS.lightDir.xyz);
+  let v = normalize(uS.eye.xyz - in.worldPos);
+  let h = normalize(l + v);
+  let nDotL = max(dot(n, l), 0.0);
+  let shin  = max(1.0, uD.matParams.x);
+  let spec  = pow(max(dot(n, h), 0.0), shin) * step(0.001, nDotL);
+  let amb   = clamp(uD.matParams.y, 0.0, 1.0);
+  let albedo = mix(uD.baseColor.rgb, in.color, uD.baseColor.a);
+  let li     = uS.lightColor.rgb * uS.lightColor.w;
+  let lit    = albedo * (amb + nDotL * (1.0 - amb)) * li + vec3<f32>(spec) * li * 0.6;
+  return vec4<f32>(lit, 1.0);
 }`;
 
 /* Sprint 7.5.3a -- (re)allocate the depth + MSAA color textures at
@@ -43798,54 +44108,93 @@ function _updateMsaaPill() {
 // console every frame.
 const _SCENE_DIAG = { pipeline: false, instance: false, encode: false, draw: false };
 
-function _ensureMeshPipeline(sampleCount) {
+function _ensureMeshPipeline(materialType, sampleCount) {
   if (!Number.isFinite(sampleCount) || sampleCount < 1) sampleCount = 1;
-  const key = "default-" + sampleCount + "x";
+  // Sprint 7.5.3c -- pipeline cache keyed by both material type AND
+  // sample count. Each material flavor picks a different fragment
+  // entry point in the shared shader module.
+  if (!materialType) materialType = "unlit-vc";
+  const key = materialType + "-" + sampleCount + "x";
   if (Visual.meshPipelineCache.has(key)) {
     return Visual.meshPipelineCache.get(key);
   }
   if (!Visual.device) return null;
-  // Build shared BGL + pipeline layout on first use.
+  // Build shared BGL + pipeline layout on first use. Two uniform
+  // buffers: per-Scene (viewProj + light + eye) at binding 0,
+  // per-draw (model + material) at binding 1. Both visible to vertex
+  // AND fragment stages -- the vertex shader transforms by model +
+  // viewProj; the fragment shader reads light + material data.
   if (!Visual.meshBindGroupLayout) {
     Visual.meshBindGroupLayout = Visual.device.createBindGroupLayout({
       label: "mesh-bgl",
-      entries: [{
-        binding: 0,
-        visibility: GPUShaderStage.VERTEX,
-        buffer: { type: "uniform" }
-      }]
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        { binding: 1, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } }
+      ]
     });
     Visual.meshPipelineLayout = Visual.device.createPipelineLayout({
       label: "mesh-pl",
       bindGroupLayouts: [Visual.meshBindGroupLayout]
     });
   }
-  let module;
-  try {
-    module = Visual.device.createShaderModule({ label: "mesh-shader", code: _MESH_WGSL });
-  } catch (e) {
-    console.warn("[scene] mesh shader compile failed:", e);
-    return null;
+  // Lazily build the shader module ONCE per session -- the same
+  // module exposes every fragment entry point, so re-using avoids
+  // duplicate WGSL compiles when toggling material types.
+  if (!Visual.meshShaderModule) {
+    let module;
+    try {
+      module = Visual.device.createShaderModule({ label: "mesh-shader", code: _MESH_WGSL });
+    } catch (e) {
+      console.warn("[scene] mesh shader compile failed:", e);
+      return null;
+    }
+    Visual.meshShaderModule = module;
+    // Surface WGSL errors via getCompilationInfo (createShaderModule
+    // doesn't throw on bad WGSL; errors arrive async).
+    module.getCompilationInfo().then(info => {
+      const errs = info.messages.filter(m => m.type === "error");
+      if (errs.length) {
+        console.error("[scene] mesh shader WGSL errors:");
+        for (const m of errs) {
+          console.error("  line " + m.lineNum + " col " + m.linePos + ": " + m.message);
+        }
+      } else {
+        const warns = info.messages.filter(m => m.type === "warning");
+        if (warns.length) console.warn("[scene] mesh shader WGSL warnings:", warns);
+      }
+    });
   }
+  const module = Visual.meshShaderModule;
+  // Pick fragment entry point per material type.
+  const fragEntry =
+    materialType === "phong"    ? "fs_phong" :
+    materialType === "unlit"    ? "fs_unlit" :
+    /* default unlit-vc */        "fs_unlit_vc";
   let pipeline;
   try {
     pipeline = Visual.device.createRenderPipeline({
-      label: "mesh-pipeline-" + sampleCount + "x",
+      label: "mesh-pipeline-" + materialType + "-" + sampleCount + "x",
       layout: Visual.meshPipelineLayout,
       vertex: {
         module,
         entryPoint: "vs_main",
         buffers: [{
-          arrayStride: 6 * 4,           // 6 floats per vertex (pos.xyz + color.rgb)
+          // Sprint 7.5.3c -- vertex layout grew to 9 floats per
+          // vertex: position (3) + color (3) + normal (3). Stride
+          // 36 bytes. Normal is needed for Phong's diffuse + spec
+          // dot products. Sprints 7.5.3a/b mesh builders all emit
+          // this layout (DebugTriangle + 6 primitives all updated).
+          arrayStride: 9 * 4,
           attributes: [
             { shaderLocation: 0, offset: 0,     format: "float32x3" },  // position
-            { shaderLocation: 1, offset: 3 * 4, format: "float32x3" }   // color
+            { shaderLocation: 1, offset: 3 * 4, format: "float32x3" },  // color
+            { shaderLocation: 2, offset: 6 * 4, format: "float32x3" }   // normal
           ]
         }]
       },
       fragment: {
         module,
-        entryPoint: "fs_main",
+        entryPoint: fragEntry,
         targets: [{
           format: Visual.fbFormat,
           blend: {
@@ -43867,40 +44216,21 @@ function _ensureMeshPipeline(sampleCount) {
       multisample: { count: sampleCount }
     });
   } catch (e) {
-    console.warn("[scene] mesh pipeline " + sampleCount + "x failed (often '8x unsupported on this adapter'):", e);
-    // Fall back to 1x if the requested sample count is unsupported.
-    // Persisted in Visual.msaaSampleCount so subsequent frames don't
-    // keep retrying the same bad pipeline.
+    console.warn("[scene] mesh pipeline " + materialType + " " + sampleCount + "x failed:", e);
     if (sampleCount !== 1) {
       console.warn("[scene] falling back to 1x MSAA");
       Visual.msaaSampleCount = 1;
       _ensureMsaa3DTextures();
       _updateMsaaPill();
-      return _ensureMeshPipeline(1);
+      return _ensureMeshPipeline(materialType, 1);
     }
     return null;
   }
   Visual.meshPipelineCache.set(key, pipeline);
   if (!_SCENE_DIAG.pipeline) {
     _SCENE_DIAG.pipeline = true;
-    console.log("[scene] mesh pipeline built (sampleCount=" + sampleCount + "x, fbFormat=" + Visual.fbFormat + ")");
+    console.log("[scene] first mesh pipeline built (" + materialType + ", sampleCount=" + sampleCount + "x, fbFormat=" + Visual.fbFormat + ")");
   }
-  // Async shader compile-error path. createShaderModule is sync but
-  // WGSL errors surface async via getCompilationInfo. Without this
-  // hook, an invalid shader silently produces a pipeline that just
-  // doesn't render -- caller sees no triangles + no errors.
-  module.getCompilationInfo().then(info => {
-    const errs = info.messages.filter(m => m.type === "error");
-    if (errs.length) {
-      console.error("[scene] mesh shader WGSL errors:");
-      for (const m of errs) {
-        console.error("  line " + m.lineNum + " col " + m.linePos + ": " + m.message);
-      }
-    } else {
-      const warns = info.messages.filter(m => m.type === "warning");
-      if (warns.length) console.warn("[scene] mesh shader WGSL warnings:", warns);
-    }
-  });
   return pipeline;
 }
 
@@ -43949,7 +44279,7 @@ function _ensureMeshBuffers(meshEntry) {
   }
   const out = {
     vertexBuffer,
-    vertexCount: verts.length / 6,
+    vertexCount: verts.length / 9,   // Sprint 7.5.3c: 9 floats per vertex (pos + color + normal)
     indexBuffer,
     indexCount,
     cacheKey: _meshCacheKey(node)
@@ -43998,10 +44328,11 @@ function _buildMeshData(node) {
 
 function _buildDebugTriangle(node) {
   const s = (node.params && typeof node.params.scale === "number") ? node.params.scale : 1.0;
+  // pos.xyz  color.rgb       normal.xyz  -- triangle faces +Z, normal = (0, 0, 1).
   const verts = new Float32Array([
-    -0.866*s, -0.5*s, 0,        1, 0, 0,
-     0.866*s, -0.5*s, 0,        0, 1, 0,
-     0,        1.0*s, 0,        0.3, 0.5, 1
+    -0.866*s, -0.5*s, 0,     1, 0, 0,      0, 0, 1,
+     0.866*s, -0.5*s, 0,     0, 1, 0,      0, 0, 1,
+     0,        1.0*s, 0,     0.3, 0.5, 1,  0, 0, 1
   ]);
   return { verts, indices: null };
 }
@@ -44018,30 +44349,30 @@ function _buildBox(node) {
   const hh = ((typeof p.height === "number") ? p.height : 1) * 0.5;
   const hd = ((typeof p.depth  === "number") ? p.depth  : 1) * 0.5;
   // Face order: +X, -X, +Y, -Y, +Z, -Z. Each face: 4 verts in
-  // CCW order viewed from outside.
+  // CCW order viewed from outside, with explicit normal.
   const faces = [
-    { c: [1.00, 0.22, 0.22], verts: [
+    { c: [1.00, 0.22, 0.22], n: [ 1, 0, 0], verts: [
       [ hw, -hh, -hd], [ hw,  hh, -hd], [ hw,  hh,  hd], [ hw, -hh,  hd] ]},  // +X
-    { c: [0.22, 0.92, 0.95], verts: [
+    { c: [0.22, 0.92, 0.95], n: [-1, 0, 0], verts: [
       [-hw, -hh,  hd], [-hw,  hh,  hd], [-hw,  hh, -hd], [-hw, -hh, -hd] ]},  // -X
-    { c: [0.45, 0.96, 0.35], verts: [
+    { c: [0.45, 0.96, 0.35], n: [ 0, 1, 0], verts: [
       [-hw,  hh,  hd], [ hw,  hh,  hd], [ hw,  hh, -hd], [-hw,  hh, -hd] ]},  // +Y
-    { c: [0.96, 0.35, 0.92], verts: [
+    { c: [0.96, 0.35, 0.92], n: [ 0,-1, 0], verts: [
       [-hw, -hh, -hd], [ hw, -hh, -hd], [ hw, -hh,  hd], [-hw, -hh,  hd] ]},  // -Y
-    { c: [0.40, 0.55, 1.00], verts: [
+    { c: [0.40, 0.55, 1.00], n: [ 0, 0, 1], verts: [
       [-hw, -hh,  hd], [ hw, -hh,  hd], [ hw,  hh,  hd], [-hw,  hh,  hd] ]},  // +Z
-    { c: [0.98, 0.92, 0.30], verts: [
+    { c: [0.98, 0.92, 0.30], n: [ 0, 0,-1], verts: [
       [ hw, -hh, -hd], [-hw, -hh, -hd], [-hw,  hh, -hd], [ hw,  hh, -hd] ]}   // -Z
   ];
-  const verts = new Float32Array(24 * 6);
+  const verts = new Float32Array(24 * 9);
   const indices = new Uint32Array(36);
   let v = 0, i = 0, base = 0;
   for (const f of faces) {
     for (const pos of f.verts) {
       verts[v++] = pos[0]; verts[v++] = pos[1]; verts[v++] = pos[2];
       verts[v++] = f.c[0]; verts[v++] = f.c[1]; verts[v++] = f.c[2];
+      verts[v++] = f.n[0]; verts[v++] = f.n[1]; verts[v++] = f.n[2];
     }
-    // Two CCW triangles per quad.
     indices[i++] = base + 0; indices[i++] = base + 1; indices[i++] = base + 2;
     indices[i++] = base + 0; indices[i++] = base + 2; indices[i++] = base + 3;
     base += 4;
@@ -44059,7 +44390,7 @@ function _buildSphere(node) {
   const r = (typeof p.radius === "number") ? p.radius : 1;
   const stacks = Math.max(2, Math.min(64, Math.floor((typeof p.stacks === "number") ? p.stacks : 16)));
   const slices = Math.max(3, Math.min(128, Math.floor((typeof p.slices === "number") ? p.slices : 24)));
-  const verts = new Float32Array((stacks + 1) * (slices + 1) * 6);
+  const verts = new Float32Array((stacks + 1) * (slices + 1) * 9);
   const indices = new Uint32Array(stacks * slices * 6);
   let v = 0, i = 0;
   for (let st = 0; st <= stacks; st++) {
@@ -44073,6 +44404,7 @@ function _buildSphere(node) {
       verts[v++] = nx * 0.5 + 0.5;
       verts[v++] = ny * 0.5 + 0.5;
       verts[v++] = nz * 0.5 + 0.5;
+      verts[v++] = nx; verts[v++] = ny; verts[v++] = nz;
     }
   }
   for (let st = 0; st < stacks; st++) {
@@ -44093,11 +44425,12 @@ function _buildPlane(node) {
   const p = node.params || {};
   const hw = ((typeof p.width === "number") ? p.width : 1) * 0.5;
   const hd = ((typeof p.depth === "number") ? p.depth : 1) * 0.5;
+  // pos.xyz  color.rgb         normal.xyz (+Y, flat plane)
   const verts = new Float32Array([
-    -hw, 0, -hd,   0.40, 0.62, 0.95,    // back-left   (cyan-ish)
-     hw, 0, -hd,   0.78, 0.42, 0.95,    // back-right  (violet)
-     hw, 0,  hd,   0.85, 0.50, 0.55,    // front-right (mauve)
-    -hw, 0,  hd,   0.45, 0.78, 0.65     // front-left  (teal)
+    -hw, 0, -hd,   0.40, 0.62, 0.95,   0, 1, 0,
+     hw, 0, -hd,   0.78, 0.42, 0.95,   0, 1, 0,
+     hw, 0,  hd,   0.85, 0.50, 0.55,   0, 1, 0,
+    -hw, 0,  hd,   0.45, 0.78, 0.65,   0, 1, 0
   ]);
   const indices = new Uint32Array([0, 1, 2,  0, 2, 3]);
   return { verts, indices };
@@ -44112,7 +44445,7 @@ function _buildTorus(node) {
   const r = (typeof p.minorRadius === "number") ? p.minorRadius : 0.3;
   const majS = Math.max(3, Math.min(128, Math.floor((typeof p.majorSlices === "number") ? p.majorSlices : 24)));
   const minS = Math.max(3, Math.min(64,  Math.floor((typeof p.minorSlices === "number") ? p.minorSlices : 12)));
-  const verts = new Float32Array((majS + 1) * (minS + 1) * 6);
+  const verts = new Float32Array((majS + 1) * (minS + 1) * 9);
   const indices = new Uint32Array(majS * minS * 6);
   let v = 0, i = 0;
   for (let j = 0; j <= majS; j++) {
@@ -44129,6 +44462,7 @@ function _buildTorus(node) {
       verts[v++] = nx * 0.5 + 0.5;
       verts[v++] = ny * 0.5 + 0.5;
       verts[v++] = nz * 0.5 + 0.5;
+      verts[v++] = nx; verts[v++] = ny; verts[v++] = nz;
     }
   }
   for (let j = 0; j < majS; j++) {
@@ -44151,51 +44485,58 @@ function _buildCylinder(node) {
   const slices = Math.max(3, Math.min(128, Math.floor((typeof p.slices === "number") ? p.slices : 24)));
   const hy = h * 0.5;
   // Side: 2*(slices+1) verts. Top cap: 1 center + (slices+1) rim. Bottom cap: same.
+  // Each vertex: pos.xyz + color.rgb + normal.xyz = 9 floats.
   const sideVerts = 2 * (slices + 1);
   const totalVerts = sideVerts + 2 * (1 + slices + 1);
-  const verts = new Float32Array(totalVerts * 6);
+  const verts = new Float32Array(totalVerts * 9);
   const sideIdx = slices * 6;
   const capIdx  = slices * 3;
   const indices = new Uint32Array(sideIdx + 2 * capIdx);
   let v = 0, i = 0;
-  // Side strip
+  // Side strip -- normal is radial (cosθ, 0, sinθ).
   for (let k = 0; k <= slices; k++) {
     const theta = 2 * Math.PI * (k / slices);
     const cth = Math.cos(theta), sth = Math.sin(theta);
     // bottom rim
     verts[v++] = r * cth; verts[v++] = -hy; verts[v++] = r * sth;
     verts[v++] = cth * 0.5 + 0.5; verts[v++] = 0.5; verts[v++] = sth * 0.5 + 0.5;
+    verts[v++] = cth; verts[v++] = 0; verts[v++] = sth;
     // top rim
     verts[v++] = r * cth; verts[v++] =  hy; verts[v++] = r * sth;
     verts[v++] = cth * 0.5 + 0.5; verts[v++] = 0.8; verts[v++] = sth * 0.5 + 0.5;
+    verts[v++] = cth; verts[v++] = 0; verts[v++] = sth;
   }
   for (let k = 0; k < slices; k++) {
     const a = k * 2;
     indices[i++] = a;     indices[i++] = a + 1; indices[i++] = a + 2;
     indices[i++] = a + 2; indices[i++] = a + 1; indices[i++] = a + 3;
   }
-  // Top cap (CCW from above)
+  // Top cap (normal = +Y)
   const topCenter = sideVerts;
   verts[v++] = 0; verts[v++] = hy; verts[v++] = 0;
   verts[v++] = 0.6; verts[v++] = 0.95; verts[v++] = 0.6;
+  verts[v++] = 0; verts[v++] = 1; verts[v++] = 0;
   for (let k = 0; k <= slices; k++) {
     const theta = 2 * Math.PI * (k / slices);
     const cth = Math.cos(theta), sth = Math.sin(theta);
     verts[v++] = r * cth; verts[v++] = hy; verts[v++] = r * sth;
     verts[v++] = 0.65; verts[v++] = 0.95; verts[v++] = 0.65;
+    verts[v++] = 0; verts[v++] = 1; verts[v++] = 0;
   }
   for (let k = 0; k < slices; k++) {
     indices[i++] = topCenter; indices[i++] = topCenter + 1 + k + 1; indices[i++] = topCenter + 1 + k;
   }
-  // Bottom cap (CCW from below)
+  // Bottom cap (normal = -Y)
   const botCenter = topCenter + 1 + slices + 1;
   verts[v++] = 0; verts[v++] = -hy; verts[v++] = 0;
   verts[v++] = 0.4; verts[v++] = 0.4; verts[v++] = 0.6;
+  verts[v++] = 0; verts[v++] = -1; verts[v++] = 0;
   for (let k = 0; k <= slices; k++) {
     const theta = 2 * Math.PI * (k / slices);
     const cth = Math.cos(theta), sth = Math.sin(theta);
     verts[v++] = r * cth; verts[v++] = -hy; verts[v++] = r * sth;
     verts[v++] = 0.42; verts[v++] = 0.42; verts[v++] = 0.65;
+    verts[v++] = 0; verts[v++] = -1; verts[v++] = 0;
   }
   for (let k = 0; k < slices; k++) {
     indices[i++] = botCenter; indices[i++] = botCenter + 1 + k; indices[i++] = botCenter + 1 + k + 1;
@@ -44212,31 +44553,42 @@ function _buildCone(node) {
   const slices = Math.max(3, Math.min(128, Math.floor((typeof p.slices === "number") ? p.slices : 24)));
   const hy = h * 0.5;
   // Side: 1 apex + (slices+1) rim. Base: 1 center + (slices+1) rim.
+  // Side normal tilted: pointing outward + slightly up (apex bias).
+  // For a cone of radius r and height h, the slant makes side-normal
+  // (cosθ * h, r, sinθ * h) normalized.
+  const slantLen = Math.hypot(r, h);
+  const ny_side  = r / slantLen;
+  const horiz    = h / slantLen;
   const totalVerts = 1 + (slices + 1) + 1 + (slices + 1);
-  const verts = new Float32Array(totalVerts * 6);
+  const verts = new Float32Array(totalVerts * 9);
   const indices = new Uint32Array(slices * 6);
   let v = 0, i = 0;
-  // Apex
+  // Apex (use +Y as a clean normal, no good single normal for an
+  // apex on a flat-shaded cone; this is the standard hack).
   verts[v++] = 0; verts[v++] = hy; verts[v++] = 0;
   verts[v++] = 0.95; verts[v++] = 0.85; verts[v++] = 0.55;
+  verts[v++] = 0; verts[v++] = 1; verts[v++] = 0;
   for (let k = 0; k <= slices; k++) {
     const theta = 2 * Math.PI * (k / slices);
     const cth = Math.cos(theta), sth = Math.sin(theta);
     verts[v++] = r * cth; verts[v++] = -hy; verts[v++] = r * sth;
     verts[v++] = cth * 0.45 + 0.5; verts[v++] = 0.5; verts[v++] = sth * 0.45 + 0.5;
+    verts[v++] = horiz * cth; verts[v++] = ny_side; verts[v++] = horiz * sth;
   }
   for (let k = 0; k < slices; k++) {
     indices[i++] = 0; indices[i++] = 1 + k; indices[i++] = 1 + k + 1;
   }
-  // Bottom cap
+  // Bottom cap (normal = -Y)
   const botCenter = 1 + slices + 1;
   verts[v++] = 0; verts[v++] = -hy; verts[v++] = 0;
   verts[v++] = 0.3; verts[v++] = 0.3; verts[v++] = 0.5;
+  verts[v++] = 0; verts[v++] = -1; verts[v++] = 0;
   for (let k = 0; k <= slices; k++) {
     const theta = 2 * Math.PI * (k / slices);
     const cth = Math.cos(theta), sth = Math.sin(theta);
     verts[v++] = r * cth; verts[v++] = -hy; verts[v++] = r * sth;
     verts[v++] = 0.35; verts[v++] = 0.35; verts[v++] = 0.55;
+    verts[v++] = 0; verts[v++] = -1; verts[v++] = 0;
   }
   for (let k = 0; k < slices; k++) {
     indices[i++] = botCenter; indices[i++] = botCenter + 1 + k; indices[i++] = botCenter + 1 + k + 1;
@@ -44244,29 +44596,48 @@ function _buildCone(node) {
   return { verts, indices };
 }
 
-/* Acquire / build the per-Scene uniform buffer + bind group. Each
- * Scene has its own viewProj + model buffer; per-mesh-draw we
- * overwrite the model portion before issuing the draw call. */
+/* Acquire / build the per-Scene uniform buffers + bind group. Two
+ * uniform buffers:
+ *   perSceneBuffer (binding 0, 112 bytes) -- viewProj (64) +
+ *     lightDir (16) + lightColor (16) + eye (16). Written once per
+ *     Scene render before the draw loop.
+ *   perDrawBuffer  (binding 1, 96 bytes) -- model (64) + baseColor
+ *     (16) + matParams (16). Written before each mesh draw.
+ * The bind group references both; the underlying buffer contents
+ * change per call but the bind group itself stays constant. */
 function _ensureSceneInstance(sceneNode) {
   let inst = Visual.sceneInstances.get(sceneNode.id);
   if (inst) return inst;
   if (!Visual.device || !Visual.meshBindGroupLayout) {
-    // Pipeline not built yet; bail and let the next frame retry.
     return null;
   }
-  // 32 floats = 2 mat4x4 = 128 bytes. Float32Array used as the
-  // packing buffer; queue.writeBuffer ships it.
-  const uniformBuffer = Visual.device.createBuffer({
-    label: "scene-uniform-" + sceneNode.id,
-    size: 128,
+  // perScene: viewProj (16 floats) + lightDir (4) + lightColor (4) + eye (4) = 28 floats = 112 bytes
+  const perSceneBuffer = Visual.device.createBuffer({
+    label: "scene-perscene-" + sceneNode.id,
+    size: 112,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+  });
+  // perDraw: model (16) + baseColor (4) + matParams (4) = 24 floats = 96 bytes
+  const perDrawBuffer = Visual.device.createBuffer({
+    label: "scene-perdraw-" + sceneNode.id,
+    size: 96,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
   });
   const bindGroup = Visual.device.createBindGroup({
     label: "scene-bg-" + sceneNode.id,
     layout: Visual.meshBindGroupLayout,
-    entries: [{ binding: 0, resource: { buffer: uniformBuffer } }]
+    entries: [
+      { binding: 0, resource: { buffer: perSceneBuffer } },
+      { binding: 1, resource: { buffer: perDrawBuffer  } }
+    ]
   });
-  inst = { uniformBuffer, bindGroup, scratch: new Float32Array(32) };
+  inst = {
+    perSceneBuffer,
+    perDrawBuffer,
+    bindGroup,
+    sceneScratch: new Float32Array(28),
+    drawScratch:  new Float32Array(24)
+  };
   Visual.sceneInstances.set(sceneNode.id, inst);
   return inst;
 }
@@ -44287,8 +44658,6 @@ function _encodeScenePass(enc, entry) {
   }
   if (!layerView) return false;
   const sampleCount = Visual.msaaSampleCount || 1;
-  const pipeline = _ensureMeshPipeline(sampleCount);
-  if (!pipeline) return false;
   const inst = _ensureSceneInstance(node);
   if (!inst) return false;
   if (!Visual.depthTextureView) return false;
@@ -44301,6 +44670,7 @@ function _encodeScenePass(enc, entry) {
 
   const camera = _resolveSceneCamera(node, Visual.fbWidth, Visual.fbHeight);
   const meshes = _resolveSceneMeshes(node);
+  const light  = _resolveSceneLight(node);
   if (!_SCENE_DIAG.encode) {
     _SCENE_DIAG.encode = true;
     console.log("[scene] first encode: node=" + node.id +
@@ -44344,19 +44714,52 @@ function _encodeScenePass(enc, entry) {
       depthStoreOp: (sampleCount > 1) ? "discard" : "store"
     }
   });
-  pass.setPipeline(pipeline);
   pass.setBindGroup(0, inst.bindGroup);
 
-  // Same uniform buffer reused per draw; we copy viewProj once + the
-  // model matrix per mesh.
-  inst.scratch.set(camera.viewProj, 0);
+  // Per-Scene uniform: viewProj + light + camera eye. Same for every
+  // draw in this scene.
+  inst.sceneScratch.set(camera.viewProj, 0);
+  inst.sceneScratch[16] = light.dir[0];
+  inst.sceneScratch[17] = light.dir[1];
+  inst.sceneScratch[18] = light.dir[2];
+  inst.sceneScratch[19] = 0;                        // padding
+  inst.sceneScratch[20] = light.color[0];
+  inst.sceneScratch[21] = light.color[1];
+  inst.sceneScratch[22] = light.color[2];
+  inst.sceneScratch[23] = light.intensity;
+  inst.sceneScratch[24] = camera.eye[0];
+  inst.sceneScratch[25] = camera.eye[1];
+  inst.sceneScratch[26] = camera.eye[2];
+  inst.sceneScratch[27] = 0;
+  Visual.device.queue.writeBuffer(inst.perSceneBuffer, 0, inst.sceneScratch.buffer, 0, 112);
 
+  // Per-draw loop. Each mesh may have its own material; we switch
+  // pipeline when the material type changes (sorting upstream would
+  // minimize this; not worth optimizing for the typical 1-4 mesh
+  // case in sprint 7.5.3c).
+  let curMaterialType = null;
   for (const m of meshes) {
     const buf = _ensureMeshBuffers(m);
     if (!buf || !buf.vertexBuffer) continue;
-    // Write model into the second half of the uniform.
-    inst.scratch.set(m.transform, 16);
-    Visual.device.queue.writeBuffer(inst.uniformBuffer, 0, inst.scratch.buffer, 0, 128);
+    const matType = (m.material && m.material.type) || "unlit-vc";
+    if (matType !== curMaterialType) {
+      const pipeline = _ensureMeshPipeline(matType, sampleCount);
+      if (!pipeline) continue;
+      pass.setPipeline(pipeline);
+      curMaterialType = matType;
+    }
+    // Write model + material into the per-draw uniform.
+    inst.drawScratch.set(m.transform, 0);
+    const mp = (m.material && m.material.params) || {};
+    inst.drawScratch[16] = (typeof mp.r === "number") ? mp.r : 1.0;
+    inst.drawScratch[17] = (typeof mp.g === "number") ? mp.g : 1.0;
+    inst.drawScratch[18] = (typeof mp.b === "number") ? mp.b : 1.0;
+    inst.drawScratch[19] = (typeof mp.vertexMix === "number") ? mp.vertexMix : (matType === "unlit-vc" ? 1.0 : 0.0);
+    inst.drawScratch[20] = (typeof mp.shininess === "number") ? mp.shininess : 32.0;
+    inst.drawScratch[21] = (typeof mp.ambient   === "number") ? mp.ambient   : 0.15;
+    inst.drawScratch[22] = 0;
+    inst.drawScratch[23] = 0;
+    Visual.device.queue.writeBuffer(inst.perDrawBuffer, 0, inst.drawScratch.buffer, 0, 96);
     pass.setVertexBuffer(0, buf.vertexBuffer);
     if (buf.indexBuffer) {
       pass.setIndexBuffer(buf.indexBuffer, "uint32");
@@ -44367,12 +44770,54 @@ function _encodeScenePass(enc, entry) {
     if (!_SCENE_DIAG.draw) {
       _SCENE_DIAG.draw = true;
       console.log("[scene] first mesh draw: src=" + m.node.type + "#" + m.node.id +
+                  " material=" + matType +
                   " verts=" + buf.vertexCount + (buf.indexCount ? " indices=" + buf.indexCount : ""));
     }
   }
 
   pass.end();
   return true;
+}
+
+/* Resolve a Scene's `light` input. Returns {dir, color, intensity}
+ * with sensible defaults when no light is wired (overhead warm-
+ * white directional so meshes don't appear pitch-black with a
+ * PhongMat). Per-frame cache via Visual._frameLightCache so multi-
+ * Scene patches sharing a light don't recompute. */
+function _resolveSceneLight(sceneNode) {
+  if (!Visual._frameLightCache) Visual._frameLightCache = new Map();
+  const wire = state.edges && state.edges.find(e =>
+    e && e.to && e.to.node === sceneNode.id && e.to.port === "light"
+  );
+  if (wire && wire.from) {
+    const cached = Visual._frameLightCache.get(wire.from.node);
+    if (cached) return cached;
+    const src = state.nodes.find(n => n && n.id === wire.from.node);
+    if (src && src.type === "DirectionalLight") {
+      const p = _resolveNodeParams(src);
+      const dx = (typeof p.dirX === "number") ? p.dirX : 0.3;
+      const dy = (typeof p.dirY === "number") ? p.dirY : 1.0;
+      const dz = (typeof p.dirZ === "number") ? p.dirZ : 0.4;
+      const len = Math.hypot(dx, dy, dz) || 1.0;
+      const out = {
+        dir:   [dx / len, dy / len, dz / len],
+        color: [
+          (typeof p.colorR === "number") ? p.colorR : 1.0,
+          (typeof p.colorG === "number") ? p.colorG : 1.0,
+          (typeof p.colorB === "number") ? p.colorB : 1.0
+        ],
+        intensity: (typeof p.intensity === "number") ? p.intensity : 1.0
+      };
+      Visual._frameLightCache.set(wire.from.node, out);
+      return out;
+    }
+  }
+  // Default: warm-white from above-front. Same shape every frame.
+  return {
+    dir:       [0.3 / 1.118, 1.0 / 1.118, 0.4 / 1.118],
+    color:     [1.0, 0.98, 0.92],
+    intensity: 1.0
+  };
 }
 
 /* Phase 6.6.30 + v0.2.16 — render one plan entry. Handles BOTH the
@@ -45662,6 +46107,8 @@ function renderVisualFrame() {
   // Camera param changes propagate to every Scene that references it.
   // Re-populated on first Scene render this frame.
   if (Visual._frameCameraCache) Visual._frameCameraCache.clear();
+  // Sprint 7.5.3c -- ditto for the light cache.
+  if (Visual._frameLightCache) Visual._frameLightCache.clear();
 
   // Phase 6.5.3 + 6.5.4 — refresh FFT bins in the SAB from the
   // main-thread analyser, then write the SAB audio + JS-side
