@@ -6421,6 +6421,8 @@
         <div class="visual-hud" id="visual-hud">
           <button class="visual-hud-pill" id="res-pill" type="button"
                   title="Render resolution — click to cycle 1080p → 1440p → 4K → 8K. Affects framebuffer size, not browser window size.">1080p</button>
+          <button class="visual-hud-pill" id="msaa-pill" type="button"
+                  title="MSAA disabled (1x). Click to cycle 1x -> 4x -> 8x. Affects only 3D Scene passes; existing shader-frag passes stay single-sample.">1x MSAA</button>
           <button class="visual-hud-pill" id="proj-pill" type="button"
                   title="Operator preview projection — click to cycle Tile-flat → Cylinder → Equirect → Fisheye. Same content, different unwrap of the multi-display rig onto your screen.">Tile</button>
           <button class="visual-hud-pill visual-hud-icon" id="gizmo-pill" type="button"
@@ -29415,6 +29417,92 @@ const _demos = [
     }
   },
 
+  /* Sprint 7.5.3a -- 3D Orbit. The smoke test triangle with a camera
+   * orbiting it in the XZ plane. Validates two things on top of the
+   * 3D Triangle demo: (1) Camera params follow wired inputs (so the
+   * posX/posZ live updates propagate per frame), (2) the math-
+   * template recursion in _resolveNodeParams resolves chains like
+   * "Phasor -> Mul -> Sin -> Mul -> Camera.posX" without an audio
+   * runtime needed.
+   *
+   * Math chain (one full orbit every 4 seconds at freq=0.25):
+   *   Phasor(0.25Hz) -> Mul(2*pi) -> ┬-> Sin -> Mul(2.5) -> Camera.posX
+   *                                  └-> Cos -> Mul(2.5) -> Camera.posZ
+   *
+   * Phasor's continuous 0..1 ramp times 2pi gives a 0..2pi angle.
+   * Sin/Cos of that are the standard parametric circle. radius=2.5
+   * puts the orbit comfortably outside the triangle (which sits at
+   * the origin with halfsize ~1). posY stays 0 -- horizontal orbit. */
+  {
+    id: "scene-3d-orbit",
+    name: "3D Orbit",
+    sub: "phasor → sin/cos → camera",
+    type: "visual",
+    thumb: `<svg viewBox="0 0 100 44">
+      <defs>
+        <linearGradient id="dg-3d-orbit-bg" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0"   stop-color="rgba(14, 22, 44, 1)"/>
+          <stop offset="1"   stop-color="rgba(4, 8, 18, 1)"/>
+        </linearGradient>
+      </defs>
+      <rect width="100" height="44" fill="url(#dg-3d-orbit-bg)"/>
+      <!-- orbit ring -->
+      <ellipse cx="50" cy="24" rx="34" ry="8" fill="none"
+               stroke="rgba(131,232,255,0.4)" stroke-width="0.7"
+               stroke-dasharray="2 3"/>
+      <!-- triangle in middle -->
+      <polygon points="42,26 58,26 50,16" fill="rgba(200,232,90,0.85)"
+               stroke="rgba(255,255,255,0.4)" stroke-width="0.5"/>
+      <!-- camera dot orbiting -->
+      <circle cx="82" cy="22" r="2.2" fill="rgba(255,180,90,0.95)"/>
+      <text x="82" y="32" text-anchor="middle"
+            font-family="monospace" font-size="3.6"
+            fill="rgba(255,180,90,0.85)">CAM</text>
+    </svg>`,
+    build: () => {
+      // Animation source: Phasor at 0.25 Hz = full orbit every 4s.
+      // Phasor is an audio-rate oscillator; the JS-side mirror added
+      // in v0.3.48 + the math-template recursion in v0.3.49 mean it
+      // resolves correctly into a Camera param without an audio
+      // runtime being active.
+      const phasor = makeNode("Phasor",  40,  40, { freq: 0.25 });
+      // Phasor outputs 0..1; multiply by 2π so Sin/Cos see a full
+      // revolution per Phasor period.
+      const mulTau = makeNode("Mul",     220, 40, { b: 6.283185307 });
+      const sinN   = makeNode("Sin",     400, 40);
+      const cosN   = makeNode("Cos",     400, 130);
+      // Scale to orbit radius. 2.5 world units = comfortable distance
+      // for the default triangle (halfsize ~1) at fov=60.
+      const mulRx  = makeNode("Mul",     560, 40,  { b: 2.5 });
+      const mulRz  = makeNode("Mul",     560, 130, { b: 2.5 });
+
+      const tri = makeNode("DebugTriangle", 40,  240, { scale: 1.0 });
+      const cam = makeNode("Camera",        40,  340, {
+        posX: 0, posY: 0, posZ: 0,            // overridden by wires
+        targetX: 0, targetY: 0, targetZ: 0,
+        fov: 60, near: 0.1, far: 100, mode: 0
+      });
+      const scn = makeNode("Scene",         760, 200, {
+        clearR: 0.04, clearG: 0.05, clearB: 0.09
+      });
+      const vo  = makeNode("VisualOutput", 1000, 200, { display: 0 });
+
+      // Math chain.
+      state.edges.push({ from: { node: phasor, port: "out" }, to: { node: mulTau, port: "a" } });
+      state.edges.push({ from: { node: mulTau, port: "out" }, to: { node: sinN,   port: "in" } });
+      state.edges.push({ from: { node: mulTau, port: "out" }, to: { node: cosN,   port: "in" } });
+      state.edges.push({ from: { node: sinN,   port: "out" }, to: { node: mulRx,  port: "a" } });
+      state.edges.push({ from: { node: cosN,   port: "out" }, to: { node: mulRz,  port: "a" } });
+      // Math chain -> Camera position.
+      state.edges.push({ from: { node: mulRx,  port: "out"    }, to: { node: cam, port: "posX"  } });
+      state.edges.push({ from: { node: mulRz,  port: "out"    }, to: { node: cam, port: "posZ"  } });
+      // Scene wiring.
+      state.edges.push({ from: { node: tri,    port: "mesh"   }, to: { node: scn, port: "mesh1"  } });
+      state.edges.push({ from: { node: cam,    port: "camera" }, to: { node: scn, port: "camera" } });
+      state.edges.push({ from: { node: scn,    port: "out"    }, to: { node: vo,  port: "in"     } });
+    }
+  },
+
   {
     id: "mesh-text",
     name: "Mesh Text",
@@ -37205,10 +37293,20 @@ const Visual = {
   // re-allocated on resolution change.
   depthTexture: null,
   depthTextureView: null,
-  // Lazily-built mesh render pipeline. Single pipeline serves all
-  // mesh draws for sprint 7.5.3a -- vertex format is (pos.xyz,
-  // color.rgb) interleaved; future material variants get their own
-  // cache entries. Key: format combination string.
+  // MSAA state. msaaSampleCount is 1 (off), 4, or 8. The mesh
+  // pipeline + depth + color attachments must all match. The
+  // resolution HUD cycles this; renderpass picks attachments per
+  // pass. Setting to >1 allocates Visual.msaaColorTexture (MSAA
+  // intermediate) and rebuilds the depth texture at the matching
+  // sampleCount. Render pass attaches the MSAA color as `view` +
+  // the framebuffer layer as `resolveTarget` for hardware resolve.
+  msaaSampleCount:    1,
+  msaaColorTexture:   null,
+  msaaColorTextureView: null,
+  // Lazily-built mesh render pipeline. Cache key is the sample
+  // count -- pipelines need their multisample.count to match the
+  // attachments. Sprint 7.5.3a only emits the unlit-vertex-color
+  // variant; sprint 7.5.3c adds material variants per cache key.
   meshPipelineCache: new Map(),
   meshBindGroupLayout:    null,
   meshPipelineLayout:     null,
@@ -37428,11 +37526,19 @@ function _allocateFramebuffer() {
   }
   // Sprint 7.5.3a -- depth texture is a single-layer 2D texture
   // matching the framebuffer dimensions. Cleared per Scene render
-  // pass + re-used across passes in the same frame.
+  // pass + re-used across passes in the same frame. MSAA: depth
+  // texture's sampleCount must match the color attachment, so we
+  // reallocate whenever Visual.msaaSampleCount changes (via
+  // _ensureMsaa3DTextures).
   if (Visual.depthTexture) {
     try { Visual.depthTexture.destroy(); } catch (_) {}
     Visual.depthTexture     = null;
     Visual.depthTextureView = null;
+  }
+  if (Visual.msaaColorTexture) {
+    try { Visual.msaaColorTexture.destroy(); } catch (_) {}
+    Visual.msaaColorTexture     = null;
+    Visual.msaaColorTextureView = null;
   }
   // Phase 6.6.30 — framebuffer + feedbackArray sized to rig display
   // count only (reverted v0.2.4's over-allocation). Scratch lives in
@@ -37497,19 +37603,13 @@ function _allocateFramebuffer() {
     dimension: "2d-array"
   });
 
-  // Sprint 7.5.3a -- depth texture for 3D Scene render passes. Single
-  // 2D non-array because each Scene pass only writes to one
-  // framebuffer layer; depth + color attachments must match dimensions
-  // + sample count. depth32float gives a 24-bit-mantissa float depth
-  // with the full [0,1] range and adequate near/far precision for the
-  // patches we expect. STENCIL omitted -- no stencil-test workflow yet.
-  Visual.depthTexture = Visual.device.createTexture({
-    label: "visual-depth-" + Visual.resolutionKey,
-    size: [Visual.fbWidth, Visual.fbHeight, 1],
-    format: "depth32float",
-    usage: GPUTextureUsage.RENDER_ATTACHMENT
-  });
-  Visual.depthTextureView = Visual.depthTexture.createView({ label: "visual-depth-view" });
+  // Sprint 7.5.3a -- depth + MSAA-color textures for 3D Scene render
+  // passes. Allocated at the CURRENT Visual.msaaSampleCount; updated
+  // by _ensureMsaa3DTextures when the user cycles the MSAA HUD pill.
+  // depth32float gives a 24-bit-mantissa float depth with the full
+  // [0,1] range and adequate near/far precision for the patches we
+  // expect. STENCIL omitted -- no stencil-test workflow yet.
+  _ensureMsaa3DTextures();
   // Phase 6.6.30 + v0.2.16 — two scratch render-target textures (A + B)
   // for composition node inputs. SCRATCH_BUDGET layers each, isolated
   // from the framebuffer. Deep composition chains ping-pong between
@@ -42503,61 +42603,19 @@ function _resolveNodeParams(node) {
       e && e.to && e.to.node === node.id && e.to.port === port.n
     );
     if (!wire || !wire.from) continue;
-    const src = state.nodes.find(n => n && n.id === wire.from.node);
-    if (!src) continue;
-    // Slider source: surface its current value (set by the Monitor
-    // controls panel + persisted in node.params.value). The Slider's
-    // min/max/curve mapping happens on the C++ side via setValue; in
-    // JS we just expose the raw value. User should set min=0, max=1
-    // for shader-frag mix-style params, or scale themselves.
-    if (src.type === "Slider") {
-      const v = (src.params && typeof src.params.value === "number")
-        ? src.params.value : 0;
+    // Sprint 7.5.3a -- unified with the OscOut path. _readWireJsSideValue
+    // dispatches on source type (Slider, MasterClock, HandLandmarker,
+    // PoseLandmarker, FaceLandmarker, HandKeyboard, BlobTracker, OscIn,
+    // Sine/Saw/Square/Phasor audio mirrors, AD/AR/ADSR envelope mirrors,
+    // AND the full cmath / arithmetic math-template family via
+    // _evalMathTemplateJsSide recursion). Single source of truth for
+    // "what does this wire produce, JS-side?". Returns null when the
+    // source has no JS mirror -- in that case we keep the node's static
+    // param value (the existing fallback).
+    const v = _readWireJsSideValue(wire);
+    if (v !== null && v !== undefined && Number.isFinite(v)) {
       out[port.n] = v;
     }
-    else if (src.type === "MasterClock") {
-      // Phase 6.5.4 — JS-side MasterClock mirror. Reads the source
-      // MasterClock node's bpm param + uses performance.now() as
-      // the epoch to compute the current value for whichever
-      // output port the wire is from (bar / beat / quarter /
-      // eighth / sixteenth / phase / bpm). Sub-ms drift vs the
-      // sample-accurate C++ MasterClock in the worklet -- ample
-      // for visual reactivity at 60 fps.
-      out[port.n] = _masterClockOutputValue(src, wire.from.port);
-    }
-    else if (src.type === "HandLandmarker") {
-      // Phase 7.1b — MediaPipe HandLandmarker. Returns the latest
-      // detection value for the wire's output port (numHands, hN_x,
-      // hN_pinch, etc). First read lazy-inits the detector +
-      // getUserMedia camera; subsequent reads return cached results
-      // from the per-node detection rAF loop.
-      out[port.n] = _handLandmarkerValue(src, wire.from.port);
-    }
-    else if (src.type === "PoseLandmarker") {
-      out[port.n] = _poseLandmarkerValue(src, wire.from.port);
-    }
-    else if (src.type === "FaceLandmarker") {
-      out[port.n] = _faceLandmarkerValue(src, wire.from.port);
-    }
-    else if (src.type === "HandKeyboard") {
-      out[port.n] = _handKeyboardValue(src, wire.from.port);
-    }
-    else if (src.type === "BlobTracker") {
-      // v0.3.37 -- classical-CV blob detection. Same JS-driven pattern
-      // as the MediaPipe landmarks; per-frame rAF loop updates
-      // entry.latest, this resolver reads it.
-      out[port.n] = _blobTrackerValue(src, wire.from.port);
-    }
-    else if (src.type === "OscIn") {
-      // v0.3.47 -- external OSC source. node.params.{v1,v2,v3,v4}
-      // are kept current by _dispatchOscIn whenever a WS message
-      // arrives. The visual side reads them directly here; the audio
-      // side gets the same values pushed via _pushLiveControlsToWorklet.
-      const v = src.params && src.params[wire.from.port];
-      out[port.n] = (typeof v === "number") ? v : 0;
-    }
-    // Future source types (Knob, audio-rate LFO via SAB, etc.) plug
-    // in here.
   }
   return out;
 }
@@ -42681,7 +42739,11 @@ function _mat4Ortho(left, right, bottom, top, near, far) {
  * Camera don't recompute the matrices. The cache is cleared at the
  * top of each frame in renderVisualFrame. */
 function _evaluateCamera(cameraNode, fbW, fbH) {
-  const p = (cameraNode && cameraNode.params) || {};
+  // Sprint 7.5.3a -- resolve wired param inputs first so external
+  // sources (Slider, MasterClock, Sin/Cos chains, OscIn, etc) can
+  // drive camera position / orientation / fov in real time. Falls
+  // back to the node's static params for unwired inputs.
+  const p = cameraNode ? _resolveNodeParams(cameraNode) : {};
   const px = (typeof p.posX === "number") ? p.posX : 0;
   const py = (typeof p.posY === "number") ? p.posY : 0;
   const pz = (typeof p.posZ === "number") ? p.posZ : 5;
@@ -43188,9 +43250,81 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
   return vec4<f32>(in.color, 1.0);
 }`;
 
-function _ensureMeshPipeline() {
-  if (Visual.meshPipelineCache.has("default")) {
-    return Visual.meshPipelineCache.get("default");
+/* Sprint 7.5.3a -- (re)allocate the depth + MSAA color textures at
+ * the current Visual.msaaSampleCount. Called from _allocateFramebuffer
+ * and from setMsaaSampleCount when the HUD pill cycles. The MSAA
+ * color texture is only allocated when sampleCount > 1; the depth
+ * texture is always allocated (with matching sampleCount). */
+function _ensureMsaa3DTextures() {
+  if (!Visual.device || !Visual.fbWidth || !Visual.fbHeight) return;
+  const sc = Math.max(1, Visual.msaaSampleCount | 0);
+  // Depth -- always allocated.
+  if (Visual.depthTexture) {
+    try { Visual.depthTexture.destroy(); } catch (_) {}
+  }
+  Visual.depthTexture = Visual.device.createTexture({
+    label: "visual-depth-" + sc + "x-" + Visual.resolutionKey,
+    size: [Visual.fbWidth, Visual.fbHeight, 1],
+    sampleCount: sc,
+    format: "depth32float",
+    usage: GPUTextureUsage.RENDER_ATTACHMENT
+  });
+  Visual.depthTextureView = Visual.depthTexture.createView({ label: "visual-depth-view" });
+  // MSAA color -- only when sc > 1. We render into this and resolve
+  // to the framebuffer layer at end-of-pass.
+  if (Visual.msaaColorTexture) {
+    try { Visual.msaaColorTexture.destroy(); } catch (_) {}
+    Visual.msaaColorTexture     = null;
+    Visual.msaaColorTextureView = null;
+  }
+  if (sc > 1) {
+    Visual.msaaColorTexture = Visual.device.createTexture({
+      label: "visual-msaa-color-" + sc + "x-" + Visual.resolutionKey,
+      size: [Visual.fbWidth, Visual.fbHeight, 1],
+      sampleCount: sc,
+      format: Visual.fbFormat,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT
+    });
+    Visual.msaaColorTextureView = Visual.msaaColorTexture.createView({ label: "visual-msaa-color-view" });
+  }
+  // The mesh pipeline is sampleCount-keyed, so changing sc means
+  // future _ensureMeshPipeline(sc) calls hit a fresh cache slot.
+  // Existing entries for other sample counts stay -- cheap, lets
+  // the user toggle 1x <-> 4x without paying shader compile cost
+  // on every flip.
+}
+
+function setMsaaSampleCount(n) {
+  n = (n === 4 || n === 8) ? n : 1;
+  if (n === Visual.msaaSampleCount) return;
+  Visual.msaaSampleCount = n;
+  _ensureMsaa3DTextures();
+  _updateMsaaPill();
+}
+function cycleMsaa() {
+  // 1 -> 4 -> 8 -> 1. 8x is not universally supported, but WebGPU
+  // surfaces a validation error at pipeline create time which we
+  // catch + display in the HUD; we still LET the user try it on
+  // adapters that have it.
+  const cur = Visual.msaaSampleCount;
+  setMsaaSampleCount(cur === 1 ? 4 : (cur === 4 ? 8 : 1));
+}
+function _updateMsaaPill() {
+  const pill = document.getElementById("msaa-pill");
+  if (!pill) return;
+  const sc = Visual.msaaSampleCount;
+  pill.textContent = sc + "x MSAA";
+  pill.classList.toggle("active", sc > 1);
+  pill.title = sc === 1
+    ? "MSAA disabled (1x). Click to cycle 1x -> 4x -> 8x. Affects only 3D Scene passes; existing shader-frag passes stay single-sample."
+    : "MSAA " + sc + "x. Click to cycle. Anti-aliases triangle edges in Scene render passes via WebGPU resolveTarget. Costs ~" + sc + "x the depth + color memory of the 3D pass.";
+}
+
+function _ensureMeshPipeline(sampleCount) {
+  if (!Number.isFinite(sampleCount) || sampleCount < 1) sampleCount = 1;
+  const key = "default-" + sampleCount + "x";
+  if (Visual.meshPipelineCache.has(key)) {
+    return Visual.meshPipelineCache.get(key);
   }
   if (!Visual.device) return null;
   // Build shared BGL + pipeline layout on first use.
@@ -43215,43 +43349,60 @@ function _ensureMeshPipeline() {
     console.warn("[scene] mesh shader compile failed:", e);
     return null;
   }
-  const pipeline = Visual.device.createRenderPipeline({
-    label: "mesh-pipeline",
-    layout: Visual.meshPipelineLayout,
-    vertex: {
-      module,
-      entryPoint: "vs_main",
-      buffers: [{
-        arrayStride: 6 * 4,           // 6 floats per vertex (pos.xyz + color.rgb)
-        attributes: [
-          { shaderLocation: 0, offset: 0,     format: "float32x3" },  // position
-          { shaderLocation: 1, offset: 3 * 4, format: "float32x3" }   // color
-        ]
-      }]
-    },
-    fragment: {
-      module,
-      entryPoint: "fs_main",
-      targets: [{
-        format: Visual.fbFormat,
-        blend: {
-          color: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
-          alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" }
-        }
-      }]
-    },
-    primitive: {
-      topology: "triangle-list",
-      cullMode: "none",
-      frontFace: "ccw"
-    },
-    depthStencil: {
-      format: "depth32float",
-      depthCompare: "less",
-      depthWriteEnabled: true
+  let pipeline;
+  try {
+    pipeline = Visual.device.createRenderPipeline({
+      label: "mesh-pipeline-" + sampleCount + "x",
+      layout: Visual.meshPipelineLayout,
+      vertex: {
+        module,
+        entryPoint: "vs_main",
+        buffers: [{
+          arrayStride: 6 * 4,           // 6 floats per vertex (pos.xyz + color.rgb)
+          attributes: [
+            { shaderLocation: 0, offset: 0,     format: "float32x3" },  // position
+            { shaderLocation: 1, offset: 3 * 4, format: "float32x3" }   // color
+          ]
+        }]
+      },
+      fragment: {
+        module,
+        entryPoint: "fs_main",
+        targets: [{
+          format: Visual.fbFormat,
+          blend: {
+            color: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+            alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" }
+          }
+        }]
+      },
+      primitive: {
+        topology: "triangle-list",
+        cullMode: "none",
+        frontFace: "ccw"
+      },
+      depthStencil: {
+        format: "depth32float",
+        depthCompare: "less",
+        depthWriteEnabled: true
+      },
+      multisample: { count: sampleCount }
+    });
+  } catch (e) {
+    console.warn("[scene] mesh pipeline " + sampleCount + "x failed (often '8x unsupported on this adapter'):", e);
+    // Fall back to 1x if the requested sample count is unsupported.
+    // Persisted in Visual.msaaSampleCount so subsequent frames don't
+    // keep retrying the same bad pipeline.
+    if (sampleCount !== 1) {
+      console.warn("[scene] falling back to 1x MSAA");
+      Visual.msaaSampleCount = 1;
+      _ensureMsaa3DTextures();
+      _updateMsaaPill();
+      return _ensureMeshPipeline(1);
     }
-  });
-  Visual.meshPipelineCache.set("default", pipeline);
+    return null;
+  }
+  Visual.meshPipelineCache.set(key, pipeline);
   return pipeline;
 }
 
@@ -43354,11 +43505,13 @@ function _encodeScenePass(enc, entry) {
     layerView = Visual.framebufferLayerViews[layerIdx];
   }
   if (!layerView) return false;
-  const pipeline = _ensureMeshPipeline();
+  const sampleCount = Visual.msaaSampleCount || 1;
+  const pipeline = _ensureMeshPipeline(sampleCount);
   if (!pipeline) return false;
   const inst = _ensureSceneInstance(node);
   if (!inst) return false;
   if (!Visual.depthTextureView) return false;
+  if (sampleCount > 1 && !Visual.msaaColorTextureView) return false;
 
   const p = node.params || {};
   const clearR = (typeof p.clearR === "number") ? p.clearR : 0.04;
@@ -43368,19 +43521,33 @@ function _encodeScenePass(enc, entry) {
   const camera = _resolveSceneCamera(node, Visual.fbWidth, Visual.fbHeight);
   const meshes = _resolveSceneMeshes(node);
 
+  // MSAA path: render into the MSAA color texture + use the
+  // framebuffer layer as resolveTarget so WebGPU does the down-
+  // sample at end-of-pass. storeOp "discard" because we only need
+  // the resolved output -- saves bandwidth.
+  // Single-sample path: render directly into the framebuffer layer.
+  const colorAttachment = (sampleCount > 1)
+    ? {
+        view: Visual.msaaColorTextureView,
+        resolveTarget: layerView,
+        clearValue: { r: clearR, g: clearG, b: clearB, a: 1.0 },
+        loadOp: "clear",
+        storeOp: "discard"
+      }
+    : {
+        view: layerView,
+        clearValue: { r: clearR, g: clearG, b: clearB, a: 1.0 },
+        loadOp: "clear",
+        storeOp: "store"
+      };
   const pass = enc.beginRenderPass({
-    label: "scene-pass-" + node.id,
-    colorAttachments: [{
-      view: layerView,
-      clearValue: { r: clearR, g: clearG, b: clearB, a: 1.0 },
-      loadOp: "clear",
-      storeOp: "store"
-    }],
+    label: "scene-pass-" + node.id + "-" + sampleCount + "x",
+    colorAttachments: [colorAttachment],
     depthStencilAttachment: {
       view: Visual.depthTextureView,
       depthLoadOp: "clear",
       depthClearValue: 1.0,
-      depthStoreOp: "store"
+      depthStoreOp: (sampleCount > 1) ? "discard" : "store"
     }
   });
   pass.setPipeline(pipeline);
@@ -45376,20 +45543,57 @@ function _readWireJsSideValue(wire) {
   if (src.type === "AD" || src.type === "AR" || src.type === "ADSR") {
     return _envMirrorValue(src, wire.from.port);
   }
-  // Math template nodes (Mul / Add / Sub / etc.) recurse into their
-  // own inputs. Common patterns like "(Slider * 2 + 1) -> OscOut"
-  // work after this.
-  if (src.type === "Mul" || src.type === "Add" || src.type === "Sub" || src.type === "Div" ||
-      src.type === "Tanh" || src.type === "Abs" || src.type === "Neg" || src.type === "Inv") {
+  // Math template nodes (Mul / Add / Sub / Sin / Cos / cmath family
+  // / etc.) recurse into their own inputs. Common patterns like
+  // "(Slider * 2 + 1) -> OscOut" or "(Phasor * 2pi -> Sin) -> Camera.posX"
+  // work after this. Sprint 7.5.3a broadened from the v0.3.48 set
+  // to the full cmath family via _isMathTemplateType.
+  if (_isMathTemplateType(src.type)) {
     return _evalMathTemplateJsSide(src);
   }
   return null;
 }
 
-/* Evaluate a math-template node (Mul/Add/Sub/Div/Tanh/Abs/Neg/Inv)
- * on the JS side by recursively reading its wired inputs. Returns
- * null if any input dependency can't be JS-resolved. Mirrors the
- * codegen-time inlining: Mul(a,b) emits "(a*b)", etc. */
+/* JS-side evaluation table for single-input math template nodes
+ * (cmath / arithmetic functions inlined at codegen time). Same set
+ * the C++ side uses, mirrored here so visual-side wire resolution +
+ * OscOut can follow modulation chains through math nodes without an
+ * audio runtime. Sprint 7.5.3a expanded from the v0.3.48 set to
+ * include the full cmath family so e.g. Camera.posX <- Mul(Sin(...))
+ * works for the orbit demo without ad-hoc plumbing. */
+const _MATH_UNARY_FNS = {
+  Sin:     Math.sin,
+  Cos:     Math.cos,
+  Tan:     Math.tan,
+  Asin:    Math.asin,
+  Acos:    Math.acos,
+  Atan:    Math.atan,
+  Sinh:    Math.sinh,
+  Cosh:    Math.cosh,
+  Tanh:    Math.tanh,
+  Exp:     Math.exp,
+  Exp2:    (x) => Math.pow(2, x),
+  Log:     Math.log,
+  Log2:    Math.log2,
+  Log10:   Math.log10,
+  Sqrt:    (x) => x >= 0 ? Math.sqrt(x) : 0,
+  Cbrt:    Math.cbrt,
+  Squared: (x) => x * x,
+  Cubed:   (x) => x * x * x,
+  Abs:     Math.abs,
+  Neg:     (x) => -x,
+  Inv:     (x) => Math.abs(x) < 1e-9 ? 0 : 1.0 / x,
+  Floor:   Math.floor,
+  Ceil:    Math.ceil,
+  Round:   Math.round,
+  Sign:    Math.sign,
+  Fract:   (x) => x - Math.floor(x)
+};
+
+/* Evaluate a math-template node on the JS side by recursively
+ * reading its wired inputs. Returns null if any input dependency
+ * can't be JS-resolved. Mirrors the codegen-time inlining:
+ * Mul(a,b) emits "(a*b)", Sin(in) emits "sinf(in)", etc. */
 function _evalMathTemplateJsSide(node) {
   if (!node) return null;
   const valOf = (portName) => {
@@ -45405,7 +45609,14 @@ function _evalMathTemplateJsSide(node) {
     const p = node.params && node.params[portName];
     return (typeof p === "number") ? p : null;
   };
-  const a = valOf("a"), b = valOf("b"), inV = valOf("in");
+  // Single-input math (cmath family). Table-driven.
+  if (_MATH_UNARY_FNS[node.type]) {
+    const inV = valOf("in");
+    if (inV === null) return null;
+    return _MATH_UNARY_FNS[node.type](inV);
+  }
+  // Two-input arithmetic (a, b).
+  const a = valOf("a"), b = valOf("b");
   if (node.type === "Mul") {
     if (a === null || b === null) return null;
     return a * b;
@@ -45422,23 +45633,33 @@ function _evalMathTemplateJsSide(node) {
     if (a === null || b === null || Math.abs(b) < 1e-9) return null;
     return a / b;
   }
-  if (node.type === "Tanh") {
-    if (inV === null) return null;
-    return Math.tanh(inV);
+  if (node.type === "Pow") {
+    if (a === null || b === null) return null;
+    return Math.pow(a, b);
   }
-  if (node.type === "Abs") {
-    if (inV === null) return null;
-    return Math.abs(inV);
+  if (node.type === "Mod") {
+    if (a === null || b === null || Math.abs(b) < 1e-9) return null;
+    return a - Math.floor(a / b) * b;
   }
-  if (node.type === "Neg") {
-    if (inV === null) return null;
-    return -inV;
+  if (node.type === "Min") {
+    if (a === null || b === null) return null;
+    return Math.min(a, b);
   }
-  if (node.type === "Inv") {
-    if (inV === null || Math.abs(inV) < 1e-9) return null;
-    return 1.0 / inV;
+  if (node.type === "Max") {
+    if (a === null || b === null) return null;
+    return Math.max(a, b);
   }
   return null;
+}
+
+/* Helper: is this node type a JS-mirrorable math template? Used by
+ * _resolveNodeParams to dispatch into _evalMathTemplateJsSide for
+ * wires that pass through arithmetic / cmath nodes. */
+function _isMathTemplateType(t) {
+  if (!t) return false;
+  if (_MATH_UNARY_FNS[t]) return true;
+  return t === "Mul" || t === "Add" || t === "Sub" || t === "Div" ||
+         t === "Pow" || t === "Mod" || t === "Min" || t === "Max";
 }
 
 function _tickOscOut() {
@@ -54943,6 +55164,12 @@ ensureGPUDevice();
   if (resPill) {
     _updateResolutionPill();
     resPill.addEventListener("click", _cycleRenderResolution);
+  }
+  // Sprint 7.5.3a -- MSAA pill cycles 1x -> 4x -> 8x.
+  const msaaPill = document.getElementById("msaa-pill");
+  if (msaaPill) {
+    _updateMsaaPill();
+    msaaPill.addEventListener("click", cycleMsaa);
   }
   if (projPill) {
     _updateProjectionPill();
