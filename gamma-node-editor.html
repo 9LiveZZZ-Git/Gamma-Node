@@ -41525,6 +41525,21 @@ function _disposeShaderInstance(nodeId) {
     try { meshBuf.indexBuffer  && meshBuf.indexBuffer.destroy();  } catch (_) {}
     Visual.meshBufferCache.delete(nodeId);
   }
+  // Sprint 7.5.6.a part 2d -- RT scene instance cleanup. Close the
+  // WS, destroy the GPU texture. Reconnect timer cleared.
+  const rtInst = Visual.rtSceneInstances && Visual.rtSceneInstances.get(nodeId);
+  if (rtInst) {
+    if (rtInst.reconnectTimer) {
+      clearTimeout(rtInst.reconnectTimer);
+      rtInst.reconnectTimer = null;
+    }
+    if (rtInst.ws) {
+      try { rtInst.ws.send(JSON.stringify({ type: "render-stop" })); } catch (_) {}
+      try { rtInst.ws.close(); } catch (_) {}
+    }
+    try { rtInst.texture && rtInst.texture.destroy(); } catch (_) {}
+    Visual.rtSceneInstances.delete(nodeId);
+  }
 }
 
 /* =========================================================================
@@ -44716,7 +44731,12 @@ function _buildRenderPlan(visualOutputs) {
       // walk. Mesh + Camera inputs aren't layer-producers and
       // get resolved at encode time, not via the plan.
       const isScene      = def.kind === "scene";
-      if (!isShaderFrag && !isAiCanvas && !isScene) return;
+      // Sprint 7.5.6.a part 2d -- RayTracedScene is the RT
+      // equivalent of Scene; same plan-walker treatment. Its
+      // output is a blit of the streamed RT texture onto the
+      // assigned framebuffer/scratch layer.
+      const isSceneRt    = def.kind === "scene-rt";
+      if (!isShaderFrag && !isAiCanvas && !isScene && !isSceneRt) return;
 
       const planKey = node.id + "@" + vo.id;
       if (plan.has(planKey)) return;
@@ -46274,6 +46294,274 @@ function _resolveSceneLights(sceneNode) {
   return lights;
 }
 
+/* =========================================================================
+ * Sprint 7.5.6.a part 2d -- RayTracedScene encoder + WebSocket client
+ *
+ * Per-RayTracedScene-node state:
+ *   { ws, status, width, height, texture, textureView, bindGroup,
+ *     pendingFrame (Uint8Array | null), frameCount, lastFrameAt,
+ *     error (string | null) }
+ *
+ * Lifecycle:
+ *   1. First _ensureRtSceneInstance call allocates the state +
+ *      opens a WebSocket to ${localServerEndpoint}/rt.
+ *   2. On WS open, sends {hello} + {render-start} (with the
+ *      compile-server probing the engine in the middle).
+ *   3. Engine replies with frame-config message; editor allocates
+ *      a GPUTexture at the matching dims + a bind group.
+ *   4. Binary messages arrive at ~30 fps with raw RGBA8 pixel data;
+ *      we stash the latest as `pendingFrame` (overwriting any older
+ *      one -- we only ever display the freshest).
+ *   5. _encodeRtScenePass on each render frame: if pendingFrame,
+ *      queue.writeTexture into the GPUTexture; then blit the
+ *      texture to the assigned framebuffer/scratch layer via a
+ *      dedicated fullscreen-triangle pipeline.
+ *
+ * Cleanup happens in _disposeShaderInstance when a RayTracedScene
+ * node is removed from the patch -- closes the WS + destroys the
+ * texture. */
+
+const _RT_BLIT_WGSL = `
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+@group(0) @binding(0) var srcTex: texture_2d<f32>;
+@group(0) @binding(1) var srcSampler: sampler;
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  return textureSampleLevel(srcTex, srcSampler, in.uv, 0.0);
+}
+`;
+
+function _ensureRtBlitPipeline() {
+  if (Visual._rtBlitPipeline) return Visual._rtBlitPipeline;
+  if (!Visual.device) return null;
+  Visual._rtBlitBgl = Visual.device.createBindGroupLayout({
+    label: "rt-blit-bgl",
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.FRAGMENT,
+        texture: { sampleType: "float", viewDimension: "2d", multisampled: false } },
+      { binding: 1, visibility: GPUShaderStage.FRAGMENT,
+        sampler: { type: "filtering" } }
+    ]
+  });
+  const layout = Visual.device.createPipelineLayout({
+    label: "rt-blit-pl",
+    bindGroupLayouts: [Visual._rtBlitBgl]
+  });
+  const module = Visual.device.createShaderModule({
+    label: "rt-blit-shader",
+    code: _RT_BLIT_WGSL
+  });
+  Visual._rtBlitPipeline = Visual.device.createRenderPipeline({
+    label: "rt-blit-pipeline",
+    layout,
+    vertex: { module, entryPoint: "vs_main" },
+    fragment: {
+      module, entryPoint: "fs_main",
+      targets: [{ format: Visual.fbFormat }]
+    },
+    primitive: { topology: "triangle-list", cullMode: "none" }
+  });
+  Visual._rtBlitSampler = Visual.device.createSampler({
+    label: "rt-blit-sampler",
+    magFilter: "linear", minFilter: "linear",
+    addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge"
+  });
+  console.log("[rt-scene] blit pipeline built");
+  return Visual._rtBlitPipeline;
+}
+
+function _ensureRtSceneInstance(node) {
+  if (!Visual.rtSceneInstances) Visual.rtSceneInstances = new Map();
+  let inst = Visual.rtSceneInstances.get(node.id);
+  if (inst) return inst;
+  if (!Visual.device) return null;
+  inst = {
+    status: "idle",
+    ws: null,
+    width: 0, height: 0,
+    texture: null, textureView: null, bindGroup: null,
+    pendingFrame: null,
+    frameCount: 0,
+    lastFrameAt: 0,
+    error: null,
+    reconnectTimer: null
+  };
+  Visual.rtSceneInstances.set(node.id, inst);
+  _rtSceneConnect(node.id, inst);
+  return inst;
+}
+
+async function _rtSceneConnect(nodeId, inst) {
+  if (inst.ws && inst.ws.readyState <= 1) return;
+  inst.status = "connecting";
+  await probeLocalServer();
+  if (!localServerEndpoint) {
+    inst.status = "no-server";
+    inst.error = "compile-server not detected; start gamma-compile-server locally";
+    console.warn("[rt-scene] no compile-server at first probe -- will retry on next render");
+    return;
+  }
+  const wsUrl = localServerEndpoint.replace(/^https:/, "wss:").replace(/^http:/, "ws:") + "/rt";
+  let ws;
+  try { ws = new WebSocket(wsUrl); }
+  catch (e) {
+    inst.status = "error";
+    inst.error = "WebSocket ctor: " + e.message;
+    return;
+  }
+  ws.binaryType = "arraybuffer";
+  inst.ws = ws;
+  ws.onopen = () => {
+    inst.status = "connected";
+    inst.error = null;
+    console.log("[rt-scene] connected for node " + nodeId);
+    try {
+      ws.send(JSON.stringify({ type: "hello" }));
+      ws.send(JSON.stringify({ type: "configure", width: 800, height: 600 }));
+      ws.send(JSON.stringify({ type: "render-start" }));
+    } catch (_) {}
+  };
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === "string") {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch (_) { return; }
+      if (msg.type === "hello") {
+        console.log("[rt-scene] engine hello:",
+          "backend=" + msg.backend,
+          "gpu=" + (msg.capabilities && msg.capabilities.gpu_name));
+      } else if (msg.type === "frame-config") {
+        _rtSceneAllocateTexture(inst, msg.width | 0, msg.height | 0);
+        console.log("[rt-scene] frame-config " + msg.width + "x" + msg.height +
+                    " format=" + msg.format);
+      } else if (msg.type === "error") {
+        console.warn("[rt-scene] engine error:", msg.where, msg.message);
+        inst.error = (msg.where || "engine") + ": " + msg.message;
+      }
+    } else {
+      // Binary frame -- raw RGBA8 pixel data. Stash for the next
+      // render tick's queue.writeTexture; overwrite any older
+      // pending frame (we only display the freshest).
+      inst.pendingFrame = new Uint8Array(ev.data);
+      inst.frameCount++;
+      inst.lastFrameAt = performance.now();
+      if (inst.frameCount === 1) {
+        console.log("[rt-scene] first frame received (" + ev.data.byteLength + " bytes)");
+      }
+    }
+  };
+  ws.onerror = (e) => {
+    console.warn("[rt-scene] ws error for node " + nodeId, e);
+    inst.status = "error";
+  };
+  ws.onclose = () => {
+    console.log("[rt-scene] ws closed for node " + nodeId);
+    inst.ws = null;
+    if (inst.status !== "error") inst.status = "closed";
+    // Try reconnecting after 2s -- handles engine restarts gracefully.
+    if (!inst.reconnectTimer) {
+      inst.reconnectTimer = setTimeout(() => {
+        inst.reconnectTimer = null;
+        if (Visual.rtSceneInstances && Visual.rtSceneInstances.get(nodeId) === inst) {
+          _rtSceneConnect(nodeId, inst);
+        }
+      }, 2000);
+    }
+  };
+}
+
+function _rtSceneAllocateTexture(inst, width, height) {
+  if (inst.width === width && inst.height === height && inst.texture) return;
+  if (inst.texture) try { inst.texture.destroy(); } catch (_) {}
+  inst.width = width;
+  inst.height = height;
+  inst.texture = Visual.device.createTexture({
+    label: "rt-scene-tex-" + width + "x" + height,
+    size: [width, height, 1],
+    format: "rgba8unorm",
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
+  });
+  inst.textureView = inst.texture.createView();
+  _ensureRtBlitPipeline();
+  inst.bindGroup = Visual.device.createBindGroup({
+    label: "rt-scene-bg-" + width + "x" + height,
+    layout: Visual._rtBlitBgl,
+    entries: [
+      { binding: 0, resource: inst.textureView },
+      { binding: 1, resource: Visual._rtBlitSampler }
+    ]
+  });
+}
+
+function _encodeRtScenePass(enc, entry) {
+  const { node, layerIdx, isScratch, writeKey } = entry;
+  let layerView;
+  if (isScratch) {
+    const views = (writeKey === "a") ? Visual.scratchLayerViewsA : Visual.scratchLayerViewsB;
+    layerView = views[layerIdx];
+  } else {
+    layerView = Visual.framebufferLayerViews[layerIdx];
+  }
+  if (!layerView) return false;
+
+  const inst = _ensureRtSceneInstance(node);
+  if (!inst) return false;
+
+  // Upload pending frame, if any, into the GPU texture.
+  if (inst.pendingFrame && inst.texture &&
+      inst.pendingFrame.byteLength === inst.width * inst.height * 4) {
+    Visual.device.queue.writeTexture(
+      { texture: inst.texture },
+      inst.pendingFrame,
+      { bytesPerRow: inst.width * 4, rowsPerImage: inst.height },
+      { width: inst.width, height: inst.height, depthOrArrayLayers: 1 }
+    );
+    inst.pendingFrame = null;
+  }
+
+  // If we don't have a texture yet (still connecting / no
+  // frame-config received), clear the layer to a deep navy + return.
+  // Downstream consumers see a flat color; no crash.
+  if (!inst.bindGroup || !inst.texture) {
+    enc.beginRenderPass({
+      label: "rt-scene-clear-" + node.id,
+      colorAttachments: [{
+        view: layerView,
+        clearValue: { r: 0.02, g: 0.03, b: 0.05, a: 1.0 },
+        loadOp: "clear",
+        storeOp: "store"
+      }]
+    }).end();
+    return true;
+  }
+
+  // Blit the RT texture onto the framebuffer / scratch layer.
+  const pass = enc.beginRenderPass({
+    label: "rt-scene-blit-" + node.id,
+    colorAttachments: [{
+      view: layerView,
+      clearValue: { r: 0, g: 0, b: 0, a: 1 },
+      loadOp: "clear",
+      storeOp: "store"
+    }]
+  });
+  pass.setPipeline(Visual._rtBlitPipeline);
+  pass.setBindGroup(0, inst.bindGroup);
+  pass.draw(3);
+  pass.end();
+  return true;
+}
+
 /* Phase 6.6.30 + v0.2.16 — render one plan entry. Handles BOTH the
  * scratch case (writes to scratchLayerViewsA/B[layerIdx] -- relative
  * index 0..SCRATCH_BUDGET-1, used by composition reads in the same
@@ -46308,6 +46596,13 @@ function _encodeShaderFragPassForPlan(enc, entry, dtSec) {
   // depth attachment, and per-mesh draw loop.
   if (def.kind === "scene") {
     return _encodeScenePass(enc, entry);
+  }
+  // Sprint 7.5.6.a part 2d -- RayTracedScene render path. The actual
+  // rendering happens in the native gamma-rt-engine; the editor just
+  // receives H.264 / RGBA frames over WebSocket + blits the latest
+  // one to the assigned framebuffer/scratch layer.
+  if (def.kind === "scene-rt") {
+    return _encodeRtScenePass(enc, entry);
   }
 
   // v0.3.3 — ai-vision-canvas branch: bypass the shader pipeline
