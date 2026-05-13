@@ -44113,6 +44113,29 @@ function _updateMsaaPill() {
 // console every frame.
 const _SCENE_DIAG = { pipeline: false, instance: false, encode: false, draw: false };
 
+/* Sprint 7.5.3c bug fix -- BGL build extracted so it's available
+ * before any pipeline is created. _ensureSceneInstance needs the
+ * BGL to build per-slot bind groups, and it's called BEFORE the
+ * pipeline path inside _encodeScenePass. Without this helper the
+ * chicken-and-egg ordering means scene instances never allocate
+ * and every render bails (the v0.3.53 regression). */
+function _ensureMeshBindGroupLayout() {
+  if (Visual.meshBindGroupLayout) return Visual.meshBindGroupLayout;
+  if (!Visual.device) return null;
+  Visual.meshBindGroupLayout = Visual.device.createBindGroupLayout({
+    label: "mesh-bgl",
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+      { binding: 1, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } }
+    ]
+  });
+  Visual.meshPipelineLayout = Visual.device.createPipelineLayout({
+    label: "mesh-pl",
+    bindGroupLayouts: [Visual.meshBindGroupLayout]
+  });
+  return Visual.meshBindGroupLayout;
+}
+
 function _ensureMeshPipeline(materialType, sampleCount) {
   if (!Number.isFinite(sampleCount) || sampleCount < 1) sampleCount = 1;
   // Sprint 7.5.3c -- pipeline cache keyed by both material type AND
@@ -44124,24 +44147,10 @@ function _ensureMeshPipeline(materialType, sampleCount) {
     return Visual.meshPipelineCache.get(key);
   }
   if (!Visual.device) return null;
-  // Build shared BGL + pipeline layout on first use. Two uniform
-  // buffers: per-Scene (viewProj + light + eye) at binding 0,
-  // per-draw (model + material) at binding 1. Both visible to vertex
-  // AND fragment stages -- the vertex shader transforms by model +
-  // viewProj; the fragment shader reads light + material data.
-  if (!Visual.meshBindGroupLayout) {
-    Visual.meshBindGroupLayout = Visual.device.createBindGroupLayout({
-      label: "mesh-bgl",
-      entries: [
-        { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
-        { binding: 1, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } }
-      ]
-    });
-    Visual.meshPipelineLayout = Visual.device.createPipelineLayout({
-      label: "mesh-pl",
-      bindGroupLayouts: [Visual.meshBindGroupLayout]
-    });
-  }
+  // Two uniform buffers: per-Scene (viewProj + light + eye) at
+  // binding 0, per-draw (model + material) at binding 1. Both
+  // visible to vertex AND fragment stages.
+  if (!_ensureMeshBindGroupLayout()) return null;
   // Lazily build the shader module ONCE per session -- the same
   // module exposes every fragment entry point, so re-using avoids
   // duplicate WGSL compiles when toggling material types.
@@ -44613,9 +44622,11 @@ function _buildCone(node) {
 function _ensureSceneInstance(sceneNode) {
   let inst = Visual.sceneInstances.get(sceneNode.id);
   if (inst) return inst;
-  if (!Visual.device || !Visual.meshBindGroupLayout) {
-    return null;
-  }
+  if (!Visual.device) return null;
+  // Sprint 7.5.3c bug fix -- build BGL on demand so instance
+  // allocation works regardless of whether a pipeline has been
+  // built yet. Was the v0.3.53 regression cause.
+  if (!_ensureMeshBindGroupLayout()) return null;
   // perScene: viewProj (16 floats) + lightDir (4) + lightColor (4) + eye (4) = 28 floats = 112 bytes
   const perSceneBuffer = Visual.device.createBuffer({
     label: "scene-perscene-" + sceneNode.id,
