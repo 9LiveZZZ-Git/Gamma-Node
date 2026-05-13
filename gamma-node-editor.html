@@ -10017,7 +10017,191 @@ public:
       clearR: 0.04, clearG: 0.05, clearB: 0.09
     },
     methods: {},
-    description: "3D scene sink. Wire up to four `mesh` inputs (DebugTriangle today; Box/Sphere/Plane/Torus/Cylinder/Cone in sprint 7.5.3b) and one `camera` input from a Camera node. Renders the meshes through the camera into a framebuffer layer; output is `texture`-typed so the result flows into the existing post-processing graph (CRT, Bloom, BlendShader, etc.). clearR/G/B is the background color (default a deep navy). Depth-tested; meshes farther from the camera are correctly occluded. Sprint 7.5.3c adds materials + lighting; until then the pipeline is unlit + uses per-vertex colors."
+    description: "3D scene sink. Wire up to four `mesh` inputs (Box/Sphere/Plane/Torus/Cylinder/Cone via sprint 7.5.3b primitives, or DebugTriangle for the simplest smoke test) and one `camera` input from a Camera node. Renders the meshes through the camera into a framebuffer layer; output is `texture`-typed so the result flows into the existing post-processing graph (CRT, Bloom, BlendShader, etc.). clearR/G/B is the background color (default a deep navy). Depth-tested; meshes farther from the camera are correctly occluded. Sprint 7.5.3c adds materials + lighting; until then the pipeline is unlit + uses per-vertex colors."
+  },
+
+  /* =========================================================================
+   * Sprint 7.5.3b -- Procedural primitive meshes
+   *
+   * Six classic 3D primitives, each emitting a `mesh` output that
+   * flows into a Scene sink (optionally through Translate / Rotate /
+   * Scale transform nodes for positioning). Vertex layout matches
+   * the existing unlit-vertex-color pipeline: (pos.xyz, color.rgb)
+   * interleaved float32, stride 24 bytes. Color generation per type:
+   *
+   *   Box      distinct per-face colors (RGB/CMY for the 6 faces)
+   *   Sphere   normal-as-color ((n+1)*0.5 maps each direction to a
+   *            pastel hue)
+   *   Plane    soft cyan→violet UV gradient
+   *   Torus    normal-as-color
+   *   Cylinder side strip + cap distinct tints
+   *   Cone     apex-to-base falloff
+   *
+   * Geometry rebuilt on param change via the mesh-buffer cache's
+   * cacheKey -- dimensional tweaks (e.g. dragging Sphere.stacks) cost
+   * one buffer-rebuild per change, then re-cached. Sprint 7.5.3c
+   * replaces the vertex-color shader with PBR / Phong / Unlit
+   * material variants. ======================================================================== */
+  Box: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "mesh-gen",
+    ins: [
+      { n: "width",  t: "param" },
+      { n: "height", t: "param" },
+      { n: "depth",  t: "param" }
+    ],
+    outs: [{ n: "mesh", t: "mesh" }],
+    params: { width: 1, height: 1, depth: 1 },
+    methods: {},
+    description: "3D box primitive. width / height / depth are world-units along X / Y / Z. 24 vertices (4 per face × 6 faces, NOT shared) so each face can carry its own color + normal. Faces are color-coded for easy orientation: +X red, -X cyan, +Y green, -Y magenta, +Z blue, -Z yellow. Wire `mesh` into a Scene (optionally through Translate / Rotate / Scale first). Geometry rebuilds when params change; cost is one small vertex-buffer rewrite."
+  },
+
+  Sphere: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "mesh-gen",
+    ins: [
+      { n: "radius", t: "param" },
+      { n: "stacks", t: "param" },
+      { n: "slices", t: "param" }
+    ],
+    outs: [{ n: "mesh", t: "mesh" }],
+    params: { radius: 1, stacks: 16, slices: 24 },
+    methods: {},
+    description: "UV-sphere primitive. radius is world-units; stacks are horizontal slices (latitude, 2..64), slices are vertical meridians (longitude, 3..128). Higher numbers = smoother surface, more triangles. Vertex color is normal-as-RGB: ((n + 1) * 0.5) so each direction maps to a distinct pastel hue (visible smoothing reveals quality without materials). Defaults (16, 24) give a clean look at ~770 verts."
+  },
+
+  Plane: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "mesh-gen",
+    ins: [
+      { n: "width", t: "param" },
+      { n: "depth", t: "param" }
+    ],
+    outs: [{ n: "mesh", t: "mesh" }],
+    params: { width: 2, depth: 2 },
+    methods: {},
+    description: "Flat 2D quad in the XZ plane (Y = 0 by default; wrap in a Translate to lift it). width / depth in world units. 4 verts, 6 indices -- the cheapest primitive. Vertex color is a soft cyan→teal→violet gradient by corner so the surface reads as more than a flat blob under the unlit shader. Common use: ground plane, billboard, reflection target."
+  },
+
+  Torus: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "mesh-gen",
+    ins: [
+      { n: "majorRadius", t: "param" },
+      { n: "minorRadius", t: "param" },
+      { n: "majorSlices", t: "param" },
+      { n: "minorSlices", t: "param" }
+    ],
+    outs: [{ n: "mesh", t: "mesh" }],
+    params: { majorRadius: 1, minorRadius: 0.3, majorSlices: 24, minorSlices: 12 },
+    methods: {},
+    description: "Donut primitive. majorRadius is the distance from the center of the hole to the center of the tube; minorRadius is the tube thickness. majorSlices (3..128) controls the outer ring resolution, minorSlices (3..64) the tube cross-section. Vertex color from surface normal. Defaults give a classic donut at ~325 verts."
+  },
+
+  Cylinder: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "mesh-gen",
+    ins: [
+      { n: "radius", t: "param" },
+      { n: "height", t: "param" },
+      { n: "slices", t: "param" }
+    ],
+    outs: [{ n: "mesh", t: "mesh" }],
+    params: { radius: 0.5, height: 1, slices: 24 },
+    methods: {},
+    description: "Cylinder primitive centered at origin, axis along +Y. radius + height in world units; slices (3..128) is the angular resolution. Includes top + bottom caps so the shape is closed. Top cap tints brighter (cyan-ish), bottom darker (slate); side wall is normal-based color so the curved surface reads cleanly at any rotation."
+  },
+
+  Cone: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "mesh-gen",
+    ins: [
+      { n: "radius", t: "param" },
+      { n: "height", t: "param" },
+      { n: "slices", t: "param" }
+    ],
+    outs: [{ n: "mesh", t: "mesh" }],
+    params: { radius: 0.5, height: 1, slices: 24 },
+    methods: {},
+    description: "Cone primitive: apex at +Y, circular base at -Y. radius is the base radius; height is apex-to-base distance. slices (3..128) is the angular resolution. Includes bottom cap. Vertex color fades from a warm apex (gold) to a cool base (slate)."
+  },
+
+  /* =========================================================================
+   * Sprint 7.5.3b -- Mesh transforms
+   *
+   * Three chainable affine transforms. Each takes a `mesh` input
+   * (from a primitive or a deeper transform chain) and emits a `mesh`
+   * output with its own local matrix accumulated onto the chain. The
+   * Scene's mesh resolver walks the chain leaf-up, multiplying local
+   * matrices into the right side of the accumulator -- so the
+   * leaf-side (closest to the primitive) transforms apply FIRST to
+   * vertices, and root-side (closest to Scene) transforms apply LAST.
+   *
+   * Example:  Box → Rotate(45° Y) → Translate(2, 0, 0) → Scene
+   *           rotates the box around its origin, then moves it +2 X
+   *           (satellite orbiting nothing -- it's spun in place then
+   *           offset).
+   *
+   *           Box → Translate(2, 0, 0) → Rotate(45° Y) → Scene
+   *           translates the box first, then rotates it -- you get
+   *           the box swinging around the world origin.
+   *
+   * No codegen (mesh-transform is JS-side only). Params are scalars
+   * so they accept wires from any JS-readable source (Slider,
+   * MasterClock, OscIn, math chains). ======================================================================== */
+  Translate: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "mesh-transform",
+    ins: [
+      { n: "mesh", t: "mesh" },
+      { n: "x",    t: "param" },
+      { n: "y",    t: "param" },
+      { n: "z",    t: "param" }
+    ],
+    outs: [{ n: "mesh", t: "mesh" }],
+    params: { x: 0, y: 0, z: 0 },
+    methods: {},
+    description: "Translate a mesh by (x, y, z) world units. Wire any JS-readable source into x/y/z for animated translation: MasterClock.beat for tempo-locked bouncing, Slider for live control, OscIn for external automation. Chain order matters: T(2,0,0) → R(45° Y) → Scene swings the mesh around the world origin; R → T → Scene rotates the mesh in place then offsets it."
+  },
+
+  Rotate: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "mesh-transform",
+    ins: [
+      { n: "mesh",   t: "mesh" },
+      { n: "angleX", t: "param" },
+      { n: "angleY", t: "param" },
+      { n: "angleZ", t: "param" }
+    ],
+    outs: [{ n: "mesh", t: "mesh" }],
+    params: { angleX: 0, angleY: 0, angleZ: 0 },
+    methods: {},
+    description: "Rotate a mesh by Euler angles (degrees) in X-Y-Z order: Rz · Ry · Rx · vertex, so the user's intuition 'spin around X, then Y, then Z' matches the result. Wire angleY into MasterClock.phase × 360 for one full revolution per beat; wire into a Slider for live control. Combine with Translate to build orbit / pivot animations."
+  },
+
+  Scale: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "mesh-transform",
+    ins: [
+      { n: "mesh",    t: "mesh" },
+      { n: "x",       t: "param" },
+      { n: "y",       t: "param" },
+      { n: "z",       t: "param" },
+      { n: "uniform", t: "param" }
+    ],
+    outs: [{ n: "mesh", t: "mesh" }],
+    params: { x: 1, y: 1, z: 1, uniform: 0 },
+    methods: {},
+    description: "Scale a mesh along each axis. x/y/z are individual scale factors (1 = no change). Set `uniform` to any non-zero value to override the per-axis values with a single scale (handy when you want to drive size from one Slider). Wire `uniform` to MasterClock.beat-derived values for breath / pulse effects."
   },
 
   /* Custom ramp / curve shaper. Takes any 0..1 signal in, applies the
@@ -29512,6 +29696,149 @@ const _demos = [
     }
   },
 
+  /* Sprint 7.5.3b -- Primitive showcase. All four Scene mesh inputs
+   * occupied by different primitives, each Translate'd to a unique
+   * x position so they form a row. Validates that the multi-mesh
+   * path works + each primitive type renders correctly. Camera
+   * positioned far enough back to see all four. */
+  {
+    id: "scene-3d-primitives",
+    name: "3D Primitives",
+    sub: "box · sphere · cone · torus",
+    type: "visual",
+    thumb: `<svg viewBox="0 0 100 44">
+      <rect width="100" height="44" fill="rgba(10, 16, 32, 1)"/>
+      <!-- 4 primitives in a row -->
+      <rect x="9"  y="16" width="14" height="14" fill="rgba(255,90,90,0.85)"
+            stroke="rgba(255,255,255,0.4)" stroke-width="0.5"/>
+      <circle cx="36" cy="23" r="7"
+              fill="rgba(120,200,255,0.85)"
+              stroke="rgba(255,255,255,0.4)" stroke-width="0.5"/>
+      <polygon points="58,30 66,15 74,30" fill="rgba(255,200,90,0.85)"
+               stroke="rgba(255,255,255,0.4)" stroke-width="0.5"/>
+      <ellipse cx="88" cy="23" rx="7.5" ry="5.5"
+               fill="rgba(230,90,180,0.85)"
+               stroke="rgba(255,255,255,0.4)" stroke-width="0.5"/>
+      <ellipse cx="88" cy="23" rx="3" ry="2"
+               fill="rgba(10, 16, 32, 1)"/>
+    </svg>`,
+    build: () => {
+      const box  = makeNode("Box",       40,  40, { width: 1, height: 1, depth: 1 });
+      const sph  = makeNode("Sphere",    40, 140, { radius: 0.6, stacks: 16, slices: 24 });
+      const con  = makeNode("Cone",      40, 240, { radius: 0.6, height: 1.2, slices: 24 });
+      const tor  = makeNode("Torus",     40, 340, { majorRadius: 0.7, minorRadius: 0.25, majorSlices: 24, minorSlices: 12 });
+      const tBox = makeNode("Translate", 280,  40, { x: -3, y: 0, z: 0 });
+      const tSph = makeNode("Translate", 280, 140, { x: -1, y: 0, z: 0 });
+      const tCon = makeNode("Translate", 280, 240, { x:  1, y: 0, z: 0 });
+      const tTor = makeNode("Translate", 280, 340, { x:  3, y: 0, z: 0 });
+      const cam  = makeNode("Camera",    520, 200, {
+        posX: 0, posY: 1.5, posZ: 6,
+        targetX: 0, targetY: 0, targetZ: 0,
+        fov: 55, near: 0.1, far: 100, mode: 0
+      });
+      const scn  = makeNode("Scene",     760, 200, { clearR: 0.04, clearG: 0.05, clearB: 0.09 });
+      const vo   = makeNode("VisualOutput", 980, 200, { display: 0 });
+      state.edges.push({ from: { node: box, port: "mesh" }, to: { node: tBox, port: "mesh" } });
+      state.edges.push({ from: { node: sph, port: "mesh" }, to: { node: tSph, port: "mesh" } });
+      state.edges.push({ from: { node: con, port: "mesh" }, to: { node: tCon, port: "mesh" } });
+      state.edges.push({ from: { node: tor, port: "mesh" }, to: { node: tTor, port: "mesh" } });
+      state.edges.push({ from: { node: tBox, port: "mesh" }, to: { node: scn, port: "mesh1" } });
+      state.edges.push({ from: { node: tSph, port: "mesh" }, to: { node: scn, port: "mesh2" } });
+      state.edges.push({ from: { node: tCon, port: "mesh" }, to: { node: scn, port: "mesh3" } });
+      state.edges.push({ from: { node: tTor, port: "mesh" }, to: { node: scn, port: "mesh4" } });
+      state.edges.push({ from: { node: cam, port: "camera" }, to: { node: scn, port: "camera" } });
+      state.edges.push({ from: { node: scn, port: "out" }, to: { node: vo, port: "in" } });
+    }
+  },
+
+  /* Sprint 7.5.3b -- Spinning Box. The cleanest "is the transform
+   * stack working?" demo. A single Box, rotated around Y by an angle
+   * driven from MasterClock.phase * 360, so the box completes one
+   * full revolution per beat. At bpm=60 that's one rotation per
+   * second -- visually obvious + obviously tempo-locked. */
+  {
+    id: "scene-3d-spinbox",
+    name: "Spinning Box",
+    sub: "masterclock × rotate · 1 rev / beat",
+    type: "visual",
+    thumb: `<svg viewBox="0 0 100 44">
+      <rect width="100" height="44" fill="rgba(10, 16, 32, 1)"/>
+      <!-- box in mid-rotation: skewed perspective view -->
+      <polygon points="36,12 64,12 76,22 48,22" fill="rgba(96,220,96,0.85)"
+               stroke="rgba(255,255,255,0.45)" stroke-width="0.6"/>
+      <polygon points="36,12 36,32 48,42 48,22" fill="rgba(255,90,90,0.85)"
+               stroke="rgba(255,255,255,0.45)" stroke-width="0.6"/>
+      <polygon points="48,22 76,22 76,42 48,42" fill="rgba(96,140,255,0.85)"
+               stroke="rgba(255,255,255,0.45)" stroke-width="0.6"/>
+    </svg>`,
+    build: () => {
+      const clk     = makeNode("MasterClock", 40,  40, { bpm: 60 });
+      // phase * 360 = degrees per beat (one full revolution).
+      const mul     = makeNode("Mul",         240, 40, { b: 360 });
+      const box     = makeNode("Box",         40,  200, { width: 1.2, height: 1.2, depth: 1.2 });
+      const rot     = makeNode("Rotate",      280, 200, { angleX: 20, angleY: 0, angleZ: 0 });
+      const cam     = makeNode("Camera",      40,  340, {
+        posX: 0, posY: 0.5, posZ: 4,
+        targetX: 0, targetY: 0, targetZ: 0,
+        fov: 60, near: 0.1, far: 100, mode: 0
+      });
+      const scn     = makeNode("Scene",       560, 200, { clearR: 0.04, clearG: 0.05, clearB: 0.09 });
+      const vo      = makeNode("VisualOutput",780, 200, { display: 0 });
+      state.edges.push({ from: { node: clk, port: "phase" }, to: { node: mul, port: "a" } });
+      state.edges.push({ from: { node: mul, port: "out"   }, to: { node: rot, port: "angleY" } });
+      state.edges.push({ from: { node: box, port: "mesh"  }, to: { node: rot, port: "mesh" } });
+      state.edges.push({ from: { node: rot, port: "mesh"  }, to: { node: scn, port: "mesh1" } });
+      state.edges.push({ from: { node: cam, port: "camera" }, to: { node: scn, port: "camera" } });
+      state.edges.push({ from: { node: scn, port: "out"   }, to: { node: vo,  port: "in" } });
+    }
+  },
+
+  /* Sprint 7.5.3b -- Bouncing Sphere. Sphere with a Translate whose
+   * Y is driven by sin(MasterClock.phase * 2π) * 1.0, so the sphere
+   * bobs +/- 1 world-unit per beat. Demonstrates the math chain
+   * resolves into a transform param (not just into a Camera param
+   * as in the orbit demo). */
+  {
+    id: "scene-3d-bounce",
+    name: "Bouncing Sphere",
+    sub: "sin(phase × 2π) · vertical bob",
+    type: "visual",
+    thumb: `<svg viewBox="0 0 100 44">
+      <rect width="100" height="44" fill="rgba(10, 16, 32, 1)"/>
+      <!-- ground line -->
+      <line x1="10" y1="36" x2="90" y2="36" stroke="rgba(120,180,255,0.4)" stroke-width="0.6"/>
+      <!-- 3 sphere positions to suggest bouncing -->
+      <circle cx="30" cy="32" r="5" fill="rgba(180,220,255,0.5)"/>
+      <circle cx="50" cy="20" r="5" fill="rgba(180,220,255,0.85)"
+              stroke="rgba(255,255,255,0.4)" stroke-width="0.5"/>
+      <circle cx="70" cy="32" r="5" fill="rgba(180,220,255,0.5)"/>
+    </svg>`,
+    build: () => {
+      const clk    = makeNode("MasterClock", 40,  40, { bpm: 60 });
+      // phase * 2π -> Sin -> bob in [-1, 1]; scale by 1.0 for ±1 unit bob.
+      const mulTau = makeNode("Mul",         240, 40, { b: 6.283185307 });
+      const sinN   = makeNode("Sin",         420, 40);
+      const mulAmp = makeNode("Mul",         600, 40, { b: 1.0 });
+      const sph    = makeNode("Sphere",      40,  200, { radius: 0.5, stacks: 16, slices: 24 });
+      const trn    = makeNode("Translate",   280, 200, { x: 0, y: 0, z: 0 });
+      const cam    = makeNode("Camera",      40,  340, {
+        posX: 0, posY: 0, posZ: 4,
+        targetX: 0, targetY: 0, targetZ: 0,
+        fov: 60, near: 0.1, far: 100, mode: 0
+      });
+      const scn    = makeNode("Scene",       560, 200, { clearR: 0.04, clearG: 0.05, clearB: 0.09 });
+      const vo     = makeNode("VisualOutput",780, 200, { display: 0 });
+      state.edges.push({ from: { node: clk,    port: "phase" }, to: { node: mulTau, port: "a" } });
+      state.edges.push({ from: { node: mulTau, port: "out"   }, to: { node: sinN,   port: "in" } });
+      state.edges.push({ from: { node: sinN,   port: "out"   }, to: { node: mulAmp, port: "a" } });
+      state.edges.push({ from: { node: mulAmp, port: "out"   }, to: { node: trn,    port: "y" } });
+      state.edges.push({ from: { node: sph,    port: "mesh"  }, to: { node: trn,    port: "mesh" } });
+      state.edges.push({ from: { node: trn,    port: "mesh"  }, to: { node: scn,    port: "mesh1" } });
+      state.edges.push({ from: { node: cam,    port: "camera" }, to: { node: scn,   port: "camera" } });
+      state.edges.push({ from: { node: scn,    port: "out"   }, to: { node: vo,     port: "in" } });
+    }
+  },
+
   {
     id: "mesh-text",
     name: "Mesh Text",
@@ -42733,6 +43060,53 @@ function _mat4Perspective(fovYRad, aspect, near, far) {
   return m;
 }
 
+/* Sprint 7.5.3b -- elementary affine transforms. Each returns a fresh
+ * Float32Array(16) in column-major order. Compose via _mat4Multiply
+ * to build chained model matrices. Standard right-handed coordinate
+ * system; rotation angles in RADIANS (degrees converted at the node
+ * boundary via DEG_TO_RAD). */
+function _mat4Translate(x, y, z) {
+  const m = _mat4Identity();
+  m[12] = x; m[13] = y; m[14] = z;
+  return m;
+}
+
+function _mat4Scale(sx, sy, sz) {
+  const m = new Float32Array(16);
+  m[0] = sx; m[5] = sy; m[10] = sz; m[15] = 1;
+  return m;
+}
+
+function _mat4RotateX(rad) {
+  const c = Math.cos(rad), s = Math.sin(rad);
+  const m = new Float32Array(16);
+  m[0] = 1;
+  m[5] = c;  m[6] = s;
+  m[9] = -s; m[10] = c;
+  m[15] = 1;
+  return m;
+}
+
+function _mat4RotateY(rad) {
+  const c = Math.cos(rad), s = Math.sin(rad);
+  const m = new Float32Array(16);
+  m[0] = c;  m[2] = -s;
+  m[5] = 1;
+  m[8] = s;  m[10] = c;
+  m[15] = 1;
+  return m;
+}
+
+function _mat4RotateZ(rad) {
+  const c = Math.cos(rad), s = Math.sin(rad);
+  const m = new Float32Array(16);
+  m[0] = c;  m[1] = s;
+  m[4] = -s; m[5] = c;
+  m[10] = 1;
+  m[15] = 1;
+  return m;
+}
+
 function _mat4Ortho(left, right, bottom, top, near, far) {
   const m = new Float32Array(16);
   const lr = 1.0 / (left - right);
@@ -42812,10 +43186,96 @@ function _resolveSceneCamera(sceneNode, fbW, fbH) {
   return _evaluateCamera({ params: {} }, fbW, fbH);
 }
 
+/* Sprint 7.5.3b -- build the local mat4 for a mesh-transform node.
+ * Reads the node's params (or wired-in scalar inputs via
+ * _resolveNodeParams) and returns the appropriate affine. Identity
+ * for unknown node types. */
+const _DEG_TO_RAD = Math.PI / 180.0;
+
+function _buildTransformMatrix(node) {
+  const p = _resolveNodeParams(node);
+  if (node.type === "Translate") {
+    const x = (typeof p.x === "number") ? p.x : 0;
+    const y = (typeof p.y === "number") ? p.y : 0;
+    const z = (typeof p.z === "number") ? p.z : 0;
+    return _mat4Translate(x, y, z);
+  }
+  if (node.type === "Scale") {
+    const u = (typeof p.uniform === "number") ? p.uniform : 0;
+    if (u !== 0) return _mat4Scale(u, u, u);     // uniform != 0 overrides
+    const x = (typeof p.x === "number") ? p.x : 1;
+    const y = (typeof p.y === "number") ? p.y : 1;
+    const z = (typeof p.z === "number") ? p.z : 1;
+    return _mat4Scale(x, y, z);
+  }
+  if (node.type === "Rotate") {
+    const ax = ((typeof p.angleX === "number") ? p.angleX : 0) * _DEG_TO_RAD;
+    const ay = ((typeof p.angleY === "number") ? p.angleY : 0) * _DEG_TO_RAD;
+    const az = ((typeof p.angleZ === "number") ? p.angleZ : 0) * _DEG_TO_RAD;
+    // Compose Rx then Ry then Rz so the user's intuition "first
+    // angleX, then angleY, then angleZ" matches the result (vertex
+    // sees Rz * Ry * Rx * v = inner-most rotation first).
+    const mx = _mat4RotateX(ax);
+    const my = _mat4RotateY(ay);
+    const mz = _mat4RotateZ(az);
+    const tmp = new Float32Array(16);
+    const out = new Float32Array(16);
+    _mat4Multiply(tmp, my, mx);
+    _mat4Multiply(out, mz, tmp);
+    return out;
+  }
+  return _mat4Identity();
+}
+
 /* Walk a Scene node's mesh* inputs + return an array of {node, def,
  * transform} entries for each wired mesh source. transform is the
- * accumulated model matrix (identity for sprint 7.5.3a; Translate /
- * Rotate / Scale add to it in 7.5.3b). */
+ * accumulated model matrix from the chain of mesh-transform nodes
+ * between the Scene and the leaf mesh-gen.
+ *
+ * Chain semantics (matching the standard scene-graph convention):
+ *   leaf-gen → T_inner → T_middle → T_outer → Scene
+ * yields a model matrix of M = T_outer · T_middle · T_inner, so the
+ * inner-most transform is applied to vertices FIRST. e.g.
+ *   Box → Rotate(45deg Y) → Translate(2, 0, 0) → Scene
+ * rotates the box around its own origin, THEN translates it out --
+ * a satellite-style orbit rather than a swing-around-a-point.
+ *
+ * To get the "swing around the world origin" behavior, flip the chain:
+ *   Box → Translate(2, 0, 0) → Rotate(45deg Y) → Scene
+ *
+ * Cycle guard at depth 16 -- meshes never chain that deep in practice
+ * but a malformed save (self-referential transform) would loop forever
+ * without it. */
+const _MESH_CHAIN_DEPTH_LIMIT = 16;
+
+function _walkMeshChain(nodeId, accMat, depth) {
+  if (depth > _MESH_CHAIN_DEPTH_LIMIT) {
+    console.warn("[scene] mesh chain depth limit hit at node " + nodeId + " -- cycle?");
+    return null;
+  }
+  const node = state.nodes.find(n => n && n.id === nodeId);
+  if (!node) return null;
+  const def = TYPES[node.type];
+  if (!def) return null;
+  if (def.kind === "mesh-gen") {
+    return { node, def, transform: accMat };
+  }
+  if (def.kind === "mesh-transform") {
+    const local = _buildTransformMatrix(node);
+    // accMat is the world-side accumulator (closer to Scene); we
+    // multiply local into the RIGHT side so leaf-side transforms
+    // end up rightmost in the product (applied first to vertices).
+    const next = new Float32Array(16);
+    _mat4Multiply(next, accMat, local);
+    const wire = state.edges && state.edges.find(e =>
+      e && e.to && e.to.node === node.id && e.to.port === "mesh"
+    );
+    if (!wire || !wire.from) return null;
+    return _walkMeshChain(wire.from.node, next, depth + 1);
+  }
+  return null;
+}
+
 function _resolveSceneMeshes(sceneNode) {
   const meshes = [];
   const def = TYPES[sceneNode.type];
@@ -42826,11 +43286,8 @@ function _resolveSceneMeshes(sceneNode) {
       e && e.to && e.to.node === sceneNode.id && e.to.port === port.n
     );
     if (!wire || !wire.from) continue;
-    const src = state.nodes.find(n => n && n.id === wire.from.node);
-    if (!src) continue;
-    const srcDef = TYPES[src.type];
-    if (!srcDef || srcDef.kind !== "mesh-gen") continue;
-    meshes.push({ node: src, def: srcDef, transform: _mat4Identity() });
+    const resolved = _walkMeshChain(wire.from.node, _mat4Identity(), 0);
+    if (resolved) meshes.push(resolved);
   }
   return meshes;
 }
@@ -43457,23 +43914,19 @@ function _ensureMeshPipeline(sampleCount) {
 function _ensureMeshBuffers(meshEntry) {
   const node = meshEntry.node;
   const cached = Visual.meshBufferCache.get(node.id);
-  if (cached) return cached;
-  if (!Visual.device) return null;
-  let verts, indices = null;
-  if (node.type === "DebugTriangle") {
-    const s = (node.params && typeof node.params.scale === "number") ? node.params.scale : 1.0;
-    // Three vertices: red bottom-left, green bottom-right, blue top.
-    // Z = 0 so the triangle sits in the XY plane and the default
-    // camera at (0, 0, 5) sees it head-on.
-    verts = new Float32Array([
-      // pos.xyz                  color.rgb
-      -0.866*s, -0.5*s, 0,        1, 0, 0,    // red, bottom-left
-       0.866*s, -0.5*s, 0,        0, 1, 0,    // green, bottom-right
-       0,        1.0*s, 0,        0.3, 0.5, 1 // blue, top
-    ]);
-  } else {
-    return null;
+  if (cached && _meshCacheKey(node) === cached.cacheKey) return cached;
+  // Params changed -- destroy + rebuild. Cheap (just a couple of
+  // GPU buffers); avoids stale geometry when the user tweaks
+  // dimensions in the props pane.
+  if (cached) {
+    try { cached.vertexBuffer && cached.vertexBuffer.destroy(); } catch (_) {}
+    try { cached.indexBuffer  && cached.indexBuffer.destroy();  } catch (_) {}
+    Visual.meshBufferCache.delete(node.id);
   }
+  if (!Visual.device) return null;
+  const built = _buildMeshData(node);
+  if (!built) return null;
+  const { verts, indices } = built;
   const vertexBuffer = Visual.device.createBuffer({
     label: "mesh-vb-" + node.id,
     size: verts.byteLength,
@@ -43498,10 +43951,297 @@ function _ensureMeshBuffers(meshEntry) {
     vertexBuffer,
     vertexCount: verts.length / 6,
     indexBuffer,
-    indexCount
+    indexCount,
+    cacheKey: _meshCacheKey(node)
   };
   Visual.meshBufferCache.set(node.id, out);
   return out;
+}
+
+/* Param-fingerprint string used to invalidate the mesh cache when a
+ * primitive's dimensions / segment counts change. Each primitive
+ * type lists the params that actually affect geometry. */
+function _meshCacheKey(node) {
+  const p = node.params || {};
+  switch (node.type) {
+    case "DebugTriangle": return "tri:" + (p.scale || 1);
+    case "Box":           return "box:" + [p.width, p.height, p.depth].join(",");
+    case "Sphere":        return "sph:" + [p.radius, p.stacks, p.slices].join(",");
+    case "Plane":         return "pln:" + [p.width, p.depth].join(",");
+    case "Torus":         return "tor:" + [p.majorRadius, p.minorRadius, p.majorSlices, p.minorSlices].join(",");
+    case "Cylinder":      return "cyl:" + [p.radius, p.height, p.slices].join(",");
+    case "Cone":          return "con:" + [p.radius, p.height, p.slices].join(",");
+    default:              return node.type;
+  }
+}
+
+/* Build vertex + index arrays for a mesh-gen node. Returns {verts,
+ * indices} or null on unknown type. Vertex layout is (pos.xyz,
+ * color.rgb) interleaved float32 -- matches the pipeline's vertex
+ * buffer layout exactly. Color is generated per-primitive: Box uses
+ * distinct per-face colors; everything else uses normal-derived
+ * shading (color = (normal + 1) * 0.5, so each direction maps to
+ * a distinct hue) for an immediately-legible 3D shape. Materials
+ * in sprint 7.5.3c replace this with proper lit shading. */
+function _buildMeshData(node) {
+  switch (node.type) {
+    case "DebugTriangle": return _buildDebugTriangle(node);
+    case "Box":           return _buildBox(node);
+    case "Sphere":        return _buildSphere(node);
+    case "Plane":         return _buildPlane(node);
+    case "Torus":         return _buildTorus(node);
+    case "Cylinder":      return _buildCylinder(node);
+    case "Cone":          return _buildCone(node);
+    default: return null;
+  }
+}
+
+function _buildDebugTriangle(node) {
+  const s = (node.params && typeof node.params.scale === "number") ? node.params.scale : 1.0;
+  const verts = new Float32Array([
+    -0.866*s, -0.5*s, 0,        1, 0, 0,
+     0.866*s, -0.5*s, 0,        0, 1, 0,
+     0,        1.0*s, 0,        0.3, 0.5, 1
+  ]);
+  return { verts, indices: null };
+}
+
+/* Box -- 24 verts (4 per face, NOT shared between faces) so each
+ * face can have its own color/normal. 36 indices = 6 faces × 2
+ * triangles × 3 verts. Standard cube oriented with +Y up.
+ *
+ * Face colors (Pantone-ish): +X red, -X cyan, +Y green, -Y magenta,
+ * +Z blue, -Z yellow. Easy to identify which face you're looking at. */
+function _buildBox(node) {
+  const p = node.params || {};
+  const hw = ((typeof p.width  === "number") ? p.width  : 1) * 0.5;
+  const hh = ((typeof p.height === "number") ? p.height : 1) * 0.5;
+  const hd = ((typeof p.depth  === "number") ? p.depth  : 1) * 0.5;
+  // Face order: +X, -X, +Y, -Y, +Z, -Z. Each face: 4 verts in
+  // CCW order viewed from outside.
+  const faces = [
+    { c: [1.00, 0.22, 0.22], verts: [
+      [ hw, -hh, -hd], [ hw,  hh, -hd], [ hw,  hh,  hd], [ hw, -hh,  hd] ]},  // +X
+    { c: [0.22, 0.92, 0.95], verts: [
+      [-hw, -hh,  hd], [-hw,  hh,  hd], [-hw,  hh, -hd], [-hw, -hh, -hd] ]},  // -X
+    { c: [0.45, 0.96, 0.35], verts: [
+      [-hw,  hh,  hd], [ hw,  hh,  hd], [ hw,  hh, -hd], [-hw,  hh, -hd] ]},  // +Y
+    { c: [0.96, 0.35, 0.92], verts: [
+      [-hw, -hh, -hd], [ hw, -hh, -hd], [ hw, -hh,  hd], [-hw, -hh,  hd] ]},  // -Y
+    { c: [0.40, 0.55, 1.00], verts: [
+      [-hw, -hh,  hd], [ hw, -hh,  hd], [ hw,  hh,  hd], [-hw,  hh,  hd] ]},  // +Z
+    { c: [0.98, 0.92, 0.30], verts: [
+      [ hw, -hh, -hd], [-hw, -hh, -hd], [-hw,  hh, -hd], [ hw,  hh, -hd] ]}   // -Z
+  ];
+  const verts = new Float32Array(24 * 6);
+  const indices = new Uint32Array(36);
+  let v = 0, i = 0, base = 0;
+  for (const f of faces) {
+    for (const pos of f.verts) {
+      verts[v++] = pos[0]; verts[v++] = pos[1]; verts[v++] = pos[2];
+      verts[v++] = f.c[0]; verts[v++] = f.c[1]; verts[v++] = f.c[2];
+    }
+    // Two CCW triangles per quad.
+    indices[i++] = base + 0; indices[i++] = base + 1; indices[i++] = base + 2;
+    indices[i++] = base + 0; indices[i++] = base + 2; indices[i++] = base + 3;
+    base += 4;
+  }
+  return { verts, indices };
+}
+
+/* Sphere -- UV sphere with `stacks` horizontal slices + `slices`
+ * vertical meridians. (stacks+1)*(slices+1) verts, 2*stacks*slices*3
+ * indices. Color from surface normal (= normalized position for a
+ * unit sphere) mapped (n + 1) * 0.5 -- each direction is a distinct
+ * pastel hue. */
+function _buildSphere(node) {
+  const p = node.params || {};
+  const r = (typeof p.radius === "number") ? p.radius : 1;
+  const stacks = Math.max(2, Math.min(64, Math.floor((typeof p.stacks === "number") ? p.stacks : 16)));
+  const slices = Math.max(3, Math.min(128, Math.floor((typeof p.slices === "number") ? p.slices : 24)));
+  const verts = new Float32Array((stacks + 1) * (slices + 1) * 6);
+  const indices = new Uint32Array(stacks * slices * 6);
+  let v = 0, i = 0;
+  for (let st = 0; st <= stacks; st++) {
+    const phi = Math.PI * (st / stacks);                // 0..π (north pole to south)
+    const sphi = Math.sin(phi), cphi = Math.cos(phi);
+    for (let sl = 0; sl <= slices; sl++) {
+      const theta = 2 * Math.PI * (sl / slices);        // 0..2π around Y
+      const sth = Math.sin(theta), cth = Math.cos(theta);
+      const nx = sphi * cth, ny = cphi, nz = sphi * sth;
+      verts[v++] = r * nx; verts[v++] = r * ny; verts[v++] = r * nz;
+      verts[v++] = nx * 0.5 + 0.5;
+      verts[v++] = ny * 0.5 + 0.5;
+      verts[v++] = nz * 0.5 + 0.5;
+    }
+  }
+  for (let st = 0; st < stacks; st++) {
+    for (let sl = 0; sl < slices; sl++) {
+      const a = st * (slices + 1) + sl;
+      const b = a + slices + 1;
+      indices[i++] = a;     indices[i++] = b;     indices[i++] = a + 1;
+      indices[i++] = a + 1; indices[i++] = b;     indices[i++] = b + 1;
+    }
+  }
+  return { verts, indices };
+}
+
+/* Plane -- flat quad in the XZ plane, +Y normal. 4 verts, 6 indices.
+ * Colored by a soft cyan-to-violet gradient by U coord so even the
+ * unlit pipeline shows it as more than a solid blob. */
+function _buildPlane(node) {
+  const p = node.params || {};
+  const hw = ((typeof p.width === "number") ? p.width : 1) * 0.5;
+  const hd = ((typeof p.depth === "number") ? p.depth : 1) * 0.5;
+  const verts = new Float32Array([
+    -hw, 0, -hd,   0.40, 0.62, 0.95,    // back-left   (cyan-ish)
+     hw, 0, -hd,   0.78, 0.42, 0.95,    // back-right  (violet)
+     hw, 0,  hd,   0.85, 0.50, 0.55,    // front-right (mauve)
+    -hw, 0,  hd,   0.45, 0.78, 0.65     // front-left  (teal)
+  ]);
+  const indices = new Uint32Array([0, 1, 2,  0, 2, 3]);
+  return { verts, indices };
+}
+
+/* Torus -- (majorSlices+1)*(minorSlices+1) verts. Standard parametric
+ * formulation with major radius R + minor radius r. Normal = (cos(θ)*cos(φ),
+ * sin(φ), sin(θ)*cos(φ)). */
+function _buildTorus(node) {
+  const p = node.params || {};
+  const R = (typeof p.majorRadius === "number") ? p.majorRadius : 1.0;
+  const r = (typeof p.minorRadius === "number") ? p.minorRadius : 0.3;
+  const majS = Math.max(3, Math.min(128, Math.floor((typeof p.majorSlices === "number") ? p.majorSlices : 24)));
+  const minS = Math.max(3, Math.min(64,  Math.floor((typeof p.minorSlices === "number") ? p.minorSlices : 12)));
+  const verts = new Float32Array((majS + 1) * (minS + 1) * 6);
+  const indices = new Uint32Array(majS * minS * 6);
+  let v = 0, i = 0;
+  for (let j = 0; j <= majS; j++) {
+    const u = j / majS;
+    const theta = 2 * Math.PI * u;
+    const cth = Math.cos(theta), sth = Math.sin(theta);
+    for (let k = 0; k <= minS; k++) {
+      const phi = 2 * Math.PI * (k / minS);
+      const cphi = Math.cos(phi), sphi = Math.sin(phi);
+      const nx = cth * cphi, ny = sphi, nz = sth * cphi;
+      verts[v++] = (R + r * cphi) * cth;
+      verts[v++] = r * sphi;
+      verts[v++] = (R + r * cphi) * sth;
+      verts[v++] = nx * 0.5 + 0.5;
+      verts[v++] = ny * 0.5 + 0.5;
+      verts[v++] = nz * 0.5 + 0.5;
+    }
+  }
+  for (let j = 0; j < majS; j++) {
+    for (let k = 0; k < minS; k++) {
+      const a = j * (minS + 1) + k;
+      const b = a + minS + 1;
+      indices[i++] = a;     indices[i++] = b;     indices[i++] = a + 1;
+      indices[i++] = a + 1; indices[i++] = b;     indices[i++] = b + 1;
+    }
+  }
+  return { verts, indices };
+}
+
+/* Cylinder -- side strip + top cap + bottom cap. Centered at origin,
+ * Y axis. Side normal = radial; cap normals = ±Y. */
+function _buildCylinder(node) {
+  const p = node.params || {};
+  const r = (typeof p.radius === "number") ? p.radius : 0.5;
+  const h = (typeof p.height === "number") ? p.height : 1.0;
+  const slices = Math.max(3, Math.min(128, Math.floor((typeof p.slices === "number") ? p.slices : 24)));
+  const hy = h * 0.5;
+  // Side: 2*(slices+1) verts. Top cap: 1 center + (slices+1) rim. Bottom cap: same.
+  const sideVerts = 2 * (slices + 1);
+  const totalVerts = sideVerts + 2 * (1 + slices + 1);
+  const verts = new Float32Array(totalVerts * 6);
+  const sideIdx = slices * 6;
+  const capIdx  = slices * 3;
+  const indices = new Uint32Array(sideIdx + 2 * capIdx);
+  let v = 0, i = 0;
+  // Side strip
+  for (let k = 0; k <= slices; k++) {
+    const theta = 2 * Math.PI * (k / slices);
+    const cth = Math.cos(theta), sth = Math.sin(theta);
+    // bottom rim
+    verts[v++] = r * cth; verts[v++] = -hy; verts[v++] = r * sth;
+    verts[v++] = cth * 0.5 + 0.5; verts[v++] = 0.5; verts[v++] = sth * 0.5 + 0.5;
+    // top rim
+    verts[v++] = r * cth; verts[v++] =  hy; verts[v++] = r * sth;
+    verts[v++] = cth * 0.5 + 0.5; verts[v++] = 0.8; verts[v++] = sth * 0.5 + 0.5;
+  }
+  for (let k = 0; k < slices; k++) {
+    const a = k * 2;
+    indices[i++] = a;     indices[i++] = a + 1; indices[i++] = a + 2;
+    indices[i++] = a + 2; indices[i++] = a + 1; indices[i++] = a + 3;
+  }
+  // Top cap (CCW from above)
+  const topCenter = sideVerts;
+  verts[v++] = 0; verts[v++] = hy; verts[v++] = 0;
+  verts[v++] = 0.6; verts[v++] = 0.95; verts[v++] = 0.6;
+  for (let k = 0; k <= slices; k++) {
+    const theta = 2 * Math.PI * (k / slices);
+    const cth = Math.cos(theta), sth = Math.sin(theta);
+    verts[v++] = r * cth; verts[v++] = hy; verts[v++] = r * sth;
+    verts[v++] = 0.65; verts[v++] = 0.95; verts[v++] = 0.65;
+  }
+  for (let k = 0; k < slices; k++) {
+    indices[i++] = topCenter; indices[i++] = topCenter + 1 + k + 1; indices[i++] = topCenter + 1 + k;
+  }
+  // Bottom cap (CCW from below)
+  const botCenter = topCenter + 1 + slices + 1;
+  verts[v++] = 0; verts[v++] = -hy; verts[v++] = 0;
+  verts[v++] = 0.4; verts[v++] = 0.4; verts[v++] = 0.6;
+  for (let k = 0; k <= slices; k++) {
+    const theta = 2 * Math.PI * (k / slices);
+    const cth = Math.cos(theta), sth = Math.sin(theta);
+    verts[v++] = r * cth; verts[v++] = -hy; verts[v++] = r * sth;
+    verts[v++] = 0.42; verts[v++] = 0.42; verts[v++] = 0.65;
+  }
+  for (let k = 0; k < slices; k++) {
+    indices[i++] = botCenter; indices[i++] = botCenter + 1 + k; indices[i++] = botCenter + 1 + k + 1;
+  }
+  return { verts, indices };
+}
+
+/* Cone -- side strip from apex to a circular base + one bottom cap.
+ * Centered at origin; apex at +Y, base at -Y. */
+function _buildCone(node) {
+  const p = node.params || {};
+  const r = (typeof p.radius === "number") ? p.radius : 0.5;
+  const h = (typeof p.height === "number") ? p.height : 1.0;
+  const slices = Math.max(3, Math.min(128, Math.floor((typeof p.slices === "number") ? p.slices : 24)));
+  const hy = h * 0.5;
+  // Side: 1 apex + (slices+1) rim. Base: 1 center + (slices+1) rim.
+  const totalVerts = 1 + (slices + 1) + 1 + (slices + 1);
+  const verts = new Float32Array(totalVerts * 6);
+  const indices = new Uint32Array(slices * 6);
+  let v = 0, i = 0;
+  // Apex
+  verts[v++] = 0; verts[v++] = hy; verts[v++] = 0;
+  verts[v++] = 0.95; verts[v++] = 0.85; verts[v++] = 0.55;
+  for (let k = 0; k <= slices; k++) {
+    const theta = 2 * Math.PI * (k / slices);
+    const cth = Math.cos(theta), sth = Math.sin(theta);
+    verts[v++] = r * cth; verts[v++] = -hy; verts[v++] = r * sth;
+    verts[v++] = cth * 0.45 + 0.5; verts[v++] = 0.5; verts[v++] = sth * 0.45 + 0.5;
+  }
+  for (let k = 0; k < slices; k++) {
+    indices[i++] = 0; indices[i++] = 1 + k; indices[i++] = 1 + k + 1;
+  }
+  // Bottom cap
+  const botCenter = 1 + slices + 1;
+  verts[v++] = 0; verts[v++] = -hy; verts[v++] = 0;
+  verts[v++] = 0.3; verts[v++] = 0.3; verts[v++] = 0.5;
+  for (let k = 0; k <= slices; k++) {
+    const theta = 2 * Math.PI * (k / slices);
+    const cth = Math.cos(theta), sth = Math.sin(theta);
+    verts[v++] = r * cth; verts[v++] = -hy; verts[v++] = r * sth;
+    verts[v++] = 0.35; verts[v++] = 0.35; verts[v++] = 0.55;
+  }
+  for (let k = 0; k < slices; k++) {
+    indices[i++] = botCenter; indices[i++] = botCenter + 1 + k; indices[i++] = botCenter + 1 + k + 1;
+  }
+  return { verts, indices };
 }
 
 /* Acquire / build the per-Scene uniform buffer + bind group. Each
