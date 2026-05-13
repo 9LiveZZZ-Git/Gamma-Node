@@ -58,6 +58,7 @@
     --texture:      #5fbeff;     /* Phase 6.1.6 — GPU texture (shader output) */
     --transform:    #b974ff;     /* Phase 6.1.6 — mat4 (declared, used in Phase 7) */
     --mesh:         #ff9d3f;     /* Phase 6.1.6 — vertex buffer ref (declared, used in Phase 7) */
+    --camera:       #ffd96a;     /* Sprint 7.5.3a — view+proj matrices (Camera → Scene) */
     --selected:     #4a8fdc;
     --danger:       #e24b4a;
     --info:         #83e8ff;
@@ -809,13 +810,16 @@
   .port.texture   { border-color: var(--texture);   border-style: dotted; border-width: 2px; }
   .port.transform { border-color: var(--transform); border-style: groove; border-width: 2.5px; }
   .port.mesh      { border-color: var(--mesh);      border-style: solid;  border-width: 3px; }
-  .port.connected.audio { background: var(--audio); }
+  /* Sprint 7.5.3a -- Camera port. Two concentric rings (dashed outer +
+     solid inner) reads as "matrix data, not vertex data" visually. */
+  .port.camera    { border-color: var(--camera);    border-style: double; border-width: 4px; }
   .port.connected.param { background: var(--param); border-style: solid; }
   .port.connected.gate  { background: var(--gate); }
   .port.connected.clock { background: var(--clock); border-style: solid; }
   .port.connected.texture   { background: var(--texture);   border-style: solid; }
   .port.connected.transform { background: var(--transform); border-style: solid; }
   .port.connected.mesh      { background: var(--mesh);      border-style: solid; }
+  .port.connected.camera    { background: var(--camera);    border-style: solid; }
   .port:hover { transform: translateY(-50%) scale(1.4); }
   /* Live snap target during a wire drag — when the dragged endpoint
    * is within a screen-radius of a type-compatible input port, that
@@ -29418,25 +29422,29 @@ const _demos = [
   },
 
   /* Sprint 7.5.3a -- 3D Orbit. The smoke test triangle with a camera
-   * orbiting it in the XZ plane. Validates two things on top of the
-   * 3D Triangle demo: (1) Camera params follow wired inputs (so the
-   * posX/posZ live updates propagate per frame), (2) the math-
-   * template recursion in _resolveNodeParams resolves chains like
-   * "Phasor -> Mul -> Sin -> Mul -> Camera.posX" without an audio
-   * runtime needed.
+   * orbiting it in the XZ plane, tempo-locked to a MasterClock.
+   * Validates several things on top of the 3D Triangle demo:
+   *   - Camera params follow wired inputs (posX/posZ updated each frame)
+   *   - The math-template recursion in _resolveNodeParams resolves
+   *     chains like "MasterClock.phase -> Mul -> Sin -> Mul -> Camera.posX"
+   *     without an audio runtime needed (everything JS-side mirrors)
+   *   - MasterClock.phase is continuous-at-the-wrap (phase 0 == phase 1)
+   *     because sin/cos have period 2π, so a beat-synced ramp produces
+   *     a smooth orbit without discontinuities at beat boundaries
    *
-   * Math chain (one full orbit every 4 seconds at freq=0.25):
-   *   Phasor(0.25Hz) -> Mul(2*pi) -> ┬-> Sin -> Mul(2.5) -> Camera.posX
-   *                                  └-> Cos -> Mul(2.5) -> Camera.posZ
+   * Math chain (one full orbit per beat):
+   *   MasterClock.phase -> Mul(2*pi) -> ┬-> Sin -> Mul(2.5) -> Camera.posX
+   *                                     └-> Cos -> Mul(2.5) -> Camera.posZ
    *
-   * Phasor's continuous 0..1 ramp times 2pi gives a 0..2pi angle.
-   * Sin/Cos of that are the standard parametric circle. radius=2.5
-   * puts the orbit comfortably outside the triangle (which sits at
-   * the origin with halfsize ~1). posY stays 0 -- horizontal orbit. */
+   * bpm=30 means each beat lasts 2 seconds, so one full orbit takes 2s.
+   * Drop a different bpm to change speed; wire a Slider into MasterClock.bpm
+   * for live control. radius=2.5 world units = comfortable distance for
+   * the default triangle (halfsize ~1) at fov=60. posY stays 0 -- the
+   * orbit is in the horizontal XZ plane. */
   {
     id: "scene-3d-orbit",
     name: "3D Orbit",
-    sub: "phasor → sin/cos → camera",
+    sub: "masterclock → sin/cos → camera",
     type: "visual",
     thumb: `<svg viewBox="0 0 100 44">
       <defs>
@@ -29460,39 +29468,40 @@ const _demos = [
             fill="rgba(255,180,90,0.85)">CAM</text>
     </svg>`,
     build: () => {
-      // Animation source: Phasor at 0.25 Hz = full orbit every 4s.
-      // Phasor is an audio-rate oscillator; the JS-side mirror added
-      // in v0.3.48 + the math-template recursion in v0.3.49 mean it
-      // resolves correctly into a Camera param without an audio
-      // runtime being active.
-      const phasor = makeNode("Phasor",  40,  40, { freq: 0.25 });
-      // Phasor outputs 0..1; multiply by 2π so Sin/Cos see a full
-      // revolution per Phasor period.
-      const mulTau = makeNode("Mul",     220, 40, { b: 6.283185307 });
-      const sinN   = makeNode("Sin",     400, 40);
-      const cosN   = makeNode("Cos",     400, 130);
+      // Animation source: MasterClock at 30 BPM. .phase output is a
+      // continuous 0..1 ramp per beat, so at bpm=30 (one beat = 2s)
+      // the orbit cycle is also 2s. The JS-side mirror in
+      // _masterClockOutputValue gives the same value at frame rate
+      // without needing the audio runtime.
+      const clk    = makeNode("MasterClock",   40,  40, { bpm: 30 });
+      // Convert phase (0..1) -> angle (0..2π) so Sin/Cos see a full
+      // revolution per beat. Use _isMathTemplateType chain (Mul/Sin/Cos)
+      // -- these all have JS-side mirrors and pass through _resolveNodeParams.
+      const mulTau = makeNode("Mul",          240,  40, { b: 6.283185307 });
+      const sinN   = makeNode("Sin",          420,  40);
+      const cosN   = makeNode("Cos",          420, 130);
       // Scale to orbit radius. 2.5 world units = comfortable distance
       // for the default triangle (halfsize ~1) at fov=60.
-      const mulRx  = makeNode("Mul",     560, 40,  { b: 2.5 });
-      const mulRz  = makeNode("Mul",     560, 130, { b: 2.5 });
+      const mulRx  = makeNode("Mul",          580,  40,  { b: 2.5 });
+      const mulRz  = makeNode("Mul",          580, 130, { b: 2.5 });
 
-      const tri = makeNode("DebugTriangle", 40,  240, { scale: 1.0 });
-      const cam = makeNode("Camera",        40,  340, {
+      const tri = makeNode("DebugTriangle",    40, 240, { scale: 1.0 });
+      const cam = makeNode("Camera",           40, 340, {
         posX: 0, posY: 0, posZ: 0,            // overridden by wires
         targetX: 0, targetY: 0, targetZ: 0,
         fov: 60, near: 0.1, far: 100, mode: 0
       });
-      const scn = makeNode("Scene",         760, 200, {
+      const scn = makeNode("Scene",           780, 200, {
         clearR: 0.04, clearG: 0.05, clearB: 0.09
       });
-      const vo  = makeNode("VisualOutput", 1000, 200, { display: 0 });
+      const vo  = makeNode("VisualOutput",   1020, 200, { display: 0 });
 
-      // Math chain.
-      state.edges.push({ from: { node: phasor, port: "out" }, to: { node: mulTau, port: "a" } });
-      state.edges.push({ from: { node: mulTau, port: "out" }, to: { node: sinN,   port: "in" } });
-      state.edges.push({ from: { node: mulTau, port: "out" }, to: { node: cosN,   port: "in" } });
-      state.edges.push({ from: { node: sinN,   port: "out" }, to: { node: mulRx,  port: "a" } });
-      state.edges.push({ from: { node: cosN,   port: "out" }, to: { node: mulRz,  port: "a" } });
+      // Math chain: clock.phase -> 2π -> Sin/Cos -> radius -> camera xz.
+      state.edges.push({ from: { node: clk,    port: "phase" }, to: { node: mulTau, port: "a" } });
+      state.edges.push({ from: { node: mulTau, port: "out"   }, to: { node: sinN,   port: "in" } });
+      state.edges.push({ from: { node: mulTau, port: "out"   }, to: { node: cosN,   port: "in" } });
+      state.edges.push({ from: { node: sinN,   port: "out"   }, to: { node: mulRx,  port: "a" } });
+      state.edges.push({ from: { node: cosN,   port: "out"   }, to: { node: mulRz,  port: "a" } });
       // Math chain -> Camera position.
       state.edges.push({ from: { node: mulRx,  port: "out"    }, to: { node: cam, port: "posX"  } });
       state.edges.push({ from: { node: mulRz,  port: "out"    }, to: { node: cam, port: "posZ"  } });
@@ -31028,6 +31037,12 @@ function renderWires(temp) {
       // Thick amber wire — visually heavy because mesh data is
       // structurally "more" than audio per sample.
       html += `<path d="${path}" fill="none" stroke="var(--mesh)" stroke-width="3" stroke-linecap="round" />`;
+    } else if (t === "camera") {
+      // Sprint 7.5.3a -- Camera wire. Double-stripe in butter-yellow,
+      // matches the camera-port styling. Reads distinctly from the
+      // amber mesh wires + violet transform wires.
+      html += `<path d="${path}" fill="none" stroke="var(--camera)" stroke-width="4" stroke-linecap="round" />`;
+      html += `<path d="${path}" fill="none" stroke="var(--bg)"     stroke-width="1.5" stroke-linecap="round" />`;
     } else if (t === "transform") {
       // Double-stripe like clock but in transform-violet to keep the
       // 4×4 mat semantics visually distinct from rhythmic data.
@@ -43320,6 +43335,12 @@ function _updateMsaaPill() {
     : "MSAA " + sc + "x. Click to cycle. Anti-aliases triangle edges in Scene render passes via WebGPU resolveTarget. Costs ~" + sc + "x the depth + color memory of the 3D pass.";
 }
 
+// Sprint 7.5.3a -- one-shot diagnostic logs so we can see exactly
+// where the 3D render path stops if a smoke-test demo shows blank.
+// Each flag is flipped true on first success so we don't spam the
+// console every frame.
+const _SCENE_DIAG = { pipeline: false, instance: false, encode: false, draw: false };
+
 function _ensureMeshPipeline(sampleCount) {
   if (!Number.isFinite(sampleCount) || sampleCount < 1) sampleCount = 1;
   const key = "default-" + sampleCount + "x";
@@ -43403,6 +43424,26 @@ function _ensureMeshPipeline(sampleCount) {
     return null;
   }
   Visual.meshPipelineCache.set(key, pipeline);
+  if (!_SCENE_DIAG.pipeline) {
+    _SCENE_DIAG.pipeline = true;
+    console.log("[scene] mesh pipeline built (sampleCount=" + sampleCount + "x, fbFormat=" + Visual.fbFormat + ")");
+  }
+  // Async shader compile-error path. createShaderModule is sync but
+  // WGSL errors surface async via getCompilationInfo. Without this
+  // hook, an invalid shader silently produces a pipeline that just
+  // doesn't render -- caller sees no triangles + no errors.
+  module.getCompilationInfo().then(info => {
+    const errs = info.messages.filter(m => m.type === "error");
+    if (errs.length) {
+      console.error("[scene] mesh shader WGSL errors:");
+      for (const m of errs) {
+        console.error("  line " + m.lineNum + " col " + m.linePos + ": " + m.message);
+      }
+    } else {
+      const warns = info.messages.filter(m => m.type === "warning");
+      if (warns.length) console.warn("[scene] mesh shader WGSL warnings:", warns);
+    }
+  });
   return pipeline;
 }
 
@@ -43520,6 +43561,19 @@ function _encodeScenePass(enc, entry) {
 
   const camera = _resolveSceneCamera(node, Visual.fbWidth, Visual.fbHeight);
   const meshes = _resolveSceneMeshes(node);
+  if (!_SCENE_DIAG.encode) {
+    _SCENE_DIAG.encode = true;
+    console.log("[scene] first encode: node=" + node.id +
+                " layer=" + layerIdx + (isScratch ? " (scratch)" : " (display)") +
+                " sampleCount=" + sampleCount + "x" +
+                " meshes=" + meshes.length +
+                " eye=(" + camera.eye.map(v => v.toFixed(2)).join(",") + ")");
+    if (meshes.length === 0) {
+      console.warn("[scene] node " + node.id + " has no wired mesh inputs -- " +
+                   "the Scene will only show the clear color. Wire a DebugTriangle " +
+                   "(or any mesh-gen node) into mesh1/mesh2/mesh3/mesh4.");
+    }
+  }
 
   // MSAA path: render into the MSAA color texture + use the
   // framebuffer layer as resolveTarget so WebGPU does the down-
@@ -43569,6 +43623,11 @@ function _encodeScenePass(enc, entry) {
       pass.drawIndexed(buf.indexCount);
     } else {
       pass.draw(buf.vertexCount);
+    }
+    if (!_SCENE_DIAG.draw) {
+      _SCENE_DIAG.draw = true;
+      console.log("[scene] first mesh draw: src=" + m.node.type + "#" + m.node.id +
+                  " verts=" + buf.vertexCount + (buf.indexCount ? " indices=" + buf.indexCount : ""));
     }
   }
 
