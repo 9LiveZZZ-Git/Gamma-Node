@@ -10327,6 +10327,7 @@ public:
     kind: "material",
     ins: [
       { n: "mesh",      t: "mesh" },
+      { n: "texture",   t: "texture" },
       { n: "preset",    t: "param" },
       { n: "r",         t: "param" },
       { n: "g",         t: "param" },
@@ -10343,9 +10344,9 @@ public:
     },
     methods: {},
     paramOptions: {
-      preset: ["iridescent", "plasma", "scanlines", "fresnelEdge"]
+      preset: ["iridescent", "plasma", "scanlines", "fresnelEdge", "texture"]
     },
-    description: "Custom WGSL surface material. preset picks one of four built-in shader bodies (iridescent / plasma / scanlines / fresnelEdge). r/g/b is the tint color (used differently by each preset -- as the base hue, the dim-state color, or the rim color). time advances the animation (wire MasterClock.phase × 2π for a 2π-periodic loop per beat). freq controls scale (cycles per unit area or per second). intensity controls effect strength. Future: arbitrary user WGSL via an in-editor code editor; for now the four presets cover the most common per-pixel effects."
+    description: "Custom WGSL surface material. preset picks one of five built-in shader bodies (iridescent / plasma / scanlines / fresnelEdge / texture). For most presets r/g/b is the tint, time advances animation (wire MasterClock.phase × 2π), freq scales density, intensity scales effect strength. The 'texture' preset wraps any upstream visual node's output (StarNest / Voronoi / MatrixRain / ShapeTunnel / Plasma / etc.) onto the mesh via spherical projection -- wire the visual's `out` port into ShaderMat's `texture` input. Plan walker auto-schedules the upstream into a scratch slot before the Scene's pass; the texture is sampled with linear filtering. freq tiles the UV (1 = single wrap; 2 = two wraps); r/g/b tints multiplicatively; intensity scales brightness."
   },
 
   /* DirectionalLight -- a single infinite-distance light source.
@@ -30641,6 +30642,137 @@ const _demos = [
     }
   },
 
+  /* Sprint 7.5.3c push 5 -- Shader-as-Texture demo. Four 3D
+   * primitives wrapping four different upstream shader-frag
+   * outputs as their surface texture via ShaderMat(preset=texture).
+   * The plan walker auto-schedules each upstream into a scratch
+   * slot before the Scene's pass; the spherical UV projection
+   * maps the 2D shader output onto each 3D shape.
+   *
+   *   StarNest    → Sphere      (volumetric stars wrapped globally)
+   *   Voronoi     → Box         (cellular pattern per-face-ish)
+   *   MatrixRain  → Torus       (rain wrapping the donut surface)
+   *   Plasma      → Cylinder    (plasma flowing around the curve)
+   *
+   * A slow camera orbit shows how the shader rotates with the
+   * surface (since UV is sphericial-from-world-pos, the camera
+   * sees the texture wrap stay attached to each shape). */
+  {
+    id: "scene-3d-shader-tex",
+    name: "Shaders as Textures",
+    sub: "starnest · voronoi · matrix · plasma",
+    type: "visual",
+    thumb: `<svg viewBox="0 0 100 44">
+      <defs>
+        <radialGradient id="dg-stx-stars" cx="0.4" cy="0.5" r="0.6">
+          <stop offset="0"   stop-color="rgba(180,200,255,1)"/>
+          <stop offset="0.5" stop-color="rgba(60,80,150,1)"/>
+          <stop offset="1"   stop-color="rgba(10,15,40,1)"/>
+        </radialGradient>
+        <pattern id="dg-stx-vor" x="0" y="0" width="6" height="6" patternUnits="userSpaceOnUse">
+          <rect width="6" height="6" fill="rgba(120,90,200,1)"/>
+          <circle cx="3" cy="3" r="2.5" fill="rgba(160,140,240,0.7)"/>
+        </pattern>
+        <linearGradient id="dg-stx-mtx" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0"    stop-color="rgba(0,80,40,1)"/>
+          <stop offset="0.3"  stop-color="rgba(20,255,80,1)"/>
+          <stop offset="0.6"  stop-color="rgba(0,120,50,1)"/>
+          <stop offset="1"    stop-color="rgba(0,30,15,1)"/>
+        </linearGradient>
+        <radialGradient id="dg-stx-pls" cx="0.5" cy="0.5" r="0.7">
+          <stop offset="0"   stop-color="rgba(255,200,90,1)"/>
+          <stop offset="0.5" stop-color="rgba(230,90,170,1)"/>
+          <stop offset="1"   stop-color="rgba(60,100,200,1)"/>
+        </radialGradient>
+      </defs>
+      <rect width="100" height="44" fill="rgba(4, 6, 12, 1)"/>
+      <circle cx="14" cy="22" r="8" fill="url(#dg-stx-stars)"/>
+      <rect   cx="38" cy="22" x="30" y="14" width="16" height="16" fill="url(#dg-stx-vor)"
+              stroke="rgba(255,255,255,0.35)" stroke-width="0.4"/>
+      <ellipse cx="62" cy="22" rx="9" ry="6" fill="url(#dg-stx-mtx)"
+               stroke="rgba(100,255,120,0.4)" stroke-width="0.4"/>
+      <rect cx="86" cy="22" x="80" y="13" width="12" height="18" rx="2"
+            fill="url(#dg-stx-pls)" stroke="rgba(255,255,255,0.35)" stroke-width="0.4"/>
+    </svg>`,
+    build: () => {
+      // Upstream visuals (no VisualOutput needed; the plan walker
+      // schedules them into scratch slots before Scene renders).
+      const stars  = makeNode("StarNest",     40,  40, {});
+      const vor    = makeNode("Voronoi",      40, 200, { density: 16, edgeThickness: 0.06, seed: 0.4 });
+      const mtx    = makeNode("MatrixRain",   40, 360, {});
+      const plas   = makeNode("Plasma",       40, 520, { speed: 0.6, scale: 1.5 });
+
+      // Meshes.
+      const sph    = makeNode("Sphere",      240,  40, { radius: 0.8, stacks: 32, slices: 48 });
+      const box    = makeNode("Box",         240, 200, { width: 1.4, height: 1.4, depth: 1.4 });
+      const tor    = makeNode("Torus",       240, 360, { majorRadius: 0.9, minorRadius: 0.35, majorSlices: 32, minorSlices: 16 });
+      const cyl    = makeNode("Cylinder",    240, 520, { radius: 0.7, height: 1.6, slices: 32 });
+
+      // ShaderMat(texture) per mesh.
+      const m1 = makeNode("ShaderMat", 460,  40, { preset: 4, r: 1, g: 1, b: 1, freq: 1.0, intensity: 1.3 });
+      const m2 = makeNode("ShaderMat", 460, 200, { preset: 4, r: 1, g: 1, b: 1, freq: 1.2, intensity: 1.1 });
+      const m3 = makeNode("ShaderMat", 460, 360, { preset: 4, r: 1, g: 1, b: 1, freq: 1.5, intensity: 1.3 });
+      const m4 = makeNode("ShaderMat", 460, 520, { preset: 4, r: 1, g: 1, b: 1, freq: 1.0, intensity: 1.4 });
+
+      // Position them in a row.
+      const tr1 = makeNode("Translate", 700,  40, { x: -3.6, y: 0, z: 0 });
+      const tr2 = makeNode("Translate", 700, 200, { x: -1.2, y: 0, z: 0 });
+      const tr3 = makeNode("Translate", 700, 360, { x:  1.2, y: 0, z: 0 });
+      const tr4 = makeNode("Translate", 700, 520, { x:  3.6, y: 0, z: 0 });
+
+      // Slow camera orbit.
+      const clk    = makeNode("MasterClock", 940,  40, { bpm: 15 });
+      const mulTau = makeNode("Mul",        1140, 40, { b: 6.283185307 });
+      const sinC   = makeNode("Sin",        1320, 40);
+      const cosC   = makeNode("Cos",        1320, 130);
+      const mulCx  = makeNode("Mul",        1480, 40,  { b: 1.5 });    // small horizontal pan
+      const mulCz  = makeNode("Mul",        1480, 130, { b: 0.8 });
+      const addCz  = makeNode("Add",        1660, 130, { b: 7.0 });    // base distance
+      const cam    = makeNode("Camera",      940, 260, {
+        posX: 0, posY: 0.4, posZ: 7,
+        targetX: 0, targetY: 0, targetZ: 0,
+        fov: 55, near: 0.1, far: 100, mode: 0
+      });
+
+      const scn    = makeNode("Scene",      1900, 320, { clearR: 0.02, clearG: 0.03, clearB: 0.05 });
+      const vo     = makeNode("VisualOutput",2120, 320, { display: 0 });
+
+      // Upstream visual -> material.texture
+      state.edges.push({ from: { node: stars, port: "out" }, to: { node: m1, port: "texture" } });
+      state.edges.push({ from: { node: vor,   port: "out" }, to: { node: m2, port: "texture" } });
+      state.edges.push({ from: { node: mtx,   port: "out" }, to: { node: m3, port: "texture" } });
+      state.edges.push({ from: { node: plas,  port: "out" }, to: { node: m4, port: "texture" } });
+
+      // Mesh -> material -> translate.
+      state.edges.push({ from: { node: sph, port: "mesh" }, to: { node: m1, port: "mesh" } });
+      state.edges.push({ from: { node: box, port: "mesh" }, to: { node: m2, port: "mesh" } });
+      state.edges.push({ from: { node: tor, port: "mesh" }, to: { node: m3, port: "mesh" } });
+      state.edges.push({ from: { node: cyl, port: "mesh" }, to: { node: m4, port: "mesh" } });
+      state.edges.push({ from: { node: m1,  port: "mesh" }, to: { node: tr1, port: "mesh" } });
+      state.edges.push({ from: { node: m2,  port: "mesh" }, to: { node: tr2, port: "mesh" } });
+      state.edges.push({ from: { node: m3,  port: "mesh" }, to: { node: tr3, port: "mesh" } });
+      state.edges.push({ from: { node: m4,  port: "mesh" }, to: { node: tr4, port: "mesh" } });
+
+      // Camera orbit math: clock.phase → sin/cos → posX, posZ
+      state.edges.push({ from: { node: clk,    port: "phase" }, to: { node: mulTau, port: "a" } });
+      state.edges.push({ from: { node: mulTau, port: "out"   }, to: { node: sinC,   port: "in" } });
+      state.edges.push({ from: { node: mulTau, port: "out"   }, to: { node: cosC,   port: "in" } });
+      state.edges.push({ from: { node: sinC,   port: "out"   }, to: { node: mulCx,  port: "a" } });
+      state.edges.push({ from: { node: cosC,   port: "out"   }, to: { node: mulCz,  port: "a" } });
+      state.edges.push({ from: { node: mulCz,  port: "out"   }, to: { node: addCz,  port: "a" } });
+      state.edges.push({ from: { node: mulCx,  port: "out"   }, to: { node: cam,    port: "posX" } });
+      state.edges.push({ from: { node: addCz,  port: "out"   }, to: { node: cam,    port: "posZ" } });
+
+      // Scene wiring.
+      state.edges.push({ from: { node: tr1, port: "mesh"   }, to: { node: scn, port: "mesh1"  } });
+      state.edges.push({ from: { node: tr2, port: "mesh"   }, to: { node: scn, port: "mesh2"  } });
+      state.edges.push({ from: { node: tr3, port: "mesh"   }, to: { node: scn, port: "mesh3"  } });
+      state.edges.push({ from: { node: tr4, port: "mesh"   }, to: { node: scn, port: "mesh4"  } });
+      state.edges.push({ from: { node: cam, port: "camera" }, to: { node: scn, port: "camera" } });
+      state.edges.push({ from: { node: scn, port: "out"    }, to: { node: vo,  port: "in"     } });
+    }
+  },
+
   {
     id: "mesh-text",
     name: "Mesh Text",
@@ -38811,6 +38943,9 @@ function _allocateFramebuffer() {
   // bind groups reference the now-destroyed views; they'll rebuild on
   // next render.
   Visual.shaderInstances.clear();
+  // Sprint 7.5.3c push 5 -- scene instances reference the scratch
+  // texture views via their bind groups too. Same rebuild rule.
+  if (Visual.sceneInstances) Visual.sceneInstances.clear();
 }
 
 /* Build the fullscreen-triangle blit pipeline once at device init.
@@ -44149,13 +44284,15 @@ function _buildMaterialDescriptor(matNode) {
   if (matNode.type === "ShaderMat") {
     // Sprint 7.5.3c -- preset name from the enum index. The
     // matParams slots get reinterpreted here: shininess=time,
-    // ambient=freq, metallic=intensity, roughness=reserved.
-    // The descriptor stores them under their legacy names so the
-    // _encodeScenePass writer works unchanged.
+    // ambient=freq, metallic=intensity, roughness=texLayer (for
+    // the "texture" preset; unused otherwise). The descriptor
+    // stores them under their legacy names so the _encodeScenePass
+    // writer works unchanged.
     const presetIdx = (typeof p.preset === "number") ? Math.floor(p.preset) : 0;
     const presetName = _SHADERMAT_PRESET_NAMES[presetIdx] || _SHADERMAT_PRESET_NAMES[0];
     return {
       type: "shadermat-" + presetName,
+      node: matNode,            // sprint 7.5.3c push 5 -- needed for texture-input lookup at encode time
       params: {
         r: (typeof p.r === "number") ? p.r : 0.7,
         g: (typeof p.g === "number") ? p.g : 0.85,
@@ -44562,6 +44699,53 @@ function _buildRenderPlan(visualOutputs) {
           walk(wire.from.node, true, depth + 1);
         }
       }
+      // Sprint 7.5.3c push 5 -- Scene nodes also need to schedule
+      // upstream visuals wired into any ShaderMat's `texture` input
+      // somewhere down the mesh chain. Walk through mesh-typed
+      // inputs (mesh1..mesh4) through transforms + materials until
+      // we hit a mesh-gen leaf, calling `walk` on any texture input
+      // encountered on a ShaderMat node. The upstream gets
+      // scheduled into a scratch slot before this Scene renders.
+      if (isScene && Array.isArray(def.ins)) {
+        const visited = new Set();
+        const walkMeshChainForTextures = (chainNodeId, chainDepth) => {
+          if (chainDepth > 16 || visited.has(chainNodeId)) return;
+          visited.add(chainNodeId);
+          const chainNode = state.nodes.find(n => n && n.id === chainNodeId);
+          if (!chainNode) return;
+          const chainDef = TYPES[chainNode.type];
+          if (!chainDef) return;
+          // Any texture-typed input on this chain node gets walked
+          // (covers ShaderMat.texture). Schedule the upstream into
+          // a scratch slot at depth+1 from THIS Scene.
+          if (Array.isArray(chainDef.ins)) {
+            for (const port of chainDef.ins) {
+              if (!port || port.t !== "texture") continue;
+              const w = state.edges.find(e =>
+                e && e.to && e.to.node === chainNodeId && e.to.port === port.n
+              );
+              if (w && w.from) walk(w.from.node, true, depth + 1);
+            }
+          }
+          // Recurse upstream through the chain. mesh-gen is a leaf.
+          if (chainDef.kind === "material" || chainDef.kind === "mesh-transform") {
+            const meshWire = state.edges.find(e =>
+              e && e.to && e.to.node === chainNodeId && e.to.port === "mesh"
+            );
+            if (meshWire && meshWire.from) {
+              walkMeshChainForTextures(meshWire.from.node, chainDepth + 1);
+            }
+          }
+        };
+        for (const port of def.ins) {
+          if (!port || port.t !== "mesh") continue;
+          const meshWire = state.edges.find(e =>
+            e && e.to && e.to.node === nodeId && e.to.port === port.n
+          );
+          if (!meshWire || !meshWire.from) continue;
+          walkMeshChainForTextures(meshWire.from.node, 0);
+        }
+      }
       sched.push(entry);
     }
 
@@ -44634,6 +44818,14 @@ struct PerDraw {
 };
 @group(0) @binding(0) var<uniform> uS: PerScene;
 @group(0) @binding(1) var<uniform> uD: PerDraw;
+
+// Sprint 7.5.3c push 5 -- texture binding for ShaderMat. Bound to
+// the scratch texture array (matched parity with Scene's readKey
+// since Scene is depth=0 → readKey="a", upstreams of ShaderMat at
+// depth=1 → writeKey="a"). Unused by non-ShaderMat materials, but
+// always present in the BGL so the pipeline layout is uniform.
+@group(0) @binding(2) var srcTexture: texture_2d_array<f32>;
+@group(0) @binding(3) var srcSampler: sampler;
 
 struct VsIn  {
   @location(0) pos:    vec3<f32>,
@@ -44965,6 +45157,35 @@ fn surface_shade(s: SurfaceIn) -> vec3<f32> {
   let edge = uD.baseColor.rgb * uD.matParams.z;
   return mix(core, edge, rim);
 }
+`,
+
+  /* Texture -- sample an upstream visual node's output (StarNest,
+   * Voronoi, MatrixRain, ShapeTunnel, Plasma, etc.) as the surface
+   * texture. The upstream is auto-scheduled into a scratch slot by
+   * the plan walker; the slot index lands in matParams.w.
+   *
+   * UV mapping: spherical projection from origin. Works naturally
+   * for Sphere; on other meshes you get a "globe-style" wrap which
+   * still looks great. Future: per-vertex UVs (would need a vertex
+   * layout change to 11 floats). matParams.y = freq tiles the UV;
+   * matParams.z = intensity scales brightness; baseColor.rgb tints
+   * (multiplicative). */
+  texture: `
+fn surface_shade(s: SurfaceIn) -> vec3<f32> {
+  let layer = u32(max(0.0, uD.matParams.w));
+  // Spherical projection from world origin. Centers around the
+  // primitive's origin so sphere / cube / torus all get a globe-
+  // style wrap. freq tiles the UV (1 = single wrap, 2 = two wraps).
+  let p = normalize(s.worldPos);
+  let tile = max(0.001, uD.matParams.y);
+  var u = atan2(p.z, p.x) / 6.2831853 + 0.5;
+  var v = asin(clamp(p.y, -1.0, 1.0)) / 3.14159265 + 0.5;
+  u = fract(u * tile);
+  v = fract(v * tile);
+  // Flip V so the texture's top renders at the mesh's north pole.
+  let tex = textureSampleLevel(srcTexture, srcSampler, vec2<f32>(u, 1.0 - v), layer, 0.0);
+  return tex.rgb * uD.baseColor.rgb * uD.matParams.z;
+}
 `
 };
 
@@ -45041,7 +45262,13 @@ function _ensureMeshBindGroupLayout() {
     label: "mesh-bgl",
     entries: [
       { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
-      { binding: 1, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } }
+      { binding: 1, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+      // Sprint 7.5.3c push 5 -- texture + sampler for ShaderMat
+      // texture sampling. Always present in the BGL so the pipeline
+      // layout matches for all material types; non-texture materials
+      // simply don't reference the bindings in their WGSL.
+      { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d-array", multisampled: false } },
+      { binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } }
     ]
   });
   Visual.meshPipelineLayout = Visual.device.createPipelineLayout({
@@ -45569,6 +45796,21 @@ function _ensureSceneInstance(sceneNode) {
   // Cheap (96 bytes per slot) and the bind groups are stable across
   // frames (the underlying buffer object stays the same; only its
   // contents change per frame).
+  // Sprint 7.5.3c push 5 -- include the scratch texture array +
+  // a default sampler in the bind group so ShaderMat-texture can
+  // sample upstream visual outputs. scratchArrayViewA always
+  // matches readKey="a" for direct-VO Scenes (depth=0 → readKey=
+  // "a"; upstream texture inputs at depth=1 → writeKey="a"). For
+  // Scenes nested deeper in composition chains, the sampling would
+  // be against the wrong parity; that's an edge case to address
+  // in a follow-up. Sampler reuses a shared one.
+  if (!Visual.meshSampler) {
+    Visual.meshSampler = Visual.device.createSampler({
+      label: "mesh-shadermat-sampler",
+      magFilter: "linear", minFilter: "linear",
+      addressModeU: "repeat", addressModeV: "repeat"
+    });
+  }
   const SLOT_COUNT = 4;
   const slots = [];
   for (let i = 0; i < SLOT_COUNT; i++) {
@@ -45582,7 +45824,9 @@ function _ensureSceneInstance(sceneNode) {
       layout: Visual.meshBindGroupLayout,
       entries: [
         { binding: 0, resource: { buffer: perSceneBuffer } },
-        { binding: 1, resource: { buffer: perDrawBuffer  } }
+        { binding: 1, resource: { buffer: perDrawBuffer  } },
+        { binding: 2, resource: Visual.scratchArrayViewA },
+        { binding: 3, resource: Visual.meshSampler }
       ]
     });
     slots.push({ perDrawBuffer, bindGroup });
@@ -45765,6 +46009,24 @@ function _encodeScenePass(enc, entry) {
     inst.drawScratch[21] = (typeof mp.ambient   === "number") ? mp.ambient   : 0.15;
     inst.drawScratch[22] = (typeof mp.metallic  === "number") ? mp.metallic  : 0.0;
     inst.drawScratch[23] = (typeof mp.roughness === "number") ? mp.roughness : 0.5;
+    // Sprint 7.5.3c push 5 -- for ShaderMat with a wired texture
+    // input, look up the upstream's scratch layer + override
+    // matParams.w (roughness slot) with the layer index. The
+    // "texture" preset reads this to know which scratch layer to
+    // sample. Other presets ignore matParams.w (it was reserved
+    // before this push).
+    if (matType.indexOf("shadermat-") === 0 && m.material && m.material.node) {
+      const texWire = state.edges.find(e =>
+        e && e.to && e.to.node === m.material.node.id && e.to.port === "texture"
+      );
+      if (texWire && texWire.from) {
+        const planMap = Visual._currentRenderPlan;
+        const upstreamEntry = planMap && planMap.get(texWire.from.node + "@" + entry.consumerVO.id);
+        if (upstreamEntry && upstreamEntry.isScratch) {
+          inst.drawScratch[23] = upstreamEntry.layerIdx;
+        }
+      }
+    }
     Visual.device.queue.writeBuffer(slot.perDrawBuffer, 0, inst.drawScratch.buffer, 0, 96);
     pass.setBindGroup(0, slot.bindGroup);
     pass.setVertexBuffer(0, buf.vertexBuffer);
