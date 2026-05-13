@@ -40698,11 +40698,16 @@ function _disposeShaderInstance(nodeId) {
   // Phase 7.1b — MediaPipe AI node cleanup. Stops the detection rAF
   // loop, closes the WASM detector, releases the camera stream.
   _disposeMediapipeNode(nodeId);
-  // Sprint 7.5.3a -- 3D scene resource cleanup. Scene uniform buffers
-  // + mesh vertex/index buffers per node.
+  // Sprint 7.5.3a/c -- 3D scene resource cleanup. Per-Scene
+  // shared uniform + per-slot uniforms.
   const sceneInst = Visual.sceneInstances && Visual.sceneInstances.get(nodeId);
   if (sceneInst) {
-    try { sceneInst.uniformBuffer && sceneInst.uniformBuffer.destroy(); } catch (_) {}
+    try { sceneInst.perSceneBuffer && sceneInst.perSceneBuffer.destroy(); } catch (_) {}
+    if (Array.isArray(sceneInst.slots)) {
+      for (const slot of sceneInst.slots) {
+        try { slot.perDrawBuffer && slot.perDrawBuffer.destroy(); } catch (_) {}
+      }
+    }
     Visual.sceneInstances.delete(nodeId);
   }
   const meshBuf = Visual.meshBufferCache && Visual.meshBufferCache.get(nodeId);
@@ -44617,24 +44622,37 @@ function _ensureSceneInstance(sceneNode) {
     size: 112,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
   });
-  // perDraw: model (16) + baseColor (4) + matParams (4) = 24 floats = 96 bytes
-  const perDrawBuffer = Visual.device.createBuffer({
-    label: "scene-perdraw-" + sceneNode.id,
-    size: 96,
-    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
-  });
-  const bindGroup = Visual.device.createBindGroup({
-    label: "scene-bg-" + sceneNode.id,
-    layout: Visual.meshBindGroupLayout,
-    entries: [
-      { binding: 0, resource: { buffer: perSceneBuffer } },
-      { binding: 1, resource: { buffer: perDrawBuffer  } }
-    ]
-  });
+  // Sprint 7.5.3c bug fix -- queue.writeBuffer ordering. All
+  // writeBuffer calls in a submit happen BEFORE any encoder command
+  // executes; they don't interleave with draws. So a single per-draw
+  // buffer overwritten between draws would mean every draw saw the
+  // LAST write -- broken for multi-mesh scenes.
+  // Fix: one per-draw buffer + one bind group per Scene mesh slot
+  // (4 total). Each slot's buffer holds its own model + material.
+  // Cheap (96 bytes per slot) and the bind groups are stable across
+  // frames (the underlying buffer object stays the same; only its
+  // contents change per frame).
+  const SLOT_COUNT = 4;
+  const slots = [];
+  for (let i = 0; i < SLOT_COUNT; i++) {
+    const perDrawBuffer = Visual.device.createBuffer({
+      label: "scene-perdraw-" + sceneNode.id + "-slot" + i,
+      size: 96,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+    const bindGroup = Visual.device.createBindGroup({
+      label: "scene-bg-" + sceneNode.id + "-slot" + i,
+      layout: Visual.meshBindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: perSceneBuffer } },
+        { binding: 1, resource: { buffer: perDrawBuffer  } }
+      ]
+    });
+    slots.push({ perDrawBuffer, bindGroup });
+  }
   inst = {
     perSceneBuffer,
-    perDrawBuffer,
-    bindGroup,
+    slots,
     sceneScratch: new Float32Array(28),
     drawScratch:  new Float32Array(24)
   };
@@ -44656,12 +44674,37 @@ function _encodeScenePass(enc, entry) {
   } else {
     layerView = Visual.framebufferLayerViews[layerIdx];
   }
-  if (!layerView) return false;
+  if (!layerView) {
+    if (!_SCENE_DIAG.bail_layer) {
+      _SCENE_DIAG.bail_layer = true;
+      console.warn("[scene] bail: no layerView for layerIdx=" + layerIdx + " isScratch=" + isScratch);
+    }
+    return false;
+  }
   const sampleCount = Visual.msaaSampleCount || 1;
   const inst = _ensureSceneInstance(node);
-  if (!inst) return false;
-  if (!Visual.depthTextureView) return false;
-  if (sampleCount > 1 && !Visual.msaaColorTextureView) return false;
+  if (!inst) {
+    if (!_SCENE_DIAG.bail_inst) {
+      _SCENE_DIAG.bail_inst = true;
+      console.warn("[scene] bail: _ensureSceneInstance returned null; Visual.device=" + !!Visual.device +
+                   " bgl=" + !!Visual.meshBindGroupLayout);
+    }
+    return false;
+  }
+  if (!Visual.depthTextureView) {
+    if (!_SCENE_DIAG.bail_depth) {
+      _SCENE_DIAG.bail_depth = true;
+      console.warn("[scene] bail: no depthTextureView; fbW=" + Visual.fbWidth + " fbH=" + Visual.fbHeight);
+    }
+    return false;
+  }
+  if (sampleCount > 1 && !Visual.msaaColorTextureView) {
+    if (!_SCENE_DIAG.bail_msaa) {
+      _SCENE_DIAG.bail_msaa = true;
+      console.warn("[scene] bail: msaa sampleCount=" + sampleCount + " but no msaaColorTextureView");
+    }
+    return false;
+  }
 
   const p = node.params || {};
   const clearR = (typeof p.clearR === "number") ? p.clearR : 0.04;
@@ -44714,10 +44757,8 @@ function _encodeScenePass(enc, entry) {
       depthStoreOp: (sampleCount > 1) ? "discard" : "store"
     }
   });
-  pass.setBindGroup(0, inst.bindGroup);
-
-  // Per-Scene uniform: viewProj + light + camera eye. Same for every
-  // draw in this scene.
+  // Per-Scene uniform: viewProj + light + camera eye. Written once
+  // per Scene render (shared across all this Scene's mesh draws).
   inst.sceneScratch.set(camera.viewProj, 0);
   inst.sceneScratch[16] = light.dir[0];
   inst.sceneScratch[17] = light.dir[1];
@@ -44733,12 +44774,13 @@ function _encodeScenePass(enc, entry) {
   inst.sceneScratch[27] = 0;
   Visual.device.queue.writeBuffer(inst.perSceneBuffer, 0, inst.sceneScratch.buffer, 0, 112);
 
-  // Per-draw loop. Each mesh may have its own material; we switch
-  // pipeline when the material type changes (sorting upstream would
-  // minimize this; not worth optimizing for the typical 1-4 mesh
-  // case in sprint 7.5.3c).
+  // Per-draw loop. Each mesh writes to its OWN per-slot buffer +
+  // binds its OWN bind group, so multi-mesh draws work correctly
+  // (queue.writeBuffer ordering doesn't interleave with draws).
   let curMaterialType = null;
-  for (const m of meshes) {
+  for (let i = 0; i < meshes.length && i < inst.slots.length; i++) {
+    const m = meshes[i];
+    const slot = inst.slots[i];
     const buf = _ensureMeshBuffers(m);
     if (!buf || !buf.vertexBuffer) continue;
     const matType = (m.material && m.material.type) || "unlit-vc";
@@ -44748,7 +44790,7 @@ function _encodeScenePass(enc, entry) {
       pass.setPipeline(pipeline);
       curMaterialType = matType;
     }
-    // Write model + material into the per-draw uniform.
+    // Write model + material into THIS slot's per-draw buffer.
     inst.drawScratch.set(m.transform, 0);
     const mp = (m.material && m.material.params) || {};
     inst.drawScratch[16] = (typeof mp.r === "number") ? mp.r : 1.0;
@@ -44759,7 +44801,8 @@ function _encodeScenePass(enc, entry) {
     inst.drawScratch[21] = (typeof mp.ambient   === "number") ? mp.ambient   : 0.15;
     inst.drawScratch[22] = 0;
     inst.drawScratch[23] = 0;
-    Visual.device.queue.writeBuffer(inst.perDrawBuffer, 0, inst.drawScratch.buffer, 0, 96);
+    Visual.device.queue.writeBuffer(slot.perDrawBuffer, 0, inst.drawScratch.buffer, 0, 96);
+    pass.setBindGroup(0, slot.bindGroup);
     pass.setVertexBuffer(0, buf.vertexBuffer);
     if (buf.indexBuffer) {
       pass.setIndexBuffer(buf.indexBuffer, "uint32");
@@ -44769,7 +44812,7 @@ function _encodeScenePass(enc, entry) {
     }
     if (!_SCENE_DIAG.draw) {
       _SCENE_DIAG.draw = true;
-      console.log("[scene] first mesh draw: src=" + m.node.type + "#" + m.node.id +
+      console.log("[scene] first mesh draw: slot=" + i + " src=" + m.node.type + "#" + m.node.id +
                   " material=" + matType +
                   " verts=" + buf.vertexCount + (buf.indexCount ? " indices=" + buf.indexCount : ""));
     }
