@@ -10029,6 +10029,72 @@ public:
     description: "3D scene sink. Wire up to four `mesh` inputs (Box/Sphere/Plane/Torus/Cylinder/Cone via sprint 7.5.3b primitives, or DebugTriangle for the simplest smoke test) and one `camera` input from a Camera node. Renders the meshes through the camera into a framebuffer layer; output is `texture`-typed so the result flows into the existing post-processing graph (CRT, Bloom, BlendShader, etc.). clearR/G/B is the background color (default a deep navy). Depth-tested; meshes farther from the camera are correctly occluded. Sprint 7.5.3c adds materials + lighting; until then the pipeline is unlit + uses per-vertex colors."
   },
 
+  /* RayTracedScene -- the hardware ray-tracing alternative to Scene.
+   * Same inputs (meshes / camera / lights / environment), but the
+   * scene is rendered by the native gamma-rt-engine on the local
+   * compile-server (Vulkan-RT on PC, Metal-RT on Mac) and streamed
+   * back as H.264 frames over WebSocket.
+   *
+   * Sprint 7.5.6.a part 1 -- STUB. The node exists + the editor
+   * checks engine availability via /health, but no actual rendering
+   * yet. The render loop + streaming proxy land in part 2. If the
+   * engine isn't installed, the node displays a status message and
+   * outputs the clear color so downstream graphs don't break.
+   *
+   * Quality presets:
+   *   draft    1 spp, no denoise, no progressive accumulation
+   *   preview  4 spp + denoiser + progressive accumulation
+   *   final    16 spp + multi-bounce path tracing + denoiser
+   *
+   * Materials specific to RT (work ONLY inside RayTracedScene):
+   *   - GlassMat   (refractive dielectric, lands in §5.6.d)
+   *   - MirrorMat  (pure-mirror, lands in §5.6.d)
+   *   - AreaLight  (rectangular soft-shadow source, lands in §5.6.c) */
+  RayTracedScene: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "scene-rt",   // distinct from "scene" so the encoder
+                        // dispatches a different path (not yet
+                        // implemented in part 1; falls back to a
+                        // black clear).
+    ins: [
+      { n: "mesh1",   t: "mesh" },
+      { n: "mesh2",   t: "mesh" },
+      { n: "mesh3",   t: "mesh" },
+      { n: "mesh4",   t: "mesh" },
+      { n: "camera",  t: "camera" },
+      { n: "light1",  t: "light" },
+      { n: "light2",  t: "light" },
+      { n: "light3",  t: "light" },
+      { n: "light4",  t: "light" },
+      { n: "quality", t: "param" },
+      { n: "bounces", t: "param" },
+      { n: "samples", t: "param" },
+      { n: "denoise", t: "param" },
+      { n: "exposure", t: "param" },
+      { n: "tonemap", t: "param" },
+      { n: "clearR",  t: "param" },
+      { n: "clearG",  t: "param" },
+      { n: "clearB",  t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    params: {
+      quality: 1,         // 0=draft, 1=preview, 2=final
+      bounces: 4,
+      samples: 4,
+      denoise: 1,
+      exposure: 0.0,
+      tonemap: 1,         // 0=none, 1=ACES, 2=Reinhard, 3=AgX
+      clearR: 0.02, clearG: 0.02, clearB: 0.04
+    },
+    methods: {},
+    paramOptions: {
+      quality: ["draft", "preview", "final"],
+      tonemap: ["none", "ACES", "Reinhard", "AgX"]
+    },
+    description: "Hardware ray-tracing scene sink. Requires gamma-compile-server to have the gamma-rt-engine binary installed (Rust monorepo sibling; see docs/RAYTRACING.md). Same inputs as Scene (meshes / camera / lights) but renders via native Vulkan-RT (PC) or Metal-RT (Mac) and streams the result as an H.264 video over WebSocket. Output is `texture`, so downstream nodes (CRT, BlendShader, post-processing) consume it like any other layer. Quality presets: draft (1spp, no denoise), preview (4spp + denoise + progressive accumulation), final (16spp + full multi-bounce path tracing + denoise). bounces caps recursion depth; samples is per-pixel-per-frame; denoise toggles the OIDN / MetalFX denoiser pass; exposure is the EV stop offset; tonemap picks the operator. Sprint 7.5.6.a part 1: NODE STUB ONLY -- the actual streaming pipeline lands in part 2. Falls back to a clear-color black when the engine isn't installed."
+  },
+
   /* =========================================================================
    * Sprint 7.5.3b -- Procedural primitive meshes
    *
@@ -47781,6 +47847,15 @@ const _OSC_IN_LIVE_PORTS = ["v1", "v2", "v3", "v4"];
  * server side -- exact match, '*' = any chars within one path part,
  * '?' = one char. Cross-segment wildcards left for a follow-up. */
 
+/* Sprint 7.5.6.a part 1 -- RT engine state. Populated by the
+ * compile-server /health probe; the editor uses this to know whether
+ * to enable the RayTracedScene node or grey it out with "engine
+ * not installed". serverInfo shape: { available, capabilities,
+ * wsPath, proxyReady } from the Node side. */
+const _rtEngineState = {
+  serverInfo: null
+};
+
 const _oscState = {
   ws: null,
   status: "idle",          // idle | connecting | connected | error | disabled
@@ -47818,10 +47893,13 @@ async function _ensureOscConnection() {
   }
   // /health tells us if the bridge is enabled on this daemon. Older
   // daemons (pre v0.3.0) won't have the osc key -- treat as disabled.
+  // Sprint 7.5.6.a part 1 -- also capture rtEngine.* here so the
+  // editor knows whether the RayTracedScene node has a backend.
   let oscEnabled = false;
   try {
     const h = await fetch(localServerEndpoint + "/health", { signal: AbortSignal.timeout(2000) }).then(r => r.json());
     oscEnabled = !!(h && h.osc && h.osc.enabled);
+    if (h && h.rtEngine) _rtEngineState.serverInfo = h.rtEngine;
   } catch (_) { /* leave disabled */ }
   if (!oscEnabled) {
     _oscState.status = "disabled";
