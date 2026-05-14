@@ -46472,17 +46472,23 @@ function _ensureRtSceneInstance(node) {
     // Sprint 7.5.6.a part 2e-2 + 7.5.6.c-1 -- three-tier live
     // update tracking. Each render tick re-derives these from the
     // current graph state:
-    //   * lastSceneSig    -- structural (mesh wiring + light wiring
-    //                        + mesh geometry params). Change here
-    //                        triggers a full Scene replace + AS
-    //                        rebuild on the engine.
-    //   * lastLightsJson  -- packed lights array. Change triggers
-    //                        a Params message with just the lights;
-    //                        engine patches lights_buffer in place.
-    //   * lastCameraJson  -- packed camera. Change → Params with
-    //                        camera; engine patches camera_buffer.
+    //   * lastSceneSig       -- structural (mesh wiring + material
+    //                           wiring + light wiring + mesh geometry
+    //                           params). Change triggers full Scene
+    //                           replace + AS rebuild on the engine.
+    //   * lastMaterialsJson  -- packed materials array. Change ->
+    //                           Params(materials); engine patches
+    //                           material_buffer in place. Catches
+    //                           live PhongMat / PhysicalMat slider
+    //                           drags without churning the BVH.
+    //   * lastLightsJson     -- packed lights array. Change ->
+    //                           Params(lights); engine patches
+    //                           lights_buffer in place.
+    //   * lastCameraJson     -- packed camera. Change -> Params(camera);
+    //                           engine patches camera_buffer.
     lastCameraJson: null,
     lastLightsJson: null,
+    lastMaterialsJson: null,
     lastSceneSig: null,
     lastClearSig: null
   };
@@ -46504,19 +46510,36 @@ function _ensureRtSceneInstance(node) {
  * succeeds (returns an empty meshes[] if nothing wired). */
 function _rtBuildSceneJson(rtNode) {
   const meshes = [];
-  // Walk mesh1..mesh4 inputs; collect any that resolve to a known
-  // mesh-builder node.
+  // Walk mesh1..mesh4 inputs; collect each mesh node plus any
+  // material node wired between mesh and RayTracedScene (so a chain
+  // like Sphere → PhysicalMat → RT.mesh1 sends PBR params to the
+  // engine instead of an Unlit fallback).
   for (let i = 1; i <= 4; i++) {
     const portName = "mesh" + i;
-    const meshNode = _rtFindUpstreamMesh(rtNode.id, portName);
-    if (!meshNode) continue;
+    const found = _rtFindUpstreamMeshAndMaterial(rtNode.id, portName);
+    if (!found) continue;
+    const { mesh: meshNode, material: matNode } = found;
     const data = _buildMeshData(meshNode);
     if (!data) continue;
     const stride = 11;
     const verts = Array.from(data.verts);
     const indices = data.indices ? Array.from(data.indices) : null;
-    // Average per-vertex color → per-mesh flat color (option a).
-    const meshColor = _rtMeshAverageColor(data.verts, stride);
+    // Sprint 7.5.6.c-2 -- material wiring. If a material node is in
+    // the chain, send its real params; the engine's c-2 kernel
+    // branches on the material type tag (Unlit / Phong / PBR).
+    // If no material is wired, fall back to PhongMat with the mesh's
+    // average per-vertex color so unmaterialed meshes still get
+    // shaded (matching the c-1 implicit-Lambert default; an
+    // unmaterialed RT scene shouldn't suddenly look flat).
+    let material = matNode ? _rtExtractMaterial(matNode) : null;
+    if (!material) {
+      material = {
+        type: "phong",
+        color: _rtMeshAverageColor(data.verts, stride),
+        shininess: 32,
+        ambient: 0.15
+      };
+    }
     meshes.push({
       geometry: {
         kind: "inline",
@@ -46530,11 +46553,7 @@ function _rtBuildSceneJson(rtNode) {
         0, 0, 1, 0,
         0, 0, 0, 1
       ],
-      material: {
-        type: "unlit",
-        color: meshColor,
-        vertex_mix: 0
-      }
+      material
     });
   }
 
@@ -46619,32 +46638,82 @@ function _rtExtractLight(lightNode) {
 }
 
 /* Walk wires backwards from rtNode[portName] until we hit a mesh-
- * builder node (DebugTriangle / Box / Sphere / etc). Skips over
- * Translate / Rotate / Scale / ShaderMat / PhongMat / etc by
- * following whatever input port they have that's named "mesh" or
- * "in". Returns the originating mesh node, or null. */
-function _rtFindUpstreamMesh(rtNodeId, portName) {
-  const meshTypes = new Set(["DebugTriangle", "Box", "Sphere", "Plane", "Torus", "Cylinder", "Cone"]);
+ * builder node, capturing the FIRST material node encountered along
+ * the way (closest to the RT scene). Returns { mesh, material } or
+ * null if no mesh resolves. Material can be null even on a hit --
+ * means the mesh is wired directly without any material in between. */
+const _RT_MESH_TYPES = new Set([
+  "DebugTriangle", "Box", "Sphere", "Plane", "Torus", "Cylinder", "Cone"
+]);
+const _RT_MATERIAL_TYPES = new Set([
+  "UnlitMat", "PhongMat", "PhysicalMat", "ShaderMat"
+]);
+function _rtFindUpstreamMeshAndMaterial(rtNodeId, portName) {
   let curNodeId = rtNodeId;
   let curPort = portName;
-  // Hard cap on wire-walking depth -- mostly defensive against cycles.
+  let material = null;
   for (let depth = 0; depth < 32; depth++) {
     const edge = state.edges.find(e => e.to.node === curNodeId && e.to.port === curPort);
     if (!edge) return null;
     const upNode = state.nodes.find(n => n.id === edge.from.node);
     if (!upNode) return null;
-    if (meshTypes.has(upNode.type)) return upNode;
-    // Not a mesh -- continue upstream through this node's "mesh"
-    // or "in" input. Materials/transforms pass mesh through that way.
+    if (_RT_MESH_TYPES.has(upNode.type)) return { mesh: upNode, material };
+    if (_RT_MATERIAL_TYPES.has(upNode.type) && !material) material = upNode;
     curNodeId = upNode.id;
     curPort = "mesh";
-    // Some material nodes use a different upstream port; fall back
-    // to "in" if no "mesh" port wire exists.
     if (!state.edges.find(e => e.to.node === curNodeId && e.to.port === "mesh")) {
       curPort = "in";
     }
   }
   return null;
+}
+
+// Legacy wrapper -- some old call sites that only need the mesh.
+function _rtFindUpstreamMesh(rtNodeId, portName) {
+  const r = _rtFindUpstreamMeshAndMaterial(rtNodeId, portName);
+  return r ? r.mesh : null;
+}
+
+/* Sprint 7.5.6.c-2 -- pack a material node into the scene.rs
+ * Material enum's JSON shape. The engine's c-2 kernel honors
+ * Unlit / Phong / Pbr; ShaderMat collapses to Unlit for now
+ * (matching the engine's material_to_uniform fallback). */
+function _rtExtractMaterial(matNode) {
+  const p = _resolveNodeParams(matNode);
+  const num = (v, d) => (typeof v === "number" ? v : d);
+  switch (matNode.type) {
+    case "UnlitMat":
+      return {
+        type: "unlit",
+        color: [num(p.r, 1), num(p.g, 1), num(p.b, 1)],
+        vertex_mix: num(p.vertexMix, 0)
+      };
+    case "PhongMat":
+      return {
+        type: "phong",
+        color: [num(p.r, 0.85), num(p.g, 0.85), num(p.b, 0.92)],
+        shininess: num(p.shininess, 32),
+        ambient: num(p.ambient, 0.15)
+      };
+    case "PhysicalMat":
+      return {
+        type: "pbr",
+        color: [num(p.r, 0.85), num(p.g, 0.85), num(p.b, 0.85)],
+        metallic: num(p.metallic, 0),
+        roughness: num(p.roughness, 0.5)
+      };
+    case "ShaderMat":
+      // c-2 fallback: Slang transpile not implemented yet, so a
+      // ShaderMat-wrapped mesh just renders as Unlit with whatever
+      // tint params the user set.
+      return {
+        type: "unlit",
+        color: [num(p.r, 1), num(p.g, 1), num(p.b, 1)],
+        vertex_mix: 0
+      };
+    default:
+      return null;
+  }
 }
 
 /* Find a node wired into rtNode.portName regardless of type. Used
@@ -46749,11 +46818,13 @@ function _rtScenePollAndSend(node, inst) {
     const sceneJson = _rtBuildSceneJson(node);
     const camJson = JSON.stringify(sceneJson.camera);
     const lightsJson = JSON.stringify(sceneJson.lights);
+    const matsJson = JSON.stringify(sceneJson.meshes.map(m => m.material));
     try {
       inst.ws.send(JSON.stringify({ type: "scene", patch: sceneJson }));
       inst.lastSceneSig = sceneSig;
       inst.lastCameraJson = camJson;
       inst.lastLightsJson = lightsJson;
+      inst.lastMaterialsJson = matsJson;
       console.log("[rt-scene] scene replace (sig change) — " +
                   sceneJson.meshes.length + " mesh(es), " +
                   sceneJson.lights.length + " light(s)");
@@ -46763,7 +46834,42 @@ function _rtScenePollAndSend(node, inst) {
     return;
   }
 
-  // Tier 2 -- lights. Same wiring as last send, but the light
+  // Tier 2 -- materials. Same wiring, possibly drifted params
+  // (PhongMat.shininess drag, PhysicalMat.metallic drag, etc).
+  // Engine's update_materials patches the per-mesh material buffer
+  // in place; no AS rebuild.
+  const matsArr = [];
+  for (let i = 1; i <= 4; i++) {
+    const portName = "mesh" + i;
+    const found = _rtFindUpstreamMeshAndMaterial(node.id, portName);
+    if (!found) continue;
+    const { mesh: meshNode, material: matNode } = found;
+    const data = _buildMeshData(meshNode);
+    if (!data) continue;
+    let m = matNode ? _rtExtractMaterial(matNode) : null;
+    if (!m) {
+      // Matches the _rtBuildSceneJson default -- Phong with average
+      // per-vertex color so unmaterialed meshes stay shaded.
+      m = {
+        type: "phong",
+        color: _rtMeshAverageColor(data.verts, 11),
+        shininess: 32,
+        ambient: 0.15
+      };
+    }
+    matsArr.push(m);
+  }
+  const matsJson = JSON.stringify(matsArr);
+  if (matsJson !== inst.lastMaterialsJson) {
+    try {
+      inst.ws.send(JSON.stringify({ type: "params", patch: { materials: matsArr } }));
+      inst.lastMaterialsJson = matsJson;
+    } catch (e) {
+      console.warn("[rt-scene] materials params send failed:", e);
+    }
+  }
+
+  // Tier 3 -- lights. Same wiring as last send, but the light
   // node's params may have moved (slider drag on intensity/hue).
   // Catches that without rebuilding the AS.
   const lightsArr = [];
@@ -46783,7 +46889,7 @@ function _rtScenePollAndSend(node, inst) {
     }
   }
 
-  // Tier 3 -- camera. Cheap stringify-compare on the camera node's
+  // Tier 4 -- camera. Cheap stringify-compare on the camera node's
   // resolved params. Fires on every slider drag / clock-driven orbit
   // tick that moves the camera.
   const camNode = _rtFindUpstreamByPort(node.id, "camera");
@@ -46853,10 +46959,11 @@ async function _rtSceneConnect(nodeId, inst) {
     console.log("[rt-scene] connected for node " + nodeId);
     // Reset send-tracking so the next poll fires a fresh scene
     // (the lastSceneSig=null branch ships scene + camera + lights
-    // in one Scene message and primes all three trackers).
+    // + materials in one Scene message and primes all four trackers).
     inst.lastSceneSig = null;
     inst.lastCameraJson = null;
     inst.lastLightsJson = null;
+    inst.lastMaterialsJson = null;
     try {
       ws.send(JSON.stringify({ type: "hello" }));
       ws.send(JSON.stringify({ type: "configure", width: 800, height: 600 }));
