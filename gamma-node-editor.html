@@ -30839,6 +30839,79 @@ const _demos = [
     }
   },
 
+  /* Sprint 7.5.6.a part 2h -- RT engine demo. Single sphere lit by
+   * an orbiting camera, rendered via hardware ray tracing through
+   * the local gamma-rt-engine subprocess (auto-spawned by the
+   * compile-server). Exercises both pieces of part 2e: scene data
+   * (mesh + clear color) shipped to the engine at connect, and live
+   * camera Params updates as the clock-driven orbit ticks. The
+   * "Hardware RT" sub indicates the editor is offloading rendering
+   * to the engine instead of doing it on the editor's WebGPU. */
+  {
+    id: "rt-sphere-orbit",
+    name: "RT Sphere (orbit)",
+    sub: "hardware ray traced · live camera",
+    type: "visual",
+    thumb: `<svg viewBox="0 0 100 44">
+      <defs>
+        <radialGradient id="dg-rt-sph" cx="0.55" cy="0.45" r="0.55">
+          <stop offset="0"   stop-color="rgba(220,230,255,1)"/>
+          <stop offset="0.45" stop-color="rgba(120,170,230,1)"/>
+          <stop offset="1"   stop-color="rgba(40,60,120,1)"/>
+        </radialGradient>
+      </defs>
+      <rect width="100" height="44" fill="rgba(4,6,12,1)"/>
+      <!-- orbit ellipse hinting at camera path -->
+      <ellipse cx="50" cy="22" rx="34" ry="9"
+               fill="none" stroke="rgba(232,140,60,0.45)"
+               stroke-width="0.5" stroke-dasharray="2 2"/>
+      <circle cx="50" cy="22" r="12" fill="url(#dg-rt-sph)"/>
+      <text x="84" y="10" text-anchor="end"
+            font-family="monospace" font-size="5"
+            fill="rgba(232,140,60,0.85)"
+            letter-spacing="0.08em">RT</text>
+    </svg>`,
+    build: () => {
+      // Sphere we'll trace through. Modest tri-count so the AS build
+      // is instant; bump stacks/slices in the inspector to stress the
+      // RT cores if you want to see them earn their keep.
+      const sph = makeNode("Sphere", 40, 60, { radius: 0.9, stacks: 24, slices: 32 });
+
+      // Orbit math: clock.phase (0..1) → ×τ → sin/cos → posX/posZ.
+      // BPM=12 → one orbit every ~5 seconds. Slow enough to watch.
+      const clk    = makeNode("MasterClock", 40, 340, { bpm: 12 });
+      const mulTau = makeNode("Mul",        260, 340, { b: 6.283185307 });
+      const sinC   = makeNode("Sin",        460, 320);
+      const cosC   = makeNode("Cos",        460, 420);
+      const mulCx  = makeNode("Mul",        640, 320, { b: 2.6 });
+      const mulCz  = makeNode("Mul",        640, 420, { b: 2.6 });
+      const cam    = makeNode("Camera",     860, 340, {
+        posX: 0, posY: 0.4, posZ: 2.6,
+        targetX: 0, targetY: 0, targetZ: 0,
+        fov: 55, near: 0.1, far: 100, mode: 0
+      });
+
+      const rt = makeNode("RayTracedScene", 1100, 80, { clearR: 0.03, clearG: 0.04, clearB: 0.08 });
+      const vo = makeNode("VisualOutput",   1340, 80, { display: 0 });
+
+      // Geometry → RT scene.
+      state.edges.push({ from: { node: sph, port: "mesh" }, to: { node: rt, port: "mesh1" } });
+
+      // Camera-orbit math chain.
+      state.edges.push({ from: { node: clk,    port: "phase" }, to: { node: mulTau, port: "a" } });
+      state.edges.push({ from: { node: mulTau, port: "out"   }, to: { node: sinC,   port: "in" } });
+      state.edges.push({ from: { node: mulTau, port: "out"   }, to: { node: cosC,   port: "in" } });
+      state.edges.push({ from: { node: sinC,   port: "out"   }, to: { node: mulCx,  port: "a" } });
+      state.edges.push({ from: { node: cosC,   port: "out"   }, to: { node: mulCz,  port: "a" } });
+      state.edges.push({ from: { node: mulCx,  port: "out"   }, to: { node: cam,    port: "posX" } });
+      state.edges.push({ from: { node: mulCz,  port: "out"   }, to: { node: cam,    port: "posZ" } });
+      state.edges.push({ from: { node: cam,    port: "camera"}, to: { node: rt,     port: "camera" } });
+
+      // RT scene → output.
+      state.edges.push({ from: { node: rt, port: "out" }, to: { node: vo, port: "in" } });
+    }
+  },
+
   {
     id: "mesh-text",
     name: "Mesh Text",
@@ -46531,13 +46604,18 @@ function _rtMeshAverageColor(verts, stride) {
 }
 
 function _rtExtractCamera(camNode) {
-  const p = camNode.params || {};
+  // Sprint 7.5.6.a part 2h -- read wired-param-resolved values, not
+  // static .params. Without this, a `MasterClock → ... → Camera.posX`
+  // orbit chain wouldn't update the engine (we'd see the static
+  // posX=0 every frame). _resolveNodeParams is the same resolver
+  // the raster Scene's _evaluateCamera uses; single source of truth.
+  const p = _resolveNodeParams(camNode);
   const num = (v, d) => (typeof v === "number" ? v : d);
   return {
     mode: "perspective",
     pos: [num(p.posX, 0), num(p.posY, 0), num(p.posZ, 5)],
     target: [num(p.targetX, 0), num(p.targetY, 0), num(p.targetZ, 0)],
-    up: [0, 1, 0],
+    up: [num(p.upX, 0), num(p.upY, 1), num(p.upZ, 0)],
     fov_deg: num(p.fov, 60),
     near: num(p.near, 0.1),
     far: num(p.far, 100)
