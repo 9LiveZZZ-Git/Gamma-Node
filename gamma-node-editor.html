@@ -10729,14 +10729,20 @@ public:
       { n: "timeOfDay", t: "param" },
       { n: "turbidity", t: "param" },
       { n: "mieG",      t: "param" },
-      { n: "intensity", t: "param" }
+      { n: "intensity", t: "param" },
+      // 7.5.4.c-polish -- 0..1, controls moon's lit fraction.
+      // 0 / 1 = new moon (no visible disk), 0.5 = full moon. Wire
+      // a very slow MasterClock for an animated lunar cycle (a real
+      // month is 29.5 days; in 60s-day units that's a 30-min loop).
+      { n: "moonPhase", t: "param" }
     ],
     outs: [{ n: "env", t: "environment" }],
     params: {
       timeOfDay: 0.5,
       turbidity: 1.0,
       mieG:      0.76,
-      intensity: 1.0
+      intensity: 1.0,
+      moonPhase: 0.5
     },
     methods: {},
     description: "Hand-tuned atmospheric-scattering sky. timeOfDay drives a day/night cycle: noon -> blue zenith + pale horizon, sunset -> orange-red sky + dim ground, midnight -> deep blue night sky. turbidity pushes the daytime color toward warmer/hazier tones (high turbidity = orange sunsets bleeding longer into the day). mieG controls the forward-scatter anisotropy: 0.76 gives a textbook sun-halo; higher = tighter glow, lower = broader fuzzy sun. Wire `DayNightCycle.timeOfDay` into this AND into the Sun node so the sky's sun-disk + the DirectionalLight come from the same direction at the same color. NOT physically accurate (no integrated transmittance) but reads as 'sky' through the cycle. Hosek-Wilkie implementation is a future polish."
@@ -46014,48 +46020,106 @@ fn vs_sky(@builtin(vertex_index) vid: u32) -> SkyVsOut {
 
 @fragment
 fn fs_sky(in: SkyVsOut) -> @location(0) vec4<f32> {
-  return vec4<f32>(sample_env(normalize(in.worldDir)), 1.0);
+  // Sprint 7.5.4.c-polish -- sky background pass includes the
+  // features (disk / moon / stars / Milky Way) on top of the
+  // smooth scattering. sample_env is smooth-only (for IBL safety);
+  // this dispatch path is the only place features show up so that
+  // a high-frequency star can't end up reflected through a smooth
+  // surface normal and alias.
+  let dir = normalize(in.worldDir);
+  let mode = u32(uS.envParams.x);
+  if (mode == 2u) {
+    return vec4<f32>(sample_procedural_sky(dir), 1.0);
+  }
+  return vec4<f32>(sample_env(dir), 1.0);
 }
 
-// Sprint 7.5.4.c -- hand-tuned procedural sky. Not physically
-// accurate scattering (no integrated transmittance, no proper
-// optical depth), but reads as "sky" through the day/night cycle:
-//   * deep blue zenith when sun is high
-//   * warm horizon when sun is low (sunset reds)
-//   * dim blue night sky when sun is below horizon
-// Falls back to a polished GradientSky variant + Henyey-Greenstein
-// sun halo. Replace with full Hosek-Wilkie in a future sprint if
-// physical accuracy matters; this is good enough for the day/night
-// demo + IBL ambient.
-fn sample_procedural_sky(dir: vec3<f32>) -> vec3<f32> {
-  let sunDir = uS.envSun.xyz;
-  let sunVis = uS.envSun.w;
+// Sprint 7.5.4.c-physics -- atmospheric scattering with proper
+// Rayleigh + Mie phase functions and Beer-Lambert extinction along
+// the sun ray. NOT integrated multi-scattering (that needs precomp
+// tables, e.g. Bruneton); single-scattering with the right shape:
+//   * sun's color reddens through atmospheric path (extinction)
+//   * sky's zenith blue comes from Rayleigh in-scatter
+//   * Mie halo around sun + brownish horizon haze from aerosols
+//
+// Sub-divided into:
+//   sample_procedural_sky_smooth(dir)   - smooth gradient + halo
+//     only (no point-features). For IBL ambient on PBR surfaces;
+//     the high-freq star/disk features alias badly through smooth
+//     surface normals so they're factored out.
+//   sample_procedural_sky_features(dir) - sun disk + moon + stars
+//     + Milky Way. Background-only.
+//   sample_procedural_sky(dir)          - = smooth + features.
+
+// Wavelength-dependent Rayleigh extinction (~1/λ⁴; blue scatters
+// most). Ratios tuned so one full atmospheric path produces an
+// observed sunset-red residual on the sun. Mie is gray, scaled
+// by turbidity (aerosol load).
+const SKY_BETA_R = vec3<f32>(0.030, 0.070, 0.170);
+const SKY_PATH_SCALE = 4.0;
+
+fn _sky_optical_depth(cos_zenith: f32) -> f32 {
+  // Chapman-style approximation: 1 at zenith, large at horizon.
+  // +0.05 floor prevents the 1/cos singularity at horizon.
+  return 1.0 / max(cos_zenith + 0.05, 0.08);
+}
+
+fn _sky_sun_extinction(sunCosZenith: f32, turbidity: f32) -> vec3<f32> {
+  let depth = _sky_optical_depth(sunCosZenith);
+  let betaM = vec3<f32>(0.030) * turbidity;
+  return exp(-(SKY_BETA_R + betaM) * depth * SKY_PATH_SCALE);
+}
+
+fn sample_procedural_sky_smooth(dir: vec3<f32>) -> vec3<f32> {
+  let sunDir    = uS.envSun.xyz;
+  let sunVis    = uS.envSun.w;
   let turbidity = uS.envParams.z;
-  let mieG = uS.envParams.w;
+  let mieG      = uS.envParams.w;
   let intensity = uS.envParams.y;
 
-  let view_y = clamp(dir.y, -1.0, 1.0);
+  let view_y   = clamp(dir.y, -1.0, 1.0);
   let sun_elev = clamp(sunDir.y, -1.0, 1.0);
+  let day      = smoothstep(-0.08, 0.18, sun_elev);
 
-  // Day/night blend: smoothly goes from 0 (sun far below horizon) to
-  // 1 (sun comfortably above). The transition is sunrise/sunset.
-  let day = smoothstep(-0.08, 0.18, sun_elev);
+  // === DAY: Rayleigh + Mie single-scattering ===
+  let betaR = SKY_BETA_R;
+  let betaM = vec3<f32>(0.030) * turbidity;
+  let cos_theta = clamp(dot(dir, sunDir), -1.0, 1.0);
+  let cos2 = cos_theta * cos_theta;
 
-  // Daytime palette. Zenith deepens to blue as sun rises; horizon
-  // warms when sun is low (more atmospheric path = more red).
-  let zen_day = mix(
-    vec3<f32>(0.55, 0.40, 0.35),                              // dawn zenith
-    vec3<f32>(0.28, 0.50, 0.92),                              // noon zenith
-    smoothstep(0.0, 0.55, sun_elev)
-  );
-  let hor_day = mix(
-    vec3<f32>(0.95, 0.55, 0.30) * (0.85 + turbidity * 0.25),  // sunset
-    vec3<f32>(0.78, 0.85, 0.95),                              // midday
-    smoothstep(0.0, 0.45, sun_elev)
-  );
-  let sky_day = mix(hor_day, zen_day, smoothstep(0.0, 1.0, max(view_y, 0.0)));
+  // Rayleigh phase: 3/(16π) × (1 + cos²θ). Symmetric, adds to both
+  // forward and backward view directions.
+  let phaseR = 0.0596 * (1.0 + cos2);
+  // Mie phase: Cornette-Shanks improved HG. Strongly forward-
+  // scattering -> bright halo around sun + brown horizon haze.
+  let g  = clamp(mieG, 0.0, 0.95);
+  let g2 = g * g;
+  let phaseM_denom = pow(max(1.0 + g2 - 2.0 * g * cos_theta, 1e-4), 1.5);
+  let phaseM = 0.119 * (1.0 - g2) * (1.0 + cos2) / ((2.0 + g2) * phaseM_denom);
 
-  // Nighttime palette. Deep navy zenith, slightly lighter horizon.
+  // Optical depths along view + sun rays.
+  let sunCosZenith  = max(sun_elev, -0.05);
+  let viewCosZenith = max(view_y, 0.0);
+  let sunDepth  = _sky_optical_depth(sunCosZenith);
+  let viewDepth = _sky_optical_depth(viewCosZenith);
+
+  // Beer-Lambert sun extinction: ratio of sunlight surviving its
+  // trip from atmosphere edge to the observer. At zenith ≈ neutral
+  // white; at horizon, blue extinguishes first, leaving deep red.
+  let extinction = exp(-(betaR + betaM) * sunDepth * SKY_PATH_SCALE);
+  let sunRadiance = vec3<f32>(1.5, 1.4, 1.3) * extinction;
+
+  // Single in-scattering integral approximation. Real integral is
+  // ∫ phase × Lsun × T(view) dx along view ray; here we collapse
+  // the integral to phase × sunRadiance × (1 - exp(-tau_view))
+  // which preserves the day/dusk/zenith color shapes without the
+  // precomp table cost.
+  let viewExt = exp(-(betaR + betaM) * viewDepth * SKY_PATH_SCALE * 0.6);
+  let inScatterR = sunRadiance * betaR * phaseR;
+  let inScatterM = sunRadiance * betaM * phaseM;
+  let sky_day = (inScatterR + inScatterM) * (1.0 - viewExt) * 14.0;
+
+  // === NIGHT ===
   let zen_night = vec3<f32>(0.015, 0.022, 0.060);
   let hor_night = vec3<f32>(0.045, 0.050, 0.095);
   let sky_night = mix(hor_night, zen_night, smoothstep(0.0, 1.0, max(view_y, 0.0)));
@@ -46063,67 +46127,96 @@ fn sample_procedural_sky(dir: vec3<f32>) -> vec3<f32> {
   // Ground (below horizon): warm-dim for day, near-black for night.
   let ground_day   = vec3<f32>(0.18, 0.13, 0.10);
   let ground_night = vec3<f32>(0.010, 0.012, 0.025);
-  let ground = mix(ground_night, ground_day, day);
+  let ground       = mix(ground_night, ground_day, day);
 
-  // Pick day vs night, ground vs sky.
   var col = mix(sky_night, sky_day, day);
   if (view_y < 0.0) {
     col = ground;
   }
 
-  // Sun halo + disk. Henyey-Greenstein-ish forward scatter peaks
-  // toward sunDir; visible only when sun is above the horizon. Sun
-  // disk is a tight smoothstep, halo is broader.
-  let cos_theta = clamp(dot(dir, sunDir), -1.0, 1.0);
-  let g  = clamp(mieG, 0.0, 0.95);
-  let g2 = g * g;
-  let denom = pow(max(1.0 + g2 - 2.0 * g * cos_theta, 1e-4), 1.5);
-  let phase = (1.0 - g2) / denom * 0.0796;     // 1 / (4π)
-  let halo  = phase * sunVis * 0.6;
-  // 7.5.4.c-polish -- tightened sun disk to roughly real angular
-  // size (~0.5° apparent diameter from Earth). Pre-fix the disk was
-  // ~3° across -- visibly too large + soft. Inner cos = 0.99996 ≈
-  // 0.5°, outer cos = 0.99988 ≈ 0.9°. Brightness bumped to keep
-  // the same total energy in the smaller disk.
-  let disk  = smoothstep(0.99988, 0.99996, cos_theta) * sunVis * 14.0;
-  let sun_color = mix(
-    vec3<f32>(1.4, 0.55, 0.25),                               // low-sun red
-    vec3<f32>(1.3, 1.18, 1.05),                               // high-sun warm white
-    smoothstep(0.0, 0.35, sun_elev)
-  );
-  col = col + (disk + halo) * sun_color;
+  // Sun-halo Mie glow (smooth; the disk itself lives in _features).
+  let halo = phaseM * sunVis * 1.0;
+  col = col + halo * sunRadiance;
 
-  // 7.5.4.c-polish -- moon (sky decoration only; doesn't light the
-  // scene). Roughly opposite the sun so it rises as the sun sets.
-  // Visible only at night-ish (day blend < 1). Disk size matches
-  // real moon (~0.5° apparent diameter); tiny bluish halo softens
-  // the edge. Future polish: phases (lit fraction tracks the angle
-  // between sun and moon).
-  let moonDir = -sunDir;
-  let cos_moon = clamp(dot(dir, moonDir), -1.0, 1.0);
-  let moon_vis = clamp(1.0 - day, 0.0, 1.0);
-  let moon_disk = smoothstep(0.99988, 0.99996, cos_moon) * moon_vis * 5.0;
-  let moon_halo = smoothstep(0.985, 0.9999, cos_moon)  * moon_vis * 0.06;
+  return col * intensity;
+}
+
+fn sample_procedural_sky_features(dir: vec3<f32>) -> vec3<f32> {
+  let sunDir    = uS.envSun.xyz;
+  let sunVis    = uS.envSun.w;
+  let turbidity = uS.envParams.z;
+  let intensity = uS.envParams.y;
+  let moonPhase = uS.envSky.w;   // packed by JS; 0/1=new, 0.5=full
+
+  let view_y   = clamp(dir.y, -1.0, 1.0);
+  let sun_elev = clamp(sunDir.y, -1.0, 1.0);
+  let day      = smoothstep(-0.08, 0.18, sun_elev);
+  let night    = 1.0 - day;
+
+  var col = vec3<f32>(0.0);
+
+  // --- Sun disk. ~0.5° angular size. Color = white × atmospheric
+  //     extinction along sun-ray; reddens dramatically at horizon.
+  let cos_theta = clamp(dot(dir, sunDir), -1.0, 1.0);
+  let disk = smoothstep(0.99988, 0.99996, cos_theta) * sunVis * 14.0;
+  let sunExt = _sky_sun_extinction(max(sun_elev, -0.05), turbidity);
+  let sunDiskColor = sunExt * vec3<f32>(2.2, 2.0, 1.8);
+  col = col + disk * sunDiskColor;
+
+  // --- Moon. Placed directly opposite the sun (full-moon position).
+  //     Phase param modulates lit fraction via sin(phase·π) -- gives
+  //     0 (new) at moonPhase=0/1 and 1 (full) at moonPhase=0.5. v1
+  //     just brightness-modulates; a proper crescent shape would
+  //     compute per-pixel lit hemisphere via sphere math.
+  let moonDir    = -sunDir;
+  let cos_moon   = clamp(dot(dir, moonDir), -1.0, 1.0);
+  let moon_vis   = clamp(night, 0.0, 1.0);
+  let phaseLit   = sin(clamp(moonPhase, 0.0, 1.0) * 3.14159265);
+  let moon_disk  = smoothstep(0.99988, 0.99996, cos_moon) * moon_vis * 5.0 * phaseLit;
+  let moon_halo  = smoothstep(0.985, 0.9999, cos_moon)   * moon_vis * 0.05 * phaseLit;
   let moon_color = vec3<f32>(0.92, 0.95, 1.00);
   col = col + (moon_disk + moon_halo) * moon_color;
 
-  // 7.5.4.c-polish -- stars. Cheap per-pixel hash on the view
-  // direction: 99.7th percentile pixels become individual stars.
-  // Fades out as day blends in. Only visible above the horizon
-  // (no stars on the ground / below view_y=0). The 220x grid is
-  // a balance between "you can see individual stars" and "the
-  // field doesn't look like a regular pattern" at typical FOVs.
+  // --- Stars: denser grid + temperature-varied color. Hash grid
+  //     bumped 220 -> 360 so individual stars stay tiny at larger
+  //     pixel counts. Threshold lowered 0.997 -> 0.989 (~3x more
+  //     stars). Each star gets a "temperature hash" mapped from
+  //     hot-blue to cool-orange.
   if (view_y > 0.0 && moon_vis > 0.001) {
-    let p = floor(dir * 220.0);
+    let p = floor(dir * 360.0);
     let h = fract(sin(dot(p, vec3<f32>(127.1, 311.7, 74.7))) * 43758.5453);
-    let star_amt = smoothstep(0.997, 1.0, h) * moon_vis;
-    // Subtle twinkle from a coarser hash so different stars vary
-    // in brightness; flat field reads as "lit pixels" not "stars."
-    let twinkle = 0.6 + 0.4 * fract(sin(dot(p, vec3<f32>(19.7, 41.3, 7.1))) * 12345.6);
-    col = col + vec3<f32>(0.78, 0.83, 1.00) * star_amt * twinkle;
+    let star_amt = smoothstep(0.989, 1.0, h) * moon_vis;
+    let temp_h = fract(sin(dot(p, vec3<f32>(89.3, 47.7, 31.1))) * 76123.4);
+    var starColor: vec3<f32>;
+    if (temp_h < 0.5) {
+      starColor = mix(vec3<f32>(0.62, 0.78, 1.00),
+                      vec3<f32>(1.00, 0.98, 0.95),
+                      smoothstep(0.0, 0.5, temp_h));
+    } else {
+      starColor = mix(vec3<f32>(1.00, 0.98, 0.95),
+                      vec3<f32>(1.00, 0.72, 0.45),
+                      smoothstep(0.5, 1.0, temp_h));
+    }
+    let twinkle = 0.55 + 0.45 * fract(sin(dot(p, vec3<f32>(19.7, 41.3, 7.1))) * 12345.6);
+    col = col + starColor * star_amt * twinkle * 1.4;
+
+    // --- Milky Way band. Tilted reference axis (~galactic pole),
+    //     soft glow + low-freq noise for clumpy dust-lane look.
+    //     Night-only, above-horizon-only.
+    let galacticAxis = normalize(vec3<f32>(0.45, 0.55, 0.70));
+    let bandDist = abs(dot(dir, galacticAxis));
+    let bandIntensity = smoothstep(0.35, 0.05, bandDist);
+    let nhash = fract(sin(dot(floor(dir * 24.0), vec3<f32>(17.3, 91.2, 53.5))) * 8194.7);
+    let bandTex = 0.45 + 0.55 * nhash;
+    let bandColor = vec3<f32>(0.22, 0.20, 0.32);
+    col = col + bandColor * bandIntensity * bandTex * moon_vis * 0.65;
   }
 
   return col * intensity;
+}
+
+fn sample_procedural_sky(dir: vec3<f32>) -> vec3<f32> {
+  return sample_procedural_sky_smooth(dir) + sample_procedural_sky_features(dir);
 }
 
 // Sprint 7.5.4 -- sample the wired environment by direction. Used
@@ -46145,7 +46238,12 @@ fn sample_env(dir: vec3<f32>) -> vec3<f32> {
     }
   }
   if (mode == 2u) {
-    return sample_procedural_sky(dir);
+    // Sprint 7.5.4.c-polish -- IBL ambient uses smooth-only.
+    // The features (sun disk, moon, stars, Milky Way) are high-
+    // frequency point samples that alias badly when reflected
+    // through a smooth-surface normal; they belong only in the
+    // sky background pass.
+    return sample_procedural_sky_smooth(dir);
   }
   // Default: pre-7.5.4 hardcoded hemisphere-IBL. Two-stop gradient
   // from cool sky to warm ground via the up-axis-aligned mix that
@@ -47448,7 +47546,9 @@ function _encodeScenePass(enc, entry) {
     const horizon = env.horizon || [0, 0, 0];
     const ground  = env.ground  || [0, 0, 0];
     const sun     = env.sun     || [0, 1, 0, 0];
-    inst.sceneScratch[92]  = sky[0];     inst.sceneScratch[93]  = sky[1];     inst.sceneScratch[94]  = sky[2];     inst.sceneScratch[95]  = 0;
+    // 7.5.4.c-polish -- sky.w carries moonPhase for ProceduralSky.
+    // GradientSky doesn't use it; falls through to 0.
+    inst.sceneScratch[92]  = sky[0];     inst.sceneScratch[93]  = sky[1];     inst.sceneScratch[94]  = sky[2];     inst.sceneScratch[95]  = (typeof sky[3] === "number") ? sky[3] : 0;
     inst.sceneScratch[96]  = horizon[0]; inst.sceneScratch[97]  = horizon[1]; inst.sceneScratch[98]  = horizon[2]; inst.sceneScratch[99]  = 0;
     inst.sceneScratch[100] = ground[0];  inst.sceneScratch[101] = ground[1];  inst.sceneScratch[102] = ground[2];  inst.sceneScratch[103] = 0;
     inst.sceneScratch[104] = sun[0];     inst.sceneScratch[105] = sun[1];     inst.sceneScratch[106] = sun[2];     inst.sceneScratch[107] = sun[3];
@@ -47630,9 +47730,12 @@ function _resolveLightNode(lightNode) {
     };
   }
   if (lightNode.type === "Sun") {
-    // 7.5.4.c -- Sun is a DirectionalLight whose direction + color
-    // come from timeOfDay. Below horizon -> intensity 0 so the scene
-    // dims for night while the sky still emits ambient via env.
+    // 7.5.4.c-polish -- Sun emits SUNLIGHT by day, MOONLIGHT by
+    // night. _sunColorFromElevation returns isNight=true when sun
+    // is below horizon (cool-blue, low intensity); the moon is
+    // opposite the sun, so we flip the direction so the light
+    // comes FROM the moon's position. This way the scene never
+    // goes pitch dark just because the sun set.
     const t = (typeof p.timeOfDay === "number") ? p.timeOfDay : 0.5;
     const sunDir = _sunDirFromTime(t);
     const sc = _sunColorFromElevation(sunDir[1]);
@@ -47641,9 +47744,12 @@ function _resolveLightNode(lightNode) {
       g: (typeof p.tintG === "number") ? p.tintG : 1.0,
       b: (typeof p.tintB === "number") ? p.tintB : 1.0
     };
+    const lightDir = sc.isNight
+      ? [-sunDir[0], -sunDir[1], -sunDir[2]]
+      : sunDir;
     return {
       type:  0,
-      pos:   sunDir,
+      pos:   lightDir,
       color: [sc.r * tint.r, sc.g * tint.g, sc.b * tint.b],
       intensity: sc.intensity * ((typeof p.intensityScale === "number") ? p.intensityScale : 1.0),
       range:    0,
@@ -47707,29 +47813,47 @@ function _sunDirFromTime(t) {
   return [sx / len, sy / len, sz / len];
 }
 
-/* Sprint 7.5.4.c -- sun color + intensity from elevation. elev is
- * the Y component of the normalized sunDir (= sin of altitude
- * angle); +1 = zenith, 0 = horizon, -1 = nadir. Below horizon ->
- * sun is "off" (intensity 0). Above -> color tints from warm-red
- * at the horizon (more atmospheric scattering = lower B) toward
- * neutral-warm-white at zenith. MATCHES the sun-disk color the
- * WGSL sample_procedural_sky() generates, so the Sun
- * DirectionalLight visually agrees with what shows in the sky. */
+/* Sprint 7.5.4.c -- celestial light: sun color + intensity from
+ * elevation, with moonlight at night. elev is the Y of normalized
+ * sunDir (= sin of altitude angle); +1 = zenith, 0 = horizon,
+ * -1 = nadir.
+ *
+ * Above horizon (sun visible): color reddens at horizon (Beer-
+ * Lambert through more atmosphere), intensity ramps with elevation.
+ * Below horizon (sun set): emit MOONLIGHT instead -- soft cool-blue
+ * from the opposite direction (caller flips dir). This way Sun.light
+ * still illuminates the scene at night, just dimmer + cooler.
+ *
+ * MATCHES the sun-disk color the WGSL sample_procedural_sky_features
+ * generates, so the Sun DirectionalLight visually agrees with the
+ * disk that shows in the sky. */
 function _sunColorFromElevation(elev) {
   if (elev <= 0) {
-    return { r: 0, g: 0, b: 0, intensity: 0, visibility: 0 };
+    // Night: moonlight. The caller (_resolveLightNode / _rtExtract-
+    // Light for Sun) will INVERT the direction so the moonlight
+    // comes from the moon's position (opposite the sun). Soft cool-
+    // blue, ~5-8% of daylight intensity (real moonlight is ~0.1%,
+    // but at that brightness PBR scenes go pitch dark; tuned up).
+    const moonRamp = Math.min(1, -elev / 0.4);
+    return {
+      r: 0.55,
+      g: 0.65,
+      b: 0.95,
+      intensity: 0.03 + 0.05 * moonRamp,
+      visibility: 0,
+      isNight: true
+    };
   }
-  // Sunset (low elev) -> warm red. Daytime (high elev) -> neutral.
+  // Day: sunlight. Sunset (low elev) -> warm red. Noon -> neutral.
   const s = Math.min(1, elev / 0.35);
-  const r = 1.0;
-  const g = 0.55 + 0.40 * s;
-  const b = 0.25 + 0.65 * s;
-  // Intensity scales from dim-warm at the horizon to full overhead.
-  const intensity = 0.50 + 0.75 * s;
-  // Visibility for the sun-disk: smooth fade so the sun doesn't
-  // pop in at exactly y=0. Matches the day blend in the shader.
-  const visibility = Math.min(1, elev / 0.18);
-  return { r, g, b, intensity, visibility };
+  return {
+    r: 1.0,
+    g: 0.55 + 0.40 * s,
+    b: 0.25 + 0.65 * s,
+    intensity: 0.50 + 0.75 * s,
+    visibility: Math.min(1, elev / 0.18),
+    isNight: false
+  };
 }
 
 /* Sprint 7.5.4 -- resolve the Scene's wired environment input.
@@ -47763,11 +47887,15 @@ function _resolveSceneEnvironment(sceneNode) {
     const t = num(p.timeOfDay, 0.5);
     const sunDir = _sunDirFromTime(t);
     const sunColor = _sunColorFromElevation(sunDir[1]);
+    // 7.5.4.c-polish -- pack moonPhase into envSky.w (unused slot
+    // when mode=2 since GradientSky's sky colors are ignored for
+    // ProceduralSky). Shader reads uS.envSky.w as moon lit-fraction.
     return {
       mode: 2,
       intensity: num(p.intensity, 1.0),
       turbidity: num(p.turbidity, 1.0),
       mieG:      num(p.mieG, 0.76),
+      sky: [0, 0, 0, Math.max(0, Math.min(1, num(p.moonPhase, 0.5)))],
       sun: [sunDir[0], sunDir[1], sunDir[2], sunColor.visibility]
     };
   }
@@ -48082,9 +48210,10 @@ function _rtExtractLight(lightNode) {
         intensity: num(p.intensity, 4.0)
       };
     case "Sun": {
-      // 7.5.4.c -- Sun is a DirectionalLight whose direction + color
-      // come from timeOfDay. Engine receives it as a regular
-      // Light::Directional so no engine-side change is needed.
+      // 7.5.4.c-polish -- emits sunlight by day, moonlight by night
+      // (with direction flipped to come FROM the moon's position so
+      // the scene gets cool-blue fill at night). Engine receives it
+      // as a regular Light::Directional regardless of which mode.
       const t = num(p.timeOfDay, 0.5);
       const sunDir = _sunDirFromTime(t);
       const sc = _sunColorFromElevation(sunDir[1]);
@@ -48092,9 +48221,12 @@ function _rtExtractLight(lightNode) {
       const tintG = num(p.tintG, 1.0);
       const tintB = num(p.tintB, 1.0);
       const scale = num(p.intensityScale, 1.0);
+      const lightDir = sc.isNight
+        ? [-sunDir[0], -sunDir[1], -sunDir[2]]
+        : sunDir;
       return {
         type: "directional",
-        direction: sunDir,
+        direction: lightDir,
         color:     [sc.r * tintR, sc.g * tintG, sc.b * tintB],
         intensity: sc.intensity * scale
       };
