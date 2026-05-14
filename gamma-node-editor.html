@@ -47719,6 +47719,11 @@ async function _rtSceneConnect(nodeId, inst) {
       } else if (msg.type === "error") {
         console.warn("[rt-scene] engine error:", msg.where, msg.message);
         inst.error = (msg.where || "engine") + ": " + msg.message;
+        // 7.5.6.h-status -- promote engine-side errors to inst.status
+        // so the node's fallback clear color reflects them. WS is
+        // still alive; future frames will replace the red clear if
+        // the engine recovers.
+        inst.status = "error";
       }
     } else {
       // Binary frame -- raw RGBA8 pixel data. Stash for the next
@@ -47828,15 +47833,33 @@ function _encodeRtScenePass(enc, entry) {
     inst.pendingFrame = null;
   }
 
-  // If we don't have a texture yet (still connecting / no
-  // frame-config received), clear the layer to a deep navy + return.
-  // Downstream consumers see a flat color; no crash.
+  // If we don't have a texture yet (still connecting / no frame-
+  // config received), clear the layer to a status-coded color +
+  // return. Downstream consumers see a flat color; no crash. The
+  // color tells the user at a glance which failure mode they're in
+  // without having to open dev tools (the actual error message is
+  // still in inst.error / the browser console).
+  //
+  //   navy   = waiting / connecting (normal startup)
+  //   red    = engine reported an error (look at inst.error)
+  //   crimson= compile-server not detected (start gamma-compile-server)
+  //   amber  = WS closed (auto-reconnecting; usually transient)
+  // 7.5.6.h-status -- pre-fix, the fallback was always navy regardless
+  // of why we had no texture, which meant "engine crashed" looked
+  // identical to "I just opened the editor."
   if (!inst.bindGroup || !inst.texture) {
+    let clearValue;
+    switch (inst.status) {
+      case "error":     clearValue = { r: 0.50, g: 0.06, b: 0.06, a: 1.0 }; break;
+      case "no-server": clearValue = { r: 0.25, g: 0.05, b: 0.05, a: 1.0 }; break;
+      case "closed":    clearValue = { r: 0.20, g: 0.10, b: 0.03, a: 1.0 }; break;
+      default:          clearValue = { r: 0.02, g: 0.03, b: 0.05, a: 1.0 }; break;
+    }
     enc.beginRenderPass({
-      label: "rt-scene-clear-" + node.id,
+      label: "rt-scene-clear-" + node.id + "-" + (inst.status || "init"),
       colorAttachments: [{
         view: layerView,
-        clearValue: { r: 0.02, g: 0.03, b: 0.05, a: 1.0 },
+        clearValue: clearValue,
         loadOp: "clear",
         storeOp: "store"
       }]

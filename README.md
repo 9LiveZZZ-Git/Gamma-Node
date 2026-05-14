@@ -1,10 +1,10 @@
 # Gamma Node Editor
 
-A browser-native visual node editor for real-time audio. Patches authored in the editor compile to plain [Gamma](https://github.com/AlloSphere-Research-Group/Gamma) C++ — and, with the optional local compile daemon, run as live WebAssembly inside the page. **205+ built-in DSP nodes**, an in-page AI assistant, voice + handwriting input, full touch / iPad support, and end-to-end live performance from a Mac, iPad, or Chromebook on the same Wi-Fi.
+A browser-native visual node editor for real-time audio AND visuals. Patches authored in the editor compile to plain [Gamma](https://github.com/AlloSphere-Research-Group/Gamma) C++ — and, with the optional local compile daemon, run as live WebAssembly inside the page. **205+ built-in DSP nodes** plus a WebGPU visual layer (shader-frag, 3D scenes, post-processing, video input), an in-page AI assistant, voice + handwriting input, full touch / iPad support, and end-to-end live performance from a Mac, iPad, or Chromebook on the same Wi-Fi.
 
 Designed as the visual companion to [AlloLib Studio Online](https://allolib.dev) — beginners can patch interactively without writing a `gam::` declaration by hand, advanced users use the editor as scaffolding before taking the generated code over, and live performers run the whole loop in-browser.
 
-> **Heads-up — visuals are coming, not here yet.** The roadmap's next phase is a WebGPU-native visual layer (shaders, 3D, video, audio reactivity). Today the editor is a *very* well-equipped audio environment; the visual side is in active development. `docs/ROADMAP.md` (gitignored, local) tracks current direction.
+> **Optional power-up — hardware ray tracing.** On Apple Silicon (M-series), an optional native binary alongside the compile daemon runs *real* path-traced rendering (glass, mirrors, soft shadows via area lights, MetalFX TDS denoising + upscaling) and streams the result back into the editor as just another texture. Falls back gracefully to the WebGPU raster path without it. See "Hardware ray tracing" below.
 
 ## Quick start
 
@@ -129,6 +129,72 @@ python -m http.server 8000
 
 ⚠ `--host 0.0.0.0` exposes `/compile` to your LAN; the endpoint runs Emscripten on whatever C++ it receives. **Only do this on a trusted network** (your home Wi-Fi, not a coffee shop).
 
+## Hardware ray tracing (optional, M-series Mac)
+
+The editor has a `RayTracedScene` node that mirrors the regular raster `Scene` node's inputs (meshes, transforms, camera, lights, materials) but renders the result with **true path tracing** instead of rasterization — real refraction through `GlassMat`, real mirror chains through `MirrorMat`, real soft shadows from `AreaLight`, hardware-accelerated traversal, and Apple's MetalFX temporal denoiser + upscaler doing the cleanup.
+
+The rendering itself happens in a separate native binary, `gamma-rt-engine` (Rust + Metal), that lives alongside `gamma-compile-server`. The editor talks to the engine over a local WebSocket and consumes the streamed frames as a regular `texture` output — so downstream nodes (BlendShader, CRT, post-processing, VisualOutput) consume it like any other layer.
+
+**Hardware support:**
+
+| GPU | RT path | Status |
+|---|---|---|
+| Apple M3 / M4 / M5 | Metal-RT hardware traversal + MetalFX denoise+upscale | Production-grade. Hold 60 fps at `preview` preset / 720p |
+| Apple M1 / M2 | Metal-RT software traversal (MPS) + MetalFX | Preview-quality at `draft` preset. Software traversal is the bottleneck |
+| Anything else | Falls back to raster `Scene` automatically | RT node displays a status-coded fallback color (no engine = dark navy; engine error = red) |
+
+PC (NVIDIA / AMD / Intel Arc) Vulkan-RT support is planned but not yet shipped — track `docs/RAYTRACING.md` for the phase plan.
+
+### Installing the engine
+
+Requires **Rust 1.78+** and **Xcode Command Line Tools** (for the Metal SDK headers).
+
+```bash
+# The engine lives in the same repo as the compile daemon, in a
+# sibling rt-engine/ directory. Clone, build, run:
+git clone https://github.com/9LiveZZZ-Git/gamma-compile-server
+cd gamma-compile-server
+cargo build --release --manifest-path rt-engine/Cargo.toml
+
+# Then start the engine. Two patterns work:
+#
+# A) Auto-spawn: just start the compile-server normally; it'll
+#    spawn the engine as a child process on first /health probe.
+node bin/gamma-compile-server.js
+#
+# B) Run separately (better for iterating on engine code -- the
+#    engine logs go to their own terminal, and you can Ctrl-C +
+#    restart the engine without touching the compile-server).
+#    Terminal 1:
+cargo run --release --manifest-path rt-engine/Cargo.toml
+#    Terminal 2:
+node bin/gamma-compile-server.js
+```
+
+Engine listens on `ws://127.0.0.1:9100/`. The editor probes `/health` on the compile-server to discover the engine, then connects to the engine **directly** (Chrome's mixed-content rules explicitly allow `ws://` to loopback from `https://` origins).
+
+### Quality presets
+
+The `RayTracedScene` node has a `quality` dropdown that drives both samples-per-pixel and bounce depth:
+
+| Preset | spp | bounces | What it's for |
+|---|---|---|---|
+| `draft` | 1 | 2 | Live editing. Intentionally grainy; TDS handles the bulk of the cleanup |
+| `preview` | 4 | 4 | The default. "Looks ok in motion"; targets 60 fps at 720p on M4 |
+| `final` | 16 | 8 | Render-grade. Multi-bounce, denoised. Use for stills + recorded video |
+
+Plus a `displaySize` (480p / 600p / 720p / 900p / 1080p) and `renderScale` (`native` / `quality` / `balanced` / `performance` / `ultra`) pair — same DLSS/FSR convention. At `balanced` the kernel shades at 66 % of the display dim and MetalFX upscales to native; `performance` is 50 %, `ultra` is 35 %.
+
+Try the **RT Quality Preset** demo from the demo browser to see all of these working together.
+
+### Troubleshooting
+
+- **Node viewport is dark navy:** engine isn't responding. Most likely the compile-server hasn't been started, or the engine binary isn't built. Check the compile-server's startup log.
+- **Node viewport is dark crimson:** editor connected to the compile-server but couldn't reach the engine. Verify `gamma-rt-engine` is running on port 9100 (`lsof -i :9100` on macOS).
+- **Node viewport is bright red:** the engine started, the WS connected, but the engine reported an error (shader compile failure, scene parse error, OOM). Open the browser console — the message is in `[rt-scene] engine error:` and the engine's stdout has the matching warn line.
+- **Node viewport is amber:** WS closed unexpectedly; the editor will auto-reconnect within 2 s. Common after a `cargo build` if you forgot to restart the engine process.
+- **"Port 9100 already in use; assuming external instance":** the compile-server saw an orphaned engine from a previous run. Kill it (`pkill gamma-rt-engine` or `lsof -ti :9100 | xargs kill`) and restart the compile-server so it spawns the fresh binary.
+
 ### Touch gestures
 
 | Gesture | Effect |
@@ -160,9 +226,9 @@ Topo-sort the graph from sinks back to sources, declare a C++ member for each st
 
 ## Status
 
-**v0.1.8 — audio side is feature-complete for v1.** Phases 0–5 of the roadmap shipped: codegen correctness, editor polish, User DSP UX, multi-output codegen, real-time audio preview via local daemon, master-clock + sequencing + automation. AI panel, voice / handwriting input, group nodes, full touch + iPad UX all live.
+**Audio side (Phases 0–5):** feature-complete for v1. Codegen correctness, editor polish, User DSP UX, multi-output codegen, real-time audio preview via local daemon, master-clock + sequencing + automation. AI panel, voice / handwriting input, group nodes, full touch + iPad UX.
 
-**Next up: Phase 6 — WebGPU-native visual layer.** Shader nodes, audio-reactive uniforms, a polymorphic `.gdsp` format that accepts WGSL bodies. WebGPU rather than WebGL2 — designed for live-performance latency targets. See `docs/ROADMAP.md` for the current ticket breakdown.
+**Visual side (Phases 6–7 in progress):** WebGPU-native pipeline shipping in waves. Done so far: shader-frag nodes, audio-reactive uniforms, dynamic-WGSL `.gdsp` kind, video input + edit suite, 3D scene primitives + transforms + PBR / Phong / Unlit materials + Directional / Point / Spot / Area lights, glass + mirror RT materials, hardware ray tracing via the optional `gamma-rt-engine` (Phase 7 §5.6 — Mac path complete with MetalFX denoise + upscale; PC Vulkan-RT path queued). See `docs/ROADMAP.md` and `docs/RAYTRACING.md` for the phase plans.
 
 ## Credits
 
