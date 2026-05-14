@@ -31183,6 +31183,159 @@ const _demos = [
     }
   },
 
+  /* Sprint 7.5.6.f.3.d-fix6 -- quality preset comparison harness.
+   * The scene piles on the things extra spp + bounces actually fix:
+   * a mirror ball reflecting two glass balls + a warm-colored floor.
+   *
+   *   draft   (1 spp, 2 bounces): glass refraction terminates after
+   *           one in/out pair so the mirror BEHIND the glass shows
+   *           as solid sky color through it. Floor specular caustic
+   *           under each glass ball is firefly-grainy. Mirror's
+   *           reflection of the glass-front shows as sky too.
+   *   preview (4 spp, 4 bounces): glass refraction reveals the floor
+   *           + opposite glass through it. Mirror reflects the glass
+   *           balls cleanly. Per-frame noise mostly cleared by TDS.
+   *   final   (16 spp, 8 bounces): mirror -> glass-in -> glass-out
+   *           -> scene chain resolves; you can see the floor color
+   *           through nested refraction. Static-frame noise drops
+   *           to near-zero on the glass + mirror surfaces.
+   *
+   * Toggle the `quality` knob on the RayTracedScene node to A/B.
+   * Orbit is slow (bpm=4, ~15s per revolution) so you can pause-
+   * watch noise behavior between preset switches. Mirror is set
+   * back behind the two glass balls so it dominates center-frame
+   * and gets refracted through the glass at the same time. */
+  {
+    id: "rt-quality-preset",
+    name: "RT Quality Preset",
+    sub: "draft / preview / final · A/B",
+    type: "visual",
+    thumb: `<svg viewBox="0 0 100 44">
+      <defs>
+        <radialGradient id="dg-rt-qp-mirror" cx="0.5" cy="0.4" r="0.55">
+          <stop offset="0"   stop-color="rgba(240,245,255,1)"/>
+          <stop offset="0.5" stop-color="rgba(140,165,200,1)"/>
+          <stop offset="1"   stop-color="rgba(30,40,70,1)"/>
+        </radialGradient>
+        <radialGradient id="dg-rt-qp-glass" cx="0.5" cy="0.45" r="0.5">
+          <stop offset="0"    stop-color="rgba(220,240,255,0.95)"/>
+          <stop offset="0.7"  stop-color="rgba(160,200,235,0.75)"/>
+          <stop offset="1"    stop-color="rgba(180,200,235,1)"/>
+        </radialGradient>
+        <linearGradient id="dg-rt-qp-floor" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stop-color="rgba(150,90,60,1)"/>
+          <stop offset="1" stop-color="rgba(70,40,28,1)"/>
+        </linearGradient>
+      </defs>
+      <rect width="100" height="44" fill="rgba(3,4,8,1)"/>
+      <rect x="0" y="32" width="100" height="12" fill="url(#dg-rt-qp-floor)"/>
+      <ellipse cx="20" cy="33" rx="7"  ry="1.2" fill="rgba(0,0,0,0.45)"/>
+      <ellipse cx="50" cy="34" rx="13" ry="1.8" fill="rgba(0,0,0,0.7)"/>
+      <ellipse cx="80" cy="33" rx="7"  ry="1.2" fill="rgba(0,0,0,0.45)"/>
+      <circle cx="50" cy="22" r="11" fill="url(#dg-rt-qp-mirror)"/>
+      <circle cx="20" cy="26" r="7"  fill="url(#dg-rt-qp-glass)"
+              stroke="rgba(255,255,255,0.4)" stroke-width="0.4"/>
+      <circle cx="80" cy="26" r="7"  fill="url(#dg-rt-qp-glass)"
+              stroke="rgba(255,255,255,0.4)" stroke-width="0.4"/>
+      <text x="92" y="10" text-anchor="end"
+            font-family="monospace" font-size="5"
+            fill="rgba(232,140,60,0.85)"
+            letter-spacing="0.08em">QP</text>
+    </svg>`,
+    build: () => {
+      // Warm-colored floor -- the saturation makes indirect bounces
+      // from the `final` preset (8 bounces) visibly tint the upper
+      // hemisphere of the spheres. A neutral gray floor would hide
+      // this difference. shininess=24 keeps the specular highlight
+      // small enough that diffuse bounce dominates.
+      const plane    = makeNode("Plane",       40,  40, { width: 8, depth: 8 });
+      const planeMat = makeNode("PhongMat",   280,  40, {
+        r: 0.85, g: 0.55, b: 0.35, shininess: 24, ambient: 0.18
+      });
+
+      // Left glass ball -- foreground, slightly toward camera
+      const glass1Ball = makeNode("Sphere",     40, 220, { radius: 0.4, stacks: 32, slices: 48 });
+      const glass1Tr   = makeNode("Translate", 280, 220, { x: -0.85, y: 0.4, z: 0.6 });
+      const glass1Mat  = makeNode("GlassMat",  500, 220, { r: 0.95, g: 1.0, b: 0.98, ior: 1.5 });
+
+      // Right glass ball -- mirror image of left
+      const glass2Ball = makeNode("Sphere",     40, 420, { radius: 0.4, stacks: 32, slices: 48 });
+      const glass2Tr   = makeNode("Translate", 280, 420, { x:  0.85, y: 0.4, z: 0.6 });
+      const glass2Mat  = makeNode("GlassMat",  500, 420, { r: 0.98, g: 0.95, b: 1.0, ior: 1.5 });
+
+      // Mirror ball -- back center, large enough to dominate center
+      // frame even with glass in front. The bounce-budget stressor:
+      // mirror -> reflects glass-front -> glass refracts -> resolves
+      // into floor/sky. At MAX_BOUNCES=2 the mirror's reflection of
+      // glass shows as sky color; at MAX_BOUNCES=4+ the floor color
+      // resolves through the chain.
+      const mirrorBall = makeNode("Sphere",     40, 620, { radius: 0.65, stacks: 40, slices: 56 });
+      const mirrorTr   = makeNode("Translate", 280, 620, { x: 0.0, y: 0.65, z: -0.5 });
+      const mirrorMat  = makeNode("MirrorMat", 500, 620, { r: 0.92, g: 0.92, b: 0.96 });
+
+      // Bright warm directional light -- positioned so the glass
+      // balls cast visible refractive caustics on the floor (the
+      // single-sample firefly noise high-spp cleans up the most).
+      const light = makeNode("DirectionalLight", 40, 820, {
+        dirX: 0.25, dirY: 1.0, dirZ: 0.3,
+        colorR: 1.0, colorG: 0.96, colorB: 0.88,
+        intensity: 1.15
+      });
+
+      // Slow orbit -- bpm=4 ~= 15s per revolution. Slow enough you
+      // can stare at a preset switch and watch the noise settle (or
+      // not). Pause-friendly.
+      const clk    = makeNode("MasterClock", 40, 1020, { bpm: 4 });
+      const mulTau = makeNode("Mul",        260, 1020, { b: 6.283185307 });
+      const sinC   = makeNode("Sin",        460, 1000);
+      const cosC   = makeNode("Cos",        460, 1100);
+      const mulCx  = makeNode("Mul",        640, 1000, { b: 3.0 });
+      const mulCz  = makeNode("Mul",        640, 1100, { b: 3.0 });
+      const cam    = makeNode("Camera",     860, 1020, {
+        posX: 0, posY: 1.1, posZ: 3.0,
+        targetX: 0, targetY: 0.4, targetZ: 0,
+        fov: 50, near: 0.1, far: 100, mode: 0
+      });
+
+      // Starting preset = preview (the default). User toggles
+      // `quality` to draft (0) / final (2) to A/B. The preset
+      // drives spp + bounces on the engine side; samples / bounces
+      // params remain at 0 so they follow the preset.
+      const rt = makeNode("RayTracedScene", 1100, 320, {
+        quality: 1,
+        clearR: 0.03, clearG: 0.03, clearB: 0.06
+      });
+      const vo = makeNode("VisualOutput",   1340, 320, { display: 0 });
+
+      // ── Floor chain
+      state.edges.push({ from: { node: plane,    port: "mesh" }, to: { node: planeMat, port: "mesh" } });
+      state.edges.push({ from: { node: planeMat, port: "mesh" }, to: { node: rt,       port: "mesh1" } });
+      // ── Left glass chain
+      state.edges.push({ from: { node: glass1Ball, port: "mesh" }, to: { node: glass1Tr,  port: "mesh" } });
+      state.edges.push({ from: { node: glass1Tr,   port: "mesh" }, to: { node: glass1Mat, port: "mesh" } });
+      state.edges.push({ from: { node: glass1Mat,  port: "mesh" }, to: { node: rt,        port: "mesh2" } });
+      // ── Right glass chain
+      state.edges.push({ from: { node: glass2Ball, port: "mesh" }, to: { node: glass2Tr,  port: "mesh" } });
+      state.edges.push({ from: { node: glass2Tr,   port: "mesh" }, to: { node: glass2Mat, port: "mesh" } });
+      state.edges.push({ from: { node: glass2Mat,  port: "mesh" }, to: { node: rt,        port: "mesh3" } });
+      // ── Mirror chain
+      state.edges.push({ from: { node: mirrorBall, port: "mesh" }, to: { node: mirrorTr,  port: "mesh" } });
+      state.edges.push({ from: { node: mirrorTr,   port: "mesh" }, to: { node: mirrorMat, port: "mesh" } });
+      state.edges.push({ from: { node: mirrorMat,  port: "mesh" }, to: { node: rt,        port: "mesh4" } });
+      // ── Light + camera-orbit + output
+      state.edges.push({ from: { node: light,  port: "light"  }, to: { node: rt, port: "light1" } });
+      state.edges.push({ from: { node: cam,    port: "camera" }, to: { node: rt, port: "camera" } });
+      state.edges.push({ from: { node: clk,    port: "phase"  }, to: { node: mulTau, port: "a" } });
+      state.edges.push({ from: { node: mulTau, port: "out"    }, to: { node: sinC,   port: "in" } });
+      state.edges.push({ from: { node: mulTau, port: "out"    }, to: { node: cosC,   port: "in" } });
+      state.edges.push({ from: { node: sinC,   port: "out"    }, to: { node: mulCx,  port: "a" } });
+      state.edges.push({ from: { node: cosC,   port: "out"    }, to: { node: mulCz,  port: "a" } });
+      state.edges.push({ from: { node: mulCx,  port: "out"    }, to: { node: cam,    port: "posX" } });
+      state.edges.push({ from: { node: mulCz,  port: "out"    }, to: { node: cam,    port: "posZ" } });
+      state.edges.push({ from: { node: rt,     port: "out"    }, to: { node: vo,     port: "in" } });
+    }
+  },
+
   {
     id: "mesh-text",
     name: "Mesh Text",
