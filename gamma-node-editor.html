@@ -10073,6 +10073,8 @@ public:
       { n: "denoise", t: "param" },
       { n: "exposure", t: "param" },
       { n: "tonemap", t: "param" },
+      { n: "displaySize", t: "param" },
+      { n: "renderScale", t: "param" },
       { n: "clearR",  t: "param" },
       { n: "clearG",  t: "param" },
       { n: "clearB",  t: "param" }
@@ -10087,12 +10089,23 @@ public:
       denoise: 1,
       exposure: 0.0,
       tonemap: 1,         // 0=none, 1=ACES, 2=Reinhard, 3=AgX
+      // f.3.f-prep -- display target + internal render scale.
+      // displaySize is the OUTPUT resolution streamed to the editor
+      // (and what the user sees). renderScale is the fraction of
+      // displaySize the kernel actually shades; the engine's TDS
+      // scaler upscales kernel output back to displaySize. Both
+      // apply at WS-connect time -- changes require reloading the
+      // demo (live-reconfigure lands with the upscale wiring).
+      displaySize: "720p",   // 854x480 / 800x600 / 1280x720 / 1600x900 / 1920x1080
+      renderScale: "native", // native / quality / balanced / performance / ultra
       clearR: 0.02, clearG: 0.02, clearB: 0.04
     },
     methods: {},
     paramOptions: {
-      quality: ["draft", "preview", "final"],
-      tonemap: ["none", "ACES", "Reinhard", "AgX"]
+      quality:     ["draft", "preview", "final"],
+      tonemap:     ["none", "ACES", "Reinhard", "AgX"],
+      displaySize: ["480p", "600p", "720p", "900p", "1080p"],
+      renderScale: ["native", "quality", "balanced", "performance", "ultra"]
     },
     description: "Hardware ray-tracing scene sink. Requires gamma-compile-server to have the gamma-rt-engine binary installed (Rust monorepo sibling; see docs/RAYTRACING.md). Same inputs as Scene (meshes / camera / lights) but renders via native Vulkan-RT (PC) or Metal-RT (Mac) and streams the result as an H.264 video over WebSocket. Output is `texture`, so downstream nodes (CRT, BlendShader, post-processing) consume it like any other layer. Quality presets: draft (1spp, no denoise), preview (4spp + denoise + progressive accumulation), final (16spp + full multi-bounce path tracing + denoise). bounces caps recursion depth; samples is per-pixel-per-frame; denoise toggles the OIDN / MetalFX denoiser pass; exposure is the EV stop offset; tonemap picks the operator. Sprint 7.5.6.a part 1: NODE STUB ONLY -- the actual streaming pipeline lands in part 2. Falls back to a clear-color black when the engine isn't installed."
   },
@@ -47485,12 +47498,46 @@ async function _rtSceneConnect(nodeId, inst) {
     inst.lastQualityJson = null;
     try {
       ws.send(JSON.stringify({ type: "hello" }));
-      ws.send(JSON.stringify({ type: "configure", width: 800, height: 600 }));
+
+      // f.3.f-prep -- read display dims + render scale from the
+      // RayTracedScene node's params so the engine allocates at the
+      // requested output resolution. renderScale is the fraction of
+      // displaySize the kernel will shade (next-sprint TDS upscale
+      // path); the engine logs it but doesn't honor it yet. Applies
+      // at WS-connect time only -- live re-configure on param
+      // change lands with the upscale wiring.
+      const node = state.nodes.find(n => n.id === nodeId);
+      const DISPLAY_SIZES = {
+        "480p":  [854,  480],
+        "600p":  [800,  600],
+        "720p":  [1280, 720],
+        "900p":  [1600, 900],
+        "1080p": [1920, 1080]
+      };
+      const RENDER_SCALES = {
+        "native":      1.0,
+        "quality":     0.75,
+        "balanced":    0.66,
+        "performance": 0.5,
+        "ultra":       0.33
+      };
+      const ds = (node && node.params && node.params.displaySize) || "720p";
+      const rs = (node && node.params && node.params.renderScale) || "native";
+      const [dispW, dispH] = DISPLAY_SIZES[ds] || DISPLAY_SIZES["720p"];
+      const rsFloat = RENDER_SCALES[rs] != null ? RENDER_SCALES[rs] : 1.0;
+      ws.send(JSON.stringify({
+        type: "configure",
+        width: dispW,
+        height: dispH,
+        renderScale: rsFloat
+      }));
+      console.log("[rt-scene] configure: " + ds + " (" + dispW + "x" + dispH +
+                  ")  renderScale=" + rs + " (" + rsFloat + ")");
+
       // Sprint 7.5.6.a part 2e-2: route the initial scene send
       // through the poll function so the diff-tracking state stays
       // consistent. Sends a Scene message (the lastSceneSig=null
       // forces the "structural change" branch).
-      const node = state.nodes.find(n => n.id === nodeId);
       if (node) {
         _rtScenePollAndSend(node, inst);
       } else {
