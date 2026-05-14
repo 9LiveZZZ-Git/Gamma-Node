@@ -47241,6 +47241,15 @@ const _RT_DEFAULT_CAMERA = Object.freeze({
   far: 100
 });
 
+// 7.5.6.h-warmup -- when the engine resets TDS history (preset
+// change, scale change, reconnect) the first ~30 frames are
+// intrinsically less converged than steady-state. Holding the
+// previous frame for this many incoming frames hides the visual
+// "noise pop" without complicating the engine. ~1s at 30fps;
+// long enough for TDS to populate temporal history, short enough
+// that camera/scene drift over the hold isn't visible.
+const _RT_WARMUP_FRAMES = 30;
+
 /* Sprint 7.5.6.a part 2e-2 -- structural signature for the scene.
  * Stringifies the things that, if changed, require a full Scene
  * replace + AS rebuild on the engine side: which mesh-builder node
@@ -47448,6 +47457,16 @@ function _rtScenePollAndSend(node, inst) {
   if (qJson !== inst.lastQualityJson) {
     try {
       inst.ws.send(JSON.stringify({ type: "params", patch: { quality: qObj } }));
+      // 7.5.6.h-warmup -- a real preset/spp/bounces change resets
+      // accumulation engine-side (set_spp / set_bounces both call
+      // reset_accumulation, plus TDS gets set_reset on frame_count
+      // == 0). Hide the warmup pop by holding the previous frame
+      // until TDS history rebuilds. Only fires when there's a
+      // PREVIOUS quality value (lastQualityJson != null), so the
+      // very first send after connect doesn't trigger this.
+      if (inst.lastQualityJson !== null && inst.heldFrame) {
+        inst.warmupFramesRemaining = _RT_WARMUP_FRAMES;
+      }
       inst.lastQualityJson = qJson;
     } catch (e) {
       console.warn("[rt-scene] quality params send failed:", e);
@@ -47565,6 +47584,18 @@ async function _rtSceneConnect(nodeId, inst) {
       // configure values).
       inst.lastConfigKey = ds + "|" + rs;
 
+      // 7.5.6.h-warmup -- if we had a previous session whose last
+      // frame is still in memory, hide TDS warmup by displaying the
+      // held frame for the first WARMUP_FRAMES we receive on this
+      // new connection. _rtSceneAllocateTexture clears heldFrame
+      // when dims change, so a displaySize change correctly falls
+      // through to "no held -> show new frames immediately."
+      if (inst.heldFrame) {
+        inst.warmupFramesRemaining = _RT_WARMUP_FRAMES;
+        console.log("[rt-scene] warmup-hide: holding previous frame for " +
+                    _RT_WARMUP_FRAMES + " frames after reconnect");
+      }
+
       // Sprint 7.5.6.a part 2e-2: route the initial scene send
       // through the poll function so the diff-tracking state stays
       // consistent. Sends a Scene message (the lastSceneSig=null
@@ -47604,7 +47635,22 @@ async function _rtSceneConnect(nodeId, inst) {
       // Binary frame -- raw RGBA8 pixel data. Stash for the next
       // render tick's queue.writeTexture; overwrite any older
       // pending frame (we only display the freshest).
-      inst.pendingFrame = new Uint8Array(ev.data);
+      const incoming = new Uint8Array(ev.data);
+      if (inst.warmupFramesRemaining > 0 && inst.heldFrame &&
+          inst.heldFrame.byteLength === incoming.byteLength) {
+        // 7.5.6.h-warmup -- during TDS warmup, show the previous
+        // frame instead of the noisy incoming one. heldFrame stays
+        // unchanged so every warmup-hide tick displays the same
+        // pre-reset content. The byteLength guard catches a stale
+        // heldFrame whose dims don't match the current texture
+        // (defense; _rtSceneAllocateTexture should already null
+        // heldFrame on dim change).
+        inst.pendingFrame = inst.heldFrame;
+        inst.warmupFramesRemaining--;
+      } else {
+        inst.pendingFrame = incoming;
+        inst.heldFrame = incoming;
+      }
       inst.frameCount++;
       inst.lastFrameAt = performance.now();
       if (inst.frameCount === 1) {
@@ -47635,6 +47681,12 @@ async function _rtSceneConnect(nodeId, inst) {
 function _rtSceneAllocateTexture(inst, width, height) {
   if (inst.width === width && inst.height === height && inst.texture) return;
   if (inst.texture) try { inst.texture.destroy(); } catch (_) {}
+  // 7.5.6.h-warmup -- a dim change invalidates any held frame
+  // (different byteLength = can't blit into the new texture). Clear
+  // it so the new connection falls through to "no held -> show new
+  // frames immediately."
+  inst.heldFrame = null;
+  inst.warmupFramesRemaining = 0;
   inst.width = width;
   inst.height = height;
   inst.texture = Visual.device.createTexture({
