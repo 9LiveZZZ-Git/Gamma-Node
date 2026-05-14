@@ -10031,11 +10031,27 @@ public:
       { n: "environment", t: "environment" },
       { n: "clearR",      t: "param" },
       { n: "clearG",      t: "param" },
-      { n: "clearB",      t: "param" }
+      { n: "clearB",      t: "param" },
+      // Sprint 7.5.4.e -- distance fog. fogDensity=0 disables (default).
+      //   fogDensity  -- Beer-Lambert coefficient, ~0.01-0.05 typical
+      //   fogStart    -- distance before fog kicks in
+      //   fogHeight   -- 0 = uniform; >0 = ground fog (clouds stay clear)
+      //   fogAuto     -- 1 = pull color from env in camera-forward;
+      //                  0 = use fogR/G/B manual color
+      //   fogR/G/B    -- manual fog color (used when fogAuto = 0)
+      { n: "fogDensity", t: "param" },
+      { n: "fogStart",   t: "param" },
+      { n: "fogHeight",  t: "param" },
+      { n: "fogAuto",    t: "param" },
+      { n: "fogR",       t: "param" },
+      { n: "fogG",       t: "param" },
+      { n: "fogB",       t: "param" }
     ],
     outs: [{ n: "out", t: "texture" }],
     params: {
-      clearR: 0.04, clearG: 0.05, clearB: 0.09
+      clearR: 0.04, clearG: 0.05, clearB: 0.09,
+      fogDensity: 0.0, fogStart: 5.0, fogHeight: 0.0, fogAuto: 1.0,
+      fogR: 0.65, fogG: 0.70, fogB: 0.78
     },
     methods: {},
     description: "3D scene sink. Wire up to four `mesh` inputs (Box/Sphere/Plane/Torus/Cylinder/Cone via sprint 7.5.3b primitives, or DebugTriangle for the simplest smoke test) and one `camera` input from a Camera node. Renders the meshes through the camera into a framebuffer layer; output is `texture`-typed so the result flows into the existing post-processing graph (CRT, Bloom, BlendShader, etc.). clearR/G/B is the background color (default a deep navy). Depth-tested; meshes farther from the camera are correctly occluded. Sprint 7.5.3c adds materials + lighting; until then the pipeline is unlit + uses per-vertex colors."
@@ -10734,7 +10750,15 @@ public:
       // 0 / 1 = new moon (no visible disk), 0.5 = full moon. Wire
       // a very slow MasterClock for an animated lunar cycle (a real
       // month is 29.5 days; in 60s-day units that's a 30-min loop).
-      { n: "moonPhase", t: "param" }
+      { n: "moonPhase",     t: "param" },
+      // Sprint 7.5.4.d -- cloud layer. coverage=0 turns clouds off
+      // entirely (default). 0.3-0.7 is typical for partly cloudy.
+      // density scales how thick / opaque the clouds read; wind
+      // drifts the noise field over time.
+      { n: "cloudCoverage", t: "param" },
+      { n: "cloudDensity",  t: "param" },
+      { n: "windSpeedX",    t: "param" },
+      { n: "windSpeedZ",    t: "param" }
     ],
     outs: [{ n: "env", t: "environment" }],
     params: {
@@ -10742,7 +10766,11 @@ public:
       turbidity: 1.0,
       mieG:      0.76,
       intensity: 1.0,
-      moonPhase: 0.5
+      moonPhase: 0.5,
+      cloudCoverage: 0.0,
+      cloudDensity:  1.0,
+      windSpeedX:    0.0,
+      windSpeedZ:    0.0
     },
     methods: {},
     description: "Hand-tuned atmospheric-scattering sky. timeOfDay drives a day/night cycle: noon -> blue zenith + pale horizon, sunset -> orange-red sky + dim ground, midnight -> deep blue night sky. turbidity pushes the daytime color toward warmer/hazier tones (high turbidity = orange sunsets bleeding longer into the day). mieG controls the forward-scatter anisotropy: 0.76 gives a textbook sun-halo; higher = tighter glow, lower = broader fuzzy sun. Wire `DayNightCycle.timeOfDay` into this AND into the Sun node so the sky's sun-disk + the DirectionalLight come from the same direction at the same color. NOT physically accurate (no integrated transmittance) but reads as 'sky' through the cycle. Hosek-Wilkie implementation is a future polish."
@@ -31869,7 +31897,10 @@ const _demos = [
         intensityScale: 1.0
       });
       const sky    = makeNode("ProceduralSky", 500, 1020, {
-        timeOfDay: 0.5, turbidity: 1.2, mieG: 0.78, intensity: 1.0
+        timeOfDay: 0.5, turbidity: 1.2, mieG: 0.78, intensity: 1.0,
+        // 7.5.4.d -- partly cloudy with slow westward drift.
+        cloudCoverage: 0.45, cloudDensity: 1.0,
+        windSpeedX: 0.8, windSpeedZ: 0.3
       });
 
       // ── Camera orbit (independent slow clock so it doesn't sync
@@ -31887,7 +31918,11 @@ const _demos = [
       });
 
       const scene = makeNode("Scene",       1100, 320, {
-        clearR: 0.02, clearG: 0.02, clearB: 0.04
+        clearR: 0.02, clearG: 0.02, clearB: 0.04,
+        // 7.5.4.e -- ground-fog pulled from env-horizon color. Tints
+        // the floor's far edge toward whatever the sky horizon is
+        // doing (sunset orange, midday blue, etc).
+        fogDensity: 0.06, fogStart: 3.5, fogHeight: 1.5, fogAuto: 1.0
       });
       const vo = makeNode("VisualOutput",   1340, 320, { display: 0 });
 
@@ -46146,7 +46181,115 @@ struct PerScene {
   camRight:   vec4<f32>,
   camUp:      vec4<f32>,
   camForward: vec4<f32>,
+  // Sprint 7.5.4.d -- volumetric-ish clouds. 2D fbm on a cloud plane
+  // sampled per view ray. ProceduralSky resolver packs these; other
+  // env sources leave them zero (no clouds shown).
+  //   envCloudParams.x = coverage [0,1]
+  //   envCloudParams.y = density multiplier (0 = clear sky)
+  //   envCloudParams.z = wind X offset (= windSpeedX * elapsed_s)
+  //   envCloudParams.w = wind Z offset (= windSpeedZ * elapsed_s)
+  envCloudParams: vec4<f32>,
+  // Sprint 7.5.4.e -- distance fog (Scene-level, not env-side).
+  //   envFogParams.x  = density (Beer-Lambert e^(-density * dist))
+  //   envFogParams.y  = start distance (no fog inside this)
+  //   envFogParams.z  = height falloff (0 = uniform; >0 = ground fog)
+  //   envFogParams.w  = autoPullEnv (>0.5 = sample env in camera-fwd
+  //                    for fog color; otherwise use envFogColor.rgb)
+  //   envFogColor.rgb = manual fog color
+  envFogParams: vec4<f32>,
+  envFogColor:  vec4<f32>,
 };
+
+// Sprint 7.5.4.e -- ACES filmic tonemap. Maps HDR (values > 1) into
+// LDR [0,1] smoothly so bright highlights preserve detail instead
+// of clipping at the framebuffer write. For values <= 1 the curve
+// is nearly identity (slight contrast bump); HDR values get
+// compressed nicely. Applied at the end of every lit fragment
+// shader so HDRI / ProceduralSky output doesn't blow out.
+fn tonemap_aces(x: vec3<f32>) -> vec3<f32> {
+  let a = 2.51;
+  let b = 0.03;
+  let c = 2.43;
+  let d = 0.59;
+  let e = 0.14;
+  let num = x * (a * x + b);
+  let den = x * (c * x + d) + e;
+  return clamp(num / max(den, vec3<f32>(1e-5)), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+// Sprint 7.5.4.d -- 2D value noise + fbm for clouds. Sampled on a
+// virtual cloud plane (at world altitude h) via view ray intersect.
+// Wind drifts the noise UV over time (offsets are pre-computed JS).
+fn _hash21(p: vec2<f32>) -> f32 {
+  return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453);
+}
+fn _noise2d(p: vec2<f32>) -> f32 {
+  let i = floor(p);
+  let f = fract(p);
+  let u = f * f * (3.0 - 2.0 * f);
+  let a = _hash21(i);
+  let b = _hash21(i + vec2<f32>(1.0, 0.0));
+  let c = _hash21(i + vec2<f32>(0.0, 1.0));
+  let d = _hash21(i + vec2<f32>(1.0, 1.0));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+fn _fbm(p: vec2<f32>) -> f32 {
+  var v: f32 = 0.0;
+  var amp: f32 = 0.5;
+  var freq: f32 = 1.0;
+  for (var i = 0; i < 5; i = i + 1) {
+    v = v + amp * _noise2d(p * freq);
+    freq = freq * 2.07;
+    amp  = amp  * 0.5;
+  }
+  return v;
+}
+
+// Sample clouds for a given world view direction. Returns vec4
+// where rgb = lit cloud color and a = coverage alpha (0 = no
+// cloud, 1 = fully opaque). Only meaningful for upward view dirs
+// (dir.y > small threshold); below horizon -> 0.
+fn sample_clouds(dir: vec3<f32>) -> vec4<f32> {
+  let coverage = uS.envCloudParams.x;
+  let density  = uS.envCloudParams.y;
+  if (coverage <= 0.0 || density <= 0.0) {
+    return vec4<f32>(0.0);
+  }
+  // Below horizon -> no clouds. Smooth fade-in near the horizon
+  // band so clouds don't pop at the edge.
+  let yMask = smoothstep(0.0, 0.12, dir.y);
+  if (yMask <= 0.0) {
+    return vec4<f32>(0.0);
+  }
+  // Intersect view ray with cloud plane at altitude H. Standard
+  // ray-plane: pos = dir * t where t = H / dir.y.
+  let H = 250.0;
+  let t = H / max(dir.y, 0.02);
+  let pos = dir * t;
+  // Wind-drifted noise coordinate.
+  let wind = uS.envCloudParams.zw;
+  let xz = (pos.xz - wind) * 0.0025;
+  // Fractal density via 5-octave fbm; coverage threshold gates it
+  // (real cloud fronts have sharp edges, fbm is too smooth alone).
+  let raw = _fbm(xz);
+  let alpha = smoothstep(coverage * 0.85, coverage * 0.85 + 0.22, raw) * density * yMask;
+  // Cloud color: lit white-warm by sun (cos_theta with sunDir gives
+  // a coarse forward-scatter brightening), darkened by self-shadow
+  // approximation (1 - alpha gives a fake "thicker = darker bottom").
+  let cos_theta = clamp(dot(normalize(dir), uS.envSun.xyz), -1.0, 1.0);
+  let sunUp     = max(uS.envSun.y, 0.0);
+  let scatter   = pow(max(cos_theta * 0.5 + 0.5, 0.0), 2.0);
+  // Color picks a warm tint near sunset, cool at midday.
+  let sun_elev = clamp(uS.envSun.y, -1.0, 1.0);
+  let lit = mix(vec3<f32>(1.10, 0.85, 0.65),
+                vec3<f32>(1.05, 1.02, 0.98),
+                smoothstep(0.0, 0.35, sun_elev));
+  let shadow = vec3<f32>(0.35, 0.40, 0.50);
+  // Day intensity: clouds are dim at night, bright by day.
+  let day = smoothstep(-0.10, 0.20, sun_elev);
+  let cloudCol = mix(shadow, lit, scatter * uS.envSun.w) * day;
+  return vec4<f32>(cloudCol, clamp(alpha, 0.0, 0.95));
+}
 
 // Sprint 7.5.4.c-sky -- background sky pass. Fullscreen triangle
 // at clip-space z=1 (far plane); depth-test "less-equal" lets it
@@ -46192,6 +46335,34 @@ fn vs_sky(@builtin(vertex_index) vid: u32) -> SkyVsOut {
   return out;
 }
 
+// Sprint 7.5.4.e -- distance fog blend. Applied at end of lit
+// fragment shaders. Beer-Lambert exp(-density * (dist - start))
+// with optional height falloff so ground fog doesn't tint distant
+// mountaintops. Defined here (after sample_env) so the
+// autoPull-from-env path can call sample_env() in the camera-
+// forward direction for a fog color that matches the sky horizon.
+fn apply_fog(color: vec3<f32>, worldPos: vec3<f32>) -> vec3<f32> {
+  let density = uS.envFogParams.x;
+  if (density <= 0.0) { return color; }
+  let start = uS.envFogParams.y;
+  let hf    = uS.envFogParams.z;
+  let dist  = length(uS.eye.xyz - worldPos);
+  let beyond = max(dist - start, 0.0);
+  var heightFactor: f32 = 1.0;
+  if (hf > 0.0) {
+    heightFactor = smoothstep(hf * 2.0, 0.0, worldPos.y);
+  }
+  let factor = 1.0 - exp(-density * beyond * heightFactor);
+  var fogCol: vec3<f32>;
+  if (uS.envFogParams.w > 0.5) {
+    let camFwd = normalize(uS.camForward.xyz);
+    fogCol = sample_env(camFwd);
+  } else {
+    fogCol = uS.envFogColor.rgb;
+  }
+  return mix(color, fogCol, clamp(factor, 0.0, 1.0));
+}
+
 @fragment
 fn fs_sky(in: SkyVsOut) -> @location(0) vec4<f32> {
   // Sprint 7.5.4.c-polish -- sky background pass includes the
@@ -46202,10 +46373,21 @@ fn fs_sky(in: SkyVsOut) -> @location(0) vec4<f32> {
   // surface normal and alias.
   let dir = normalize(in.worldDir);
   let mode = u32(uS.envParams.x);
+  var col: vec3<f32>;
   if (mode == 2u) {
-    return vec4<f32>(sample_procedural_sky(dir), 1.0);
+    col = sample_procedural_sky(dir);
+  } else {
+    col = sample_env(dir);
   }
-  return vec4<f32>(sample_env(dir), 1.0);
+  // Sprint 7.5.4.d -- composite clouds over the sky background.
+  // ProceduralSky resolver packs cloud coverage/density/wind; for
+  // other env sources cloud params stay 0 (sample_clouds returns
+  // zero-alpha, no visible change).
+  let cloud = sample_clouds(dir);
+  col = mix(col, cloud.rgb, cloud.a);
+  // 7.5.4.e -- ACES tonemap so HDR-range values (sun disk, bright
+  // HDRI pixels) don't clip-blow-out at the framebuffer write.
+  return vec4<f32>(tonemap_aces(col), 1.0);
 }
 
 // Sprint 7.5.4.c-physics -- atmospheric scattering with proper
@@ -46593,7 +46775,9 @@ fn fs_phong(in: VsOut) -> @location(0) vec4<f32> {
     lit = lit + albedo * nDotL * (1.0 - amb) * atten * li
               + vec3<f32>(spec) * atten * li * 0.6;
   }
-  return vec4<f32>(lit, 1.0);
+  // 7.5.4.e -- fog + tonemap, matches fs_pbr.
+  let fogged = apply_fog(lit, in.worldPos);
+  return vec4<f32>(tonemap_aces(fogged), 1.0);
 }
 
 // PhysicalMat fragment: Cook-Torrance microfacet BRDF (GGX D,
@@ -46653,7 +46837,12 @@ fn fs_pbr(in: VsOut) -> @location(0) vec4<f32> {
   let kD_amb = (vec3<f32>(1.0) - kS_amb) * (1.0 - metallic);
   let ambient = kD_amb * albedo * envDiffuse * 0.5
               + kS_amb * envSpec * (1.0 - roughness * 0.6);
-  return vec4<f32>(total + ambient, 1.0);
+  // 7.5.4.e -- fog + tonemap. Fog mixes toward env-horizon color at
+  // far distances; ACES compresses HDR ambient into [0,1] so HDRI /
+  // ProceduralSky bright reflections don't blow out.
+  let lit = total + ambient;
+  let fogged = apply_fog(lit, in.worldPos);
+  return vec4<f32>(tonemap_aces(fogged), 1.0);
 }`;
 
 /* Sprint 7.5.3a -- (re)allocate the depth + MSAA color textures at
@@ -47777,14 +47966,16 @@ function _ensureSceneInstance(sceneNode) {
   // perScene: viewProj (16) + eye (4) + lightCount (4) + lights[4]
   // (64) + envParams (4) + envSky (4) + envHorizon (4) + envGround
   // (4) + envSun (4) + camRight (4) + camUp (4) + camForward (4)
-  // = 120 floats = 480 bytes.
+  // + envCloudParams (4) + envFogParams (4) + envFogColor (4)
+  // = 132 floats = 528 bytes.
   // Sprint 7.5.3c push 3 grew this from 128 to 352 to hold up to 4
   // lights. Sprint 7.5.4 grew 352 -> 416 for environment data.
   // Sprint 7.5.4.c grew 416 -> 432 for the ProceduralSky sun vec4.
   // Sprint 7.5.4.c-sky grew 432 -> 480 for camera basis (sky pass).
+  // Sprint 7.5.4.d/e grew 480 -> 528 for cloud + fog data.
   const perSceneBuffer = Visual.device.createBuffer({
     label: "scene-perscene-" + sceneNode.id,
-    size: 480,
+    size: 528,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
   });
   // Sprint 7.5.3c bug fix -- queue.writeBuffer ordering. All
@@ -47841,7 +48032,7 @@ function _ensureSceneInstance(sceneNode) {
   inst = {
     perSceneBuffer,
     slots,
-    sceneScratch: new Float32Array(120),  // 480 bytes (sprint 7.5.4.c-sky -- + camera basis)
+    sceneScratch: new Float32Array(132),  // 528 bytes (sprint 7.5.4.d/e -- + clouds + fog)
     drawScratch:  new Float32Array(24)
   };
   Visual.sceneInstances.set(sceneNode.id, inst);
@@ -47962,6 +48153,9 @@ function _encodeScenePass(enc, entry) {
   //   [108..111] camRight    (vec4: xyz = world right, w = tanHFov*aspect)
   //   [112..115] camUp       (vec4: xyz = world up,    w = tanHFov)
   //   [116..119] camForward  (vec4: xyz = world fwd,   w = 0persp/1ortho)
+  //   [120..123] envCloudParams (vec4: x=coverage, y=density, z/w=wind)
+  //   [124..127] envFogParams   (vec4: x=density, y=start, z=hFalloff, w=autoEnv)
+  //   [128..131] envFogColor    (vec4: rgb=color)
   inst.sceneScratch.set(camera.viewProj, 0);
   inst.sceneScratch[16] = camera.eye[0];
   inst.sceneScratch[17] = camera.eye[1];
@@ -48028,7 +48222,24 @@ function _encodeScenePass(enc, entry) {
   inst.sceneScratch[108] = cR[0]; inst.sceneScratch[109] = cR[1]; inst.sceneScratch[110] = cR[2]; inst.sceneScratch[111] = cR[3];
   inst.sceneScratch[112] = cU[0]; inst.sceneScratch[113] = cU[1]; inst.sceneScratch[114] = cU[2]; inst.sceneScratch[115] = cU[3];
   inst.sceneScratch[116] = cF[0]; inst.sceneScratch[117] = cF[1]; inst.sceneScratch[118] = cF[2]; inst.sceneScratch[119] = cF[3];
-  Visual.device.queue.writeBuffer(inst.perSceneBuffer, 0, inst.sceneScratch.buffer, 0, 480);
+  // Sprint 7.5.4.d -- cloud params (from env source, typically ProceduralSky).
+  const cl = (env && env.cloud) || [0, 0, 0, 0];
+  inst.sceneScratch[120] = cl[0]; inst.sceneScratch[121] = cl[1]; inst.sceneScratch[122] = cl[2]; inst.sceneScratch[123] = cl[3];
+  // Sprint 7.5.4.e -- fog params (from Scene node's fog* params).
+  const sp = _resolveNodeParams(node);
+  const fogDensity = (typeof sp.fogDensity === "number") ? sp.fogDensity : 0;
+  const fogStart   = (typeof sp.fogStart   === "number") ? sp.fogStart   : 5;
+  const fogHeight  = (typeof sp.fogHeight  === "number") ? sp.fogHeight  : 0;
+  const fogAuto    = (typeof sp.fogAuto    === "number") ? sp.fogAuto    : 1;
+  const fogR       = (typeof sp.fogR       === "number") ? sp.fogR       : 0.65;
+  const fogG       = (typeof sp.fogG       === "number") ? sp.fogG       : 0.70;
+  const fogB       = (typeof sp.fogB       === "number") ? sp.fogB       : 0.78;
+  inst.sceneScratch[124] = fogDensity;
+  inst.sceneScratch[125] = fogStart;
+  inst.sceneScratch[126] = fogHeight;
+  inst.sceneScratch[127] = fogAuto;
+  inst.sceneScratch[128] = fogR; inst.sceneScratch[129] = fogG; inst.sceneScratch[130] = fogB; inst.sceneScratch[131] = 0;
+  Visual.device.queue.writeBuffer(inst.perSceneBuffer, 0, inst.sceneScratch.buffer, 0, 528);
 
   // Per-draw loop. Each mesh writes to its OWN per-slot buffer +
   // binds its OWN bind group, so multi-mesh draws work correctly
@@ -48353,13 +48564,24 @@ function _resolveSceneEnvironment(sceneNode) {
     // 7.5.4.c-polish -- pack moonPhase into envSky.w (unused slot
     // when mode=2 since GradientSky's sky colors are ignored for
     // ProceduralSky). Shader reads uS.envSky.w as moon lit-fraction.
+    // 7.5.4.d -- cloud params + wind offsets (= speed × elapsed s).
+    const elapsed = (typeof performance !== "undefined")
+      ? performance.now() * 0.001 : 0;
+    const windX = num(p.windSpeedX, 0.0) * elapsed;
+    const windZ = num(p.windSpeedZ, 0.0) * elapsed;
     return {
       mode: 2,
       intensity: num(p.intensity, 1.0),
       turbidity: num(p.turbidity, 1.0),
       mieG:      num(p.mieG, 0.76),
       sky: [0, 0, 0, Math.max(0, Math.min(1, num(p.moonPhase, 0.5)))],
-      sun: [sunDir[0], sunDir[1], sunDir[2], sunColor.visibility]
+      sun: [sunDir[0], sunDir[1], sunDir[2], sunColor.visibility],
+      cloud: [
+        Math.max(0, Math.min(1, num(p.cloudCoverage, 0.0))),
+        Math.max(0, num(p.cloudDensity, 1.0)),
+        windX,
+        windZ
+      ]
     };
   }
   if (src.type === "HDRI" || src.type === "Skybox") {
