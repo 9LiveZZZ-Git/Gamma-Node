@@ -46395,7 +46395,16 @@ function _ensureRtSceneInstance(node) {
     frameCount: 0,
     lastFrameAt: 0,
     error: null,
-    reconnectTimer: null
+    reconnectTimer: null,
+    // Sprint 7.5.6.a part 2e-2 -- live update tracking. Each render
+    // tick we re-derive these from the current graph state; if the
+    // string differs from what we last shipped to the engine, send
+    // an update. Camera-only changes get a cheap Params message;
+    // structural changes (mesh added/removed/swapped, geometry
+    // params edited) get a full Scene replace + AS rebuild.
+    lastCameraJson: null,
+    lastSceneSig: null,
+    lastClearSig: null
   };
   Visual.rtSceneInstances.set(node.id, inst);
   _rtSceneConnect(node.id, inst);
@@ -46535,6 +46544,86 @@ function _rtExtractCamera(camNode) {
   };
 }
 
+const _RT_DEFAULT_CAMERA = Object.freeze({
+  mode: "perspective",
+  pos: [0, 0, 2],
+  target: [0, 0, 0],
+  up: [0, 1, 0],
+  fov_deg: 60,
+  near: 0.1,
+  far: 100
+});
+
+/* Sprint 7.5.6.a part 2e-2 -- structural signature for the scene.
+ * Stringifies the things that, if changed, require a full Scene
+ * replace + AS rebuild on the engine side: which mesh-builder node
+ * is wired to each port, its geometry-affecting params (radius,
+ * slices, etc -- already captured by _meshCacheKey from the raster
+ * path), and which camera node is wired. Cheap to compute (one wire
+ * walk per port) so per-frame polling is fine. */
+function _rtComputeSceneSignature(rtNode) {
+  const parts = [];
+  for (let i = 1; i <= 4; i++) {
+    const portName = "mesh" + i;
+    const meshNode = _rtFindUpstreamMesh(rtNode.id, portName);
+    if (!meshNode) {
+      parts.push("-");
+      continue;
+    }
+    parts.push(meshNode.id + ":" + meshNode.type + ":" + _meshCacheKey(meshNode));
+  }
+  return parts.join("|");
+}
+
+/* Sprint 7.5.6.a part 2e-2 -- per-frame poll. Called from
+ * _encodeRtScenePass on every render tick the RayTracedScene is
+ * actually visible. Compares the camera + scene signature against
+ * what we last shipped and sends the minimal patch (Params for
+ * camera-only, full Scene for structural changes). No-op when the
+ * WS isn't open. */
+function _rtScenePollAndSend(node, inst) {
+  if (!inst.ws || inst.ws.readyState !== 1) return;
+
+  const p = node.params || {};
+  const num = (v, d) => (typeof v === "number" ? v : d);
+  const clearSig = num(p.clearR, 0.05) + "," + num(p.clearG, 0.06) + "," + num(p.clearB, 0.10);
+
+  const sceneSig = _rtComputeSceneSignature(node) + "|clr=" + clearSig;
+  if (sceneSig !== inst.lastSceneSig) {
+    // Structural change -- rebuild scene fully. This also resends the
+    // camera (it's part of the Scene payload), so reset the camera
+    // hash to whatever we shipped to avoid an immediate redundant
+    // Params follow-up next frame.
+    const sceneJson = _rtBuildSceneJson(node);
+    const camJson = JSON.stringify(sceneJson.camera);
+    try {
+      inst.ws.send(JSON.stringify({ type: "scene", patch: sceneJson }));
+      inst.lastSceneSig = sceneSig;
+      inst.lastCameraJson = camJson;
+      console.log("[rt-scene] scene replace (sig change) — " +
+                  sceneJson.meshes.length + " mesh(es)");
+    } catch (e) {
+      console.warn("[rt-scene] scene send failed:", e);
+    }
+    return;
+  }
+
+  // Same structure -- check camera. Cheap: just stringify the camera
+  // params and string-compare. The camera node's params change every
+  // time the user drags a slider, so this catches live orbit.
+  const camNode = _rtFindUpstreamByPort(node.id, "camera");
+  const camObj = camNode ? _rtExtractCamera(camNode) : _RT_DEFAULT_CAMERA;
+  const camJson = JSON.stringify(camObj);
+  if (camJson !== inst.lastCameraJson) {
+    try {
+      inst.ws.send(JSON.stringify({ type: "params", patch: { camera: camObj } }));
+      inst.lastCameraJson = camJson;
+    } catch (e) {
+      console.warn("[rt-scene] camera params send failed:", e);
+    }
+  }
+}
+
 async function _rtSceneConnect(nodeId, inst) {
   if (inst.ws && inst.ws.readyState <= 1) return;
   inst.status = "connecting";
@@ -46587,19 +46676,21 @@ async function _rtSceneConnect(nodeId, inst) {
     inst.status = "connected";
     inst.error = null;
     console.log("[rt-scene] connected for node " + nodeId);
+    // Reset send-tracking so the next poll fires a fresh scene+camera
+    // pair (which the poll function does on first invocation when
+    // both last-* fields are null).
+    inst.lastSceneSig = null;
+    inst.lastCameraJson = null;
     try {
       ws.send(JSON.stringify({ type: "hello" }));
       ws.send(JSON.stringify({ type: "configure", width: 800, height: 600 }));
-      // Sprint 7.5.6.a part 2e-1: ship the editor's scene state to
-      // the engine. Built fresh from the node graph on each connect
-      // (no live updates yet -- that's 2e-2). Empty meshes[] is
-      // fine; engine falls back to clear-color rendering.
+      // Sprint 7.5.6.a part 2e-2: route the initial scene send
+      // through the poll function so the diff-tracking state stays
+      // consistent. Sends a Scene message (the lastSceneSig=null
+      // forces the "structural change" branch).
       const node = state.nodes.find(n => n.id === nodeId);
       if (node) {
-        const sceneJson = _rtBuildSceneJson(node);
-        console.log("[rt-scene] sending scene: " + sceneJson.meshes.length +
-                    " mesh(es), camera@" + JSON.stringify(sceneJson.camera.pos));
-        ws.send(JSON.stringify({ type: "scene", patch: sceneJson }));
+        _rtScenePollAndSend(node, inst);
       } else {
         console.warn("[rt-scene] node " + nodeId + " gone before scene send; sending empty");
         ws.send(JSON.stringify({ type: "scene", patch: {
@@ -46697,6 +46788,12 @@ function _encodeRtScenePass(enc, entry) {
 
   const inst = _ensureRtSceneInstance(node);
   if (!inst) return false;
+
+  // Sprint 7.5.6.a part 2e-2 -- live update diff-send. Runs every
+  // frame the RT scene is visible; sends a Params or full Scene
+  // message ONLY when the wired state has changed since last send.
+  // No-op when the WS isn't open yet (initial scene goes via onopen).
+  _rtScenePollAndSend(node, inst);
 
   // Upload pending frame, if any, into the GPU texture.
   if (inst.pendingFrame && inst.texture &&
