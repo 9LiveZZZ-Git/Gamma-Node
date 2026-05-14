@@ -10748,6 +10748,71 @@ public:
     description: "Hand-tuned atmospheric-scattering sky. timeOfDay drives a day/night cycle: noon -> blue zenith + pale horizon, sunset -> orange-red sky + dim ground, midnight -> deep blue night sky. turbidity pushes the daytime color toward warmer/hazier tones (high turbidity = orange sunsets bleeding longer into the day). mieG controls the forward-scatter anisotropy: 0.76 gives a textbook sun-halo; higher = tighter glow, lower = broader fuzzy sun. Wire `DayNightCycle.timeOfDay` into this AND into the Sun node so the sky's sun-disk + the DirectionalLight come from the same direction at the same color. NOT physically accurate (no integrated transmittance) but reads as 'sky' through the cycle. Hosek-Wilkie implementation is a future polish."
   },
 
+  /* HDRI -- Sprint 7.5.4.b. Loads an equirectangular .hdr file
+   * (Radiance RGBE format) and exposes it as a true HDR environment.
+   * Drives both IBL ambient on PBR surfaces AND the sky background
+   * pass. Currently ships with one bundled test HDRI from PolyHaven
+   * (Table Mountain pure-sky 4K); add more entries to assets/hdri/
+   * + the `preset` paramOptions to expand the dropdown.
+   *
+   *   preset    -- which bundled HDRI to load. The HDR data parses
+   *                + uploads once on first selection, then caches
+   *                in Visual._hdriCache for the session.
+   *   intensity -- multiplier on the HDR values. 1.0 = literal HDR
+   *                (some values may exceed 1 -> clip in the LDR
+   *                framebuffer; lower intensity to dial exposure
+   *                down). Try 0.5 for dim, 2.0 for bright.
+   *
+   * The first frame after selecting a new preset has a ~200-500ms
+   * stall while the .hdr file is fetched + parsed + uploaded; that's
+   * one-shot per file per session. Subsequent renders are free. */
+  HDRI: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "environment",
+    ins: [
+      { n: "preset",    t: "param" },
+      { n: "intensity", t: "param" }
+    ],
+    outs: [{ n: "env", t: "environment" }],
+    params: {
+      preset: "table-mountain",
+      intensity: 1.0
+    },
+    methods: {},
+    paramOptions: {
+      preset: ["table-mountain"]
+    },
+    description: "Equirectangular HDR environment map. The bundled 'table-mountain' preset is a 4K PolyHaven HDR (CC0). When wired into Scene.environment: drives IBL ambient on PBR surfaces (chrome ball reflects the photographed sky), drives the visible sky background pass (sky shows behind meshes), and gets sampled by the same sample_env path as ProceduralSky / GradientSky. intensity scales the loaded values -- bump down for an LDR display, up for stronger reflections. Bigger HDRs = more memory; the 4K preset eats ~64MB of GPU memory. Add more files to assets/hdri/ + the `preset` paramOptions entries to grow the dropdown."
+  },
+
+  /* Skybox -- Sprint 7.5.4.b. Currently a thin wrapper around the
+   * HDRI path: takes an equirect image (HDR or future LDR) and
+   * binds it as the env source. Distinct from HDRI conceptually
+   * (Skybox = "the background sky," HDRI = "the lighting source")
+   * but mechanically the same code path until we add a true
+   * 6-face cubemap pipeline. Use HDRI for now if you want IBL +
+   * sky from one node; use Skybox for a future LDR-only sky. */
+  Skybox: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "environment",
+    ins: [
+      { n: "preset",    t: "param" },
+      { n: "intensity", t: "param" }
+    ],
+    outs: [{ n: "env", t: "environment" }],
+    params: {
+      preset: "table-mountain",
+      intensity: 1.0
+    },
+    methods: {},
+    paramOptions: {
+      preset: ["table-mountain"]
+    },
+    description: "Skybox node -- equirect image as the visible sky background + IBL source. Currently the same code path as HDRI (Radiance .hdr equirect). Distinguished from HDRI conceptually but mechanically identical until a 6-face cubemap pipeline ships. Use HDRI for now."
+  },
+
   /* GradientSky -- Sprint 7.5.4 / Phase 7 §5.4. Cheap procedural sky:
    * three-stop vertical gradient (top, horizon, bottom) that the
    * Scene's PBR / Phong ambient term samples instead of the
@@ -31857,6 +31922,115 @@ const _demos = [
     }
   },
 
+  /* Sprint 7.5.4.b -- HDRI showcase. The bundled PolyHaven Table
+   * Mountain pure-sky 4K HDR wired into Scene.environment. Three
+   * PBR balls (matte / glossy / chrome) so you can read the HDR's
+   * reflection at every roughness. No DayNightCycle / Sun -- the
+   * HDR's own sun + sky drive both ambient illumination AND the
+   * visible background. First load takes ~500ms (one-time fetch +
+   * parse + GPU upload); after that the texture is cached. */
+  {
+    id: "hdri-showcase",
+    name: "HDRI Sky",
+    sub: "real HDR · table mountain 4K",
+    type: "visual",
+    thumb: `<svg viewBox="0 0 100 44">
+      <defs>
+        <linearGradient id="dg-hdri-sky" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0"   stop-color="rgba(120,165,210,1)"/>
+          <stop offset="0.6" stop-color="rgba(195,205,220,1)"/>
+          <stop offset="1"   stop-color="rgba(245,232,205,1)"/>
+        </linearGradient>
+        <radialGradient id="dg-hdri-chrome" cx="0.5" cy="0.4" r="0.55">
+          <stop offset="0"   stop-color="rgba(220,235,250,1)"/>
+          <stop offset="0.5" stop-color="rgba(170,195,225,1)"/>
+          <stop offset="1"   stop-color="rgba(50,60,75,1)"/>
+        </radialGradient>
+      </defs>
+      <rect width="100" height="44" fill="url(#dg-hdri-sky)"/>
+      <rect x="0" y="32" width="100" height="12" fill="rgba(80,70,55,0.85)"/>
+      <ellipse cx="50" cy="34" rx="11" ry="1.5" fill="rgba(0,0,0,0.5)"/>
+      <circle cx="50" cy="24" r="10" fill="url(#dg-hdri-chrome)"/>
+    </svg>`,
+    build: () => {
+      const plane    = makeNode("Plane",      40,  40, { width: 10, depth: 10 });
+      const planeMat = makeNode("PhysicalMat",280,  40, {
+        r: 0.55, g: 0.50, b: 0.46,
+        metallic: 0.0, roughness: 0.50
+      });
+
+      const matteBall = makeNode("Sphere",     40, 220, { radius: 0.55, stacks: 32, slices: 48 });
+      const matteTr   = makeNode("Translate", 280, 220, { x: -1.5, y: 0.55, z: 0 });
+      const matteMat  = makeNode("PhysicalMat",500, 220, {
+        r: 0.85, g: 0.78, b: 0.70,
+        metallic: 0.0, roughness: 0.85
+      });
+
+      const glossyBall = makeNode("Sphere",     40, 420, { radius: 0.55, stacks: 32, slices: 48 });
+      const glossyTr   = makeNode("Translate", 280, 420, { x: 0.0, y: 0.55, z: 0 });
+      const glossyMat  = makeNode("PhysicalMat",500, 420, {
+        r: 0.65, g: 0.55, b: 0.50,
+        metallic: 0.2, roughness: 0.25
+      });
+
+      const chromeBall = makeNode("Sphere",     40, 620, { radius: 0.55, stacks: 32, slices: 48 });
+      const chromeTr   = makeNode("Translate", 280, 620, { x: 1.5, y: 0.55, z: 0 });
+      const chromeMat  = makeNode("PhysicalMat",500, 620, {
+        r: 0.95, g: 0.95, b: 0.97,
+        metallic: 1.0, roughness: 0.05
+      });
+
+      // HDRI env source. preset selects which bundled file to load;
+      // intensity scales the loaded values.
+      const hdri = makeNode("HDRI", 40, 820, {
+        preset: "table-mountain",
+        intensity: 1.0
+      });
+
+      // Slow camera orbit
+      const clk    = makeNode("MasterClock", 40, 1020, { bpm: 3 });
+      const mulTau = makeNode("Mul",        260, 1020, { b: 6.283185307 });
+      const sinC   = makeNode("Sin",        460, 1000);
+      const cosC   = makeNode("Cos",        460, 1100);
+      const mulCx  = makeNode("Mul",        640, 1000, { b: 3.6 });
+      const mulCz  = makeNode("Mul",        640, 1100, { b: 3.6 });
+      const cam    = makeNode("Camera",     860, 1020, {
+        posX: 0, posY: 1.2, posZ: 3.6,
+        targetX: 0, targetY: 0.5, targetZ: 0,
+        fov: 50, near: 0.1, far: 100, mode: 0
+      });
+
+      const scene = makeNode("Scene",       1100, 320, {
+        clearR: 0.5, clearG: 0.65, clearB: 0.85
+      });
+      const vo = makeNode("VisualOutput",   1340, 320, { display: 0 });
+
+      // ── Mesh chains
+      state.edges.push({ from: { node: plane,    port: "mesh" }, to: { node: planeMat, port: "mesh" } });
+      state.edges.push({ from: { node: planeMat, port: "mesh" }, to: { node: scene,    port: "mesh1" } });
+      state.edges.push({ from: { node: matteBall, port: "mesh" }, to: { node: matteTr,  port: "mesh" } });
+      state.edges.push({ from: { node: matteTr,   port: "mesh" }, to: { node: matteMat, port: "mesh" } });
+      state.edges.push({ from: { node: matteMat,  port: "mesh" }, to: { node: scene,    port: "mesh2" } });
+      state.edges.push({ from: { node: glossyBall, port: "mesh" }, to: { node: glossyTr,  port: "mesh" } });
+      state.edges.push({ from: { node: glossyTr,   port: "mesh" }, to: { node: glossyMat, port: "mesh" } });
+      state.edges.push({ from: { node: glossyMat,  port: "mesh" }, to: { node: scene,     port: "mesh3" } });
+      state.edges.push({ from: { node: chromeBall, port: "mesh" }, to: { node: chromeTr,  port: "mesh" } });
+      state.edges.push({ from: { node: chromeTr,   port: "mesh" }, to: { node: chromeMat, port: "mesh" } });
+      state.edges.push({ from: { node: chromeMat,  port: "mesh" }, to: { node: scene,     port: "mesh4" } });
+      // ── HDRI -> env, camera, orbit, output
+      state.edges.push({ from: { node: hdri,   port: "env"    }, to: { node: scene,  port: "environment" } });
+      state.edges.push({ from: { node: cam,    port: "camera" }, to: { node: scene,  port: "camera" } });
+      state.edges.push({ from: { node: clk,    port: "phase"  }, to: { node: mulTau, port: "a" } });
+      state.edges.push({ from: { node: mulTau, port: "out"    }, to: { node: sinC,   port: "in" } });
+      state.edges.push({ from: { node: mulTau, port: "out"    }, to: { node: cosC,   port: "in" } });
+      state.edges.push({ from: { node: sinC,   port: "out"    }, to: { node: mulCx,  port: "a" } });
+      state.edges.push({ from: { node: cosC,   port: "out"    }, to: { node: mulCz,  port: "a" } });
+      state.edges.push({ from: { node: mulCx,  port: "out"    }, to: { node: cam,    port: "posX" } });
+      state.edges.push({ from: { node: mulCz,  port: "out"    }, to: { node: cam,    port: "posZ" } });
+      state.edges.push({ from: { node: scene,  port: "out"    }, to: { node: vo,     port: "in" } });
+    }
+  },
+
   {
     id: "mesh-text",
     name: "Mesh Text",
@@ -46263,6 +46437,18 @@ fn sample_env(dir: vec3<f32>) -> vec3<f32> {
     // sky background pass.
     return sample_procedural_sky_smooth(dir);
   }
+  if (mode == 3u) {
+    // Sprint 7.5.4.b -- HDRI / Skybox. Equirectangular texture
+    // sample. envParams.y is the intensity multiplier (lets users
+    // dial exposure without re-loading the file). textureSampleLevel
+    // at LOD 0 -- mipmap generation for the env texture is a future
+    // polish; without it the diffuse IBL sample (which would
+    // benefit from a low LOD for smoothing) can show high-freq
+    // texels in matte reflections.
+    let uv = dir_to_equirect_uv(dir);
+    let hdr = textureSampleLevel(envTexture, envSampler, uv, 0.0);
+    return hdr.rgb * uS.envParams.y;
+  }
   // Default: pre-7.5.4 hardcoded hemisphere-IBL. Two-stop gradient
   // from cool sky to warm ground via the up-axis-aligned mix that
   // fs_pbr used inline pre-refactor.
@@ -46285,6 +46471,26 @@ struct PerDraw {
 // always present in the BGL so the pipeline layout is uniform.
 @group(0) @binding(2) var srcTexture: texture_2d_array<f32>;
 @group(0) @binding(3) var srcSampler: sampler;
+
+// Sprint 7.5.4.b -- env texture for HDRI / Skybox equirect sampling.
+// Bound to a 1x1 mid-gray when no HDRI is loaded; sample_env mode 3
+// is the only path that reads it. RGBA16Float so HDR values > 1
+// pass through (clamp happens at framebuffer write).
+@group(0) @binding(4) var envTexture: texture_2d<f32>;
+@group(0) @binding(5) var envSampler: sampler;
+
+// Sprint 7.5.4.b -- world ray direction -> equirect UV. Standard
+// convention: U around the +Y axis (atan2(z, x)), V from zenith
+// to nadir (asin(-y)). Polyhaven + most authoring tools use this
+// orientation. If a particular HDRI looks rotated 180° on the X
+// axis the caller can rotate dir before sampling.
+fn dir_to_equirect_uv(dir: vec3<f32>) -> vec2<f32> {
+  let inv_pi  = 0.31830988618;
+  let inv_2pi = 0.15915494309;
+  let u = atan2(dir.z, dir.x) * inv_2pi + 0.5;
+  let v = asin(clamp(-dir.y, -1.0, 1.0)) * inv_pi + 0.5;
+  return vec2<f32>(u, v);
+}
 
 struct VsIn  {
   @location(0) pos:    vec3<f32>,
@@ -46722,7 +46928,15 @@ function _ensureMeshBindGroupLayout() {
       // layout matches for all material types; non-texture materials
       // simply don't reference the bindings in their WGSL.
       { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d-array", multisampled: false } },
-      { binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } }
+      { binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+      // Sprint 7.5.4.b -- env texture + sampler for HDRI / Skybox
+      // equirectangular sampling (mode 3 in sample_env). Always
+      // present in the BGL; bound to a 1x1 default when no HDRI is
+      // loaded (mode != 3 never reads it). RGBA16Float so HDR values
+      // > 1 pass through; tonemap happens implicitly at framebuffer
+      // clamp time for now (future polish: explicit ACES pass).
+      { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d", multisampled: false } },
+      { binding: 5, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } }
     ]
   });
   Visual.meshPipelineLayout = Visual.device.createPipelineLayout({
@@ -46730,6 +46944,231 @@ function _ensureMeshBindGroupLayout() {
     bindGroupLayouts: [Visual.meshBindGroupLayout]
   });
   return Visual.meshBindGroupLayout;
+}
+
+/* Sprint 7.5.4.b -- env texture management. A single GPUTexture
+ * (RGBA16Float, 2D, equirect) holds the currently-loaded HDRI /
+ * Skybox image. Initialized to 1×1 mid-gray at editor load so
+ * Scene bind groups have something to bind even when no env source
+ * is wired. When an HDRI loads, the texture is destroyed + replaced
+ * at the HDR's actual size, and Visual.sceneInstances is cleared
+ * so the next render rebuilds bind groups against the new texture
+ * view. The env sampler stays the same (repeat U / clamp V for
+ * equirect seam handling). */
+function _ensureEnvTextureDefault() {
+  if (Visual.envTexture) return;
+  if (!Visual.device) return;
+  Visual.envTexture = Visual.device.createTexture({
+    label: "env-texture-default-1x1",
+    size: [1, 1, 1],
+    format: "rgba16float",
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
+  });
+  Visual.envTextureView = Visual.envTexture.createView({ label: "env-texture-view" });
+  // 1×1 mid-gray (rgba half-float). Just to satisfy bind group
+  // binding -- never actually sampled when no HDRI is loaded
+  // (sample_env's mode dispatch skips mode 3).
+  const data = new Uint16Array([_floatToHalf(0.5), _floatToHalf(0.5), _floatToHalf(0.5), _floatToHalf(1.0)]);
+  Visual.device.queue.writeTexture(
+    { texture: Visual.envTexture },
+    data,
+    { bytesPerRow: 8 },
+    { width: 1, height: 1, depthOrArrayLayers: 1 }
+  );
+  if (!Visual.envSampler) {
+    Visual.envSampler = Visual.device.createSampler({
+      label: "env-sampler",
+      magFilter: "linear",
+      minFilter: "linear",
+      addressModeU: "repeat",
+      addressModeV: "clamp-to-edge"
+    });
+  }
+}
+
+/* Sprint 7.5.4.b -- single-precision → half-precision (IEEE 754
+ * binary16) bit conversion. WebGPU wants RGBA16Float for HDR
+ * uploads; JS has no native f16 type so we pack the bits manually.
+ * Handles normals + zero + infinity; subnormals collapse to zero
+ * (negligible for HDR-range color values). */
+function _floatToHalf(val) {
+  const f32 = new Float32Array(1);
+  const u32 = new Uint32Array(f32.buffer);
+  f32[0] = val;
+  const x = u32[0];
+  const sign = (x >> 16) & 0x8000;
+  let exp = ((x >> 23) & 0xff) - 127 + 15;
+  let mant = (x >> 13) & 0x3ff;
+  if (exp >= 31) return sign | 0x7c00 | (mant ? 0x200 : 0); // inf / NaN
+  if (exp <= 0) return sign;                                // zero / subnormal
+  return sign | (exp << 10) | mant;
+}
+
+/* Sprint 7.5.4.b -- Radiance .hdr / RGBE parser. The format:
+ *   - ASCII header (FORMAT=32-bit_rle_rgbe), terminated by blank line
+ *   - Resolution line ("-Y H +X W" most common; top-to-bottom)
+ *   - Body: H scanlines, each W pixels of RLE-encoded RGBE
+ *
+ * RGBE → RGB float: f = 2^(E - 128) / 256; R = r*f, G = g*f, B = b*f.
+ * Returns { width, height, data } where data is a Float32Array of
+ * length width*height*3 in row-major order, top-to-bottom. */
+function _parseHdr(bytes) {
+  let i = 0;
+  // --- ASCII header: read until blank line.
+  let header = "";
+  while (i < bytes.length) {
+    const c = String.fromCharCode(bytes[i++]);
+    header += c;
+    if (header.endsWith("\n\n")) break;
+  }
+  if (!header.includes("RADIANCE")) {
+    throw new Error("not a Radiance .hdr (no #?RADIANCE token)");
+  }
+  // --- Resolution line: "-Y H +X W".
+  let resLine = "";
+  while (i < bytes.length) {
+    const c = String.fromCharCode(bytes[i++]);
+    if (c === "\n") break;
+    resLine += c;
+  }
+  const m = resLine.match(/-Y\s+(\d+)\s+\+X\s+(\d+)/);
+  if (!m) throw new Error("unsupported HDR resolution line: " + resLine);
+  const height = parseInt(m[1], 10);
+  const width  = parseInt(m[2], 10);
+  // --- Pixel body. Each scanline is either old-style raw RGBE or
+  // new-style RLE (marker 0x02 0x02 high-byte low-byte).
+  const out = new Float32Array(width * height * 3);
+  const scanline = new Uint8Array(width * 4);
+  for (let y = 0; y < height; y++) {
+    if (i + 4 > bytes.length) throw new Error("HDR: scanline header truncated at y=" + y);
+    const r0 = bytes[i], g0 = bytes[i + 1], b0 = bytes[i + 2], e0 = bytes[i + 3];
+    if (r0 === 0x02 && g0 === 0x02 && (b0 & 0x80) === 0) {
+      // New-style RLE. Width is in (b0 << 8) | e0; should equal width.
+      const decodedWidth = (b0 << 8) | e0;
+      if (decodedWidth !== width) {
+        throw new Error("HDR: RLE width mismatch (got " + decodedWidth + ", expected " + width + ")");
+      }
+      i += 4;
+      // Decode 4 channels (R, G, B, E) separately.
+      for (let ch = 0; ch < 4; ch++) {
+        let x = 0;
+        while (x < width) {
+          if (i >= bytes.length) throw new Error("HDR: RLE truncated y=" + y + " ch=" + ch);
+          const n = bytes[i++];
+          if (n > 128) {
+            // Run: repeat next byte (n - 128) times.
+            const run = n - 128;
+            const v = bytes[i++];
+            for (let k = 0; k < run && x < width; k++) {
+              scanline[x * 4 + ch] = v;
+              x++;
+            }
+          } else {
+            // Dump: n raw bytes.
+            for (let k = 0; k < n && x < width; k++) {
+              scanline[x * 4 + ch] = bytes[i++];
+              x++;
+            }
+          }
+        }
+      }
+    } else {
+      // Old-style: raw RGBE pixels, no RLE. The 4 bytes we just
+      // peeked are the first pixel; continue reading the rest.
+      scanline[0] = r0; scanline[1] = g0; scanline[2] = b0; scanline[3] = e0;
+      i += 4;
+      for (let x = 1; x < width; x++) {
+        scanline[x * 4 + 0] = bytes[i++];
+        scanline[x * 4 + 1] = bytes[i++];
+        scanline[x * 4 + 2] = bytes[i++];
+        scanline[x * 4 + 3] = bytes[i++];
+      }
+    }
+    // Convert scanline RGBE to float RGB into out.
+    for (let x = 0; x < width; x++) {
+      const r = scanline[x * 4 + 0];
+      const g = scanline[x * 4 + 1];
+      const b = scanline[x * 4 + 2];
+      const e = scanline[x * 4 + 3];
+      if (e === 0) {
+        // RGBE pixels with exponent=0 are pure black; everything's zero.
+        out[(y * width + x) * 3 + 0] = 0;
+        out[(y * width + x) * 3 + 1] = 0;
+        out[(y * width + x) * 3 + 2] = 0;
+      } else {
+        const f = Math.pow(2, e - 128) / 256;
+        out[(y * width + x) * 3 + 0] = r * f;
+        out[(y * width + x) * 3 + 1] = g * f;
+        out[(y * width + x) * 3 + 2] = b * f;
+      }
+    }
+  }
+  return { width, height, data: out };
+}
+
+/* Sprint 7.5.4.b -- HDRI cache + loader. Keyed by URL; promises
+ * deduplicated so multiple HDRI nodes pointing at the same file
+ * don't re-fetch + re-parse. Pre-converts the parsed Float32 RGB
+ * to RGBA16Float so the actual texture upload is fast. */
+function _ensureHdriCache() {
+  if (!Visual._hdriCache) Visual._hdriCache = new Map();
+}
+function _loadHdri(url) {
+  _ensureHdriCache();
+  if (Visual._hdriCache.has(url)) return Visual._hdriCache.get(url);
+  const promise = (async () => {
+    const t0 = performance.now();
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error("HDRI fetch " + url + " -> HTTP " + resp.status);
+    const buf = await resp.arrayBuffer();
+    const { width, height, data } = _parseHdr(new Uint8Array(buf));
+    // RGBA half-float for GPU upload. Alpha = 1.0 in half-float.
+    const ALPHA_ONE = 0x3c00;
+    const half = new Uint16Array(width * height * 4);
+    for (let i = 0; i < width * height; i++) {
+      half[i * 4 + 0] = _floatToHalf(data[i * 3 + 0]);
+      half[i * 4 + 1] = _floatToHalf(data[i * 3 + 1]);
+      half[i * 4 + 2] = _floatToHalf(data[i * 3 + 2]);
+      half[i * 4 + 3] = ALPHA_ONE;
+    }
+    const dt = performance.now() - t0;
+    console.log("[hdri] loaded " + url + " (" + width + "x" + height + ", " +
+                Math.round(buf.byteLength / 1024) + "KB) in " + Math.round(dt) + "ms");
+    return { width, height, half };
+  })();
+  Visual._hdriCache.set(url, promise);
+  return promise;
+}
+
+/* Sprint 7.5.4.b -- apply a loaded HDRI to the global env texture.
+ * Destroys + reallocates Visual.envTexture at the HDRI's size, writes
+ * the data, and clears Visual.sceneInstances so the next render
+ * rebuilds bind groups against the new texture view. Idempotent --
+ * if the same HDRI is already applied, no-op. */
+function _applyHdriToEnvTexture(hdri, urlForLabel) {
+  if (!Visual.device) return;
+  if (Visual._envTextureUrl === urlForLabel) return;
+  if (Visual.envTexture) {
+    try { Visual.envTexture.destroy(); } catch (_) {}
+  }
+  Visual.envTexture = Visual.device.createTexture({
+    label: "env-texture-" + (urlForLabel || "hdri") + "-" + hdri.width + "x" + hdri.height,
+    size: [hdri.width, hdri.height, 1],
+    format: "rgba16float",
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
+  });
+  Visual.envTextureView = Visual.envTexture.createView({ label: "env-texture-view" });
+  Visual.device.queue.writeTexture(
+    { texture: Visual.envTexture },
+    hdri.half,
+    { bytesPerRow: hdri.width * 8 },  // RGBA × 2 bytes per half-float
+    { width: hdri.width, height: hdri.height, depthOrArrayLayers: 1 }
+  );
+  Visual._envTextureUrl = urlForLabel;
+  // Force Scene bind groups to rebuild against the new texture view.
+  if (Visual.sceneInstances && Visual.sceneInstances.size > 0) {
+    Visual.sceneInstances.clear();
+  }
 }
 
 function _ensureMeshPipeline(materialType, sampleCount) {
@@ -47381,6 +47820,10 @@ function _ensureSceneInstance(sceneNode) {
       size: 96,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
     });
+    // Sprint 7.5.4.b -- env texture (HDRI / Skybox) at bindings 4+5.
+    // Default to a 1x1 mid-gray when no HDRI is loaded; sample_env's
+    // mode dispatch only reads it when mode == 3.
+    _ensureEnvTextureDefault();
     const bindGroup = Visual.device.createBindGroup({
       label: "scene-bg-" + sceneNode.id + "-slot" + i,
       layout: Visual.meshBindGroupLayout,
@@ -47388,7 +47831,9 @@ function _ensureSceneInstance(sceneNode) {
         { binding: 0, resource: { buffer: perSceneBuffer } },
         { binding: 1, resource: { buffer: perDrawBuffer  } },
         { binding: 2, resource: Visual.scratchArrayViewA },
-        { binding: 3, resource: Visual.meshSampler }
+        { binding: 3, resource: Visual.meshSampler },
+        { binding: 4, resource: Visual.envTextureView },
+        { binding: 5, resource: Visual.envSampler }
       ]
     });
     slots.push({ perDrawBuffer, bindGroup });
@@ -47917,7 +48362,52 @@ function _resolveSceneEnvironment(sceneNode) {
       sun: [sunDir[0], sunDir[1], sunDir[2], sunColor.visibility]
     };
   }
+  if (src.type === "HDRI" || src.type === "Skybox") {
+    // 7.5.4.b -- equirectangular HDR/LDR. The preset string maps
+    // to a URL in assets/hdri/. Loading is async + cached; first
+    // resolution kicks off the fetch and falls back to mode 0
+    // (hardcoded hemisphere) until the texture is uploaded. Next
+    // frame after upload picks up mode 3.
+    const preset = (typeof p.preset === "string") ? p.preset : "table-mountain";
+    const url = _hdriPresetUrl(preset);
+    if (!url) return null;
+    const cached = Visual._hdriCache && Visual._hdriCache.get(url);
+    if (cached && cached.__loaded) {
+      // Make sure the global env texture matches this preset.
+      _applyHdriToEnvTexture(cached.__data, url);
+      return {
+        mode: 3,
+        intensity: num(p.intensity, 1.0)
+      };
+    }
+    // Kick off the load (idempotent via the cache promise) and
+    // mark loaded when it resolves.
+    _loadHdri(url).then(data => {
+      const promiseEntry = Visual._hdriCache.get(url);
+      // Promote the cache entry from "promise" to "loaded data" so
+      // the next resolve hits the fast path. Attach the data onto
+      // the promise to survive any external consumers still
+      // awaiting it.
+      promiseEntry.__loaded = true;
+      promiseEntry.__data = data;
+    }).catch(e => {
+      console.warn("[hdri] failed to load " + url + ":", e);
+    });
+    // Not yet ready -- render with hemisphere fallback. Next frame
+    // (after the async load resolves) will switch to mode 3.
+    return null;
+  }
   return null;
+}
+
+/* Sprint 7.5.4.b -- map an HDRI preset name to a URL relative to
+ * the editor's hosting origin. Edit here + the HDRI node's
+ * paramOptions entries to add presets. */
+function _hdriPresetUrl(presetName) {
+  const map = {
+    "table-mountain": "./assets/hdri/table_mountain_1_puresky_4k.hdr"
+  };
+  return map[presetName] || null;
 }
 
 function _resolveSceneLights(sceneNode) {
