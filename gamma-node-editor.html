@@ -46402,6 +46402,139 @@ function _ensureRtSceneInstance(node) {
   return inst;
 }
 
+/* Sprint 7.5.6.a part 2e-1 -- serialize the editor's RayTracedScene
+ * node state into the JSON shape the engine's `scene` IPC message
+ * expects (mirrors scene.rs in the gamma-compile-server repo).
+ *
+ * Option (a) materials: per-mesh flat RGB color, derived as the
+ * average of the upstream mesh's per-vertex colors. No PBR fields,
+ * no lights, no environment. Transforms identity for 2e-1 -- wire-
+ * based Translate/Rotate/Scale composition lands in 2e-2.
+ *
+ * Returns a Scene-shaped object ready for JSON.stringify. Always
+ * succeeds (returns an empty meshes[] if nothing wired). */
+function _rtBuildSceneJson(rtNode) {
+  const meshes = [];
+  // Walk mesh1..mesh4 inputs; collect any that resolve to a known
+  // mesh-builder node.
+  for (let i = 1; i <= 4; i++) {
+    const portName = "mesh" + i;
+    const meshNode = _rtFindUpstreamMesh(rtNode.id, portName);
+    if (!meshNode) continue;
+    const data = _buildMeshData(meshNode);
+    if (!data) continue;
+    const stride = 11;
+    const verts = Array.from(data.verts);
+    const indices = data.indices ? Array.from(data.indices) : null;
+    // Average per-vertex color → per-mesh flat color (option a).
+    const meshColor = _rtMeshAverageColor(data.verts, stride);
+    meshes.push({
+      geometry: {
+        kind: "inline",
+        vertices: verts,
+        indices: indices,  // null = non-indexed; engine handles either
+        stride: stride
+      },
+      transform: [
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1
+      ],
+      material: {
+        type: "unlit",
+        color: meshColor,
+        vertex_mix: 0
+      }
+    });
+  }
+
+  // Camera input -- if a Camera node is wired, pull its pose. Else
+  // default to the same eye/target as the engine's --render-test path.
+  const camNode = _rtFindUpstreamByPort(rtNode.id, "camera");
+  const camera = camNode ? _rtExtractCamera(camNode) : {
+    mode: "perspective",
+    pos: [0, 0, 2],
+    target: [0, 0, 0],
+    up: [0, 1, 0],
+    fov_deg: 60,
+    near: 0.1,
+    far: 100
+  };
+
+  const p = rtNode.params || {};
+  const num = (v, d) => (typeof v === "number" ? v : d);
+  return {
+    camera,
+    meshes,
+    lights: [],
+    clear_color: [num(p.clearR, 0.05), num(p.clearG, 0.06), num(p.clearB, 0.10)]
+  };
+}
+
+/* Walk wires backwards from rtNode[portName] until we hit a mesh-
+ * builder node (DebugTriangle / Box / Sphere / etc). Skips over
+ * Translate / Rotate / Scale / ShaderMat / PhongMat / etc by
+ * following whatever input port they have that's named "mesh" or
+ * "in". Returns the originating mesh node, or null. */
+function _rtFindUpstreamMesh(rtNodeId, portName) {
+  const meshTypes = new Set(["DebugTriangle", "Box", "Sphere", "Plane", "Torus", "Cylinder", "Cone"]);
+  let curNodeId = rtNodeId;
+  let curPort = portName;
+  // Hard cap on wire-walking depth -- mostly defensive against cycles.
+  for (let depth = 0; depth < 32; depth++) {
+    const edge = state.edges.find(e => e.to.node === curNodeId && e.to.port === curPort);
+    if (!edge) return null;
+    const upNode = state.nodes.find(n => n.id === edge.from.node);
+    if (!upNode) return null;
+    if (meshTypes.has(upNode.type)) return upNode;
+    // Not a mesh -- continue upstream through this node's "mesh"
+    // or "in" input. Materials/transforms pass mesh through that way.
+    curNodeId = upNode.id;
+    curPort = "mesh";
+    // Some material nodes use a different upstream port; fall back
+    // to "in" if no "mesh" port wire exists.
+    if (!state.edges.find(e => e.to.node === curNodeId && e.to.port === "mesh")) {
+      curPort = "in";
+    }
+  }
+  return null;
+}
+
+/* Find a node wired into rtNode.portName regardless of type. Used
+ * for the camera input. */
+function _rtFindUpstreamByPort(rtNodeId, portName) {
+  const edge = state.edges.find(e => e.to.node === rtNodeId && e.to.port === portName);
+  if (!edge) return null;
+  return state.nodes.find(n => n.id === edge.from.node) || null;
+}
+
+function _rtMeshAverageColor(verts, stride) {
+  const n = verts.length / stride;
+  if (n === 0) return [1, 1, 1];
+  let r = 0, g = 0, b = 0;
+  for (let i = 0; i < n; i++) {
+    r += verts[i * stride + 3];
+    g += verts[i * stride + 4];
+    b += verts[i * stride + 5];
+  }
+  return [r / n, g / n, b / n];
+}
+
+function _rtExtractCamera(camNode) {
+  const p = camNode.params || {};
+  const num = (v, d) => (typeof v === "number" ? v : d);
+  return {
+    mode: "perspective",
+    pos: [num(p.posX, 0), num(p.posY, 0), num(p.posZ, 5)],
+    target: [num(p.targetX, 0), num(p.targetY, 0), num(p.targetZ, 0)],
+    up: [0, 1, 0],
+    fov_deg: num(p.fov, 60),
+    near: num(p.near, 0.1),
+    far: num(p.far, 100)
+  };
+}
+
 async function _rtSceneConnect(nodeId, inst) {
   if (inst.ws && inst.ws.readyState <= 1) return;
   inst.status = "connecting";
@@ -46457,8 +46590,28 @@ async function _rtSceneConnect(nodeId, inst) {
     try {
       ws.send(JSON.stringify({ type: "hello" }));
       ws.send(JSON.stringify({ type: "configure", width: 800, height: 600 }));
+      // Sprint 7.5.6.a part 2e-1: ship the editor's scene state to
+      // the engine. Built fresh from the node graph on each connect
+      // (no live updates yet -- that's 2e-2). Empty meshes[] is
+      // fine; engine falls back to clear-color rendering.
+      const node = state.nodes.find(n => n.id === nodeId);
+      if (node) {
+        const sceneJson = _rtBuildSceneJson(node);
+        console.log("[rt-scene] sending scene: " + sceneJson.meshes.length +
+                    " mesh(es), camera@" + JSON.stringify(sceneJson.camera.pos));
+        ws.send(JSON.stringify({ type: "scene", patch: sceneJson }));
+      } else {
+        console.warn("[rt-scene] node " + nodeId + " gone before scene send; sending empty");
+        ws.send(JSON.stringify({ type: "scene", patch: {
+          camera: { mode: "perspective", pos:[0,0,2], target:[0,0,0], up:[0,1,0],
+                    fov_deg: 60, near: 0.1, far: 100 },
+          meshes: [], lights: [], clear_color: [0.05, 0.06, 0.10]
+        }}));
+      }
       ws.send(JSON.stringify({ type: "render-start" }));
-    } catch (_) {}
+    } catch (e) {
+      console.warn("[rt-scene] onopen send threw:", e);
+    }
   };
   ws.onmessage = (ev) => {
     if (typeof ev.data === "string") {
