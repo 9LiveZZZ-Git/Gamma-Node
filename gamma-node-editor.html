@@ -10577,6 +10577,56 @@ public:
     description: "Spotlight -- positional light + cone-shaped emission. posX/Y/Z is the world position; dirX/Y/Z is the direction the spot is POINTING (so dirY=-1 means pointing straight down). innerAngle / outerAngle are HALF-angles in DEGREES: full contribution inside innerAngle, zero outside outerAngle, smooth falloff between. range is the distance falloff (same as PointLight). Common settings: tight cone (5°/10°) for a flashlight beam, wide cone (30°/45°) for a stage spot. Wire dirX/Y/Z to math chains for sweeping spots; wire intensity to MasterClock.beat for a strobe."
   },
 
+  /* AreaLight -- rectangular emissive surface. RT-only: the kernel
+   * Monte-Carlo samples one point on the rect per shadow ray, so
+   * each primary ray sees a different sub-light-position. Combined
+   * with TDS temporal averaging this yields TRUE SOFT SHADOWS
+   * naturally -- the penumbra builds up over frames as primary rays
+   * sample different parts of the light. No special light-source
+   * algorithm beyond uniform sampling.
+   *
+   * posX/Y/Z is the CENTER of the rectangle. dirX/Y/Z is the
+   * normal direction the surface points (so dirY=-1 means a ceiling
+   * panel facing the floor). width / height are world-units along
+   * the rectangle's tangent / bitangent (auto-derived from the
+   * normal in the kernel). intensity is the total emitted power
+   * scaled into the sampling weight, so doubling width OR intensity
+   * gives the same illumination at the same scene point.
+   *
+   * Inside a raster Scene: degrades to a single PointLight at the
+   * center (raster has no shadow rays / no soft shadow primitive
+   * cheap enough). Inside RayTracedScene: full soft-shadow
+   * treatment. Sprint 7.5.6.h. */
+  AreaLight: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "light",
+    ins: [
+      { n: "posX",      t: "param" },
+      { n: "posY",      t: "param" },
+      { n: "posZ",      t: "param" },
+      { n: "dirX",      t: "param" },
+      { n: "dirY",      t: "param" },
+      { n: "dirZ",      t: "param" },
+      { n: "width",     t: "param" },
+      { n: "height",    t: "param" },
+      { n: "colorR",    t: "param" },
+      { n: "colorG",    t: "param" },
+      { n: "colorB",    t: "param" },
+      { n: "intensity", t: "param" }
+    ],
+    outs: [{ n: "light", t: "light" }],
+    params: {
+      posX: 0, posY: 3, posZ: 0,
+      dirX: 0, dirY: -1, dirZ: 0,
+      width: 2.0, height: 2.0,
+      colorR: 1.0, colorG: 0.97, colorB: 0.92,
+      intensity: 4.0
+    },
+    methods: {},
+    description: "Rectangular area light source (RT-only). posX/Y/Z is the CENTER of the panel; dirX/Y/Z is the normal direction it faces (dirY=-1 = ceiling panel pointing down). width / height are world-units along the panel's tangent / bitangent. Inside RayTracedScene: the kernel uniform-samples one point on the rectangle per shadow ray + each primary samples a different sub-position, so TDS temporal averaging produces TRUE SOFT SHADOWS with a real penumbra (no PCF / PCSS hack). Doubling width or intensity gives equivalent total illumination. Falls back to a PointLight at the center inside a raster Scene (no shadow-ray equivalent there). Intensity scales by area implicitly via the kernel's MC weight, so an intensity of 4 with a 2x2 panel = the same surface radiance as intensity 4 with a 4x4."
+  },
+
   /* Custom ramp / curve shaper. Takes any 0..1 signal in, applies the
    * chosen curve, outputs 0..1. Same curve set the slider editor uses
    * (linear / log / exp / sCurve) plus an extra expSteep (x⁴) for
@@ -46763,6 +46813,32 @@ function _resolveLightNode(lightNode) {
       ]
     };
   }
+  if (lightNode.type === "AreaLight") {
+    // 7.5.6.h -- raster Scene has no shadow-ray equivalent, so we
+    // degrade the area light to a single PointLight at the panel
+    // center. Same color + intensity. Cos_light and 1/r^2 area-MC
+    // weight aren't expressible here, but the visual result (a soft
+    // fill from that direction) is close enough that swapping between
+    // Scene and RayTracedScene doesn't black out.
+    return {
+      type:  1,  // point
+      pos:   [
+        (typeof p.posX === "number") ? p.posX : 0,
+        (typeof p.posY === "number") ? p.posY : 3,
+        (typeof p.posZ === "number") ? p.posZ : 0
+      ],
+      color: [
+        (typeof p.colorR === "number") ? p.colorR : 1.0,
+        (typeof p.colorG === "number") ? p.colorG : 0.97,
+        (typeof p.colorB === "number") ? p.colorB : 0.92
+      ],
+      intensity: (typeof p.intensity === "number") ? p.intensity : 4.0,
+      range:     20.0,
+      cosInner:  1.0,
+      cosOuter:  1.0,
+      spotDir:   [0, -1, 0]
+    };
+  }
   return null;
 }
 
@@ -47063,6 +47139,19 @@ function _rtExtractLight(lightNode) {
         range:     num(p.range, 8.0),
         inner_angle_deg: num(p.innerAngle, 15),
         outer_angle_deg: num(p.outerAngle, 25)
+      };
+    case "AreaLight":
+      // 7.5.6.h -- rectangular emitter, RT-only. Engine kernel
+      // samples one point on the rect per shadow ray; TDS averages
+      // across primaries -> real soft shadows.
+      return {
+        type: "area",
+        position:  [num(p.posX, 0), num(p.posY, 3), num(p.posZ, 0)],
+        normal:    [num(p.dirX, 0), num(p.dirY, -1), num(p.dirZ, 0)],
+        width:     num(p.width, 2.0),
+        height:    num(p.height, 2.0),
+        color:     [num(p.colorR, 1.0), num(p.colorG, 0.97), num(p.colorB, 0.92)],
+        intensity: num(p.intensity, 4.0)
       };
     default:
       return null;
