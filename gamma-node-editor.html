@@ -10045,13 +10045,19 @@ public:
       { n: "fogAuto",    t: "param" },
       { n: "fogR",       t: "param" },
       { n: "fogG",       t: "param" },
-      { n: "fogB",       t: "param" }
+      { n: "fogB",       t: "param" },
+      // Sprint 5.10 -- view-frustum culling. cullEnable=1 (default)
+      // skips draws for meshes whose world-space AABB lies fully
+      // outside the camera frustum. Set to 0 to disable for
+      // debugging or for non-frustum-bound projection setups.
+      { n: "cullEnable", t: "param" }
     ],
     outs: [{ n: "out", t: "texture" }],
     params: {
       clearR: 0.04, clearG: 0.05, clearB: 0.09,
       fogDensity: 0.0, fogStart: 5.0, fogHeight: 0.0, fogAuto: 1.0,
-      fogR: 0.65, fogG: 0.70, fogB: 0.78
+      fogR: 0.65, fogG: 0.70, fogB: 0.78,
+      cullEnable: 1
     },
     methods: {},
     description: "3D scene sink. Wire up to four `mesh` inputs (Box/Sphere/Plane/Torus/Cylinder/Cone via sprint 7.5.3b primitives, or DebugTriangle for the simplest smoke test) and one `camera` input from a Camera node. Renders the meshes through the camera into a framebuffer layer; output is `texture`-typed so the result flows into the existing post-processing graph (CRT, Bloom, BlendShader, etc.). clearR/G/B is the background color (default a deep navy). Depth-tested; meshes farther from the camera are correctly occluded. Sprint 7.5.3c adds materials + lighting; until then the pipeline is unlit + uses per-vertex colors."
@@ -45620,11 +45626,44 @@ function _evaluateCamera(cameraNode, fbW, fbH) {
   const uyC = rz * fx - rx * fz;
   const uzC = rx * fy - ry * fx;
   const tanHalfFov = (mode === 1) ? 1.0 : Math.tan(fov * 0.01745329251994 * 0.5);
+  // Sprint 5.10 -- 6-plane frustum extracted from the view-projection
+  // matrix. Each plane is (a, b, c, d) with normal (a, b, c) pointing
+  // INSIDE the frustum; a point is inside iff a*x + b*y + c*z + d >= 0
+  // for ALL planes. Standard derivation: combine rows of viewProj.
+  //   left   = row3 + row0
+  //   right  = row3 - row0
+  //   bottom = row3 + row1
+  //   top    = row3 - row1
+  //   near   = row2          (WebGPU clip z in [0, 1])
+  //   far    = row3 - row2
+  // viewProj is stored column-major (mat[col][row]) -- "row k" is
+  // viewProj[k], viewProj[k+4], viewProj[k+8], viewProj[k+12].
+  const vp = viewProj;
+  const r0x = vp[0], r0y = vp[4], r0z = vp[8],  r0w = vp[12];
+  const r1x = vp[1], r1y = vp[5], r1z = vp[9],  r1w = vp[13];
+  const r2x = vp[2], r2y = vp[6], r2z = vp[10], r2w = vp[14];
+  const r3x = vp[3], r3y = vp[7], r3z = vp[11], r3w = vp[15];
+  const planes = new Float32Array(24);
+  // left
+  planes[0]  = r3x + r0x; planes[1]  = r3y + r0y; planes[2]  = r3z + r0z; planes[3]  = r3w + r0w;
+  // right
+  planes[4]  = r3x - r0x; planes[5]  = r3y - r0y; planes[6]  = r3z - r0z; planes[7]  = r3w - r0w;
+  // bottom
+  planes[8]  = r3x + r1x; planes[9]  = r3y + r1y; planes[10] = r3z + r1z; planes[11] = r3w + r1w;
+  // top
+  planes[12] = r3x - r1x; planes[13] = r3y - r1y; planes[14] = r3z - r1z; planes[15] = r3w - r1w;
+  // near
+  planes[16] = r2x;       planes[17] = r2y;       planes[18] = r2z;       planes[19] = r2w;
+  // far
+  planes[20] = r3x - r2x; planes[21] = r3y - r2y; planes[22] = r3z - r2z; planes[23] = r3w - r2w;
   return {
     view, proj, viewProj, eye: [px, py, pz],
     camRight:   [rx,  ry,  rz,  tanHalfFov * aspect],
     camUp:      [uxC, uyC, uzC, tanHalfFov],
-    camForward: [fx,  fy,  fz,  (mode === 1) ? 1 : 0]
+    camForward: [fx,  fy,  fz,  (mode === 1) ? 1 : 0],
+    // 5.10 -- 6 frustum planes for cull testing. Float32Array(24)
+    // packed as 6 × vec4(a,b,c,d). Order: L/R/B/T/N/F.
+    frustumPlanes: planes
   };
 }
 
@@ -47111,7 +47150,7 @@ function _updateMsaaPill() {
 // where the 3D render path stops if a smoke-test demo shows blank.
 // Each flag is flipped true on first success so we don't spam the
 // console every frame.
-const _SCENE_DIAG = { pipeline: false, instance: false, encode: false, draw: false };
+const _SCENE_DIAG = { pipeline: false, instance: false, encode: false, draw: false, cull: false };
 
 /* =========================================================================
  * Sprint 7.5.3c -- ShaderMat preset library
@@ -47773,15 +47812,99 @@ function _ensureMeshBuffers(meshEntry) {
     indexBuffer.unmap();
     indexCount = indices.length;
   }
+  // Sprint 5.10 -- compute the local-space AABB from vertex data so
+  // the encoder can frustum-cull this mesh. Cheap (one pass over
+  // verts) and cached alongside the GPU buffers; invalidated by the
+  // same cacheKey check above when geometry params change.
+  const aabb = _computeLocalAABB(verts);
   const out = {
     vertexBuffer,
     vertexCount: verts.length / 11,  // Sprint 7.5.3c push 6: 11 floats per vertex (pos + color + normal + uv)
     indexBuffer,
     indexCount,
-    cacheKey: _meshCacheKey(node)
+    cacheKey: _meshCacheKey(node),
+    aabbMin: aabb.min,
+    aabbMax: aabb.max
   };
   Visual.meshBufferCache.set(node.id, out);
   return out;
+}
+
+/* Sprint 5.10 -- local-space AABB from interleaved vertex data.
+ * Vertex stride is 11 floats: pos (3) + color (3) + normal (3) + uv
+ * (2); position is at indices 0..2. Returns { min: [x,y,z], max:
+ * [x,y,z] }. Empty verts -> degenerate zero-size AABB at origin
+ * (caller's cull test treats this as outside the frustum). */
+function _computeLocalAABB(verts) {
+  if (!verts || verts.length === 0) {
+    return { min: [0, 0, 0], max: [0, 0, 0] };
+  }
+  const stride = 11;
+  const n = verts.length / stride;
+  let minX = Infinity, minY = Infinity, minZ = Infinity;
+  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+  for (let i = 0; i < n; i++) {
+    const k = i * stride;
+    const px = verts[k], py = verts[k + 1], pz = verts[k + 2];
+    if (px < minX) minX = px; if (px > maxX) maxX = px;
+    if (py < minY) minY = py; if (py > maxY) maxY = py;
+    if (pz < minZ) minZ = pz; if (pz > maxZ) maxZ = pz;
+  }
+  return { min: [minX, minY, minZ], max: [maxX, maxY, maxZ] };
+}
+
+/* Sprint 5.10 -- AABB-vs-frustum test. 6-plane SAT: for each plane
+ * (a, b, c, d) with normal pointing inside the frustum, find the
+ * AABB corner farthest along the normal (the "positive corner");
+ * if even that corner is on the negative side of the plane, the
+ * AABB is fully outside the frustum -> cull. Otherwise either
+ * intersecting or inside -> draw.
+ *
+ * worldMin / worldMax are the WORLD-SPACE AABB after transforming
+ * the local-space AABB through the mesh's model matrix. Cheap to
+ * derive: pass the 8 local corners through the matrix + take new
+ * min/max. */
+function _aabbInsideFrustum(planes, worldMin, worldMax) {
+  for (let p = 0; p < 6; p++) {
+    const a = planes[p * 4 + 0];
+    const b = planes[p * 4 + 1];
+    const c = planes[p * 4 + 2];
+    const d = planes[p * 4 + 3];
+    const px = (a > 0) ? worldMax[0] : worldMin[0];
+    const py = (b > 0) ? worldMax[1] : worldMin[1];
+    const pz = (c > 0) ? worldMax[2] : worldMin[2];
+    if (a * px + b * py + c * pz + d < 0) return false;
+  }
+  return true;
+}
+
+/* Sprint 5.10 -- transform a local AABB through a model matrix to
+ * get the world-space AABB. Transforms all 8 corners then takes
+ * min/max (vs the cheaper but less accurate "transform center +
+ * extend by half-diagonal" — the 8-corner version is tight under
+ * rotation, which matters when meshes are rotated 45° away from
+ * axis-aligned). worldMin / worldMax are written into the supplied
+ * Float32Array(3) outputs to avoid per-frame allocation. */
+function _transformAABB(localMin, localMax, model, outMin, outMax) {
+  let nx = Infinity, ny = Infinity, nz = Infinity;
+  let xx = -Infinity, xy = -Infinity, xz = -Infinity;
+  const m0 = model[0], m1 = model[1], m2 = model[2];
+  const m4 = model[4], m5 = model[5], m6 = model[6];
+  const m8 = model[8], m9 = model[9], m10 = model[10];
+  const m12 = model[12], m13 = model[13], m14 = model[14];
+  for (let i = 0; i < 8; i++) {
+    const x = (i & 1) ? localMax[0] : localMin[0];
+    const y = (i & 2) ? localMax[1] : localMin[1];
+    const z = (i & 4) ? localMax[2] : localMin[2];
+    const wx = m0 * x + m4 * y + m8  * z + m12;
+    const wy = m1 * x + m5 * y + m9  * z + m13;
+    const wz = m2 * x + m6 * y + m10 * z + m14;
+    if (wx < nx) nx = wx; if (wx > xx) xx = wx;
+    if (wy < ny) ny = wy; if (wy > xy) xy = wy;
+    if (wz < nz) nz = wz; if (wz > xz) xz = wz;
+  }
+  outMin[0] = nx; outMin[1] = ny; outMin[2] = nz;
+  outMax[0] = xx; outMax[1] = xy; outMax[2] = xz;
 }
 
 /* Param-fingerprint string used to invalidate the mesh cache when a
@@ -48436,12 +48559,35 @@ function _encodeScenePass(enc, entry) {
   // Per-draw loop. Each mesh writes to its OWN per-slot buffer +
   // binds its OWN bind group, so multi-mesh draws work correctly
   // (queue.writeBuffer ordering doesn't interleave with draws).
+  //
+  // Sprint 5.10 -- frustum culling. Scene.cullEnable (default 1)
+  // gates the test. Per mesh: transform local AABB through model
+  // matrix, run 6-plane SAT against camera.frustumPlanes. Outside
+  // the frustum -> skip draw entirely.
+  const sParams = _resolveNodeParams(node);
+  const cullEnable = (typeof sParams.cullEnable === "number")
+    ? sParams.cullEnable >= 0.5 : true;
+  let culledCount = 0;
+  const _aabbMinScratch = new Float32Array(3);
+  const _aabbMaxScratch = new Float32Array(3);
   let curMaterialType = null;
   for (let i = 0; i < meshes.length && i < inst.slots.length; i++) {
     const m = meshes[i];
     const slot = inst.slots[i];
     const buf = _ensureMeshBuffers(m);
     if (!buf || !buf.vertexBuffer) continue;
+    // 5.10 -- frustum cull. Skip mesh draws entirely outside the
+    // camera frustum. Tested in world space via 8-corner-transform
+    // of the cached local AABB. Diagnostic count logged once per
+    // frame so users can see culling actually firing.
+    if (cullEnable && camera.frustumPlanes && buf.aabbMin && buf.aabbMax) {
+      _transformAABB(buf.aabbMin, buf.aabbMax, m.transform,
+                     _aabbMinScratch, _aabbMaxScratch);
+      if (!_aabbInsideFrustum(camera.frustumPlanes, _aabbMinScratch, _aabbMaxScratch)) {
+        culledCount++;
+        continue;
+      }
+    }
     const matType = (m.material && m.material.type) || "unlit-vc";
     if (matType !== curMaterialType) {
       const pipeline = _ensureMeshPipeline(matType, sampleCount);
@@ -48493,6 +48639,14 @@ function _encodeScenePass(enc, entry) {
                   " material=" + matType +
                   " verts=" + buf.vertexCount + (buf.indexCount ? " indices=" + buf.indexCount : ""));
     }
+  }
+
+  // Sprint 5.10 -- one-shot diagnostic on first frustum cull so the
+  // user can confirm culling is working without needing a gizmo.
+  if (culledCount > 0 && !_SCENE_DIAG.cull) {
+    _SCENE_DIAG.cull = true;
+    console.log("[scene] frustum culling active (" + culledCount +
+                " mesh(es) culled this frame). Disable via Scene.cullEnable=0.");
   }
 
   // Sprint 7.5.4.c-sky -- background sky pass. Fills the
