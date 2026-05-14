@@ -10103,6 +10103,20 @@ public:
       { n: "tonemap", t: "param" },
       { n: "displaySize", t: "param" },
       { n: "renderScale", t: "param" },
+      // Sprint 5.4-rt -- environment + fog. RayTracedScene now
+      // honors the same env sources as raster Scene (GradientSky,
+      // ProceduralSky -- HDRI texture support is queued separately).
+      // Engine kernel reads sample_env_smooth for IBL on PBR hits +
+      // sample_env_full for primary-ray misses (sky background); fog
+      // applied per-pixel via apply_fog_rt.
+      { n: "environment", t: "environment" },
+      { n: "fogDensity",  t: "param" },
+      { n: "fogStart",    t: "param" },
+      { n: "fogHeight",   t: "param" },
+      { n: "fogAuto",     t: "param" },
+      { n: "fogR",        t: "param" },
+      { n: "fogG",        t: "param" },
+      { n: "fogB",        t: "param" },
       { n: "clearR",  t: "param" },
       { n: "clearG",  t: "param" },
       { n: "clearB",  t: "param" }
@@ -10126,6 +10140,11 @@ public:
       // demo (live-reconfigure lands with the upscale wiring).
       displaySize: "720p",   // 854x480 / 800x600 / 1280x720 / 1600x900 / 1920x1080
       renderScale: "native", // native / quality / balanced / performance / ultra
+      // 5.4-rt -- fog defaults match raster Scene's. fogDensity=0
+      // disables fog; the env input remains a wire (no default value
+      // — unwired = engine's mode-0 hemisphere fallback).
+      fogDensity: 0.0, fogStart: 5.0, fogHeight: 0.0, fogAuto: 1.0,
+      fogR: 0.65, fogG: 0.70, fogB: 0.78,
       clearR: 0.02, clearG: 0.02, clearB: 0.04
     },
     methods: {},
@@ -49385,6 +49404,82 @@ function _rtScenePollAndSend(node, inst) {
       console.warn("[rt-scene] quality params send failed:", e);
     }
   }
+
+  // Tier 6 -- environment (5.4-rt). Mirror the raster Scene's env
+  // uniform (8 vec4s: mode/intensity/turbidity/mieG + sky/horizon/
+  // ground + sun + cloud/fog) to the engine so RayTracedScene shows
+  // ProceduralSky / GradientSky / clouds / fog identical to what the
+  // raster Scene does. Engine kernel reads these from PathState
+  // and dispatches sample_env_smooth/full + apply_fog accordingly.
+  // HDRI (mode 3) intentionally not supported in this first pass --
+  // engine doesn't yet have an env texture binding.
+  // Also pulls Scene fog params (fogDensity etc.) since fog lives
+  // on the Scene node, not the env source.
+  const envRT = _rtBuildEnvWire(node);
+  const envJson = JSON.stringify(envRT);
+  if (envJson !== inst.lastEnvJson) {
+    try {
+      inst.ws.send(JSON.stringify({ type: "params", patch: { env: envRT } }));
+      inst.lastEnvJson = envJson;
+    } catch (e) {
+      console.warn("[rt-scene] env params send failed:", e);
+    }
+  }
+}
+
+/* Sprint 5.4-rt -- build the 8-vec4 wire env payload from the
+ * RayTracedScene node's wired environment + Scene-level fog params.
+ * Engine's set_env() reads these by key (params/sky/horizon/ground/
+ * sun/cloudParams/fogParams/fogColor). Missing keys keep the engine
+ * defaults (mode 0 = hemisphere fallback). */
+function _rtBuildEnvWire(rtNode) {
+  // Find the wired environment source via the RayTracedScene's
+  // `environment` input port. Resolve into the same descriptor
+  // shape the raster Scene uses, so the same math lands engine-side.
+  const sceneLike = { id: rtNode.id };
+  // Reuse the raster Scene's env resolver. It looks at
+  // state.edges where to.node = rtNode.id + to.port = "environment".
+  // RayTracedScene has the same port name + type, so this works.
+  const env = _resolveSceneEnvironment(rtNode);
+  // Pull RayTracedScene's own fog params (Scene + RayTracedScene
+  // both expose fogDensity/Start/Height/Auto + fogR/G/B as params).
+  const p = _resolveNodeParams(rtNode);
+  const num = (v, d) => (typeof v === "number" ? v : d);
+
+  if (!env) {
+    return {
+      params:      [0, 1, 1, 0.76],
+      sky:         [0, 0, 0, 0],
+      horizon:     [0, 0, 0, 0],
+      ground:      [0, 0, 0, 0],
+      sun:         [0, 1, 0, 0],
+      cloudParams: [0, 0, 0, 0],
+      fogParams:   [num(p.fogDensity, 0), num(p.fogStart, 5),
+                    num(p.fogHeight, 0),  num(p.fogAuto, 1)],
+      fogColor:    [num(p.fogR, 0.65), num(p.fogG, 0.70), num(p.fogB, 0.78), 0]
+    };
+  }
+  const sky     = env.sky     || [0, 0, 0, 0];
+  const horizon = env.horizon || [0, 0, 0, 0];
+  const ground  = env.ground  || [0, 0, 0, 0];
+  const sun     = env.sun     || [0, 1, 0, 0];
+  const cloud   = env.cloud   || [0, 0, 0, 0];
+  return {
+    params: [
+      (typeof env.mode === "number") ? env.mode : 0,
+      (typeof env.intensity === "number") ? env.intensity : 1,
+      (typeof env.turbidity === "number") ? env.turbidity : 1,
+      (typeof env.mieG === "number") ? env.mieG : 0.76
+    ],
+    sky:     [sky[0]||0, sky[1]||0, sky[2]||0, sky[3]||0],
+    horizon: [horizon[0]||0, horizon[1]||0, horizon[2]||0, horizon[3]||0],
+    ground:  [ground[0]||0, ground[1]||0, ground[2]||0, ground[3]||0],
+    sun:     [sun[0]||0, sun[1]||0, sun[2]||0, sun[3]||0],
+    cloudParams: [cloud[0]||0, cloud[1]||0, cloud[2]||0, cloud[3]||0],
+    fogParams:   [num(p.fogDensity, 0), num(p.fogStart, 5),
+                  num(p.fogHeight, 0),  num(p.fogAuto, 1)],
+    fogColor:    [num(p.fogR, 0.65), num(p.fogG, 0.70), num(p.fogB, 0.78), 0]
+  };
 }
 
 async function _rtSceneConnect(nodeId, inst) {
@@ -49447,6 +49542,7 @@ async function _rtSceneConnect(nodeId, inst) {
     inst.lastLightsJson = null;
     inst.lastMaterialsJson = null;
     inst.lastQualityJson = null;
+    inst.lastEnvJson = null;
     try {
       ws.send(JSON.stringify({ type: "hello" }));
 
