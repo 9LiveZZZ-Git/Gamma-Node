@@ -10370,6 +10370,49 @@ public:
     description: "Physically-based surface material with metallic-roughness workflow (glTF / Disney style). r/g/b is the albedo (basecolor): for metals this is the specular tint; for dielectrics it's the diffuse color. metallic in [0..1] mixes between dielectric (0, 4% F0 reflectance, full diffuse) and conductor (1, tinted F0 = albedo, no diffuse). roughness in [0.04..1] controls microfacet spread: ~0.05 = mirror, ~0.3 = polished plastic, ~0.7 = weathered surface, 1.0 = fully matte. Wire metallic / roughness to audio-reactive sources for live material modulation: MasterClock.beat into roughness for beat-driven shine, EnvFollow into metallic for bass-pumped metals."
   },
 
+  /* MirrorMat -- perfect mirror (RT-only). Reflects rays with a tint.
+   * Raster fallback renders as a high-metallic PhysicalMat (low
+   * roughness, albedo = tint). Behaves as a *true* mirror only when
+   * fed through a RayTracedScene -- the RT kernel bounces a reflection
+   * ray and gathers the surface it hits. */
+  MirrorMat: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "material",
+    ins: [
+      { n: "mesh", t: "mesh" },
+      { n: "r",    t: "param" },
+      { n: "g",    t: "param" },
+      { n: "b",    t: "param" }
+    ],
+    outs: [{ n: "mesh", t: "mesh" }],
+    params: { r: 1.0, g: 1.0, b: 1.0 },
+    methods: {},
+    description: "Perfect mirror surface (RT-only material). r/g/b tints the reflected color: (1,1,1) = chrome, (0.95,0.82,0.5) = gold, (0.78,0.78,0.78) = aluminum, (0.6,0.6,0.65) = lead. The RT kernel casts a reflection ray at each hit and multiplies the gathered color by this tint, up to MAX_BOUNCES (4) deep. Raster fallback: high-metallic PhysicalMat (mirror-but-not-true-mirror). Wire through a RayTracedScene to see actual mirror behavior."
+  },
+
+  /* GlassMat -- refracting transparent material (RT-only). Bends rays
+   * by Snell's law on entry + exit, attenuates color through Beer-
+   * Lambert absorption along the medium-side ray. Raster fallback
+   * renders as a low-opacity PhongMat (poor approximation; glass
+   * needs RT to look right). */
+  GlassMat: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "material",
+    ins: [
+      { n: "mesh", t: "mesh" },
+      { n: "r",    t: "param" },
+      { n: "g",    t: "param" },
+      { n: "b",    t: "param" },
+      { n: "ior",  t: "param" }
+    ],
+    outs: [{ n: "mesh", t: "mesh" }],
+    params: { r: 0.95, g: 0.97, b: 1.0, ior: 1.5 },
+    methods: {},
+    description: "Refracting transparent material (RT-only). r/g/b is the absorption tint -- the color the medium absorbs OUT of light passing through it; a deep blue tint gives blue glass. ior is the index of refraction: 1.0=air, 1.33=water, 1.46=quartz, 1.5=window glass, 1.7=lead crystal, 2.4=diamond. Total internal reflection happens automatically at angles steeper than the critical angle (gives the sparkling edges of diamond at high IoR). Raster fallback approximates with a low-opacity PhongMat; for the real look, wire into a RayTracedScene."
+  },
+
   /* ShaderMat -- curated WGSL surface presets. Each preset is a
    * unique fragment shader compiled on first use; the rest of the
    * pipeline (vertex shader, uniforms, render state) is shared with
@@ -31017,6 +31060,121 @@ const _demos = [
     }
   },
 
+  /* Sprint 7.5.6.d -- glass + mirror demo. Two balls on a matte floor:
+   * left = clear glass (ior=1.5, refracts the floor + sky behind it),
+   * right = chrome mirror (reflects floor, sky, and the glass ball).
+   * Slow orbit so you see the refraction distortion shift as the camera
+   * moves. Showcases the c-3/d bounce loop -- each ball can fire 4-6
+   * reflection/refraction rays per pixel via the hardware RT cores. */
+  {
+    id: "rt-glass-mirror",
+    name: "RT Glass + Mirror",
+    sub: "refraction · reflection · live",
+    type: "visual",
+    thumb: `<svg viewBox="0 0 100 44">
+      <defs>
+        <radialGradient id="dg-rt-gm-glass" cx="0.5" cy="0.45" r="0.5">
+          <stop offset="0"    stop-color="rgba(220,240,255,0.95)"/>
+          <stop offset="0.65" stop-color="rgba(160,200,235,0.75)"/>
+          <stop offset="0.95" stop-color="rgba(230,240,255,0.95)"/>
+          <stop offset="1"    stop-color="rgba(180,200,235,1)"/>
+        </radialGradient>
+        <radialGradient id="dg-rt-gm-mirror" cx="0.5" cy="0.4" r="0.55">
+          <stop offset="0"   stop-color="rgba(240,245,255,1)"/>
+          <stop offset="0.5" stop-color="rgba(140,165,200,1)"/>
+          <stop offset="1"   stop-color="rgba(30,40,70,1)"/>
+        </radialGradient>
+        <linearGradient id="dg-rt-gm-floor" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stop-color="rgba(90,90,100,1)"/>
+          <stop offset="1" stop-color="rgba(40,40,45,1)"/>
+        </linearGradient>
+      </defs>
+      <rect width="100" height="44" fill="rgba(4,6,12,1)"/>
+      <rect x="0" y="29" width="100" height="15" fill="url(#dg-rt-gm-floor)"/>
+      <ellipse cx="32" cy="34" rx="11" ry="1.8" fill="rgba(0,0,0,0.45)"/>
+      <ellipse cx="70" cy="34" rx="11" ry="1.8" fill="rgba(0,0,0,0.65)"/>
+      <circle cx="32" cy="23" r="9" fill="url(#dg-rt-gm-glass)"
+              stroke="rgba(255,255,255,0.45)" stroke-width="0.5"/>
+      <circle cx="70" cy="23" r="9" fill="url(#dg-rt-gm-mirror)"/>
+      <text x="92" y="10" text-anchor="end"
+            font-family="monospace" font-size="5"
+            fill="rgba(232,140,60,0.85)"
+            letter-spacing="0.08em">RT</text>
+    </svg>`,
+    build: () => {
+      // Floor (matte gray Phong so glass refracts visible texture)
+      const plane    = makeNode("Plane",       40,  40, { width: 8, depth: 8 });
+      const planeMat = makeNode("PhongMat",   280,  40, {
+        r: 0.55, g: 0.55, b: 0.58, shininess: 8, ambient: 0.2
+      });
+
+      // Glass ball -- left side
+      const glassBall = makeNode("Sphere",     40, 220, {
+        radius: 0.5, stacks: 32, slices: 48
+      });
+      const glassTr  = makeNode("Translate",  280, 220, { x: -0.7, y: 0.5, z: 0 });
+      const glassMat = makeNode("GlassMat",   500, 220, {
+        r: 0.95, g: 0.97, b: 1.0, ior: 1.5
+      });
+
+      // Mirror ball -- right side
+      const mirrorBall = makeNode("Sphere",   40, 420, {
+        radius: 0.5, stacks: 32, slices: 48
+      });
+      const mirrorTr  = makeNode("Translate", 280, 420, { x: 0.7, y: 0.5, z: 0 });
+      const mirrorMat = makeNode("MirrorMat", 500, 420, {
+        r: 0.95, g: 0.95, b: 0.95
+      });
+
+      // Light + camera + outputs
+      const light = makeNode("DirectionalLight", 40, 620, {
+        dirX: 0.3, dirY: 1.0, dirZ: 0.4,
+        colorR: 1.0, colorG: 0.97, colorB: 0.9,
+        intensity: 1.4
+      });
+
+      const clk    = makeNode("MasterClock", 40, 800, { bpm: 6 });
+      const mulTau = makeNode("Mul",        260, 800, { b: 6.283185307 });
+      const sinC   = makeNode("Sin",        460, 780);
+      const cosC   = makeNode("Cos",        460, 880);
+      const mulCx  = makeNode("Mul",        640, 780, { b: 2.8 });
+      const mulCz  = makeNode("Mul",        640, 880, { b: 2.8 });
+      const cam    = makeNode("Camera",     860, 800, {
+        posX: 0, posY: 0.9, posZ: 2.8,
+        targetX: 0, targetY: 0.4, targetZ: 0,
+        fov: 55, near: 0.1, far: 100, mode: 0
+      });
+
+      const rt = makeNode("RayTracedScene", 1100, 320, {
+        clearR: 0.04, clearG: 0.05, clearB: 0.09
+      });
+      const vo = makeNode("VisualOutput",   1340, 320, { display: 0 });
+
+      // ── Floor chain
+      state.edges.push({ from: { node: plane,    port: "mesh"  }, to: { node: planeMat, port: "mesh" } });
+      state.edges.push({ from: { node: planeMat, port: "mesh"  }, to: { node: rt,       port: "mesh1" } });
+      // ── Glass-ball chain
+      state.edges.push({ from: { node: glassBall, port: "mesh" }, to: { node: glassTr,  port: "mesh" } });
+      state.edges.push({ from: { node: glassTr,   port: "mesh" }, to: { node: glassMat, port: "mesh" } });
+      state.edges.push({ from: { node: glassMat,  port: "mesh" }, to: { node: rt,       port: "mesh2" } });
+      // ── Mirror-ball chain
+      state.edges.push({ from: { node: mirrorBall, port: "mesh" }, to: { node: mirrorTr,  port: "mesh" } });
+      state.edges.push({ from: { node: mirrorTr,   port: "mesh" }, to: { node: mirrorMat, port: "mesh" } });
+      state.edges.push({ from: { node: mirrorMat,  port: "mesh" }, to: { node: rt,        port: "mesh3" } });
+      // ── Light + camera-orbit + output
+      state.edges.push({ from: { node: light,  port: "light"  }, to: { node: rt, port: "light1" } });
+      state.edges.push({ from: { node: cam,    port: "camera" }, to: { node: rt, port: "camera" } });
+      state.edges.push({ from: { node: clk,    port: "phase"  }, to: { node: mulTau, port: "a" } });
+      state.edges.push({ from: { node: mulTau, port: "out"    }, to: { node: sinC,   port: "in" } });
+      state.edges.push({ from: { node: mulTau, port: "out"    }, to: { node: cosC,   port: "in" } });
+      state.edges.push({ from: { node: sinC,   port: "out"    }, to: { node: mulCx,  port: "a" } });
+      state.edges.push({ from: { node: cosC,   port: "out"    }, to: { node: mulCz,  port: "a" } });
+      state.edges.push({ from: { node: mulCx,  port: "out"    }, to: { node: cam,    port: "posX" } });
+      state.edges.push({ from: { node: mulCz,  port: "out"    }, to: { node: cam,    port: "posZ" } });
+      state.edges.push({ from: { node: rt,     port: "out"    }, to: { node: vo,     port: "in" } });
+    }
+  },
+
   {
     id: "mesh-text",
     name: "Mesh Text",
@@ -46829,6 +46987,22 @@ function _rtExtractMaterial(matNode) {
         color: [num(p.r, 0.85), num(p.g, 0.85), num(p.b, 0.85)],
         metallic: num(p.metallic, 0),
         roughness: num(p.roughness, 0.5)
+      };
+    case "MirrorMat":
+      // scene.rs Material::Mirror uses .tint instead of .color.
+      return {
+        type: "mirror",
+        tint: [num(p.r, 1), num(p.g, 1), num(p.b, 1)]
+      };
+    case "GlassMat":
+      // scene.rs Material::Glass: color (= absorption tint), ior,
+      // optional absorption (here we use color directly; absorption
+      // could be a separate per-component density param in c-d.2).
+      return {
+        type: "glass",
+        color: [num(p.r, 0.95), num(p.g, 0.97), num(p.b, 1.0)],
+        ior: num(p.ior, 1.5),
+        absorption: [0.0, 0.0, 0.0]
       };
     case "ShaderMat":
       // c-2 fallback: Slang transpile not implemented yet, so a
