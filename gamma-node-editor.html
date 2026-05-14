@@ -45208,7 +45208,28 @@ function _evaluateCamera(cameraNode, fbW, fbH) {
   }
   const viewProj = new Float32Array(16);
   _mat4Multiply(viewProj, proj, view);
-  return { view, proj, viewProj, eye: [px, py, pz] };
+  // Sprint 7.5.4.c-sky -- camera basis vectors + tan(fov/2) for the
+  // background sky pass to reconstruct world-space rays from screen
+  // coords. Derived from the same eye/target/up the view matrix is
+  // built from so they match exactly.
+  let fx = tx - px, fy = ty - py, fz = tz - pz;
+  let flen = Math.hypot(fx, fy, fz) || 1.0;
+  fx /= flen; fy /= flen; fz /= flen;
+  let rx = fy * uz - fz * uy;
+  let ry = fz * ux - fx * uz;
+  let rz = fx * uy - fy * ux;
+  let rlen = Math.hypot(rx, ry, rz) || 1.0;
+  rx /= rlen; ry /= rlen; rz /= rlen;
+  const uxC = ry * fz - rz * fy;
+  const uyC = rz * fx - rx * fz;
+  const uzC = rx * fy - ry * fx;
+  const tanHalfFov = (mode === 1) ? 1.0 : Math.tan(fov * 0.01745329251994 * 0.5);
+  return {
+    view, proj, viewProj, eye: [px, py, pz],
+    camRight:   [rx,  ry,  rz,  tanHalfFov * aspect],
+    camUp:      [uxC, uyC, uzC, tanHalfFov],
+    camForward: [fx,  fy,  fz,  (mode === 1) ? 1 : 0]
+  };
 }
 
 /* Resolve the camera wired into a Scene node's "camera" input. Falls
@@ -45934,7 +45955,67 @@ struct PerScene {
   envHorizon: vec4<f32>,
   envGround:  vec4<f32>,
   envSun:     vec4<f32>,
+  // Sprint 7.5.4.c-sky -- camera basis for the sky background pass.
+  // Pre-computed JS-side from the same eye/target/up the viewProj
+  // matrix uses, so the sky's reconstructed world ray matches what
+  // the meshes are projected against. .w slots:
+  //   camRight.w   = tan(fov/2) * aspect
+  //   camUp.w      = tan(fov/2)
+  //   camForward.w = 0 for perspective, 1 for ortho (ortho sky uses
+  //                  a flat color from camForward direction).
+  camRight:   vec4<f32>,
+  camUp:      vec4<f32>,
+  camForward: vec4<f32>,
 };
+
+// Sprint 7.5.4.c-sky -- background sky pass. Fullscreen triangle
+// at clip-space z=1 (far plane); depth-test "less-equal" lets it
+// pass only where no mesh has written a smaller depth. Result:
+// the sky fills uncovered background pixels with sample_env(rayDir).
+//
+// Without this pass the Scene's clearR/G/B shows through behind
+// meshes, even when an env is wired -- meaning glossy reflections
+// of the sky showed up but the actual sky behind didn't. With it,
+// the env source becomes a true skybox.
+
+struct SkyVsOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) worldDir: vec3<f32>,
+};
+
+@vertex
+fn vs_sky(@builtin(vertex_index) vid: u32) -> SkyVsOut {
+  // Oversized fullscreen triangle: (-1,-3), (3,1), (-1,1) covers
+  // the viewport with vertices outside the screen, avoiding the
+  // hypotenuse-of-two-tris seam.
+  var positions = array<vec2<f32>, 3>(
+    vec2<f32>(-1.0, -3.0),
+    vec2<f32>( 3.0,  1.0),
+    vec2<f32>(-1.0,  1.0)
+  );
+  let p = positions[vid];
+  var out: SkyVsOut;
+  // Far plane in WebGPU clip space (z=1). With depth-test less-equal
+  // + initial depth-clear=1, this fragment passes wherever no mesh
+  // drew (depth still = 1) and fails wherever a mesh wrote depth<1.
+  out.pos = vec4<f32>(p.x, p.y, 1.0, 1.0);
+  // Reconstruct world-space ray dir from screen coords + camera
+  // basis. Perspective: dir = forward + p.x * tanHFov*aspect * right
+  //                                    + p.y * tanHFov        * up
+  // Ortho: dir = forward (constant; sky becomes a flat color, fine
+  // for the rare ortho-camera case).
+  let isOrtho = uS.camForward.w > 0.5;
+  let pdir = uS.camForward.xyz
+           + p.x * uS.camRight.w * uS.camRight.xyz
+           + p.y * uS.camUp.w    * uS.camUp.xyz;
+  out.worldDir = select(normalize(pdir), uS.camForward.xyz, isOrtho);
+  return out;
+}
+
+@fragment
+fn fs_sky(in: SkyVsOut) -> @location(0) vec4<f32> {
+  return vec4<f32>(sample_env(normalize(in.worldDir)), 1.0);
+}
 
 // Sprint 7.5.4.c -- hand-tuned procedural sky. Not physically
 // accurate scattering (no integrated transmittance, no proper
@@ -46621,6 +46702,63 @@ function _ensureMeshPipeline(materialType, sampleCount) {
   return pipeline;
 }
 
+/* Sprint 7.5.4.c-sky -- background sky pipeline. Shares the same
+ * pipeline layout as mesh pipelines (binding 0 = perScene) but
+ * uses a different vertex / fragment entry pair (vs_sky / fs_sky)
+ * and depth-state: less-equal compare + no depth write. Drawn AT
+ * the end of the Scene mesh draws so the depth buffer is already
+ * populated; sky fragments only land on pixels with depth == 1
+ * (i.e. nothing covered them). No vertex buffer -- the shader
+ * builds its own positions from @builtin(vertex_index). Cached
+ * per sample count because pipelines are MSAA-keyed in WebGPU. */
+function _ensureSkyPipeline(sampleCount) {
+  if (!Number.isFinite(sampleCount) || sampleCount < 1) sampleCount = 1;
+  if (!Visual._skyPipelineCache) Visual._skyPipelineCache = new Map();
+  const key = "sky-" + sampleCount + "x";
+  if (Visual._skyPipelineCache.has(key)) {
+    return Visual._skyPipelineCache.get(key);
+  }
+  if (!Visual.device) return null;
+  if (!_ensureMeshBindGroupLayout()) return null;
+  // Reuse Visual.meshShaderModule; vs_sky / fs_sky live in the same
+  // shared mesh shader source as fs_pbr.
+  if (!Visual.meshShaderModule) {
+    try {
+      Visual.meshShaderModule = Visual.device.createShaderModule({
+        label: "mesh-shader", code: _MESH_WGSL
+      });
+    } catch (e) {
+      console.warn("[scene] mesh shader compile failed (sky):", e);
+      return null;
+    }
+  }
+  let pipeline;
+  try {
+    pipeline = Visual.device.createRenderPipeline({
+      label: "sky-pipeline-" + sampleCount + "x",
+      layout: Visual.meshPipelineLayout,
+      vertex: { module: Visual.meshShaderModule, entryPoint: "vs_sky" },
+      fragment: {
+        module: Visual.meshShaderModule,
+        entryPoint: "fs_sky",
+        targets: [{ format: Visual.fbFormat }]
+      },
+      primitive: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" },
+      depthStencil: {
+        format: "depth32float",
+        depthCompare: "less-equal",   // pass where depth still == 1 (no mesh)
+        depthWriteEnabled: false
+      },
+      multisample: { count: sampleCount }
+    });
+  } catch (e) {
+    console.warn("[scene] sky pipeline " + sampleCount + "x failed:", e);
+    return null;
+  }
+  Visual._skyPipelineCache.set(key, pipeline);
+  return pipeline;
+}
+
 /* Build / fetch a mesh's GPU buffers. DebugTriangle is the only
  * mesh-gen kind in sprint 7.5.3a; future primitives will dispatch
  * here based on node.type with vertex data built procedurally
@@ -47048,13 +47186,15 @@ function _ensureSceneInstance(sceneNode) {
   if (!_ensureMeshBindGroupLayout()) return null;
   // perScene: viewProj (16) + eye (4) + lightCount (4) + lights[4]
   // (64) + envParams (4) + envSky (4) + envHorizon (4) + envGround
-  // (4) + envSun (4) = 108 floats = 432 bytes.
+  // (4) + envSun (4) + camRight (4) + camUp (4) + camForward (4)
+  // = 120 floats = 480 bytes.
   // Sprint 7.5.3c push 3 grew this from 128 to 352 to hold up to 4
   // lights. Sprint 7.5.4 grew 352 -> 416 for environment data.
   // Sprint 7.5.4.c grew 416 -> 432 for the ProceduralSky sun vec4.
+  // Sprint 7.5.4.c-sky grew 432 -> 480 for camera basis (sky pass).
   const perSceneBuffer = Visual.device.createBuffer({
     label: "scene-perscene-" + sceneNode.id,
-    size: 432,
+    size: 480,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
   });
   // Sprint 7.5.3c bug fix -- queue.writeBuffer ordering. All
@@ -47105,7 +47245,7 @@ function _ensureSceneInstance(sceneNode) {
   inst = {
     perSceneBuffer,
     slots,
-    sceneScratch: new Float32Array(108),  // 432 bytes (sprint 7.5.4.c -- env data + sun)
+    sceneScratch: new Float32Array(120),  // 480 bytes (sprint 7.5.4.c-sky -- + camera basis)
     drawScratch:  new Float32Array(24)
   };
   Visual.sceneInstances.set(sceneNode.id, inst);
@@ -47209,7 +47349,7 @@ function _encodeScenePass(enc, entry) {
       depthStoreOp: (sampleCount > 1) ? "discard" : "store"
     }
   });
-  // Per-Scene uniform layout (sprint 7.5.4.c, 108 floats / 432 bytes):
+  // Per-Scene uniform layout (sprint 7.5.4.c-sky, 120 floats / 480 bytes):
   //   [ 0..15]   viewProj (mat4)
   //   [16..19]   eye         (vec4: xyz = camera world pos, w = unused)
   //   [20..23]   lightCount  (vec4: x = N in [1..4])
@@ -47223,6 +47363,9 @@ function _encodeScenePass(enc, entry) {
   //   [96..99]   envHorizon  (vec4: rgb = horizon color)
   //   [100..103] envGround   (vec4: rgb = ground/bottom color)
   //   [104..107] envSun      (vec4: xyz = dir TO sun, w = visibility)
+  //   [108..111] camRight    (vec4: xyz = world right, w = tanHFov*aspect)
+  //   [112..115] camUp       (vec4: xyz = world up,    w = tanHFov)
+  //   [116..119] camForward  (vec4: xyz = world fwd,   w = 0persp/1ortho)
   inst.sceneScratch.set(camera.viewProj, 0);
   inst.sceneScratch[16] = camera.eye[0];
   inst.sceneScratch[17] = camera.eye[1];
@@ -47278,7 +47421,16 @@ function _encodeScenePass(enc, entry) {
     // Zero out env slots when nothing is wired (mode=0 = fallback).
     for (let k = 88; k < 108; k++) inst.sceneScratch[k] = 0;
   }
-  Visual.device.queue.writeBuffer(inst.perSceneBuffer, 0, inst.sceneScratch.buffer, 0, 432);
+  // Sprint 7.5.4.c-sky -- camera basis vectors for the background
+  // sky pass. Always written (even when no env wired) so the data
+  // is fresh; the sky pass is only dispatched conditionally below.
+  const cR = camera.camRight   || [1, 0, 0, 1];
+  const cU = camera.camUp      || [0, 1, 0, 1];
+  const cF = camera.camForward || [0, 0, -1, 0];
+  inst.sceneScratch[108] = cR[0]; inst.sceneScratch[109] = cR[1]; inst.sceneScratch[110] = cR[2]; inst.sceneScratch[111] = cR[3];
+  inst.sceneScratch[112] = cU[0]; inst.sceneScratch[113] = cU[1]; inst.sceneScratch[114] = cU[2]; inst.sceneScratch[115] = cU[3];
+  inst.sceneScratch[116] = cF[0]; inst.sceneScratch[117] = cF[1]; inst.sceneScratch[118] = cF[2]; inst.sceneScratch[119] = cF[3];
+  Visual.device.queue.writeBuffer(inst.perSceneBuffer, 0, inst.sceneScratch.buffer, 0, 480);
 
   // Per-draw loop. Each mesh writes to its OWN per-slot buffer +
   // binds its OWN bind group, so multi-mesh draws work correctly
@@ -47339,6 +47491,28 @@ function _encodeScenePass(enc, entry) {
       console.log("[scene] first mesh draw: slot=" + i + " src=" + m.node.type + "#" + m.node.id +
                   " material=" + matType +
                   " verts=" + buf.vertexCount + (buf.indexCount ? " indices=" + buf.indexCount : ""));
+    }
+  }
+
+  // Sprint 7.5.4.c-sky -- background sky pass. Fills the
+  // not-covered-by-mesh pixels with sample_env(rayDir) so the wired
+  // environment becomes the actual visible sky behind the scene,
+  // not just IBL ambient on surfaces. Only fires when an env is
+  // wired (env != null); otherwise the Scene's clearR/G/B persists
+  // as the background and existing patches don't shift visually.
+  // Runs LAST in the render pass: meshes have already written
+  // depth < 1 wherever they cover, so depth-test less-equal +
+  // sky-vertex-z=1 paints only the uncovered pixels.
+  if (env && inst.slots[0] && inst.slots[0].bindGroup) {
+    const skyPipeline = _ensureSkyPipeline(sampleCount);
+    if (skyPipeline) {
+      pass.setPipeline(skyPipeline);
+      pass.setBindGroup(0, inst.slots[0].bindGroup);
+      pass.draw(3);
+      if (!_SCENE_DIAG.sky) {
+        _SCENE_DIAG.sky = true;
+        console.log("[scene] first sky pass (env mode=" + env.mode + ")");
+      }
     }
   }
 
