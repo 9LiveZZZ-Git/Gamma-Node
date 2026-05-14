@@ -47,6 +47,14 @@ Provider-agnostic via the `PROVIDERS` map (around `gamma-node-editor.html:2700`)
 
 The system prompt for `.gdsp` generation is built fresh from `gdspFormatSpec()` rather than hardcoded — keep it that way so the prompt stays in sync with what `parseGdsp` actually accepts.
 
+## Ray-tracing engine (Phase 7 §5.6)
+
+`RayTracedScene` (`gamma-node-editor.html:10053`) is a sink node that streams frames from a separate native binary — `gamma-rt-engine` (Rust + Vulkan-RT or Metal-RT), shipped in a sibling `rt-engine/` directory inside the `gamma-compile-server` monorepo, **not** in this checkout. The editor opens a WS to the engine, sends an initial scene patch, then per-frame diff patches (materials / lights / camera / quality) as the user drags sliders. Frames come back H.264-encoded, decoded via WebCodecs into a `GPUTexture` downstream nodes consume like any other texture.
+
+Design doc: `docs/RAYTRACING.md`. Sprint tags `7.5.6.a`–`7.5.6.h` track the phases. As of 2026-05-14 we're in **§5.6.f (denoising)** — engine-side `MTLFXTemporalDenoisedScaler` work is underway (see RAYTRACING.md for the four required aux textures + depth/jitter conventions). Editor's role this sprint: the Tier-5 quality WS patch at `gamma-node-editor.html:47220` resolves the `quality` preset (draft/preview/final → 1/4/16 spp, 2/4/8 bounces per §5.6.g) and ships it per frame. Extra samples at higher presets target edge / disocclusion noise that TDS history validation can't clear on its own.
+
+When editing: engine code lives in the other repo. In this checkout you can only change the editor-side protocol and the spec doc. When a commit references engine behavior, trust the spec doc + the sprint tag, not the local code.
+
 ## Conventions worth preserving
 
 - **No build step, no dependencies on disk.** Don't introduce npm/yarn/bundler tooling without an explicit reason. The "single HTML file you can email someone" property is load-bearing.

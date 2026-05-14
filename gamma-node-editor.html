@@ -10080,8 +10080,10 @@ public:
     outs: [{ n: "out", t: "texture" }],
     params: {
       quality: 1,         // 0=draft, 1=preview, 2=final
-      bounces: 4,
-      samples: 4,
+      bounces: 0,         // 0 = follow quality preset (2/4/8);
+                          //   1-8 = explicit override
+      samples: 0,         // 0 = follow quality preset (1/4/16 spp);
+                          //   1-16 = explicit per-frame override
       denoise: 1,
       exposure: 0.0,
       tonemap: 1,         // 0=none, 1=ACES, 2=Reinhard, 3=AgX
@@ -47216,6 +47218,41 @@ function _rtScenePollAndSend(node, inst) {
       console.warn("[rt-scene] camera params send failed:", e);
     }
   }
+
+  // Tier 5 -- quality. Sprint 7.5.6.f.3.d. The `quality` preset is
+  // the user's primary noise/detail dial; presets match the spec
+  // in docs/RAYTRACING.md §5.6.g:
+  //   draft    1 spp, 2 bounces   (cheapest, intentionally grainy)
+  //   preview  4 spp, 4 bounces   (denoised, "looks ok in motion")
+  //   final   16 spp, 8 bounces   (multi-bounce, denoised, render-grade)
+  // Extra spp at higher presets targets edge / disocclusion noise
+  // that MetalFX TDS history validation can't clear on its own (see
+  // docs/RAYTRACING.md §5.6.f for the TDS aux-texture requirements).
+  //
+  // `samples` / `bounces` params act as explicit overrides: 0 = follow
+  // preset, non-zero = pin. spp clamped to [1, 16], bounces to [1, 8].
+  // Changing either resets path-tracing accumulation engine-side.
+  const QUALITY_PRESETS = [
+    { spp:  1, bounces: 2 }, // 0 draft
+    { spp:  4, bounces: 4 }, // 1 preview (default)
+    { spp: 16, bounces: 8 }, // 2 final
+  ];
+  const qIdx = Math.max(0, Math.min(2, Math.round(num(p.quality, 1))));
+  const preset = QUALITY_PRESETS[qIdx];
+  const sppOverride = Math.round(num(p.samples, 0));
+  const bouncesOverride = Math.round(num(p.bounces, 0));
+  const qSpp = Math.max(1, Math.min(16, sppOverride || preset.spp));
+  const qBounces = Math.max(1, Math.min(8, bouncesOverride || preset.bounces));
+  const qObj = { spp: qSpp, bounces: qBounces };
+  const qJson = JSON.stringify(qObj);
+  if (qJson !== inst.lastQualityJson) {
+    try {
+      inst.ws.send(JSON.stringify({ type: "params", patch: { quality: qObj } }));
+      inst.lastQualityJson = qJson;
+    } catch (e) {
+      console.warn("[rt-scene] quality params send failed:", e);
+    }
+  }
 }
 
 async function _rtSceneConnect(nodeId, inst) {
@@ -47277,6 +47314,7 @@ async function _rtSceneConnect(nodeId, inst) {
     inst.lastCameraJson = null;
     inst.lastLightsJson = null;
     inst.lastMaterialsJson = null;
+    inst.lastQualityJson = null;
     try {
       ws.send(JSON.stringify({ type: "hello" }));
       ws.send(JSON.stringify({ type: "configure", width: 800, height: 600 }));
