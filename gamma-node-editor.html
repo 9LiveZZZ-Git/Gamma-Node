@@ -60,6 +60,7 @@
     --mesh:         #ff9d3f;     /* Phase 6.1.6 — vertex buffer ref (declared, used in Phase 7) */
     --camera:       #ffd96a;     /* Sprint 7.5.3a — view+proj matrices (Camera → Scene) */
     --light:        #f5e6c8;     /* Sprint 7.5.3c — light source (DirectionalLight → Scene) */
+    --environment:  #7ad6c4;     /* Sprint 7.5.4 — environment / sky (GradientSky → Scene.environment) */
     --selected:     #4a8fdc;
     --danger:       #e24b4a;
     --info:         #83e8ff;
@@ -817,6 +818,11 @@
   /* Sprint 7.5.3c -- Light port. Same double-ring as camera but in a
      softer cream — both are "global scene state, not per-vertex". */
   .port.light     { border-color: var(--light);     border-style: double; border-width: 4px; }
+  /* Sprint 7.5.4 -- Environment port. Dashed teal ring reads as
+     "global scene context, sky / IBL flavor" -- visually distinct
+     from the cream double-ring of light and the gold double-ring
+     of camera, but in the same "scene-level state" family. */
+  .port.environment { border-color: var(--environment); border-style: dashed; border-width: 3px; }
   .port.connected.param { background: var(--param); border-style: solid; }
   .port.connected.gate  { background: var(--gate); }
   .port.connected.clock { background: var(--clock); border-style: solid; }
@@ -825,6 +831,7 @@
   .port.connected.mesh      { background: var(--mesh);      border-style: solid; }
   .port.connected.camera    { background: var(--camera);    border-style: solid; }
   .port.connected.light     { background: var(--light);     border-style: solid; }
+  .port.connected.environment { background: var(--environment); border-style: solid; }
   .port:hover { transform: translateY(-50%) scale(1.4); }
   /* Live snap target during a wire drag — when the dragged endpoint
    * is within a screen-radius of a type-compatible input port, that
@@ -10008,18 +10015,23 @@ public:
     cppType: "",
     kind: "scene",
     ins: [
-      { n: "mesh1",      t: "mesh" },
-      { n: "mesh2",      t: "mesh" },
-      { n: "mesh3",      t: "mesh" },
-      { n: "mesh4",      t: "mesh" },
-      { n: "camera",     t: "camera" },
-      { n: "light1",     t: "light" },
-      { n: "light2",     t: "light" },
-      { n: "light3",     t: "light" },
-      { n: "light4",     t: "light" },
-      { n: "clearR",     t: "param" },
-      { n: "clearG",     t: "param" },
-      { n: "clearB",     t: "param" }
+      { n: "mesh1",       t: "mesh" },
+      { n: "mesh2",       t: "mesh" },
+      { n: "mesh3",       t: "mesh" },
+      { n: "mesh4",       t: "mesh" },
+      { n: "camera",      t: "camera" },
+      { n: "light1",      t: "light" },
+      { n: "light2",      t: "light" },
+      { n: "light3",      t: "light" },
+      { n: "light4",      t: "light" },
+      // Sprint 7.5.4 -- environment / IBL source. When wired, the
+      // PBR / Phong ambient sampling uses the wired sky instead of
+      // the hardcoded blue-gray hemisphere. When unwired, falls back
+      // to the prior behavior so existing patches don't change.
+      { n: "environment", t: "environment" },
+      { n: "clearR",      t: "param" },
+      { n: "clearG",      t: "param" },
+      { n: "clearB",      t: "param" }
     ],
     outs: [{ n: "out", t: "texture" }],
     params: {
@@ -10625,6 +10637,53 @@ public:
     },
     methods: {},
     description: "Rectangular area light source (RT-only). posX/Y/Z is the CENTER of the panel; dirX/Y/Z is the normal direction it faces (dirY=-1 = ceiling panel pointing down). width / height are world-units along the panel's tangent / bitangent. Inside RayTracedScene: the kernel uniform-samples one point on the rectangle per shadow ray + each primary samples a different sub-position, so TDS temporal averaging produces TRUE SOFT SHADOWS with a real penumbra (no PCF / PCSS hack). Doubling width or intensity gives equivalent total illumination. Falls back to a PointLight at the center inside a raster Scene (no shadow-ray equivalent there). Intensity scales by area implicitly via the kernel's MC weight, so an intensity of 4 with a 2x2 panel = the same surface radiance as intensity 4 with a 4x4."
+  },
+
+  /* GradientSky -- Sprint 7.5.4 / Phase 7 §5.4. Cheap procedural sky:
+   * three-stop vertical gradient (top, horizon, bottom) that the
+   * Scene's PBR / Phong ambient term samples instead of the
+   * hardcoded blue-gray hemisphere. Wire `env` into Scene's
+   * `environment` input.
+   *
+   *   skyR/G/B      -- color at direction.y = +1 (straight up)
+   *   horizonR/G/B  -- color at direction.y =  0 (equator)
+   *   groundR/G/B   -- color at direction.y = -1 (straight down)
+   *   intensity     -- overall multiplier; 1.0 = literal RGB,
+   *                    higher = brighter IBL contribution
+   *
+   * Reads in fs_pbr's sample_env() via .y on the surface normal
+   * (for diffuse) and the reflection vector (for specular). A
+   * metallic ball with a saturated sky vs warm ground will visibly
+   * reflect both halves, which is the whole point of having a real
+   * env source. Cheap fallback when an HDRI / Skybox isn't wanted. */
+  GradientSky: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "environment",
+    ins: [
+      { n: "skyR",      t: "param" },
+      { n: "skyG",      t: "param" },
+      { n: "skyB",      t: "param" },
+      { n: "horizonR",  t: "param" },
+      { n: "horizonG",  t: "param" },
+      { n: "horizonB",  t: "param" },
+      { n: "groundR",   t: "param" },
+      { n: "groundG",   t: "param" },
+      { n: "groundB",   t: "param" },
+      { n: "intensity", t: "param" }
+    ],
+    outs: [{ n: "env", t: "environment" }],
+    params: {
+      // Defaults: a soft daytime-blue overhead, warm horizon, dim
+      // ground. Same family as the pre-7.5.4 hardcoded hemisphere
+      // but with a 3rd horizon stop for a richer transition.
+      skyR: 0.40, skyG: 0.60, skyB: 0.95,
+      horizonR: 0.85, horizonG: 0.78, horizonB: 0.65,
+      groundR: 0.18, groundG: 0.15, groundB: 0.12,
+      intensity: 1.0
+    },
+    methods: {},
+    description: "Cheap procedural sky for IBL ambient. Three-stop vertical gradient: sky (color at +Y), horizon (color at equator), ground (color at -Y), with smooth-stepped transitions across the horizon. intensity scales the whole output -- bump to 1.5+ for stronger reflections on chrome / mirror finishes. Wire `env` into Scene's `environment` input -- replaces the hardcoded blue-gray hemisphere-IBL with this gradient. Same family as ProceduralSky / HDRI / Skybox (all Phase 7 §5.4); GradientSky is the cheapest of the four since there's no texture loading or scattering math. Defaults give a daytime sky -> warm horizon -> dim ground. Try (skyR=0.04, skyG=0.04, skyB=0.12) + (horizonR=0.4, G=0.3, B=0.5) + (groundR=0.05, G=0.05, B=0.08) for night. Or warm-uniform (sky=0.95, horizon=0.8, ground=0.55) for a sunset glow."
   },
 
   /* Custom ramp / curve shaper. Takes any 0..1 signal in, applies the
@@ -32731,7 +32790,7 @@ const SIGNAL_PORT_TYPES = new Set(["audio", "param", "gate", "clock"]);
 // Sprint 7.5.3a -- camera is a new visual-side port type alongside
 // mesh + texture. Same strict-same-type rule applies. Cameras carry
 // view + projection matrices to a Scene sink.
-const VISUAL_PORT_TYPES = new Set(["texture", "transform", "mesh", "camera", "light"]);
+const VISUAL_PORT_TYPES = new Set(["texture", "transform", "mesh", "camera", "light", "environment"]);
 function portsCompatible(srcType, dstType) {
   if (srcType === dstType) return true;
   if (SIGNAL_PORT_TYPES.has(srcType) && SIGNAL_PORT_TYPES.has(dstType)) return true;
@@ -32935,6 +32994,11 @@ function renderWires(temp) {
       // camera but in cream, signaling "scene-global uniform data".
       html += `<path d="${path}" fill="none" stroke="var(--light)" stroke-width="4" stroke-linecap="round" />`;
       html += `<path d="${path}" fill="none" stroke="var(--bg)"    stroke-width="1.5" stroke-linecap="round" />`;
+    } else if (t === "environment") {
+      // Sprint 7.5.4 -- Environment wire. Dashed teal, signals "sky /
+      // IBL context for the scene." Visually distinct from light's
+      // double-stripe and texture's short-dotted pattern.
+      html += `<path d="${path}" fill="none" stroke="var(--environment)" stroke-width="3" stroke-linecap="round" stroke-dasharray="6,5" />`;
     } else if (t === "transform") {
       // Double-stripe like clock but in transform-violet to keep the
       // 4×4 mat semantics visually distinct from rhythmic data.
@@ -45456,7 +45520,48 @@ struct PerScene {
   eye:        vec4<f32>,        // .xyz = camera world position
   lightCount: vec4<f32>,        // .x = active light count (1..4)
   lights:     array<Light, 4>,
+  // Sprint 7.5.4 -- environment / IBL. envParams.x is the mode:
+  //   0 = no environment wired -> use the hardcoded blue-gray
+  //       hemisphere-IBL fallback (matches pre-7.5.4 look so
+  //       existing patches don't shift colors when the buffer
+  //       layout grows).
+  //   1 = GradientSky: 3-stop gradient driven by direction.y, with
+  //       envSky.rgb at +Y, envHorizon.rgb at the equator, and
+  //       envGround.rgb at -Y. envParams.y is intensity multiplier.
+  // Future modes (Skybox = 2, HDRI = 3, ProceduralSky = 4) will
+  // re-use the same uniform shape, possibly bound textures, and
+  // sample_env() will dispatch on envParams.x.
+  envParams:  vec4<f32>,
+  envSky:     vec4<f32>,
+  envHorizon: vec4<f32>,
+  envGround:  vec4<f32>,
 };
+
+// Sprint 7.5.4 -- sample the wired environment by direction. Used
+// for hemisphere IBL ambient on lit materials (Phong, PBR). dir
+// should be a normalized world-space vector (e.g. the surface
+// normal for diffuse ambient, the reflection vector for specular).
+fn sample_env(dir: vec3<f32>) -> vec3<f32> {
+  let mode = u32(uS.envParams.x);
+  if (mode == 1u) {
+    // GradientSky: 3-stop. Above horizon -> mix(horizon, sky); below
+    // -> mix(horizon, ground). smoothstep softens the equator band
+    // so a glossy reflection doesn't show a knife edge.
+    let t = clamp(dir.y, -1.0, 1.0);
+    let intensity = uS.envParams.y;
+    if (t > 0.0) {
+      return mix(uS.envHorizon.rgb, uS.envSky.rgb,    smoothstep(0.0, 1.0, t)) * intensity;
+    } else {
+      return mix(uS.envHorizon.rgb, uS.envGround.rgb, smoothstep(0.0, 1.0, -t)) * intensity;
+    }
+  }
+  // Default: pre-7.5.4 hardcoded hemisphere-IBL. Two-stop gradient
+  // from cool sky to warm ground via the up-axis-aligned mix that
+  // fs_pbr used inline pre-refactor.
+  let envSkyD    = vec3<f32>(0.55, 0.62, 0.78);
+  let envGroundD = vec3<f32>(0.18, 0.16, 0.14);
+  return mix(envGroundD, envSkyD, dir.y * 0.5 + 0.5);
+}
 struct PerDraw {
   model:      mat4x4<f32>,
   baseColor:  vec4<f32>,   // .rgb = material color, .a = vertex-color mix amount (0 = pure material color, 1 = pure vertex color)
@@ -45621,18 +45726,15 @@ fn fs_pbr(in: VsOut) -> @location(0) vec4<f32> {
     total = total + (diffuse + specular) * li * nDotL * atten;
   }
 
-  // Cheap "hemisphere IBL" -- without a real cubemap, chrome
-  // (metallic=1, low roughness) would render as black in a black
-  // void. This fakes a sky/ground gradient so metals have
-  // something to reflect + dielectrics have soft fill light. Sky
-  // contribution biased toward the reflection vector for metals;
-  // dielectric contribution biased toward the surface normal.
-  // Replace with real IBL when a cubemap source ships.
+  // Sprint 7.5.4 -- IBL ambient via sample_env(). Mode 0 = pre-7.5.4
+  // hardcoded hemisphere; mode 1+ = wired environment (e.g.
+  // GradientSky). Diffuse uses the surface normal direction so the
+  // top of the sphere reads the sky color; specular uses the
+  // reflection vector so a low-roughness metal reflects whatever the
+  // env shows in the direction the camera-bounce ray would go.
   let r = reflect(-v, n);
-  let envSky    = vec3<f32>(0.55, 0.62, 0.78);
-  let envGround = vec3<f32>(0.18, 0.16, 0.14);
-  let envDiffuse = mix(envGround, envSky, n.y * 0.5 + 0.5);
-  let envSpec    = mix(envGround, envSky, r.y * 0.5 + 0.5);
+  let envDiffuse = sample_env(n);
+  let envSpec    = sample_env(r);
   let kS_amb = F0 + (vec3<f32>(1.0) - F0) * pow(1.0 - nDotV, 5.0);
   let kD_amb = (vec3<f32>(1.0) - kS_amb) * (1.0 - metallic);
   let ambient = kD_amb * albedo * envDiffuse * 0.5
@@ -46468,13 +46570,14 @@ function _ensureSceneInstance(sceneNode) {
   // allocation works regardless of whether a pipeline has been
   // built yet. Was the v0.3.53 regression cause.
   if (!_ensureMeshBindGroupLayout()) return null;
-  // perScene: viewProj (16) + eye (4) + lightCount (4) + lights[4] (4 lights × 16 floats) = 88 floats = 352 bytes.
-  // Sprint 7.5.3c push 3 grew this from 128 to 352 to hold an
-  // array of up to 4 lights (each 64 bytes: pos + color + params +
-  // spotDir).
+  // perScene: viewProj (16) + eye (4) + lightCount (4) + lights[4]
+  // (64) + envParams (4) + envSky (4) + envHorizon (4) + envGround
+  // (4) = 104 floats = 416 bytes.
+  // Sprint 7.5.3c push 3 grew this from 128 to 352 to hold up to 4
+  // lights. Sprint 7.5.4 grew 352 -> 416 for environment data.
   const perSceneBuffer = Visual.device.createBuffer({
     label: "scene-perscene-" + sceneNode.id,
-    size: 352,
+    size: 416,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
   });
   // Sprint 7.5.3c bug fix -- queue.writeBuffer ordering. All
@@ -46525,7 +46628,7 @@ function _ensureSceneInstance(sceneNode) {
   inst = {
     perSceneBuffer,
     slots,
-    sceneScratch: new Float32Array(88),   // 352 bytes (sprint 7.5.3c push 3)
+    sceneScratch: new Float32Array(104),  // 416 bytes (sprint 7.5.4 -- env data)
     drawScratch:  new Float32Array(24)
   };
   Visual.sceneInstances.set(sceneNode.id, inst);
@@ -46629,15 +46732,18 @@ function _encodeScenePass(enc, entry) {
       depthStoreOp: (sampleCount > 1) ? "discard" : "store"
     }
   });
-  // Per-Scene uniform layout (sprint 7.5.3c push 3, 88 floats /
-  // 352 bytes total):
-  //   [ 0..15]  viewProj (mat4)
-  //   [16..19]  eye      (vec4: xyz = camera world pos, w = unused)
-  //   [20..23]  lightCount (vec4: x = N in [1..4])
-  //   [24..39]  light 0 (4 vec4 = 16 floats: pos / color / params / spotDir)
-  //   [40..55]  light 1
-  //   [56..71]  light 2
-  //   [72..87]  light 3
+  // Per-Scene uniform layout (sprint 7.5.4, 104 floats / 416 bytes):
+  //   [ 0..15]   viewProj (mat4)
+  //   [16..19]   eye         (vec4: xyz = camera world pos, w = unused)
+  //   [20..23]   lightCount  (vec4: x = N in [1..4])
+  //   [24..39]   light 0 (4 vec4: pos / color / params / spotDir)
+  //   [40..55]   light 1
+  //   [56..71]   light 2
+  //   [72..87]   light 3
+  //   [88..91]   envParams   (vec4: x = mode 0/1, y = intensity)
+  //   [92..95]   envSky      (vec4: rgb = sky/top color)
+  //   [96..99]   envHorizon  (vec4: rgb = horizon color)
+  //   [100..103] envGround   (vec4: rgb = ground/bottom color)
   inst.sceneScratch.set(camera.viewProj, 0);
   inst.sceneScratch[16] = camera.eye[0];
   inst.sceneScratch[17] = camera.eye[1];
@@ -46671,7 +46777,23 @@ function _encodeScenePass(enc, entry) {
       for (let k = 0; k < 16; k++) inst.sceneScratch[base + k] = 0;
     }
   }
-  Visual.device.queue.writeBuffer(inst.perSceneBuffer, 0, inst.sceneScratch.buffer, 0, 352);
+  // Sprint 7.5.4 -- environment. Pull from the wired environment
+  // input (if any) and pack into the env vec4s. mode=0 means
+  // unwired -> shader falls back to the hardcoded hemisphere-IBL.
+  const env = _resolveSceneEnvironment(node);
+  if (env) {
+    inst.sceneScratch[88]  = env.mode;
+    inst.sceneScratch[89]  = env.intensity;
+    inst.sceneScratch[90]  = 0;
+    inst.sceneScratch[91]  = 0;
+    inst.sceneScratch[92]  = env.sky[0];     inst.sceneScratch[93]  = env.sky[1];     inst.sceneScratch[94]  = env.sky[2];     inst.sceneScratch[95]  = 0;
+    inst.sceneScratch[96]  = env.horizon[0]; inst.sceneScratch[97]  = env.horizon[1]; inst.sceneScratch[98]  = env.horizon[2]; inst.sceneScratch[99]  = 0;
+    inst.sceneScratch[100] = env.ground[0];  inst.sceneScratch[101] = env.ground[1];  inst.sceneScratch[102] = env.ground[2];  inst.sceneScratch[103] = 0;
+  } else {
+    // Zero out env slots when nothing is wired (mode=0 = fallback).
+    for (let k = 88; k < 104; k++) inst.sceneScratch[k] = 0;
+  }
+  Visual.device.queue.writeBuffer(inst.perSceneBuffer, 0, inst.sceneScratch.buffer, 0, 416);
 
   // Per-draw loop. Each mesh writes to its OWN per-slot buffer +
   // binds its OWN bind group, so multi-mesh draws work correctly
@@ -46846,6 +46968,35 @@ function _resolveLightNode(lightNode) {
  * an array of light descriptors. Falls back to a single default
  * directional light when nothing is wired so meshes don't render
  * pitch-black. Per-frame cache via Visual._frameLightCache. */
+/* Sprint 7.5.4 -- resolve the Scene's wired environment input.
+ * Returns the descriptor the per-Scene uniform writer packs into
+ * the env vec4s, or null when nothing is wired (= shader falls
+ * back to hardcoded hemisphere-IBL). The structure mirrors what
+ * sample_env() in WGSL expects:
+ *   { mode, intensity, sky, horizon, ground }
+ * Future modes (Skybox, HDRI, ProceduralSky) will return higher
+ * mode numbers + possibly resolved-texture handles. */
+function _resolveSceneEnvironment(sceneNode) {
+  const wire = state.edges && state.edges.find(e =>
+    e && e.to && e.to.node === sceneNode.id && e.to.port === "environment"
+  );
+  if (!wire || !wire.from) return null;
+  const src = state.nodes.find(n => n && n.id === wire.from.node);
+  if (!src) return null;
+  const p = _resolveNodeParams(src);
+  const num = (v, d) => (typeof v === "number" ? v : d);
+  if (src.type === "GradientSky") {
+    return {
+      mode: 1,
+      intensity: num(p.intensity, 1.0),
+      sky:     [num(p.skyR, 0.55),     num(p.skyG, 0.65),     num(p.skyB, 0.85)],
+      horizon: [num(p.horizonR, 0.78), num(p.horizonG, 0.80), num(p.horizonB, 0.85)],
+      ground:  [num(p.groundR, 0.18),  num(p.groundG, 0.16),  num(p.groundB, 0.14)]
+    };
+  }
+  return null;
+}
+
 function _resolveSceneLights(sceneNode) {
   if (!Visual._frameLightCache) Visual._frameLightCache = new Map();
   const lights = [];
