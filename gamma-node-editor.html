@@ -10639,6 +10639,109 @@ public:
     description: "Rectangular area light source (RT-only). posX/Y/Z is the CENTER of the panel; dirX/Y/Z is the normal direction it faces (dirY=-1 = ceiling panel pointing down). width / height are world-units along the panel's tangent / bitangent. Inside RayTracedScene: the kernel uniform-samples one point on the rectangle per shadow ray + each primary samples a different sub-position, so TDS temporal averaging produces TRUE SOFT SHADOWS with a real penumbra (no PCF / PCSS hack). Doubling width or intensity gives equivalent total illumination. Falls back to a PointLight at the center inside a raster Scene (no shadow-ray equivalent there). Intensity scales by area implicitly via the kernel's MC weight, so an intensity of 4 with a 2x2 panel = the same surface radiance as intensity 4 with a 4x4."
   },
 
+  /* DayNightCycle -- Sprint 7.5.4.c. Time-of-day driver. Outputs a
+   * single `timeOfDay` param in [0, 1] that Sun + ProceduralSky
+   * both consume so they stay in sync. Conventions:
+   *   0.00 midnight   0.25 sunrise   0.50 noon   0.75 sunset
+   *
+   * Two modes:
+   *   - phase input WIRED: emits the phase value verbatim (clamped /
+   *     wrapped to [0,1]). Wire `MasterClock.phase → phase` with a
+   *     slow clock (bpm=2 -> 30s day, bpm=0.5 -> 2min day) for an
+   *     auto-cycling scene.
+   *   - phase input UNWIRED: emits `manual` (a stored param). Lets
+   *     you freeze the scene at a specific time-of-day during
+   *     authoring -- twist the slider to find the look you want. */
+  DayNightCycle: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "daynight",
+    ins: [
+      { n: "phase",  t: "param" },
+      { n: "manual", t: "param" }
+    ],
+    outs: [{ n: "timeOfDay", t: "param" }],
+    params: { manual: 0.5 },
+    methods: {},
+    description: "Time-of-day driver for Sun + ProceduralSky. Outputs a 0..1 timeOfDay phase: 0=midnight, 0.25=sunrise, 0.5=noon, 0.75=sunset. Wire `MasterClock.phase → phase` for an auto-cycle (set the MasterClock to a slow bpm: 2 = 30s day, 1 = 60s day, 0.5 = 2min day). Leave `phase` unwired to freeze the scene at `manual` for authoring. The same timeOfDay should feed BOTH Sun and ProceduralSky so the rendered sun-disk on the sky matches the direction the DirectionalLight comes from."
+  },
+
+  /* Sun -- Sprint 7.5.4.c. DirectionalLight whose direction + color
+   * are driven by timeOfDay (via DayNightCycle or a literal slider).
+   * Direction goes around an arc (east-rise, overhead-noon, west-
+   * set). Color tints warm-red at the horizon, neutral-warm-white
+   * overhead -- matches the sun-disk color rendered by Procedural-
+   * Sky exactly (same math both sides). Below horizon -> intensity
+   * 0 so the scene goes dark for night (env still emits a dim blue
+   * ambient via ProceduralSky's night palette).
+   *
+   * Optional tintR/G/B let you push the sun warm/cool independent
+   * of the elevation-driven default. intensityScale scales the
+   * computed intensity (use 0.5 for an overcast feel, 1.5 for
+   * harsh-noon). */
+  Sun: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "light",
+    ins: [
+      { n: "timeOfDay",      t: "param" },
+      { n: "tintR",          t: "param" },
+      { n: "tintG",          t: "param" },
+      { n: "tintB",          t: "param" },
+      { n: "intensityScale", t: "param" }
+    ],
+    outs: [{ n: "light", t: "light" }],
+    params: {
+      timeOfDay: 0.5,
+      tintR: 1.0, tintG: 1.0, tintB: 1.0,
+      intensityScale: 1.0
+    },
+    methods: {},
+    description: "DirectionalLight driven by timeOfDay. Wire `DayNightCycle.timeOfDay → Sun.timeOfDay` for an animated cycle (or set timeOfDay manually to freeze). Direction follows an east-up-west arc; color tints sunset-warm at the horizon, neutral-warm-white overhead. Below horizon (timeOfDay near midnight) the sun's intensity falls to 0 so the scene dims into night naturally. Pairs with ProceduralSky on the same timeOfDay so the sun-disk on the sky matches the DirectionalLight's direction. tintR/G/B and intensityScale let you customize without touching the elevation-driven defaults."
+  },
+
+  /* ProceduralSky -- Sprint 7.5.4.c. Hand-tuned Rayleigh+Mie style
+   * atmospheric scattering. Drives the env IBL ambient on PBR
+   * surfaces (and, eventually, sky pixels in screen-space). Wire
+   * `DayNightCycle.timeOfDay → ProceduralSky.timeOfDay` then
+   * `ProceduralSky.env → Scene.environment` and you have an animated
+   * day-night sky.
+   *
+   * params:
+   *   timeOfDay -- 0..1 phase (see DayNightCycle for convention)
+   *   turbidity -- atmosphere haze [0.5, 5.0]. Higher = more washed-
+   *                out + warmer horizon at sunset.
+   *   mieG      -- forward-scatter anisotropy [0, 0.95]. 0.76 is a
+   *                standard textbook value; higher = tighter sun
+   *                glow, lower = broader.
+   *   intensity -- overall multiplier. Bump to 1.5+ for brighter
+   *                reflections on chrome surfaces.
+   *
+   * NOT physically accurate (no integrated transmittance, no proper
+   * optical depth math). Reads as "sky" through the day/night cycle
+   * and that's the goal for v1; replace with a real Hosek-Wilkie
+   * implementation in a future sprint. */
+  ProceduralSky: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "environment",
+    ins: [
+      { n: "timeOfDay", t: "param" },
+      { n: "turbidity", t: "param" },
+      { n: "mieG",      t: "param" },
+      { n: "intensity", t: "param" }
+    ],
+    outs: [{ n: "env", t: "environment" }],
+    params: {
+      timeOfDay: 0.5,
+      turbidity: 1.0,
+      mieG:      0.76,
+      intensity: 1.0
+    },
+    methods: {},
+    description: "Hand-tuned atmospheric-scattering sky. timeOfDay drives a day/night cycle: noon -> blue zenith + pale horizon, sunset -> orange-red sky + dim ground, midnight -> deep blue night sky. turbidity pushes the daytime color toward warmer/hazier tones (high turbidity = orange sunsets bleeding longer into the day). mieG controls the forward-scatter anisotropy: 0.76 gives a textbook sun-halo; higher = tighter glow, lower = broader fuzzy sun. Wire `DayNightCycle.timeOfDay` into this AND into the Sun node so the sky's sun-disk + the DirectionalLight come from the same direction at the same color. NOT physically accurate (no integrated transmittance) but reads as 'sky' through the cycle. Hosek-Wilkie implementation is a future polish."
+  },
+
   /* GradientSky -- Sprint 7.5.4 / Phase 7 §5.4. Cheap procedural sky:
    * three-stop vertical gradient (top, horizon, bottom) that the
    * Scene's PBR / Phong ambient term samples instead of the
@@ -31613,6 +31716,141 @@ const _demos = [
     }
   },
 
+  /* Sprint 7.5.4.c -- Day / Night Cycle showcase. The whole §5.4.c
+   * trio (DayNightCycle + Sun + ProceduralSky) wired up against a
+   * trio of PBR balls + a glossy floor. MasterClock(bpm=0.6) drives
+   * the cycle through ~100 seconds per day -- short enough to watch
+   * the whole arc in a sitting, long enough to enjoy each phase.
+   * Sun's direction + color + the sky's appearance all derive from
+   * the SAME timeOfDay so the directional shadow matches the
+   * apparent sun position in the sky exactly.
+   *
+   * To see specific times-of-day, disconnect the MasterClock from
+   * DayNightCycle and twist its `manual` slider. 0.25 = sunrise,
+   * 0.5 = noon, 0.75 = sunset, 0.0 = midnight. */
+  {
+    id: "day-night-cycle",
+    name: "Day / Night Cycle",
+    sub: "sun + procedural sky · 100s loop",
+    type: "visual",
+    thumb: `<svg viewBox="0 0 100 44">
+      <defs>
+        <linearGradient id="dg-dn-sky" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0"   stop-color="rgba(255,140,55,1)"/>
+          <stop offset="0.5" stop-color="rgba(180,90,75,1)"/>
+          <stop offset="1"   stop-color="rgba(15,18,40,1)"/>
+        </linearGradient>
+        <radialGradient id="dg-dn-sun" cx="0.85" cy="0.5" r="0.18">
+          <stop offset="0"   stop-color="rgba(255,235,170,1)"/>
+          <stop offset="0.5" stop-color="rgba(255,170,90,0.7)"/>
+          <stop offset="1"   stop-color="rgba(255,140,55,0)"/>
+        </radialGradient>
+        <radialGradient id="dg-dn-chrome" cx="0.5" cy="0.4" r="0.55">
+          <stop offset="0"   stop-color="rgba(255,180,120,1)"/>
+          <stop offset="0.5" stop-color="rgba(180,90,75,1)"/>
+          <stop offset="1"   stop-color="rgba(35,25,50,1)"/>
+        </radialGradient>
+      </defs>
+      <rect width="100" height="44" fill="url(#dg-dn-sky)"/>
+      <ellipse cx="85" cy="22" rx="16" ry="16" fill="url(#dg-dn-sun)"/>
+      <rect x="0" y="32" width="100" height="12" fill="rgba(20,15,18,0.92)"/>
+      <ellipse cx="50" cy="34" rx="9" ry="1.4" fill="rgba(0,0,0,0.55)"/>
+      <circle cx="50" cy="24" r="9" fill="url(#dg-dn-chrome)"/>
+    </svg>`,
+    build: () => {
+      // ── Three PBR balls so you can read the day/night color
+      // shift across material types simultaneously.
+      const plane    = makeNode("Plane",      40,  40, { width: 10, depth: 10 });
+      const planeMat = makeNode("PhysicalMat",280,  40, {
+        r: 0.30, g: 0.28, b: 0.30,
+        metallic: 0.0, roughness: 0.55
+      });
+
+      const matteBall = makeNode("Sphere",     40, 220, { radius: 0.55, stacks: 32, slices: 48 });
+      const matteTr   = makeNode("Translate", 280, 220, { x: -1.5, y: 0.55, z: 0 });
+      const matteMat  = makeNode("PhysicalMat",500, 220, {
+        r: 0.78, g: 0.74, b: 0.68,
+        metallic: 0.0, roughness: 0.80
+      });
+
+      const glossyBall = makeNode("Sphere",     40, 420, { radius: 0.55, stacks: 32, slices: 48 });
+      const glossyTr   = makeNode("Translate", 280, 420, { x: 0.0, y: 0.55, z: 0 });
+      const glossyMat  = makeNode("PhysicalMat",500, 420, {
+        r: 0.55, g: 0.50, b: 0.46,
+        metallic: 0.2, roughness: 0.30
+      });
+
+      const chromeBall = makeNode("Sphere",     40, 620, { radius: 0.55, stacks: 32, slices: 48 });
+      const chromeTr   = makeNode("Translate", 280, 620, { x: 1.5, y: 0.55, z: 0 });
+      const chromeMat  = makeNode("PhysicalMat",500, 620, {
+        r: 0.95, g: 0.95, b: 0.97,
+        metallic: 1.0, roughness: 0.05
+      });
+
+      // ── Day/night infrastructure. Slow clock -> DayNightCycle
+      // -> Sun + ProceduralSky. Single source of truth for time-of-
+      // day; Sun and sky stay perfectly in sync.
+      const clkDay = makeNode("MasterClock", 40, 820, { bpm: 0.6 });
+      const dnc    = makeNode("DayNightCycle", 280, 820, { manual: 0.5 });
+      const sun    = makeNode("Sun",         500, 820, {
+        timeOfDay: 0.5,
+        tintR: 1.0, tintG: 1.0, tintB: 1.0,
+        intensityScale: 1.0
+      });
+      const sky    = makeNode("ProceduralSky", 500, 1020, {
+        timeOfDay: 0.5, turbidity: 1.2, mieG: 0.78, intensity: 1.0
+      });
+
+      // ── Camera orbit (independent slow clock so it doesn't sync
+      // to the day-night cycle visibly).
+      const clkCam = makeNode("MasterClock", 40, 1220, { bpm: 3 });
+      const mulTau = makeNode("Mul",        260, 1220, { b: 6.283185307 });
+      const sinC   = makeNode("Sin",        460, 1200);
+      const cosC   = makeNode("Cos",        460, 1300);
+      const mulCx  = makeNode("Mul",        640, 1200, { b: 3.6 });
+      const mulCz  = makeNode("Mul",        640, 1300, { b: 3.6 });
+      const cam    = makeNode("Camera",     860, 1220, {
+        posX: 0, posY: 1.2, posZ: 3.6,
+        targetX: 0, targetY: 0.5, targetZ: 0,
+        fov: 50, near: 0.1, far: 100, mode: 0
+      });
+
+      const scene = makeNode("Scene",       1100, 320, {
+        clearR: 0.02, clearG: 0.02, clearB: 0.04
+      });
+      const vo = makeNode("VisualOutput",   1340, 320, { display: 0 });
+
+      // ── Floor + 3 balls
+      state.edges.push({ from: { node: plane,    port: "mesh" }, to: { node: planeMat, port: "mesh" } });
+      state.edges.push({ from: { node: planeMat, port: "mesh" }, to: { node: scene,    port: "mesh1" } });
+      state.edges.push({ from: { node: matteBall, port: "mesh" }, to: { node: matteTr,  port: "mesh" } });
+      state.edges.push({ from: { node: matteTr,   port: "mesh" }, to: { node: matteMat, port: "mesh" } });
+      state.edges.push({ from: { node: matteMat,  port: "mesh" }, to: { node: scene,    port: "mesh2" } });
+      state.edges.push({ from: { node: glossyBall, port: "mesh" }, to: { node: glossyTr,  port: "mesh" } });
+      state.edges.push({ from: { node: glossyTr,   port: "mesh" }, to: { node: glossyMat, port: "mesh" } });
+      state.edges.push({ from: { node: glossyMat,  port: "mesh" }, to: { node: scene,     port: "mesh3" } });
+      state.edges.push({ from: { node: chromeBall, port: "mesh" }, to: { node: chromeTr,  port: "mesh" } });
+      state.edges.push({ from: { node: chromeTr,   port: "mesh" }, to: { node: chromeMat, port: "mesh" } });
+      state.edges.push({ from: { node: chromeMat,  port: "mesh" }, to: { node: scene,     port: "mesh4" } });
+      // ── Day-night wiring. Single timeOfDay drives Sun + Sky.
+      state.edges.push({ from: { node: clkDay, port: "phase"     }, to: { node: dnc, port: "phase" } });
+      state.edges.push({ from: { node: dnc,    port: "timeOfDay" }, to: { node: sun, port: "timeOfDay" } });
+      state.edges.push({ from: { node: dnc,    port: "timeOfDay" }, to: { node: sky, port: "timeOfDay" } });
+      state.edges.push({ from: { node: sun,    port: "light"     }, to: { node: scene, port: "light1" } });
+      state.edges.push({ from: { node: sky,    port: "env"       }, to: { node: scene, port: "environment" } });
+      // ── Camera orbit + output
+      state.edges.push({ from: { node: cam,    port: "camera" }, to: { node: scene,  port: "camera" } });
+      state.edges.push({ from: { node: clkCam, port: "phase"  }, to: { node: mulTau, port: "a" } });
+      state.edges.push({ from: { node: mulTau, port: "out"    }, to: { node: sinC,   port: "in" } });
+      state.edges.push({ from: { node: mulTau, port: "out"    }, to: { node: cosC,   port: "in" } });
+      state.edges.push({ from: { node: sinC,   port: "out"    }, to: { node: mulCx,  port: "a" } });
+      state.edges.push({ from: { node: cosC,   port: "out"    }, to: { node: mulCz,  port: "a" } });
+      state.edges.push({ from: { node: mulCx,  port: "out"    }, to: { node: cam,    port: "posX" } });
+      state.edges.push({ from: { node: mulCz,  port: "out"    }, to: { node: cam,    port: "posZ" } });
+      state.edges.push({ from: { node: scene,  port: "out"    }, to: { node: vo,     port: "in" } });
+    }
+  },
+
   {
     id: "mesh-text",
     name: "Mesh Text",
@@ -45676,21 +45914,101 @@ struct PerScene {
   lightCount: vec4<f32>,        // .x = active light count (1..4)
   lights:     array<Light, 4>,
   // Sprint 7.5.4 -- environment / IBL. envParams.x is the mode:
-  //   0 = no environment wired -> use the hardcoded blue-gray
-  //       hemisphere-IBL fallback (matches pre-7.5.4 look so
-  //       existing patches don't shift colors when the buffer
-  //       layout grows).
+  //   0 = no environment wired -> hardcoded blue-gray hemisphere-IBL
+  //       fallback (matches pre-7.5.4 look so existing patches don't
+  //       shift colors when the buffer layout grows).
   //   1 = GradientSky: 3-stop gradient driven by direction.y, with
   //       envSky.rgb at +Y, envHorizon.rgb at the equator, and
   //       envGround.rgb at -Y. envParams.y is intensity multiplier.
-  // Future modes (Skybox = 2, HDRI = 3, ProceduralSky = 4) will
-  // re-use the same uniform shape, possibly bound textures, and
-  // sample_env() will dispatch on envParams.x.
+  //   2 = ProceduralSky (7.5.4.c): hand-tuned Rayleigh+Mie style
+  //       scattering. envSun.xyz = direction TO the sun (computed
+  //       JS-side from time-of-day), envSun.w = visibility in [0,1]
+  //       (0 below horizon, smoothly 1 above). envParams.z =
+  //       turbidity (haze; pushes color toward horizon tones),
+  //       envParams.w = mieG (forward-scatter anisotropy, ~0.76).
+  //       envSky/envHorizon/envGround unused for this mode.
+  // Future modes (Skybox = 3, HDRI = 4) re-use the same shape, bind
+  // a cubemap/equirect texture, and dispatch in sample_env.
   envParams:  vec4<f32>,
   envSky:     vec4<f32>,
   envHorizon: vec4<f32>,
   envGround:  vec4<f32>,
+  envSun:     vec4<f32>,
 };
+
+// Sprint 7.5.4.c -- hand-tuned procedural sky. Not physically
+// accurate scattering (no integrated transmittance, no proper
+// optical depth), but reads as "sky" through the day/night cycle:
+//   * deep blue zenith when sun is high
+//   * warm horizon when sun is low (sunset reds)
+//   * dim blue night sky when sun is below horizon
+// Falls back to a polished GradientSky variant + Henyey-Greenstein
+// sun halo. Replace with full Hosek-Wilkie in a future sprint if
+// physical accuracy matters; this is good enough for the day/night
+// demo + IBL ambient.
+fn sample_procedural_sky(dir: vec3<f32>) -> vec3<f32> {
+  let sunDir = uS.envSun.xyz;
+  let sunVis = uS.envSun.w;
+  let turbidity = uS.envParams.z;
+  let mieG = uS.envParams.w;
+  let intensity = uS.envParams.y;
+
+  let view_y = clamp(dir.y, -1.0, 1.0);
+  let sun_elev = clamp(sunDir.y, -1.0, 1.0);
+
+  // Day/night blend: smoothly goes from 0 (sun far below horizon) to
+  // 1 (sun comfortably above). The transition is sunrise/sunset.
+  let day = smoothstep(-0.08, 0.18, sun_elev);
+
+  // Daytime palette. Zenith deepens to blue as sun rises; horizon
+  // warms when sun is low (more atmospheric path = more red).
+  let zen_day = mix(
+    vec3<f32>(0.55, 0.40, 0.35),                              // dawn zenith
+    vec3<f32>(0.28, 0.50, 0.92),                              // noon zenith
+    smoothstep(0.0, 0.55, sun_elev)
+  );
+  let hor_day = mix(
+    vec3<f32>(0.95, 0.55, 0.30) * (0.85 + turbidity * 0.25),  // sunset
+    vec3<f32>(0.78, 0.85, 0.95),                              // midday
+    smoothstep(0.0, 0.45, sun_elev)
+  );
+  let sky_day = mix(hor_day, zen_day, smoothstep(0.0, 1.0, max(view_y, 0.0)));
+
+  // Nighttime palette. Deep navy zenith, slightly lighter horizon.
+  let zen_night = vec3<f32>(0.015, 0.022, 0.060);
+  let hor_night = vec3<f32>(0.045, 0.050, 0.095);
+  let sky_night = mix(hor_night, zen_night, smoothstep(0.0, 1.0, max(view_y, 0.0)));
+
+  // Ground (below horizon): warm-dim for day, near-black for night.
+  let ground_day   = vec3<f32>(0.18, 0.13, 0.10);
+  let ground_night = vec3<f32>(0.010, 0.012, 0.025);
+  let ground = mix(ground_night, ground_day, day);
+
+  // Pick day vs night, ground vs sky.
+  var col = mix(sky_night, sky_day, day);
+  if (view_y < 0.0) {
+    col = ground;
+  }
+
+  // Sun halo + disk. Henyey-Greenstein-ish forward scatter peaks
+  // toward sunDir; visible only when sun is above the horizon. Sun
+  // disk is a tight smoothstep, halo is broader.
+  let cos_theta = clamp(dot(dir, sunDir), -1.0, 1.0);
+  let g  = clamp(mieG, 0.0, 0.95);
+  let g2 = g * g;
+  let denom = pow(max(1.0 + g2 - 2.0 * g * cos_theta, 1e-4), 1.5);
+  let phase = (1.0 - g2) / denom * 0.0796;     // 1 / (4π)
+  let halo  = phase * sunVis * 0.6;
+  let disk  = smoothstep(0.9985, 0.99965, cos_theta) * sunVis * 6.0;
+  let sun_color = mix(
+    vec3<f32>(1.4, 0.55, 0.25),                               // low-sun red
+    vec3<f32>(1.3, 1.18, 1.05),                               // high-sun warm white
+    smoothstep(0.0, 0.35, sun_elev)
+  );
+  col = col + (disk + halo) * sun_color;
+
+  return col * intensity;
+}
 
 // Sprint 7.5.4 -- sample the wired environment by direction. Used
 // for hemisphere IBL ambient on lit materials (Phong, PBR). dir
@@ -45709,6 +46027,9 @@ fn sample_env(dir: vec3<f32>) -> vec3<f32> {
     } else {
       return mix(uS.envHorizon.rgb, uS.envGround.rgb, smoothstep(0.0, 1.0, -t)) * intensity;
     }
+  }
+  if (mode == 2u) {
+    return sample_procedural_sky(dir);
   }
   // Default: pre-7.5.4 hardcoded hemisphere-IBL. Two-stop gradient
   // from cool sky to warm ground via the up-axis-aligned mix that
@@ -46727,12 +47048,13 @@ function _ensureSceneInstance(sceneNode) {
   if (!_ensureMeshBindGroupLayout()) return null;
   // perScene: viewProj (16) + eye (4) + lightCount (4) + lights[4]
   // (64) + envParams (4) + envSky (4) + envHorizon (4) + envGround
-  // (4) = 104 floats = 416 bytes.
+  // (4) + envSun (4) = 108 floats = 432 bytes.
   // Sprint 7.5.3c push 3 grew this from 128 to 352 to hold up to 4
   // lights. Sprint 7.5.4 grew 352 -> 416 for environment data.
+  // Sprint 7.5.4.c grew 416 -> 432 for the ProceduralSky sun vec4.
   const perSceneBuffer = Visual.device.createBuffer({
     label: "scene-perscene-" + sceneNode.id,
-    size: 416,
+    size: 432,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
   });
   // Sprint 7.5.3c bug fix -- queue.writeBuffer ordering. All
@@ -46783,7 +47105,7 @@ function _ensureSceneInstance(sceneNode) {
   inst = {
     perSceneBuffer,
     slots,
-    sceneScratch: new Float32Array(104),  // 416 bytes (sprint 7.5.4 -- env data)
+    sceneScratch: new Float32Array(108),  // 432 bytes (sprint 7.5.4.c -- env data + sun)
     drawScratch:  new Float32Array(24)
   };
   Visual.sceneInstances.set(sceneNode.id, inst);
@@ -46887,7 +47209,7 @@ function _encodeScenePass(enc, entry) {
       depthStoreOp: (sampleCount > 1) ? "discard" : "store"
     }
   });
-  // Per-Scene uniform layout (sprint 7.5.4, 104 floats / 416 bytes):
+  // Per-Scene uniform layout (sprint 7.5.4.c, 108 floats / 432 bytes):
   //   [ 0..15]   viewProj (mat4)
   //   [16..19]   eye         (vec4: xyz = camera world pos, w = unused)
   //   [20..23]   lightCount  (vec4: x = N in [1..4])
@@ -46895,10 +47217,12 @@ function _encodeScenePass(enc, entry) {
   //   [40..55]   light 1
   //   [56..71]   light 2
   //   [72..87]   light 3
-  //   [88..91]   envParams   (vec4: x = mode 0/1, y = intensity)
+  //   [88..91]   envParams   (vec4: x = mode 0/1/2, y = intensity,
+  //                          z = turbidity, w = mieG)
   //   [92..95]   envSky      (vec4: rgb = sky/top color)
   //   [96..99]   envHorizon  (vec4: rgb = horizon color)
   //   [100..103] envGround   (vec4: rgb = ground/bottom color)
+  //   [104..107] envSun      (vec4: xyz = dir TO sun, w = visibility)
   inst.sceneScratch.set(camera.viewProj, 0);
   inst.sceneScratch[16] = camera.eye[0];
   inst.sceneScratch[17] = camera.eye[1];
@@ -46935,20 +47259,26 @@ function _encodeScenePass(enc, entry) {
   // Sprint 7.5.4 -- environment. Pull from the wired environment
   // input (if any) and pack into the env vec4s. mode=0 means
   // unwired -> shader falls back to the hardcoded hemisphere-IBL.
+  // Sprint 7.5.4.c -- mode 2 (ProceduralSky) also writes envSun.
   const env = _resolveSceneEnvironment(node);
   if (env) {
     inst.sceneScratch[88]  = env.mode;
-    inst.sceneScratch[89]  = env.intensity;
-    inst.sceneScratch[90]  = 0;
-    inst.sceneScratch[91]  = 0;
-    inst.sceneScratch[92]  = env.sky[0];     inst.sceneScratch[93]  = env.sky[1];     inst.sceneScratch[94]  = env.sky[2];     inst.sceneScratch[95]  = 0;
-    inst.sceneScratch[96]  = env.horizon[0]; inst.sceneScratch[97]  = env.horizon[1]; inst.sceneScratch[98]  = env.horizon[2]; inst.sceneScratch[99]  = 0;
-    inst.sceneScratch[100] = env.ground[0];  inst.sceneScratch[101] = env.ground[1];  inst.sceneScratch[102] = env.ground[2];  inst.sceneScratch[103] = 0;
+    inst.sceneScratch[89]  = (typeof env.intensity === "number") ? env.intensity : 1.0;
+    inst.sceneScratch[90]  = (typeof env.turbidity === "number") ? env.turbidity : 1.0;
+    inst.sceneScratch[91]  = (typeof env.mieG      === "number") ? env.mieG      : 0.76;
+    const sky     = env.sky     || [0, 0, 0];
+    const horizon = env.horizon || [0, 0, 0];
+    const ground  = env.ground  || [0, 0, 0];
+    const sun     = env.sun     || [0, 1, 0, 0];
+    inst.sceneScratch[92]  = sky[0];     inst.sceneScratch[93]  = sky[1];     inst.sceneScratch[94]  = sky[2];     inst.sceneScratch[95]  = 0;
+    inst.sceneScratch[96]  = horizon[0]; inst.sceneScratch[97]  = horizon[1]; inst.sceneScratch[98]  = horizon[2]; inst.sceneScratch[99]  = 0;
+    inst.sceneScratch[100] = ground[0];  inst.sceneScratch[101] = ground[1];  inst.sceneScratch[102] = ground[2];  inst.sceneScratch[103] = 0;
+    inst.sceneScratch[104] = sun[0];     inst.sceneScratch[105] = sun[1];     inst.sceneScratch[106] = sun[2];     inst.sceneScratch[107] = sun[3];
   } else {
     // Zero out env slots when nothing is wired (mode=0 = fallback).
-    for (let k = 88; k < 104; k++) inst.sceneScratch[k] = 0;
+    for (let k = 88; k < 108; k++) inst.sceneScratch[k] = 0;
   }
-  Visual.device.queue.writeBuffer(inst.perSceneBuffer, 0, inst.sceneScratch.buffer, 0, 416);
+  Visual.device.queue.writeBuffer(inst.perSceneBuffer, 0, inst.sceneScratch.buffer, 0, 432);
 
   // Per-draw loop. Each mesh writes to its OWN per-slot buffer +
   // binds its OWN bind group, so multi-mesh draws work correctly
@@ -47090,6 +47420,29 @@ function _resolveLightNode(lightNode) {
       ]
     };
   }
+  if (lightNode.type === "Sun") {
+    // 7.5.4.c -- Sun is a DirectionalLight whose direction + color
+    // come from timeOfDay. Below horizon -> intensity 0 so the scene
+    // dims for night while the sky still emits ambient via env.
+    const t = (typeof p.timeOfDay === "number") ? p.timeOfDay : 0.5;
+    const sunDir = _sunDirFromTime(t);
+    const sc = _sunColorFromElevation(sunDir[1]);
+    const tint = {
+      r: (typeof p.tintR === "number") ? p.tintR : 1.0,
+      g: (typeof p.tintG === "number") ? p.tintG : 1.0,
+      b: (typeof p.tintB === "number") ? p.tintB : 1.0
+    };
+    return {
+      type:  0,
+      pos:   sunDir,
+      color: [sc.r * tint.r, sc.g * tint.g, sc.b * tint.b],
+      intensity: sc.intensity * ((typeof p.intensityScale === "number") ? p.intensityScale : 1.0),
+      range:    0,
+      cosInner: 1.0,
+      cosOuter: 1.0,
+      spotDir:  [0, -1, 0]
+    };
+  }
   if (lightNode.type === "AreaLight") {
     // 7.5.6.h -- raster Scene has no shadow-ray equivalent, so we
     // degrade the area light to a single PointLight at the panel
@@ -47123,14 +47476,62 @@ function _resolveLightNode(lightNode) {
  * an array of light descriptors. Falls back to a single default
  * directional light when nothing is wired so meshes don't render
  * pitch-black. Per-frame cache via Visual._frameLightCache. */
+/* Sprint 7.5.4.c -- shared math for sun direction + sun light
+ * color. Used by Sun (the light node), ProceduralSky (the env
+ * source), and DayNightCycle's diagnostic output. Keeping it here
+ * means the Sun's DirectionalLight color matches the sun-disk
+ * color rendered into the env exactly. timeOfDay convention:
+ *   0.00 = midnight (sun straight down, well below horizon)
+ *   0.25 = sunrise   (sun at the +X horizon)
+ *   0.50 = noon      (sun overhead, slightly +Z tilt)
+ *   0.75 = sunset    (sun at the -X horizon)
+ * The +Z tilt is cosmetic -- a perfectly polar arc looks flat. */
+function _sunDirFromTime(t) {
+  const wrapped = ((t % 1) + 1) % 1;        // wrap to [0, 1)
+  const theta = (wrapped - 0.25) * Math.PI * 2;
+  // Pre-normalization: cos(theta) is the X sweep, sin(theta) is the Y
+  // elevation, Z is the small cosmetic forward tilt.
+  const sx = Math.cos(theta);
+  const sy = Math.sin(theta);
+  const sz = 0.3;
+  const len = Math.hypot(sx, sy, sz) || 1.0;
+  return [sx / len, sy / len, sz / len];
+}
+
+/* Sprint 7.5.4.c -- sun color + intensity from elevation. elev is
+ * the Y component of the normalized sunDir (= sin of altitude
+ * angle); +1 = zenith, 0 = horizon, -1 = nadir. Below horizon ->
+ * sun is "off" (intensity 0). Above -> color tints from warm-red
+ * at the horizon (more atmospheric scattering = lower B) toward
+ * neutral-warm-white at zenith. MATCHES the sun-disk color the
+ * WGSL sample_procedural_sky() generates, so the Sun
+ * DirectionalLight visually agrees with what shows in the sky. */
+function _sunColorFromElevation(elev) {
+  if (elev <= 0) {
+    return { r: 0, g: 0, b: 0, intensity: 0, visibility: 0 };
+  }
+  // Sunset (low elev) -> warm red. Daytime (high elev) -> neutral.
+  const s = Math.min(1, elev / 0.35);
+  const r = 1.0;
+  const g = 0.55 + 0.40 * s;
+  const b = 0.25 + 0.65 * s;
+  // Intensity scales from dim-warm at the horizon to full overhead.
+  const intensity = 0.50 + 0.75 * s;
+  // Visibility for the sun-disk: smooth fade so the sun doesn't
+  // pop in at exactly y=0. Matches the day blend in the shader.
+  const visibility = Math.min(1, elev / 0.18);
+  return { r, g, b, intensity, visibility };
+}
+
 /* Sprint 7.5.4 -- resolve the Scene's wired environment input.
  * Returns the descriptor the per-Scene uniform writer packs into
  * the env vec4s, or null when nothing is wired (= shader falls
  * back to hardcoded hemisphere-IBL). The structure mirrors what
  * sample_env() in WGSL expects:
- *   { mode, intensity, sky, horizon, ground }
- * Future modes (Skybox, HDRI, ProceduralSky) will return higher
- * mode numbers + possibly resolved-texture handles. */
+ *   { mode, intensity, turbidity, mieG, sky, horizon, ground, sun }
+ * sun = [x, y, z, visibility]; only used by mode 2 (ProceduralSky).
+ * Future modes (Skybox, HDRI) will return higher mode numbers
+ * + possibly resolved-texture handles. */
 function _resolveSceneEnvironment(sceneNode) {
   const wire = state.edges && state.edges.find(e =>
     e && e.to && e.to.node === sceneNode.id && e.to.port === "environment"
@@ -47147,6 +47548,18 @@ function _resolveSceneEnvironment(sceneNode) {
       sky:     [num(p.skyR, 0.55),     num(p.skyG, 0.65),     num(p.skyB, 0.85)],
       horizon: [num(p.horizonR, 0.78), num(p.horizonG, 0.80), num(p.horizonB, 0.85)],
       ground:  [num(p.groundR, 0.18),  num(p.groundG, 0.16),  num(p.groundB, 0.14)]
+    };
+  }
+  if (src.type === "ProceduralSky") {
+    const t = num(p.timeOfDay, 0.5);
+    const sunDir = _sunDirFromTime(t);
+    const sunColor = _sunColorFromElevation(sunDir[1]);
+    return {
+      mode: 2,
+      intensity: num(p.intensity, 1.0),
+      turbidity: num(p.turbidity, 1.0),
+      mieG:      num(p.mieG, 0.76),
+      sun: [sunDir[0], sunDir[1], sunDir[2], sunColor.visibility]
     };
   }
   return null;
@@ -47459,6 +47872,24 @@ function _rtExtractLight(lightNode) {
         color:     [num(p.colorR, 1.0), num(p.colorG, 0.97), num(p.colorB, 0.92)],
         intensity: num(p.intensity, 4.0)
       };
+    case "Sun": {
+      // 7.5.4.c -- Sun is a DirectionalLight whose direction + color
+      // come from timeOfDay. Engine receives it as a regular
+      // Light::Directional so no engine-side change is needed.
+      const t = num(p.timeOfDay, 0.5);
+      const sunDir = _sunDirFromTime(t);
+      const sc = _sunColorFromElevation(sunDir[1]);
+      const tintR = num(p.tintR, 1.0);
+      const tintG = num(p.tintG, 1.0);
+      const tintB = num(p.tintB, 1.0);
+      const scale = num(p.intensityScale, 1.0);
+      return {
+        type: "directional",
+        direction: sunDir,
+        color:     [sc.r * tintR, sc.g * tintG, sc.b * tintB],
+        intensity: sc.intensity * scale
+      };
+    }
     default:
       return null;
   }
@@ -50162,6 +50593,22 @@ function _readWireJsSideValue(wire) {
   }
   if (src.type === "MasterClock") {
     return _masterClockOutputValue(src, wire.from.port);
+  }
+  if (src.type === "DayNightCycle") {
+    // 7.5.4.c -- timeOfDay output = phase (if wired and finite),
+    // otherwise the stored `manual` param. _resolveNodeParams
+    // handles the phase-input wire resolution + falls back to the
+    // stored phase param if nothing's wired (Number.isFinite() then
+    // catches the static-default case so we land on manual). Wrap
+    // to [0, 1) so a continuously-incrementing source still maps to
+    // a clean time-of-day phase.
+    const p = _resolveNodeParams(src);
+    const phaseRaw = (typeof p.phase === "number" && Number.isFinite(p.phase)) ? p.phase : null;
+    if (phaseRaw !== null) {
+      return ((phaseRaw % 1) + 1) % 1;
+    }
+    const manual = (typeof p.manual === "number") ? p.manual : 0.5;
+    return ((manual % 1) + 1) % 1;
   }
   if (src.type === "HandLandmarker") return _handLandmarkerValue(src, wire.from.port);
   if (src.type === "PoseLandmarker") return _poseLandmarkerValue(src, wire.from.port);
