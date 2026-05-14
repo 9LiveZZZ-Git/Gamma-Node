@@ -46469,13 +46469,20 @@ function _ensureRtSceneInstance(node) {
     lastFrameAt: 0,
     error: null,
     reconnectTimer: null,
-    // Sprint 7.5.6.a part 2e-2 -- live update tracking. Each render
-    // tick we re-derive these from the current graph state; if the
-    // string differs from what we last shipped to the engine, send
-    // an update. Camera-only changes get a cheap Params message;
-    // structural changes (mesh added/removed/swapped, geometry
-    // params edited) get a full Scene replace + AS rebuild.
+    // Sprint 7.5.6.a part 2e-2 + 7.5.6.c-1 -- three-tier live
+    // update tracking. Each render tick re-derives these from the
+    // current graph state:
+    //   * lastSceneSig    -- structural (mesh wiring + light wiring
+    //                        + mesh geometry params). Change here
+    //                        triggers a full Scene replace + AS
+    //                        rebuild on the engine.
+    //   * lastLightsJson  -- packed lights array. Change triggers
+    //                        a Params message with just the lights;
+    //                        engine patches lights_buffer in place.
+    //   * lastCameraJson  -- packed camera. Change → Params with
+    //                        camera; engine patches camera_buffer.
     lastCameraJson: null,
+    lastLightsJson: null,
     lastSceneSig: null,
     lastClearSig: null
   };
@@ -46544,14 +46551,67 @@ function _rtBuildSceneJson(rtNode) {
     far: 100
   };
 
+  // Sprint 7.5.6.c-1: light1..light4 inputs. Walk each, pack into
+  // the scene's lights[] array if the upstream node is a light type
+  // we recognize. Engine ignores types it can't render in c-1
+  // (point / spot / area). Empty lights array → engine synthesizes
+  // a default sunlit angle so shaded materials still look right.
+  const lights = [];
+  for (let i = 1; i <= 4; i++) {
+    const ln = _rtFindUpstreamByPort(rtNode.id, "light" + i);
+    if (!ln) continue;
+    const packed = _rtExtractLight(ln);
+    if (packed) lights.push(packed);
+  }
+
   const p = rtNode.params || {};
   const num = (v, d) => (typeof v === "number" ? v : d);
   return {
     camera,
     meshes,
-    lights: [],
+    lights,
     clear_color: [num(p.clearR, 0.05), num(p.clearG, 0.06), num(p.clearB, 0.10)]
   };
+}
+
+/* Sprint 7.5.6.c-1 -- pack one light node into the wire format the
+ * engine's scene.rs Light enum expects. Returns null for unknown
+ * node types (caller skips them). c-1 only renders Directional;
+ * Point / Spot / Area get parsed into the JSON but the engine
+ * silently skips them. c-2 wires up real point/spot evaluation. */
+function _rtExtractLight(lightNode) {
+  const p = _resolveNodeParams(lightNode);
+  const num = (v, d) => (typeof v === "number" ? v : d);
+  switch (lightNode.type) {
+    case "DirectionalLight":
+      return {
+        type: "directional",
+        direction: [num(p.dirX, -0.3), num(p.dirY, -0.8), num(p.dirZ, -0.4)],
+        color:     [num(p.r, 1), num(p.g, 1), num(p.b, 1)],
+        intensity: num(p.intensity, 1.0)
+      };
+    case "PointLight":
+      return {
+        type: "point",
+        position:  [num(p.posX, 0), num(p.posY, 2), num(p.posZ, 0)],
+        color:     [num(p.r, 1), num(p.g, 1), num(p.b, 1)],
+        intensity: num(p.intensity, 1.0),
+        range:     num(p.range, 10)
+      };
+    case "SpotLight":
+      return {
+        type: "spot",
+        position:  [num(p.posX, 0), num(p.posY, 2), num(p.posZ, 0)],
+        direction: [num(p.dirX, 0), num(p.dirY, -1), num(p.dirZ, 0)],
+        color:     [num(p.r, 1), num(p.g, 1), num(p.b, 1)],
+        intensity: num(p.intensity, 1.0),
+        range:     num(p.range, 10),
+        inner_angle_deg: num(p.innerAngle, 20),
+        outer_angle_deg: num(p.outerAngle, 35)
+      };
+    default:
+      return null;
+  }
 }
 
 /* Walk wires backwards from rtNode[portName] until we hit a mesh-
@@ -46650,6 +46710,16 @@ function _rtComputeSceneSignature(rtNode) {
     }
     parts.push(meshNode.id + ":" + meshNode.type + ":" + _meshCacheKey(meshNode));
   }
+  // Sprint 7.5.6.c-1 -- light wiring is part of the signature too,
+  // so swapping a DirectionalLight for a PointLight or unwiring a
+  // light triggers a full Scene replace. Light *param* changes
+  // (slider drags on a wired light's intensity) are NOT in this
+  // sig -- those'd need a separate Params message for lights,
+  // landing with c-2 alongside the multi-light kernel work.
+  for (let i = 1; i <= 4; i++) {
+    const ln = _rtFindUpstreamByPort(rtNode.id, "light" + i);
+    parts.push(ln ? "l" + i + ":" + ln.id + ":" + ln.type : "l" + i + ":-");
+  }
   return parts.join("|");
 }
 
@@ -46669,26 +46739,49 @@ function _rtScenePollAndSend(node, inst) {
   const sceneSig = _rtComputeSceneSignature(node) + "|clr=" + clearSig;
   if (sceneSig !== inst.lastSceneSig) {
     // Structural change -- rebuild scene fully. This also resends the
-    // camera (it's part of the Scene payload), so reset the camera
-    // hash to whatever we shipped to avoid an immediate redundant
-    // Params follow-up next frame.
+    // camera + lights (they're part of the Scene payload), so prime
+    // the tier-2 / tier-3 hashes to match so we don't immediately
+    // re-send a redundant Params next frame.
     const sceneJson = _rtBuildSceneJson(node);
     const camJson = JSON.stringify(sceneJson.camera);
+    const lightsJson = JSON.stringify(sceneJson.lights);
     try {
       inst.ws.send(JSON.stringify({ type: "scene", patch: sceneJson }));
       inst.lastSceneSig = sceneSig;
       inst.lastCameraJson = camJson;
+      inst.lastLightsJson = lightsJson;
       console.log("[rt-scene] scene replace (sig change) — " +
-                  sceneJson.meshes.length + " mesh(es)");
+                  sceneJson.meshes.length + " mesh(es), " +
+                  sceneJson.lights.length + " light(s)");
     } catch (e) {
       console.warn("[rt-scene] scene send failed:", e);
     }
     return;
   }
 
-  // Same structure -- check camera. Cheap: just stringify the camera
-  // params and string-compare. The camera node's params change every
-  // time the user drags a slider, so this catches live orbit.
+  // Tier 2 -- lights. Same wiring as last send, but the light
+  // node's params may have moved (slider drag on intensity/hue).
+  // Catches that without rebuilding the AS.
+  const lightsArr = [];
+  for (let i = 1; i <= 4; i++) {
+    const ln = _rtFindUpstreamByPort(node.id, "light" + i);
+    if (!ln) continue;
+    const packed = _rtExtractLight(ln);
+    if (packed) lightsArr.push(packed);
+  }
+  const lightsJson = JSON.stringify(lightsArr);
+  if (lightsJson !== inst.lastLightsJson) {
+    try {
+      inst.ws.send(JSON.stringify({ type: "params", patch: { lights: lightsArr } }));
+      inst.lastLightsJson = lightsJson;
+    } catch (e) {
+      console.warn("[rt-scene] lights params send failed:", e);
+    }
+  }
+
+  // Tier 3 -- camera. Cheap stringify-compare on the camera node's
+  // resolved params. Fires on every slider drag / clock-driven orbit
+  // tick that moves the camera.
   const camNode = _rtFindUpstreamByPort(node.id, "camera");
   const camObj = camNode ? _rtExtractCamera(camNode) : _RT_DEFAULT_CAMERA;
   const camJson = JSON.stringify(camObj);
@@ -46754,11 +46847,12 @@ async function _rtSceneConnect(nodeId, inst) {
     inst.status = "connected";
     inst.error = null;
     console.log("[rt-scene] connected for node " + nodeId);
-    // Reset send-tracking so the next poll fires a fresh scene+camera
-    // pair (which the poll function does on first invocation when
-    // both last-* fields are null).
+    // Reset send-tracking so the next poll fires a fresh scene
+    // (the lastSceneSig=null branch ships scene + camera + lights
+    // in one Scene message and primes all three trackers).
     inst.lastSceneSig = null;
     inst.lastCameraJson = null;
+    inst.lastLightsJson = null;
     try {
       ws.send(JSON.stringify({ type: "hello" }));
       ws.send(JSON.stringify({ type: "configure", width: 800, height: 600 }));
