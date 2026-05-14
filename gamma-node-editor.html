@@ -31981,6 +31981,163 @@ const _demos = [
     }
   },
 
+  /* Sprint 5.4-rt -- RT Day / Night Cycle. Same setup as the raster
+   * day-night-cycle but with RayTracedScene as the sink, plus one
+   * glass ball + one mirror ball to take advantage of what RT
+   * specifically delivers (proper refraction + recursive reflection
+   * of the day-night sky). With the 5.4-rt engine sprint the kernel
+   * honors ProceduralSky's atmospheric scattering + sun-disk + moon
+   * + stars + Milky Way + clouds, AND atmospheric-perspective fog --
+   * all the same env wiring as the raster sibling.
+   *
+   * Compare side-by-side with day-night-cycle: this one's chrome
+   * sphere reflects the sun-disk with crisp recursion (raster only
+   * shows IBL-blurred sky), the glass refracts the sky into the
+   * floor caustic-style, and the mirror reflects the moon at night.
+   * Otherwise identical lighting / fog / cloud behavior. */
+  {
+    id: "rt-day-night-cycle",
+    name: "RT Day / Night Cycle",
+    sub: "ray-traced sun + sky · glass + chrome",
+    type: "visual",
+    thumb: `<svg viewBox="0 0 100 44">
+      <defs>
+        <linearGradient id="dg-rtdn-sky" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0"   stop-color="rgba(255,140,55,1)"/>
+          <stop offset="0.5" stop-color="rgba(180,90,75,1)"/>
+          <stop offset="1"   stop-color="rgba(15,18,40,1)"/>
+        </linearGradient>
+        <radialGradient id="dg-rtdn-sun" cx="0.85" cy="0.5" r="0.18">
+          <stop offset="0"   stop-color="rgba(255,235,170,1)"/>
+          <stop offset="0.5" stop-color="rgba(255,170,90,0.7)"/>
+          <stop offset="1"   stop-color="rgba(255,140,55,0)"/>
+        </radialGradient>
+        <radialGradient id="dg-rtdn-chrome" cx="0.5" cy="0.4" r="0.55">
+          <stop offset="0"   stop-color="rgba(255,180,120,1)"/>
+          <stop offset="0.5" stop-color="rgba(180,90,75,1)"/>
+          <stop offset="1"   stop-color="rgba(35,25,50,1)"/>
+        </radialGradient>
+        <radialGradient id="dg-rtdn-glass" cx="0.5" cy="0.4" r="0.55">
+          <stop offset="0"    stop-color="rgba(255,210,170,0.95)"/>
+          <stop offset="0.65" stop-color="rgba(220,140,95,0.75)"/>
+          <stop offset="1"    stop-color="rgba(255,200,160,1)"/>
+        </radialGradient>
+      </defs>
+      <rect width="100" height="44" fill="url(#dg-rtdn-sky)"/>
+      <ellipse cx="85" cy="22" rx="14" ry="14" fill="url(#dg-rtdn-sun)"/>
+      <rect x="0" y="32" width="100" height="12" fill="rgba(20,15,18,0.92)"/>
+      <ellipse cx="30" cy="34" rx="7"  ry="1.2" fill="rgba(0,0,0,0.5)"/>
+      <ellipse cx="55" cy="34" rx="7"  ry="1.2" fill="rgba(0,0,0,0.55)"/>
+      <ellipse cx="80" cy="34" rx="7"  ry="1.2" fill="rgba(0,0,0,0.5)"/>
+      <circle cx="30" cy="25" r="8" fill="url(#dg-rtdn-glass)"
+              stroke="rgba(255,220,180,0.45)" stroke-width="0.4"/>
+      <circle cx="55" cy="25" r="8" fill="url(#dg-rtdn-chrome)"/>
+      <circle cx="80" cy="25" r="8" fill="rgba(255,210,180,0.92)"/>
+      <text x="92" y="9" text-anchor="end"
+            font-family="monospace" font-size="5"
+            fill="rgba(232,140,60,0.85)"
+            letter-spacing="0.08em">RT</text>
+    </svg>`,
+    build: () => {
+      // ── Floor (same as raster day-night-cycle).
+      const plane    = makeNode("Plane",      40,  40, { width: 10, depth: 10 });
+      const planeMat = makeNode("PhysicalMat",280,  40, {
+        r: 0.30, g: 0.28, b: 0.30,
+        metallic: 0.0, roughness: 0.55
+      });
+
+      // ── Glass ball (RT-only flavor; raster falls back to a high-
+      // metallic PhysicalMat approximation which isn't bad but lacks
+      // refraction.) IOR 1.5 = window glass.
+      const glassBall = makeNode("Sphere",     40, 220, { radius: 0.55, stacks: 32, slices: 48 });
+      const glassTr   = makeNode("Translate", 280, 220, { x: -1.5, y: 0.55, z: 0 });
+      const glassMat  = makeNode("GlassMat",  500, 220, {
+        r: 0.96, g: 0.98, b: 1.00, ior: 1.5
+      });
+
+      // ── Glossy PBR (middle).
+      const glossyBall = makeNode("Sphere",     40, 420, { radius: 0.55, stacks: 32, slices: 48 });
+      const glossyTr   = makeNode("Translate", 280, 420, { x: 0.0, y: 0.55, z: 0 });
+      const glossyMat  = makeNode("PhysicalMat",500, 420, {
+        r: 0.55, g: 0.50, b: 0.46,
+        metallic: 0.2, roughness: 0.30
+      });
+
+      // ── Chrome (right). Same as raster day-night-cycle.
+      const chromeBall = makeNode("Sphere",     40, 620, { radius: 0.55, stacks: 32, slices: 48 });
+      const chromeTr   = makeNode("Translate", 280, 620, { x: 1.5, y: 0.55, z: 0 });
+      const chromeMat  = makeNode("PhysicalMat",500, 620, {
+        r: 0.95, g: 0.95, b: 0.97,
+        metallic: 1.0, roughness: 0.05
+      });
+
+      // ── Day/night infrastructure. Identical to raster -- the env
+      // wire works the same on raster Scene + RayTracedScene now.
+      const clkDay = makeNode("MasterClock", 40, 820, { bpm: 0.6 });
+      const dnc    = makeNode("DayNightCycle", 280, 820, { manual: 0.5 });
+      const sun    = makeNode("Sun",         500, 820, {
+        timeOfDay: 0.5,
+        tintR: 1.0, tintG: 1.0, tintB: 1.0,
+        intensityScale: 1.0
+      });
+      const sky    = makeNode("ProceduralSky", 500, 1020, {
+        timeOfDay: 0.5, turbidity: 1.2, mieG: 0.78, intensity: 1.0,
+        cloudCoverage: 0.45, cloudDensity: 1.0,
+        windSpeedX: 0.8, windSpeedZ: 0.3
+      });
+
+      // ── Camera orbit (slow + independent clock).
+      const clkCam = makeNode("MasterClock", 40, 1220, { bpm: 3 });
+      const mulTau = makeNode("Mul",        260, 1220, { b: 6.283185307 });
+      const sinC   = makeNode("Sin",        460, 1200);
+      const cosC   = makeNode("Cos",        460, 1300);
+      const mulCx  = makeNode("Mul",        640, 1200, { b: 3.6 });
+      const mulCz  = makeNode("Mul",        640, 1300, { b: 3.6 });
+      const cam    = makeNode("Camera",     860, 1220, {
+        posX: 0, posY: 1.2, posZ: 3.6,
+        targetX: 0, targetY: 0.5, targetZ: 0,
+        fov: 50, near: 0.1, far: 100, mode: 0
+      });
+
+      // ── RayTracedScene sink. Same env + fog wiring as raster.
+      const rt = makeNode("RayTracedScene", 1100, 320, {
+        quality: 1,                                          // preview
+        clearR: 0.02, clearG: 0.02, clearB: 0.04,
+        fogDensity: 0.09, fogStart: 2.2, fogHeight: 0.0, fogAuto: 1.0
+      });
+      const vo = makeNode("VisualOutput",   1340, 320, { display: 0 });
+
+      // ── Mesh chains
+      state.edges.push({ from: { node: plane,    port: "mesh" }, to: { node: planeMat, port: "mesh" } });
+      state.edges.push({ from: { node: planeMat, port: "mesh" }, to: { node: rt,       port: "mesh1" } });
+      state.edges.push({ from: { node: glassBall, port: "mesh" }, to: { node: glassTr,  port: "mesh" } });
+      state.edges.push({ from: { node: glassTr,   port: "mesh" }, to: { node: glassMat, port: "mesh" } });
+      state.edges.push({ from: { node: glassMat,  port: "mesh" }, to: { node: rt,       port: "mesh2" } });
+      state.edges.push({ from: { node: glossyBall, port: "mesh" }, to: { node: glossyTr,  port: "mesh" } });
+      state.edges.push({ from: { node: glossyTr,   port: "mesh" }, to: { node: glossyMat, port: "mesh" } });
+      state.edges.push({ from: { node: glossyMat,  port: "mesh" }, to: { node: rt,        port: "mesh3" } });
+      state.edges.push({ from: { node: chromeBall, port: "mesh" }, to: { node: chromeTr,  port: "mesh" } });
+      state.edges.push({ from: { node: chromeTr,   port: "mesh" }, to: { node: chromeMat, port: "mesh" } });
+      state.edges.push({ from: { node: chromeMat,  port: "mesh" }, to: { node: rt,        port: "mesh4" } });
+      // ── Day-night wiring -- identical to raster Scene path
+      state.edges.push({ from: { node: clkDay, port: "phase"     }, to: { node: dnc, port: "phase" } });
+      state.edges.push({ from: { node: dnc,    port: "timeOfDay" }, to: { node: sun, port: "timeOfDay" } });
+      state.edges.push({ from: { node: dnc,    port: "timeOfDay" }, to: { node: sky, port: "timeOfDay" } });
+      state.edges.push({ from: { node: sun,    port: "light"     }, to: { node: rt,  port: "light1" } });
+      state.edges.push({ from: { node: sky,    port: "env"       }, to: { node: rt,  port: "environment" } });
+      // ── Camera orbit + output
+      state.edges.push({ from: { node: cam,    port: "camera" }, to: { node: rt,     port: "camera" } });
+      state.edges.push({ from: { node: clkCam, port: "phase"  }, to: { node: mulTau, port: "a" } });
+      state.edges.push({ from: { node: mulTau, port: "out"    }, to: { node: sinC,   port: "in" } });
+      state.edges.push({ from: { node: mulTau, port: "out"    }, to: { node: cosC,   port: "in" } });
+      state.edges.push({ from: { node: sinC,   port: "out"    }, to: { node: mulCx,  port: "a" } });
+      state.edges.push({ from: { node: cosC,   port: "out"    }, to: { node: mulCz,  port: "a" } });
+      state.edges.push({ from: { node: mulCx,  port: "out"    }, to: { node: cam,    port: "posX" } });
+      state.edges.push({ from: { node: mulCz,  port: "out"    }, to: { node: cam,    port: "posZ" } });
+      state.edges.push({ from: { node: rt,     port: "out"    }, to: { node: vo,     port: "in" } });
+    }
+  },
+
   /* Sprint 7.5.4.b -- HDRI showcase. The bundled PolyHaven Table
    * Mountain pure-sky 4K HDR wired into Scene.environment. Three
    * PBR balls (matte / glossy / chrome) so you can read the HDR's
