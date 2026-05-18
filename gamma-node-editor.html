@@ -1744,6 +1744,21 @@
   .node-edit-revert:hover { color: var(--warn); border-color: var(--warn); }
   .node-edit-revert:disabled { opacity: 0.4; cursor: not-allowed; }
 
+  /* Mode-toggle button in the modal head. Switches between the
+     fields view (cppType + ports tables + helperClass textarea)
+     and the .gdsp view (single textarea with metadata + class). */
+  .node-edit-mode-toggle {
+    margin-right: 8px;
+    padding: 4px 10px !important;
+    font-size: 10px;
+    font-family: var(--font-mono);
+    color: var(--text-2);
+    border: 1px solid var(--border);
+    background: transparent;
+    cursor: pointer;
+  }
+  .node-edit-mode-toggle:hover { color: var(--phosphor); border-color: var(--phosphor-dim); }
+
   /* Inline ✎ button at the bottom edge of the selected node. Mounted
      by render() when a single node is selected. */
   .node-edit-handle {
@@ -7088,6 +7103,7 @@
     <div class="modal">
       <div class="modal-head">
         <span id="node-edit-title">Edit node</span>
+        <button class="btn node-edit-mode-toggle" id="btn-node-edit-mode" title="Toggle between fields view and a single .gdsp source (User DSP format)">.gdsp →</button>
         <button class="btn modal-x" id="btn-node-edit-close">×</button>
       </div>
       <div class="modal-body">
@@ -7095,26 +7111,37 @@
           Per-node override of helperClass code and ports. Changes apply to <em>this instance only</em>; other nodes of the same type stay on the registry default. Recompile (▶) after saving to see the new C++ in action.
         </p>
 
-        <div class="node-edit-section">
-          <div class="node-edit-section-head">class name (cppType)</div>
-          <input id="node-edit-cppType" class="node-edit-classfield" type="text" placeholder="e.g. gam::Sine&lt;&gt; or MyCustomClass" />
+        <!-- "raw" mode: fields view -->
+        <div id="node-edit-raw-view">
+          <div class="node-edit-section">
+            <div class="node-edit-section-head">class name (cppType)</div>
+            <input id="node-edit-cppType" class="node-edit-classfield" type="text" placeholder="e.g. gam::Sine&lt;&gt; or MyCustomClass" />
+          </div>
+
+          <div class="node-edit-section">
+            <div class="node-edit-section-head">inputs</div>
+            <div class="node-port-rows" id="node-edit-ins"></div>
+            <button class="node-port-add" id="btn-node-add-in">+ add input</button>
+          </div>
+
+          <div class="node-edit-section">
+            <div class="node-edit-section-head">outputs</div>
+            <div class="node-port-rows" id="node-edit-outs"></div>
+            <button class="node-port-add" id="btn-node-add-out">+ add output</button>
+          </div>
+
+          <div class="node-edit-section">
+            <div class="node-edit-section-head">helper class (C++ source)</div>
+            <textarea id="node-edit-code" class="node-edit-codearea" spellcheck="false"></textarea>
+          </div>
         </div>
 
-        <div class="node-edit-section">
-          <div class="node-edit-section-head">inputs</div>
-          <div class="node-port-rows" id="node-edit-ins"></div>
-          <button class="node-port-add" id="btn-node-add-in">+ add input</button>
-        </div>
-
-        <div class="node-edit-section">
-          <div class="node-edit-section-head">outputs</div>
-          <div class="node-port-rows" id="node-edit-outs"></div>
-          <button class="node-port-add" id="btn-node-add-out">+ add output</button>
-        </div>
-
-        <div class="node-edit-section">
-          <div class="node-edit-section-head">helper class (C++ source)</div>
-          <textarea id="node-edit-code" class="node-edit-codearea" spellcheck="false"></textarea>
+        <!-- ".gdsp" mode: single textarea with metadata + class body -->
+        <div id="node-edit-gdsp-view" style="display:none;">
+          <div class="node-edit-section">
+            <div class="node-edit-section-head">.gdsp source (metadata + class)</div>
+            <textarea id="node-edit-gdsp" class="node-edit-codearea" spellcheck="false" style="min-height: 360px;"></textarea>
+          </div>
         </div>
 
         <div class="node-edit-warn" id="node-edit-warn"></div>
@@ -60163,6 +60190,16 @@ function openNodeCodeEditor(nodeId) {
   const warn = document.getElementById("node-edit-warn");
   warn.textContent = ""; warn.classList.remove("visible");
 
+  // Always open in "raw" (fields) view so the structure is visible.
+  // If the user previously toggled to .gdsp on a different node, the
+  // raw view fields still apply this time.
+  _nodeEditMode = "raw";
+  document.getElementById("node-edit-raw-view").style.display  = "";
+  document.getElementById("node-edit-gdsp-view").style.display = "none";
+  const modeBtn = document.getElementById("btn-node-edit-mode");
+  modeBtn.textContent = ".gdsp →";
+  modeBtn.title = "Toggle between fields view and a single .gdsp source (User DSP format)";
+
   document.getElementById("node-edit-modal").style.display = "flex";
   // Focus the code area as the most-likely edit target.
   setTimeout(() => codeEl.focus(), 0);
@@ -60277,7 +60314,9 @@ function _refreshSetterCell(row, dir, port, methods, gateM) {
   }
 }
 
-/* Read the current modal state, validate, write to node.override. */
+/* Read the current modal state, validate, write to node.override.
+ * In ".gdsp" mode, parse the source first and treat the resulting
+ * fields as authoritative; in "raw" mode read the form fields. */
 function _saveNodeOverride() {
   if (_nodeEditTargetId == null) return;
   const node = state.nodes.find(n => n.id === _nodeEditTargetId);
@@ -60285,19 +60324,33 @@ function _saveNodeOverride() {
   const base = TYPES[node.type];
   if (!base) return;
 
-  const cppType     = document.getElementById("node-edit-cppType").value.trim();
-  const helperClass = document.getElementById("node-edit-code").value;
-  const insHost  = document.getElementById("node-edit-ins");
-  const outsHost = document.getElementById("node-edit-outs");
-  const ins  = (insHost._portsArr  || []).filter(p => p.n).map(p => ({ n: p.n, t: p.t }));
-  const outs = (outsHost._portsArr || []).filter(p => p.n).map(p => ({ n: p.n, t: p.t }));
-  const methodsRaw = insHost._methods  || {};
-  const gateMRaw   = insHost._gateM    || {};
-
   const warn = document.getElementById("node-edit-warn");
   function fail(msg) {
     warn.textContent = msg;
     warn.classList.add("visible");
+  }
+
+  let cppType, helperClass, ins, outs, methodsRaw, gateMRaw;
+  if (_nodeEditMode === "gdsp") {
+    const src = document.getElementById("node-edit-gdsp").value;
+    let raw;
+    try { raw = _parseGdspToState(src); }
+    catch (err) { return fail(".gdsp: " + (err && err.message ? err.message : String(err))); }
+    cppType     = raw.cppType;
+    helperClass = raw.helperClass;
+    ins         = raw.ins;
+    outs        = raw.outs;
+    methodsRaw  = raw.methods;
+    gateMRaw    = raw.gateMethods;
+  } else {
+    cppType     = document.getElementById("node-edit-cppType").value.trim();
+    helperClass = document.getElementById("node-edit-code").value;
+    const insHost  = document.getElementById("node-edit-ins");
+    const outsHost = document.getElementById("node-edit-outs");
+    ins  = (insHost._portsArr  || []).filter(p => p.n).map(p => ({ n: p.n, t: p.t }));
+    outs = (outsHost._portsArr || []).filter(p => p.n).map(p => ({ n: p.n, t: p.t }));
+    methodsRaw = insHost._methods  || {};
+    gateMRaw   = insHost._gateM    || {};
   }
 
   // Basic validation -- catches the common footguns. Codegen will
@@ -60372,11 +60425,178 @@ function _revertNodeOverride() {
   render();
 }
 
+/* =========================================================================
+ * .gdsp mode toggle -- alternate view of the same per-node override
+ * data, using the User DSP file format (single textarea, // @gdsp-*
+ * metadata + class body). Lets the user edit a built-in node's code
+ * in the same format they'd use for a from-scratch User DSP class.
+ *
+ * Mode is a UI state ("raw" vs "gdsp"); the underlying model is the
+ * same set of fields (cppType, ins, outs, methods, gateMethods,
+ * helperClass). Toggling synthesizes/parses between the two views;
+ * save reads whichever view is currently active. */
+let _nodeEditMode = "raw"; // "raw" | "gdsp"
+
+/* Pull the current "raw view" fields into a plain state object. */
+function _captureRawState() {
+  const insHost  = document.getElementById("node-edit-ins");
+  const outsHost = document.getElementById("node-edit-outs");
+  return {
+    cppType:    document.getElementById("node-edit-cppType").value.trim(),
+    helperClass: document.getElementById("node-edit-code").value,
+    ins:  (insHost._portsArr  || []).filter(p => p.n).map(p => ({ n: p.n, t: p.t })),
+    outs: (outsHost._portsArr || []).filter(p => p.n).map(p => ({ n: p.n, t: p.t })),
+    methods:     insHost._methods  || {},
+    gateMethods: insHost._gateM    || {}
+  };
+}
+
+/* Synthesize a .gdsp source from a raw-state object. Used when the
+ * user clicks "convert to .gdsp" so the editable text is pre-filled
+ * with the equivalent .gdsp format.
+ *
+ * @gdsp-method is only emitted when the setter name differs from
+ * the port name; @gdsp-gate only when it differs from "reset" --
+ * matches the convention parseGdsp uses on the way back. */
+function _synthGdspSource(raw, baseNode) {
+  let s = "";
+  // Class name: prefer one extracted from the helperClass body so
+  // the @gdsp-name line matches the actual class declaration (which
+  // parseGdsp validates). Fall back to cppType, then node type.
+  let className = raw.cppType || (baseNode ? baseNode.type : "MyNode");
+  const cm = (raw.helperClass || "").match(/class\s+(\w+)/);
+  if (cm) className = cm[1];
+
+  const baseDef = baseNode ? TYPES[baseNode.type] : null;
+  const category = (baseDef && baseDef.category) || "UserDSP";
+
+  s += "// @gdsp-name        " + className + "\n";
+  s += "// @gdsp-category    " + category + "\n";
+  if (baseDef && baseDef.description) {
+    s += "// @gdsp-description " + String(baseDef.description).split("\n")[0] + "\n";
+  }
+  (raw.ins || []).forEach(p => {
+    // @gdsp-input only supports audio/param/gate per parseGdsp's
+    // type check. Visual ports (mesh/camera/texture/etc.) get
+    // skipped with a TODO comment so the user notices.
+    if (!["audio", "param", "gate"].includes(p.t)) {
+      s += "// TODO: input '" + p.n + "' has type '" + p.t + "' which @gdsp-input doesn't accept (audio/param/gate only)\n";
+      return;
+    }
+    let line = "// @gdsp-input       " + p.n + " " + p.t;
+    // Include a default for params if the base node carries one.
+    if (p.t === "param" && baseNode && baseNode.params && baseNode.params[p.n] !== undefined) {
+      line += " " + baseNode.params[p.n];
+    }
+    s += line + "\n";
+  });
+  (raw.outs || []).forEach(p => {
+    if (!["audio", "param", "gate"].includes(p.t)) {
+      s += "// TODO: output '" + p.n + "' has type '" + p.t + "' which @gdsp-output doesn't accept (audio/param/gate only)\n";
+      return;
+    }
+    s += "// @gdsp-output      " + p.n + " " + p.t + "\n";
+  });
+  Object.keys(raw.methods || {}).forEach(n => {
+    const m = raw.methods[n];
+    if (m && m !== n) s += "// @gdsp-method      " + n + " " + m + "\n";
+  });
+  Object.keys(raw.gateMethods || {}).forEach(n => {
+    const m = raw.gateMethods[n];
+    if (m && m !== "reset") s += "// @gdsp-gate        " + n + " " + m + "\n";
+  });
+  s += "\n";
+  // Body: helperClass if we have one, else a stub the user can fill.
+  if (raw.helperClass && raw.helperClass.trim() && !/no helper class/i.test(raw.helperClass)) {
+    s += raw.helperClass;
+  } else {
+    s += "class " + className + " {\npublic:\n    float operator()(float in) { return in; }\n};\n";
+  }
+  if (!s.endsWith("\n")) s += "\n";
+  return s;
+}
+
+/* Parse a .gdsp source via the existing buildUserDspDef and map the
+ * resulting def into the raw-state shape. Throws on parse / shape
+ * errors -- caller surfaces those in the modal's warn area. */
+function _parseGdspToState(source) {
+  // buildUserDspDef enforces @gdsp-name + at least one @gdsp-input +
+  // @gdsp-output and validates the class declaration matches. Throws
+  // on mismatch.
+  const { def, name } = buildUserDspDef(source);
+  return {
+    cppType:     def.cppType || name,
+    helperClass: stripGdspHeader(source),
+    ins:         (def.ins  || []).map(p => ({ n: p.n, t: p.t })),
+    outs:        (def.outs || []).map(p => ({ n: p.n, t: p.t })),
+    methods:     def.methods     || {},
+    gateMethods: def.gateMethods || {}
+  };
+}
+
+/* Apply a raw-state object back to the "raw view" form fields. */
+function _applyRawStateToForm(rawState) {
+  document.getElementById("node-edit-cppType").value = rawState.cppType || "";
+  document.getElementById("node-edit-code").value    = rawState.helperClass || "";
+  const insArr  = rawState.ins.map(p => ({ n: p.n, t: p.t }));
+  const outsArr = rawState.outs.map(p => ({ n: p.n, t: p.t }));
+  const methods = Object.assign({}, rawState.methods || {});
+  const gateM   = Object.assign({}, rawState.gateMethods || {});
+  _renderPortRows("in",  insArr,  methods, gateM);
+  _renderPortRows("out", outsArr, methods, gateM);
+}
+
+/* Switch the modal between "raw" (fields) and "gdsp" (single
+ * textarea) views. Converts data in the current view's shape into
+ * the other shape so edits aren't lost. Surfaces parse errors in
+ * the warn area when going gdsp -> raw. */
+function _setNodeEditMode(mode) {
+  const warnEl = document.getElementById("node-edit-warn");
+  warnEl.textContent = ""; warnEl.classList.remove("visible");
+  const rawView  = document.getElementById("node-edit-raw-view");
+  const gdspView = document.getElementById("node-edit-gdsp-view");
+  const toggle   = document.getElementById("btn-node-edit-mode");
+  const node = (_nodeEditTargetId != null) ? state.nodes.find(n => n.id === _nodeEditTargetId) : null;
+
+  if (mode === "gdsp") {
+    // Pull current raw state, synthesize the .gdsp text, swap views.
+    const raw = _captureRawState();
+    const src = _synthGdspSource(raw, node);
+    document.getElementById("node-edit-gdsp").value = src;
+    rawView.style.display  = "none";
+    gdspView.style.display = "";
+    toggle.textContent = "← fields";
+    toggle.title = "Switch back to the fields view";
+    _nodeEditMode = "gdsp";
+  } else {
+    // Going gdsp -> raw: parse the current .gdsp source and populate
+    // the raw form fields. If parse fails, stay in gdsp mode and
+    // surface the error so the user can fix it.
+    const src = document.getElementById("node-edit-gdsp").value;
+    try {
+      const raw = _parseGdspToState(src);
+      _applyRawStateToForm(raw);
+    } catch (err) {
+      warnEl.textContent = ".gdsp parse: " + (err && err.message ? err.message : String(err));
+      warnEl.classList.add("visible");
+      return;       // refuse the switch; user fixes the source
+    }
+    rawView.style.display  = "";
+    gdspView.style.display = "none";
+    toggle.textContent = ".gdsp →";
+    toggle.title = "Toggle between fields view and a single .gdsp source (User DSP format)";
+    _nodeEditMode = "raw";
+  }
+}
+
 // Wire the modal's buttons + esc/cmd-enter shortcuts.
 document.getElementById("btn-node-edit-close").addEventListener("click", closeNodeCodeEditor);
 document.getElementById("btn-node-edit-cancel").addEventListener("click", closeNodeCodeEditor);
 document.getElementById("btn-node-edit-save").addEventListener("click", _saveNodeOverride);
 document.getElementById("btn-node-edit-revert").addEventListener("click", _revertNodeOverride);
+document.getElementById("btn-node-edit-mode").addEventListener("click", () => {
+  _setNodeEditMode(_nodeEditMode === "raw" ? "gdsp" : "raw");
+});
 // Backdrop click closes (matches other modals).
 document.getElementById("node-edit-modal").addEventListener("click", (e) => {
   if (e.target.id === "node-edit-modal") closeNodeCodeEditor();
