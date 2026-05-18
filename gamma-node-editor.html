@@ -16721,6 +16721,136 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     description: "Voronoi cellular noise — surface-aware equal-area cells on the rig screen (sphere/cylinder/swept). F2-F1 edge highlighting + per-cell random color. density: cells around the equator. edgeThickness: dark border width. seed: shifts the cell pattern."
   },
 
+  /* Phase 7 §5.5.b — ProceduralTerrain. Noise-based heightmap source
+   * for the Terrain node (§5.5.a, ships next). Pure-procedural fBm
+   * (or ridge multifractal when `ridges` is nonzero) sampled per-
+   * fragment in UV space. Output `out` is a single-channel-ish
+   * texture (R = G = B = height) the Terrain node samples in its
+   * vertex shader to displace an XZ grid.
+   *
+   * Why a shader-frag and not a static texture: the user can drive
+   * `seed` from MasterClock for an animated landscape, or wire
+   * `frequency` to a slider to dial scale live without rebaking.
+   * The texture is regenerated each frame at framebuffer resolution,
+   * which is cheap (one fullscreen triangle pass).
+   *
+   * Stop-go: this + the §5.5.a Terrain node (queued) closes out the
+   * "ProceduralTerrain → Terrain → Scene" demo from ROADMAP.md. */
+  ProceduralTerrain: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    ins: [
+      { n: "seed",       t: "param" },
+      { n: "frequency",  t: "param" },
+      { n: "octaves",    t: "param" },
+      { n: "lacunarity", t: "param" },
+      { n: "gain",       t: "param" },
+      { n: "ridges",     t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    params: {
+      seed:       1.234,
+      frequency:  4.0,
+      octaves:    5,
+      lacunarity: 2.0,
+      gain:       0.5,
+      ridges:     0.0
+    },
+    methods: {},
+    // 16-float preamble + 6 params + 2 pad = 24 floats = 96 bytes.
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution: vec4f,
+  u_time:       f32,
+  u_dt:         f32,
+  _pad0:        vec2f,
+  u_view:       vec4f,
+  u_world_uv:   vec4f,
+  seed:         f32,
+  frequency:    f32,
+  octaves:      f32,
+  lacunarity:   f32,
+  gain:         f32,
+  ridges:       f32,
+  _pad1:        vec2f,
+};
+@group(0) @binding(0) var<uniform> u: U;
+
+struct VsOut {
+  @builtin(position) pos: vec4f,
+  @location(0) uv: vec2f,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(
+    vec2f(-1.0, -1.0),
+    vec2f( 3.0, -1.0),
+    vec2f(-1.0,  3.0),
+  );
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+// 2-component hash seeded by u.seed. Stable across frames.
+fn _hash2(p: vec2f) -> f32 {
+  let h = vec2f(dot(p, vec2f(127.1, 311.7)),
+                dot(p, vec2f(269.5, 183.3)));
+  return fract(sin(h.x + h.y + u.seed) * 43758.5453);
+}
+
+// 2D value noise: smoothed bilinear interp of hashed corners.
+fn _value_noise(p: vec2f) -> f32 {
+  let i = floor(p);
+  let f = fract(p);
+  let a = _hash2(i);
+  let b = _hash2(i + vec2f(1.0, 0.0));
+  let c = _hash2(i + vec2f(0.0, 1.0));
+  let d = _hash2(i + vec2f(1.0, 1.0));
+  let s = f * f * (3.0 - 2.0 * f);
+  return mix(mix(a, b, s.x), mix(c, d, s.x), s.y);
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  var p = in.uv * max(u.frequency, 0.001);
+  var amp: f32 = 1.0;
+  var sum: f32 = 0.0;
+  var maxAmp: f32 = 0.0;
+  let octs = i32(clamp(u.octaves, 1.0, 8.0));
+  for (var i = 0; i < octs; i = i + 1) {
+    var n = _value_noise(p);
+    // Ridge multifractal mix: 0 = standard fBm, 1 = sharp ridges
+    // (1 - |2n - 1|)^2 emphasizes the boundaries where n ≈ 0.5.
+    let ridge = 1.0 - abs(2.0 * n - 1.0);
+    n = mix(n, ridge * ridge, clamp(u.ridges, 0.0, 1.0));
+    sum = sum + n * amp;
+    maxAmp = maxAmp + amp;
+    p = p * u.lacunarity;
+    amp = amp * u.gain;
+  }
+  let h = clamp(sum / max(maxAmp, 1e-6), 0.0, 1.0);
+  return vec4f(h, h, h, 1.0);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.seed       === "number") ? p.seed       : 1.234;
+      scratch[17] = (typeof p.frequency  === "number") ? p.frequency  : 4.0;
+      scratch[18] = (typeof p.octaves    === "number") ? p.octaves    : 5.0;
+      scratch[19] = (typeof p.lacunarity === "number") ? p.lacunarity : 2.0;
+      scratch[20] = (typeof p.gain       === "number") ? p.gain       : 0.5;
+      scratch[21] = (typeof p.ridges     === "number") ? p.ridges     : 0.0;
+      scratch[22] = 0;
+      scratch[23] = 0;
+    },
+    description: "Noise-based heightmap source for Terrain (Phase 7 §5.5.b). fBm + optional ridge multifractal. seed: changes the noise field. frequency: base cell count across the UV span (higher = smaller features). octaves: how many fBm bands stack (1-8). lacunarity: frequency multiplier per octave (~2 = standard). gain: amplitude multiplier per octave (~0.5 = standard). ridges: 0 = smooth fBm hills, 1 = sharp mountain ridges. Output is a single-channel texture (R=G=B=height ∈ [0,1]); wire into Terrain.heightmap or any other texture sink."
+  },
+
   /* Phase 6.6.20.7 — WireframeCalibration. AlloSphere-style
    * calibration pattern: lat/long sphere wireframe + 3 axis-aligned
    * great circles (RGB-coded) + 3 beacon small-circles around the
