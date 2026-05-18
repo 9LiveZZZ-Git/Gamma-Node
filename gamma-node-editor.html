@@ -6496,6 +6496,13 @@
               <span class="tool-menu-sub">Connect 2+ selected nodes left-to-right by spatial X order</span>
             </span>
           </button>
+          <button class="tool-menu-item" id="tool-ai-auto-wire">
+            <span class="tool-menu-icon">✦</span>
+            <span>
+              <strong>AI auto-wire (Shift+W)</strong>
+              <span class="tool-menu-sub">Ask the AI to propose edges for the whole patch; optional guidance from the User DSP prompt</span>
+            </span>
+          </button>
         </div>
         <button class="tool-btn" id="tool-voice" title="Voice → AI prompt (microphone)">🎤</button>
       </div>
@@ -39359,6 +39366,15 @@ if (_autoWireBtn) _autoWireBtn.addEventListener("click", () => {
   _autoConnectSelection();
 });
 
+// Sprint 5.smart-link.ai-patch-connect -- menu-driven trigger for
+// the AI auto-wire (Shift+W). Same provider plumbing as the User
+// DSP tab; status feedback shows on the canvas-side pill.
+const _aiAutoWireBtn = document.getElementById("tool-ai-auto-wire");
+if (_aiAutoWireBtn) _aiAutoWireBtn.addEventListener("click", () => {
+  _toggleToolMenu(false);
+  _aiAutoConnect();
+});
+
 /* HTML for the popup window. Self-contained -- styles + scripts +
  * pointer event handling all inline. Communicates with the main
  * window via BroadcastChannel("gamma-touchscreen"). */
@@ -40174,24 +40190,24 @@ function _autoWireSequential(nodeIds) {
   return added;
 }
 
-/* Sprint 5.smart-link.multi-select -- second consumer of
- * _autoWireSequential. User selects 2+ nodes on the canvas (Shift-
- * click, marquee, or Cmd/Ctrl-A then Shift-click to deselect a
- * few) and triggers this via the W keybind or the canvas-tools
- * ▾ menu item. Nodes are sorted left-to-right by spatial X so
- * the user's spatial layout drives the chain direction (the
- * natural "signal flows left-to-right" convention).
+/* Sprint 5.smart-link.multi-select -- W keybind / canvas-tools
+ * menu item entry point.
  *
- * Returns the count of edges added so callers can update the
- * status pill; visible status update happens here too for the
- * keybind / menu paths. */
+ * Uses _autoConnectMulti rather than _autoWireSequential because
+ * jumbled selections (e.g. {Sine, Output, Box, Scene, VisualOutput}
+ * dropped in random X order) don't form an adjacent-pair chain --
+ * they're several typed chains sharing one selection. The multi-
+ * variant walks ALL rightward pairs and prefers exact-type matches
+ * anywhere in the rightward neighborhood, falling back to cross-
+ * signal coercion only when no exact match exists. Strict-adjacent
+ * with cross-signal fallback (the handwriting-chain behavior) lands
+ * Sine.out -> Box.width because Box happens to sit next to Sine. */
 function _autoConnectSelection() {
   if (!selectedSet || selectedSet.size < 2) {
     setVoiceStatus("Select 2+ nodes to auto-wire", "err");
     setTimeout(() => setVoiceStatus("", ""), 2000);
     return 0;
   }
-  // Resolve selected ids to actual node refs + filter missing.
   const nodes = [...selectedSet]
     .map(id => state.nodes.find(n => n && n.id === id))
     .filter(Boolean);
@@ -40199,18 +40215,313 @@ function _autoConnectSelection() {
     setVoiceStatus("Selection has fewer than 2 valid nodes", "err");
     return 0;
   }
-  // Sort by node.x (left-to-right). Ties broken by .y (top-to-bottom)
-  // so stacked-vertical selections wire top-down without surprises.
   nodes.sort((a, b) => (a.x - b.x) || (a.y - b.y));
   const sortedIds = nodes.map(n => n.id);
   pushHistory("multi-select:auto-wire");
-  const added = _autoWireSequential(sortedIds);
+  const added = _autoConnectMulti(sortedIds);
   if (added > 0) {
     setVoiceStatus("Auto-wired " + added + " edge(s) across " + sortedIds.length + " nodes", "");
     setTimeout(() => setVoiceStatus("", ""), 2200);
   } else {
     setVoiceStatus("No compatible port pairs found in selection", "err");
     setTimeout(() => setVoiceStatus("", ""), 2200);
+  }
+  render();
+  return added;
+}
+
+/* Sprint 5.smart-link.multi-select-fix1 -- type-driven, non-
+ * adjacent auto-wire for jumbled selections.
+ *
+ * Why a separate function from _autoWireSequential:
+ *   _autoWireSequential walks STRICT adjacent X-pairs with cross-
+ *   signal fallback. That's correct for "sine | filter | AD" (the
+ *   user gave us explicit order). For multi-select, the user
+ *   shift-clicked a bunch of nodes; X-order is whatever happens to
+ *   match their layout. Strict-adjacent + cross-signal lands
+ *   Sine.out on Box.width because audio is signal-compatible with
+ *   param and Box sits next to Sine. Wrong.
+ *
+ * Algorithm:
+ *   Pass 1 -- exact-type matches.
+ *     For each source node (in X order), for each output port,
+ *     find the FIRST rightward node with an EXACT-type compatible
+ *     input port not already wired. Wire it. One edge per output
+ *     port. Skips over nodes that don't match -- so Sine's audio
+ *     out jumps over Box to reach Output's audio in.
+ *
+ *   Pass 2 -- cross-signal fallback for ORPHAN outputs.
+ *     Outputs that didn't connect in Pass 1 get a cross-signal
+ *     attempt (audio -> param, clock -> param, etc.). Only fires
+ *     when no exact match was available rightward, so it can't
+ *     stomp the right answer.
+ *
+ * Returns count of edges added. */
+function _autoConnectMulti(nodeIds) {
+  if (!Array.isArray(nodeIds) || nodeIds.length < 2) return 0;
+  if (!Array.isArray(state.edges)) state.edges = [];
+  const nodes = nodeIds
+    .map(id => state.nodes.find(n => n && n.id === id))
+    .filter(Boolean);
+  if (nodes.length < 2) return 0;
+  let added = 0;
+  const inputIsWired = (nodeId, portName) =>
+    state.edges.some(e =>
+      e && e.to && e.to.node === nodeId && e.to.port === portName);
+  // Track outputs connected in Pass 1; Pass 2 only attempts the
+  // orphans (key = "<srcId>:<outPortName>").
+  const wiredOutputs = new Set();
+
+  // --- Pass 1: exact-type matches ---
+  for (let i = 0; i < nodes.length; i++) {
+    const src = nodes[i];
+    const srcDef = TYPES[src.type];
+    if (!srcDef || !Array.isArray(srcDef.outs)) continue;
+    for (const sout of srcDef.outs) {
+      for (let j = i + 1; j < nodes.length; j++) {
+        const dst = nodes[j];
+        const dstDef = TYPES[dst.type];
+        if (!dstDef || !Array.isArray(dstDef.ins)) continue;
+        let matched = null;
+        for (const din of dstDef.ins) {
+          if (din.t === sout.t && !inputIsWired(dst.id, din.n)) {
+            matched = din;
+            break;
+          }
+        }
+        if (matched) {
+          state.edges.push({
+            from: { node: src.id, port: sout.n },
+            to:   { node: dst.id, port: matched.n }
+          });
+          wiredOutputs.add(src.id + ":" + sout.n);
+          added++;
+          break; // one wire per output; move to next output port
+        }
+      }
+    }
+  }
+
+  // --- Pass 2: cross-signal coercion for outputs still orphaned ---
+  for (let i = 0; i < nodes.length; i++) {
+    const src = nodes[i];
+    const srcDef = TYPES[src.type];
+    if (!srcDef || !Array.isArray(srcDef.outs)) continue;
+    for (const sout of srcDef.outs) {
+      if (wiredOutputs.has(src.id + ":" + sout.n)) continue;
+      for (let j = i + 1; j < nodes.length; j++) {
+        const dst = nodes[j];
+        const dstDef = TYPES[dst.type];
+        if (!dstDef || !Array.isArray(dstDef.ins)) continue;
+        let matched = null;
+        for (const din of dstDef.ins) {
+          if (portsCompatible(sout.t, din.t) && !inputIsWired(dst.id, din.n)) {
+            matched = din;
+            break;
+          }
+        }
+        if (matched) {
+          state.edges.push({
+            from: { node: src.id, port: sout.n },
+            to:   { node: dst.id, port: matched.n }
+          });
+          added++;
+          break;
+        }
+      }
+    }
+  }
+  return added;
+}
+
+/* Sprint 5.smart-link.ai-patch-connect -- validate + apply a batch
+ * of arbitrary proposed edges (not necessarily sequential). Used by
+ * _aiAutoConnect; could be reused later by import-patch or paste
+ * flows that hand us pre-baked edge sets.
+ *
+ * Validation per edge:
+ *   - both endpoints reference real nodes in state.nodes
+ *   - both port names exist on their respective TYPES def
+ *   - portsCompatible(srcType, dstType) holds
+ *   - destination input is not already wired
+ *   - no self-loop (loops must go through Delay1 via the manual
+ *     edge-tool path, not this batch applier)
+ *
+ * Returns the count of edges that passed validation and were
+ * actually pushed. */
+function _applyEdgeSet(edges) {
+  if (!Array.isArray(edges) || !Array.isArray(state.nodes)) return 0;
+  if (!Array.isArray(state.edges)) state.edges = [];
+  let added = 0;
+  const inputIsWired = (nodeId, portName) =>
+    state.edges.some(e =>
+      e && e.to && e.to.node === nodeId && e.to.port === portName);
+  for (const proposed of edges) {
+    if (!proposed || !proposed.from || !proposed.to) continue;
+    const srcId = proposed.from.node, srcPort = proposed.from.port;
+    const dstId = proposed.to.node,   dstPort = proposed.to.port;
+    if (!srcId || !dstId || !srcPort || !dstPort) continue;
+    if (srcId === dstId) continue;
+    const src = state.nodes.find(n => n && n.id === srcId);
+    const dst = state.nodes.find(n => n && n.id === dstId);
+    if (!src || !dst) continue;
+    const srcDef = TYPES[src.type], dstDef = TYPES[dst.type];
+    if (!srcDef || !dstDef) continue;
+    const sout = (srcDef.outs || []).find(p => p.n === srcPort);
+    const din  = (dstDef.ins  || []).find(p => p.n === dstPort);
+    if (!sout || !din) continue;
+    if (!portsCompatible(sout.t, din.t)) continue;
+    if (inputIsWired(dstId, dstPort)) continue;
+    state.edges.push({
+      from: { node: srcId, port: srcPort },
+      to:   { node: dstId, port: dstPort }
+    });
+    added++;
+  }
+  return added;
+}
+
+/* Sprint 5.smart-link.ai-patch-connect -- third smart-link consumer.
+ * Shift+W keybind / canvas-tools menu item. Sends the current graph
+ * (nodes + their port shapes + existing edges) to the configured AI
+ * provider and asks for proposed new edges following conventional
+ * patching logic (audio toward Outputs; mesh into Scene; Scene
+ * texture into VisualOutput; lights/cameras/env into Scene; etc.).
+ *
+ * Not prompt-based by default per the user's spec ("just a button
+ * that does the most likely auto wire based on the nodes active on
+ * the editor"). If the User DSP prompt input has text, it's passed
+ * as optional guidance for custom requests ("only wire the audio
+ * chain, leave visuals", "use Slider as a freq modulator", etc.).
+ *
+ * Edges come back as a JSON array; we strip any markdown fences,
+ * validate each via _applyEdgeSet, and push history before applying
+ * so undo rolls back the whole batch in one step.
+ *
+ * Status feedback uses setVoiceStatus (canvas-side pill) rather
+ * than setAiStatus because the User DSP tab isn't necessarily
+ * visible when triggered. */
+async function _aiAutoConnect() {
+  if (!Array.isArray(state.nodes) || state.nodes.length < 2) {
+    setVoiceStatus("Need 2+ nodes on canvas for AI auto-wire", "err");
+    setTimeout(() => setVoiceStatus("", ""), 2000);
+    return 0;
+  }
+  const provider = PROVIDERS[aiSettings.provider];
+  if (!provider) {
+    setVoiceStatus("No AI provider configured (User DSP ⚙)", "err");
+    setTimeout(() => setVoiceStatus("", ""), 2500);
+    return 0;
+  }
+  let key = "";
+  if (provider.requiresKey) {
+    key = aiSettings.anthropicKey || "";
+    if (!key) {
+      setVoiceStatus("AI provider needs API key (User DSP ⚙)", "err");
+      setTimeout(() => setVoiceStatus("", ""), 2500);
+      return 0;
+    }
+  }
+
+  // Compact graph payload -- keep tokens minimal for Gemma-local.
+  // Only include ports actually defined in TYPES; omit per-node
+  // params (those aren't routable in the same way as port edges).
+  const compactNodes = state.nodes.map(n => {
+    const def = TYPES[n.type];
+    return {
+      id: n.id,
+      type: n.type,
+      outs: (def && def.outs) ? def.outs.map(p => ({ n: p.n, t: p.t })) : [],
+      ins:  (def && def.ins)  ? def.ins.map(p  => ({ n: p.n, t: p.t })) : []
+    };
+  });
+  const compactEdges = (state.edges || []).map(e => ({
+    from: { node: e.from.node, port: e.from.port },
+    to:   { node: e.to.node,   port: e.to.port }
+  }));
+
+  const system =
+    "You are a routing assistant for the Gamma Node Editor (visual DSP / audio / 3D patcher).\n" +
+    "Given a graph of nodes (with port types) plus existing edges, propose NEW edges that connect the patch following conventional signal-flow logic.\n\n" +
+    "Port type rules:\n" +
+    "- Audio family (audio, param, gate, clock) is cross-compatible.\n" +
+    "- Visual family (texture, transform, mesh, camera, light, environment) is STRICT same-type.\n\n" +
+    "Patching conventions:\n" +
+    "- Audio sources (Sine, Saw, Noise, filters) flow toward Output / OutputStereo sinks.\n" +
+    "- Mesh-generating nodes feed Scene's mesh inputs. Scene's texture output feeds VisualOutput.\n" +
+    "- Lights and Cameras feed Scene's light / camera inputs. Environments feed Scene's environment input.\n" +
+    "- Modulation sources (LFO, EnvFollow, Slider) wire to param inputs of audio processors.\n" +
+    "- NEVER re-wire an input that already has an edge.\n" +
+    "- It's fine to leave a node unwired if no sensible target exists -- do not force junk connections.\n\n" +
+    "Output: a JSON array of edges, NOTHING ELSE -- no prose, no markdown fences.\n" +
+    "Edge shape: { \"from\": { \"node\": \"<id>\", \"port\": \"<outPortName>\" }, \"to\": { \"node\": \"<id>\", \"port\": \"<inPortName>\" } }\n" +
+    "If no useful edges, return [].";
+
+  const customGuidance = (aiPromptEl && aiPromptEl.value || "").trim();
+  const guidanceBlock = customGuidance
+    ? "\n\nUser guidance: " + JSON.stringify(customGuidance)
+    : "";
+  const userMsg =
+    "Nodes:\n" + JSON.stringify(compactNodes) +
+    "\n\nExisting edges:\n" + JSON.stringify(compactEdges) +
+    guidanceBlock +
+    "\n\nReturn only the JSON edge array.";
+
+  setVoiceStatus("AI auto-wire — thinking (" +
+    shortModelName(aiSettings.provider, aiSettings.model) + ")…", "thinking");
+
+  let text = "";
+  try {
+    text = await provider.call({
+      system,
+      user: userMsg,
+      model: aiSettings.model,
+      key,
+      temperature: 0,
+      maxTokens: 1024
+    });
+  } catch (err) {
+    setVoiceStatus("AI error: " + (err && err.message ? err.message : err), "err");
+    setTimeout(() => setVoiceStatus("", ""), 4000);
+    return 0;
+  }
+
+  // Strip code fences + isolate the first JSON array. Both Claude
+  // and Gemma occasionally wrap the output in ```json ... ``` despite
+  // the system prompt forbidding it.
+  let parsed = null;
+  try {
+    let s = (text || "").trim();
+    s = s.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+    const start = s.indexOf("[");
+    const end   = s.lastIndexOf("]");
+    if (start >= 0 && end > start) s = s.slice(start, end + 1);
+    parsed = JSON.parse(s);
+  } catch (err) {
+    setVoiceStatus("AI returned malformed JSON; nothing applied", "err");
+    setTimeout(() => setVoiceStatus("", ""), 3000);
+    return 0;
+  }
+  if (!Array.isArray(parsed)) {
+    setVoiceStatus("AI response wasn't an edge array", "err");
+    setTimeout(() => setVoiceStatus("", ""), 3000);
+    return 0;
+  }
+  if (parsed.length === 0) {
+    setVoiceStatus("AI: no new wires suggested", "");
+    setTimeout(() => setVoiceStatus("", ""), 2500);
+    return 0;
+  }
+
+  pushHistory("ai:auto-wire");
+  const added = _applyEdgeSet(parsed);
+  if (added > 0) {
+    setVoiceStatus("AI auto-wired " + added + " edge(s)" +
+      (added < parsed.length ? " (" + (parsed.length - added) + " rejected)" : ""), "");
+    setTimeout(() => setVoiceStatus("", ""), 2500);
+  } else {
+    setVoiceStatus("AI proposed " + parsed.length + " edge(s) but none validated", "err");
+    setTimeout(() => setVoiceStatus("", ""), 3000);
   }
   render();
   return added;
@@ -40559,11 +40870,19 @@ document.addEventListener("keydown", e => {
   if (previewState.state === "playing" && (lk in QWERTY_TO_MIDI || lk === "z" || lk === "x")) return;
   if (e.key === "v" || e.key === "V") setTool("select");
   if (e.key === "d" || e.key === "D") setTool("draw");
-  // Sprint 5.smart-link.multi-select -- W auto-wires the current
-  // selection left-to-right. Same playing-keyboard gate as V/D
+  // Sprint 5.smart-link -- W auto-wires the current selection
+  // left-to-right; Shift+W asks the AI provider to propose edges
+  // for the whole patch. Same playing-keyboard gate as V/D
   // (already checked at the top of this handler since "w" is in
   // QWERTY_TO_MIDI = C#4).
-  if (e.key === "w" || e.key === "W") _autoConnectSelection();
+  //
+  // e.key === "W" with shiftKey === true catches normal Shift+W;
+  // unshifted caps-lock W falls through to the multi-select path.
+  if (e.key === "W" && e.shiftKey) {
+    _aiAutoConnect();
+  } else if (e.key === "w" || e.key === "W") {
+    _autoConnectSelection();
+  }
 });
 
 /* =========================================================================
