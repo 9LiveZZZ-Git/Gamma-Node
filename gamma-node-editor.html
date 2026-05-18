@@ -39251,9 +39251,20 @@ function _ensureTouchChannel() {
     } else if (msg.type === "control-button") {
       _handleTouchControlButton(msg);
     } else if (msg.type === "control-key-down") {
-      if (typeof playKeyboardNote === "function") playKeyboardNote(msg.key);
+      // Touch keyboard sends MIDI directly so it can address any
+      // octave; the legacy QWERTY-keyed shape (msg.key) still works
+      // for back-compat in case an older popup is open.
+      if (typeof msg.midi === "number" && typeof playKeyboardMidi === "function") {
+        playKeyboardMidi(msg.midi);
+      } else if (typeof msg.key === "string" && typeof playKeyboardNote === "function") {
+        playKeyboardNote(msg.key);
+      }
     } else if (msg.type === "control-key-up") {
-      if (typeof releaseKeyboardNote === "function") releaseKeyboardNote(msg.key);
+      if (typeof msg.midi === "number" && typeof releaseKeyboardMidi === "function") {
+        releaseKeyboardMidi(msg.midi);
+      } else if (typeof msg.key === "string" && typeof releaseKeyboardNote === "function") {
+        releaseKeyboardNote(msg.key);
+      }
     } else if (msg.type === "control-octave") {
       if (typeof setKbOctaveShift === "function") {
         setKbOctaveShift(kbOctaveShift + (Number(msg.delta) || 0));
@@ -39488,126 +39499,378 @@ function _buildTouchscreenHtml() {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Gamma · Touchscreen</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Inter:wght@400;500&family=Major+Mono+Display&family=Fragment+Mono&display=swap" rel="stylesheet" />
 <style>
+  /* Match the main editor's phosphor lab tokens so the popup feels
+     like one app, not two. Same palette, same fonts, same sharp
+     1px borders. See main editor :root for the canonical values. */
   :root {
-    --bg: #0e1116; --surface: #161b22; --surface-2: #1f262e;
-    --border: #2a3340; --text: #e6edf3; --text-2: #a6b1bf;
-    --accent: #c8e85a; --accent-ink: #0e1116; --danger: #f0726a;
+    --bg:           #050608;
+    --surface:      #0c0e12;
+    --surface-2:    #11141a;
+    --surface-3:    #171a20;
+    --border:       rgba(200,232,90,0.16);
+    --border-strong:rgba(200,232,90,0.34);
+    --text:         #e6e3dc;
+    --text-2:       #95928a;
+    --text-3:       #5d5b54;
+    --accent:       #c8e85a;
+    --accent-ink:   #050608;
+    --danger:       #e24b4a;
+    --warn:         #ffb347;
+    --phosphor:     #c8e85a;
+    --phosphor-mid: rgba(200,232,90,0.45);
+    --phosphor-dim: rgba(200,232,90,0.18);
+    --phosphor-trc: rgba(200,232,90,0.06);
+    --instr-bg:     #050608;
+    --instr-bg-2:   #0a0c10;
+    --instr-rule:   rgba(200,232,90,0.14);
+    --font-sans:    "Inter", system-ui, -apple-system, sans-serif;
+    --font-mono:    "JetBrains Mono", ui-monospace, "SF Mono", Consolas, monospace;
+    --font-instr:   "Major Mono Display", "JetBrains Mono", monospace;
+    --font-body-m:  "Fragment Mono", "JetBrains Mono", monospace;
   }
   * { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif; user-select: none; -webkit-user-select: none; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg); color: var(--text);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    -webkit-font-smoothing: antialiased;
+    user-select: none; -webkit-user-select: none;
+  }
   body { display: flex; flex-direction: column; }
-  .tabs { display: flex; gap: 2px; padding: 8px 8px 0 8px; background: var(--surface); border-bottom: 1px solid var(--border); }
-  .tab { flex: 1; padding: 12px 16px; background: var(--surface-2); border: none; color: var(--text-2); font-size: 15px; cursor: pointer; border-radius: 6px 6px 0 0; }
-  .tab.active { background: var(--bg); color: var(--accent); border-bottom: 2px solid var(--accent); }
-  .panel { flex: 1; display: none; flex-direction: column; padding: 12px; gap: 12px; min-height: 0; }
+  /* Lab-style scrollbars match the main editor exactly. */
+  * { scrollbar-color: var(--phosphor-dim) var(--instr-bg); scrollbar-width: thin; }
+  ::-webkit-scrollbar          { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track    { background: var(--instr-bg); }
+  ::-webkit-scrollbar-thumb    { background: var(--phosphor-dim); border: 2px solid var(--instr-bg); border-radius: 0; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--phosphor-mid); }
+
+  /* Tabs ---------------------------------------------------- */
+  .tabs {
+    display: flex; gap: 0;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+  }
+  .tab {
+    flex: 1; padding: 12px 16px;
+    background: transparent;
+    border: none;
+    border-right: 1px solid var(--border);
+    color: var(--text-2);
+    font-family: var(--font-instr);
+    font-size: 12px;
+    letter-spacing: 0.16em;
+    text-transform: lowercase;
+    cursor: pointer;
+  }
+  .tab:last-child { border-right: none; }
+  .tab.active {
+    background: var(--bg);
+    color: var(--phosphor);
+    border-bottom: 1px solid var(--phosphor);
+    margin-bottom: -1px;
+  }
+
+  .panel { flex: 1; display: none; flex-direction: column; padding: 14px; gap: 12px; min-height: 0; }
   .panel.active { display: flex; }
-  .ink-wrap { flex: 1; position: relative; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; min-height: 0; }
+
+  /* Handwriting tab ---------------------------------------- */
+  .ink-wrap {
+    flex: 1; position: relative;
+    background: var(--instr-bg-2);
+    border: 1px solid var(--instr-rule);
+    overflow: hidden; min-height: 0;
+  }
   #ink-canvas { width: 100%; height: 100%; display: block; touch-action: none; cursor: crosshair; }
-  /* Baseline guide -- a dashed horizontal line at 70% canvas height
-     so users have something to write ON. Pointer-events: none so
-     it doesn't intercept touch events. Pure visual aid; not
-     included in the OCR render (offscreen canvas redraw doesn't
-     reference this overlay). */
   .baseline {
     position: absolute;
-    left: 6%; right: 6%;
-    top: 70%;
+    left: 6%; right: 6%; top: 70%;
     height: 0;
-    border-top: 1px dashed rgba(140, 150, 170, 0.45);
+    border-top: 1px dashed var(--phosphor-dim);
     pointer-events: none;
   }
   .baseline-cap {
     position: absolute;
     width: 6px; height: 6px;
-    background: rgba(140, 150, 170, 0.5);
-    border-radius: 50%;
+    background: var(--phosphor-dim);
     top: -3.5px;
   }
   .baseline-cap.l { left: -3px; }
   .baseline-cap.r { right: -3px; }
   .box-banner {
     position: absolute;
-    top: 8px; left: 50%; transform: translateX(-50%);
+    top: 10px; left: 50%; transform: translateX(-50%);
     padding: 6px 12px;
-    background: rgba(8, 11, 16, 0.85);
-    border: 1px solid var(--border);
-    border-radius: 4px;
+    background: var(--instr-bg);
+    border: 1px solid var(--instr-rule);
     color: var(--text-2);
-    font-size: 12px;
+    font-family: var(--font-instr);
+    font-size: 9px;
+    letter-spacing: 0.16em;
+    text-transform: lowercase;
     pointer-events: none;
     display: none;
   }
-  .box-banner.has-box { border-color: var(--accent); color: var(--accent); }
-  .actions { display: flex; gap: 8px; align-items: center; }
-  .btn { padding: 14px 22px; font-size: 16px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text); cursor: pointer; }
-  .btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 500; }
-  .btn:hover { background: var(--surface); }
-  .btn.primary:hover { background: #b8d850; }
-  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-  .status { font-size: 13px; color: var(--text-2); flex: 1; padding: 0 8px; min-height: 1.4em; }
-  .status.ok  { color: var(--accent); }
-  .status.err { color: var(--danger); }
-  .placeholder { padding: 40px; text-align: center; color: var(--text-2); font-size: 14px; line-height: 1.6; }
-  .placeholder code { background: var(--surface-2); padding: 2px 6px; border-radius: 3px; color: var(--accent); font-size: 12px; }
-  .conn-pip { width: 8px; height: 8px; border-radius: 50%; background: var(--danger); display: inline-block; vertical-align: middle; margin-right: 6px; }
-  .conn-pip.ok { background: var(--accent); }
+  .box-banner.has-box { border-color: var(--phosphor-dim); color: var(--phosphor); }
 
-  /* Controls panel ------------------------------------------- */
-  .ctrl-status-bar { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; font-size: 13px; color: var(--text-2); }
-  .ctrl-play-pip { width: 8px; height: 8px; border-radius: 50%; background: var(--danger); flex: 0 0 8px; }
-  .ctrl-play-pip.playing { background: var(--accent); }
-  .ctrl-list { display: flex; flex-direction: column; gap: 10px; flex: 1; overflow-y: auto; padding-right: 4px; }
-  .ctrl-group-label { font-size: 12px; color: var(--text-2); text-transform: uppercase; letter-spacing: 0.06em; margin: 6px 0 -2px 2px; }
-  .ctrl-row { display: flex; align-items: center; gap: 10px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+  .actions { display: flex; gap: 8px; align-items: center; }
+  /* Primary touchscreen buttons -- larger than the main editor's
+     monitor-control buttons because fingertips, but same phosphor
+     palette + uppercase-tracking aesthetic. */
+  .btn {
+    padding: 12px 22px;
+    background: var(--instr-bg);
+    border: 1px solid var(--phosphor-dim);
+    color: var(--phosphor);
+    font-family: var(--font-instr);
+    font-size: 12px;
+    letter-spacing: 0.18em;
+    text-transform: lowercase;
+    cursor: pointer;
+    transition: background 0.08s, color 0.08s;
+  }
+  .btn:hover  { background: var(--instr-bg-2); border-color: var(--phosphor-mid); }
+  .btn:active { background: var(--phosphor); color: var(--instr-bg); }
+  .btn.primary { background: var(--phosphor); color: var(--instr-bg); border-color: var(--phosphor); }
+  .btn.primary:hover  { background: var(--phosphor); color: var(--instr-bg); }
+  .btn.primary:active { background: var(--phosphor-mid); }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .status {
+    flex: 1; padding: 0 8px;
+    min-height: 1.4em;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-2);
+  }
+  .status.ok  { color: var(--phosphor); }
+  .status.err { color: var(--danger); }
+  .placeholder {
+    padding: 40px; text-align: center;
+    color: var(--text-2);
+    font-size: 13px;
+    line-height: 1.6;
+  }
+  .placeholder strong { color: var(--text); }
+  .placeholder code {
+    background: var(--instr-bg-2);
+    border: 1px solid var(--instr-rule);
+    padding: 1px 6px;
+    color: var(--phosphor);
+    font-family: var(--font-mono);
+    font-size: 11px;
+  }
+  .conn-pip {
+    width: 8px; height: 8px;
+    background: var(--danger);
+    display: inline-block; vertical-align: middle;
+    margin-right: 6px;
+  }
+  .conn-pip.ok { background: var(--phosphor); }
+
+  /* Controls tab ------------------------------------------- */
+  .ctrl-status-bar {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 12px;
+    background: var(--instr-bg-2);
+    border: 1px solid var(--instr-rule);
+    font-family: var(--font-instr);
+    font-size: 10px;
+    letter-spacing: 0.16em;
+    text-transform: lowercase;
+    color: var(--text-2);
+  }
+  .ctrl-play-pip {
+    width: 8px; height: 8px;
+    background: var(--danger);
+    flex: 0 0 8px;
+  }
+  .ctrl-play-pip.playing { background: var(--phosphor); }
+  .ctrl-list {
+    display: flex; flex-direction: column; gap: 8px;
+    flex: 1;
+    overflow-y: auto;
+    padding-right: 4px;
+  }
+  .ctrl-group-label {
+    font-family: var(--font-instr);
+    font-size: 9px;
+    letter-spacing: 0.18em;
+    text-transform: lowercase;
+    color: var(--phosphor-mid);
+    margin: 8px 0 -2px 2px;
+  }
+  .ctrl-group-label:first-child { margin-top: 2px; }
+  /* Row matches main editor's .monitor-control: dim panel bg,
+     hairline phosphor rule, sharp corners. */
+  .ctrl-row {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 12px;
+    background: var(--instr-bg-2);
+    border: 1px solid var(--instr-rule);
+  }
   .ctrl-row.disabled { opacity: 0.55; }
-  .ctrl-id { font-family: ui-monospace, "SF Mono", Consolas, monospace; font-size: 12px; color: var(--text-2); min-width: 84px; flex: 0 0 84px; }
-  .ctrl-id b { color: var(--text); font-weight: 600; }
-  .ctrl-slider-input { flex: 1; -webkit-appearance: none; appearance: none; height: 28px; background: transparent; }
-  .ctrl-slider-input::-webkit-slider-runnable-track { height: 12px; background: var(--surface-2); border-radius: 6px; border: 1px solid var(--border); }
-  .ctrl-slider-input::-moz-range-track            { height: 12px; background: var(--surface-2); border-radius: 6px; border: 1px solid var(--border); }
-  .ctrl-slider-input::-webkit-slider-thumb { -webkit-appearance: none; width: 32px; height: 32px; border-radius: 50%; background: var(--accent); border: 2px solid var(--accent-ink); margin-top: -11px; cursor: pointer; }
-  .ctrl-slider-input::-moz-range-thumb     {                          width: 32px; height: 32px; border-radius: 50%; background: var(--accent); border: 2px solid var(--accent-ink); cursor: pointer; }
-  .ctrl-val { min-width: 64px; text-align: right; font-family: ui-monospace, "SF Mono", Consolas, monospace; font-size: 13px; color: var(--accent); }
+  .ctrl-id {
+    font-family: var(--font-instr);
+    font-size: 10px;
+    letter-spacing: 0.16em;
+    color: var(--phosphor-mid);
+    text-transform: lowercase;
+    min-width: 72px;
+  }
+  .ctrl-id b { color: var(--phosphor); font-weight: 400; }
+  /* Slider track: thin like main, but thumb beefed up to a
+     finger-sized 26x26 with phosphor fill so it's tappable. */
+  .ctrl-slider-input {
+    -webkit-appearance: none; appearance: none;
+    width: 100%;
+    height: 4px;
+    background: var(--instr-bg);
+    border: 1px solid var(--instr-rule);
+    outline: none;
+    cursor: pointer;
+  }
+  .ctrl-slider-input::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 26px; height: 26px;
+    background: var(--phosphor);
+    border: 1px solid var(--instr-bg);
+    cursor: grab;
+  }
+  .ctrl-slider-input::-moz-range-thumb {
+    width: 26px; height: 26px;
+    background: var(--phosphor);
+    border: 1px solid var(--instr-bg);
+    cursor: grab;
+  }
+  .ctrl-val {
+    font-family: var(--font-body-m);
+    font-size: 11px;
+    color: var(--phosphor);
+    font-variant-numeric: tabular-nums;
+    min-width: 64px;
+    text-align: right;
+  }
+  /* Button widget styled exactly like main's .monitor-control-button
+     but larger padding for touch. */
   .ctrl-button {
-    flex: 1; padding: 18px; font-size: 16px; font-weight: 500;
-    background: var(--surface-2); color: var(--text); border: 1px solid var(--border);
-    border-radius: 8px; cursor: pointer; transition: background-color 0.06s, transform 0.06s;
+    width: 100%;
+    padding: 16px 14px;
+    background: var(--instr-bg);
+    border: 1px solid var(--phosphor-dim);
+    color: var(--phosphor);
+    font-family: var(--font-instr);
+    font-size: 11px;
+    letter-spacing: 0.18em;
+    text-transform: lowercase;
+    cursor: pointer;
+    transition: background 0.08s, color 0.08s;
   }
-  .ctrl-button:active, .ctrl-button.firing { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); transform: scale(0.98); }
-  .ctrl-kb-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
-  .ctrl-kb-toolbar { display: flex; gap: 8px; align-items: center; font-size: 12px; color: var(--text-2); }
-  .ctrl-kb-toolbar .oct-btn { padding: 8px 14px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-size: 14px; cursor: pointer; }
-  .ctrl-kb-toolbar .oct-btn:active { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  .ctrl-button:hover { background: var(--instr-bg-2); border-color: var(--phosphor-mid); }
+  .ctrl-button:active, .ctrl-button.firing {
+    background: var(--phosphor);
+    color: var(--instr-bg);
+  }
+  /* Keyboard widget ---------------------------------------- */
+  .ctrl-kb-wrap {
+    flex: 0 0 auto;
+    display: flex; flex-direction: column;
+    background: var(--instr-bg-2);
+    border: 1px solid var(--instr-rule);
+    padding: 10px;
+    gap: 10px;
+  }
+  .ctrl-kb-wrap.disabled { opacity: 0.55; }
+  /* When expanded, the wrap grows to fill remaining vertical space
+     in the panel so the keys themselves get taller. */
+  .ctrl-kb-wrap.expanded { flex: 1 1 auto; min-height: 0; }
+  .ctrl-kb-toolbar {
+    display: flex; gap: 8px; align-items: center;
+    font-family: var(--font-instr);
+    font-size: 9px;
+    letter-spacing: 0.16em;
+    text-transform: lowercase;
+    color: var(--text-2);
+  }
+  .ctrl-kb-toolbar .label { color: var(--phosphor-mid); padding: 0 4px; }
+  .ctrl-kb-toolbar .label b { color: var(--phosphor); font-weight: 400; }
+  .ctrl-kb-toolbar .oct-btn {
+    padding: 8px 14px;
+    background: var(--instr-bg);
+    border: 1px solid var(--phosphor-dim);
+    color: var(--phosphor);
+    font-family: var(--font-instr);
+    font-size: 11px;
+    letter-spacing: 0.16em;
+    cursor: pointer;
+    transition: background 0.08s, color 0.08s;
+  }
+  .ctrl-kb-toolbar .oct-btn:hover  { background: var(--instr-bg-2); border-color: var(--phosphor-mid); }
+  .ctrl-kb-toolbar .oct-btn:active { background: var(--phosphor); color: var(--instr-bg); }
+  .ctrl-kb-toolbar .spacer { flex: 1; }
   .ctrl-kb {
-    position: relative; height: 140px; background: var(--surface-2);
-    border: 1px solid var(--border); border-radius: 6px; overflow: hidden;
-    touch-action: none; user-select: none;
+    position: relative;
+    flex: 1 1 auto;
+    min-height: 110px;
+    background: var(--instr-bg);
+    border: 1px solid var(--instr-rule);
+    overflow: hidden;
+    touch-action: none;
+    user-select: none;
   }
-  /* White keys laid out as flex children; black keys absolutely
-     positioned on top. Each key is a button (large tap target). */
   .ctrl-kb-whites { position: absolute; inset: 0; display: flex; }
+  /* White keys -- phosphor lab style: dark instrument bg, phosphor
+     hairline border, phosphor labels. Matches the .piano-key style
+     in the main editor's Monitor pane. */
   .ctrl-kb-key {
-    flex: 1; border: 1px solid var(--border); background: #f5f6f8; color: #0e1116;
-    font-size: 12px; padding: 0; padding-bottom: 8px;
+    flex: 1;
+    border: none;
+    border-right: 1px solid var(--instr-rule);
+    background: var(--instr-bg-2);
+    color: var(--phosphor-mid);
+    font-family: var(--font-instr);
+    font-size: 9px;
+    letter-spacing: 0.14em;
+    padding: 0 0 8px 0;
     display: flex; align-items: flex-end; justify-content: center;
     cursor: pointer; user-select: none; touch-action: none;
   }
-  .ctrl-kb-key:not(:last-child) { border-right: none; }
-  .ctrl-kb-key.held { background: var(--accent); color: var(--accent-ink); }
+  .ctrl-kb-key:last-child { border-right: none; }
+  .ctrl-kb-key.held {
+    background: var(--phosphor);
+    color: var(--instr-bg);
+  }
+  .ctrl-kb-key.c-marker { color: var(--phosphor); }
   .ctrl-kb-black {
-    position: absolute; width: 8%; height: 60%; top: 0;
-    background: #0e1116; color: #f5f6f8; border: 1px solid #2a3340;
-    font-size: 11px; padding: 0; padding-bottom: 6px;
+    position: absolute; top: 0;
+    width: 7%; height: 65%;
+    background: var(--instr-bg);
+    border: 1px solid var(--phosphor-dim);
+    color: var(--phosphor-mid);
+    font-family: var(--font-instr);
+    font-size: 9px;
+    letter-spacing: 0.14em;
+    padding: 0 0 6px 0;
     display: flex; align-items: flex-end; justify-content: center;
     cursor: pointer; user-select: none; touch-action: none;
   }
-  .ctrl-kb-black.held { background: var(--accent); color: var(--accent-ink); }
+  .ctrl-kb-black.held {
+    background: var(--phosphor);
+    color: var(--instr-bg);
+    border-color: var(--phosphor);
+  }
 </style>
 </head><body>
 <div class="tabs">
-  <button class="tab active" data-tab="hw">✎ Handwriting</button>
-  <button class="tab" data-tab="ctrl">⚙ Controls</button>
+  <button class="tab active" data-tab="hw">✎ handwriting</button>
+  <button class="tab" data-tab="ctrl">⚙ controls</button>
 </div>
 <div class="panel active" data-panel="hw">
   <div class="ink-wrap">
@@ -39817,24 +40080,63 @@ function _buildTouchscreenHtml() {
   // widget can compute its layout before the first snapshot arrives.
   let _lastSnap = { sliders: [], buttons: [], keyboard: { present: false }, octaveShift: 0, playing: false };
 
-  // QWERTY → MIDI map (mirror of main's QWERTY_TO_MIDI). Used to lay
-  // out the touch keyboard with the right black-key positions.
-  const _QWERTY_TO_MIDI = {
-    "a": 60, "s": 62, "d": 64, "f": 65, "g": 67, "h": 69, "j": 71, "k": 72, "l": 74, ";": 76,
-    "w": 61, "e": 63, "t": 66, "y": 68, "u": 70, "o": 73, "p": 75
+  // Per-octave white-key MIDI offsets (C major: 0,2,4,5,7,9,11). Black
+  // keys (C#,D#,F#,G#,A#) sit between specific white pairs -- after
+  // white index 0,1,3,4,5 within each octave.
+  const _WHITE_PCS = [0, 2, 4, 5, 7, 9, 11];
+  const _BLACK_PCS = [1, 3, 6, 8, 10];
+  const _BLACK_AFTER_WHITE_IDX = { 1: 0, 3: 1, 6: 3, 8: 4, 10: 5 };
+  // QWERTY mirror so we can render the QWERTY letter on the matching
+  // keys when the popup's octave aligns with main's kbOctaveShift.
+  const _QWERTY_BY_MIDI_PC = {
+    0: "a", 2: "s", 4: "d", 5: "f", 7: "g", 9: "h", 11: "j",
+    1: "w", 3: "e", 6: "t", 8: "y", 10: "u"
   };
-  const _WHITE_KEYS = ["a","s","d","f","g","h","j","k","l",";"];
-  const _BLACK_KEYS = ["w","e","t","y","u","o","p"];
-  // Which white-key index each black key sits between. Layout matches
-  // the QWERTY-to-piano convention used in the main editor (W between
-  // A/S, E between S/D, no key between D/F, T between F/G, Y between
-  // G/H, U between H/J, no key between J/K, O between K/L, P between L/;).
-  const _BLACK_AFTER_WHITE = { "w": 0, "e": 1, "t": 3, "y": 4, "u": 5, "o": 7, "p": 8 };
+  const _QWERTY_BY_MIDI_PC_UPPER = {
+    0: "k", 2: "l", 4: ";",
+    1: "o", 3: "p"
+  };
 
   function _midiName(midi) {
     const NAMES = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
     const oct = Math.floor(midi / 12) - 1;
-    return NAMES[midi % 12] + oct;
+    return NAMES[((midi % 12) + 12) % 12] + oct;
+  }
+
+  // Octave count persisted across popup reloads via localStorage.
+  // Defaults to 2 octaves which fits comfortably on a typical
+  // touchscreen secondary monitor (iPad mini class).
+  function _loadKbOctaves() {
+    try {
+      const raw = parseInt(localStorage.getItem("gamma-touch-kb-octaves"), 10);
+      if (raw >= 1 && raw <= 6) return raw;
+    } catch (_) {}
+    return 2;
+  }
+  let _kbOctaves = _loadKbOctaves();
+  function _saveKbOctaves(n) {
+    _kbOctaves = Math.max(1, Math.min(6, n | 0));
+    try { localStorage.setItem("gamma-touch-kb-octaves", String(_kbOctaves)); } catch (_) {}
+  }
+
+  // Vertical height of the keyboard wrap (px). Persisted so the
+  // user's preferred size survives reload. Clamped to a band that
+  // keeps it usable on small touchscreens and avoids eating the
+  // sliders/buttons list above on tall ones (ctrl-list scrolls).
+  const _KB_HEIGHT_MIN = 140;
+  const _KB_HEIGHT_MAX = 700;
+  const _KB_HEIGHT_STEP = 60;
+  function _loadKbHeight() {
+    try {
+      const raw = parseInt(localStorage.getItem("gamma-touch-kb-height"), 10);
+      if (raw >= _KB_HEIGHT_MIN && raw <= _KB_HEIGHT_MAX) return raw;
+    } catch (_) {}
+    return 220;
+  }
+  let _kbHeight = _loadKbHeight();
+  function _saveKbHeight(px) {
+    _kbHeight = Math.max(_KB_HEIGHT_MIN, Math.min(_KB_HEIGHT_MAX, px | 0));
+    try { localStorage.setItem("gamma-touch-kb-height", String(_kbHeight)); } catch (_) {}
   }
 
   function renderControls(snap) {
@@ -39921,98 +40223,224 @@ function _buildTouchscreenHtml() {
     return row;
   }
 
+  /* Multi-octave touch keyboard. Layout:
+   *   Base MIDI = 60 (C4) + octaveShift (12 * shift-octaves from main editor)
+   *   Width = _kbOctaves * 7 white keys laid out across the full width.
+   *   Black keys absolutely positioned over the white-key gaps.
+   *
+   * Each key carries a data-midi attribute; we send MIDI note numbers
+   * over the channel so the popup can address ANY note on the keyboard,
+   * not just the ones in QWERTY_TO_MIDI. The main editor has a
+   * playKeyboardMidi() helper that mirrors playKeyboardNote but takes
+   * MIDI directly. QWERTY-mapped notes additionally show their letter
+   * on the key so the user can match what main's keyboard handles. */
   function _buildKeyboardWidget(octaveShift, playing) {
     const wrap = document.createElement("div");
     wrap.className = "ctrl-kb-wrap" + (playing ? "" : " disabled");
+    // Explicit vertical size, user-adjustable via the +/- height
+    // buttons. Drag-resize would be nicer but is finicky on touch.
+    wrap.style.flex   = "0 0 auto";
+    wrap.style.height = _kbHeight + "px";
 
     const toolbar = document.createElement("div");
     toolbar.className = "ctrl-kb-toolbar";
+    // Octave-shift label + buttons -- mirror main editor's Z/X.
     const octLabel = document.createElement("span");
-    octLabel.textContent = "octave " + (octaveShift === 0 ? "0" : (octaveShift > 0 ? "+" : "") + (octaveShift / 12));
+    octLabel.className = "label";
+    const shiftOct = (octaveShift === 0 ? "0" : (octaveShift > 0 ? "+" : "") + (octaveShift / 12));
+    octLabel.innerHTML = "octave <b>" + shiftOct + "</b>";
     const octDown = document.createElement("button");
-    octDown.className = "oct-btn"; octDown.textContent = "−12";
+    octDown.className = "oct-btn";
+    octDown.textContent = "−12";
     octDown.addEventListener("pointerdown", (ev) => {
       ev.preventDefault();
       ch.postMessage({ type: "control-octave", delta: -12 });
     });
     const octUp = document.createElement("button");
-    octUp.className = "oct-btn"; octUp.textContent = "+12";
+    octUp.className = "oct-btn";
+    octUp.textContent = "+12";
     octUp.addEventListener("pointerdown", (ev) => {
       ev.preventDefault();
       ch.postMessage({ type: "control-octave", delta: +12 });
     });
+
+    const spacer = document.createElement("span");
+    spacer.className = "spacer";
+
+    // Octave-count label + shrink/grow buttons. Drives how many
+    // octaves are visible; persisted to localStorage so the choice
+    // survives popup reload.
+    const octsLabel = document.createElement("span");
+    octsLabel.className = "label";
+    octsLabel.innerHTML = "range <b>" + _kbOctaves + "</b> oct";
+    const shrinkBtn = document.createElement("button");
+    shrinkBtn.className = "oct-btn";
+    shrinkBtn.textContent = "−";
+    shrinkBtn.disabled = (_kbOctaves <= 1);
+    shrinkBtn.addEventListener("pointerdown", (ev) => {
+      ev.preventDefault();
+      if (_kbOctaves <= 1) return;
+      _saveKbOctaves(_kbOctaves - 1);
+      renderControls(_lastSnap);
+    });
+    const growBtn = document.createElement("button");
+    growBtn.className = "oct-btn";
+    growBtn.textContent = "+";
+    growBtn.disabled = (_kbOctaves >= 6);
+    growBtn.addEventListener("pointerdown", (ev) => {
+      ev.preventDefault();
+      if (_kbOctaves >= 6) return;
+      _saveKbOctaves(_kbOctaves + 1);
+      renderControls(_lastSnap);
+    });
+
+    // Height (vertical) shrink/grow. Uses the same pattern as the
+    // octave-count buttons. Bumps in _KB_HEIGHT_STEP increments and
+    // re-renders so the change applies immediately.
+    const heightLabel = document.createElement("span");
+    heightLabel.className = "label";
+    heightLabel.innerHTML = "size <b>" + _kbHeight + "</b>px";
+    const heightDown = document.createElement("button");
+    heightDown.className = "oct-btn";
+    heightDown.textContent = "▼";
+    heightDown.title = "Shrink keyboard";
+    heightDown.disabled = (_kbHeight <= _KB_HEIGHT_MIN);
+    heightDown.addEventListener("pointerdown", (ev) => {
+      ev.preventDefault();
+      if (_kbHeight <= _KB_HEIGHT_MIN) return;
+      _saveKbHeight(_kbHeight - _KB_HEIGHT_STEP);
+      renderControls(_lastSnap);
+    });
+    const heightUp = document.createElement("button");
+    heightUp.className = "oct-btn";
+    heightUp.textContent = "▲";
+    heightUp.title = "Grow keyboard";
+    heightUp.disabled = (_kbHeight >= _KB_HEIGHT_MAX);
+    heightUp.addEventListener("pointerdown", (ev) => {
+      ev.preventDefault();
+      if (_kbHeight >= _KB_HEIGHT_MAX) return;
+      _saveKbHeight(_kbHeight + _KB_HEIGHT_STEP);
+      renderControls(_lastSnap);
+    });
+
     toolbar.appendChild(octLabel);
     toolbar.appendChild(octDown);
     toolbar.appendChild(octUp);
+    toolbar.appendChild(spacer);
+    toolbar.appendChild(octsLabel);
+    toolbar.appendChild(shrinkBtn);
+    toolbar.appendChild(growBtn);
+    toolbar.appendChild(heightLabel);
+    toolbar.appendChild(heightDown);
+    toolbar.appendChild(heightUp);
     wrap.appendChild(toolbar);
 
     const board = document.createElement("div");
     board.className = "ctrl-kb";
 
+    // Base MIDI -- where the leftmost C lands. main's kbOctaveShift
+    // shifts in 12-semitone steps so this stays whole-octave aligned.
+    const baseMidi = 60 + octaveShift;
+    const whiteCount = _kbOctaves * 7;
+    // QWERTY letters only apply to the kbOctaveShift octave's keys --
+    // outside that we leave the QWERTY letter blank. The main editor
+    // pins QWERTY to ONE octave (the kbOctaveShift one), so showing
+    // QWERTY letters on every octave would be misleading.
+    const qwertyOctaveIdx = 0; // base octave on the popup matches main's kbOctaveShift
+
     const whites = document.createElement("div");
     whites.className = "ctrl-kb-whites";
-    _WHITE_KEYS.forEach((k, i) => {
+    for (let i = 0; i < whiteCount; i++) {
+      const oct = (i / 7) | 0;
+      const pc = _WHITE_PCS[i % 7];
+      const midi = baseMidi + oct * 12 + pc;
       const key = document.createElement("button");
-      key.className = "ctrl-kb-key";
-      key.dataset.key = k;
-      const midi = _QWERTY_TO_MIDI[k] + octaveShift;
-      key.textContent = _midiName(midi);
+      key.className = "ctrl-kb-key" + (pc === 0 ? " c-marker" : "");
+      key.dataset.midi = String(midi);
+      // C keys show their note name (orientation cue). Others show
+      // QWERTY letter if applicable, else nothing.
+      let label = "";
+      if (pc === 0) {
+        label = _midiName(midi);
+      } else if (oct === qwertyOctaveIdx && _QWERTY_BY_MIDI_PC[pc]) {
+        label = _QWERTY_BY_MIDI_PC[pc].toUpperCase();
+      } else if (oct === qwertyOctaveIdx + 1 && _QWERTY_BY_MIDI_PC_UPPER[pc]) {
+        label = _QWERTY_BY_MIDI_PC_UPPER[pc].toUpperCase();
+      }
+      key.textContent = label;
       whites.appendChild(key);
-    });
+    }
     board.appendChild(whites);
 
-    _BLACK_KEYS.forEach(k => {
-      const afterWhiteIdx = _BLACK_AFTER_WHITE[k];
-      if (afterWhiteIdx == null) return;
-      // Center on the gap between two white keys. 10 white keys
-      // total, so each is 10%; we position the black key at the
-      // boundary minus half its 8% width.
-      const leftPct = (afterWhiteIdx + 1) * 10 - 4;
-      const key = document.createElement("button");
-      key.className = "ctrl-kb-black";
-      key.dataset.key = k;
-      key.style.left = leftPct + "%";
-      key.textContent = k.toUpperCase();
-      board.appendChild(key);
-    });
+    // Black keys: position by relative offset into the strip.
+    // Each white key is (100 / whiteCount)% wide; black key sits
+    // centered on the gap between white index 'idx' and 'idx+1',
+    // with width slightly less than one white.
+    const blackWidthPct = (100 / whiteCount) * 0.65;
+    for (let oct = 0; oct < _kbOctaves; oct++) {
+      _BLACK_PCS.forEach(pc => {
+        const afterIdx = _BLACK_AFTER_WHITE_IDX[pc] + oct * 7;
+        const midi = baseMidi + oct * 12 + pc;
+        const key = document.createElement("button");
+        key.className = "ctrl-kb-black";
+        key.dataset.midi = String(midi);
+        // Center on white-key boundary.
+        const centerPct = (afterIdx + 1) * (100 / whiteCount);
+        key.style.left  = (centerPct - blackWidthPct / 2) + "%";
+        key.style.width = blackWidthPct + "%";
+        if (oct === qwertyOctaveIdx && _QWERTY_BY_MIDI_PC[pc]) {
+          key.textContent = _QWERTY_BY_MIDI_PC[pc].toUpperCase();
+        } else if (oct === qwertyOctaveIdx + 1 && _QWERTY_BY_MIDI_PC_UPPER[pc]) {
+          key.textContent = _QWERTY_BY_MIDI_PC_UPPER[pc].toUpperCase();
+        } else {
+          key.textContent = "";
+        }
+        board.appendChild(key);
+      });
+    }
 
-    // Pointer routing: a single set of pointer listeners on the board
-    // so dragging across keys (glissando) works without per-key state.
-    // pointerdown/move use elementFromPoint -- on touch the original
-    // e.target is the pointerdown element for the whole gesture, so
-    // we need the dynamic hit-test to follow the finger.
-    const held = new Set();
+    // Pointer routing: single set of listeners on the board (vs per-
+    // key) so dragging across keys (glissando) works without state
+    // per key. Uses elementFromPoint each move because on touch,
+    // pointerup's e.target is the pointerdown element for the whole
+    // gesture -- see touch-implicit-capture memo.
+    const held = new Set(); // MIDI numbers currently held
     function _keyAt(ev) {
       const el = document.elementFromPoint(ev.clientX, ev.clientY);
-      if (!el || !el.dataset || !el.dataset.key) return null;
-      // Only count keys that belong to THIS board (in case the popup
-      // grows more keyboards later).
+      if (!el || !el.dataset || !el.dataset.midi) return null;
       if (!board.contains(el)) return null;
       return el;
     }
     function _press(el) {
       if (!el) return;
-      const k = el.dataset.key;
-      if (held.has(k)) return;
-      held.add(k);
+      const midi = Number(el.dataset.midi);
+      if (held.has(midi)) return;
+      held.add(midi);
       el.classList.add("held");
-      ch.postMessage({ type: "control-key-down", key: k });
-    }
-    function _release(el) {
-      if (!el) return;
-      const k = el.dataset.key;
-      if (!held.has(k)) return;
-      held.delete(k);
-      el.classList.remove("held");
-      ch.postMessage({ type: "control-key-up", key: k });
+      ch.postMessage({ type: "control-key-down", midi });
     }
     function _releaseAll() {
-      held.forEach(k => {
-        const el = board.querySelector('[data-key="' + (k === ";" ? "\\;" : k) + '"]');
+      held.forEach(midi => {
+        const el = board.querySelector('[data-midi="' + midi + '"]');
         if (el) el.classList.remove("held");
-        ch.postMessage({ type: "control-key-up", key: k });
+        ch.postMessage({ type: "control-key-up", midi });
       });
       held.clear();
+    }
+    function _swapTo(newEl) {
+      if (!newEl) return;
+      const midi = Number(newEl.dataset.midi);
+      if (held.has(midi)) return;
+      // Release the prior key (glissando: only one note at a time per
+      // gesture -- monophonic). If you want polyphony, drop the
+      // _releaseAll and just _press the new key.
+      held.forEach(prev => {
+        const prevEl = board.querySelector('[data-midi="' + prev + '"]');
+        if (prevEl) prevEl.classList.remove("held");
+        ch.postMessage({ type: "control-key-up", midi: prev });
+      });
+      held.clear();
+      _press(newEl);
     }
     board.addEventListener("pointerdown", (ev) => {
       ev.preventDefault();
@@ -40021,20 +40449,7 @@ function _buildTouchscreenHtml() {
     });
     board.addEventListener("pointermove", (ev) => {
       if (!held.size) return;
-      // Glissando: if finger moves to a new key, release old + press new.
-      const el = _keyAt(ev);
-      if (!el) return;
-      const k = el.dataset.key;
-      if (!held.has(k)) {
-        // Find which key the user was on and release it
-        held.forEach(oldK => {
-          const oldEl = board.querySelector('[data-key="' + (oldK === ";" ? "\\;" : oldK) + '"]');
-          if (oldEl) oldEl.classList.remove("held");
-          ch.postMessage({ type: "control-key-up", key: oldK });
-        });
-        held.clear();
-        _press(el);
-      }
+      _swapTo(_keyAt(ev));
     });
     board.addEventListener("pointerup",     () => _releaseAll());
     board.addEventListener("pointercancel", () => _releaseAll());
@@ -58322,6 +58737,52 @@ function playKeyboardNote(qwertyKey) {
 function freqToMidi(hz) {
   if (!hz || !isFinite(hz) || hz <= 0) return 0;
   return Math.round(69 + 12 * Math.log2(hz / 440));
+}
+
+/* Sprint 5.handwriting-multimonitor -- MIDI-direct play/release for
+ * the touchscreen popup's multi-octave keyboard. playKeyboardNote
+ * is QWERTY-keyed (and only handles the one octave QWERTY_TO_MIDI
+ * spans); the touch keyboard can reach any MIDI note. Same audio
+ * path otherwise: write freq to KeyboardIn.setFreq, fire all press
+ * gates (release fires the rel gates). Also highlights the on-
+ * screen piano key if the MIDI value happens to land in the visible
+ * QWERTY-mapped octave -- otherwise no highlight, since the main
+ * piano widget only renders that octave. */
+function playKeyboardMidi(midi) {
+  if (!previewState.workletNode || previewState.state !== "playing") return false;
+  const kbIdx = findKeyboardSetterIndex();
+  if (kbIdx < 0) return false;
+  const freq = midiToFreq(midi);
+  previewState.workletNode.port.postMessage({ type: "set", index: kbIdx, value: freq });
+  listGateSetterIndices("press").forEach(i => {
+    previewState.workletNode.port.postMessage({ type: "set", index: i, value: 0 });
+  });
+  // If the MIDI value maps to a visible QWERTY key (under the
+  // current octave shift), light it up so the user sees their
+  // touchscreen press on main's piano too.
+  const qk = midiToQwertyAt(midi);
+  if (qk) highlightPianoKey(qk, true);
+  updatePianoReadout(midi, freq);
+  return true;
+}
+function releaseKeyboardMidi(midi) {
+  if (previewState.workletNode && previewState.state === "playing") {
+    listGateSetterIndices("release").forEach(i => {
+      previewState.workletNode.port.postMessage({ type: "set", index: i, value: 0 });
+    });
+  }
+  const qk = midiToQwertyAt(midi);
+  if (qk) highlightPianoKey(qk, false);
+}
+// Reverse-lookup: which QWERTY letter maps to this MIDI note (with
+// the current octave shift applied)? Returns null if outside the
+// QWERTY-mapped range. Used to highlight main's piano widget for
+// touchscreen-initiated notes that land in the visible octave.
+function midiToQwertyAt(midi) {
+  for (const k in QWERTY_TO_MIDI) {
+    if ((QWERTY_TO_MIDI[k] + kbOctaveShift) === midi) return k;
+  }
+  return null;
 }
 function releaseKeyboardNote(qwertyKey) {
   if (!(qwertyKey in QWERTY_TO_MIDI)) return;
