@@ -39827,12 +39827,23 @@ async function getTesseract() {
         }
       }
     });
-    // Restrict the recognized character set + treat the image as a
-    // single short word — both nudge tesseract toward better accuracy
-    // on short labels like "AD", "Sine", "LFO".
+    // Restrict the recognized character set + treat the image as
+    // a single text line. Whitelist nudges tesseract toward better
+    // accuracy on short labels like "AD", "Sine", "LFO" by
+    // disqualifying ambiguous glyph picks. The `|` + `>` are
+    // included so chain-separator syntax like "sine | AD" gets
+    // through OCR; the chain handler in tryCreateFromLabel splits
+    // on them.
+    //
+    // 5.handwriting-chain -- PSM_SINGLE_LINE (7) instead of
+    // PSM_SINGLE_WORD (8). Single-word mode treats the entire image
+    // as one token + drops separator characters; single-line
+    // preserves spaces + punctuation, which we need for the chain.
+    // Short single-word labels still recognize fine (PSM 7 doesn't
+    // require multi-word input).
     await w.setParameters({
-      tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
-      tessedit_pageseg_mode: "8"   // PSM_SINGLE_WORD
+      tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789|>",
+      tessedit_pageseg_mode: "7"   // PSM_SINGLE_LINE
     });
     tesseractWorker = w;
     return w;
@@ -40023,6 +40034,86 @@ function levenshtein(a, b) {
   return prev[b.length];
 }
 
+/* Sprint 5.handwriting-chain -- spawn one node per token from a
+ * pipe-separated handwriting label (e.g. "sine | AD" -> two
+ * nodes). Each token recurses through tryCreateFromLabel with
+ * silent=true; if ALL tokens match a node type, they spawn side-
+ * by-side. If any token fails, nothing spawns -- partial chains
+ * are confusing for the user.
+ *
+ * Auto-wiring (output of N -> input of N+1) is deliberately
+ * NOT done here; lands in a follow-up sprint so the smart-link
+ * design can be considered across handwriting, drag-drop, and
+ * multi-select-then-connect entry points uniformly. */
+function _tryCreateChain(parts, box, silent) {
+  // Per-token horizontal offset between the spawned nodes. Larger
+  // than the typical node width so they don't overlap; small
+  // enough that 3-4 nodes fit in a normal viewport.
+  const HORIZ_GAP = 200;
+  const matches = [];
+  // Test-spawn first to catch any unmatched token BEFORE we commit
+  // to spawning anything. Per-token recursion happens twice (once
+  // to validate, once to spawn) -- cheap, no GPU work, just TYPES
+  // lookup + string matching.
+  const dryRun = parts.map(part => {
+    const def = _matchTypeName(part);
+    return def;
+  });
+  if (dryRun.some(d => !d)) {
+    const bad = parts[dryRun.findIndex(d => !d)];
+    if (!silent) setVoiceStatus("Chain: \"" + bad + "\" didn't match any node type", "err");
+    return null;
+  }
+  // All good -- spawn each at an offset and accumulate the names.
+  pushHistory("hwr:add-chain");
+  let lastId = null;
+  for (let i = 0; i < parts.length; i++) {
+    const subBox = { x: box.x + i * HORIZ_GAP, y: box.y, w: box.w, h: box.h };
+    const m = tryCreateFromLabel(parts[i], subBox, /*silent*/ true);
+    if (!m) {
+      // Should be unreachable (dry run passed) but stay defensive.
+      if (!silent) setVoiceStatus("Chain: \"" + parts[i] + "\" failed on second pass", "err");
+      return null;
+    }
+    matches.push(m);
+    lastId = state.nodes[state.nodes.length - 1] && state.nodes[state.nodes.length - 1].id;
+  }
+  if (lastId) selectOne(lastId);
+  render();
+  return matches.join(" + ");
+}
+
+/* Sprint 5.handwriting-chain -- pre-flight TYPES match for the
+ * chain handler. Mirrors the matching steps in tryCreateFromLabel
+ * (exact -> case-insensitive -> prefix -> substring -> Levenshtein
+ * fuzzy) but without the side effect of spawning a node. Used to
+ * validate every token in a chain matches BEFORE committing to
+ * spawn any of them. */
+function _matchTypeName(rawToken) {
+  const types = Object.keys(TYPES);
+  const clean = String(rawToken || "")
+    .replace(/[`*_~"'.,:;!?()\[\]\n]/g, "")
+    .replace(/[^A-Za-z0-9]/g, "")
+    .trim();
+  if (!clean) return null;
+  const lc = clean.toLowerCase();
+  let match = types.find(t => t === clean)
+           || types.find(t => t.toLowerCase() === lc)
+           || types.find(t => t.toLowerCase().startsWith(lc) && lc.length >= 3)
+           || types.find(t => t.toLowerCase().includes(lc) && lc.length >= 3);
+  if (!match && clean.length >= 3) {
+    const tol = Math.max(1, Math.ceil(clean.length / 3));
+    let best = null, bestDist = tol + 1;
+    for (const t of types) {
+      if (Math.abs(t.length - clean.length) > tol) continue;
+      const d = levenshtein(lc, t.toLowerCase());
+      if (d < bestDist) { bestDist = d; best = t; }
+    }
+    if (best) match = best;
+  }
+  return match || null;
+}
+
 function tryCreateFromLabel(rawLabel, box, silent) {
   // The model may return more than one word, with whitespace, periods,
   // markdown bullets, "node:" prefixes, etc. Extract candidate tokens
@@ -40048,6 +40139,26 @@ function tryCreateFromLabel(rawLabel, box, silent) {
     .replace(/^[\s\-•*]*```[a-z]*\s*/i, "")
     .replace(/```\s*$/i, "")
     .trim();
+
+  // Sprint 5.handwriting-chain -- chain-separator syntax. The user
+  // writes "sine | AD" (or "sine > AD", or "sine → AD") to spawn
+  // BOTH nodes side-by-side AND auto-wire them in sequence.
+  // Pipe is the canonical separator; > matches OCR misreads + the
+  // common arrow shorthand; → is what AI-vision providers return
+  // for the unicode arrow. Whitespace around the separator is
+  // optional so "sine|AD" works too. A two-or-more-part split
+  // dispatches to the chain handler; a single segment falls
+  // through to the existing single-node path.
+  if (/[|→>]/.test(preStripped)) {
+    const parts = preStripped
+      .split(/\s*[|→>]\s*/)
+      .map(s => s.trim())
+      .filter(Boolean);
+    if (parts.length >= 2) {
+      return _tryCreateChain(parts, box, silent);
+    }
+  }
+
   const cleanedFull = preStripped.replace(/[`*_~"'.,:;!?()\[\]\n]/g, " ").trim();
   if (/^\s*UNKNOWN\s*$/i.test(cleanedFull) || !cleanedFull) {
     if (!silent) setVoiceStatus(`Recognizer didn't identify a node type — got “${rawLabel.trim().slice(0,40)}”. Try writing larger / more clearly.`, "err");
