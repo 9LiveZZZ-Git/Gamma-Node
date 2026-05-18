@@ -39216,6 +39216,16 @@ function _ensureTouchChannel() {
       _handleTouchInkImage(msg);
     } else if (msg.type === "pong") {
       console.log("[touchscreen] popup is alive");
+      // Pop the current box state to the popup so its banner doesn't
+      // start in the wrong state (e.g. main has a box drawn already
+      // when the user opens the popup mid-session).
+      try {
+        if (inkBox && inkBox.w >= 30 && inkBox.h >= 24) {
+          _touchChannel.postMessage({ type: "box-update", w: inkBox.w, h: inkBox.h });
+        } else {
+          _touchChannel.postMessage({ type: "box-clear" });
+        }
+      } catch (_) {}
     }
   };
   return _touchChannel;
@@ -39231,24 +39241,29 @@ async function _handleTouchInkImage(msg) {
   // Convert dataUrl to base64 (existing helpers expect both).
   const dataUrl = msg.dataUrl;
   const base64  = dataUrl.split(",")[1] || "";
-  // Synthesize a placement box at the visible-canvas center.
-  // screenToWorld accepts CLIENT (viewport-relative) coords, so we
-  // use getBoundingClientRect() to convert the canvas-local center
-  // to viewport coords first. With the canvas pan/zoom applied,
-  // this lands the new node where the user is currently looking
-  // instead of at world origin.
-  const cr  = canvas.getBoundingClientRect();
-  const cx  = cr.left + cr.width  / 2;
-  const cy  = cr.top  + cr.height / 2;
-  const w   = 240, h = 140;
-  let worldX = cx - w / 2, worldY = cy - h / 2;
-  try {
-    if (typeof screenToWorld === "function") {
-      const wp = screenToWorld(cx, cy);
-      worldX = wp.x - w / 2; worldY = wp.y - h / 2;
-    }
-  } catch (_) {}
-  const box = { x: worldX, y: worldY, w, h };
+  // Placement target: prefer the box the user drew on the main
+  // canvas (so the touchscreen is just an alternative INPUT surface
+  // for the SAME box). If no box is drawn, fall back to a synthesized
+  // viewport-center box so we still spawn SOMETHING -- useful when
+  // the user is purely touchscreen-driven and never touched the main
+  // canvas's ✎ tool.
+  let box;
+  if (inkBox && inkBox.w >= 30 && inkBox.h >= 24) {
+    box = { x: inkBox.x, y: inkBox.y, w: inkBox.w, h: inkBox.h };
+  } else {
+    const cr  = canvas.getBoundingClientRect();
+    const cx  = cr.left + cr.width  / 2;
+    const cy  = cr.top  + cr.height / 2;
+    const w   = 240, h = 140;
+    let worldX = cx - w / 2, worldY = cy - h / 2;
+    try {
+      if (typeof screenToWorld === "function") {
+        const wp = screenToWorld(cx, cy);
+        worldX = wp.x - w / 2; worldY = wp.y - h / 2;
+      }
+    } catch (_) {}
+    box = { x: worldX, y: worldY, w, h };
+  }
 
   const ackTo = (ok, note) => {
     if (_touchChannel) _touchChannel.postMessage({ type: "ink-ack", ok, note });
@@ -39279,6 +39294,9 @@ async function _handleTouchInkImage(msg) {
     setVoiceStatus("✓ touchscreen → " + matched, "");
     setTimeout(() => setVoiceStatus("", ""), 2000);
     ackTo(true, matched);
+    // Successful spawn -- dismiss the box on the main canvas (also
+    // broadcasts box-clear to the popup, which resets its status).
+    if (inkBox) clearInk();
     render();
   } else {
     setVoiceStatus("No match: \"" + (lastReply || "").trim().slice(0, 30) + "\"", "err");
@@ -39333,6 +39351,41 @@ function _buildTouchscreenHtml() {
   .panel.active { display: flex; }
   .ink-wrap { flex: 1; position: relative; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; min-height: 0; }
   #ink-canvas { width: 100%; height: 100%; display: block; touch-action: none; cursor: crosshair; }
+  /* Baseline guide -- a dashed horizontal line at 70% canvas height
+     so users have something to write ON. Pointer-events: none so
+     it doesn't intercept touch events. Pure visual aid; not
+     included in the OCR render (offscreen canvas redraw doesn't
+     reference this overlay). */
+  .baseline {
+    position: absolute;
+    left: 6%; right: 6%;
+    top: 70%;
+    height: 0;
+    border-top: 1px dashed rgba(140, 150, 170, 0.45);
+    pointer-events: none;
+  }
+  .baseline-cap {
+    position: absolute;
+    width: 6px; height: 6px;
+    background: rgba(140, 150, 170, 0.5);
+    border-radius: 50%;
+    top: -3.5px;
+  }
+  .baseline-cap.l { left: -3px; }
+  .baseline-cap.r { right: -3px; }
+  .box-banner {
+    position: absolute;
+    top: 8px; left: 50%; transform: translateX(-50%);
+    padding: 6px 12px;
+    background: rgba(8, 11, 16, 0.85);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-2);
+    font-size: 12px;
+    pointer-events: none;
+    display: none;
+  }
+  .box-banner.has-box { border-color: var(--accent); color: var(--accent); }
   .actions { display: flex; gap: 8px; align-items: center; }
   .btn { padding: 14px 22px; font-size: 16px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text); cursor: pointer; }
   .btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 500; }
@@ -39353,7 +39406,11 @@ function _buildTouchscreenHtml() {
   <button class="tab" data-tab="ctrl">⚙ Controls</button>
 </div>
 <div class="panel active" data-panel="hw">
-  <div class="ink-wrap"><canvas id="ink-canvas"></canvas></div>
+  <div class="ink-wrap">
+    <canvas id="ink-canvas"></canvas>
+    <div class="baseline"><span class="baseline-cap l"></span><span class="baseline-cap r"></span></div>
+    <div class="box-banner" id="box-banner">no box drawn on main canvas yet</div>
+  </div>
   <div class="actions">
     <div class="status" id="status"><span class="conn-pip" id="conn-pip"></span>connecting…</div>
     <button class="btn" id="btn-clear">↻ Clear</button>
@@ -39470,6 +39527,22 @@ function _buildTouchscreenHtml() {
     });
   });
 
+  const banner = document.getElementById("box-banner");
+  let hasBox = false;
+  function setBoxState(boxMsg) {
+    if (boxMsg && typeof boxMsg.w === "number" && typeof boxMsg.h === "number") {
+      hasBox = true;
+      banner.textContent = "box ready — " + Math.round(boxMsg.w) + "×" + Math.round(boxMsg.h) + " · write here";
+      banner.classList.add("has-box");
+      banner.style.display = "block";
+    } else {
+      hasBox = false;
+      banner.textContent = "no box on main canvas — draw one with the ✎ tool (D)";
+      banner.classList.remove("has-box");
+      banner.style.display = "block";
+    }
+  }
+
   // Main -> popup messages.
   ch.onmessage = (ev) => {
     const msg = ev.data || {};
@@ -39481,6 +39554,10 @@ function _buildTouchscreenHtml() {
       } else {
         setStatus("✗ " + (msg.note || "recognize failed"), "err");
       }
+    } else if (msg.type === "box-update") {
+      setBoxState(msg);
+    } else if (msg.type === "box-clear") {
+      setBoxState(null);
     } else if (msg.type === "ping") {
       ch.postMessage({ type: "pong" });
     }
@@ -39488,7 +39565,8 @@ function _buildTouchscreenHtml() {
 
   // Heartbeat to main so it knows we're alive.
   ch.postMessage({ type: "pong" });
-  setStatus("Connected — write into the canvas, then ✓ Recognize", "ok");
+  setStatus("Connected — write a node name above the line, then ✓ Recognize", "ok");
+  setBoxState(null);
   requestAnimationFrame(resizeCanvas);
 })();
 <\/script>
@@ -39503,6 +39581,11 @@ function clearInk() {
   boxStart = null;
   inkFinalize.style.display = "none";
   renderInk();
+  // Sprint 5.handwriting-multimonitor -- tell any open touchscreen
+  // popup the box is gone, so it can show "draw a box first" status.
+  if (_touchChannel) {
+    try { _touchChannel.postMessage({ type: "box-clear" }); } catch (_) {}
+  }
 }
 
 function renderInk() {
@@ -39585,6 +39668,18 @@ ink.addEventListener("pointerup", e => {
       clearInk();
     } else {
       renderInk();
+      // Sprint 5.handwriting-multimonitor -- broadcast the drawn box
+      // to any open touchscreen popup. The popup's status line
+      // updates to "Box ready — write here" so the user knows the
+      // touchscreen surface is now bound to a real placement target.
+      if (_touchChannel) {
+        try {
+          _touchChannel.postMessage({
+            type: "box-update",
+            w: inkBox.w, h: inkBox.h
+          });
+        } catch (_) {}
+      }
     }
   } else if (inkCurrent) {
     if (inkCurrent.length > 1) inkStrokes.push(inkCurrent);
