@@ -10954,9 +10954,9 @@ public:
     },
     methods: {},
     paramOptions: {
-      preset: ["iridescent", "plasma", "scanlines", "fresnelEdge", "texture"]
+      preset: ["iridescent", "plasma", "scanlines", "fresnelEdge", "texture", "texture-triplanar"]
     },
-    description: "Custom WGSL surface material. preset picks one of five built-in shader bodies (iridescent / plasma / scanlines / fresnelEdge / texture). For most presets r/g/b is the tint, time advances animation (wire MasterClock.phase × 2π), freq scales density, intensity scales effect strength. The 'texture' preset wraps any upstream visual node's output (StarNest / Voronoi / MatrixRain / ShapeTunnel / Plasma / etc.) onto the mesh via spherical projection -- wire the visual's `out` port into ShaderMat's `texture` input. Plan walker auto-schedules the upstream into a scratch slot before the Scene's pass; the texture is sampled with linear filtering. freq tiles the UV (1 = single wrap; 2 = two wraps); r/g/b tints multiplicatively; intensity scales brightness."
+    description: "Custom WGSL surface material. preset picks one of six built-in shader bodies. For most presets r/g/b is the tint, time advances animation (wire MasterClock.phase × 2π), freq scales density, intensity scales effect strength. The 'texture' preset wraps any upstream visual node's output (StarNest / Voronoi / MatrixRain / ShapeTunnel / Plasma / etc.) onto the mesh via per-vertex UVs -- wire the visual's `out` port into ShaderMat's `texture` input. 'texture-triplanar' (Phase 7 §5.5.c-2) is the same idea but projects via three world-axis planes blended by the surface normal -- the standard solve for surfaces where regular UVs stretch (cliffs on a Terrain mesh, sculpted shapes); freq reinterpreted as world scale (smaller = larger features; ~0.05 for terrain), time reinterpreted as triplanar sharpness (4 default; raise for harder axis-aligned, lower for softer cross-blending). Plan walker auto-schedules the upstream into a scratch slot before the Scene's pass; the texture is sampled with linear filtering."
   },
 
   /* Phase 7 §5.5.c — TerrainMaterial. Altitude- and slope-blended
@@ -49941,6 +49941,46 @@ fn dir_to_equirect_uv(dir: vec3<f32>) -> vec2<f32> {
   return vec2<f32>(u, v);
 }
 
+// Phase 7 §5.5.c-2 -- triplanar projection helpers. The standard
+// solve for texturing surfaces where regular UVs stretch (cliffs
+// on a terrain heightmap, organic / sculpted meshes, etc.). The
+// idea: sample the texture three times -- once for each world-
+// axis projection (XY / XZ / ZY plane) -- and blend by the
+// squared normal components. Faces aligned with each axis pick
+// up that axis's sample.
+//
+//   triplanar_weights(n, k) -- pure weight computation. k=4 typical
+//                              (sharper = each axis dominates more
+//                              on faces aligned with it; k=2 is
+//                              softer / more blended).
+//   triplanar_sample_array  -- sample a texture_2d_array<f32>
+//                              (the editor's scratch texture is
+//                              one of these) at a specific layer.
+//                              Use this from ShaderMat presets or
+//                              future mesh materials that consume
+//                              upstream visual outputs.
+fn triplanar_weights(normal: vec3<f32>, sharpness: f32) -> vec3<f32> {
+  let blend = pow(abs(normal), vec3<f32>(max(sharpness, 0.001)));
+  let sum   = max(blend.x + blend.y + blend.z, 0.0001);
+  return blend / sum;
+}
+
+fn triplanar_sample_array(tex: texture_2d_array<f32>, samp: sampler,
+                          layer: u32, worldPos: vec3<f32>,
+                          normal: vec3<f32>, scale: f32,
+                          sharpness: f32) -> vec4<f32> {
+  let w = triplanar_weights(normal, sharpness);
+  // Per-axis plane projection: X-axis face samples ZY, Y-axis face
+  // samples XZ (top-down), Z-axis face samples XY.
+  let uvX = fract(worldPos.zy * scale);
+  let uvY = fract(worldPos.xz * scale);
+  let uvZ = fract(worldPos.xy * scale);
+  let cX = textureSampleLevel(tex, samp, uvX, layer, 0.0);
+  let cY = textureSampleLevel(tex, samp, uvY, layer, 0.0);
+  let cZ = textureSampleLevel(tex, samp, uvZ, layer, 0.0);
+  return cX * w.x + cY * w.y + cZ * w.z;
+}
+
 struct VsIn  {
   @location(0) pos:    vec3<f32>,
   @location(1) color:  vec3<f32>,
@@ -50363,6 +50403,31 @@ fn surface_shade(s: SurfaceIn) -> vec3<f32> {
   let tile  = max(0.001, uD.matParams.y);
   let uv    = fract(s.uv * tile);
   let tex   = textureSampleLevel(srcTexture, srcSampler, uv, layer, 0.0);
+  return tex.rgb * uD.baseColor.rgb * uD.matParams.z;
+}
+`,
+
+  /* Phase 7 §5.5.c-2 -- triplanar variant of the texture preset.
+   * Skips per-vertex UVs entirely; instead projects the upstream
+   * texture onto three world-axis planes (XY / XZ / ZY) and blends
+   * by the squared normal so each face picks up its aligned plane.
+   * The classic solve for procedurally-textured terrain (where
+   * vertex UVs stretch on cliffs) and any other mesh where UV
+   * unwrapping would be awkward. Wire ProceduralTerrain.out (or
+   * any visual node) into ShaderMat.texture; pick this preset.
+   * matParams.y = scale (world units per texture wrap; 0.05 ≈
+   * 20m per repeat is sensible for terrain); matParams.x reused
+   * as sharpness (4 default; 1..8 useful range -- higher = more
+   * axis-aligned, lower = softer cross-blending). */
+  "texture-triplanar": `
+fn surface_shade(s: SurfaceIn) -> vec3<f32> {
+  let layer     = u32(max(0.0, uD.matParams.w));
+  let scale     = max(0.0001, uD.matParams.y);
+  let sharpness = max(0.5, uD.matParams.x);
+  let tex = triplanar_sample_array(srcTexture, srcSampler,
+                                    layer, s.worldPos,
+                                    normalize(s.normal),
+                                    scale, sharpness);
   return tex.rgb * uD.baseColor.rgb * uD.matParams.z;
 }
 `
