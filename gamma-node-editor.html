@@ -40038,49 +40038,123 @@ function levenshtein(a, b) {
  * pipe-separated handwriting label (e.g. "sine | AD" -> two
  * nodes). Each token recurses through tryCreateFromLabel with
  * silent=true; if ALL tokens match a node type, they spawn side-
- * by-side. If any token fails, nothing spawns -- partial chains
- * are confusing for the user.
- *
- * Auto-wiring (output of N -> input of N+1) is deliberately
- * NOT done here; lands in a follow-up sprint so the smart-link
- * design can be considered across handwriting, drag-drop, and
- * multi-select-then-connect entry points uniformly. */
+ * by-side AND auto-wire (output of N -> first compatible input
+ * of N+1). If any token fails, nothing spawns -- partial chains
+ * are confusing. */
 function _tryCreateChain(parts, box, silent) {
   // Per-token horizontal offset between the spawned nodes. Larger
   // than the typical node width so they don't overlap; small
   // enough that 3-4 nodes fit in a normal viewport.
   const HORIZ_GAP = 200;
   const matches = [];
+  const ids = [];
   // Test-spawn first to catch any unmatched token BEFORE we commit
   // to spawning anything. Per-token recursion happens twice (once
   // to validate, once to spawn) -- cheap, no GPU work, just TYPES
   // lookup + string matching.
-  const dryRun = parts.map(part => {
-    const def = _matchTypeName(part);
-    return def;
-  });
+  const dryRun = parts.map(part => _matchTypeName(part));
   if (dryRun.some(d => !d)) {
     const bad = parts[dryRun.findIndex(d => !d)];
     if (!silent) setVoiceStatus("Chain: \"" + bad + "\" didn't match any node type", "err");
     return null;
   }
-  // All good -- spawn each at an offset and accumulate the names.
+  // All good -- spawn each at an offset and collect ids for wiring.
   pushHistory("hwr:add-chain");
-  let lastId = null;
   for (let i = 0; i < parts.length; i++) {
     const subBox = { x: box.x + i * HORIZ_GAP, y: box.y, w: box.w, h: box.h };
+    const before = state.nodes.length;
     const m = tryCreateFromLabel(parts[i], subBox, /*silent*/ true);
     if (!m) {
-      // Should be unreachable (dry run passed) but stay defensive.
       if (!silent) setVoiceStatus("Chain: \"" + parts[i] + "\" failed on second pass", "err");
       return null;
     }
     matches.push(m);
-    lastId = state.nodes[state.nodes.length - 1] && state.nodes[state.nodes.length - 1].id;
+    // Capture every node just appended (usually one, but stay
+    // defensive in case a token expands via some future path).
+    for (let k = before; k < state.nodes.length; k++) {
+      ids.push(state.nodes[k].id);
+    }
   }
-  if (lastId) selectOne(lastId);
+  // Auto-wire adjacent pairs.
+  const wiredCount = _autoWireSequential(ids);
+  if (ids.length) selectOne(ids[ids.length - 1]);
   render();
-  return matches.join(" + ");
+  const sep = (wiredCount > 0) ? " → " : " + ";
+  return matches.join(sep);
+}
+
+/* Sprint 5.smart-link -- the first shared piece of smart-linking
+ * infra. Given an array of node IDs in left-to-right order, walks
+ * adjacent pairs and creates one edge per pair: from the first
+ * unwired output of the left node to the first compatible unwired
+ * input of the right node. Returns the count of edges actually
+ * added so callers can adjust their status message.
+ *
+ * Match priority:
+ *   1. Exact type match (audio -> audio, gate -> gate, mesh ->
+ *      mesh, camera -> camera, etc.). Picks the "obvious"
+ *      connection first -- a sine into a filter lands on the
+ *      filter's audio input, NOT on its freq param.
+ *   2. Cross-signal compatibility via portsCompatible. Catches
+ *      audio -> param, audio -> gate, clock -> param, etc. when
+ *      no exact-type pair is available.
+ *
+ * Skips inputs that are already wired so it doesn't stomp manual
+ * edges. Visual-type ports (mesh / camera / light / texture /
+ * environment / transform) are strict-same-type per the editor's
+ * existing connection legality rules, so they fall through Pass 1
+ * naturally without needing special-case logic.
+ *
+ * Reused by handwriting chains (this sprint), multi-select auto-
+ * connect (next), and the AI patch-completion button (later). */
+function _autoWireSequential(nodeIds) {
+  if (!Array.isArray(nodeIds) || nodeIds.length < 2) return 0;
+  if (!Array.isArray(state.edges)) state.edges = [];
+  let added = 0;
+  const inputIsWired = (nodeId, portName) =>
+    state.edges.some(e =>
+      e && e.to && e.to.node === nodeId && e.to.port === portName);
+  for (let i = 0; i + 1 < nodeIds.length; i++) {
+    const src = state.nodes.find(n => n && n.id === nodeIds[i]);
+    const dst = state.nodes.find(n => n && n.id === nodeIds[i + 1]);
+    if (!src || !dst) continue;
+    const srcDef = TYPES[src.type];
+    const dstDef = TYPES[dst.type];
+    if (!srcDef || !dstDef) continue;
+    const souts = Array.isArray(srcDef.outs) ? srcDef.outs : [];
+    const dins  = Array.isArray(dstDef.ins)  ? dstDef.ins  : [];
+    let edge = null;
+    // Pass 1: exact-type match.
+    for (const sout of souts) {
+      for (const din of dins) {
+        if (sout.t === din.t && !inputIsWired(dst.id, din.n)) {
+          edge = { fromPort: sout.n, toPort: din.n };
+          break;
+        }
+      }
+      if (edge) break;
+    }
+    // Pass 2: cross-signal compatibility (audio -> param etc.).
+    if (!edge) {
+      for (const sout of souts) {
+        for (const din of dins) {
+          if (portsCompatible(sout.t, din.t) && !inputIsWired(dst.id, din.n)) {
+            edge = { fromPort: sout.n, toPort: din.n };
+            break;
+          }
+        }
+        if (edge) break;
+      }
+    }
+    if (edge) {
+      state.edges.push({
+        from: { node: src.id, port: edge.fromPort },
+        to:   { node: dst.id, port: edge.toPort }
+      });
+      added++;
+    }
+  }
+  return added;
 }
 
 /* Sprint 5.handwriting-chain -- pre-flight TYPES match for the
