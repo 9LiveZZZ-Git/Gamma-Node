@@ -39233,7 +39233,9 @@ function _ensureTouchChannel() {
       console.log("[touchscreen] popup is alive");
       // Pop the current box state to the popup so its banner doesn't
       // start in the wrong state (e.g. main has a box drawn already
-      // when the user opens the popup mid-session).
+      // when the user opens the popup mid-session). Same idea for
+      // the controls panel -- send a snapshot in case the popup is
+      // already on the Controls tab when it connects.
       try {
         if (inkBox && inkBox.w >= 30 && inkBox.h >= 24) {
           _touchChannel.postMessage({ type: "box-update", w: inkBox.w, h: inkBox.h });
@@ -39241,9 +39243,111 @@ function _ensureTouchChannel() {
           _touchChannel.postMessage({ type: "box-clear" });
         }
       } catch (_) {}
+      _pushTouchControlsSnapshot();
+    } else if (msg.type === "controls-request") {
+      _pushTouchControlsSnapshot();
+    } else if (msg.type === "control-slider") {
+      _handleTouchControlSlider(msg);
+    } else if (msg.type === "control-button") {
+      _handleTouchControlButton(msg);
+    } else if (msg.type === "control-key-down") {
+      if (typeof playKeyboardNote === "function") playKeyboardNote(msg.key);
+    } else if (msg.type === "control-key-up") {
+      if (typeof releaseKeyboardNote === "function") releaseKeyboardNote(msg.key);
+    } else if (msg.type === "control-octave") {
+      if (typeof setKbOctaveShift === "function") {
+        setKbOctaveShift(kbOctaveShift + (Number(msg.delta) || 0));
+        _pushTouchControlsSnapshot();
+      }
     }
   };
   return _touchChannel;
+}
+
+/* Sprint 5.handwriting-multimonitor (controls tab) -- compact
+ * snapshot of every Slider / Button / KeyboardIn in the patch for
+ * the touchscreen popup. Sent on connect, on request, after a
+ * patch mutation that affects controls (renderMonitorControls),
+ * after a play/stop transition, and after any control changes
+ * (so the popup re-syncs with main-editor drags). */
+function _pushTouchControlsSnapshot() {
+  if (!_touchChannel) return;
+  try {
+    const sliders = state.nodes.filter(n => n.type === "Slider").map(n => {
+      const min = (n.params && typeof n.params.min === "number") ? n.params.min : 0;
+      const max = (n.params && typeof n.params.max === "number" && n.params.max > min) ? n.params.max : (min + 1);
+      let value = (n.params && typeof n.params.value === "number") ? n.params.value : (min + max) / 2;
+      if (value < min) value = min; if (value > max) value = max;
+      const curve = (n.params && typeof n.params.curve === "string") ? n.params.curve : "linear";
+      const curveTable = (n.params && Array.isArray(n.params.curveTable)) ? n.params.curveTable : null;
+      return { id: n.id, min, max, value, curve, curveTable };
+    });
+    const buttons = state.nodes.filter(n => n.type === "Button").map(n => {
+      const label = (n.params && typeof n.params.label === "string" && n.params.label) ? n.params.label : "press";
+      return { id: n.id, label };
+    });
+    const hasKeyboard = state.nodes.some(n => n.type === "KeyboardIn");
+    _touchChannel.postMessage({
+      type: "controls-snapshot",
+      sliders,
+      buttons,
+      keyboard: { present: hasKeyboard },
+      octaveShift: (typeof kbOctaveShift === "number") ? kbOctaveShift : 0,
+      playing: !!(typeof previewState !== "undefined" && previewState && previewState.state === "playing")
+    });
+  } catch (_) {}
+}
+
+/* Apply a slider drag that came in from the touchscreen popup. Mirror
+ * of monitor-controls' slider input handler: write the curve-resolved
+ * value into node.params.value, post the same { type:"set", index, value }
+ * worklet message, and refresh main's monitor-controls UI so its
+ * thumb tracks the touchscreen. The popup updates its display
+ * optimistically; we re-broadcast the snapshot so other touchscreen
+ * tabs / instances re-sync. */
+function _handleTouchControlSlider(msg) {
+  if (!msg || !msg.id) return;
+  const n = state.nodes.find(x => x && x.id === msg.id);
+  if (!n || n.type !== "Slider") return;
+  const min = (n.params && typeof n.params.min === "number") ? n.params.min : 0;
+  const max = (n.params && typeof n.params.max === "number" && n.params.max > min) ? n.params.max : (min + 1);
+  const curve = (n.params && typeof n.params.curve === "string") ? n.params.curve : "linear";
+  const tbl = (n.params && Array.isArray(n.params.curveTable)) ? n.params.curveTable : null;
+  const t = Math.max(0, Math.min(1, Number(msg.t) || 0));
+  const v = sliderValueFromT(t, min, max, curve, tbl);
+  if (!n.params) n.params = {};
+  n.params.value = v;
+  // Worklet routing (no-op if preview isn't running).
+  if (previewState && previewState.workletNode && previewState.state === "playing") {
+    const setters = collectExposedSetters();
+    for (let i = 0; i < setters.length; i++) {
+      const s = setters[i];
+      if (s.nodeId === n.id && s.key === "value" && !s.isGate) {
+        previewState.workletNode.port.postMessage({ type: "set", index: i, value: v });
+        break;
+      }
+    }
+  }
+  // Refresh main's monitor-controls so the thumb / value display
+  // mirror the popup's drag.
+  if (typeof renderMonitorControls === "function") renderMonitorControls();
+}
+
+/* Fire a button gate pulse from the touchscreen popup. Mirror of
+ * the monitor-controls button click handler. */
+function _handleTouchControlButton(msg) {
+  if (!msg || !msg.id) return;
+  const n = state.nodes.find(x => x && x.id === msg.id);
+  if (!n || n.type !== "Button") return;
+  if (!previewState || !previewState.workletNode || previewState.state !== "playing") return;
+  const setters = collectExposedSetters();
+  for (let i = 0; i < setters.length; i++) {
+    const s = setters[i];
+    if (s.nodeId === n.id && s.key === "trig" && s.isGate) {
+      previewState.workletNode.port.postMessage({ type: "set", index: i, value: 0 });
+      break;
+    }
+  }
 }
 
 /* Process a PNG dataUrl that came in from the popup window. Reuses
@@ -39448,6 +39552,57 @@ function _buildTouchscreenHtml() {
   .placeholder code { background: var(--surface-2); padding: 2px 6px; border-radius: 3px; color: var(--accent); font-size: 12px; }
   .conn-pip { width: 8px; height: 8px; border-radius: 50%; background: var(--danger); display: inline-block; vertical-align: middle; margin-right: 6px; }
   .conn-pip.ok { background: var(--accent); }
+
+  /* Controls panel ------------------------------------------- */
+  .ctrl-status-bar { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; font-size: 13px; color: var(--text-2); }
+  .ctrl-play-pip { width: 8px; height: 8px; border-radius: 50%; background: var(--danger); flex: 0 0 8px; }
+  .ctrl-play-pip.playing { background: var(--accent); }
+  .ctrl-list { display: flex; flex-direction: column; gap: 10px; flex: 1; overflow-y: auto; padding-right: 4px; }
+  .ctrl-group-label { font-size: 12px; color: var(--text-2); text-transform: uppercase; letter-spacing: 0.06em; margin: 6px 0 -2px 2px; }
+  .ctrl-row { display: flex; align-items: center; gap: 10px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+  .ctrl-row.disabled { opacity: 0.55; }
+  .ctrl-id { font-family: ui-monospace, "SF Mono", Consolas, monospace; font-size: 12px; color: var(--text-2); min-width: 84px; flex: 0 0 84px; }
+  .ctrl-id b { color: var(--text); font-weight: 600; }
+  .ctrl-slider-input { flex: 1; -webkit-appearance: none; appearance: none; height: 28px; background: transparent; }
+  .ctrl-slider-input::-webkit-slider-runnable-track { height: 12px; background: var(--surface-2); border-radius: 6px; border: 1px solid var(--border); }
+  .ctrl-slider-input::-moz-range-track            { height: 12px; background: var(--surface-2); border-radius: 6px; border: 1px solid var(--border); }
+  .ctrl-slider-input::-webkit-slider-thumb { -webkit-appearance: none; width: 32px; height: 32px; border-radius: 50%; background: var(--accent); border: 2px solid var(--accent-ink); margin-top: -11px; cursor: pointer; }
+  .ctrl-slider-input::-moz-range-thumb     {                          width: 32px; height: 32px; border-radius: 50%; background: var(--accent); border: 2px solid var(--accent-ink); cursor: pointer; }
+  .ctrl-val { min-width: 64px; text-align: right; font-family: ui-monospace, "SF Mono", Consolas, monospace; font-size: 13px; color: var(--accent); }
+  .ctrl-button {
+    flex: 1; padding: 18px; font-size: 16px; font-weight: 500;
+    background: var(--surface-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; cursor: pointer; transition: background-color 0.06s, transform 0.06s;
+  }
+  .ctrl-button:active, .ctrl-button.firing { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); transform: scale(0.98); }
+  .ctrl-kb-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+  .ctrl-kb-toolbar { display: flex; gap: 8px; align-items: center; font-size: 12px; color: var(--text-2); }
+  .ctrl-kb-toolbar .oct-btn { padding: 8px 14px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-size: 14px; cursor: pointer; }
+  .ctrl-kb-toolbar .oct-btn:active { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  .ctrl-kb {
+    position: relative; height: 140px; background: var(--surface-2);
+    border: 1px solid var(--border); border-radius: 6px; overflow: hidden;
+    touch-action: none; user-select: none;
+  }
+  /* White keys laid out as flex children; black keys absolutely
+     positioned on top. Each key is a button (large tap target). */
+  .ctrl-kb-whites { position: absolute; inset: 0; display: flex; }
+  .ctrl-kb-key {
+    flex: 1; border: 1px solid var(--border); background: #f5f6f8; color: #0e1116;
+    font-size: 12px; padding: 0; padding-bottom: 8px;
+    display: flex; align-items: flex-end; justify-content: center;
+    cursor: pointer; user-select: none; touch-action: none;
+  }
+  .ctrl-kb-key:not(:last-child) { border-right: none; }
+  .ctrl-kb-key.held { background: var(--accent); color: var(--accent-ink); }
+  .ctrl-kb-black {
+    position: absolute; width: 8%; height: 60%; top: 0;
+    background: #0e1116; color: #f5f6f8; border: 1px solid #2a3340;
+    font-size: 11px; padding: 0; padding-bottom: 6px;
+    display: flex; align-items: flex-end; justify-content: center;
+    cursor: pointer; user-select: none; touch-action: none;
+  }
+  .ctrl-kb-black.held { background: var(--accent); color: var(--accent-ink); }
 </style>
 </head><body>
 <div class="tabs">
@@ -39467,13 +39622,15 @@ function _buildTouchscreenHtml() {
   </div>
 </div>
 <div class="panel" data-panel="ctrl">
-  <div class="placeholder">
-    <p><strong>Controls tab — coming next sprint.</strong></p>
-    <p>Planned: live sliders for the patch's Slider nodes, a touch
-       keyboard for KeyboardIn, and button widgets for any wired
-       triggers. All routed back to the main editor via the same
-       <code>gamma-touchscreen</code> BroadcastChannel.</p>
+  <div class="ctrl-status-bar">
+    <span class="ctrl-play-pip" id="ctrl-play-pip"></span>
+    <span id="ctrl-play-text">Audio: stopped — start playback (▶) in the main editor for live control</span>
   </div>
+  <div id="ctrl-empty" class="placeholder" style="display:none;">
+    <p><strong>No controllable nodes in the patch yet.</strong></p>
+    <p>Add a <code>Slider</code>, <code>Button</code>, or <code>KeyboardIn</code> node in the main editor and it will appear here.</p>
+  </div>
+  <div id="ctrl-list" class="ctrl-list"></div>
 </div>
 <script>
 (function() {
@@ -39568,13 +39725,323 @@ function _buildTouchscreenHtml() {
     btnRecog.disabled = true;
   });
 
-  // Tab switching
+  // Tab switching. Switching to Controls triggers a fresh snapshot
+  // request so the panel populates immediately on first activation
+  // and re-syncs if the patch changed while the tab was hidden.
   document.querySelectorAll(".tab").forEach(t => {
     t.addEventListener("click", () => {
       document.querySelectorAll(".tab").forEach(x => x.classList.toggle("active", x === t));
       document.querySelectorAll(".panel").forEach(p => p.classList.toggle("active", p.dataset.panel === t.dataset.tab));
+      if (t.dataset.tab === "ctrl") {
+        ch.postMessage({ type: "controls-request" });
+      }
     });
   });
+
+  /* ------------- Controls tab ----------------------------------
+     Sliders + Buttons + KeyboardIn live driving over BroadcastChannel.
+     Snapshot from main describes the patch; popup mirrors and posts
+     control-* messages back. Optimistic local value display so drag
+     feels instant — main re-broadcasts on each change for sync. */
+
+  // Inline copy of the editor's slider curve math so the popup can
+  // display the curve-adjusted value as the user drags, without
+  // round-tripping to main for every pixel.
+  const _SLIDER_CURVES = {
+    linear: t => t,
+    log:    t => Math.log10(1 + 9 * t),
+    exp:    t => t * t,
+    sCurve: t => t * t * (3 - 2 * t)
+  };
+  function _lutForward(t, tbl) {
+    const N = tbl.length;
+    if (!N) return t;
+    const fi = Math.max(0, Math.min(1, t)) * (N - 1);
+    const i0 = Math.floor(fi), i1 = Math.min(N - 1, i0 + 1);
+    return tbl[i0] * (1 - (fi - i0)) + tbl[i1] * (fi - i0);
+  }
+  function _sliderValueFromT(t, min, max, curve, tbl) {
+    let mapped;
+    if (curve === "custom" && Array.isArray(tbl) && tbl.length) {
+      mapped = _lutForward(t, tbl);
+    } else {
+      const fn = _SLIDER_CURVES[curve] || _SLIDER_CURVES.linear;
+      mapped = fn(Math.max(0, Math.min(1, t)));
+    }
+    return min + (max - min) * mapped;
+  }
+  function _sliderTFromValueLinearApprox(v, min, max) {
+    if (max <= min) return 0;
+    return Math.max(0, Math.min(1, (v - min) / (max - min)));
+  }
+  // Inverse-curve mapping for seeding the thumb position from a known
+  // value. Bisection-based so it works for any monotonic curve incl.
+  // custom LUTs (with the same closest-point approximation main uses).
+  function _sliderTFromValue(v, min, max, curve, tbl) {
+    const y = _sliderTFromValueLinearApprox(v, min, max);
+    if (curve === "linear" || max <= min) return y;
+    if (curve === "custom" && Array.isArray(tbl) && tbl.length) {
+      let bestT = 0, bestDist = Infinity;
+      for (let i = 0; i < tbl.length; i++) {
+        const d = Math.abs(tbl[i] - y);
+        if (d < bestDist) { bestDist = d; bestT = i / (tbl.length - 1); }
+      }
+      return bestT;
+    }
+    // Bisection on the forward curve.
+    let lo = 0, hi = 1;
+    const fwd = _SLIDER_CURVES[curve] || _SLIDER_CURVES.linear;
+    for (let i = 0; i < 24; i++) {
+      const mid = (lo + hi) / 2;
+      if (fwd(mid) < y) lo = mid; else hi = mid;
+    }
+    return (lo + hi) / 2;
+  }
+
+  // Compact value formatter; mirrors main's monitor-controls behavior
+  // (digits scale with range so a 0..1 slider shows 3 decimals and
+  // a 80..12000 slider shows 0).
+  function _fmtVal(v, min, max) {
+    const span = Math.max(1e-9, max - min);
+    const digits = Math.max(0, Math.ceil(-Math.log10(span / 1000)));
+    return Number(v).toFixed(Math.min(6, digits));
+  }
+
+  const ctrlList    = document.getElementById("ctrl-list");
+  const ctrlEmpty   = document.getElementById("ctrl-empty");
+  const ctrlPlayPip = document.getElementById("ctrl-play-pip");
+  const ctrlPlayTxt = document.getElementById("ctrl-play-text");
+
+  // Most recent snapshot, kept so we can re-render on octave change
+  // without round-tripping to main. Initialized empty so the keyboard
+  // widget can compute its layout before the first snapshot arrives.
+  let _lastSnap = { sliders: [], buttons: [], keyboard: { present: false }, octaveShift: 0, playing: false };
+
+  // QWERTY → MIDI map (mirror of main's QWERTY_TO_MIDI). Used to lay
+  // out the touch keyboard with the right black-key positions.
+  const _QWERTY_TO_MIDI = {
+    "a": 60, "s": 62, "d": 64, "f": 65, "g": 67, "h": 69, "j": 71, "k": 72, "l": 74, ";": 76,
+    "w": 61, "e": 63, "t": 66, "y": 68, "u": 70, "o": 73, "p": 75
+  };
+  const _WHITE_KEYS = ["a","s","d","f","g","h","j","k","l",";"];
+  const _BLACK_KEYS = ["w","e","t","y","u","o","p"];
+  // Which white-key index each black key sits between. Layout matches
+  // the QWERTY-to-piano convention used in the main editor (W between
+  // A/S, E between S/D, no key between D/F, T between F/G, Y between
+  // G/H, U between H/J, no key between J/K, O between K/L, P between L/;).
+  const _BLACK_AFTER_WHITE = { "w": 0, "e": 1, "t": 3, "y": 4, "u": 5, "o": 7, "p": 8 };
+
+  function _midiName(midi) {
+    const NAMES = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
+    const oct = Math.floor(midi / 12) - 1;
+    return NAMES[midi % 12] + oct;
+  }
+
+  function renderControls(snap) {
+    _lastSnap = snap;
+    // Status bar reflects playback state -- widgets are not literally
+    // disabled (touch latency would suck if we had to re-enable them on
+    // play) but are visually dimmed when audio isn't running.
+    const playing = !!snap.playing;
+    ctrlPlayPip.classList.toggle("playing", playing);
+    ctrlPlayTxt.textContent = playing
+      ? "Audio: playing — controls are live"
+      : "Audio: stopped — start playback (▶) in the main editor for live control";
+
+    ctrlList.innerHTML = "";
+    const hasAny = (snap.sliders && snap.sliders.length)
+                 || (snap.buttons && snap.buttons.length)
+                 || (snap.keyboard && snap.keyboard.present);
+    ctrlEmpty.style.display = hasAny ? "none" : "block";
+    if (!hasAny) return;
+
+    // -- Sliders ------------------------------------------------
+    if (snap.sliders && snap.sliders.length) {
+      const label = document.createElement("div");
+      label.className = "ctrl-group-label";
+      label.textContent = "Sliders";
+      ctrlList.appendChild(label);
+      snap.sliders.forEach(s => ctrlList.appendChild(_buildSliderRow(s, playing)));
+    }
+
+    // -- Buttons ------------------------------------------------
+    if (snap.buttons && snap.buttons.length) {
+      const label = document.createElement("div");
+      label.className = "ctrl-group-label";
+      label.textContent = "Buttons";
+      ctrlList.appendChild(label);
+      snap.buttons.forEach(b => ctrlList.appendChild(_buildButtonRow(b, playing)));
+    }
+
+    // -- Keyboard -----------------------------------------------
+    if (snap.keyboard && snap.keyboard.present) {
+      const label = document.createElement("div");
+      label.className = "ctrl-group-label";
+      label.textContent = "Keyboard";
+      ctrlList.appendChild(label);
+      ctrlList.appendChild(_buildKeyboardWidget(snap.octaveShift || 0, playing));
+    }
+  }
+
+  function _buildSliderRow(s, playing) {
+    const row = document.createElement("div");
+    row.className = "ctrl-row" + (playing ? "" : " disabled");
+    const t = _sliderTFromValue(s.value, s.min, s.max, s.curve, s.curveTable);
+    row.innerHTML =
+      '<span class="ctrl-id">sld <b>' + s.id + '</b></span>' +
+      '<input class="ctrl-slider-input" type="range" min="0" max="1" step="0.001" value="' + t + '" />' +
+      '<span class="ctrl-val">' + _fmtVal(s.value, s.min, s.max) + '</span>';
+    const input = row.querySelector(".ctrl-slider-input");
+    const val   = row.querySelector(".ctrl-val");
+    input.addEventListener("input", () => {
+      const tt = Number(input.value);
+      const v = _sliderValueFromT(tt, s.min, s.max, s.curve, s.curveTable);
+      val.textContent = _fmtVal(v, s.min, s.max);
+      // Optimistic update -- popup shows new value instantly. Main
+      // also re-broadcasts the resolved value so we re-sync if other
+      // sources (main UI, OSC, MIDI) change it.
+      ch.postMessage({ type: "control-slider", id: s.id, t: tt });
+    });
+    return row;
+  }
+
+  function _buildButtonRow(b, playing) {
+    const row = document.createElement("div");
+    row.className = "ctrl-row" + (playing ? "" : " disabled");
+    row.innerHTML =
+      '<span class="ctrl-id">btn <b>' + b.id + '</b></span>' +
+      '<button class="ctrl-button">' + (b.label || "press") + '</button>';
+    const btn = row.querySelector(".ctrl-button");
+    btn.addEventListener("pointerdown", (ev) => {
+      ev.preventDefault();
+      ch.postMessage({ type: "control-button", id: b.id });
+      btn.classList.add("firing");
+      setTimeout(() => btn.classList.remove("firing"), 80);
+    });
+    return row;
+  }
+
+  function _buildKeyboardWidget(octaveShift, playing) {
+    const wrap = document.createElement("div");
+    wrap.className = "ctrl-kb-wrap" + (playing ? "" : " disabled");
+
+    const toolbar = document.createElement("div");
+    toolbar.className = "ctrl-kb-toolbar";
+    const octLabel = document.createElement("span");
+    octLabel.textContent = "octave " + (octaveShift === 0 ? "0" : (octaveShift > 0 ? "+" : "") + (octaveShift / 12));
+    const octDown = document.createElement("button");
+    octDown.className = "oct-btn"; octDown.textContent = "−12";
+    octDown.addEventListener("pointerdown", (ev) => {
+      ev.preventDefault();
+      ch.postMessage({ type: "control-octave", delta: -12 });
+    });
+    const octUp = document.createElement("button");
+    octUp.className = "oct-btn"; octUp.textContent = "+12";
+    octUp.addEventListener("pointerdown", (ev) => {
+      ev.preventDefault();
+      ch.postMessage({ type: "control-octave", delta: +12 });
+    });
+    toolbar.appendChild(octLabel);
+    toolbar.appendChild(octDown);
+    toolbar.appendChild(octUp);
+    wrap.appendChild(toolbar);
+
+    const board = document.createElement("div");
+    board.className = "ctrl-kb";
+
+    const whites = document.createElement("div");
+    whites.className = "ctrl-kb-whites";
+    _WHITE_KEYS.forEach((k, i) => {
+      const key = document.createElement("button");
+      key.className = "ctrl-kb-key";
+      key.dataset.key = k;
+      const midi = _QWERTY_TO_MIDI[k] + octaveShift;
+      key.textContent = _midiName(midi);
+      whites.appendChild(key);
+    });
+    board.appendChild(whites);
+
+    _BLACK_KEYS.forEach(k => {
+      const afterWhiteIdx = _BLACK_AFTER_WHITE[k];
+      if (afterWhiteIdx == null) return;
+      // Center on the gap between two white keys. 10 white keys
+      // total, so each is 10%; we position the black key at the
+      // boundary minus half its 8% width.
+      const leftPct = (afterWhiteIdx + 1) * 10 - 4;
+      const key = document.createElement("button");
+      key.className = "ctrl-kb-black";
+      key.dataset.key = k;
+      key.style.left = leftPct + "%";
+      key.textContent = k.toUpperCase();
+      board.appendChild(key);
+    });
+
+    // Pointer routing: a single set of pointer listeners on the board
+    // so dragging across keys (glissando) works without per-key state.
+    // pointerdown/move use elementFromPoint -- on touch the original
+    // e.target is the pointerdown element for the whole gesture, so
+    // we need the dynamic hit-test to follow the finger.
+    const held = new Set();
+    function _keyAt(ev) {
+      const el = document.elementFromPoint(ev.clientX, ev.clientY);
+      if (!el || !el.dataset || !el.dataset.key) return null;
+      // Only count keys that belong to THIS board (in case the popup
+      // grows more keyboards later).
+      if (!board.contains(el)) return null;
+      return el;
+    }
+    function _press(el) {
+      if (!el) return;
+      const k = el.dataset.key;
+      if (held.has(k)) return;
+      held.add(k);
+      el.classList.add("held");
+      ch.postMessage({ type: "control-key-down", key: k });
+    }
+    function _release(el) {
+      if (!el) return;
+      const k = el.dataset.key;
+      if (!held.has(k)) return;
+      held.delete(k);
+      el.classList.remove("held");
+      ch.postMessage({ type: "control-key-up", key: k });
+    }
+    function _releaseAll() {
+      held.forEach(k => {
+        const el = board.querySelector('[data-key="' + (k === ";" ? "\\;" : k) + '"]');
+        if (el) el.classList.remove("held");
+        ch.postMessage({ type: "control-key-up", key: k });
+      });
+      held.clear();
+    }
+    board.addEventListener("pointerdown", (ev) => {
+      ev.preventDefault();
+      board.setPointerCapture(ev.pointerId);
+      _press(_keyAt(ev));
+    });
+    board.addEventListener("pointermove", (ev) => {
+      if (!held.size) return;
+      // Glissando: if finger moves to a new key, release old + press new.
+      const el = _keyAt(ev);
+      if (!el) return;
+      const k = el.dataset.key;
+      if (!held.has(k)) {
+        // Find which key the user was on and release it
+        held.forEach(oldK => {
+          const oldEl = board.querySelector('[data-key="' + (oldK === ";" ? "\\;" : oldK) + '"]');
+          if (oldEl) oldEl.classList.remove("held");
+          ch.postMessage({ type: "control-key-up", key: oldK });
+        });
+        held.clear();
+        _press(el);
+      }
+    });
+    board.addEventListener("pointerup",     () => _releaseAll());
+    board.addEventListener("pointercancel", () => _releaseAll());
+
+    wrap.appendChild(board);
+    return wrap;
+  }
 
   const banner = document.getElementById("box-banner");
   let hasBox = false;
@@ -39607,13 +40074,18 @@ function _buildTouchscreenHtml() {
       setBoxState(msg);
     } else if (msg.type === "box-clear") {
       setBoxState(null);
+    } else if (msg.type === "controls-snapshot") {
+      renderControls(msg);
     } else if (msg.type === "ping") {
       ch.postMessage({ type: "pong" });
     }
   };
 
-  // Heartbeat to main so it knows we're alive.
+  // Heartbeat to main so it knows we're alive. Also request an initial
+  // controls snapshot so the panel populates even if the user opens
+  // the Controls tab before the first patch mutation.
   ch.postMessage({ type: "pong" });
+  ch.postMessage({ type: "controls-request" });
   setStatus("Connected — write a node name above the line, then ✓ Recognize", "ok");
   setBoxState(null);
   requestAnimationFrame(resizeCanvas);
@@ -55135,9 +55607,14 @@ function previewProgressFinish() {
 }
 
 function setPreviewStatus(state, msg) {
+  const prev = previewState.state;
   previewState.state = state;
   previewState.lastStatusMsg = msg || state;
   if (state === "error") previewState.lastErrorMsg = msg || state;
+  // Touchscreen-popup status pip mirrors playing<->stopped.
+  if (prev !== state && typeof _pushTouchControlsSnapshot === "function") {
+    _pushTouchControlsSnapshot();
+  }
   // Console timeline so the pipeline is visible in DevTools too —
   // useful when the pill text is truncated or moves too fast.
   console.log("[preview] " + state + (msg ? " — " + msg : ""));
@@ -57773,6 +58250,8 @@ function setKbOctaveShift(s) {
   updateOctaveReadout();
   // Re-render piano to reposition the highlighted octave window.
   renderPiano();
+  // Mirror octave label / key letters to the touchscreen popup.
+  if (typeof _pushTouchControlsSnapshot === "function") _pushTouchControlsSnapshot();
 }
 function updateOctaveReadout() {
   const r = document.getElementById("piano-octave-readout");
@@ -58240,10 +58719,19 @@ function renderMonitorControls() {
       if (node) node.params.value = v;
       if (idx < 0 || !previewState.workletNode || previewState.state !== "playing") return;
       previewState.workletNode.port.postMessage({ type: "set", index: idx, value: v });
+      // Mirror the new value to the touchscreen popup so its slider
+      // tracks main-editor drags. No-op when no popup is connected.
+      if (typeof _pushTouchControlsSnapshot === "function") _pushTouchControlsSnapshot();
     });
     editBtn.addEventListener("click", () => openRampModal("slider", s.id));
     wrap.appendChild(row);
   });
+  // Push a fresh controls snapshot whenever the patch's controllable
+  // nodes change (renderMonitorControls runs on add/delete/edit of
+  // Slider+Button nodes). KeyboardIn add/remove doesn't go through
+  // here but is uncommon enough that the popup tab-switch re-request
+  // covers it.
+  if (typeof _pushTouchControlsSnapshot === "function") _pushTouchControlsSnapshot();
 }
 
 /* Ramp editor — modal that picks a curve / shape for a Slider or
