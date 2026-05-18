@@ -51264,14 +51264,23 @@ function _ensureSceneInstance(sceneNode) {
   // Cheap (96 bytes per slot) and the bind groups are stable across
   // frames (the underlying buffer object stays the same; only its
   // contents change per frame).
-  // Sprint 7.5.3c push 5 -- include the scratch texture array +
-  // a default sampler in the bind group so ShaderMat-texture can
-  // sample upstream visual outputs. scratchArrayViewA always
-  // matches readKey="a" for direct-VO Scenes (depth=0 → readKey=
-  // "a"; upstream texture inputs at depth=1 → writeKey="a"). For
-  // Scenes nested deeper in composition chains, the sampling would
-  // be against the wrong parity; that's an edge case to address
-  // in a follow-up. Sampler reuses a shared one.
+  // v0.3.120 -- TWO bind groups per slot, one per scratch-parity, so
+  // a Scene rendered into a composition chain (Scene → CRT → VO)
+  // doesn't alias its render target with binding 2's read-only
+  // scratch view. The plan walker assigns Scene at depth=1 with
+  // writeKey="a" + readKey="b": Scene writes to scratchA, so its
+  // bind group must NOT bind scratchA at binding 2 (WebGPU rejects
+  // same-texture-as-attachment-and-binding in one pass, silently
+  // failing the encode and leaving the downstream composition input
+  // empty -- the original Scene→CRT bug). Selecting by readKey
+  // mirrors the composition-shader convention: bind group reads the
+  // OPPOSITE parity of what the pass writes.
+  //
+  // For direct-VO Scene (depth=0, readKey="a"), upstream ShaderMat
+  // texture inputs land in scratchA (depth=1 writeKey="a") so
+  // binding scratchArrayViewA is correct. For composition-chain
+  // Scene (depth=1, readKey="b"), upstream textures would be at
+  // depth=2 in scratchB, so scratchArrayViewB matches.
   if (!Visual.meshSampler) {
     Visual.meshSampler = Visual.device.createSampler({
       label: "mesh-shadermat-sampler",
@@ -51291,19 +51300,25 @@ function _ensureSceneInstance(sceneNode) {
     // Default to a 1x1 mid-gray when no HDRI is loaded; sample_env's
     // mode dispatch only reads it when mode == 3.
     _ensureEnvTextureDefault();
-    const bindGroup = Visual.device.createBindGroup({
-      label: "scene-bg-" + sceneNode.id + "-slot" + i,
-      layout: Visual.meshBindGroupLayout,
-      entries: [
-        { binding: 0, resource: { buffer: perSceneBuffer } },
-        { binding: 1, resource: { buffer: perDrawBuffer  } },
-        { binding: 2, resource: Visual.scratchArrayViewA },
-        { binding: 3, resource: Visual.meshSampler },
-        { binding: 4, resource: Visual.envTextureView },
-        { binding: 5, resource: Visual.envSampler }
-      ]
-    });
-    slots.push({ perDrawBuffer, bindGroup });
+    const makeBindGroup = (scratchView, parity) =>
+      Visual.device.createBindGroup({
+        label: "scene-bg-" + sceneNode.id + "-slot" + i + "-" + parity,
+        layout: Visual.meshBindGroupLayout,
+        entries: [
+          { binding: 0, resource: { buffer: perSceneBuffer } },
+          { binding: 1, resource: { buffer: perDrawBuffer  } },
+          { binding: 2, resource: scratchView },
+          { binding: 3, resource: Visual.meshSampler },
+          { binding: 4, resource: Visual.envTextureView },
+          { binding: 5, resource: Visual.envSampler }
+        ]
+      });
+    const bindGroupA = makeBindGroup(Visual.scratchArrayViewA, "a");
+    const bindGroupB = makeBindGroup(Visual.scratchArrayViewB, "b");
+    // Keep `bindGroup` as an alias for parity "a" so any caller that
+    // doesn't pass a readKey (legacy paths) gets the same view it
+    // used to. _encodeScenePass picks A or B by entry.readKey.
+    slots.push({ perDrawBuffer, bindGroup: bindGroupA, bindGroupA, bindGroupB });
   }
   inst = {
     perSceneBuffer,
@@ -51586,7 +51601,12 @@ function _encodeScenePass(enc, entry) {
       }
     }
     Visual.device.queue.writeBuffer(slot.perDrawBuffer, 0, inst.drawScratch.buffer, 0, 96);
-    pass.setBindGroup(0, slot.bindGroup);
+    // v0.3.120 -- pick the bind group whose binding 2 is OPPOSITE
+    // parity to the scratch layer we're writing to. Prevents the
+    // texture-as-binding-and-attachment aliasing that silently broke
+    // Scene → composition chains (Scene → CRT, Scene → Blur, etc.).
+    const bg = (entry.readKey === "b") ? slot.bindGroupB : slot.bindGroupA;
+    pass.setBindGroup(0, bg);
     pass.setVertexBuffer(0, buf.vertexBuffer);
     if (buf.indexBuffer) {
       pass.setIndexBuffer(buf.indexBuffer, "uint32");
@@ -51623,7 +51643,9 @@ function _encodeScenePass(enc, entry) {
     const skyPipeline = _ensureSkyPipeline(sampleCount);
     if (skyPipeline) {
       pass.setPipeline(skyPipeline);
-      pass.setBindGroup(0, inst.slots[0].bindGroup);
+      // v0.3.120 -- same parity selection as the mesh draws above.
+      const skyBg = (entry.readKey === "b") ? inst.slots[0].bindGroupB : inst.slots[0].bindGroupA;
+      pass.setBindGroup(0, skyBg);
       pass.draw(3);
       if (!_SCENE_DIAG.sky) {
         _SCENE_DIAG.sky = true;
