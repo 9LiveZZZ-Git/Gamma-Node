@@ -1628,12 +1628,48 @@
      in place via node.override. Opens with E on a single selected node
      or the small ✎ button at the bottom edge of the selected node. */
   #node-edit-modal .modal {
-    width: 720px;
+    width: 860px;
     max-width: calc(100vw - 32px);
-    max-height: 88vh;
+    max-height: 92vh;
     display: flex; flex-direction: column;
   }
   #node-edit-modal .modal-body { overflow-y: auto; padding: 14px 16px 18px; }
+  /* CodeMirror styling inside the node editor -- mirrors the
+     .udsp-editor rules so the per-node editor reads as the same
+     instrument as the main User DSP source view. material-darker
+     theme, line numbers in a gutter, phosphor cursor / accent. */
+  .node-edit-cm-wrap {
+    border: 1px solid var(--border);
+    min-height: 360px;
+    display: flex; flex-direction: column;
+  }
+  #node-edit-modal .CodeMirror {
+    height: auto;
+    min-height: 360px;
+    width: 100%;
+    flex: 1 1 auto;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.55;
+    background: var(--bg);
+    color: var(--text);
+  }
+  #node-edit-modal .CodeMirror-gutters {
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+  }
+  #node-edit-modal .CodeMirror-linenumber { color: var(--text-3); }
+  #node-edit-modal .CodeMirror-cursor { border-left-color: var(--accent); }
+  #node-edit-modal .CodeMirror-selected,
+  #node-edit-modal .CodeMirror-focused .CodeMirror-selected {
+    background: rgba(74, 143, 220, 0.22) !important;
+  }
+  #node-edit-modal .CodeMirror-matchingbracket {
+    color: var(--accent) !important;
+    text-decoration: underline;
+  }
+  #node-edit-modal .CodeMirror-scrollbar-filler,
+  #node-edit-modal .CodeMirror-gutter-filler { background: var(--surface); }
   .node-edit-section {
     margin-bottom: 16px;
   }
@@ -1736,6 +1772,12 @@
     display: none;
   }
   .node-edit-warn.visible { display: block; }
+  /* Green "validation passed" state shares the warn slot. */
+  .node-edit-warn.ok {
+    background: rgba(200, 232, 90, 0.06);
+    border-color: var(--phosphor-mid);
+    color: var(--phosphor);
+  }
   .node-edit-revert {
     margin-right: auto;       /* push to the left of the action row */
     color: var(--text-2);
@@ -7132,7 +7174,9 @@
 
           <div class="node-edit-section">
             <div class="node-edit-section-head">helper class (C++ source)</div>
-            <textarea id="node-edit-code" class="node-edit-codearea" spellcheck="false"></textarea>
+            <div class="node-edit-cm-wrap">
+              <textarea id="node-edit-code" class="node-edit-codearea" spellcheck="false"></textarea>
+            </div>
           </div>
         </div>
 
@@ -7140,7 +7184,9 @@
         <div id="node-edit-gdsp-view" style="display:none;">
           <div class="node-edit-section">
             <div class="node-edit-section-head">.gdsp source (metadata + class)</div>
-            <textarea id="node-edit-gdsp" class="node-edit-codearea" spellcheck="false" style="min-height: 360px;"></textarea>
+            <div class="node-edit-cm-wrap">
+              <textarea id="node-edit-gdsp" class="node-edit-codearea" spellcheck="false"></textarea>
+            </div>
           </div>
         </div>
 
@@ -7148,6 +7194,8 @@
 
         <div class="modal-actions">
           <button class="btn node-edit-revert" id="btn-node-edit-revert" title="Remove the override and restore the registry default">↺ revert to default</button>
+          <button class="btn"         id="btn-node-edit-validate" title="Run the same checks save runs, without committing">validate</button>
+          <button class="btn"         id="btn-node-edit-export"   title="Download the .gdsp source as a file">export .gdsp</button>
           <button class="btn"         id="btn-node-edit-cancel">cancel</button>
           <button class="btn primary" id="btn-node-edit-save">save</button>
         </div>
@@ -60149,6 +60197,56 @@ function buildCurveDrawPane(node) {
 let _nodeEditTargetId = null;          // id of the node being edited
 let _nodeEditorOpen   = false;         // gates main hotkeys
 
+/* CodeMirror instances for the two code panes, created lazily on
+ * first modal open. Same options the User DSP editor uses so the
+ * per-node editor has identical syntax colouring, line numbers,
+ * bracket matching, and font / theme. */
+let _nodeEditCmRaw  = null;
+let _nodeEditCmGdsp = null;
+function _initNodeEditCm() {
+  if (typeof CodeMirror === "undefined") return;
+  const cmOpts = {
+    mode: "text/x-c++src",
+    theme: "material-darker",
+    lineNumbers: true,
+    indentUnit: 2,
+    tabSize: 2,
+    smartIndent: true,
+    matchBrackets: true,
+    autoCloseBrackets: true,
+    lineWrapping: false,
+    extraKeys: {
+      Tab:         cm => cm.execCommand("indentMore"),
+      "Shift-Tab": cm => cm.execCommand("indentLess"),
+      "Cmd-/":     "toggleComment",
+      "Ctrl-/":    "toggleComment"
+    }
+  };
+  if (!_nodeEditCmRaw) {
+    const ta = document.getElementById("node-edit-code");
+    if (ta) {
+      _nodeEditCmRaw = CodeMirror.fromTextArea(ta, cmOpts);
+      // Mirror to the underlying textarea so anything legacy that reads
+      // .value still sees the current text.
+      _nodeEditCmRaw.on("change", () => { ta.value = _nodeEditCmRaw.getValue(); });
+    }
+  }
+  if (!_nodeEditCmGdsp) {
+    const ta = document.getElementById("node-edit-gdsp");
+    if (ta) {
+      _nodeEditCmGdsp = CodeMirror.fromTextArea(ta, cmOpts);
+      _nodeEditCmGdsp.on("change", () => { ta.value = _nodeEditCmGdsp.getValue(); });
+    }
+  }
+}
+
+// Get / set wrappers that prefer the CodeMirror instance when up,
+// fall back to the raw textarea (e.g. CodeMirror failed to load).
+function _getRawCode()    { return _nodeEditCmRaw  ? _nodeEditCmRaw.getValue()  : document.getElementById("node-edit-code").value; }
+function _setRawCode(s)   { if (_nodeEditCmRaw)  _nodeEditCmRaw.setValue(s);   else document.getElementById("node-edit-code").value = s; }
+function _getGdspCode()   { return _nodeEditCmGdsp ? _nodeEditCmGdsp.getValue() : document.getElementById("node-edit-gdsp").value; }
+function _setGdspCode(s)  { if (_nodeEditCmGdsp) _nodeEditCmGdsp.setValue(s); else document.getElementById("node-edit-gdsp").value = s; }
+
 const PORT_TYPE_OPTS_IN  = ["audio", "param", "gate", "clock", "texture", "transform", "mesh", "camera", "light", "environment"];
 const PORT_TYPE_OPTS_OUT = ["audio", "param", "gate", "clock", "texture", "transform", "mesh", "camera", "light", "environment"];
 
@@ -60175,24 +60273,26 @@ function openNodeCodeEditor(nodeId) {
   _renderPortRows("in",  insArr,  methods, gateM);
   _renderPortRows("out", outsArr, methods, gateM);
 
-  // Helper-class textarea: show the current source verbatim, or a
+  // Helper-class source: show the current source verbatim, or a
   // stub if this node type doesn't have one (template-only nodes
   // like Add / Mul -- in that case we recommend giving it a cppType
   // first).
-  const codeEl = document.getElementById("node-edit-code");
-  codeEl.value = def.helperClass || (def.template
+  const codeSrc = def.helperClass || (def.template
     ? "// This node has no helperClass — it's a template-only node\n// (its operator() is inlined directly into the patch's expression).\n// To add custom C++, give it a cppType and a class above."
     : "// (no helper class registered for this node type)");
+
+  // Seed the raw textarea BEFORE initializing CodeMirror so that
+  // fromTextArea() reads the right initial content.
+  document.getElementById("node-edit-code").value = codeSrc;
+  document.getElementById("node-edit-gdsp").value = "";
 
   const revertBtn = document.getElementById("btn-node-edit-revert");
   revertBtn.disabled = !node.override;
 
   const warn = document.getElementById("node-edit-warn");
-  warn.textContent = ""; warn.classList.remove("visible");
+  warn.textContent = ""; warn.classList.remove("visible", "ok");
 
   // Always open in "raw" (fields) view so the structure is visible.
-  // If the user previously toggled to .gdsp on a different node, the
-  // raw view fields still apply this time.
   _nodeEditMode = "raw";
   document.getElementById("node-edit-raw-view").style.display  = "";
   document.getElementById("node-edit-gdsp-view").style.display = "none";
@@ -60201,8 +60301,19 @@ function openNodeCodeEditor(nodeId) {
   modeBtn.title = "Toggle between fields view and a single .gdsp source (User DSP format)";
 
   document.getElementById("node-edit-modal").style.display = "flex";
-  // Focus the code area as the most-likely edit target.
-  setTimeout(() => codeEl.focus(), 0);
+
+  // Lazy init / sync CodeMirror. fromTextArea() can only run after
+  // the textarea is in the DOM AND visible; the modal must be on
+  // first. Refresh after layout so CodeMirror reads the correct
+  // container dimensions.
+  _initNodeEditCm();
+  _setRawCode(codeSrc);
+  _setGdspCode("");
+  setTimeout(() => {
+    if (_nodeEditCmRaw)  _nodeEditCmRaw.refresh();
+    if (_nodeEditCmGdsp) _nodeEditCmGdsp.refresh();
+    if (_nodeEditCmRaw)  _nodeEditCmRaw.focus();
+  }, 0);
 }
 
 function closeNodeCodeEditor() {
@@ -60332,7 +60443,7 @@ function _saveNodeOverride() {
 
   let cppType, helperClass, ins, outs, methodsRaw, gateMRaw;
   if (_nodeEditMode === "gdsp") {
-    const src = document.getElementById("node-edit-gdsp").value;
+    const src = _getGdspCode();
     let raw;
     try { raw = _parseGdspToState(src); }
     catch (err) { return fail(".gdsp: " + (err && err.message ? err.message : String(err))); }
@@ -60344,7 +60455,7 @@ function _saveNodeOverride() {
     gateMRaw    = raw.gateMethods;
   } else {
     cppType     = document.getElementById("node-edit-cppType").value.trim();
-    helperClass = document.getElementById("node-edit-code").value;
+    helperClass = _getRawCode();
     const insHost  = document.getElementById("node-edit-ins");
     const outsHost = document.getElementById("node-edit-outs");
     ins  = (insHost._portsArr  || []).filter(p => p.n).map(p => ({ n: p.n, t: p.t }));
@@ -60443,7 +60554,7 @@ function _captureRawState() {
   const outsHost = document.getElementById("node-edit-outs");
   return {
     cppType:    document.getElementById("node-edit-cppType").value.trim(),
-    helperClass: document.getElementById("node-edit-code").value,
+    helperClass: _getRawCode(),
     ins:  (insHost._portsArr  || []).filter(p => p.n).map(p => ({ n: p.n, t: p.t })),
     outs: (outsHost._portsArr || []).filter(p => p.n).map(p => ({ n: p.n, t: p.t })),
     methods:     insHost._methods  || {},
@@ -60537,7 +60648,7 @@ function _parseGdspToState(source) {
 /* Apply a raw-state object back to the "raw view" form fields. */
 function _applyRawStateToForm(rawState) {
   document.getElementById("node-edit-cppType").value = rawState.cppType || "";
-  document.getElementById("node-edit-code").value    = rawState.helperClass || "";
+  _setRawCode(rawState.helperClass || "");
   const insArr  = rawState.ins.map(p => ({ n: p.n, t: p.t }));
   const outsArr = rawState.outs.map(p => ({ n: p.n, t: p.t }));
   const methods = Object.assign({}, rawState.methods || {});
@@ -60562,22 +60673,26 @@ function _setNodeEditMode(mode) {
     // Pull current raw state, synthesize the .gdsp text, swap views.
     const raw = _captureRawState();
     const src = _synthGdspSource(raw, node);
-    document.getElementById("node-edit-gdsp").value = src;
+    _setGdspCode(src);
     rawView.style.display  = "none";
     gdspView.style.display = "";
     toggle.textContent = "← fields";
     toggle.title = "Switch back to the fields view";
     _nodeEditMode = "gdsp";
+    // CodeMirror needs a refresh whenever its container goes from
+    // display:none to visible -- otherwise it measures 0px high.
+    setTimeout(() => { if (_nodeEditCmGdsp) { _nodeEditCmGdsp.refresh(); _nodeEditCmGdsp.focus(); } }, 0);
   } else {
     // Going gdsp -> raw: parse the current .gdsp source and populate
     // the raw form fields. If parse fails, stay in gdsp mode and
     // surface the error so the user can fix it.
-    const src = document.getElementById("node-edit-gdsp").value;
+    const src = _getGdspCode();
     try {
       const raw = _parseGdspToState(src);
       _applyRawStateToForm(raw);
     } catch (err) {
       warnEl.textContent = ".gdsp parse: " + (err && err.message ? err.message : String(err));
+      warnEl.classList.remove("ok");
       warnEl.classList.add("visible");
       return;       // refuse the switch; user fixes the source
     }
@@ -60586,7 +60701,85 @@ function _setNodeEditMode(mode) {
     toggle.textContent = ".gdsp →";
     toggle.title = "Toggle between fields view and a single .gdsp source (User DSP format)";
     _nodeEditMode = "raw";
+    setTimeout(() => { if (_nodeEditCmRaw) { _nodeEditCmRaw.refresh(); _nodeEditCmRaw.focus(); } }, 0);
   }
+}
+
+/* "Validate" -- runs the same checks save runs, surfaces the result
+ * in the warn area, but doesn't commit anything. In .gdsp mode this
+ * uses buildUserDspDef (the canonical .gdsp parser) and reports the
+ * resolved ports / params count; in raw mode it checks class-name
+ * match + port-name identifier validity. */
+function _validateNodeOverride() {
+  const warn = document.getElementById("node-edit-warn");
+  function ok(msg)  { warn.textContent = msg; warn.classList.add("visible", "ok"); }
+  function bad(msg) { warn.textContent = msg; warn.classList.add("visible"); warn.classList.remove("ok"); }
+  if (_nodeEditMode === "gdsp") {
+    try {
+      const { def, name } = buildUserDspDef(_getGdspCode());
+      const np = Object.keys(def.params || {}).length;
+      ok("✓ " + name + "  ·  " + def.ins.length + " in, " + def.outs.length + " out, " + np + " param" + (np === 1 ? "" : "s"));
+    } catch (err) {
+      bad("✗ " + (err && err.message ? err.message : String(err)));
+    }
+    return;
+  }
+  // Raw mode -- mirror save's identifier checks + a class-name
+  // sanity check between cppType and the source.
+  const raw = _captureRawState();
+  const cm = (raw.helperClass || "").match(/class\s+(\w+)/);
+  // Strip template angle-brackets from cppType for the comparison
+  // (e.g. "gam::Sine<>" vs "Sine" in the source -- we compare the
+  // tail symbol).
+  const cppTail = (raw.cppType || "").replace(/<[^>]*>/g, "").split("::").pop();
+  if (cppTail && cm && cm[1] !== cppTail) {
+    return bad("✗ cppType '" + raw.cppType + "' doesn't match class name '" + cm[1] + "' in source");
+  }
+  const seenIn = new Set();
+  for (const p of raw.ins) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(p.n)) return bad("✗ input name '" + p.n + "' isn't a valid identifier");
+    if (seenIn.has(p.n)) return bad("✗ duplicate input name '" + p.n + "'");
+    seenIn.add(p.n);
+  }
+  const seenOut = new Set();
+  for (const p of raw.outs) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(p.n)) return bad("✗ output name '" + p.n + "' isn't a valid identifier");
+    if (seenOut.has(p.n)) return bad("✗ duplicate output name '" + p.n + "'");
+    seenOut.add(p.n);
+  }
+  ok("✓ " + raw.ins.length + " in, " + raw.outs.length + " out  ·  ready to save");
+}
+
+/* "Export .gdsp" -- writes the (synthesized or current) .gdsp source
+ * to a file the user can save. Reuses exportGdsp's logic via Blob +
+ * download anchor. Filename comes from the @gdsp-name when set,
+ * otherwise falls back to {nodeType}_{nodeId}.gdsp. */
+function _exportNodeAsGdsp() {
+  let src;
+  if (_nodeEditMode === "gdsp") {
+    src = _getGdspCode();
+  } else {
+    const node = state.nodes.find(n => n && n.id === _nodeEditTargetId);
+    src = _synthGdspSource(_captureRawState(), node);
+  }
+  let fname;
+  try {
+    const dirs = parseGdsp(src).directives;
+    fname = (dirs.name || "").trim();
+  } catch (_) {}
+  if (!fname) {
+    const node = state.nodes.find(n => n && n.id === _nodeEditTargetId);
+    fname = node ? (node.type + "_" + node.id) : "node-override";
+  }
+  const blob = new Blob([src], { type: "text/plain" });
+  const url  = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = fname + ".gdsp";
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  const warn = document.getElementById("node-edit-warn");
+  warn.textContent = "↓ exported " + fname + ".gdsp";
+  warn.classList.add("visible", "ok");
 }
 
 // Wire the modal's buttons + esc/cmd-enter shortcuts.
@@ -60594,6 +60787,8 @@ document.getElementById("btn-node-edit-close").addEventListener("click", closeNo
 document.getElementById("btn-node-edit-cancel").addEventListener("click", closeNodeCodeEditor);
 document.getElementById("btn-node-edit-save").addEventListener("click", _saveNodeOverride);
 document.getElementById("btn-node-edit-revert").addEventListener("click", _revertNodeOverride);
+document.getElementById("btn-node-edit-validate").addEventListener("click", _validateNodeOverride);
+document.getElementById("btn-node-edit-export").addEventListener("click", _exportNodeAsGdsp);
 document.getElementById("btn-node-edit-mode").addEventListener("click", () => {
   _setNodeEditMode(_nodeEditMode === "raw" ? "gdsp" : "raw");
 });
