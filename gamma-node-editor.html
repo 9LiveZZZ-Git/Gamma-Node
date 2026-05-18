@@ -24018,25 +24018,31 @@ function nodeById(id) { return state.nodes.find(n => n.id === id); }
  * button) to change C++ source, port lists, and setter wiring.
  *
  * Override shape (all fields optional):
- *   { cppType, helperClass, header, ins, outs, methods, gateMethods }
+ *   { cppType, helperClass, header, ins, outs, methods, gateMethods,
+ *     template, noSigArg }
  *
- * Whatever's present in override REPLACES the corresponding base
- * field wholesale (not a deep merge) -- so renaming or removing an
- * existing port works by writing a full new ins[] / outs[] array. */
+ * Field merge uses an "in ov" check rather than null-coalescing so
+ * an override can explicitly set a field to null (or false, or "")
+ * to DROP an inherited base value. Concrete use: when a template-
+ * only node (Mul, Add, ...) is converted to a real helperClass,
+ * we set override.template = null so codegen takes the cppType
+ * path instead of inlining the template. */
 function defOf(node) {
   const base = TYPES[node.type];
   if (!node || !node.override || !base) return base;
   const ov = node.override;
-  return {
-    ...base,
-    cppType:     (ov.cppType     != null) ? ov.cppType     : base.cppType,
-    helperClass: (ov.helperClass != null) ? ov.helperClass : base.helperClass,
-    header:      (ov.header      != null) ? ov.header      : base.header,
-    ins:         (ov.ins         != null) ? ov.ins         : base.ins,
-    outs:        (ov.outs        != null) ? ov.outs        : base.outs,
-    methods:     (ov.methods     != null) ? ov.methods     : base.methods,
-    gateMethods: (ov.gateMethods != null) ? ov.gateMethods : base.gateMethods
-  };
+  const merged = { ...base };
+  if ("cppType"     in ov) merged.cppType     = ov.cppType;
+  if ("helperClass" in ov) merged.helperClass = ov.helperClass;
+  if ("header"      in ov) merged.header      = ov.header;
+  if ("ins"         in ov) merged.ins         = ov.ins;
+  if ("outs"        in ov) merged.outs        = ov.outs;
+  if ("methods"     in ov) merged.methods     = ov.methods;
+  if ("gateMethods" in ov) merged.gateMethods = ov.gateMethods;
+  if ("template"    in ov) merged.template    = ov.template;
+  if ("noSigArg"    in ov) merged.noSigArg    = ov.noSigArg;
+  if ("extraCtor"   in ov) merged.extraCtor   = ov.extraCtor;
+  return merged;
 }
 
 function freshState() {
@@ -60196,6 +60202,9 @@ function buildCurveDrawPane(node) {
 
 let _nodeEditTargetId = null;          // id of the node being edited
 let _nodeEditorOpen   = false;         // gates main hotkeys
+let _nodeEditSeed     = null;          // result of _seedNodeEditCode for the current open --
+                                       // carries the synth's noSigArg hint + class name so
+                                       // save can wire the override correctly.
 
 /* CodeMirror instances for the two code panes, created lazily on
  * first modal open. Same options the User DSP editor uses so the
@@ -60261,25 +60270,50 @@ function openNodeCodeEditor(nodeId) {
   document.getElementById("node-edit-title").textContent =
     "Edit " + node.type + " · " + node.id;
 
+  // Pick the right pre-fill: helper-class nodes show their existing
+  // source; template / wrapper nodes show a synthesized class so
+  // EVERY node has editable C++ in the modal. Save will detect what
+  // shape the user authored and write the override accordingly.
+  const seed = _seedNodeEditCode(def, node);
+  _nodeEditSeed = seed;        // stashed for save -- carries synth's
+                               // noSigArg + className hints
+
   const cppTypeEl = document.getElementById("node-edit-cppType");
-  cppTypeEl.value = def.cppType || "";
+  // For synthesized cases the cppType field should default to the
+  // synth's class name (so save's override includes a matching
+  // cppType) rather than the original library type or empty string.
+  cppTypeEl.value = seed.synthClassName || def.cppType || "";
 
   // Seed the ports tables. Deep-copy so live edits don't mutate the
   // registry until "save" is clicked.
   const insArr  = (def.ins  || []).map(p => ({ n: p.n, t: p.t }));
   const outsArr = (def.outs || []).map(p => ({ n: p.n, t: p.t }));
+  // Methods + gateMethods come from the synth when we synthesized,
+  // otherwise from the registry def. The synth's methods ensure that
+  // every audio-input setter we emitted in the class is reflected in
+  // the registry's port-name -> setter map (codegen uses methods to
+  // decide which setters to call per sample).
   const methods = Object.assign({}, def.methods || {});
   const gateM   = Object.assign({}, def.gateMethods || {});
+  // Synthesized classes augment with their own setter map.
+  if (seed.synthClassName) {
+    const synth = (def.template
+      ? _classFromTemplate(def, node)
+      : (def.cppType ? _classFromWrapper(def, node) : null));
+    if (synth) {
+      if (synth.methods)     Object.assign(methods, synth.methods);
+      if (synth.gateMethods) Object.assign(gateM,   synth.gateMethods);
+    }
+  }
   _renderPortRows("in",  insArr,  methods, gateM);
   _renderPortRows("out", outsArr, methods, gateM);
 
-  // Helper-class source: show the current source verbatim, or a
-  // stub if this node type doesn't have one (template-only nodes
-  // like Add / Mul -- in that case we recommend giving it a cppType
-  // first).
-  const codeSrc = def.helperClass || (def.template
-    ? "// This node has no helperClass — it's a template-only node\n// (its operator() is inlined directly into the patch's expression).\n// To add custom C++, give it a cppType and a class above."
-    : "// (no helper class registered for this node type)");
+  // Update the section header so the user knows whether they're
+  // editing the original source vs a synthesized class.
+  const sectionHead = document.querySelector("#node-edit-raw-view .node-edit-section:last-of-type .node-edit-section-head");
+  if (sectionHead) sectionHead.textContent = seed.sectionLabel;
+
+  const codeSrc = (seed.hint ? seed.hint + "\n" : "") + seed.source;
 
   // Seed the raw textarea BEFORE initializing CodeMirror so that
   // fromTextArea() reads the right initial content.
@@ -60480,14 +60514,18 @@ function _saveNodeOverride() {
   }
 
   // Build methods + gateMethods objects restricted to current input
-  // port names of the appropriate type (drop orphans from renamed /
-  // removed ports).
+  // port names. Gate ports go into gateMethods; everything else
+  // (including audio) goes into methods. Audio inputs DO need methods
+  // entries for noSigArg-style classes: prepareSample's audio-input
+  // setter loop fires `n.a(...)` only when def.methods[p.n] exists.
+  // Without those entries, synthesized multi-audio classes (Mul, Add,
+  // Mix, ...) would output 0 because the setters never fire.
   const methods = {};
   const gateMethods = {};
   ins.forEach(p => {
     if (p.t === "gate") {
       if (gateMRaw[p.n]) gateMethods[p.n] = gateMRaw[p.n];
-    } else if (p.t !== "audio") {
+    } else {
       if (methodsRaw[p.n]) methods[p.n] = methodsRaw[p.n];
     }
   });
@@ -60514,6 +60552,43 @@ function _saveNodeOverride() {
   if (JSON.stringify(outs) !== JSON.stringify(base.outs || [])) ov.outs = outs;
   if (JSON.stringify(methods)     !== JSON.stringify(base.methods     || {})) ov.methods     = methods;
   if (JSON.stringify(gateMethods) !== JSON.stringify(base.gateMethods || {})) ov.gateMethods = gateMethods;
+
+  // Codegen routing decisions: if the user is saving a real class
+  // (cppType + helperClass present) and the base was a template-only
+  // entry, force template = null so computeBase takes the cppType
+  // path instead of inlining the template. Also derive noSigArg
+  // from the audio-input count + the seed's hint: multi-audio
+  // classes use the "setter for every audio input + operator()()"
+  // shape that prepareSample's existing setter loop already handles.
+  const hasRealClass = !!cppType && !!helperClass && /\bclass\s+\w+/.test(helperClass);
+  if (hasRealClass && base.template) ov.template = null;
+  // When the cppType has changed (wrapper synth, template->class
+  // synth), the base extraCtor lines target the OLD class type and
+  // call methods our new class likely doesn't expose. The wrapper
+  // synth already inlined those calls into the wrapper's ctor; the
+  // template synth doesn't need them at all. Null out so codegen's
+  // patch-class ctor doesn't re-fire them.
+  if (hasRealClass && cppType !== (base.cppType || "") && Array.isArray(base.extraCtor) && base.extraCtor.length) {
+    ov.extraCtor = null;
+  }
+  if (hasRealClass) {
+    const audioInCount = ins.filter(p => p.t === "audio").length;
+    const clockInCount = ins.filter(p => p.t === "clock").length;
+    const hasArgOp    = /operator\s*\(\s*\)\s*\(\s*float\b/.test(helperClass);
+    const hasNoArgOp  = /operator\s*\(\s*\)\s*\(\s*\)/.test(helperClass);
+    let noSig;
+    // Prefer the explicit shape detected in the source; fall back to
+    // the seed's hint (set during synthesis) when the regex doesn't
+    // match cleanly (e.g. operator() split across lines).
+    if (hasArgOp) noSig = false;
+    else if (hasNoArgOp) noSig = true;
+    else noSig = !!(_nodeEditSeed && _nodeEditSeed.noSigArg);
+    // Multi-audio always needs noSigArg = true regardless of detection
+    // since the single signal-arg path can only feed one of the audio
+    // inputs.
+    if (audioInCount + clockInCount > 1) noSig = true;
+    if (noSig !== !!base.noSigArg) ov.noSigArg = noSig;
+  }
 
   if (Object.keys(ov).length === 0) {
     delete node.override;
@@ -60547,6 +60622,315 @@ function _revertNodeOverride() {
  * helperClass). Toggling synthesizes/parses between the two views;
  * save reads whichever view is currently active. */
 let _nodeEditMode = "raw"; // "raw" | "gdsp"
+
+/* Classify a node's code form so the editor can pre-fill the modal
+ * with something editable for every node, not just helperClass ones.
+ *
+ *   "helper"   - has a real helperClass (KeyboardIn, Slider, Button,
+ *                PatchMatrix, etc.) -- show it as-is.
+ *   "template" - has an inline template (Mul, Add, Mix, Abs, ...) --
+ *                synthesize a class so it shows up as editable C++.
+ *   "wrapper"  - has cppType pointing to a library class but no
+ *                helperClass (Sine, Saw, Square, ...) -- synthesize
+ *                a wrapper class delegating to the library type.
+ *   "kind"     - special codegen kind (delay1, shader-frag) -- the
+ *                editor surfaces what's there with a note since
+ *                these paths can't currently be replaced via override.
+ *   "empty"    - none of the above; show a stub. */
+function _nodeCodeCategory(def) {
+  if (!def) return "empty";
+  if (def.kind) return "kind";
+  if (def.helperClass) return "helper";
+  if (def.template) return "template";
+  if (def.cppType)   return "wrapper";
+  return "empty";
+}
+
+/* Build a real C++ class from a template-only node's `template`
+ * string + port list. Two shapes:
+ *
+ *   * Single audio input (Neg, Abs, AmpToDb, ...):
+ *       operator()(float in) takes the audio in as arg; params
+ *       become setters + state members.
+ *
+ *   * Multi-audio input (Mul, Add, Sub, Mix, ...):
+ *       operator()() returns based on member state; both audio
+ *       inputs become setters (mirrors the existing PatchMatrix /
+ *       MasterMix codegen). noSigArg flag returned so the save path
+ *       can set it on the override -- the prepareSample audio-input
+ *       setter loop already handles this shape.
+ *
+ * Returns { source, className, noSigArg, methods } -- methods is the
+ * port-name -> setter-name map matching the synthesized setters. */
+function _classFromTemplate(def, node) {
+  const className = node.type;
+  const audioIns = (def.ins || []).filter(p => p.t === "audio");
+  const paramIns = (def.ins || []).filter(p => p.t === "param");
+  const clockIns = (def.ins || []).filter(p => p.t === "clock");
+  const oneAudio = audioIns.length === 1 && clockIns.length === 0;
+
+  // Some templates reference param keys that aren't in def.ins --
+  // they live in node.params and get substituted at codegen time via
+  // computeBase's `Object.keys(node.params).forEach` fallback. Const
+  // (template "{value}", params.value), Clip (template references
+  // {min} {max}), and Scale ({inMin}/{inMax}/{outMin}/{outMax}) all
+  // need this. Collect every {key} referenced and emit a member +
+  // setter for any that aren't covered by an input port.
+  const templateKeys = new Set();
+  const tplStr = def.template || "";
+  let kmatch;
+  const keyRe = /\{(\w+)\}/g;
+  while ((kmatch = keyRe.exec(tplStr))) templateKeys.add(kmatch[1]);
+  const knownInputs = new Set([
+    ...audioIns.map(p => p.n),
+    ...clockIns.map(p => p.n),
+    ...paramIns.map(p => p.n)
+  ]);
+  const paramOnly = [];
+  templateKeys.forEach(k => { if (!knownInputs.has(k)) paramOnly.push(k); });
+
+  let s = "";
+  s += "class " + className + " {\n";
+  if (!oneAudio) {
+    audioIns.forEach(p => { s += "    float " + p.n + "_ = 0.f;\n"; });
+    clockIns.forEach(p => { s += "    float " + p.n + "_ = 0.f;\n"; });
+  }
+  // Members for every wired param + every template-referenced
+  // params-only key. Defaults come from node.params (or def.params
+  // for keys not on this instance) so the synth seeds the same
+  // values the original template would have inlined.
+  const allParamKeys = [...paramIns.map(p => p.n), ...paramOnly];
+  allParamKeys.forEach(key => {
+    let dv = (node && node.params && node.params[key] !== undefined) ? node.params[key]
+           : (def.params && def.params[key] !== undefined) ? def.params[key]
+           : 0;
+    dv = Number(dv);
+    const lit = isFinite(dv) ? dv.toFixed(4).replace(/0+$/, "0") + "f" : "0.f";
+    s += "    float " + key + "_ = " + lit + ";\n";
+  });
+  s += "public:\n";
+
+  // Setters: every non-signal input + every params-only template key
+  // gets a name(float) setter. Codegen's existing audio-input setter
+  // loop fires `n.a(...)` for noSigArg multi-audio classes; the ctor
+  // body fires `n.value(<dv>)` from def.methods for params-only keys.
+  const methods = {};
+  if (!oneAudio) {
+    audioIns.forEach(p => {
+      s += "    void " + p.n + "(float v) { " + p.n + "_ = v; }\n";
+      methods[p.n] = p.n;
+    });
+    clockIns.forEach(p => {
+      s += "    void " + p.n + "(float v) { " + p.n + "_ = v; }\n";
+      methods[p.n] = p.n;
+    });
+  }
+  allParamKeys.forEach(key => {
+    s += "    void " + key + "(float v) { " + key + "_ = v; }\n";
+    methods[key] = key;
+  });
+
+  // Substitute {key} -> key (single-audio arg) or key_ (member).
+  let expr = def.template || "";
+  if (oneAudio) {
+    const argName = audioIns[0].n;
+    allParamKeys.forEach(key => {
+      expr = expr.replace(new RegExp("\\{" + key + "\\}", "g"), key + "_");
+    });
+    expr = expr.replace(new RegExp("\\{" + argName + "\\}", "g"), argName);
+    s += "    float operator()(float " + argName + ") {\n";
+    s += "        return " + expr + ";\n";
+    s += "    }\n";
+  } else {
+    [...audioIns, ...clockIns].forEach(p => {
+      expr = expr.replace(new RegExp("\\{" + p.n + "\\}", "g"), p.n + "_");
+    });
+    allParamKeys.forEach(key => {
+      expr = expr.replace(new RegExp("\\{" + key + "\\}", "g"), key + "_");
+    });
+    s += "    float operator()() {\n";
+    s += "        return " + expr + ";\n";
+    s += "    }\n";
+  }
+  s += "};\n";
+  return { source: s, className, noSigArg: !oneAudio, methods };
+}
+
+/* Synthesize a thin wrapper class around a library cppType
+ * (gam::Sine<>, gam::Biquad<>, ...). The wrapper holds the inner
+ * instance, exposes a setter per method/gate the registry declares,
+ * and delegates operator() to the inner type.
+ *
+ * The class name is "Custom" + the stripped library tail -- new
+ * enough that it won't collide with the registry's class name in
+ * the emitted header. Override.cppType is set to this new name so
+ * the patch-class member declaration matches. */
+function _classFromWrapper(def, node) {
+  const inner = def.cppType || "";
+  const baseTail = inner.replace(/<.*$/, "").split("::").pop() || (node ? node.type : "Inner");
+  const className = "Custom" + baseTail;
+  const audioIns = (def.ins || []).filter(p => p.t === "audio");
+  const oneAudio = audioIns.length === 1;
+  const noAudio  = audioIns.length === 0;
+
+  // If the base node has extraCtor (e.g. BiquadLP's
+  // "{id}.type(gam::LOW_PASS);", Reverb's resize calls), inline it
+  // into the wrapper's constructor so the init still runs against
+  // inner_. We rewrite {id}. -> inner_. so the call lands on the
+  // library instance. The save path nulls out base.extraCtor when
+  // the cppType changes -- otherwise it'd run again on the patch
+  // class and call .type() on our wrapper, which doesn't expose it.
+  let ctorLines = [];
+  (def.extraCtor || []).forEach(t => {
+    let raw = "";
+    if (typeof t === "function") {
+      try { raw = t(node) || ""; } catch (_) { raw = ""; }
+    } else {
+      raw = String(t || "");
+    }
+    if (!raw) return;
+    // raw may contain "{id}.method(...)" or "{id}." prefixes.
+    const rewritten = raw.replace(/\{id\}\./g, "inner_.").replace(/\{id\}/g, "inner_");
+    rewritten.split("\n").forEach(line => {
+      const trimmed = line.replace(/^\s*/, "");
+      if (trimmed) ctorLines.push(trimmed);
+    });
+  });
+
+  let s = "";
+  s += "class " + className + " {\n";
+  s += "    " + inner + " inner_;\n";
+  s += "public:\n";
+  if (ctorLines.length) {
+    s += "    " + className + "() {\n";
+    ctorLines.forEach(l => { s += "        " + l + "\n"; });
+    s += "    }\n";
+  }
+
+  // For each param input that has a setter, emit a delegating setter
+  // named after the setter (or after the port name if no method
+  // override). Uses a Set to dedup if multiple ports share a setter.
+  const emittedSetters = new Set();
+  const paramMethodsOut = {};
+  (def.ins || []).forEach(p => {
+    if (p.t !== "param") return;
+    const meth = (def.methods && def.methods[p.n]) || p.n;
+    // Strip "(...)" so methods like "phase(0.f)" reduce to "phase".
+    const setterName = String(meth).replace(/\(.*$/, "");
+    if (emittedSetters.has(setterName)) return;
+    emittedSetters.add(setterName);
+    s += "    void " + setterName + "(float v) { inner_." + setterName + "(v); }\n";
+    paramMethodsOut[p.n] = setterName;
+  });
+
+  // Gate inputs: emit a delegating method per gate. The gate method
+  // ON THE WRAPPER takes float v so codegen's audio-input setter
+  // path can call it uniformly; for the gate fire path
+  // (`if ((u) > 0.5f) wrapper.method;`) we rely on the literal
+  // method-with-args form ("phase(0.f)") which is left in the
+  // override.gateMethods unchanged from the base.
+  const gateMethodsOut = {};
+  (def.ins || []).forEach(p => {
+    if (p.t !== "gate") return;
+    const meth = (def.gateMethods && def.gateMethods[p.n]) || "reset";
+    const isLiteralCall = meth.indexOf("(") >= 0;
+    const fnName = String(meth).replace(/\(.*$/, "");
+    // Avoid double-emitting if the same method name was already done
+    // above as a setter (rare; happens when a port's setter shares
+    // the gate's method name).
+    if (!emittedSetters.has(fnName)) {
+      emittedSetters.add(fnName);
+      if (isLiteralCall) {
+        // "phase(0.f)" -> emit `void phase(float v)` that delegates so the
+        // codegen call `wrap.phase(0.f)` resolves via this setter.
+        s += "    void " + fnName + "(float v) { inner_." + fnName + "(v); }\n";
+      } else {
+        s += "    void " + fnName + "() { inner_." + fnName + "(); }\n";
+      }
+    }
+    // gateMethods stays the same literal so codegen emits the
+    // existing `wrap.<literal>` call.
+    gateMethodsOut[p.n] = meth;
+  });
+
+  if (oneAudio) {
+    const a = audioIns[0].n;
+    s += "    float operator()(float " + a + ") { return inner_(" + a + "); }\n";
+  } else if (noAudio) {
+    s += "    float operator()() { return inner_(); }\n";
+  } else {
+    // Multi-audio wrapper -- rare; emit a noSigArg placeholder.
+    audioIns.forEach(p => { s += "    float " + p.n + "_ = 0.f;\n"; });
+    audioIns.forEach(p => { s += "    void "  + p.n + "(float v) { " + p.n + "_ = v; }\n"; });
+    s += "    float operator()() {\n";
+    s += "        // TODO: route audio inputs to the inner type as your library expects.\n";
+    s += "        return inner_();\n";
+    s += "    }\n";
+  }
+  s += "};\n";
+
+  // Wire the existing method names (gateMethods stay literal because
+  // codegen treats parenthesized methods as call expressions). The
+  // additional audio-input setters when multi-audio go in methods.
+  const methods = { ...(def.methods || {}), ...paramMethodsOut };
+  if (!oneAudio && !noAudio) {
+    audioIns.forEach(p => { methods[p.n] = p.n; });
+  }
+  return { source: s, className, noSigArg: !oneAudio && !noAudio, methods, gateMethods: gateMethodsOut };
+}
+
+/* Pick the right pre-fill content for the modal based on the node's
+ * code category. Returns { source, sectionLabel, hint, synthClassName,
+ * noSigArg } -- the modal uses these to populate the code area and
+ * the section-header text. */
+function _seedNodeEditCode(def, node) {
+  const cat = _nodeCodeCategory(def);
+  if (cat === "helper") {
+    return {
+      source: def.helperClass,
+      sectionLabel: "helper class (C++ source)",
+      hint: "",
+      synthClassName: null,
+      noSigArg: !!def.noSigArg
+    };
+  }
+  if (cat === "template") {
+    const { source, className, noSigArg } = _classFromTemplate(def, node);
+    return {
+      source,
+      sectionLabel: "synthesized class (was: inline template '" + (def.template || "") + "')",
+      hint: "// Original inline template: " + (def.template || "") + "\n// Editing + saving will route this node through a real class instead of the inline template.\n",
+      synthClassName: className,
+      noSigArg
+    };
+  }
+  if (cat === "wrapper") {
+    const { source, className, noSigArg } = _classFromWrapper(def, node);
+    return {
+      source,
+      sectionLabel: "synthesized wrapper class (was: " + (def.cppType || "?") + ")",
+      hint: "// Wraps " + (def.cppType || "?") + " from the Gamma library.\n// Edit to customize -- or replace the class entirely with your own.\n",
+      synthClassName: className,
+      noSigArg
+    };
+  }
+  if (cat === "kind") {
+    return {
+      source: def.helperClass || ("// This node has special codegen kind '" + def.kind + "'.\n// The current code editor doesn't support overriding the codegen path itself yet.\n// You can still edit ports / cppType, but the kind-specific behavior remains."),
+      sectionLabel: "node kind: " + def.kind + " (special codegen path)",
+      hint: "",
+      synthClassName: null,
+      noSigArg: !!def.noSigArg
+    };
+  }
+  return {
+    source: "// (no source registered for this node type)\n// Add a class declaration here + a cppType above to provide one.",
+    sectionLabel: "helper class (C++ source)",
+    hint: "",
+    synthClassName: null,
+    noSigArg: false
+  };
+}
 
 /* Pull the current "raw view" fields into a plain state object. */
 function _captureRawState() {
