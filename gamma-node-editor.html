@@ -39705,6 +39705,26 @@ function _buildTouchscreenHtml() {
     margin: 8px 0 -2px 2px;
   }
   .ctrl-group-label:first-child { margin-top: 2px; }
+  /* Header row above the sliders section. Holds the section label
+     on the left and the orientation toggle on the right. */
+  .ctrl-sliders-header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin: 8px 0 -2px 2px;
+  }
+  .ctrl-sliders-header .ctrl-group-label { margin: 0; }
+  .ctrl-orient-btn {
+    padding: 5px 10px;
+    background: var(--instr-bg);
+    border: 1px solid var(--phosphor-dim);
+    color: var(--phosphor);
+    font-family: var(--font-instr);
+    font-size: 9px;
+    letter-spacing: 0.16em;
+    text-transform: lowercase;
+    cursor: pointer;
+  }
+  .ctrl-orient-btn:hover  { background: var(--instr-bg-2); border-color: var(--phosphor-mid); }
+  .ctrl-orient-btn:active { background: var(--phosphor); color: var(--instr-bg); }
   /* Row matches main editor's .monitor-control: dim panel bg,
      hairline phosphor rule, sharp corners. */
   .ctrl-row {
@@ -39757,6 +39777,53 @@ function _buildTouchscreenHtml() {
     font-variant-numeric: tabular-nums;
     min-width: 64px;
     text-align: right;
+  }
+  /* Vertical slider mode: wraps multiple slider columns into a
+     horizontal flex strip, like a mixer board. Each column is its
+     own row card. */
+  .ctrl-sliders-vert {
+    display: flex; gap: 8px; flex-wrap: wrap;
+    align-content: flex-start;
+  }
+  .ctrl-row-vert {
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: space-between;
+    gap: 10px;
+    padding: 12px 10px;
+    background: var(--instr-bg-2);
+    border: 1px solid var(--instr-rule);
+    min-width: 60px;
+  }
+  .ctrl-row-vert.disabled { opacity: 0.55; }
+  .ctrl-slider-vert {
+    -webkit-appearance: slider-vertical;
+    appearance: slider-vertical;
+    /* writing-mode + direction is the modern cross-browser path
+       (Chrome 122+, Firefox), the slider-vertical appearance keeps
+       older WebKit working. RTL flips min->max so the high end is
+       at the top, matching a mixer fader. */
+    writing-mode: vertical-lr;
+    direction: rtl;
+    width: 28px;
+    height: 220px;
+    background: var(--instr-bg);
+    border: 1px solid var(--instr-rule);
+    outline: none;
+    cursor: pointer;
+    touch-action: none;
+  }
+  .ctrl-slider-vert::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 26px; height: 26px;
+    background: var(--phosphor);
+    border: 1px solid var(--instr-bg);
+    cursor: grab;
+  }
+  .ctrl-slider-vert::-moz-range-thumb {
+    width: 26px; height: 26px;
+    background: var(--phosphor);
+    border: 1px solid var(--instr-bg);
+    cursor: grab;
   }
   /* Button widget styled exactly like main's .monitor-control-button
      but larger padding for touch. */
@@ -40139,72 +40206,237 @@ function _buildTouchscreenHtml() {
     try { localStorage.setItem("gamma-touch-kb-height", String(_kbHeight)); } catch (_) {}
   }
 
+  // Slider orientation -- horizontal (default) or vertical mixer-fader
+  // style. Persisted to localStorage.
+  function _loadVertSliders() {
+    try { return localStorage.getItem("gamma-touch-vert-sliders") === "1"; }
+    catch (_) { return false; }
+  }
+  let _vertSliders = _loadVertSliders();
+  function _saveVertSliders(v) {
+    _vertSliders = !!v;
+    try { localStorage.setItem("gamma-touch-vert-sliders", _vertSliders ? "1" : "0"); } catch (_) {}
+  }
+
+  // Cached refs for in-place updates. Set by _rebuildControls,
+  // read by _updateControlsInPlace. Without this cache, every
+  // snapshot from main blew away the slider DOM mid-drag and the
+  // user's pointer capture broke.
+  let _rowRefs = null;
+  let _lastSig = "";
+
+  // Per-slider drag state. The slider's pointerdown sets a flag the
+  // snapshot-handler checks before overwriting the thumb position --
+  // prevents the popup from fighting the user's own finger.
+  const _sliderDragging = new Set();
+
+  /* Top-level render: decide whether to do an in-place update or a
+   * full rebuild based on structural signature. Same set of nodes +
+   * same orientation -> in-place; anything else -> rebuild. */
   function renderControls(snap) {
     _lastSnap = snap;
-    // Status bar reflects playback state -- widgets are not literally
-    // disabled (touch latency would suck if we had to re-enable them on
-    // play) but are visually dimmed when audio isn't running.
     const playing = !!snap.playing;
     ctrlPlayPip.classList.toggle("playing", playing);
     ctrlPlayTxt.textContent = playing
-      ? "Audio: playing — controls are live"
-      : "Audio: stopped — start playback (▶) in the main editor for live control";
+      ? "audio: playing — controls are live"
+      : "audio: stopped — start playback (▶) in the main editor for live control";
 
-    ctrlList.innerHTML = "";
     const hasAny = (snap.sliders && snap.sliders.length)
                  || (snap.buttons && snap.buttons.length)
                  || (snap.keyboard && snap.keyboard.present);
     ctrlEmpty.style.display = hasAny ? "none" : "block";
-    if (!hasAny) return;
-
-    // -- Sliders ------------------------------------------------
-    if (snap.sliders && snap.sliders.length) {
-      const label = document.createElement("div");
-      label.className = "ctrl-group-label";
-      label.textContent = "Sliders";
-      ctrlList.appendChild(label);
-      snap.sliders.forEach(s => ctrlList.appendChild(_buildSliderRow(s, playing)));
+    if (!hasAny) {
+      ctrlList.innerHTML = "";
+      _rowRefs = null; _lastSig = "";
+      return;
     }
-
-    // -- Buttons ------------------------------------------------
-    if (snap.buttons && snap.buttons.length) {
-      const label = document.createElement("div");
-      label.className = "ctrl-group-label";
-      label.textContent = "Buttons";
-      ctrlList.appendChild(label);
-      snap.buttons.forEach(b => ctrlList.appendChild(_buildButtonRow(b, playing)));
-    }
-
-    // -- Keyboard -----------------------------------------------
-    if (snap.keyboard && snap.keyboard.present) {
-      const label = document.createElement("div");
-      label.className = "ctrl-group-label";
-      label.textContent = "Keyboard";
-      ctrlList.appendChild(label);
-      ctrlList.appendChild(_buildKeyboardWidget(snap.octaveShift || 0, playing));
+    const sig = _snapshotSignature(snap);
+    if (sig === _lastSig && _rowRefs) {
+      _updateControlsInPlace(snap, playing);
+    } else {
+      _rebuildControls(snap, playing);
+      _lastSig = sig;
     }
   }
 
+  // Structural fingerprint: which nodes are present, in what
+  // categories, with which orientation. Excludes the live VALUE
+  // of any slider so per-frame value drift doesn't bust the cache.
+  function _snapshotSignature(snap) {
+    const sl = (snap.sliders || []).map(s => s.id).join(",");
+    const bt = (snap.buttons || []).map(b => b.id).join(",");
+    const kb = snap.keyboard && snap.keyboard.present ? "kb" : "";
+    const v  = _vertSliders ? "v" : "h";
+    return sl + "|" + bt + "|" + kb + "|" + v;
+  }
+
+  function _rebuildControls(snap, playing) {
+    ctrlList.innerHTML = "";
+    _rowRefs = { sliders: new Map(), buttons: new Map(), keyboardWrap: null };
+
+    // Order: keyboard first (most spatial / most-touched), then
+    // buttons (transient triggers), then sliders (continuous params
+    // that can sit at the bottom in vertical-mixer mode).
+    if (snap.keyboard && snap.keyboard.present) {
+      const label = document.createElement("div");
+      label.className = "ctrl-group-label";
+      label.textContent = "keyboard";
+      ctrlList.appendChild(label);
+      const kbWrap = _buildKeyboardWidget(snap.octaveShift || 0, playing);
+      kbWrap.dataset.shift = String(snap.octaveShift || 0);
+      ctrlList.appendChild(kbWrap);
+      _rowRefs.keyboardWrap = kbWrap;
+    }
+
+    if (snap.buttons && snap.buttons.length) {
+      const label = document.createElement("div");
+      label.className = "ctrl-group-label";
+      label.textContent = "buttons";
+      ctrlList.appendChild(label);
+      snap.buttons.forEach(b => {
+        const row = _buildButtonRow(b, playing);
+        ctrlList.appendChild(row);
+        _rowRefs.buttons.set(b.id, { row });
+      });
+    }
+
+    if (snap.sliders && snap.sliders.length) {
+      // Section header has a toggle button to flip orientation.
+      const header = document.createElement("div");
+      header.className = "ctrl-sliders-header";
+      const label = document.createElement("div");
+      label.className = "ctrl-group-label";
+      label.textContent = "sliders";
+      const orientBtn = document.createElement("button");
+      orientBtn.className = "ctrl-orient-btn";
+      orientBtn.textContent = _vertSliders ? "═ horizontal" : "▮ vertical";
+      orientBtn.addEventListener("pointerdown", (ev) => {
+        ev.preventDefault();
+        _saveVertSliders(!_vertSliders);
+        // Rebuild because the layout container differs.
+        _lastSig = "";
+        renderControls(_lastSnap);
+      });
+      header.appendChild(label);
+      header.appendChild(orientBtn);
+      ctrlList.appendChild(header);
+
+      if (_vertSliders) {
+        const grid = document.createElement("div");
+        grid.className = "ctrl-sliders-vert";
+        snap.sliders.forEach(s => {
+          const row = _buildSliderRowVert(s, playing);
+          grid.appendChild(row.el);
+          _rowRefs.sliders.set(s.id, row);
+        });
+        ctrlList.appendChild(grid);
+      } else {
+        snap.sliders.forEach(s => {
+          const row = _buildSliderRow(s, playing);
+          ctrlList.appendChild(row.el);
+          _rowRefs.sliders.set(s.id, row);
+        });
+      }
+    }
+  }
+
+  /* In-place update path. Avoids rebuilding the DOM so the user's
+   * active drag stays attached to its <input>. Skip any slider
+   * currently being dragged (the user's finger is authoritative). */
+  function _updateControlsInPlace(snap, playing) {
+    // Slider values
+    (snap.sliders || []).forEach(s => {
+      const ref = _rowRefs.sliders.get(s.id);
+      if (!ref) return;
+      // Track range/curve in case main editor changed them.
+      ref.s = s;
+      ref.el.classList.toggle("disabled", !playing);
+      if (_sliderDragging.has(s.id)) return;
+      const t = _sliderTFromValue(s.value, s.min, s.max, s.curve, s.curveTable);
+      ref.input.value = String(t);
+      ref.val.textContent = _fmtVal(s.value, s.min, s.max);
+    });
+    // Buttons: just keep disabled state in sync.
+    (snap.buttons || []).forEach(b => {
+      const ref = _rowRefs.buttons.get(b.id);
+      if (ref && ref.row) ref.row.classList.toggle("disabled", !playing);
+    });
+    // Keyboard: if octave shift changed, swap the whole widget --
+    // cheap rebuild that doesn't touch the slider DOM.
+    const kbWrap = _rowRefs.keyboardWrap;
+    if (kbWrap && snap.keyboard && snap.keyboard.present) {
+      const wantShift = String(snap.octaveShift || 0);
+      if (kbWrap.dataset.shift !== wantShift) {
+        const newKb = _buildKeyboardWidget(snap.octaveShift || 0, playing);
+        newKb.dataset.shift = wantShift;
+        kbWrap.replaceWith(newKb);
+        _rowRefs.keyboardWrap = newKb;
+      } else {
+        kbWrap.classList.toggle("disabled", !playing);
+      }
+    }
+  }
+
+  /* Horizontal slider row (default). Returns { el, input, val, s }
+   * so the in-place updater can mutate value/thumb without rebuild. */
   function _buildSliderRow(s, playing) {
-    const row = document.createElement("div");
-    row.className = "ctrl-row" + (playing ? "" : " disabled");
+    const el = document.createElement("div");
+    el.className = "ctrl-row" + (playing ? "" : " disabled");
     const t = _sliderTFromValue(s.value, s.min, s.max, s.curve, s.curveTable);
-    row.innerHTML =
+    el.innerHTML =
       '<span class="ctrl-id">sld <b>' + s.id + '</b></span>' +
       '<input class="ctrl-slider-input" type="range" min="0" max="1" step="0.001" value="' + t + '" />' +
       '<span class="ctrl-val">' + _fmtVal(s.value, s.min, s.max) + '</span>';
-    const input = row.querySelector(".ctrl-slider-input");
-    const val   = row.querySelector(".ctrl-val");
+    const input = el.querySelector(".ctrl-slider-input");
+    const val   = el.querySelector(".ctrl-val");
+    _wireSliderInput(input, val, s);
+    return { el, input, val, s };
+  }
+
+  /* Vertical (mixer-fader) slider column. Same data, different
+   * stacking: id on top, slider in middle, value at bottom. */
+  function _buildSliderRowVert(s, playing) {
+    const el = document.createElement("div");
+    el.className = "ctrl-row-vert" + (playing ? "" : " disabled");
+    const t = _sliderTFromValue(s.value, s.min, s.max, s.curve, s.curveTable);
+    el.innerHTML =
+      '<span class="ctrl-id">' + s.id + '</span>' +
+      '<input class="ctrl-slider-vert" type="range" orient="vertical" min="0" max="1" step="0.001" value="' + t + '" />' +
+      '<span class="ctrl-val">' + _fmtVal(s.value, s.min, s.max) + '</span>';
+    const input = el.querySelector(".ctrl-slider-vert");
+    const val   = el.querySelector(".ctrl-val");
+    _wireSliderInput(input, val, s);
+    return { el, input, val, s };
+  }
+
+  /* Shared listener wiring -- same logic for horizontal + vertical.
+   * pointerdown / pointerup track the drag state so snapshot updates
+   * skip this slider while the user holds it. */
+  function _wireSliderInput(input, val, s) {
     input.addEventListener("input", () => {
       const tt = Number(input.value);
-      const v = _sliderValueFromT(tt, s.min, s.max, s.curve, s.curveTable);
-      val.textContent = _fmtVal(v, s.min, s.max);
-      // Optimistic update -- popup shows new value instantly. Main
-      // also re-broadcasts the resolved value so we re-sync if other
-      // sources (main UI, OSC, MIDI) change it.
+      // Look up the LATEST range/curve from _rowRefs (main editor
+      // might have changed min/max via the curve modal while popup
+      // was open).
+      const ref = _rowRefs && _rowRefs.sliders.get(s.id);
+      const cur = ref && ref.s ? ref.s : s;
+      const v = _sliderValueFromT(tt, cur.min, cur.max, cur.curve, cur.curveTable);
+      val.textContent = _fmtVal(v, cur.min, cur.max);
       ch.postMessage({ type: "control-slider", id: s.id, t: tt });
     });
-    return row;
+    // Drag-lock: prevents the in-place updater from stomping the
+    // thumb mid-drag. Bound to pointer events (covers touch + mouse).
+    input.addEventListener("pointerdown", () => { _sliderDragging.add(s.id); });
+    // Use window for pointerup -- the pointer might leave the input
+    // before being released, especially on vertical sliders where
+    // the cursor can wander off the narrow column.
+    const onUp = () => { _sliderDragging.delete(s.id); };
+    input.addEventListener("pointerup",     onUp);
+    input.addEventListener("pointercancel", onUp);
+    input.addEventListener("lostpointercapture", onUp);
+    // Final safety net: window pointerup catches the case where the
+    // pointer was released way outside the input.
+    window.addEventListener("pointerup", onUp);
   }
 
   function _buildButtonRow(b, playing) {
@@ -40399,60 +40631,67 @@ function _buildTouchscreenHtml() {
       });
     }
 
-    // Pointer routing: single set of listeners on the board (vs per-
-    // key) so dragging across keys (glissando) works without state
-    // per key. Uses elementFromPoint each move because on touch,
-    // pointerup's e.target is the pointerdown element for the whole
-    // gesture -- see touch-implicit-capture memo.
-    const held = new Set(); // MIDI numbers currently held
+    // Pointer routing: per-pointer state so polyphony works (two
+    // fingers = two simultaneous notes) AND the keyboard doesn't
+    // interfere with concurrent slider drags (each pointerId is
+    // captured separately by the element it landed on).
+    // heldByPointer: pointerId -> midi note. Glissando: when a
+    // finger slides to a new key, release the prior note for THAT
+    // finger only and press the new one. Other fingers stay held.
+    const heldByPointer = new Map();
     function _keyAt(ev) {
       const el = document.elementFromPoint(ev.clientX, ev.clientY);
       if (!el || !el.dataset || !el.dataset.midi) return null;
       if (!board.contains(el)) return null;
       return el;
     }
-    function _press(el) {
+    function _midiHeldByOther(midi, ownPid) {
+      for (const [pid, m] of heldByPointer) {
+        if (pid !== ownPid && m === midi) return true;
+      }
+      return false;
+    }
+    function _press(pid, el) {
       if (!el) return;
       const midi = Number(el.dataset.midi);
-      if (held.has(midi)) return;
-      held.add(midi);
+      const prev = heldByPointer.get(pid);
+      if (prev === midi) return;
+      if (prev != null) {
+        // Glissando: release the prior note for THIS finger only.
+        // Keep the highlight if another finger is also on it.
+        if (!_midiHeldByOther(prev, pid)) {
+          const prevEl = board.querySelector('[data-midi="' + prev + '"]');
+          if (prevEl) prevEl.classList.remove("held");
+        }
+        ch.postMessage({ type: "control-key-up", midi: prev });
+      }
+      heldByPointer.set(pid, midi);
       el.classList.add("held");
       ch.postMessage({ type: "control-key-down", midi });
     }
-    function _releaseAll() {
-      held.forEach(midi => {
+    function _release(pid) {
+      const midi = heldByPointer.get(pid);
+      if (midi == null) return;
+      heldByPointer.delete(pid);
+      if (!_midiHeldByOther(midi, pid)) {
         const el = board.querySelector('[data-midi="' + midi + '"]');
         if (el) el.classList.remove("held");
-        ch.postMessage({ type: "control-key-up", midi });
-      });
-      held.clear();
-    }
-    function _swapTo(newEl) {
-      if (!newEl) return;
-      const midi = Number(newEl.dataset.midi);
-      if (held.has(midi)) return;
-      // Release the prior key (glissando: only one note at a time per
-      // gesture -- monophonic). If you want polyphony, drop the
-      // _releaseAll and just _press the new key.
-      held.forEach(prev => {
-        const prevEl = board.querySelector('[data-midi="' + prev + '"]');
-        if (prevEl) prevEl.classList.remove("held");
-        ch.postMessage({ type: "control-key-up", midi: prev });
-      });
-      held.clear();
-      _press(newEl);
+      }
+      ch.postMessage({ type: "control-key-up", midi });
     }
     board.addEventListener("pointerdown", (ev) => {
       ev.preventDefault();
       board.setPointerCapture(ev.pointerId);
-      _press(_keyAt(ev));
+      _press(ev.pointerId, _keyAt(ev));
     });
     board.addEventListener("pointermove", (ev) => {
-      if (!held.size) return;
-      _swapTo(_keyAt(ev));
+      if (!heldByPointer.has(ev.pointerId)) return;
+      const el = _keyAt(ev);
+      if (el) _press(ev.pointerId, el);
     });
-    board.addEventListener("pointerup",     () => _releaseAll());
-    board.addEventListener("pointercancel", () => _releaseAll());
+    board.addEventListener("pointerup",     (ev) => _release(ev.pointerId));
+    board.addEventListener("pointercancel", (ev) => _release(ev.pointerId));
+    board.addEventListener("lostpointercapture", (ev) => _release(ev.pointerId));
 
     wrap.appendChild(board);
     return wrap;
