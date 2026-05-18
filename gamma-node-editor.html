@@ -10636,6 +10636,58 @@ public:
     description: "Cone primitive: apex at +Y, circular base at -Y. radius is the base radius; height is apex-to-base distance. slices (3..128) is the angular resolution. Includes bottom cap. Vertex color fades from a warm apex (gold) to a cool base (slate)."
   },
 
+  /* Phase 7 §5.5.a — Terrain. Heightmap-displaced XZ grid mesh.
+   * For this first push the displacement uses BUILT-IN fBm noise
+   * computed CPU-side at mesh-build time (same hash + octave-mix
+   * formula ProceduralTerrain uses in WGSL, so dialing in the noise
+   * params here previews what ProceduralTerrain would emit). The
+   * GPU heightmap-texture-into-vertex-shader path (so Terrain can
+   * sample ProceduralTerrain.out per-frame) lands in a later sprint
+   * once the mesh pipeline grows a per-mesh heightmap binding.
+   *
+   * Built-in noise params (seed/frequency/octaves/lacunarity/gain/
+   * ridges) deliberately mirror ProceduralTerrain's so the eventual
+   * wired path is a drop-in.
+   *
+   * Normals come from finite differences on the height field --
+   * accurate enough for shading without an extra pass. Vertex color
+   * grades by altitude (slate-blue valleys → grass → rock → snow
+   * caps) so the mesh reads as terrain under the default unlit-vc
+   * material. Pair with a Phong / PBR material when you want lit
+   * terrain. */
+  Terrain: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "mesh-gen",
+    ins: [
+      { n: "width",       t: "param" },
+      { n: "depth",       t: "param" },
+      { n: "heightScale", t: "param" },
+      { n: "segments",    t: "param" },
+      { n: "seed",        t: "param" },
+      { n: "frequency",   t: "param" },
+      { n: "octaves",     t: "param" },
+      { n: "lacunarity",  t: "param" },
+      { n: "gain",        t: "param" },
+      { n: "ridges",      t: "param" }
+    ],
+    outs: [{ n: "mesh", t: "mesh" }],
+    params: {
+      width:       20,
+      depth:       20,
+      heightScale: 4,
+      segments:    64,
+      seed:        1.234,
+      frequency:   2.0,
+      octaves:     5,
+      lacunarity:  2.0,
+      gain:        0.5,
+      ridges:      0.0
+    },
+    methods: {},
+    description: "Heightmap-displaced terrain grid (Phase 7 §5.5.a). width / depth in world units, heightScale scales the peak height, segments (1..256) controls mesh resolution per axis (so 64 = 4225 verts, 8192 tris). Noise params match ProceduralTerrain: seed, frequency (cycles across the patch), octaves (1..8 fBm bands), lacunarity (freq mult/octave), gain (amp mult/octave), ridges (0=fBm hills, 1=sharp ridges). Vertex color grades by altitude — blue valleys → grass → rock → snow caps — so it reads as terrain even under unlit-vc. Mesh rebuilds when any param changes; cost is one CPU-side noise pass scaling with segments²."
+  },
+
   /* =========================================================================
    * Sprint 7.5.3b -- Mesh transforms
    *
@@ -50661,6 +50713,10 @@ function _meshCacheKey(node) {
     case "Torus":         return "tor:" + [p.majorRadius, p.minorRadius, p.majorSlices, p.minorSlices].join(",");
     case "Cylinder":      return "cyl:" + [p.radius, p.height, p.slices].join(",");
     case "Cone":          return "con:" + [p.radius, p.height, p.slices].join(",");
+    case "Terrain":       return "ter:" + [
+      p.width, p.depth, p.heightScale, p.segments,
+      p.seed, p.frequency, p.octaves, p.lacunarity, p.gain, p.ridges
+    ].join(",");
     default:              return node.type;
   }
 }
@@ -50682,6 +50738,7 @@ function _buildMeshData(node) {
     case "Torus":         return _buildTorus(node);
     case "Cylinder":      return _buildCylinder(node);
     case "Cone":          return _buildCone(node);
+    case "Terrain":       return _buildTerrain(node);
     default: return null;
   }
 }
@@ -50807,6 +50864,169 @@ function _buildPlane(node) {
     -hw, 0,  hd,   0.45, 0.78, 0.65,   0, 1, 0,   0, 1    // front-left
   ]);
   const indices = new Uint32Array([0, 1, 2,  0, 2, 3]);
+  return { verts, indices };
+}
+
+/* Phase 7 §5.5.a — Terrain noise helpers. Same hash + value-noise +
+ * fBm formula as ProceduralTerrain's WGSL (§5.5.b) so a JS-built
+ * Terrain mesh with identical noise params previews what a future
+ * ProceduralTerrain → Terrain wired path would emit at GPU time. */
+function _terrainHash(x, y, seed) {
+  const hx = x * 127.1 + y * 311.7;
+  const hy = x * 269.5 + y * 183.3;
+  // Math.sin-based hash; the same constants the WGSL helper uses.
+  const v = Math.sin(hx + hy + seed) * 43758.5453;
+  return v - Math.floor(v);
+}
+function _terrainValueNoise(x, y, seed) {
+  const ix = Math.floor(x), iy = Math.floor(y);
+  const fx = x - ix, fy = y - iy;
+  const a = _terrainHash(ix,     iy,     seed);
+  const b = _terrainHash(ix + 1, iy,     seed);
+  const c = _terrainHash(ix,     iy + 1, seed);
+  const d = _terrainHash(ix + 1, iy + 1, seed);
+  // Smoothstep weights -- matches WGSL's f*f*(3-2f).
+  const sx = fx * fx * (3 - 2 * fx);
+  const sy = fy * fy * (3 - 2 * fy);
+  return (a + (b - a) * sx) + ((c + (d - c) * sx) - (a + (b - a) * sx)) * sy;
+}
+function _terrainFBM(u, v, n) {
+  let px = u * Math.max(0.001, n.frequency);
+  let py = v * Math.max(0.001, n.frequency);
+  let amp = 1.0, sum = 0.0, maxAmp = 0.0;
+  const octs = Math.max(1, Math.min(8, Math.floor(n.octaves)));
+  const r = Math.max(0, Math.min(1, n.ridges));
+  for (let i = 0; i < octs; i++) {
+    let s = _terrainValueNoise(px, py, n.seed);
+    const ridge = 1 - Math.abs(2 * s - 1);
+    s = s * (1 - r) + ridge * ridge * r;
+    sum += s * amp;
+    maxAmp += amp;
+    px *= n.lacunarity;
+    py *= n.lacunarity;
+    amp *= n.gain;
+  }
+  return Math.max(0, Math.min(1, sum / Math.max(1e-6, maxAmp)));
+}
+
+/* Terrain -- heightmap-displaced XZ grid. (segments+1)² verts laid
+ * out on the XZ plane centered at origin, Y displaced by built-in
+ * fBm. Normals via central-difference finite-difference on the
+ * height field. Vertex color grades by altitude (blue → grass →
+ * rock → snow) so the mesh reads as terrain under the default
+ * unlit-vc material; pair with a Phong / PBR material for lit
+ * shading. */
+function _buildTerrain(node) {
+  const p = node.params || {};
+  const w  = (typeof p.width       === "number") ? p.width       : 20;
+  const dd = (typeof p.depth       === "number") ? p.depth       : 20;
+  const hs = (typeof p.heightScale === "number") ? p.heightScale : 4;
+  const segs = Math.max(1, Math.min(256, Math.floor((typeof p.segments === "number") ? p.segments : 64)));
+  const noise = {
+    seed:       (typeof p.seed       === "number") ? p.seed       : 1.234,
+    frequency:  (typeof p.frequency  === "number") ? p.frequency  : 2.0,
+    octaves:    (typeof p.octaves    === "number") ? p.octaves    : 5,
+    lacunarity: (typeof p.lacunarity === "number") ? p.lacunarity : 2.0,
+    gain:       (typeof p.gain       === "number") ? p.gain       : 0.5,
+    ridges:     (typeof p.ridges     === "number") ? p.ridges     : 0.0
+  };
+  const N = segs + 1;
+  const hw = w * 0.5, hd = dd * 0.5;
+  const dx = w / segs, dz = dd / segs;
+
+  // Pre-sample the height field. Reused for the central-difference
+  // normal computation -- without the cache we'd re-evaluate 4× per
+  // vertex which gets expensive at segments=256 (~260k extra fBm calls).
+  const heights = new Float32Array(N * N);
+  for (let j = 0; j < N; j++) {
+    for (let i = 0; i < N; i++) {
+      heights[j * N + i] = _terrainFBM(i / segs, j / segs, noise) * hs;
+    }
+  }
+
+  const verts = new Float32Array(N * N * 11);
+  const indices = new Uint32Array(segs * segs * 6);
+  let vi = 0;
+  for (let j = 0; j < N; j++) {
+    for (let i = 0; i < N; i++) {
+      const x = -hw + i * dx;
+      const z = -hd + j * dz;
+      const y = heights[j * N + i];
+
+      // Central-difference normal. Edge pixels clamp to the cell
+      // value (matches sample-edge semantics).
+      const yL = (i > 0)    ? heights[j * N + (i - 1)] : y;
+      const yR = (i < segs) ? heights[j * N + (i + 1)] : y;
+      const yD = (j > 0)    ? heights[(j - 1) * N + i] : y;
+      const yU = (j < segs) ? heights[(j + 1) * N + i] : y;
+      const dydx = (yR - yL) / (2 * dx);
+      const dydz = (yU - yD) / (2 * dz);
+      // Tangent_x = (1, dydx, 0), Tangent_z = (0, dydz, 1). Cross
+      // gives (dydx, -1, dydz); flip sign so the normal points +Y.
+      let nx = -dydx, ny = 1, nz = -dydz;
+      const nlen = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+      nx /= nlen; ny /= nlen; nz /= nlen;
+
+      // Altitude-based color gradient. Smooth-shaded transitions
+      // between four bands so the mesh reads as terrain even unlit.
+      // Bands: water (h<0.25) / grass (0.25..0.55) / rock (0.55..0.80)
+      // / snow (>0.80). All values normalized to heightScale.
+      const h01 = (hs > 0) ? Math.max(0, Math.min(1, y / hs)) : 0;
+      let rC, gC, bC;
+      if (h01 < 0.25) {
+        // Slate-blue water -> grass-green
+        const t = h01 / 0.25;
+        rC = 0.25 + t * 0.20; gC = 0.35 + t * 0.30; bC = 0.55 - t * 0.30;
+      } else if (h01 < 0.55) {
+        // Grass
+        const t = (h01 - 0.25) / 0.30;
+        rC = 0.45 - t * 0.10; gC = 0.65 - t * 0.20; bC = 0.25 - t * 0.05;
+      } else if (h01 < 0.80) {
+        // Rock (warm gray)
+        const t = (h01 - 0.55) / 0.25;
+        rC = 0.35 + t * 0.30; gC = 0.45 + t * 0.20; bC = 0.20 + t * 0.30;
+      } else {
+        // Snow caps
+        const t = (h01 - 0.80) / 0.20;
+        rC = 0.65 + t * 0.35; gC = 0.65 + t * 0.35; bC = 0.50 + t * 0.50;
+      }
+      // Slope tint: steep faces darken slightly so peaks look craggy.
+      const slope = 1 - ny;
+      const slopeMul = 1 - slope * 0.4;
+      rC *= slopeMul; gC *= slopeMul; bC *= slopeMul;
+
+      verts[vi++] = x;
+      verts[vi++] = y;
+      verts[vi++] = z;
+      verts[vi++] = Math.max(0, Math.min(1, rC));
+      verts[vi++] = Math.max(0, Math.min(1, gC));
+      verts[vi++] = Math.max(0, Math.min(1, bC));
+      verts[vi++] = nx;
+      verts[vi++] = ny;
+      verts[vi++] = nz;
+      verts[vi++] = i / segs;
+      verts[vi++] = j / segs;
+    }
+  }
+
+  // Two triangles per quad. Winding matches Plane's (BL, BR, FR /
+  // BL, FR, FL) so the visible side is +Y per the existing CCW
+  // front-face convention.
+  let ii = 0;
+  for (let j = 0; j < segs; j++) {
+    for (let i = 0; i < segs; i++) {
+      const a = j * N + i;             // back-left
+      const b = a + 1;                  // back-right
+      const c = (j + 1) * N + i;        // front-left
+      const d = c + 1;                  // front-right
+      indices[ii++] = a;
+      indices[ii++] = b;
+      indices[ii++] = d;
+      indices[ii++] = a;
+      indices[ii++] = d;
+      indices[ii++] = c;
+    }
+  }
   return { verts, indices };
 }
 
