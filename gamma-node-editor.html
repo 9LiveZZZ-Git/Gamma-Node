@@ -1765,6 +1765,62 @@
     color: white;
     animation: pulse 1.2s infinite;
   }
+  /* Sprint 5.handwriting-multimonitor -- the aux button (chevron
+     next to a primary tool) is a hair narrower + uses muted color
+     so it reads as a "more-options" affordance rather than a peer
+     tool. */
+  .tool-btn-aux {
+    width: 18px;
+    font-size: 10px;
+    color: var(--text-3);
+    margin-left: -4px;
+  }
+  .tool-btn-aux:hover { color: var(--text); }
+  .tool-menu {
+    position: absolute;
+    top: 36px;
+    right: 36px;
+    z-index: 200;
+    background: var(--surface-1);
+    border: 1px solid var(--border-1);
+    border-radius: 4px;
+    box-shadow: 0 4px 18px rgba(0,0,0,0.4);
+    padding: 4px 0;
+    min-width: 280px;
+  }
+  .tool-menu-item {
+    display: flex;
+    width: 100%;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 8px 12px;
+    background: transparent;
+    border: none;
+    color: var(--text);
+    text-align: left;
+    cursor: pointer;
+    font: inherit;
+  }
+  .tool-menu-item:hover { background: var(--surface-2); }
+  .tool-menu-icon {
+    flex: 0 0 auto;
+    width: 22px;
+    height: 22px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--surface-2);
+    border-radius: 4px;
+    color: var(--accent);
+    font-size: 13px;
+  }
+  .tool-menu-item strong { display: block; font-weight: 500; }
+  .tool-menu-sub {
+    display: block;
+    font-size: 11px;
+    color: var(--text-3);
+    margin-top: 1px;
+  }
   @keyframes pulse {
     0%, 100% { opacity: 1; }
     50%      { opacity: 0.55; }
@@ -6419,6 +6475,21 @@
       <div class="canvas-tools">
         <button class="tool-btn active" data-tool="select" title="Select / move (V)">▦</button>
         <button class="tool-btn" data-tool="draw" title="Draw box for new node (D)">✎</button>
+        <!-- Sprint 5.handwriting-multimonitor -- companion dropdown next
+             to the draw tool. Same family of "handwrite into a box"
+             but the input surface lives in a popup window the user
+             can drag to a touchscreen secondary monitor. -->
+        <button class="tool-btn tool-btn-aux" id="tool-draw-menu"
+                title="Handwriting / touchscreen options">▾</button>
+        <div class="tool-menu" id="tool-draw-menu-popup" style="display:none;">
+          <button class="tool-menu-item" id="tool-touchscreen-open">
+            <span class="tool-menu-icon">↗</span>
+            <span>
+              <strong>Open touchscreen window</strong>
+              <span class="tool-menu-sub">Drag to a 2nd monitor; handwrite there to spawn nodes here</span>
+            </span>
+          </button>
+        </div>
         <button class="tool-btn" id="tool-voice" title="Voice → AI prompt (microphone)">🎤</button>
       </div>
       <div class="canvas" id="canvas">
@@ -39094,6 +39165,335 @@ function setTool(name) {
 toolBtns.forEach(b => {
   b.addEventListener("click", () => setTool(b.dataset.tool));
 });
+
+/* Sprint 5.handwriting-multimonitor -- popup-window controls.
+ * The chevron button next to the draw tool opens a small menu;
+ * the menu's "Open touchscreen window" item launches a separate
+ * browser window with a touch-optimized handwriting canvas + a
+ * placeholder Controls tab. Cross-window messaging via Broadcast-
+ * Channel: the popup captures strokes locally and posts a PNG
+ * data URL; the main window runs the existing tesseract /
+ * AI-vision recognition pipeline and spawns the matched node at
+ * the visible viewport's center. Drag the popup to a secondary
+ * touchscreen monitor for the intended workflow.
+ *
+ * The popup HTML is generated as a Blob URL so the editor stays a
+ * single self-contained file -- no separate assets / routes.
+ * Channel name "gamma-touchscreen". Messages:
+ *   popup -> main : { type: "ink-image", dataUrl }
+ *   main -> popup : { type: "ink-ack", ok, note }
+ *   main -> popup : { type: "ping" } / popup -> main : { type: "pong" } */
+const _toolMenu       = document.getElementById("tool-draw-menu-popup");
+const _toolMenuBtn    = document.getElementById("tool-draw-menu");
+const _touchOpenBtn   = document.getElementById("tool-touchscreen-open");
+let   _touchChannel   = null;   // BroadcastChannel, created lazily
+let   _touchPopupURL  = null;   // blob: URL for the popup HTML
+let   _touchPopupRef  = null;   // window handle returned by window.open
+
+function _toggleToolMenu(show) {
+  if (!_toolMenu) return;
+  const willShow = (typeof show === "boolean") ? show : (_toolMenu.style.display === "none");
+  _toolMenu.style.display = willShow ? "block" : "none";
+}
+if (_toolMenuBtn) {
+  _toolMenuBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    _toggleToolMenu();
+  });
+}
+document.addEventListener("click", (e) => {
+  if (!_toolMenu || _toolMenu.style.display === "none") return;
+  if (e.target === _toolMenuBtn || _toolMenu.contains(e.target)) return;
+  _toggleToolMenu(false);
+});
+
+function _ensureTouchChannel() {
+  if (_touchChannel || typeof BroadcastChannel === "undefined") return _touchChannel;
+  _touchChannel = new BroadcastChannel("gamma-touchscreen");
+  _touchChannel.onmessage = (ev) => {
+    const msg = ev.data || {};
+    if (msg.type === "ink-image") {
+      _handleTouchInkImage(msg);
+    } else if (msg.type === "pong") {
+      console.log("[touchscreen] popup is alive");
+    }
+  };
+  return _touchChannel;
+}
+
+/* Process a PNG dataUrl that came in from the popup window. Reuses
+ * the existing tesseract + AI-vision recognition pipeline; on a
+ * match, spawns the node at the viewport center. The 280x180
+ * synthesized inkBox is the same size as the popup's drawing canvas
+ * region; tryCreateFromLabel uses it for positional placement. */
+async function _handleTouchInkImage(msg) {
+  if (!msg || !msg.dataUrl) return;
+  // Convert dataUrl to base64 (existing helpers expect both).
+  const dataUrl = msg.dataUrl;
+  const base64  = dataUrl.split(",")[1] || "";
+  // Synthesize a placement box at the visible-canvas center.
+  // screenToWorld accepts CLIENT (viewport-relative) coords, so we
+  // use getBoundingClientRect() to convert the canvas-local center
+  // to viewport coords first. With the canvas pan/zoom applied,
+  // this lands the new node where the user is currently looking
+  // instead of at world origin.
+  const cr  = canvas.getBoundingClientRect();
+  const cx  = cr.left + cr.width  / 2;
+  const cy  = cr.top  + cr.height / 2;
+  const w   = 240, h = 140;
+  let worldX = cx - w / 2, worldY = cy - h / 2;
+  try {
+    if (typeof screenToWorld === "function") {
+      const wp = screenToWorld(cx, cy);
+      worldX = wp.x - w / 2; worldY = wp.y - h / 2;
+    }
+  } catch (_) {}
+  const box = { x: worldX, y: worldY, w, h };
+
+  const ackTo = (ok, note) => {
+    if (_touchChannel) _touchChannel.postMessage({ type: "ink-ack", ok, note });
+  };
+  setVoiceStatus("Recognizing (touchscreen)…", "thinking");
+  let matched = null, lastReply = "";
+  try {
+    const text = await tesseractRecognize(dataUrl);
+    lastReply = text || "";
+    if (text) matched = tryCreateFromLabel(text, box, /*silent*/ true);
+  } catch (err) {
+    console.warn("[touchscreen] tesseract failed:", err);
+  }
+  if (!matched) {
+    try {
+      setVoiceStatus("Tesseract didn't match — trying " + aiSettings.provider + "…", "thinking");
+      const reply = await callVision(base64, aiSettings.key);
+      lastReply = reply;
+      matched = tryCreateFromLabel(reply, box, /*silent*/ false);
+    } catch (err) {
+      console.error("[touchscreen] vision failed:", err);
+      setVoiceStatus("Recognize failed (touchscreen): " + (err.message || err), "err");
+      ackTo(false, String(err.message || err));
+      return;
+    }
+  }
+  if (matched) {
+    setVoiceStatus("✓ touchscreen → " + matched, "");
+    setTimeout(() => setVoiceStatus("", ""), 2000);
+    ackTo(true, matched);
+    render();
+  } else {
+    setVoiceStatus("No match: \"" + (lastReply || "").trim().slice(0, 30) + "\"", "err");
+    ackTo(false, "no-match: " + lastReply);
+  }
+}
+
+function _openTouchscreenWindow() {
+  _ensureTouchChannel();
+  // Re-open: if the previous popup is still alive, just focus it.
+  if (_touchPopupRef && !_touchPopupRef.closed) {
+    try { _touchPopupRef.focus(); } catch (_) {}
+    _toggleToolMenu(false);
+    return;
+  }
+  if (!_touchPopupURL) {
+    const html = _buildTouchscreenHtml();
+    const blob = new Blob([html], { type: "text/html" });
+    _touchPopupURL = URL.createObjectURL(blob);
+  }
+  // popup=true asks for a tear-off chromeless window (Chrome / Edge);
+  // some browsers still give a regular tab. Either way it works.
+  _touchPopupRef = window.open(_touchPopupURL, "gamma-touchscreen",
+    "popup=true,width=900,height=720");
+  _toggleToolMenu(false);
+}
+
+if (_touchOpenBtn) _touchOpenBtn.addEventListener("click", _openTouchscreenWindow);
+
+/* HTML for the popup window. Self-contained -- styles + scripts +
+ * pointer event handling all inline. Communicates with the main
+ * window via BroadcastChannel("gamma-touchscreen"). */
+function _buildTouchscreenHtml() {
+  return `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gamma · Touchscreen</title>
+<style>
+  :root {
+    --bg: #0e1116; --surface: #161b22; --surface-2: #1f262e;
+    --border: #2a3340; --text: #e6edf3; --text-2: #a6b1bf;
+    --accent: #c8e85a; --accent-ink: #0e1116; --danger: #f0726a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif; user-select: none; -webkit-user-select: none; }
+  body { display: flex; flex-direction: column; }
+  .tabs { display: flex; gap: 2px; padding: 8px 8px 0 8px; background: var(--surface); border-bottom: 1px solid var(--border); }
+  .tab { flex: 1; padding: 12px 16px; background: var(--surface-2); border: none; color: var(--text-2); font-size: 15px; cursor: pointer; border-radius: 6px 6px 0 0; }
+  .tab.active { background: var(--bg); color: var(--accent); border-bottom: 2px solid var(--accent); }
+  .panel { flex: 1; display: none; flex-direction: column; padding: 12px; gap: 12px; min-height: 0; }
+  .panel.active { display: flex; }
+  .ink-wrap { flex: 1; position: relative; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; min-height: 0; }
+  #ink-canvas { width: 100%; height: 100%; display: block; touch-action: none; cursor: crosshair; }
+  .actions { display: flex; gap: 8px; align-items: center; }
+  .btn { padding: 14px 22px; font-size: 16px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text); cursor: pointer; }
+  .btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 500; }
+  .btn:hover { background: var(--surface); }
+  .btn.primary:hover { background: #b8d850; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .status { font-size: 13px; color: var(--text-2); flex: 1; padding: 0 8px; min-height: 1.4em; }
+  .status.ok  { color: var(--accent); }
+  .status.err { color: var(--danger); }
+  .placeholder { padding: 40px; text-align: center; color: var(--text-2); font-size: 14px; line-height: 1.6; }
+  .placeholder code { background: var(--surface-2); padding: 2px 6px; border-radius: 3px; color: var(--accent); font-size: 12px; }
+  .conn-pip { width: 8px; height: 8px; border-radius: 50%; background: var(--danger); display: inline-block; vertical-align: middle; margin-right: 6px; }
+  .conn-pip.ok { background: var(--accent); }
+</style>
+</head><body>
+<div class="tabs">
+  <button class="tab active" data-tab="hw">✎ Handwriting</button>
+  <button class="tab" data-tab="ctrl">⚙ Controls</button>
+</div>
+<div class="panel active" data-panel="hw">
+  <div class="ink-wrap"><canvas id="ink-canvas"></canvas></div>
+  <div class="actions">
+    <div class="status" id="status"><span class="conn-pip" id="conn-pip"></span>connecting…</div>
+    <button class="btn" id="btn-clear">↻ Clear</button>
+    <button class="btn primary" id="btn-recog">✓ Recognize</button>
+  </div>
+</div>
+<div class="panel" data-panel="ctrl">
+  <div class="placeholder">
+    <p><strong>Controls tab — coming next sprint.</strong></p>
+    <p>Planned: live sliders for the patch's Slider nodes, a touch
+       keyboard for KeyboardIn, and button widgets for any wired
+       triggers. All routed back to the main editor via the same
+       <code>gamma-touchscreen</code> BroadcastChannel.</p>
+  </div>
+</div>
+<script>
+(function() {
+  const ch = new BroadcastChannel("gamma-touchscreen");
+  const canvas = document.getElementById("ink-canvas");
+  const ctx = canvas.getContext("2d");
+  const statusEl = document.getElementById("status");
+  const pip = document.getElementById("conn-pip");
+  const btnRecog = document.getElementById("btn-recog");
+  const btnClear = document.getElementById("btn-clear");
+  let strokes = [];
+  let current = null;
+  let dpr = window.devicePixelRatio || 1;
+
+  function setStatus(text, kind) {
+    statusEl.innerHTML = '<span class="conn-pip ' + (kind === "err" ? "" : "ok") + '" id="conn-pip"></span>' + text;
+    statusEl.className = "status" + (kind ? " " + kind : "");
+  }
+
+  function resizeCanvas() {
+    const r = canvas.getBoundingClientRect();
+    canvas.width  = Math.round(r.width  * dpr);
+    canvas.height = Math.round(r.height * dpr);
+    redraw();
+  }
+  window.addEventListener("resize", resizeCanvas);
+
+  function redraw() {
+    ctx.fillStyle = "#161b22";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.strokeStyle = "#c8e85a";
+    ctx.lineWidth = 3 * dpr;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    strokes.forEach(s => {
+      if (s.length < 2) return;
+      ctx.beginPath();
+      ctx.moveTo(s[0].x * dpr, s[0].y * dpr);
+      for (let i = 1; i < s.length; i++) ctx.lineTo(s[i].x * dpr, s[i].y * dpr);
+      ctx.stroke();
+    });
+  }
+
+  function pt(ev) {
+    const r = canvas.getBoundingClientRect();
+    return { x: ev.clientX - r.left, y: ev.clientY - r.top };
+  }
+  canvas.addEventListener("pointerdown", (ev) => {
+    ev.preventDefault();
+    canvas.setPointerCapture(ev.pointerId);
+    current = [pt(ev)];
+    strokes.push(current);
+    redraw();
+  });
+  canvas.addEventListener("pointermove", (ev) => {
+    if (!current) return;
+    current.push(pt(ev));
+    redraw();
+  });
+  ["pointerup", "pointercancel", "pointerleave"].forEach(ev => {
+    canvas.addEventListener(ev, () => { current = null; });
+  });
+
+  btnClear.addEventListener("click", () => { strokes = []; current = null; redraw(); setStatus("Cleared", "ok"); });
+
+  btnRecog.addEventListener("click", () => {
+    if (strokes.length === 0) { setStatus("Nothing drawn yet", "err"); return; }
+    // Render the strokes to a smaller PNG suitable for OCR. White
+    // background, black ink — Tesseract's preferred contrast.
+    const W = 600, H = 400;
+    const r = canvas.getBoundingClientRect();
+    const sx = W / r.width, sy = H / r.height;
+    const off = document.createElement("canvas");
+    off.width = W; off.height = H;
+    const o = off.getContext("2d");
+    o.fillStyle = "#ffffff";
+    o.fillRect(0, 0, W, H);
+    o.strokeStyle = "#000000";
+    o.lineWidth = 4;
+    o.lineCap = "round";
+    o.lineJoin = "round";
+    strokes.forEach(s => {
+      if (s.length < 2) return;
+      o.beginPath();
+      o.moveTo(s[0].x * sx, s[0].y * sy);
+      for (let i = 1; i < s.length; i++) o.lineTo(s[i].x * sx, s[i].y * sy);
+      o.stroke();
+    });
+    const dataUrl = off.toDataURL("image/png");
+    ch.postMessage({ type: "ink-image", dataUrl });
+    setStatus("Sent to main — recognizing…", "");
+    btnRecog.disabled = true;
+  });
+
+  // Tab switching
+  document.querySelectorAll(".tab").forEach(t => {
+    t.addEventListener("click", () => {
+      document.querySelectorAll(".tab").forEach(x => x.classList.toggle("active", x === t));
+      document.querySelectorAll(".panel").forEach(p => p.classList.toggle("active", p.dataset.panel === t.dataset.tab));
+    });
+  });
+
+  // Main -> popup messages.
+  ch.onmessage = (ev) => {
+    const msg = ev.data || {};
+    if (msg.type === "ink-ack") {
+      btnRecog.disabled = false;
+      if (msg.ok) {
+        setStatus("✓ created node: " + msg.note, "ok");
+        strokes = []; current = null; redraw();
+      } else {
+        setStatus("✗ " + (msg.note || "recognize failed"), "err");
+      }
+    } else if (msg.type === "ping") {
+      ch.postMessage({ type: "pong" });
+    }
+  };
+
+  // Heartbeat to main so it knows we're alive.
+  ch.postMessage({ type: "pong" });
+  setStatus("Connected — write into the canvas, then ✓ Recognize", "ok");
+  requestAnimationFrame(resizeCanvas);
+})();
+</script>
+</body></html>`;
+}
 
 function clearInk() {
   inkBox = null;
