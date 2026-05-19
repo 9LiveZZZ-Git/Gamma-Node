@@ -53490,9 +53490,13 @@ function _tiledTerrainGlobalCacheKey(node) {
   ].join(",");
 }
 
-/* Visible-chunk set for the current frame. Returns Map<key, info>
- * where info has { tileX, tileZ, segs (= LOD) }. The chunk grid is
- * symmetric around the (possibly-biased) center tile. */
+/* §5.5.e-13 -- visible-chunk set. Key is "tileX,tileZ" only (no
+ * LOD), so a tile in the cache survives LOD changes (gets upgraded
+ * in-place instead of getting dropped and re-built from scratch).
+ * info.segs is the DESIRED LOD; the streaming logic ensures every
+ * tile has at least a placeholder (LOD 2) within one frame of
+ * becoming visible, then upgrades to info.segs over subsequent
+ * frames under a budget. */
 function _computeVisibleChunkSet(node) {
   const p = node.params || {};
   const radius   = Math.max(0, Math.min(32, Math.floor((typeof p.chunkRadius === "number") ? p.chunkRadius : 8)));
@@ -53504,7 +53508,7 @@ function _computeVisibleChunkSet(node) {
       const segs = _tiledTerrainLodSegments(Math.abs(cx), Math.abs(cz), radius, baseSegs);
       const tileX = center.tx + cx;
       const tileZ = center.tz + cz;
-      const key = tileX + "," + tileZ + "," + segs;
+      const key = tileX + "," + tileZ;
       visible.set(key, { tileX, tileZ, segs });
     }
   }
@@ -53736,37 +53740,78 @@ function _ensureTiledTerrainChunks(node) {
     entry.chunks.delete(key);
   }
 
-  // §5.5.e-9 -- sort visible chunks by Chebyshev ring distance from
-  // the disc center BEFORE building, so chunks NEAREST the player
-  // build first. Without this, the Map iteration order is corner-
-  // first (-radius corner onward) which fills the FAR edge of the
-  // disc before the player's nearby chunks -- that's what produced
-  // the "temporary sinkholes" effect during streaming. Closest-first
-  // keeps the gap under the player closed at all times.
-  const center  = _tiledTerrainCenterTile(node);
-  const pending = [];
+  // §5.5.e-13 -- two-phase streaming. Eliminates the "sinkhole" gap
+  // by guaranteeing every visible tile has at least a placeholder
+  // chunk (LOD 2 = ~21 verts, builds in <0.1ms) within the first
+  // frame it appears. Phase 1 (placeholders) gets a small budget;
+  // phase 2 (proper LOD) gets a larger budget for upgrades.
+  //
+  //   phase 1: for each visible tile WITHOUT any cached chunk, build
+  //            an LOD-2 placeholder. Closest-first. Tight budget --
+  //            placeholders are cheap so most fit in one frame.
+  //   phase 2: for each visible tile WITH a chunk at the wrong LOD,
+  //            rebuild at the desired LOD. Old chunk destroyed only
+  //            after the new chunk is in hand -- no transient void.
+  const center = _tiledTerrainCenterTile(node);
+  const ringOf = (info) => Math.max(Math.abs(info.tileX - center.tx),
+                                    Math.abs(info.tileZ - center.tz));
+  // PHASE 1: placeholders for any tile that has nothing yet.
+  const phPending = [];
   for (const [key, info] of visible) {
     if (entry.chunks.has(key)) continue;
-    const ring = Math.max(Math.abs(info.tileX - center.tx),
-                          Math.abs(info.tileZ - center.tz));
-    pending.push({ key, info, ring });
+    phPending.push({ key, info, ring: ringOf(info) });
   }
-  pending.sort((a, b) => a.ring - b.ring);
-  // Budget bumped 10ms -> 16ms (worst-case frame still ~45fps) so a
-  // tile-crossing's batch of new chunks usually finishes in 1 frame.
-  const BUILD_BUDGET_MS = 16;
-  const buildStart = performance.now();
-  let built = 0;
-  for (let i = 0; i < pending.length; i++) {
-    const chunk = _buildSingleChunk(node, pending[i].info);
-    if (chunk) entry.chunks.set(pending[i].key, chunk);
-    built++;
-    if (performance.now() - buildStart > BUILD_BUDGET_MS) break;
+  phPending.sort((a, b) => a.ring - b.ring);
+  const PH_BUDGET_MS = 8;
+  const phStart = performance.now();
+  let phBuilt = 0;
+  for (let i = 0; i < phPending.length; i++) {
+    const item = phPending[i];
+    const ph = _buildSingleChunk(node, {
+      tileX: item.info.tileX,
+      tileZ: item.info.tileZ,
+      segs: 2                            // minimum-LOD placeholder
+    });
+    if (ph) {
+      ph.currentLod = 2;
+      entry.chunks.set(item.key, ph);
+    }
+    phBuilt++;
+    if (performance.now() - phStart > PH_BUDGET_MS) break;
   }
-  if (built > 0 && !Visual._tiledStreamLogged) {
+  // PHASE 2: upgrade existing chunks whose currentLod differs from
+  // the desired LOD. Old chunk stays in the cache until the upgrade
+  // is in hand, so the visible mesh never goes empty.
+  const upPending = [];
+  for (const [key, info] of visible) {
+    const c = entry.chunks.get(key);
+    if (!c) continue;
+    if (c.currentLod === info.segs) continue;
+    upPending.push({ key, info, c, ring: ringOf(info) });
+  }
+  upPending.sort((a, b) => a.ring - b.ring);
+  const UP_BUDGET_MS = 12;
+  const upStart = performance.now();
+  let upBuilt = 0;
+  for (let i = 0; i < upPending.length; i++) {
+    const item = upPending[i];
+    const proper = _buildSingleChunk(node, {
+      tileX: item.info.tileX,
+      tileZ: item.info.tileZ,
+      segs: item.info.segs
+    });
+    if (proper) {
+      try { item.c.vertexBuffer && item.c.vertexBuffer.destroy(); } catch (_) {}
+      try { item.c.indexBuffer  && item.c.indexBuffer.destroy();  } catch (_) {}
+      proper.currentLod = item.info.segs;
+      entry.chunks.set(item.key, proper);
+    }
+    upBuilt++;
+    if (performance.now() - upStart > UP_BUDGET_MS) break;
+  }
+  if ((phBuilt > 0 || upBuilt > 0) && !Visual._tiledStreamLogged) {
     Visual._tiledStreamLogged = true;
-    console.log("[tiled] per-chunk streaming active: built " + built +
-                " chunks this frame, " + entry.chunks.size + " loaded total.");
+    console.log("[tiled] two-phase streaming active. Placeholder LOD-2 ensures no empty tile; upgrades happen under a separate budget.");
   }
 
   // Aggregate AABB for the mesh-level outer frustum cull.
