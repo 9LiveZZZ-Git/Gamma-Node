@@ -62,7 +62,6 @@
     --light:        #f5e6c8;     /* Sprint 7.5.3c — light source (DirectionalLight → Scene) */
     --environment:  #7ad6c4;     /* Sprint 7.5.4 — environment / sky (GradientSky → Scene.environment) */
     --hud:          #ff79c6;     /* §5.5.g — HUD overlay node (Minimap → Scene.hud1) */
-    --erosion:      #c89060;     /* §5.5.e-8 — terrain-erosion params (TerrainErosion → TiledTerrain.erosion) */
     --selected:     #4a8fdc;
     --danger:       #e24b4a;
     --info:         #83e8ff;
@@ -829,10 +828,6 @@
      layer, not scene geometry" -- distinguishable from texture's
      pure-dotted ring + camera/light double-rings. */
   .port.hud         { border-color: var(--hud);         border-style: dashed; border-width: 3px; }
-  /* §5.5.e-8 -- Erosion params port. Dashed earth-tone -- carries
-     erosion knobs (thermal/hydraulic/etc.) into a terrain mesh-gen.
-     Visually distinct from texture's pure-dotted and hud's hot-pink dashed. */
-  .port.erosion     { border-color: var(--erosion);     border-style: dashed; border-width: 3px; }
   .port.connected.param { background: var(--param); border-style: solid; }
   .port.connected.gate  { background: var(--gate); }
   .port.connected.clock { background: var(--clock); border-style: solid; }
@@ -10854,11 +10849,17 @@ public:
       { n: "ridges",      t: "param" },
       { n: "plateau",     t: "param" },
       { n: "forwardBias", t: "param" },
-      // §5.5.e-8 -- erosion params input. Wire a TerrainErosion node's
-      // `params` output here; TiledTerrain applies the same thermal +
-      // hydraulic algorithm in JS (with smaller defaults than the GPU
-      // version since each sample triggers neighbor noise calls).
-      { n: "erosion",     t: "erosion" }
+      // §5.5.e-8 -- built-in erosion. Baked into the chunk mesh at
+      // build time so there's no per-frame cost; the streaming budget
+      // absorbs the extra fBm calls into the same 3-second first-load.
+      // Wired directly here (not via a separate TerrainErosion node)
+      // because erosion is a property of the terrain, not a chain.
+      { n: "erosionThermal",    t: "param" },
+      { n: "erosionHydraulic",  t: "param" },
+      { n: "erosionTalus",      t: "param" },
+      { n: "erosionIterations", t: "param" },
+      { n: "erosionRadius",     t: "param" },
+      { n: "erosionStrength",   t: "param" }
     ],
     outs: [{ n: "mesh", t: "mesh" }],
     params: {
@@ -10875,6 +10876,16 @@ public:
       ridges:      0.5,          // mountain-crest sharpening
       plateau:     0.0,          // 0 = rolling-hill fBm; 1 = sharp isolated peaks in flat plain
       forwardBias: 0.0,          // 0 = symmetric disc; 0.4 = shifts loaded disc 40% radius forward of camera look direction (yaw-quantized to 45°)
+      // §5.5.e-8 -- built-in erosion knobs. Skipped when strength=0.
+      // Bake-once at chunk build time; no per-frame cost. Defaults
+      // off so the bare TiledTerrain emits pure fBm; demos crank
+      // strength up for natural weathered look.
+      erosionThermal:    0.65,
+      erosionHydraulic:  0.55,
+      erosionTalus:      0.02,
+      erosionIterations: 4,
+      erosionRadius:     80,
+      erosionStrength:   0.0,
       // Tiling-config-popup-only knobs (hidden from the default port row).
       anchorMode:  "auto",       // "auto" follows first FPCamera; "manual" uses centerX/Z
       centerX:     0,
@@ -10883,7 +10894,7 @@ public:
     paramOptions: { anchorMode: ["auto", "manual"] },
     uiOnlyParams: ["anchorMode", "centerX", "centerZ"],
     methods: {},
-    description: "Phase 7 §5.5.e chunked terrain at mountain scale with per-chunk streaming. Each chunk has its own VBO+IBO and is built incrementally (~6ms budget per frame) -- the camera can cross tile boundaries without the old monolithic-mesh stall. As the camera moves, chunks leaving the visible disc are destroyed and new chunks build in their place. Per-chunk frustum culling skips off-view chunks at draw time. Distance-LOD (inner = full segments, mid = half, outer = quarter) with vertical skirts to mask T-junction seams between rings. World-space fBm sampling: seams are exact along same-LOD edges, skirts cover gaps along LOD edges. Defaults are mountain-scale at 1u=1m: chunkSize=64m, chunkRadius=8, segments=24, heightScale=80m. plateau (0..1) flattens low/mid altitudes for isolated peaks in plains. forwardBias (0..1) shifts the loaded disc toward the camera's look direction (yaw-quantized to 45° to stay cache-friendly) so the player sees further forward than behind. Pair with TerrainMaterial + FPCamera. Drop a Minimap node to overlay a top-down view. Open the ⚙ Tiling Config popup on the node for the full knob set + a live preview. Anchor mode = manual locks the grid origin to (centerX, centerZ) instead of camera-follow."
+    description: "Phase 7 §5.5.e chunked terrain at mountain scale with per-chunk streaming. Each chunk has its own VBO+IBO and is built incrementally (~10ms budget per frame); crossing tile boundaries doesn't stall. As the camera moves, chunks leaving the visible disc are destroyed and new chunks build in their place. Per-chunk frustum culling skips off-view chunks at draw time. 5-ring distance-LOD (24/12/6/3/2 segments) with vertical skirts masking T-junction seams. World-space fBm sampling: seams are exact along same-LOD edges, skirts cover gaps at LOD edges. Defaults are mountain-scale at 1u=1m: chunkSize=64m, chunkRadius=8, segments=24, heightScale=80m. plateau (0..1) flattens low/mid altitudes for isolated peaks in plains. forwardBias (0..1) shifts the loaded disc toward the player's walk direction (8-cardinal-direction snap with 700ms hysteresis) so they see further forward than behind. erosionStrength (0..1) bakes a hydraulic+thermal erosion pass into the chunk mesh at build time -- carves ridges + settles valleys with no per-frame cost. Pair with TerrainMaterial + FPCamera. Drop a Minimap node + wire it to Scene.hud1 for a top-down overlay. Open the ⚙ Tiling Config popup on the node for the full knob set + a live preview. Anchor mode = manual locks the grid origin to (centerX, centerZ) instead of camera-follow."
   },
 
   /* =========================================================================
@@ -17345,14 +17356,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       { n: "radius",     t: "param" },
       { n: "strength",   t: "param" }
     ],
-    outs: [
-      { n: "out",    t: "texture" },
-      // §5.5.e-8 -- erosion-params output. Carries the thermal /
-      // hydraulic / talus knobs into a CPU-side terrain consumer
-      // (TiledTerrain.erosion). Texture pipeline still uses `out`
-      // for the GPU image-processing path.
-      { n: "params", t: "erosion" }
-    ],
+    outs: [{ n: "out", t: "texture" }],
     textureInputSlots: { in: 16 },
     params: {
       inLayer:    0,
@@ -32194,6 +32198,16 @@ const _demos = [
         ridges:      0.35,
         plateau:     0.7,
         forwardBias: 0.25,      // smaller shift now that radius is huge -- less per-step disc movement
+        // §5.5.e-8 built-in erosion. Baked into chunks at build time
+        // so there's no per-frame cost -- the 3-second first-load
+        // absorbs the extra fBm calls. Carves ridges, settles
+        // valleys for natural weathered terrain.
+        erosionThermal:    0.65,
+        erosionHydraulic:  0.55,
+        erosionTalus:      0.02,
+        erosionIterations: 4,
+        erosionRadius:     80,
+        erosionStrength:   0.6,
         anchorMode:  "auto"
       });
       // TerrainMaterial: auto-detects upstream TiledTerrain and
@@ -32262,20 +32276,6 @@ const _demos = [
         margin: 18,
         range: 1.2
       });
-      // §5.5.e-8 -- TerrainErosion node wired into TiledTerrain.erosion.
-      // Iterations dialed down to 4 (vs 8 for the GPU shader-frag path)
-      // since each iteration costs 8 fBm calls per vertex in JS. Radius
-      // is in world units here -- ~80m matches the chunkSize/segments
-      // granularity for visible carving. Strength=0.6 leaves the macro
-      // shape intact, just softens ridges + settles valleys.
-      const ero = makeNode("TerrainErosion", 40, 380, {
-        thermal:    0.65,
-        hydraulic:  0.55,
-        talus:      0.02,
-        iterations: 4,
-        radius:     80,
-        strength:   0.6
-      });
 
       state.edges.push({ from: { node: ter, port: "mesh"   }, to: { node: mat, port: "mesh"   } });
       state.edges.push({ from: { node: mat, port: "mesh"   }, to: { node: scn, port: "mesh1"  } });
@@ -32287,11 +32287,6 @@ const _demos = [
       // to this Scene. The overlay only renders when this wire exists
       // (and we're in live mode + this Scene is feeding a VisualOutput).
       state.edges.push({ from: { node: map, port: "hud"    }, to: { node: scn, port: "hud1"   } });
-      // §5.5.e-8 -- TerrainErosion.params → TiledTerrain.erosion. The
-      // TiledTerrain mesh + the walk-surface sampler both apply the
-      // JS-port of the erosion algorithm at chunk-build time. Carves
-      // ridges + settles valleys for a more naturally-weathered look.
-      state.edges.push({ from: { node: ero, port: "params" }, to: { node: ter, port: "erosion" } });
     }
   },
 
@@ -35545,10 +35540,6 @@ function renderWires(temp) {
       // §5.5.g -- HUD wire. Long-dashed hot pink, signals "overlay
       // layer that draws on top of this Scene's output."
       html += `<path d="${path}" fill="none" stroke="var(--hud)" stroke-width="3" stroke-linecap="round" stroke-dasharray="8,4" />`;
-    } else if (t === "erosion") {
-      // §5.5.e-8 -- Erosion params wire. Short dashes in earth-tone;
-      // carries erosion knobs into a terrain mesh-gen (e.g. TiledTerrain).
-      html += `<path d="${path}" fill="none" stroke="var(--erosion)" stroke-width="3" stroke-linecap="round" stroke-dasharray="4,3" />`;
     } else if (t === "transform") {
       // Double-stripe like clock but in transform-violet to keep the
       // 4×4 mat semantics visually distinct from rhythmic data.
@@ -53194,24 +53185,21 @@ function _tiledTerrainHeightAt(wx, wz, noise) {
   return h;
 }
 
-/* Walk state.edges for a TerrainErosion node wired to this
- * TiledTerrain's `erosion` input; return its params, or null. */
+/* Read built-in erosion params off the TiledTerrain node itself.
+ * Returns null when erosionStrength <= 0 so the no-erosion path
+ * stays a zero-overhead branch in _tiledTerrainHeightAt. */
 function _findTiledErosionParams(ttNode) {
-  if (!state || !Array.isArray(state.edges)) return null;
-  const wire = state.edges.find(e =>
-    e && e.to && e.to.node === ttNode.id && e.to.port === "erosion"
-  );
-  if (!wire || !wire.from) return null;
-  const src = state.nodes.find(n => n && n.id === wire.from.node);
-  if (!src || src.type !== "TerrainErosion") return null;
-  const sp = src.params || {};
+  const p = ttNode && ttNode.params;
+  if (!p) return null;
+  const strength = (typeof p.erosionStrength === "number") ? p.erosionStrength : 0;
+  if (strength <= 0.0001) return null;
   return {
-    thermal:    sp.thermal,
-    hydraulic:  sp.hydraulic,
-    talus:      sp.talus,
-    iterations: sp.iterations,
-    radius:     sp.radius,
-    strength:   sp.strength
+    thermal:    (typeof p.erosionThermal    === "number") ? p.erosionThermal    : 0.65,
+    hydraulic:  (typeof p.erosionHydraulic  === "number") ? p.erosionHydraulic  : 0.55,
+    talus:      (typeof p.erosionTalus      === "number") ? p.erosionTalus      : 0.02,
+    iterations: (typeof p.erosionIterations === "number") ? p.erosionIterations : 4,
+    radius:     (typeof p.erosionRadius     === "number") ? p.erosionRadius     : 80,
+    strength:   strength
   };
 }
 
@@ -63715,6 +63703,18 @@ function openTilingConfigPopup(nodeId) {
   body.appendChild(makeRow("ridges (0..1)", "ridges",      "number", { step: 0.05, min: 0, max: 1 }).row);
   body.appendChild(makeRow("plateau (0..1)", "plateau",    "number", { step: 0.05, min: 0, max: 1 }).row);
   body.appendChild(makeRow("forward bias",   "forwardBias","number", { step: 0.05, min: 0, max: 1 }).row);
+
+  // Section: erosion (baked into chunks at build time).
+  const secErosion = document.createElement("div");
+  secErosion.style.cssText = "margin-top:14px;font-size:10px;color:var(--text-3);text-transform:uppercase;letter-spacing:0.15em;";
+  secErosion.textContent = "erosion (baked at build)";
+  body.appendChild(secErosion);
+  body.appendChild(makeRow("strength (0=off)",      "erosionStrength",   "number", { step: 0.05, min: 0, max: 1 }).row);
+  body.appendChild(makeRow("thermal",               "erosionThermal",    "number", { step: 0.05, min: 0, max: 1 }).row);
+  body.appendChild(makeRow("hydraulic",             "erosionHydraulic",  "number", { step: 0.05, min: 0, max: 1 }).row);
+  body.appendChild(makeRow("talus angle",           "erosionTalus",      "number", { step: 0.005 }).row);
+  body.appendChild(makeRow("iterations",            "erosionIterations", "number", { step: 1, min: 1, max: 12 }).row);
+  body.appendChild(makeRow("radius (world units)",  "erosionRadius",     "number", { step: 5, min: 1 }).row);
 
   // Footer with revert + done buttons.
   const foot = document.createElement("div");
