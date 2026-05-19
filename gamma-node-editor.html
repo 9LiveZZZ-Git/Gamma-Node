@@ -52286,26 +52286,49 @@ fn fs_clouds(in: VsOut) -> @location(0) vec4<f32> {
   let densityMult = max(0.0, uD.baseColor.a);
   let coverage    = clamp(uD.matParams.x, 0.0, 1.0);
   let scale       = max(1e-7, uD.matParams.y);
+  let altMin      = uD.matParams.z;             // from uniform, not mesh Y
   let thickness   = max(1.0,  uD.matParams.w);
+  let altMax      = altMin + thickness;
   let windX       = uD.band1.x;
   let windZ       = uD.band1.y;
 
   let camPos = uS.eye.xyz;
   let viewDir = normalize(in.worldPos - camPos);
-  let altMin = in.worldPos.y;       // mesh Y == bottom of slab
-  let altMax = altMin + thickness;
+  let dy = viewDir.y;
 
-  // v2 MVP: camera must be below the slab (the typical case --
-  // archipelago + flight up to a few hundred meters). Looking down
-  // at clouds from above the slab is rare; bail out.
-  if (camPos.y >= altMin) { discard; }
-  if (viewDir.y <= 0.0)  { discard; }
+  // §5.5.h-16 -- compute slab entry/exit for every camera placement.
+  // Below / inside / above the slab are all valid; the shader picks
+  // the right tEnter/tExit pair so the ray-march always traverses
+  // only the part of the volume the camera can actually see.
+  var tEnter: f32 = 0.0;
+  var tExit:  f32 = 0.0;
+  if (camPos.y < altMin) {
+    // Below slab. Look up to see it.
+    if (dy <= 0.0001) { discard; }
+    tEnter = (altMin - camPos.y) / dy;
+    tExit  = (altMax - camPos.y) / dy;
+  } else if (camPos.y > altMax) {
+    // Above slab. Look down to see it.
+    if (dy >= -0.0001) { discard; }
+    tEnter = (altMax - camPos.y) / dy;
+    tExit  = (altMin - camPos.y) / dy;
+  } else {
+    // Inside slab. March from camera to the boundary the ray exits.
+    tEnter = 0.0;
+    if (dy > 0.0001) {
+      tExit = (altMax - camPos.y) / dy;
+    } else if (dy < -0.0001) {
+      tExit = (altMin - camPos.y) / dy;
+    } else {
+      // Looking nearly horizontal inside the cloud layer: march a
+      // bounded distance so we still pick up local cloud density.
+      tExit = thickness * 6.0;
+    }
+  }
 
-  let lo = (1.0 - coverage) * 0.85;
-  let tEnter = (altMin - camPos.y) / viewDir.y;
-  let tExit  = (altMax - camPos.y) / viewDir.y;
   let marchLen = max(0.0, tExit - tEnter);
   if (marchLen <= 0.0) { discard; }
+  let lo = (1.0 - coverage) * 0.85;
 
   // Sun-direction forward scatter -- bright halo on the sun side,
   // cool ambient on the away side. Real volumetrics integrate this
@@ -52315,32 +52338,39 @@ fn fs_clouds(in: VsOut) -> @location(0) vec4<f32> {
   let sunDir = uS.envSun.xyz;
   let cosTheta = clamp(dot(viewDir, sunDir), -1.0, 1.0);
   let scatter  = pow(max(cosTheta * 0.5 + 0.5, 0.0), 2.2);
-  let shadowCol = vec3<f32>(0.55, 0.62, 0.74);
+  let shadowCol = vec3<f32>(0.62, 0.68, 0.78);
   let litTop    = mix(shadowCol, cloudColor, scatter);
 
-  // March front-to-back through the slab. 16 steps is enough at the
+  // March front-to-back through the slab. 24 steps is enough at the
   // typical 1km thickness; quality scales gracefully if the slab
   // grows because step length is thickness-relative.
-  let STEPS: i32 = 16;
+  // §5.5.h-16 -- per-pixel jitter on the ray start so the regular
+  // sampling stride doesn't appear as concentric bands. Without
+  // this you can see the discrete step boundaries as visible layers
+  // in the cloud volume (the "16 layers" symptom the user reported).
+  // The jitter turns the banding into high-freq noise that the eye
+  // reads as cloud texture instead of geometry.
+  let STEPS: i32 = 24;
   let stepLen = marchLen / f32(STEPS);
+  let pixHash = fract(sin(dot(in.pos.xy, vec2<f32>(12.9898, 78.233))) * 43758.5453);
   var accAlpha: f32 = 0.0;
   var accCol:   vec3<f32> = vec3<f32>(0.0);
 
   for (var i: i32 = 0; i < STEPS; i = i + 1) {
     if (accAlpha >= 0.985) { break; }
-    let t   = tEnter + (f32(i) + 0.5) * stepLen;
+    let t   = tEnter + (f32(i) + pixHash) * stepLen;
     let pos = camPos + viewDir * t;
     let d   = _cloud_density(pos, altMin, thickness, scale, windX, windZ, lo) * densityMult;
     if (d <= 0.001) { continue; }
 
     // Cheap self-shadow: density a short distance toward the sun.
-    // If the cloud is thick that way, this sample is interior and
-    // sun light is attenuated; if thin, sun reaches the sample.
-    // One extra sample per step is the right perf trade for the
-    // visual lift (clouds look LIT from one side).
-    let sunPos = pos + sunDir * 220.0;
+    // §5.5.h-16 -- gentler attenuation. The previous multiplier of
+    // 4.5 made interior cloud samples go nearly black, which read
+    // as the light getting too dark too fast. 1.8 leaves real
+    // contrast between lit and shadowed sides without crushing.
+    let sunPos = pos + sunDir * 180.0;
     let dSun = _cloud_density(sunPos, altMin, thickness, scale, windX, windZ, lo);
-    let sunShade = exp(-dSun * 4.5);
+    let sunShade = max(0.45, exp(-dSun * 1.8));
 
     // Beer-Lambert step opacity along the view ray.
     let alphaStep = 1.0 - exp(-d * stepLen * 0.012);
@@ -54189,25 +54219,45 @@ function _buildWater(node) {
   return { verts, indices };
 }
 
-/* Phase 7 §5.5.h-14 -- Clouds3D plane. Same shape as Water: one
- * 100km horizontal quad at Y = altitude. Real geometry so it sits
- * at a fixed world-space position; parallax is then "free" via
- * the standard mesh projection pipeline -- no special handling
- * needed for rotation vs translation. Future v2 will widen this
- * to a slab + ray-march in fs_clouds for true volumetric depth. */
+/* Phase 7 §5.5.h-16 -- Clouds3D slab geometry. Two horizontal
+ * 100km × 100km planes -- one at the bottom of the cloud slab
+ * (Y = altitude) and one at the top (Y = altitude + thickness).
+ * Together they cover the three camera placements:
+ *   - Below slab: bottom plane is visible (look up), shader marches
+ *     from altMin to altMax.
+ *   - Above slab: top plane is visible (look down), shader marches
+ *     from altMax to altMin.
+ *   - Inside slab: one or the other plane is visible depending on
+ *     look direction -- whichever the view ray hits, the shader
+ *     marches from camera (t=0) to the slab boundary opposite the
+ *     view direction.
+ * Depth-write keeps things consistent when both planes would be in
+ * view; the nearer one wins. Without both planes the cloud volume
+ * disappears the moment the camera crosses altMin. */
 function _buildClouds3D(node) {
   const p = node.params || {};
-  const cy = (typeof p.altitude === "number") ? p.altitude : 2500;
+  const cy  = (typeof p.altitude  === "number") ? p.altitude  : 2500;
+  const th  = (typeof p.thickness === "number") ? p.thickness : 900;
+  const cy2 = cy + th;
   const half = 50000;
   const verts = new Float32Array([
-    -half, cy, -half,   1, 1, 1,   0, -1, 0,   -half, -half,
-     half, cy, -half,   1, 1, 1,   0, -1, 0,    half, -half,
-     half, cy,  half,   1, 1, 1,   0, -1, 0,    half,  half,
-    -half, cy,  half,   1, 1, 1,   0, -1, 0,   -half,  half
+    // bottom plane (Y = altMin), normals point DOWN
+    -half, cy,  -half,   1, 1, 1,   0, -1, 0,   -half, -half,
+     half, cy,  -half,   1, 1, 1,   0, -1, 0,    half, -half,
+     half, cy,   half,   1, 1, 1,   0, -1, 0,    half,  half,
+    -half, cy,   half,   1, 1, 1,   0, -1, 0,   -half,  half,
+    // top plane (Y = altMax), normals point UP
+    -half, cy2, -half,   1, 1, 1,   0,  1, 0,   -half, -half,
+     half, cy2, -half,   1, 1, 1,   0,  1, 0,    half, -half,
+     half, cy2,  half,   1, 1, 1,   0,  1, 0,    half,  half,
+    -half, cy2,  half,   1, 1, 1,   0,  1, 0,   -half,  half
   ]);
-  // Normal points -Y (down) since the camera is below the cloud plane.
-  // Wound CCW from above; reverse so the underside is the visible face.
-  const indices = new Uint32Array([0, 2, 1,  0, 3, 2]);
+  // cullMode=none on the cloud pipeline, so winding doesn't matter
+  // for visibility; either order draws both sides.
+  const indices = new Uint32Array([
+    0, 2, 1,  0, 3, 2,
+    4, 5, 6,  4, 6, 7
+  ]);
   return { verts, indices };
 }
 
@@ -55340,10 +55390,10 @@ function _encodeScenePass(enc, entry) {
         inst.drawScratch[52] = 0; inst.drawScratch[53] = 0;
       }
     }
-    // §5.5.h-14 -- Clouds3D remap. fs_clouds reads:
+    // §5.5.h-14/16 -- Clouds3D remap. fs_clouds reads:
     //   baseColor.rgb = cloud color, baseColor.a = density
     //   matParams.x = coverage, matParams.y = scale,
-    //   matParams.z = time, matParams.w = thickness (slab height, m)
+    //   matParams.z = altitude (slab bottom Y), matParams.w = thickness
     //   band1.x = windX, band1.y = windZ (already camera-XZ-anchored
     //                                     so the noise sample tracks
     //                                     world XZ as the camera moves).
@@ -55352,17 +55402,18 @@ function _encodeScenePass(enc, entry) {
       inst.drawScratch[17] = (typeof mp.colorG === "number") ? mp.colorG : 1.0;
       inst.drawScratch[18] = (typeof mp.colorB === "number") ? mp.colorB : 1.0;
       inst.drawScratch[19] = (typeof mp.density === "number") ? mp.density : 1.0;
-      inst.drawScratch[20] = (typeof mp.coverage === "number") ? mp.coverage : 0.45;
-      inst.drawScratch[21] = (typeof mp.scale    === "number") ? mp.scale    : 0.00045;
-      if (!Visual._cloudsStartT) Visual._cloudsStartT = performance.now();
-      inst.drawScratch[22] = (performance.now() - Visual._cloudsStartT) * 0.001;
+      inst.drawScratch[20] = (typeof mp.coverage  === "number") ? mp.coverage  : 0.45;
+      inst.drawScratch[21] = (typeof mp.scale     === "number") ? mp.scale     : 0.00045;
+      inst.drawScratch[22] = (typeof mp.altitude  === "number") ? mp.altitude  : 2500;
       inst.drawScratch[23] = (typeof mp.thickness === "number") ? mp.thickness : 900;
+      if (!Visual._cloudsStartT) Visual._cloudsStartT = performance.now();
+      const elapsedC = (performance.now() - Visual._cloudsStartT) * 0.001;
       const camXc = (camera && camera.eye) ? camera.eye[0] : 0;
       const camZc = (camera && camera.eye) ? camera.eye[2] : 0;
       const wsX = (typeof mp.windSpeedX === "number") ? mp.windSpeedX : 0;
       const wsZ = (typeof mp.windSpeedZ === "number") ? mp.windSpeedZ : 0;
-      inst.drawScratch[24] = (wsX * inst.drawScratch[22]) - camXc;
-      inst.drawScratch[25] = (wsZ * inst.drawScratch[22]) - camZc;
+      inst.drawScratch[24] = (wsX * elapsedC) - camXc;
+      inst.drawScratch[25] = (wsZ * elapsedC) - camZc;
       inst.drawScratch[26] = 0; inst.drawScratch[27] = 0;
       // Clear remaining slots so stale water/terrain data doesn't bleed.
       for (let s = 28; s < 56; s++) inst.drawScratch[s] = 0;
