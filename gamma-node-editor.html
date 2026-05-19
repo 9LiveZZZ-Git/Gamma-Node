@@ -10856,17 +10856,21 @@ public:
       { n: "erosionIterations", t: "param" },
       { n: "erosionRadius",     t: "param" },
       { n: "erosionStrength",   t: "param" },
-      // §5.5.e-10 -- island mode. Applies a radial falloff around
-      // (islandCenterX, islandCenterZ) so the terrain heights ramp
-      // down to a sea-floor depth outside `islandRadius`. Needed
-      // before water makes sense -- otherwise the player can walk
-      // out infinitely. Off by default (islandMode=0).
-      { n: "islandMode",      t: "param" },
-      { n: "islandCenterX",   t: "param" },
-      { n: "islandCenterZ",   t: "param" },
-      { n: "islandRadius",    t: "param" },
-      { n: "islandFalloff",   t: "param" },
-      { n: "islandSinkDepth", t: "param" }
+      // §5.5.e-10 -- island modes. "off" = infinite plain. "single"
+      // = one radial island around (islandCenterX, islandCenterZ).
+      // "archipelago" = multiple distinct islands driven by a low-
+      // frequency noise mask -- player can walk between them on
+      // the ocean floor (or swim, once Water lands).
+      { n: "islandMode",          t: "param" },
+      { n: "islandCenterX",       t: "param" },
+      { n: "islandCenterZ",       t: "param" },
+      { n: "islandRadius",        t: "param" },
+      { n: "islandFalloff",       t: "param" },
+      { n: "islandSinkDepth",     t: "param" },
+      { n: "islandMaskFreq",      t: "param" },
+      { n: "islandMaskSeed",      t: "param" },
+      { n: "islandMaskThreshold", t: "param" },
+      { n: "islandMaskSoftness",  t: "param" }
     ],
     outs: [{ n: "mesh", t: "mesh" }],
     params: {
@@ -10893,19 +10897,29 @@ public:
       erosionIterations: 4,
       erosionRadius:     80,
       erosionStrength:   0.0,
-      // §5.5.e-10 island mode. Off by default; demos opt in.
-      islandMode:      0,
-      islandCenterX:   0,
-      islandCenterZ:   0,
-      islandRadius:    2500,  // meters
-      islandFalloff:   2.0,   // power-curve exponent (1 = linear, 2 = quadratic, 4 = steep cliff edge)
-      islandSinkDepth: 4000,  // meters BELOW the normal valley floor at island edge
+      // §5.5.e-10 island modes. Off by default; demos opt in.
+      islandMode:          "off",     // "off" / "single" / "archipelago"
+      // -- "single" mode params:
+      islandCenterX:       0,
+      islandCenterZ:       0,
+      islandRadius:        2500,
+      islandFalloff:       2.0,
+      // -- shared between single + archipelago:
+      islandSinkDepth:     2200,
+      // -- "archipelago" mode params (noise-mask-driven islands):
+      islandMaskFreq:      0.00012,   // ~1 cycle per ~8km -> islands ~few km across
+      islandMaskSeed:      11.7,
+      islandMaskThreshold: 0.50,      // mask value above this = land
+      islandMaskSoftness:  0.08,      // smoothstep width around the threshold
       // Tiling-config-popup-only knobs (hidden from the default port row).
       anchorMode:  "auto",       // "auto" follows first FPCamera; "manual" uses centerX/Z
       centerX:     0,
       centerZ:     0
     },
-    paramOptions: { anchorMode: ["auto", "manual"] },
+    paramOptions: {
+      anchorMode: ["auto", "manual"],
+      islandMode: ["off", "single", "archipelago"]
+    },
     uiOnlyParams: ["anchorMode", "centerX", "centerZ"],
     methods: {},
     description: "Phase 7 §5.5.e chunked terrain at mountain scale with per-chunk streaming. Each chunk has its own VBO+IBO and is built incrementally (~10ms budget per frame); crossing tile boundaries doesn't stall. As the camera moves, chunks leaving the visible disc are destroyed and new chunks build in their place. Per-chunk frustum culling skips off-view chunks at draw time. 5-ring distance-LOD (24/12/6/3/2 segments) with vertical skirts masking T-junction seams. World-space fBm sampling: seams are exact along same-LOD edges, skirts cover gaps at LOD edges. Defaults are mountain-scale at 1u=1m: chunkSize=64m, chunkRadius=8, segments=24, heightScale=80m. plateau (0..1) flattens low/mid altitudes for isolated peaks in plains. forwardBias (0..1) shifts the loaded disc toward the player's walk direction (8-cardinal-direction snap with 700ms hysteresis) so they see further forward than behind. erosionStrength (0..1) bakes a hydraulic+thermal erosion pass into the chunk mesh at build time -- carves ridges + settles valleys with no per-frame cost. Pair with TerrainMaterial + FPCamera. Drop a Minimap node + wire it to Scene.hud1 for a top-down overlay. Open the ⚙ Tiling Config popup on the node for the full knob set + a live preview. Anchor mode = manual locks the grid origin to (centerX, centerZ) instead of camera-follow."
@@ -32195,12 +32209,13 @@ const _demos = [
       // Y=0 (sea level) and peaks at Y=+3000, so the player walks
       // on the surface with mountains rising above.
       const ter = makeNode("TiledTerrain", 40, 80, {
-        // §5.5.e-7 -- 20/20-vision view distance. radius=20 +
-        // chunkSize=256m = 5km radius / 10km diameter. Five LOD
-        // levels (24/12/6/3/2 segments per ring) keep total verts
-        // bounded while distant mountains stay visible as silhouettes.
+        // §5.5.e-12 -- bigger render distance. radius=24 +
+        // chunkSize=256m = 6.1km radius / 12.5km diameter visible
+        // disc. 49×49 = 2401 chunks; the 5-LOD-ring distribution
+        // keeps total verts ~200k. Outer ring (LOD 4) is silhouette-
+        // only at this distance, which is fine for far peaks.
         chunkSize:   256,
-        chunkRadius: 20,
+        chunkRadius: 24,
         segments:    24,
         heightScale: 3000,
         yOffset:     3000,
@@ -32211,7 +32226,7 @@ const _demos = [
         gain:        0.45,
         ridges:      0.35,
         plateau:     0.7,
-        forwardBias: 0.25,      // smaller shift now that radius is huge -- less per-step disc movement
+        forwardBias: 0.20,      // smaller bias at huge radius
         // §5.5.e-8 built-in erosion. Baked into chunks at build time
         // so there's no per-frame cost -- the 3-second first-load
         // absorbs the extra fBm calls. Carves ridges, settles
@@ -32222,16 +32237,6 @@ const _demos = [
         erosionIterations: 4,
         erosionRadius:     80,
         erosionStrength:   0.6,
-        // §5.5.e-10 -- island mode. Bounds the terrain in a 3.5km
-        // radius around the player spawn, with a 4000m sink depth
-        // at the edge -- sets up the ocean trench for the upcoming
-        // Water node. Power-2 falloff = quadratic slope to the edge.
-        islandMode:      1,
-        islandCenterX:   0,
-        islandCenterZ:   0,
-        islandRadius:    3500,
-        islandFalloff:   2.0,
-        islandSinkDepth: 4000,
         anchorMode:  "auto"
       });
       // TerrainMaterial: auto-detects upstream TiledTerrain and
@@ -32270,7 +32275,7 @@ const _demos = [
         // horizon. 20/20 vision can resolve mountains 50km+ in
         // perfect conditions; we cap at 15km for memory + a bit of
         // distance haze flavor.
-        fov: 70, near: 0.5, far: 15000,
+        fov: 70, near: 0.5, far: 25000,
         walkMode: 1,
         walkSpeed: 14, lookSpeed: 2.2,
         mouseSensitivity: 0.0025, eyeHeight: 1.7
@@ -32310,6 +32315,129 @@ const _demos = [
       // §5.5.g -- Minimap.hud → Scene.hud1: makes the minimap "belong"
       // to this Scene. The overlay only renders when this wire exists
       // (and we're in live mode + this Scene is feeding a VisualOutput).
+      state.edges.push({ from: { node: map, port: "hud"    }, to: { node: scn, port: "hud1"   } });
+    }
+  },
+
+  /* Phase 7 §5.5.e-11 — Archipelago Islands. Demo of TiledTerrain's
+   * archipelago mode: low-frequency noise mask gives multiple
+   * distinct islands you can walk between (on the ocean floor for
+   * now -- swimming arrives with the Water node). Smaller per-
+   * island terrain (height 1500m, frequency tuned for ~1.5km
+   * features so islands have visible peaks + valleys). Minimap
+   * shows the island silhouettes against ocean blue. */
+  {
+    id: "scene-archipelago-islands",
+    name: "Archipelago Islands",
+    sub: "multiple islands · noise-mask coast",
+    type: "visual",
+    thumb: `<svg viewBox="0 0 100 44">
+      <defs>
+        <linearGradient id="dg-arch-sky" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0"    stop-color="rgba(110, 160, 210, 1)"/>
+          <stop offset="0.7"  stop-color="rgba(180, 210, 230, 1)"/>
+          <stop offset="1"    stop-color="rgba(220, 220, 200, 1)"/>
+        </linearGradient>
+      </defs>
+      <rect width="100" height="44" fill="url(#dg-arch-sky)"/>
+      <rect x="0" y="28" width="100" height="16" fill="rgba(35, 75, 120, 0.85)"/>
+      <polygon points="10,28 22,18 34,26 30,28" fill="rgba(80,110,75,0.92)"/>
+      <polygon points="42,28 55,14 70,22 76,28" fill="rgba(60,95,65,0.92)"/>
+      <polygon points="78,28 88,22 96,26 96,28" fill="rgba(80,110,75,0.92)"/>
+      <polygon points="55,14 58,12 62,18" fill="rgba(240,240,250,0.9)"/>
+      <rect x="76" y="2" width="22" height="22" fill="rgba(10,16,28,0.85)" stroke="rgba(110,220,180,0.6)" stroke-width="0.4"/>
+      <rect x="78" y="6"  width="3" height="3" fill="rgba(80,110,75,0.7)"/>
+      <rect x="85" y="14" width="6" height="3" fill="rgba(80,110,75,0.7)"/>
+      <rect x="91" y="9"  width="3" height="3" fill="rgba(80,110,75,0.7)"/>
+      <circle cx="87" cy="13" r="1.4" fill="rgba(255,220,90,1)"/>
+    </svg>`,
+    build: () => {
+      // Archipelago: islandMode="archipelago" + a low-freq noise
+      // mask defines island vs ocean. heightScale=1500m gives
+      // visible-from-distance peaks without towering over the sea.
+      // yOffset=1500 puts island peaks at +1500m, valleys at sea
+      // level. sinkDepth=1700 sinks the ocean floor to -200m so
+      // the player walks at -200m+1.7m=-198m on the ocean floor
+      // between islands. islandMaskFreq=0.00012 ~ one mask cycle
+      // per 8km -> several distinct islands in the visible disc.
+      const ter = makeNode("TiledTerrain", 40, 80, {
+        chunkSize:   256,
+        chunkRadius: 20,
+        segments:    24,
+        heightScale: 1500,
+        yOffset:     1500,
+        seed:        13.7,
+        frequency:   0.0006,    // 1 feature per ~1.7km within an island
+        octaves:     5,
+        lacunarity:  2.05,
+        gain:        0.5,
+        ridges:      0.45,
+        plateau:     0.45,
+        forwardBias: 0.2,
+        erosionThermal:    0.7,
+        erosionHydraulic:  0.55,
+        erosionTalus:      0.02,
+        erosionIterations: 4,
+        erosionRadius:     80,
+        erosionStrength:   0.55,
+        islandMode:          "archipelago",
+        islandMaskFreq:      0.00012,   // 1 cycle per ~8km
+        islandMaskSeed:      11.7,
+        islandMaskThreshold: 0.50,
+        islandMaskSoftness:  0.08,
+        islandSinkDepth:     1700,      // ocean floor at -200m
+        anchorMode:  "auto"
+      });
+      // Material: same band defaults as Walkable Terrain but with
+      // lower alts since this terrain is shorter (max ~1500m).
+      // bandScale = heightScale/12 = 125, so alt=2 -> 250m,
+      // alt=4 -> 500m, alt=8 -> 1000m. Snow above ~1000m.
+      const mat = makeNode("TerrainMaterial", 280, 80, {
+        color1R: 0.78, color1G: 0.72, color1B: 0.52, alt1: 2,   // shore sand at low altitudes
+        color2R: 0.36, color2G: 0.58, color2B: 0.26, alt2: 4,   // grass
+        color3R: 0.48, color3G: 0.42, color3B: 0.36, alt3: 8,   // rock
+        color4R: 0.94, color4G: 0.96, color4B: 0.98,            // snow
+        softness: 1.5, slopeRockiness: 2.0,
+        shininess: 6, ambient: 0.22, vertexMix: 0.0,
+        detailScale: 0.4, detailStrength: 0.20,
+        microScale: 2.0, microStrength: 0.12,
+        edgeJitter: 0.8, bumpStrength: 0.25, snowMaskAmount: 0.85
+      });
+      // FPCamera. Spawned somewhere on a likely island -- (0,0)
+      // sits at the mask center which is usually land at the
+      // default seed. Player walks on terrain (walkMode=1) or
+      // shuffles across the ocean floor when between islands.
+      const cam = makeNode("FPCamera", 520, 80, {
+        posX: 0, posY: 50, posZ: 0,
+        yaw: 0, pitch: 0.02,
+        fov: 70, near: 0.5, far: 15000,
+        walkMode: 1,
+        walkSpeed: 12, lookSpeed: 2.2,
+        mouseSensitivity: 0.0025, eyeHeight: 1.7
+      });
+      const light = makeNode("DirectionalLight", 40, 280, {
+        dirX: 0.4, dirY: 0.85, dirZ: 0.3,
+        colorR: 1.0, colorG: 0.94, colorB: 0.82,
+        intensity: 1.3
+      });
+      const scn = makeNode("Scene", 760, 80, {
+        clearR: 0.62, clearG: 0.75, clearB: 0.88
+      });
+      const mb = makeNode("MotionBlur", 940, 80, { amount: 0.30 });
+      const vo = makeNode("VisualOutput", 1140, 80, { display: 0 });
+      const map = makeNode("Minimap", 280, 280, {
+        corner: "top-right",
+        size: 220,
+        margin: 18,
+        range: 1.4               // zoomed out a bit so multiple islands fit
+      });
+
+      state.edges.push({ from: { node: ter, port: "mesh"   }, to: { node: mat, port: "mesh"   } });
+      state.edges.push({ from: { node: mat, port: "mesh"   }, to: { node: scn, port: "mesh1"  } });
+      state.edges.push({ from: { node: cam, port: "camera" }, to: { node: scn, port: "camera" } });
+      state.edges.push({ from: { node: light, port: "light"} , to: { node: scn, port: "light1" } });
+      state.edges.push({ from: { node: scn, port: "out"    }, to: { node: mb,  port: "in"     } });
+      state.edges.push({ from: { node: mb,  port: "out"    }, to: { node: vo,  port: "in"     } });
       state.edges.push({ from: { node: map, port: "hud"    }, to: { node: scn, port: "hud1"   } });
     }
   },
@@ -45798,9 +45926,7 @@ function _fpcSampleGroundY(wx, wz) {
   const gz = Math.floor(wz / dStep) * dStep;
   const fx = Math.max(0, Math.min(1, (wx - gx) / dStep));
   const fz = Math.max(0, Math.min(1, (wz - gz) / dStep));
-  const sampleAt = (x, z) =>
-    (_tiledTerrainHeightAt(x, z, noise) - 1) * hs + yOff
-    + _tiledIslandYShift(x, z, noise);
+  const sampleAt = (x, z) => _tiledFinalY(x, z, noise, hs, yOff);
   const y00 = sampleAt(gx,         gz        );
   const y10 = sampleAt(gx + dStep, gz        );
   const y01 = sampleAt(gx,         gz + dStep);
@@ -46037,12 +46163,13 @@ function _tickMinimapNodes() {
     lacunarity: (typeof ttp.lacunarity === "number") ? ttp.lacunarity : 2.05,
     gain:       (typeof ttp.gain       === "number") ? ttp.gain       : 0.5,
     ridges:     (typeof ttp.ridges     === "number") ? ttp.ridges     : 0.0,
-    plateau:    (typeof ttp.plateau    === "number") ? ttp.plateau    : 0.0
-    // §5.5.e-8 -- intentionally NOT applying erosionParams here.
-    // The minimap samples ~thousands of points per frame; running
-    // erosion (8 neighbor samples × iterations per pixel) would burn
-    // tens of milliseconds. The map silhouette is still good without
-    // erosion -- just the macro shape, not the carving detail.
+    plateau:    (typeof ttp.plateau    === "number") ? ttp.plateau    : 0.0,
+    // §5.5.e-8 -- intentionally NOT applying erosion here (8 neighbor
+    // samples × iterations would burn tens of ms per frame). The
+    // map silhouette + altitude bands are good enough without it.
+    // Island params ARE applied (cheap -- 1 mask sample per pixel)
+    // so the minimap correctly shows the archipelago silhouette.
+    islandParams: _findTiledIslandParams(tt)
   };
   // Center the disc on the wired camera (or origin if none).
   const cam = state.nodes.find(n => n && (n.type === "FPCamera" || n.type === "Camera"));
@@ -46061,30 +46188,33 @@ function _tickMinimapNodes() {
       const wx = camX + (u - 0.5) * worldDiameter;
       const wz = camZ + (v - 0.5) * worldDiameter;
       const h01 = _tiledTerrainHeightAt(wx, wz, noise);
-      let rC, gC, bC;
+      let rT, gT, bT;
       if (h01 < 0.25) {
-        // Slate-blue (water / valley pool)
         const t = h01 / 0.25;
-        rC = 0.20 + t * 0.20; gC = 0.32 + t * 0.30; bC = 0.55 - t * 0.20;
+        rT = 0.20 + t * 0.20; gT = 0.32 + t * 0.30; bT = 0.55 - t * 0.20;
       } else if (h01 < 0.55) {
-        // Grass / lowland
         const t = (h01 - 0.25) / 0.30;
-        rC = 0.36 + t * 0.10; gC = 0.58 - t * 0.12; bC = 0.26 + t * 0.04;
+        rT = 0.36 + t * 0.10; gT = 0.58 - t * 0.12; bT = 0.26 + t * 0.04;
       } else if (h01 < 0.80) {
-        // Rock (warm gray)
         const t = (h01 - 0.55) / 0.25;
-        rC = 0.48 + t * 0.20; gC = 0.42 + t * 0.18; bC = 0.36 + t * 0.10;
+        rT = 0.48 + t * 0.20; gT = 0.42 + t * 0.18; bT = 0.36 + t * 0.10;
       } else {
-        // Snow caps
         const t = (h01 - 0.80) / 0.20;
-        rC = 0.85 + t * 0.15; gC = 0.86 + t * 0.14; bC = 0.88 + t * 0.12;
+        rT = 0.85 + t * 0.15; gT = 0.86 + t * 0.14; bT = 0.88 + t * 0.12;
       }
+      // §5.5.e-11 -- LERP terrain color toward ocean blue based on
+      // island land-amount. Shows the archipelago silhouette on the
+      // minimap exactly the way the rendered mesh shows it in 3D.
+      const land = noise.islandParams ? _tiledIslandLandAmount(wx, wz, noise.islandParams) : 1;
+      const rC = rT * land + 0.08 * (1 - land);
+      const gC = gT * land + 0.18 * (1 - land);
+      const bC = bT * land + 0.38 * (1 - land);
       // Cheap hillshade -- darken by a finite-diff slope in X so
       // the map reads as 3D-feeling instead of flat color blobs.
       const dx = 1.0 / RES * worldDiameter * 0.5;
       const hL = (px > 0)       ? _tiledTerrainHeightAt(wx - dx, wz, noise) : h01;
       const hR = (px < RES - 1) ? _tiledTerrainHeightAt(wx + dx, wz, noise) : h01;
-      const shade = 1.0 + (hL - hR) * 0.6;
+      const shade = 1.0 + (hL - hR) * 0.6 * land;
       const o = (py * RES + px) * 4;
       img.data[o + 0] = Math.max(0, Math.min(255, Math.floor(rC * shade * 255)));
       img.data[o + 1] = Math.max(0, Math.min(255, Math.floor(gC * shade * 255)));
@@ -53142,47 +53272,62 @@ function _tiledTerrainCenterTile(node) {
  * The "frequency" param at this layer is cycles-per-world-unit (not
  * cycles-per-chunk). At freq=0.02 the noise wraps once every 50 units
  * which matches typical open-world rolling-terrain feature scale. */
-/* §5.5.e-10 -- island-mode falloff (radial), shared between the
- * height-amplitude squish and the Y-shift sink. Returns falloff in
- * [0, 1]: 1 = full terrain at island center, 0 = ocean floor at
- * edge. Power curve = sharper cliffs at higher exponents. */
-function _tiledIslandFalloff(wx, wz, ip) {
+/* §5.5.e-11 -- island-mode "land amount" at a world XZ. Returns 1
+ * inside an island (full terrain), 0 in the ocean (sea-floor), with
+ * smooth transitions at the shoreline. Branches on ip.mode:
+ *   "single"      -- radial falloff from (cx, cz), power curve
+ *   "archipelago" -- low-frequency noise mask, smoothstep threshold
+ * Cheap: at most one mask-noise call per sample. */
+function _tiledIslandLandAmount(wx, wz, ip) {
   if (!ip) return 1;
-  const dx = wx - ip.cx;
-  const dz = wz - ip.cz;
-  const dist = Math.sqrt(dx * dx + dz * dz);
-  const t = (ip.radius > 0) ? (dist / ip.radius) : 0;
-  if (t >= 1) return 0;
-  return Math.pow(1 - t, ip.power);
+  if (ip.mode === "single") {
+    const dx = wx - ip.cx;
+    const dz = wz - ip.cz;
+    const dist = Math.sqrt(dx * dx + dz * dz);
+    const t = (ip.radius > 0) ? (dist / ip.radius) : 0;
+    if (t >= 1) return 0;
+    return Math.pow(1 - t, ip.power);
+  }
+  if (ip.mode === "archipelago") {
+    // Low-frequency single-octave noise as the island mask. Cheap;
+    // returns 0..1. Threshold + smoothstep produce sharp coastlines
+    // with soft transitions. Octaves=1 keeps cost minimal.
+    const m = _terrainValueNoise(wx * ip.maskFreq, wz * ip.maskFreq, ip.maskSeed);
+    const lo = ip.maskThreshold - ip.maskSoftness;
+    const hi = ip.maskThreshold + ip.maskSoftness;
+    const u = Math.max(0, Math.min(1, (m - lo) / Math.max(1e-6, hi - lo)));
+    return u * u * (3 - 2 * u);    // smoothstep
+  }
+  return 1;
 }
 
-/* Island Y-shift: how far BELOW yOff to sink the terrain at this
- * world XZ when island mode is active. 0 at center, -sinkDepth at
- * the edge. Applied as an additive shift in the height-to-Y mapping
- * (separately from the height-amplitude squish in _tiledBaseHeight)
- * so the ocean floor sits well below sea level. */
-function _tiledIslandYShift(wx, wz, noise) {
-  if (!noise || !noise.islandParams) return 0;
+/* §5.5.e-11 -- LERP between terrain Y and sea-floor Y based on
+ * island land amount. Called from chunk builder + ground sampler
+ * AFTER erosion so erosion only sees the natural unbounded terrain.
+ * This is cheaper than the previous height-amplitude squish (which
+ * lived inside _tiledBaseHeight and got hit by every erosion
+ * neighbor lookup -- 8x cost). Here the mask sample is once per
+ * vertex only. */
+function _tiledFinalY(wx, wz, noise, hs, yOff) {
+  const h = _tiledTerrainHeightAt(wx, wz, noise);
+  const terrainY = (h - 1) * hs + yOff;
+  if (!noise || !noise.islandParams) return terrainY;
   const ip = noise.islandParams;
-  const f = _tiledIslandFalloff(wx, wz, ip);
-  return -ip.sinkDepth * (1 - f);
+  const f  = _tiledIslandLandAmount(wx, wz, ip);
+  if (f >= 0.9999) return terrainY;
+  const seaFloor = yOff - ip.sinkDepth;
+  return terrainY * f + seaFloor * (1 - f);
 }
 
-/* Base height field: pure fBm + plateau remap + (optional) island
- * radial squish. Does NOT apply erosion -- erosion's neighbor
- * sampling must hit the pre-erosion field to avoid recursion. */
+/* Base height field: pure fBm + plateau remap. Erosion samples
+ * this; the island LERP is applied LATER in _tiledFinalY so it
+ * doesn't multiply by erosion's neighbor count. */
 function _tiledBaseHeight(wx, wz, noise) {
   let h = _terrainFBM(wx, wz, noise);
   const p = (noise && typeof noise.plateau === "number") ? noise.plateau : 0;
   if (p > 0) {
     const k = 1 + Math.max(0, Math.min(1, p)) * 4;
     h = Math.pow(Math.max(0, Math.min(1, h)), k);
-  }
-  // Island mode: shrink peak amplitude toward the edge so the
-  // island silhouette tapers off naturally. The full sea-floor
-  // sink is applied as an additive Y-shift in the caller.
-  if (noise && noise.islandParams) {
-    h = h * _tiledIslandFalloff(wx, wz, noise.islandParams);
   }
   return h;
 }
@@ -53244,19 +53389,26 @@ function _tiledTerrainHeightAt(wx, wz, noise) {
 }
 
 /* §5.5.e-10 -- read island-mode params off the TiledTerrain node.
- * Returns null when islandMode is off so the no-island path stays
- * a zero-overhead branch in _tiledBaseHeight + the Y mapping. */
+ * Returns null when islandMode is "off" so the no-island path stays
+ * a zero-overhead branch in the Y mapping + ground sampler. */
 function _findTiledIslandParams(ttNode) {
   const p = ttNode && ttNode.params;
   if (!p) return null;
-  const mode = (typeof p.islandMode === "number") ? p.islandMode : 0;
-  if (mode < 0.5) return null;
+  const mode = (typeof p.islandMode === "string") ? p.islandMode : "off";
+  if (mode === "off") return null;
   return {
-    cx:        (typeof p.islandCenterX   === "number") ? p.islandCenterX   : 0,
-    cz:        (typeof p.islandCenterZ   === "number") ? p.islandCenterZ   : 0,
-    radius:    (typeof p.islandRadius    === "number") ? p.islandRadius    : 2500,
-    power:     (typeof p.islandFalloff   === "number") ? p.islandFalloff   : 2.0,
-    sinkDepth: (typeof p.islandSinkDepth === "number") ? p.islandSinkDepth : 4000
+    mode:       mode,
+    sinkDepth:  (typeof p.islandSinkDepth     === "number") ? p.islandSinkDepth     : 2200,
+    // single-mode params
+    cx:         (typeof p.islandCenterX       === "number") ? p.islandCenterX       : 0,
+    cz:         (typeof p.islandCenterZ       === "number") ? p.islandCenterZ       : 0,
+    radius:     (typeof p.islandRadius        === "number") ? p.islandRadius        : 2500,
+    power:      (typeof p.islandFalloff       === "number") ? p.islandFalloff       : 2.0,
+    // archipelago-mode params
+    maskFreq:      (typeof p.islandMaskFreq      === "number") ? p.islandMaskFreq      : 0.00012,
+    maskSeed:      (typeof p.islandMaskSeed      === "number") ? p.islandMaskSeed      : 11.7,
+    maskThreshold: (typeof p.islandMaskThreshold === "number") ? p.islandMaskThreshold : 0.50,
+    maskSoftness:  (typeof p.islandMaskSoftness  === "number") ? p.islandMaskSoftness  : 0.08
   };
 }
 
@@ -53343,7 +53495,7 @@ function _tiledTerrainGlobalCacheKey(node) {
  * symmetric around the (possibly-biased) center tile. */
 function _computeVisibleChunkSet(node) {
   const p = node.params || {};
-  const radius   = Math.max(0, Math.min(16, Math.floor((typeof p.chunkRadius === "number") ? p.chunkRadius : 8)));
+  const radius   = Math.max(0, Math.min(32, Math.floor((typeof p.chunkRadius === "number") ? p.chunkRadius : 8)));
   const baseSegs = Math.max(2, Math.min(64, Math.floor((typeof p.segments    === "number") ? p.segments    : 24)));
   const center = _tiledTerrainCenterTile(node);
   const visible = new Map();
@@ -53404,10 +53556,7 @@ function _buildSingleChunk(node, info) {
     for (let i = 0; i < N; i++) {
       const wx = originX + i * dStep;
       const wz = originZ + j * dStep;
-      // §5.5.e-10 -- island Y-shift (additive sink below sea level
-      // at the island edge). 0 when island mode is off.
-      const y = (_tiledTerrainHeightAt(wx, wz, noise) - 1) * hs + yOff
-              + _tiledIslandYShift(wx, wz, noise);
+      const y = _tiledFinalY(wx, wz, noise, hs, yOff);
       heights[j * N + i] = y;
       if (y < chunkMinY) chunkMinY = y;
       if (y > chunkMaxY) chunkMaxY = y;
@@ -53424,15 +53573,10 @@ function _buildSingleChunk(node, info) {
       // matches across chunk boundaries (the underlying fBm field
       // is continuous; LOD seams only affect mesh-level vertex
       // placement, not the world-space gradient).
-      // §5.5.e-10 -- edge-sample heights need the same island Y-shift
-      // applied or normals at chunk borders kink in island mode.
-      const sampleY = (sx, sz) =>
-        (_tiledTerrainHeightAt(sx, sz, noise) - 1) * hs + yOff
-        + _tiledIslandYShift(sx, sz, noise);
-      const yL = (i > 0)    ? heights[j * N + (i - 1)] : sampleY(wx - dStep, wz);
-      const yR = (i < segs) ? heights[j * N + (i + 1)] : sampleY(wx + dStep, wz);
-      const yD = (j > 0)    ? heights[(j - 1) * N + i] : sampleY(wx,         wz - dStep);
-      const yU = (j < segs) ? heights[(j + 1) * N + i] : sampleY(wx,         wz + dStep);
+      const yL = (i > 0)    ? heights[j * N + (i - 1)] : _tiledFinalY(wx - dStep, wz,         noise, hs, yOff);
+      const yR = (i < segs) ? heights[j * N + (i + 1)] : _tiledFinalY(wx + dStep, wz,         noise, hs, yOff);
+      const yD = (j > 0)    ? heights[(j - 1) * N + i] : _tiledFinalY(wx,         wz - dStep, noise, hs, yOff);
+      const yU = (j < segs) ? heights[(j + 1) * N + i] : _tiledFinalY(wx,         wz + dStep, noise, hs, yOff);
       const dydx = (yR - yL) / (2 * dStep);
       const dydz = (yU - yD) / (2 * dStep);
       let nx = -dydx, ny = 1, nz = -dydz;
@@ -63805,12 +63949,18 @@ function openTilingConfigPopup(nodeId) {
   secIsland.style.cssText = "margin-top:14px;font-size:10px;color:var(--text-3);text-transform:uppercase;letter-spacing:0.15em;";
   secIsland.textContent = "island mode";
   body.appendChild(secIsland);
-  body.appendChild(makeRow("island mode (0/1)", "islandMode",      "number", { step: 1, min: 0, max: 1 }).row);
-  body.appendChild(makeRow("center X",          "islandCenterX",   "number", { step: 50 }).row);
-  body.appendChild(makeRow("center Z",          "islandCenterZ",   "number", { step: 50 }).row);
-  body.appendChild(makeRow("radius (m)",        "islandRadius",    "number", { step: 50, min: 1 }).row);
-  body.appendChild(makeRow("falloff exponent",  "islandFalloff",   "number", { step: 0.1, min: 0.5 }).row);
-  body.appendChild(makeRow("sink depth (m)",    "islandSinkDepth", "number", { step: 100, min: 0 }).row);
+  body.appendChild(makeRow("mode",              "islandMode",          "select", { options: ["off", "single", "archipelago"] }).row);
+  body.appendChild(makeRow("sink depth (m)",    "islandSinkDepth",     "number", { step: 100, min: 0 }).row);
+  // single-mode rows
+  body.appendChild(makeRow("[single] center X", "islandCenterX",       "number", { step: 50 }).row);
+  body.appendChild(makeRow("[single] center Z", "islandCenterZ",       "number", { step: 50 }).row);
+  body.appendChild(makeRow("[single] radius",   "islandRadius",        "number", { step: 50, min: 1 }).row);
+  body.appendChild(makeRow("[single] falloff",  "islandFalloff",       "number", { step: 0.1, min: 0.5 }).row);
+  // archipelago-mode rows
+  body.appendChild(makeRow("[archipelago] mask freq",      "islandMaskFreq",      "number", { step: 0.00002, min: 0.00001 }).row);
+  body.appendChild(makeRow("[archipelago] mask seed",      "islandMaskSeed",      "number", { step: 0.1 }).row);
+  body.appendChild(makeRow("[archipelago] threshold",      "islandMaskThreshold", "number", { step: 0.02, min: 0.0, max: 1.0 }).row);
+  body.appendChild(makeRow("[archipelago] softness",       "islandMaskSoftness",  "number", { step: 0.01, min: 0.01, max: 0.5 }).row);
 
   // Section: erosion (baked into chunks at build time).
   const secErosion = document.createElement("div");
