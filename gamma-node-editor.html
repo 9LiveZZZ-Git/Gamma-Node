@@ -17177,11 +17177,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     textureInputSlots: { in: 16 },
     params: {
       inLayer:    0,
-      thermal:    0.4,
-      hydraulic:  0.5,
-      talus:      0.04,
-      iterations: 10,
-      radius:     1.5,
+      thermal:    0.85,
+      hydraulic:  0.85,
+      talus:      0.01,
+      iterations: 8,
+      radius:     4.0,
       strength:   1.0
     },
     methods: {},
@@ -17234,15 +17234,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   let h0 = _sampleH(in.uv, layer);
   var erodedH = h0;
 
-  // Multi-radius erosion: each iteration samples at a slightly
-  // larger radius so the result accumulates across scales (the
-  // "multi-scale" stand-in for true frame-to-frame iteration).
+  // Multi-radius erosion. Each iteration samples 8 neighbors at a
+  // progressively larger radius (radius doubles per iteration). At
+  // each scale we apply COMPOUNDING thermal + hydraulic passes on
+  // erodedH (not on h0) so the deltas accumulate. This is a
+  // single-pass stand-in for true frame-to-frame iterative erosion
+  // (which needs feedback infra -- lands with §5.5.e).
   for (var i: i32 = 0; i < iters; i = i + 1) {
-    let r = baseRadius * (1.0 + f32(i) * 0.6);
+    let r = baseRadius * pow(1.5, f32(i));   // 1x, 1.5x, 2.25x, 3.4x ...
     let o = texel * r;
 
-    // 8-neighbor ring at this radius. Re-sample from input each
-    // iteration (we can't read our own output mid-frame).
     let nW  = _sampleH(in.uv + vec2<f32>(-o.x,  0.0), layer);
     let nE  = _sampleH(in.uv + vec2<f32>( o.x,  0.0), layer);
     let nN  = _sampleH(in.uv + vec2<f32>( 0.0,  o.y), layer);
@@ -17257,23 +17258,22 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
                      min(min(nNW, nNE), min(nSW, nSE)));
 
     // Thermal erosion: when slope to lowest neighbor exceeds the
-    // talus angle, settle material downhill proportional to the
-    // overshoot. Scaled by 1/iterations so cumulative effect stays
-    // bounded as the user dials iterations up.
+    // talus angle, blend toward the min neighbor by a fraction
+    // proportional to (slope - talus). Smoothstep so the transition
+    // around talus is gentle instead of stepping.
     let slope = max(0.0, erodedH - minNbr);
-    if (slope > talus) {
-      let amt = thermal * (slope - talus) * 0.5 / f32(iters);
-      erodedH = erodedH - amt;
-    }
+    let thermalBlend = thermal * smoothstep(talus, talus + 0.04, slope);
+    erodedH = mix(erodedH, minNbr, thermalBlend);
 
     // Hydraulic erosion: blend toward neighbor average where the
     // surface is convex (ridges get smoothed by runoff). Concave
-    // areas (valleys, basins) get LESS blending so they hold their
-    // shape -- mimics sediment deposition pooling in low spots.
+    // areas (valleys) get LESS blending so they hold their shape
+    // -- mimics sediment deposition pooling in low spots. The
+    // smoothstep gates the blend so flat regions stay flat.
     let curvature = nbrAvg - erodedH;
-    let convexW   = max(0.0, -curvature) * 4.0;
-    let blend     = hydraulic * clamp(convexW, 0.0, 1.0) / f32(iters);
-    erodedH = mix(erodedH, nbrAvg, blend);
+    let convexAmt = smoothstep(0.0, 0.02, -curvature);
+    let hydroBlend = hydraulic * convexAmt;
+    erodedH = mix(erodedH, nbrAvg, hydroBlend);
   }
 
   let outH = clamp(mix(h0, erodedH, strength), 0.0, 1.0);
@@ -17282,11 +17282,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     writeUniforms(node, scratch) {
       const p = node.params || {};
       scratch[16] = (typeof p.inLayer    === "number") ? p.inLayer    : 0;
-      scratch[17] = (typeof p.thermal    === "number") ? p.thermal    : 0.4;
-      scratch[18] = (typeof p.hydraulic  === "number") ? p.hydraulic  : 0.5;
-      scratch[19] = (typeof p.talus      === "number") ? p.talus      : 0.04;
-      scratch[20] = (typeof p.iterations === "number") ? p.iterations : 10;
-      scratch[21] = (typeof p.radius     === "number") ? p.radius     : 1.5;
+      scratch[17] = (typeof p.thermal    === "number") ? p.thermal    : 0.85;
+      scratch[18] = (typeof p.hydraulic  === "number") ? p.hydraulic  : 0.85;
+      scratch[19] = (typeof p.talus      === "number") ? p.talus      : 0.01;
+      scratch[20] = (typeof p.iterations === "number") ? p.iterations : 8;
+      scratch[21] = (typeof p.radius     === "number") ? p.radius     : 4.0;
       scratch[22] = (typeof p.strength   === "number") ? p.strength   : 1.0;
       scratch[23] = 0;
     },
@@ -31806,11 +31806,11 @@ const _demos = [
       // (vs the bare procedural heightmap, which has uniform
       // sharpness everywhere).
       const ero = makeNode("TerrainErosion", -200, 40, {
-        thermal:    0.5,
-        hydraulic:  0.6,
-        talus:      0.045,
-        iterations: 12,
-        radius:     1.5,
+        thermal:    0.9,
+        hydraulic:  0.9,
+        talus:      0.005,
+        iterations: 8,
+        radius:     5.0,
         strength:   1.0
       });
       // TerrainMaterial: altitude- and slope-blended bands so the
