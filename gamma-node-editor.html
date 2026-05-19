@@ -10979,19 +10979,27 @@ public:
     ],
     outs: [{ n: "mesh", t: "mesh" }],
     params: {
-      extent:        100000,  // 100km mesh extent
-      subdivisions:  96,      // 97x97 verts = ~9.4k; ~1km per vertex
-      tileSize:      10000,   // macro-tile snap; rebuild only on crossing
-      yBias:         -0.5,    // lower vs. TiledTerrain so inner overlap loses depth test
-      octaves:       3,       // <= upstream TiledTerrain octaves; cheap noise
-      // §5.5.h-25 planet curvature blend. Curvature factor smoothsteps
-      // from 0 to 1 over [curveAltLow, curveAltHigh] (camera Y). Above
-      // curveAltHigh, distant vertices drop by d²/(2*planetRadius).
-      // planetRadius = 200km gives a noticeable curve from a few km
-      // up; Earth-scale 6378km would barely register over a 50km disc.
-      curveAltLow:   2000,
-      curveAltHigh:  8000,
-      planetRadius:  200000
+      // §5.5.h-26 -- Earth-scale planet defaults. To see real Earth
+      // curvature you need to climb high AND have the horizon mesh
+      // extending far enough that distant verts can drop meaningfully.
+      // 800km extent at 96 subdivisions = ~8.3km per vertex; we lower
+      // the noise freq via noiseFreqScale so big-shape features still
+      // show coherently at that spacing.
+      extent:         800000,
+      subdivisions:   96,
+      tileSize:       50000,
+      yBias:          -0.5,
+      octaves:        2,
+      noiseFreqScale: 0.15,
+      // §5.5.h-26 -- Earth-scale curvature. planetRadius=6378km is
+      // the real Earth. Curve is invisible at sea level (~0.2m drop
+      // at 50km horizon) but kicks in dramatically once the camera
+      // climbs past curveAltLow: at altitude 30km with the impostor
+      // extending out 400km, the far edge drops by ~12.5km -- visible
+      // Earth curve.
+      curveAltLow:    8000,
+      curveAltHigh:   30000,
+      planetRadius:   6378000
     },
     methods: {},
     description: "Low-poly terrain impostor that extends visible coverage past TiledTerrain's chunked disc out to ~50km from the camera. Auto-detects the patch's TiledTerrain and samples the same noise (capped at `octaves`, no erosion) so big-shape silhouettes match the chunked disc at the inner-edge meeting line. Macro-tile camera-follow (default 10km) keeps the mesh roughly centered without per-frame rebuilds. Per-vertex altitude colors baked in so it renders unlit-vc with no material wire needed. `yBias` is a small downward offset (default -0.5m) so the chunked terrain wins the depth test in the overlap zone."
@@ -32747,9 +32755,12 @@ const _demos = [
         // so the player doesn't load inside terrain.
         posX: 0, posY: 1700, posZ: 0,
         yaw: 0, pitch: -0.18,
-        // §5.5.h-9 -- far plane bumped to 25km so the new 16km terrain
-        // disc + horizon don't clip when looking out across the archipelago.
-        fov: 70, near: 0.5, far: 25000,
+        // §5.5.h-26 -- far plane large enough to contain the 800km
+        // horizon impostor at low altitude AND the curved-planet view
+        // from 30km+ up. WebGPU depth precision is f32 + reverse-Z
+        // friendly enough that 1Mm far works without z-fighting on
+        // the chunked terrain near the camera.
+        fov: 70, near: 0.5, far: 1000000,
         walkMode: 0,
         // §5.5.h-25 -- faster fly mode so the user can actually cross
         // the 100km horizon impostor extent in reasonable time.
@@ -32784,17 +32795,21 @@ const _demos = [
       // mesh so the standard projection pipeline handles parallax
       // (under both translation AND rotation) without any of the
       // angular-distortion games the sky-pass shell had to play.
-      // §5.5.h-23 -- TerrainHorizon impostor. Extends terrain coverage
-      // past the chunked TiledTerrain disc out to ~50km. Lower octaves
-      // (3) keep build cheap; macro-tile follow (10km) means rebuild
-      // only every ~5 chunks of camera travel. yBias=-0.5 ensures
-      // chunked TiledTerrain wins the depth test in overlap zone.
+      // §5.5.h-26 -- TerrainHorizon at Earth scale. 800km extent so
+      // distant Earth curvature reads visibly once the camera climbs
+      // past curveAltLow (8km). At ground level the curve is invisible
+      // (~0.2m drop at 50km horizon) -- you have to fly up to see
+      // the planet shape.
       const horizon = makeNode("TerrainHorizon", 280, 680, {
-        extent:       100000,
-        subdivisions: 96,
-        tileSize:     10000,
-        yBias:        -0.5,
-        octaves:      3
+        extent:         800000,
+        subdivisions:   96,
+        tileSize:       50000,
+        yBias:          -0.5,
+        octaves:        2,
+        noiseFreqScale: 0.15,
+        curveAltLow:    8000,
+        curveAltHigh:   30000,
+        planetRadius:   6378000
       });
       const clouds = makeNode("Clouds3D", 40, 680, {
         // §5.5.h-18 -- chunked cloud streaming with rounded tops AND
@@ -51630,6 +51645,11 @@ fn fs_sky(in: SkyVsOut) -> @location(0) vec4<f32> {
   let mode = u32(uS.envParams.x);
   var col: vec3<f32>;
   if (mode == 2u) {
+    // §5.5.h-26 -- sample_procedural_sky_smooth bakes in an altitude
+    // atmospheric fade (full sky at <20km camera Y, space at >80km),
+    // so fs_water / fs_clouds / fs_horizon / IBL all see the same
+    // thinning. Features (sun disc + stars + moon + Milky Way) are
+    // additive and not faded -- those stay visible in space.
     col = sample_procedural_sky(dir);
   } else {
     col = sample_env(dir);
@@ -51770,7 +51790,16 @@ fn sample_procedural_sky_smooth(dir: vec3<f32>) -> vec3<f32> {
   let halo = phaseM * sunVis * 1.0;
   col = col + halo * sunRadiance;
 
-  return col * intensity;
+  // §5.5.h-26 -- atmospheric altitude fade. Real atmosphere is mostly
+  // gone by ~80km. Below 20km camera Y we're in full sky; ramps to
+  // 0 (space) over the 20-80km band. Applied to the smooth path only
+  // so sun / stars / Milky Way (sample_procedural_sky_features) stay
+  // visible from above the atmosphere. Used by fs_sky, fs_water,
+  // fs_horizon, fs_clouds, and IBL sampling so everything that reads
+  // the sky stays consistent as the camera climbs out of atmosphere.
+  let camY = uS.eye.y;
+  let atmFade = clamp(1.0 - (camY - 20000.0) / 60000.0, 0.0, 1.0);
+  return col * intensity * atmFade;
 }
 
 fn sample_procedural_sky_features(dir: vec3<f32>) -> vec3<f32> {
@@ -53855,7 +53884,7 @@ function _meshCacheKey(node) {
       const ttp = (tt && tt.params) || {};
       const ip  = tt ? _findTiledIslandParams(tt) : null;
       return "thr:" + [
-        p.extent, p.subdivisions, p.tileSize, p.yBias, p.octaves,
+        p.extent, p.subdivisions, p.tileSize, p.yBias, p.octaves, p.noiseFreqScale,
         tile.tx, tile.tz,
         ttp.seed, ttp.frequency, ttp.octaves, ttp.lacunarity, ttp.gain,
         ttp.ridges, ttp.plateau, ttp.heightScale, ttp.yOffset,
@@ -54609,6 +54638,11 @@ function _buildTerrainHorizon(node) {
   const segs    = Math.max(8, Math.min(256, Math.floor((typeof p.subdivisions === "number") ? p.subdivisions : 96)));
   const yBias   = (typeof p.yBias === "number") ? p.yBias : -0.5;
   const octCap  = Math.max(1, Math.min(6, Math.floor((typeof p.octaves === "number") ? p.octaves : 3)));
+  // §5.5.h-26 -- multiply the upstream TiledTerrain's frequency by
+  // this scale so the impostor samples coherent big-shape features
+  // at its much coarser vertex spacing instead of aliasing the
+  // chunked terrain's fine detail.
+  const noiseFreqScale = (typeof p.noiseFreqScale === "number") ? Math.max(0.001, p.noiseFreqScale) : 0.15;
 
   // Pull noise from any TiledTerrain in the patch. Without one, the
   // impostor falls back to a flat sea-level plane (still useful as a
@@ -54620,7 +54654,7 @@ function _buildTerrainHorizon(node) {
   const ttp = (tt && tt.params) || {};
   const noise = tt ? {
     seed:        (typeof ttp.seed       === "number") ? ttp.seed       : 7.42,
-    frequency:   (typeof ttp.frequency  === "number") ? ttp.frequency  : 0.0008,
+    frequency:   ((typeof ttp.frequency  === "number") ? ttp.frequency  : 0.0008) * noiseFreqScale,
     octaves:     Math.min(octCap, (typeof ttp.octaves === "number") ? ttp.octaves : 5),
     lacunarity:  (typeof ttp.lacunarity === "number") ? ttp.lacunarity : 2.0,
     gain:        (typeof ttp.gain       === "number") ? ttp.gain       : 0.5,
