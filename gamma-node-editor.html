@@ -51839,17 +51839,26 @@ fn fs_phong(in: VsOut) -> @location(0) vec4<f32> {
 // lines up with the rendered terrain mesh edge. Explicit type
 // literals throughout to avoid any abstract-int / abstract-float
 // inference surprise.
-fn _tw_hash(p: vec2<f32>, seed: f32) -> f32 {
-  let v = sin(p.x * 127.1 + p.y * 311.7 + p.x * 269.5 + p.y * 183.3 + seed) * 43758.5453;
-  return fract(v);
+// §5.5.h-7 -- bit-identical to JS _terrainHash. i32 multiply +
+// XOR + shift, no sin(). Now the water shader's noise matches the
+// mesh build's noise EXACTLY at any world coord.
+fn _tw_hash(ix: i32, iy: i32, seed: f32) -> f32 {
+  let ss: i32 = i32(floor(seed * 1000.0));
+  var h: i32 = (ix * 374761393) ^ (iy * 668265263) ^ (ss * 2147483647);
+  h = h ^ (h >> 13u);
+  h = h * 1274126177;
+  h = h ^ (h >> 16u);
+  return f32(bitcast<u32>(h)) / 4294967296.0;
 }
 fn _tw_valueNoise(p: vec2<f32>, seed: f32) -> f32 {
   let i = floor(p);
   let fr = p - i;
-  let a = _tw_hash(i,                               seed);
-  let b = _tw_hash(i + vec2<f32>(1.0, 0.0),         seed);
-  let c = _tw_hash(i + vec2<f32>(0.0, 1.0),         seed);
-  let d = _tw_hash(i + vec2<f32>(1.0, 1.0),         seed);
+  let ix: i32 = i32(i.x);
+  let iy: i32 = i32(i.y);
+  let a = _tw_hash(ix,     iy,     seed);
+  let b = _tw_hash(ix + 1, iy,     seed);
+  let c = _tw_hash(ix,     iy + 1, seed);
+  let d = _tw_hash(ix + 1, iy + 1, seed);
   let s = fr * fr * (vec2<f32>(3.0) - vec2<f32>(2.0) * fr);
   let ab = a + (b - a) * s.x;
   let cd = c + (d - c) * s.x;
@@ -52006,17 +52015,10 @@ fn fs_water(in: VsOut) -> @location(0) vec4<f32> {
                  + y01 * (1.0 - fx) * fz
                  + y11 * fx        * fz;
     depth = max(0.0, seaLevel - terrainY);
-    // §5.5.h-6 -- distance fade. The JS terrain mesh computes its
-    // noise at f64 precision; the shader is f32. At large world
-    // coords (5km+) the shader's sin()-based hash drifts from the
-    // mesh's noise field -- producing scattered shore/shallow
-    // patches in the distance that don't match any visible island.
-    // Fade shore detect out beyond 1.2km so distant water reads
-    // as uniform deep ocean (which is also visually correct -- you
-    // don't see shore detail from kilometers away).
-    let camDist2 = length(in.worldPos.xz - uS.eye.xz);
-    let farFade  = clamp((camDist2 - 1200.0) / 3000.0, 0.0, 1.0);
-    depth = mix(depth, 10000.0, farFade);
+    // §5.5.h-7 -- distance fade removed. The new integer-bit hash
+    // is bit-identical between JS and WGSL, so shader noise
+    // matches mesh noise at every distance -- no more scattered
+    // distant patches. Shore + shallow tint visible to the horizon.
   }
 
   // ---- Wave normal (two layered fBm UVs) ----
@@ -53347,11 +53349,22 @@ function _buildPlane(node) {
  * Terrain mesh with identical noise params previews what a future
  * ProceduralTerrain → Terrain wired path would emit at GPU time. */
 function _terrainHash(x, y, seed) {
-  const hx = x * 127.1 + y * 311.7;
-  const hy = x * 269.5 + y * 183.3;
-  // Math.sin-based hash; the same constants the WGSL helper uses.
-  const v = Math.sin(hx + hy + seed) * 43758.5453;
-  return v - Math.floor(v);
+  // §5.5.h-7 -- deterministic integer-bit-mix hash. Replaces the
+  // old Math.sin-based hash so the JS noise (mesh build) is
+  // bit-identical with the WGSL noise (water shader's fs_water).
+  // sin-based hashes diverge at large world coords because JS uses
+  // f64 sin while WGSL uses f32 sin; the resulting noise mismatch
+  // made water foam misalign with the terrain mesh past ~1km. The
+  // bit-mix below uses only i32 multiplies + XOR + bit-shifts that
+  // produce identical results across both languages.
+  const sx = x | 0;
+  const sy = y | 0;
+  const ss = (Math.floor(seed * 1000) | 0);
+  let h = Math.imul(sx, 374761393) ^ Math.imul(sy, 668265263) ^ Math.imul(ss, 2147483647);
+  h = h ^ (h >> 13);
+  h = Math.imul(h, 1274126177);
+  h = h ^ (h >> 16);
+  return (h >>> 0) / 4294967296;
 }
 function _terrainValueNoise(x, y, seed) {
   const ix = Math.floor(x), iy = Math.floor(y);
