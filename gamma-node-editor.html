@@ -10925,6 +10925,49 @@ public:
     description: "Phase 7 §5.5.e chunked terrain at mountain scale with per-chunk streaming. Each chunk has its own VBO+IBO and is built incrementally (~10ms budget per frame); crossing tile boundaries doesn't stall. As the camera moves, chunks leaving the visible disc are destroyed and new chunks build in their place. Per-chunk frustum culling skips off-view chunks at draw time. 5-ring distance-LOD (24/12/6/3/2 segments) with vertical skirts masking T-junction seams. World-space fBm sampling: seams are exact along same-LOD edges, skirts cover gaps at LOD edges. Defaults are mountain-scale at 1u=1m: chunkSize=64m, chunkRadius=8, segments=24, heightScale=80m. plateau (0..1) flattens low/mid altitudes for isolated peaks in plains. forwardBias (0..1) shifts the loaded disc toward the player's walk direction (8-cardinal-direction snap with 700ms hysteresis) so they see further forward than behind. erosionStrength (0..1) bakes a hydraulic+thermal erosion pass into the chunk mesh at build time -- carves ridges + settles valleys with no per-frame cost. Pair with TerrainMaterial + FPCamera. Drop a Minimap node + wire it to Scene.hud1 for a top-down overlay. Open the ⚙ Tiling Config popup on the node for the full knob set + a live preview. Anchor mode = manual locks the grid origin to (centerX, centerZ) instead of camera-follow."
   },
 
+  /* Phase 7 §5.5.h -- Water. Mesh-gen + baked-in water material.
+   * Emits a single huge XZ plane at Y = seaLevel (100km × 100km --
+   * effectively infinite for any walking session). Material is
+   * applied automatically by the Scene encoder when m.node.type ===
+   * "Water" so users don't need a separate WaterMat node. Phase 1
+   * shader: animated wave normals from time-shifted fBm UVs +
+   * Fresnel-mixed sky reflection (sky color is hardcoded for now;
+   * future: read from a wired environment). Phase 2 will add SSR
+   * (screen-space reflection ray-march) once the Scene exposes its
+   * color+depth attachments to post-process passes. */
+  Water: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "mesh-gen",
+    ins: [
+      { n: "seaLevel",         t: "param" },
+      { n: "colorR",           t: "param" },
+      { n: "colorG",           t: "param" },
+      { n: "colorB",           t: "param" },
+      { n: "waveFreq",         t: "param" },
+      { n: "waveSpeed",        t: "param" },
+      { n: "waveAmp",          t: "param" },
+      { n: "fresnelStrength",  t: "param" },
+      { n: "skyR",             t: "param" },
+      { n: "skyG",             t: "param" },
+      { n: "skyB",             t: "param" }
+    ],
+    outs: [{ n: "mesh", t: "mesh" }],
+    params: {
+      seaLevel:        0,
+      colorR:          0.10, colorG: 0.32, colorB: 0.48,
+      waveFreq:        0.012,    // cycles per world unit
+      waveSpeed:       0.6,
+      waveAmp:         1.0,      // strength of normal perturbation
+      fresnelStrength: 1.0,
+      // Sky color for the Fresnel reflection. Soft hazy blue by
+      // default; future: read from wired Environment.
+      skyR:            0.62, skyG: 0.78, skyB: 0.92
+    },
+    methods: {},
+    description: "Phase 7 §5.5.h water surface. Emits a 100km × 100km plane mesh at Y=seaLevel with a baked water material -- Scene auto-applies the fs_water fragment shader when the mesh's source node is `Water`. Effects: animated wave normals (time-shifted fBm UV sample → perturbed normal each fragment); Fresnel sky-color reflection (Schlick power 5); transparent-feeling water color underneath. waveFreq is cycles per world unit (default 0.012 ≈ ~80m wavelength). waveSpeed scales wave-time advance (0.6 ≈ leisurely). waveAmp scales the normal perturbation magnitude. Defaults give a calm sea look. Wire `mesh` into a Scene mesh slot like any other mesh. Phase 2 (next push) will add SSR ray-march reflections."
+  },
+
   /* =========================================================================
    * Sprint 7.5.3b -- Mesh transforms
    *
@@ -32431,9 +32474,24 @@ const _demos = [
         margin: 18,
         range: 1.4               // zoomed out a bit so multiple islands fit
       });
+      // §5.5.h Water. Sea level Y=0 matches the TiledTerrain's yOffset
+      // - heightScale = 0, so coastlines align. Calm-sea defaults:
+      // gentle waves, soft sky reflection. Phase 1 only -- SSR
+      // reflection of actual scene ships next.
+      const water = makeNode("Water", 40, 480, {
+        seaLevel: 0,
+        colorR: 0.10, colorG: 0.32, colorB: 0.48,
+        waveFreq: 0.012, waveSpeed: 0.6, waveAmp: 1.0,
+        fresnelStrength: 1.0,
+        skyR: 0.62, skyG: 0.78, skyB: 0.92
+      });
 
       state.edges.push({ from: { node: ter, port: "mesh"   }, to: { node: mat, port: "mesh"   } });
       state.edges.push({ from: { node: mat, port: "mesh"   }, to: { node: scn, port: "mesh1"  } });
+      // Water as a second mesh slot. No material wire needed -- the
+      // Water node bakes fs_water into the encoder when its mesh
+      // hits a Scene slot.
+      state.edges.push({ from: { node: water, port: "mesh" }, to: { node: scn, port: "mesh2"  } });
       state.edges.push({ from: { node: cam, port: "camera" }, to: { node: scn, port: "camera" } });
       state.edges.push({ from: { node: light, port: "light"} , to: { node: scn, port: "light1" } });
       state.edges.push({ from: { node: scn, port: "out"    }, to: { node: mb,  port: "in"     } });
@@ -51715,6 +51773,56 @@ fn fs_phong(in: VsOut) -> @location(0) vec4<f32> {
   return vec4<f32>(tonemap_aces(fogged), 1.0);
 }
 
+// Phase 7 §5.5.h -- fs_water. Animated wave normals from time-
+// shifted fBm UV sample (two octaves layered for choppy +
+// gentle-swell mix). Fresnel-weighted blend between water color
+// (looking down) and sky color (grazing) via Schlick. Time is
+// packed into uD.band1.w by the encoder so the shader stays in
+// the per-draw uniform without needing a separate time field on
+// PerScene. Phase 2 will add SSR ray-march using the Scene's
+// depth + color attachments.
+@fragment
+fn fs_water(in: VsOut) -> @location(0) vec4<f32> {
+  let waterColor = uD.baseColor.rgb;
+  let fresnelStr = max(0.0, uD.baseColor.a);
+  let waveFreq   = max(0.00001, uD.matParams.y);
+  let waveSpeed  = uD.matParams.z;
+  let waveAmp    = max(0.0, uD.matParams.w);
+  let skyColor   = uD.band1.rgb;
+  let t          = uD.band1.w;
+
+  // Wave UV in world XZ scaled by waveFreq. Two sets at different
+  // scales + opposite drift directions give a more natural ocean
+  // look than a single fBm.
+  let wp = in.worldPos;
+  let uvA = wp.xz * waveFreq           + vec2<f32>( t * waveSpeed * 0.6,  t * waveSpeed * 0.4);
+  let uvB = wp.xz * waveFreq * 2.3     + vec2<f32>(-t * waveSpeed * 0.3,  t * waveSpeed * 0.5);
+
+  // Central-difference normal of the height field defined by fBm.
+  // eps is in UV space (i.e. cycles-per-step). Larger -> smoother
+  // waves; smaller -> sharper crests.
+  let eps = 0.025;
+  let hC = _fbm(uvA)                          + _fbm(uvB) * 0.5;
+  let hX = _fbm(uvA + vec2<f32>(eps, 0.0))    + _fbm(uvB + vec2<f32>(eps, 0.0)) * 0.5;
+  let hZ = _fbm(uvA + vec2<f32>(0.0, eps))    + _fbm(uvB + vec2<f32>(0.0, eps)) * 0.5;
+  let dx = (hX - hC) / eps;
+  let dz = (hZ - hC) / eps;
+  let n = normalize(vec3<f32>(-dx * waveAmp, 1.0, -dz * waveAmp));
+
+  // View direction surface -> camera.
+  let v = normalize(uS.eye.xyz - in.worldPos);
+
+  // Schlick Fresnel. F0 ~= 0.02 for water-to-air at 0° incidence.
+  let cosTheta = max(0.0, dot(n, v));
+  let f0 = 0.02;
+  let fresnel = clamp(f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0), 0.0, 1.0);
+  let mixT = clamp(fresnel * fresnelStr, 0.0, 1.0);
+
+  let outRGB = mix(waterColor, skyColor, mixT);
+  let fogged = apply_fog(outRGB, in.worldPos);
+  return vec4<f32>(tonemap_aces(fogged), 1.0);
+}
+
 // Phase 7 §5.5.c TerrainMaterial v2 (v0.3.129) -- AAA-style
 // terrain shading. Altitude bands + slope rock + slope-masked
 // snow + multi-scale detail noise (macro variation + micro
@@ -52510,6 +52618,7 @@ function _ensureMeshPipeline(materialType, sampleCount, displaced) {
       materialType === "pbr"      ? "fs_pbr"     :
       materialType === "phong"    ? "fs_phong"   :
       materialType === "terrain"  ? "fs_terrain" :
+      materialType === "water"    ? "fs_water"   :
       materialType === "unlit"    ? "fs_unlit"   :
       /* default unlit-vc */        "fs_unlit_vc";
   }
@@ -52817,6 +52926,12 @@ function _meshCacheKey(node) {
     }
     // TiledTerrain doesn't use _meshCacheKey -- _ensureTiledTerrainChunks
     // manages its own per-chunk cache keyed by (tileX, tileZ, lod).
+    case "Water":         {
+      // Water mesh is a fixed 100km plane -- only seaLevel affects
+      // geometry. All other params (waves, color, fresnel) are
+      // shader uniforms and don't require a mesh rebuild.
+      return "water:" + (p.seaLevel || 0);
+    }
     default:              return node.type;
   }
 }
@@ -52839,6 +52954,7 @@ function _buildMeshData(node) {
     case "Cylinder":      return _buildCylinder(node);
     case "Cone":          return _buildCone(node);
     case "Terrain":       return _buildTerrain(node);
+    case "Water":         return _buildWater(node);
     default: return null;
   }
 }
@@ -53453,6 +53569,28 @@ function _tiledTerrainLodSegments(dxAbs, dzAbs, radius, baseSegs) {
   if (t <= 0.60) return Math.max(2, baseSegs >> 2);
   if (t <= 0.80) return Math.max(2, baseSegs >> 3);
   return 2;
+}
+
+/* Phase 7 §5.5.h -- Water plane mesh. A single huge XZ quad at
+ * Y = seaLevel. 100km × 100km so it covers any practical walking
+ * session without a follow-camera implementation. Just 4 verts +
+ * 6 indices -- negligible memory. Wave animation + Fresnel happen
+ * in the fragment shader (fs_water), not in the geometry. */
+function _buildWater(node) {
+  const p = node.params || {};
+  const seaY = (typeof p.seaLevel === "number") ? p.seaLevel : 0;
+  const half = 50000;   // 50km half-extent -> 100km plane
+  // Vertex layout: pos.xyz, color.rgb (unused for water), normal.xyz (+Y),
+  // uv.xy. Use world-XZ as UV so fragment shader can derive world-
+  // space wave coordinates without recomputing from pos.
+  const verts = new Float32Array([
+    -half, seaY, -half,   0.2, 0.4, 0.6,   0, 1, 0,   -half, -half,
+     half, seaY, -half,   0.2, 0.4, 0.6,   0, 1, 0,    half, -half,
+     half, seaY,  half,   0.2, 0.4, 0.6,   0, 1, 0,    half,  half,
+    -half, seaY,  half,   0.2, 0.4, 0.6,   0, 1, 0,   -half,  half
+  ]);
+  const indices = new Uint32Array([0, 1, 2,  0, 2, 3]);
+  return { verts, indices };
 }
 
 /* §5.5.e-6 -- TiledTerrain streaming. Each chunk gets its own
@@ -54414,7 +54552,10 @@ function _encodeScenePass(enc, entry) {
         continue;
       }
     }
-    const matType = (m.material && m.material.type) || "unlit-vc";
+    // §5.5.h -- Water node bakes its own material; override matType
+    // so fs_water fires regardless of any wired Material.
+    let matType = (m.material && m.material.type) || "unlit-vc";
+    if (m.node && m.node.type === "Water") matType = "water";
     // v0.3.126 §5.5.c-3 -- detect Terrain w/ heightmap wired ->
     // pick the `displaced` pipeline variant so vs_terrain runs in
     // place of vs_main. Plan walker schedules the heightmap source
@@ -54437,15 +54578,34 @@ function _encodeScenePass(enc, entry) {
     }
     // Write model + material into THIS slot's per-draw buffer.
     inst.drawScratch.set(m.transform, 0);
-    const mp = (m.material && m.material.params) || {};
-    inst.drawScratch[16] = (typeof mp.r === "number") ? mp.r : 1.0;
-    inst.drawScratch[17] = (typeof mp.g === "number") ? mp.g : 1.0;
-    inst.drawScratch[18] = (typeof mp.b === "number") ? mp.b : 1.0;
+    let mp = (m.material && m.material.params) || {};
+    // §5.5.h -- Water packs its own params from m.node (mesh-gen
+    // doubles as material since Water bakes the shader in).
+    if (matType === "water" && m.node && m.node.params) mp = m.node.params;
+    inst.drawScratch[16] = (typeof mp.r === "number") ? mp.r : ((typeof mp.colorR === "number") ? mp.colorR : 1.0);
+    inst.drawScratch[17] = (typeof mp.g === "number") ? mp.g : ((typeof mp.colorG === "number") ? mp.colorG : 1.0);
+    inst.drawScratch[18] = (typeof mp.b === "number") ? mp.b : ((typeof mp.colorB === "number") ? mp.colorB : 1.0);
     inst.drawScratch[19] = (typeof mp.vertexMix === "number") ? mp.vertexMix : (matType === "unlit-vc" ? 1.0 : 0.0);
     inst.drawScratch[20] = (typeof mp.shininess === "number") ? mp.shininess : 32.0;
     inst.drawScratch[21] = (typeof mp.ambient   === "number") ? mp.ambient   : 0.15;
     inst.drawScratch[22] = (typeof mp.metallic  === "number") ? mp.metallic  : 0.0;
     inst.drawScratch[23] = (typeof mp.roughness === "number") ? mp.roughness : 0.5;
+    // §5.5.h -- Water remap: baseColor.a = fresnelStrength, matParams =
+    // (seaLevel, waveFreq, waveSpeed, waveAmp), band1.rgba = (skyR, skyG, skyB, time).
+    if (matType === "water") {
+      inst.drawScratch[19] = (typeof mp.fresnelStrength === "number") ? mp.fresnelStrength : 1.0;
+      inst.drawScratch[20] = (typeof mp.seaLevel  === "number") ? mp.seaLevel  : 0;
+      inst.drawScratch[21] = (typeof mp.waveFreq  === "number") ? mp.waveFreq  : 0.012;
+      inst.drawScratch[22] = (typeof mp.waveSpeed === "number") ? mp.waveSpeed : 0.6;
+      inst.drawScratch[23] = (typeof mp.waveAmp   === "number") ? mp.waveAmp   : 1.0;
+      inst.drawScratch[24] = (typeof mp.skyR === "number") ? mp.skyR : 0.62;
+      inst.drawScratch[25] = (typeof mp.skyG === "number") ? mp.skyG : 0.78;
+      inst.drawScratch[26] = (typeof mp.skyB === "number") ? mp.skyB : 0.92;
+      // Time, seconds since the device acquired. Lazy-init the start
+      // time so animation begins at 0 the first time water is drawn.
+      if (!Visual._waterStartT) Visual._waterStartT = performance.now();
+      inst.drawScratch[27] = (performance.now() - Visual._waterStartT) * 0.001;
+    }
     // Phase 7 §5.5.c -- TerrainMaterial uses the extended band
     // slots [24..39] and reinterprets matParams as
     // (shininess, ambient, slopeRockiness, vertexMix). Other
