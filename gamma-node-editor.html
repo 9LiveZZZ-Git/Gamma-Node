@@ -62,6 +62,7 @@
     --light:        #f5e6c8;     /* Sprint 7.5.3c — light source (DirectionalLight → Scene) */
     --environment:  #7ad6c4;     /* Sprint 7.5.4 — environment / sky (GradientSky → Scene.environment) */
     --hud:          #ff79c6;     /* §5.5.g — HUD overlay node (Minimap → Scene.hud1) */
+    --erosion:      #c89060;     /* §5.5.e-8 — terrain-erosion params (TerrainErosion → TiledTerrain.erosion) */
     --selected:     #4a8fdc;
     --danger:       #e24b4a;
     --info:         #83e8ff;
@@ -828,6 +829,10 @@
      layer, not scene geometry" -- distinguishable from texture's
      pure-dotted ring + camera/light double-rings. */
   .port.hud         { border-color: var(--hud);         border-style: dashed; border-width: 3px; }
+  /* §5.5.e-8 -- Erosion params port. Dashed earth-tone -- carries
+     erosion knobs (thermal/hydraulic/etc.) into a terrain mesh-gen.
+     Visually distinct from texture's pure-dotted and hud's hot-pink dashed. */
+  .port.erosion     { border-color: var(--erosion);     border-style: dashed; border-width: 3px; }
   .port.connected.param { background: var(--param); border-style: solid; }
   .port.connected.gate  { background: var(--gate); }
   .port.connected.clock { background: var(--clock); border-style: solid; }
@@ -10848,7 +10853,12 @@ public:
       { n: "gain",        t: "param" },
       { n: "ridges",      t: "param" },
       { n: "plateau",     t: "param" },
-      { n: "forwardBias", t: "param" }
+      { n: "forwardBias", t: "param" },
+      // §5.5.e-8 -- erosion params input. Wire a TerrainErosion node's
+      // `params` output here; TiledTerrain applies the same thermal +
+      // hydraulic algorithm in JS (with smaller defaults than the GPU
+      // version since each sample triggers neighbor noise calls).
+      { n: "erosion",     t: "erosion" }
     ],
     outs: [{ n: "mesh", t: "mesh" }],
     params: {
@@ -17335,7 +17345,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       { n: "radius",     t: "param" },
       { n: "strength",   t: "param" }
     ],
-    outs: [{ n: "out", t: "texture" }],
+    outs: [
+      { n: "out",    t: "texture" },
+      // §5.5.e-8 -- erosion-params output. Carries the thermal /
+      // hydraulic / talus knobs into a CPU-side terrain consumer
+      // (TiledTerrain.erosion). Texture pipeline still uses `out`
+      // for the GPU image-processing path.
+      { n: "params", t: "erosion" }
+    ],
     textureInputSlots: { in: 16 },
     params: {
       inLayer:    0,
@@ -32245,6 +32262,20 @@ const _demos = [
         margin: 18,
         range: 1.2
       });
+      // §5.5.e-8 -- TerrainErosion node wired into TiledTerrain.erosion.
+      // Iterations dialed down to 4 (vs 8 for the GPU shader-frag path)
+      // since each iteration costs 8 fBm calls per vertex in JS. Radius
+      // is in world units here -- ~80m matches the chunkSize/segments
+      // granularity for visible carving. Strength=0.6 leaves the macro
+      // shape intact, just softens ridges + settles valleys.
+      const ero = makeNode("TerrainErosion", 40, 380, {
+        thermal:    0.65,
+        hydraulic:  0.55,
+        talus:      0.02,
+        iterations: 4,
+        radius:     80,
+        strength:   0.6
+      });
 
       state.edges.push({ from: { node: ter, port: "mesh"   }, to: { node: mat, port: "mesh"   } });
       state.edges.push({ from: { node: mat, port: "mesh"   }, to: { node: scn, port: "mesh1"  } });
@@ -32256,6 +32287,11 @@ const _demos = [
       // to this Scene. The overlay only renders when this wire exists
       // (and we're in live mode + this Scene is feeding a VisualOutput).
       state.edges.push({ from: { node: map, port: "hud"    }, to: { node: scn, port: "hud1"   } });
+      // §5.5.e-8 -- TerrainErosion.params → TiledTerrain.erosion. The
+      // TiledTerrain mesh + the walk-surface sampler both apply the
+      // JS-port of the erosion algorithm at chunk-build time. Carves
+      // ridges + settles valleys for a more naturally-weathered look.
+      state.edges.push({ from: { node: ero, port: "params" }, to: { node: ter, port: "erosion" } });
     }
   },
 
@@ -35509,6 +35545,10 @@ function renderWires(temp) {
       // §5.5.g -- HUD wire. Long-dashed hot pink, signals "overlay
       // layer that draws on top of this Scene's output."
       html += `<path d="${path}" fill="none" stroke="var(--hud)" stroke-width="3" stroke-linecap="round" stroke-dasharray="8,4" />`;
+    } else if (t === "erosion") {
+      // §5.5.e-8 -- Erosion params wire. Short dashes in earth-tone;
+      // carries erosion knobs into a terrain mesh-gen (e.g. TiledTerrain).
+      html += `<path d="${path}" fill="none" stroke="var(--erosion)" stroke-width="3" stroke-linecap="round" stroke-dasharray="4,3" />`;
     } else if (t === "transform") {
       // Double-stripe like clock but in transform-violet to keep the
       // 4×4 mat semantics visually distinct from rhythmic data.
@@ -45707,22 +45747,50 @@ function _wireFPCameraInput() {
 function _fpcSampleGroundY(wx, wz) {
   if (!state || !Array.isArray(state.nodes)) return null;
   const tt = state.nodes.find(n => n && n.type === "TiledTerrain");
-  if (tt && tt.params) {
-    const p = tt.params;
-    const noise = {
-      seed:       (typeof p.seed       === "number") ? p.seed       : 7.42,
-      frequency:  (typeof p.frequency  === "number") ? p.frequency  : 0.008,
-      octaves:    (typeof p.octaves    === "number") ? p.octaves    : 6,
-      lacunarity: (typeof p.lacunarity === "number") ? p.lacunarity : 2.05,
-      gain:       (typeof p.gain       === "number") ? p.gain       : 0.5,
-      ridges:     (typeof p.ridges     === "number") ? p.ridges     : 0.0,
-      plateau:    (typeof p.plateau    === "number") ? p.plateau    : 0.0
-    };
-    const hs   = (typeof p.heightScale === "number") ? p.heightScale : 80;
-    const yOff = (typeof p.yOffset === "number")     ? p.yOffset     : 0;
-    return (_tiledTerrainHeightAt(wx, wz, noise) - 1) * hs + yOff;
-  }
-  return null;
+  if (!tt || !tt.params) return null;
+  const p = tt.params;
+  const noise = {
+    seed:       (typeof p.seed       === "number") ? p.seed       : 7.42,
+    frequency:  (typeof p.frequency  === "number") ? p.frequency  : 0.008,
+    octaves:    (typeof p.octaves    === "number") ? p.octaves    : 6,
+    lacunarity: (typeof p.lacunarity === "number") ? p.lacunarity : 2.05,
+    gain:       (typeof p.gain       === "number") ? p.gain       : 0.5,
+    ridges:     (typeof p.ridges     === "number") ? p.ridges     : 0.0,
+    plateau:    (typeof p.plateau    === "number") ? p.plateau    : 0.0,
+    erosionParams: _findTiledErosionParams(tt)
+  };
+  const hs   = (typeof p.heightScale === "number") ? p.heightScale : 80;
+  const yOff = (typeof p.yOffset === "number")     ? p.yOffset     : 0;
+
+  // §5.5.e-8 -- match the rendered mesh exactly under the player's
+  // feet. Sample at the same vertex spacing the local chunk's LOD
+  // uses + bilinear-interp the 4 corner heights. Without this the
+  // camera (exact fBm) and mesh (LOD-discretized linear interp)
+  // disagree by tens of meters in low-LOD outer chunks -- the
+  // camera dips under the visible surface.
+  const cs       = Math.max(1, (typeof p.chunkSize   === "number") ? p.chunkSize   : 64);
+  const baseSegs = Math.max(2, Math.min(64, Math.floor((typeof p.segments === "number") ? p.segments : 24)));
+  const radius   = Math.max(0, Math.min(32, Math.floor((typeof p.chunkRadius === "number") ? p.chunkRadius : 8)));
+  const center   = _tiledTerrainCenterTile(tt);
+  const ptx = Math.floor(wx / cs);
+  const ptz = Math.floor(wz / cs);
+  const segsHere = _tiledTerrainLodSegments(
+    Math.abs(ptx - center.tx), Math.abs(ptz - center.tz), radius, baseSegs);
+  const dStep = cs / segsHere;
+  // Snap to LOD grid + bilinear corners.
+  const gx = Math.floor(wx / dStep) * dStep;
+  const gz = Math.floor(wz / dStep) * dStep;
+  const fx = Math.max(0, Math.min(1, (wx - gx) / dStep));
+  const fz = Math.max(0, Math.min(1, (wz - gz) / dStep));
+  const sampleAt = (x, z) => (_tiledTerrainHeightAt(x, z, noise) - 1) * hs + yOff;
+  const y00 = sampleAt(gx,         gz        );
+  const y10 = sampleAt(gx + dStep, gz        );
+  const y01 = sampleAt(gx,         gz + dStep);
+  const y11 = sampleAt(gx + dStep, gz + dStep);
+  return y00 * (1 - fx) * (1 - fz)
+       + y10 * fx       * (1 - fz)
+       + y01 * (1 - fx) * fz
+       + y11 * fx       * fz;
 }
 
 /* Per-frame tick for FPCamera nodes. Reads accumulated mouse delta
@@ -45952,6 +46020,11 @@ function _tickMinimapNodes() {
     gain:       (typeof ttp.gain       === "number") ? ttp.gain       : 0.5,
     ridges:     (typeof ttp.ridges     === "number") ? ttp.ridges     : 0.0,
     plateau:    (typeof ttp.plateau    === "number") ? ttp.plateau    : 0.0
+    // §5.5.e-8 -- intentionally NOT applying erosionParams here.
+    // The minimap samples ~thousands of points per frame; running
+    // erosion (8 neighbor samples × iterations per pixel) would burn
+    // tens of milliseconds. The map silhouette is still good without
+    // erosion -- just the macro shape, not the carving detail.
   };
   // Center the disc on the wired camera (or origin if none).
   const cam = state.nodes.find(n => n && (n.type === "FPCamera" || n.type === "Camera"));
@@ -53051,23 +53124,95 @@ function _tiledTerrainCenterTile(node) {
  * The "frequency" param at this layer is cycles-per-world-unit (not
  * cycles-per-chunk). At freq=0.02 the noise wraps once every 50 units
  * which matches typical open-world rolling-terrain feature scale. */
-function _tiledTerrainHeightAt(wx, wz, noise) {
-  // _terrainFBM expects (u, v) -- compute equivalent input. Since
-  // _terrainFBM internally multiplies by frequency, give it (wx, wz)
-  // raw and the same frequency value. The world is effectively one
-  // very large "tile" from the noise function's perspective.
+/* Base height field: pure fBm + plateau remap. Does NOT apply
+ * erosion -- erosion's neighbor sampling must hit the pre-erosion
+ * field to avoid recursion. This is the "ground truth" noise the
+ * mesh builder and the erosion kernel both read from. */
+function _tiledBaseHeight(wx, wz, noise) {
   let h = _terrainFBM(wx, wz, noise);
-  // §5.5.e-5 -- plateau curve. Power-remap that squishes low and
-  // mid altitudes toward 0 while leaving peaks at ~1, producing
-  // wide flat plains with isolated mountains sticking up. plateau=0
-  // is identity (rolling-hill fBm); plateau=1 gives sharp islands
-  // of mountain in a sea of plain. Curve: h = pow(h, 1 + p * 4).
   const p = (noise && typeof noise.plateau === "number") ? noise.plateau : 0;
   if (p > 0) {
     const k = 1 + Math.max(0, Math.min(1, p)) * 4;
     h = Math.pow(Math.max(0, Math.min(1, h)), k);
   }
   return h;
+}
+
+/* §5.5.e-8 -- JS port of the TerrainErosion fragment shader.
+ * Samples the BASE height field at 8 neighbors per iteration at
+ * progressively larger radii (geometric ×1.5). Each iteration runs
+ * thermal (move toward min neighbor when slope > talus) + hydraulic
+ * (move toward avg neighbor on convex curvature). Cost per call is
+ * O(iters * 8) fBm evals -- meaningfully expensive, so keep
+ * iterations small (3-6) on this path. Radius is in world units. */
+function _tiledApplyErosionJS(centerH, wx, wz, noise) {
+  const ep = noise.erosionParams;
+  if (!ep) return centerH;
+  const iters     = Math.max(1, Math.min(16, Math.floor(ep.iterations || 6)));
+  const baseR     = Math.max(0.1, ep.radius || 4.0);
+  const thermal   = Math.max(0, Math.min(1, ep.thermal   || 0));
+  const hydraulic = Math.max(0, Math.min(1, ep.hydraulic || 0));
+  const talus     = Math.max(0, ep.talus || 0.01);
+  const strength  = Math.max(0, Math.min(1, ep.strength || 1));
+  const smoothstepClamped = (e0, e1, x) => {
+    const t = Math.max(0, Math.min(1, (x - e0) / Math.max(1e-6, e1 - e0)));
+    return t * t * (3 - 2 * t);
+  };
+  let eroded = centerH;
+  for (let i = 0; i < iters; i++) {
+    const r = baseR * Math.pow(1.5, i);
+    const nW  = _tiledBaseHeight(wx - r, wz,     noise);
+    const nE  = _tiledBaseHeight(wx + r, wz,     noise);
+    const nN  = _tiledBaseHeight(wx,     wz + r, noise);
+    const nS  = _tiledBaseHeight(wx,     wz - r, noise);
+    const nNW = _tiledBaseHeight(wx - r, wz + r, noise);
+    const nNE = _tiledBaseHeight(wx + r, wz + r, noise);
+    const nSW = _tiledBaseHeight(wx - r, wz - r, noise);
+    const nSE = _tiledBaseHeight(wx + r, wz - r, noise);
+    const nbrAvg = (nW + nE + nN + nS + nNW + nNE + nSW + nSE) * 0.125;
+    const minNbr = Math.min(nW, nE, Math.min(nN, nS),
+                             Math.min(Math.min(nNW, nNE), Math.min(nSW, nSE)));
+    const slope = Math.max(0, eroded - minNbr);
+    const thermalBlend = thermal * smoothstepClamped(talus, talus + 0.04, slope);
+    eroded = eroded + (minNbr - eroded) * thermalBlend;
+    const curvature = nbrAvg - eroded;
+    const convexAmt = smoothstepClamped(0.0, 0.02, -curvature);
+    const hydroBlend = hydraulic * convexAmt;
+    eroded = eroded + (nbrAvg - eroded) * hydroBlend;
+  }
+  return centerH + (eroded - centerH) * strength;
+}
+
+/* Public sample: base height + (optional) JS-port erosion. Same
+ * formula that the rendered mesh + the camera walk surface read,
+ * so they always agree on Y. */
+function _tiledTerrainHeightAt(wx, wz, noise) {
+  let h = _tiledBaseHeight(wx, wz, noise);
+  if (noise && noise.erosionParams) {
+    h = _tiledApplyErosionJS(h, wx, wz, noise);
+  }
+  return h;
+}
+
+/* Walk state.edges for a TerrainErosion node wired to this
+ * TiledTerrain's `erosion` input; return its params, or null. */
+function _findTiledErosionParams(ttNode) {
+  if (!state || !Array.isArray(state.edges)) return null;
+  const wire = state.edges.find(e =>
+    e && e.to && e.to.node === ttNode.id && e.to.port === "erosion"
+  );
+  if (!wire || !wire.from) return null;
+  const src = state.nodes.find(n => n && n.id === wire.from.node);
+  if (!src || src.type !== "TerrainErosion") return null;
+  const sp = src.params || {};
+  return {
+    thermal:    sp.thermal,
+    hydraulic:  sp.hydraulic,
+    talus:      sp.talus,
+    iterations: sp.iterations,
+    radius:     sp.radius,
+    strength:   sp.strength
+  };
 }
 
 /* §5.5.e-7 -- per-chunk LOD picker with FIVE rings (was three).
@@ -53115,10 +53260,17 @@ function _tiledTerrainLodSegments(dxAbs, dzAbs, radius, baseSegs) {
 
 function _tiledTerrainGlobalCacheKey(node) {
   const p = node.params || {};
+  // §5.5.e-8 -- erosion params come from a wired TerrainErosion. Pull
+  // them into the cache key so toggling/editing the upstream erosion
+  // rebuilds chunks.
+  const ep = _findTiledErosionParams(node);
+  const epKey = ep
+    ? ("e:" + [ep.thermal, ep.hydraulic, ep.talus, ep.iterations, ep.radius, ep.strength].join(","))
+    : "e0";
   return [
     p.chunkSize, p.chunkRadius, p.segments, p.heightScale, p.yOffset,
     p.seed, p.frequency, p.octaves, p.lacunarity, p.gain, p.ridges,
-    p.plateau
+    p.plateau, epKey
   ].join(",");
 }
 
@@ -53160,7 +53312,10 @@ function _buildSingleChunk(node, info) {
     lacunarity: (typeof p.lacunarity === "number") ? p.lacunarity : 2.05,
     gain:       (typeof p.gain       === "number") ? p.gain       : 0.5,
     ridges:     (typeof p.ridges     === "number") ? p.ridges     : 0.5,
-    plateau:    (typeof p.plateau    === "number") ? p.plateau    : 0.0
+    plateau:    (typeof p.plateau    === "number") ? p.plateau    : 0.0,
+    // §5.5.e-8 -- pull erosion params off the wired TerrainErosion
+    // node (if any). null when unwired -> erosion JS is skipped.
+    erosionParams: _findTiledErosionParams(node)
   };
   const skirtY = yOff - hs * 3;
 
