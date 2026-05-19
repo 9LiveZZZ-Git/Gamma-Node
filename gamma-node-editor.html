@@ -11008,6 +11008,46 @@ public:
     description: "Phase 7 §5.5.h water surface. Emits a 100km × 100km plane mesh at Y=seaLevel with a baked water material -- Scene auto-applies the fs_water fragment shader when the mesh's source node is `Water`. Effects: animated wave normals (time-shifted fBm UV sample → perturbed normal each fragment); Fresnel sky-color reflection (Schlick power 5); shore detection by sampling the patch's TiledTerrain noise in-shader → shallow-water tint + foam band + moving wave-crests that sweep toward the coastline. waveFreq is cycles per world unit (default 0.012 ≈ ~80m wavelength). foamWidth (m) controls how far from the shoreline foam fades out; shallowDepth (m) is the shallow-color blend range. waveShoreFreq controls the spacing of moving wave-crest lines near the coast. Wire `mesh` into a Scene mesh slot like any other mesh. Phase 2 (SSR ray-march reflection) ships next."
   },
 
+  /* Phase 7 §5.5.h-14 -- Clouds3D. Volumetric clouds as a real mesh
+   * in the scene, not a skybox effect. Decouples cloud rendering
+   * from ProceduralSky so:
+   *   - Clouds are at a fixed world altitude (no parallax oddities
+   *     during rotation, since they're real geometry)
+   *   - Other meshes can be in front of / behind clouds correctly
+   *   - The node can grow features (multi-layer, real volumetric
+   *     ray-marching, lightning, etc.) without entangling the sky
+   * MVP v1 is a flat plane at altitude Y with 2-layer fbm noise +
+   * sun-direction shading. v2 will swap the plane for a true slab
+   * with ray-marched volumetric integration. */
+  Clouds3D: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "mesh-gen",
+    ins: [
+      { n: "altitude",    t: "param" },
+      { n: "coverage",    t: "param" },
+      { n: "density",     t: "param" },
+      { n: "scale",       t: "param" },
+      { n: "colorR",      t: "param" },
+      { n: "colorG",      t: "param" },
+      { n: "colorB",      t: "param" },
+      { n: "windSpeedX",  t: "param" },
+      { n: "windSpeedZ",  t: "param" }
+    ],
+    outs: [{ n: "mesh", t: "mesh" }],
+    params: {
+      altitude:   2500,    // base cloud Y in world units
+      coverage:   0.45,    // 0..1 -- fraction of sky with clouds
+      density:    1.0,     // multiplier on cloud opacity
+      scale:      0.00045, // noise frequency on world XZ
+      colorR:     1.0, colorG: 1.0, colorB: 1.0,
+      windSpeedX: 0.0,
+      windSpeedZ: 0.0
+    },
+    methods: {},
+    description: "3D cloud layer rendered as a real world-space mesh, not a skybox sample. Emits a 100km × 100km plane mesh at Y=altitude with a baked cloud material; Scene auto-applies the fs_clouds fragment shader. Because the geometry sits at a fixed world altitude, parallax behaves naturally under both translation AND rotation -- unlike the sky-pass cloud shell which had non-uniform angular response. coverage (0-1) is the fraction of sky with clouds, density scales opacity, scale is the noise frequency (lower = bigger cloud features). Wire `mesh` into a Scene mesh slot. Future v2 will add real volumetric ray-marching for depth."
+  },
+
   /* =========================================================================
    * Sprint 7.5.3b -- Mesh transforms
    *
@@ -32540,18 +32580,31 @@ const _demos = [
         tintR: 1.0, tintG: 0.96, tintB: 0.88,
         intensityScale: 1.2
       });
+      // §5.5.h-14 -- ProceduralSky no longer renders clouds (cloud
+      // coverage=0); they're now a real mesh node (Clouds3D) so they
+      // sit at a fixed world altitude with proper geometric parallax.
       const sky = makeNode("ProceduralSky", 220, 280, {
         timeOfDay: 0.42,
         turbidity: 1.3,
         mieG: 0.78,
         intensity: 1.0,
-        cloudCoverage: 0.35,
-        cloudDensity: 0.9,
-        // §5.5.h-12 -- subtle drift; clouds are at H=2500 (~25km horizontal
-        // at the horizon) so even tiny wind values read as real distant
-        // motion. Old 0.6/0.2 looked like the clouds were sliding.
-        windSpeedX: 0.08,
-        windSpeedZ: 0.03
+        cloudCoverage: 0.0,
+        cloudDensity: 0.0,
+        windSpeedX: 0.0,
+        windSpeedZ: 0.0
+      });
+      // §5.5.h-14 -- volumetric-ish 3D clouds at world Y=2500. Real
+      // mesh so the standard projection pipeline handles parallax
+      // (under both translation AND rotation) without any of the
+      // angular-distortion games the sky-pass shell had to play.
+      const clouds = makeNode("Clouds3D", 40, 680, {
+        altitude:   2500,
+        coverage:   0.45,
+        density:    1.0,
+        scale:      0.00045,
+        colorR:     1.0, colorG: 1.0, colorB: 1.0,
+        windSpeedX: 0.4,
+        windSpeedZ: 0.1
       });
       const scn = makeNode("Scene", 760, 80, {
         // ProceduralSky drives the visible background -- clear color is
@@ -32589,7 +32642,10 @@ const _demos = [
       // Water as a second mesh slot. No material wire needed -- the
       // Water node bakes fs_water into the encoder when its mesh
       // hits a Scene slot.
-      state.edges.push({ from: { node: water, port: "mesh" }, to: { node: scn, port: "mesh2"  } });
+      state.edges.push({ from: { node: water,  port: "mesh" }, to: { node: scn, port: "mesh2" } });
+      // §5.5.h-14 -- Clouds3D as a third mesh slot. Like Water, the
+      // node bakes fs_clouds into the encoder; no Material wire.
+      state.edges.push({ from: { node: clouds, port: "mesh" }, to: { node: scn, port: "mesh3" } });
       // §5.5.h-5 -- explicit terrain reference wire. Water's
       // heightmap input takes a TiledTerrain reference so the
       // shader can sample the same LOD-discretized field the
@@ -52174,6 +52230,73 @@ fn fs_water(in: VsOut) -> @location(0) vec4<f32> {
   return vec4<f32>(tonemap_aces(fogged), 1.0);
 }
 
+// Phase 7 §5.5.h-14 -- fs_clouds. Cloud-plane fragment shader.
+// Reads world XZ from in.worldPos (the cloud plane is at a fixed
+// world Y), samples two layers of fbm to give a puffy two-tone
+// look, and blends against the existing framebuffer via the
+// pipeline's premultiplied-alpha state. PerDraw legend:
+//   baseColor.rgb = cloud color, baseColor.a = density multiplier
+//   matParams     = (coverage, scale, time, _)
+//   band1.xy      = (windX, windZ) -- already camera-XZ-anchored
+//                   by the encoder so the noise sample tracks world
+//                   coords; windX/Z continues to drift via the
+//                   ProceduralSky-style wind params on the node.
+@fragment
+fn fs_clouds(in: VsOut) -> @location(0) vec4<f32> {
+  let cloudColor  = uD.baseColor.rgb;
+  let densityMult = max(0.0, uD.baseColor.a);
+  let coverage    = clamp(uD.matParams.x, 0.0, 1.0);
+  let scale       = max(1e-7, uD.matParams.y);
+  let windX       = uD.band1.x;
+  let windZ       = uD.band1.y;
+
+  let wp = in.worldPos;
+  let viewDir = normalize(wp - uS.eye.xyz);
+
+  // World-anchored noise. Wind is the only motion contribution.
+  let xz = vec2<f32>(wp.x - windX, wp.z - windZ) * scale;
+  let raw = _fbm(xz);
+  // Second layer for puffy depth -- slightly different scale +
+  // offset, blended in. Reads as 3D-ish even on a single plane.
+  let xz2 = (xz + vec2<f32>(7.13, 3.27)) * 1.93;
+  let raw2 = _fbm(xz2);
+  let combined = raw * 0.7 + raw2 * 0.5;
+
+  // Sharpen the noise into cloud-like blobs via the coverage gate.
+  let lo = (1.0 - coverage) * 0.85;
+  let alpha = smoothstep(lo, lo + 0.18, combined) * densityMult;
+  let alphaC = clamp(alpha, 0.0, 0.95);
+  if (alphaC <= 0.001) {
+    discard;
+  }
+
+  // Sun-direction lighting: forward-scatter brightening on the sun
+  // side, cooler ambient on the away side. Real volumetric clouds
+  // would integrate this along the ray; single-sample approximation
+  // already reads as "lit from the sun".
+  let sunDir = uS.envSun.xyz;
+  let cosTheta = clamp(dot(viewDir, sunDir), -1.0, 1.0);
+  let scatter  = pow(max(cosTheta * 0.5 + 0.5, 0.0), 2.2);
+  let shadow   = vec3<f32>(0.55, 0.62, 0.74);
+  let lit      = mix(shadow, cloudColor, scatter);
+
+  // §5.5.h-14 -- composite the sky background BEHIND the cloud here
+  // and output opaque (alpha=1) with depth-write enabled. The sky
+  // pass runs last and skips pixels where any mesh wrote depth, so
+  // if the cloud were translucent we'd see the Scene.clearR/G/B
+  // bleed through instead of the actual sky color. Sampling and
+  // compositing inline avoids that ordering issue cleanly.
+  let mode = u32(uS.envParams.x);
+  var bgCol: vec3<f32>;
+  if (mode == 2u) {
+    bgCol = sample_procedural_sky(viewDir);
+  } else {
+    bgCol = sample_env(viewDir);
+  }
+  let outRGB = mix(bgCol, lit, alphaC);
+  return vec4<f32>(tonemap_aces(outRGB), 1.0);
+}
+
 // Phase 7 §5.5.c TerrainMaterial v2 (v0.3.129) -- AAA-style
 // terrain shading. Altitude bands + slope rock + slope-masked
 // snow + multi-scale detail noise (macro variation + micro
@@ -52970,6 +53093,7 @@ function _ensureMeshPipeline(materialType, sampleCount, displaced) {
       materialType === "phong"    ? "fs_phong"   :
       materialType === "terrain"  ? "fs_terrain" :
       materialType === "water"    ? "fs_water"   :
+      materialType === "clouds"   ? "fs_clouds"  :
       materialType === "unlit"    ? "fs_unlit"   :
       /* default unlit-vc */        "fs_unlit_vc";
   }
@@ -53019,6 +53143,10 @@ function _ensureMeshPipeline(materialType, sampleCount, displaced) {
       depthStencil: {
         format: "depth32float",
         depthCompare: "less",
+        // §5.5.h-14 -- clouds composite the sky background inline
+        // and output opaque (alpha=1), so they DO write depth like
+        // any other opaque mesh. This lets the sky pass skip the
+        // cloud pixels (depth < 1) instead of overwriting them.
         depthWriteEnabled: true
       },
       multisample: { count: sampleCount }
@@ -53313,6 +53441,7 @@ function _buildMeshData(node) {
     case "Cone":          return _buildCone(node);
     case "Terrain":       return _buildTerrain(node);
     case "Water":         return _buildWater(node);
+    case "Clouds3D":      return _buildClouds3D(node);
     default: return null;
   }
 }
@@ -53989,6 +54118,28 @@ function _buildWater(node) {
     -half, seaY,  half,   0.2, 0.4, 0.6,   0, 1, 0,   -half,  half
   ]);
   const indices = new Uint32Array([0, 1, 2,  0, 2, 3]);
+  return { verts, indices };
+}
+
+/* Phase 7 §5.5.h-14 -- Clouds3D plane. Same shape as Water: one
+ * 100km horizontal quad at Y = altitude. Real geometry so it sits
+ * at a fixed world-space position; parallax is then "free" via
+ * the standard mesh projection pipeline -- no special handling
+ * needed for rotation vs translation. Future v2 will widen this
+ * to a slab + ray-march in fs_clouds for true volumetric depth. */
+function _buildClouds3D(node) {
+  const p = node.params || {};
+  const cy = (typeof p.altitude === "number") ? p.altitude : 2500;
+  const half = 50000;
+  const verts = new Float32Array([
+    -half, cy, -half,   1, 1, 1,   0, -1, 0,   -half, -half,
+     half, cy, -half,   1, 1, 1,   0, -1, 0,    half, -half,
+     half, cy,  half,   1, 1, 1,   0, -1, 0,    half,  half,
+    -half, cy,  half,   1, 1, 1,   0, -1, 0,   -half,  half
+  ]);
+  // Normal points -Y (down) since the camera is below the cloud plane.
+  // Wound CCW from above; reverse so the underside is the visible face.
+  const indices = new Uint32Array([0, 2, 1,  0, 3, 2]);
   return { verts, indices };
 }
 
@@ -54975,7 +55126,11 @@ function _encodeScenePass(enc, entry) {
     }
     // §5.5.h -- Water node bakes its own material; override matType
     // so fs_water fires regardless of any wired Material.
+    // §5.5.h-14 -- same pattern for Clouds3D -> fs_clouds.
     let matType = (m.material && m.material.type) || "unlit-vc";
+    if (m.node && m.node.type === "Clouds3D") {
+      matType = "clouds";
+    }
     if (m.node && m.node.type === "Water") {
       matType = "water";
       if (!Visual._waterDrawLogged) {
@@ -55026,7 +55181,9 @@ function _encodeScenePass(enc, entry) {
     let mp = (m.material && m.material.params) || {};
     // §5.5.h -- Water packs its own params from m.node (mesh-gen
     // doubles as material since Water bakes the shader in).
+    // §5.5.h-14 -- same pattern for Clouds3D.
     if (matType === "water" && m.node && m.node.params) mp = m.node.params;
+    if (matType === "clouds" && m.node && m.node.params) mp = m.node.params;
     inst.drawScratch[16] = (typeof mp.r === "number") ? mp.r : ((typeof mp.colorR === "number") ? mp.colorR : 1.0);
     inst.drawScratch[17] = (typeof mp.g === "number") ? mp.g : ((typeof mp.colorG === "number") ? mp.colorG : 1.0);
     inst.drawScratch[18] = (typeof mp.b === "number") ? mp.b : ((typeof mp.colorB === "number") ? mp.colorB : 1.0);
@@ -55114,6 +55271,34 @@ function _encodeScenePass(enc, entry) {
         inst.drawScratch[49] = 0; inst.drawScratch[50] = 0; inst.drawScratch[51] = 0;
         inst.drawScratch[52] = 0; inst.drawScratch[53] = 0;
       }
+    }
+    // §5.5.h-14 -- Clouds3D remap. fs_clouds reads:
+    //   baseColor.rgb = cloud color, baseColor.a = density
+    //   matParams.x = coverage, matParams.y = scale,
+    //   matParams.z = time (unused for now), matParams.w = unused
+    //   band1.x = windX, band1.y = windZ (both already camera-XZ-
+    //                                     anchored so the noise
+    //                                     sample tracks world XZ as
+    //                                     the camera translates).
+    if (matType === "clouds") {
+      inst.drawScratch[16] = (typeof mp.colorR === "number") ? mp.colorR : 1.0;
+      inst.drawScratch[17] = (typeof mp.colorG === "number") ? mp.colorG : 1.0;
+      inst.drawScratch[18] = (typeof mp.colorB === "number") ? mp.colorB : 1.0;
+      inst.drawScratch[19] = (typeof mp.density === "number") ? mp.density : 1.0;
+      inst.drawScratch[20] = (typeof mp.coverage === "number") ? mp.coverage : 0.45;
+      inst.drawScratch[21] = (typeof mp.scale    === "number") ? mp.scale    : 0.00045;
+      if (!Visual._cloudsStartT) Visual._cloudsStartT = performance.now();
+      inst.drawScratch[22] = (performance.now() - Visual._cloudsStartT) * 0.001;
+      inst.drawScratch[23] = 0;
+      const camXc = (camera && camera.eye) ? camera.eye[0] : 0;
+      const camZc = (camera && camera.eye) ? camera.eye[2] : 0;
+      const wsX = (typeof mp.windSpeedX === "number") ? mp.windSpeedX : 0;
+      const wsZ = (typeof mp.windSpeedZ === "number") ? mp.windSpeedZ : 0;
+      inst.drawScratch[24] = (wsX * inst.drawScratch[22]) - camXc;
+      inst.drawScratch[25] = (wsZ * inst.drawScratch[22]) - camZc;
+      inst.drawScratch[26] = 0; inst.drawScratch[27] = 0;
+      // Clear remaining slots so stale water/terrain data doesn't bleed.
+      for (let s = 28; s < 56; s++) inst.drawScratch[s] = 0;
     }
     // Phase 7 §5.5.c -- TerrainMaterial uses the extended band
     // slots [24..39] and reinterprets matParams as
