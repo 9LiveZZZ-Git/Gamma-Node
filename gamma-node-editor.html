@@ -17149,6 +17149,150 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     description: "Game-dev procedural heightmap (Phase 7 §5.5.b/c-3). type picks the base algorithm: 'fbm' (rolling hills, default), 'ridges' (sharp mountain crests via (1-|2n-1|)²), 'billowy' (puffy mounds). frequency / octaves / lacunarity / gain / seed are the standard fBm knobs; ridges is a secondary 0..1 mix that layers ridge math on top of any base type. Five post-processing layers stack on the base — each goes from no-op at 0 to fully applied at 1: warpAmount + warpFreq (domain warp — biggest single visual upgrade; turns stripey noise into meandering organic features); erosion (power remap that settles valleys); continentMask (radial falloff for island / continent shapes); terrace (8-step plateau quantization for mesa / cliff terrain). Wire `out` into Terrain.heightmap or any other texture sink. Recipes: mountains = type=ridges + erosion 0.4 + warpAmount 0.5. archipelago = type=ridges + continentMask 0.7 + warpAmount 0.3. mesa = type=fbm + terrace 0.7 + erosion 0.2. canyons = type=fbm + warpAmount 0.8 + erosion 0.6."
   },
 
+  /* Phase 7 §5.5.d — TerrainErosion. Hydraulic + thermal erosion
+   * approximation as a 1-texture-in / 1-out composition shader.
+   * Drops between ProceduralTerrain → Terrain.heightmap to carve
+   * the raw fBm into something geologically plausible (valleys
+   * smoothed, ridges sharpened, talus settled). True iterative
+   * hydraulic erosion needs frame-to-frame feedback infra (not
+   * built yet — see §5.5.e roadmap); this is a multi-scale
+   * single-pass approximation that captures the silhouette
+   * character without per-droplet simulation. Cost: O(iterations
+   * × 8) texture samples per fragment, ~80 samples at default. */
+  TerrainErosion: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "in",         t: "texture" },
+      { n: "thermal",    t: "param" },
+      { n: "hydraulic",  t: "param" },
+      { n: "talus",      t: "param" },
+      { n: "iterations", t: "param" },
+      { n: "radius",     t: "param" },
+      { n: "strength",   t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16 },
+    params: {
+      inLayer:    0,
+      thermal:    0.4,
+      hydraulic:  0.5,
+      talus:      0.04,
+      iterations: 10,
+      radius:     1.5,
+      strength:   1.0
+    },
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inLayer, y=thermal, z=hydraulic, w=talus
+  params2:       vec4f,    // x=iterations, y=radius, z=strength, w=_
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+fn _sampleH(uv: vec2<f32>, layer: u32) -> f32 {
+  // Clamp to edge to avoid wrap-around erosion artifacts at borders.
+  let uvc = clamp(uv, vec2<f32>(0.001), vec2<f32>(0.999));
+  return textureSampleLevel(fbHistory, fbSampler, uvc, layer, 0.0).r;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layer      = u32(max(0.0, u.params.x));
+  let thermal    = clamp(u.params.y,  0.0, 1.0);
+  let hydraulic  = clamp(u.params.z,  0.0, 1.0);
+  let talus      = max(0.0, u.params.w);
+  let iters      = i32(clamp(u.params2.x, 1.0, 32.0));
+  let baseRadius = max(0.5, u.params2.y);
+  let strength   = clamp(u.params2.z, 0.0, 1.0);
+  let texel      = vec2<f32>(1.0) / u.u_resolution.xy;
+
+  let h0 = _sampleH(in.uv, layer);
+  var erodedH = h0;
+
+  // Multi-radius erosion: each iteration samples at a slightly
+  // larger radius so the result accumulates across scales (the
+  // "multi-scale" stand-in for true frame-to-frame iteration).
+  for (var i: i32 = 0; i < iters; i = i + 1) {
+    let r = baseRadius * (1.0 + f32(i) * 0.6);
+    let o = texel * r;
+
+    // 8-neighbor ring at this radius. Re-sample from input each
+    // iteration (we can't read our own output mid-frame).
+    let nW  = _sampleH(in.uv + vec2<f32>(-o.x,  0.0), layer);
+    let nE  = _sampleH(in.uv + vec2<f32>( o.x,  0.0), layer);
+    let nN  = _sampleH(in.uv + vec2<f32>( 0.0,  o.y), layer);
+    let nS  = _sampleH(in.uv + vec2<f32>( 0.0, -o.y), layer);
+    let nNW = _sampleH(in.uv + vec2<f32>(-o.x,  o.y), layer);
+    let nNE = _sampleH(in.uv + vec2<f32>( o.x,  o.y), layer);
+    let nSW = _sampleH(in.uv + vec2<f32>(-o.x, -o.y), layer);
+    let nSE = _sampleH(in.uv + vec2<f32>( o.x, -o.y), layer);
+
+    let nbrAvg = (nW + nE + nN + nS + nNW + nNE + nSW + nSE) * 0.125;
+    let minNbr = min(min(min(nW, nE), min(nN, nS)),
+                     min(min(nNW, nNE), min(nSW, nSE)));
+
+    // Thermal erosion: when slope to lowest neighbor exceeds the
+    // talus angle, settle material downhill proportional to the
+    // overshoot. Scaled by 1/iterations so cumulative effect stays
+    // bounded as the user dials iterations up.
+    let slope = max(0.0, erodedH - minNbr);
+    if (slope > talus) {
+      let amt = thermal * (slope - talus) * 0.5 / f32(iters);
+      erodedH = erodedH - amt;
+    }
+
+    // Hydraulic erosion: blend toward neighbor average where the
+    // surface is convex (ridges get smoothed by runoff). Concave
+    // areas (valleys, basins) get LESS blending so they hold their
+    // shape -- mimics sediment deposition pooling in low spots.
+    let curvature = nbrAvg - erodedH;
+    let convexW   = max(0.0, -curvature) * 4.0;
+    let blend     = hydraulic * clamp(convexW, 0.0, 1.0) / f32(iters);
+    erodedH = mix(erodedH, nbrAvg, blend);
+  }
+
+  let outH = clamp(mix(h0, erodedH, strength), 0.0, 1.0);
+  return vec4<f32>(outH, outH, outH, 1.0);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inLayer    === "number") ? p.inLayer    : 0;
+      scratch[17] = (typeof p.thermal    === "number") ? p.thermal    : 0.4;
+      scratch[18] = (typeof p.hydraulic  === "number") ? p.hydraulic  : 0.5;
+      scratch[19] = (typeof p.talus      === "number") ? p.talus      : 0.04;
+      scratch[20] = (typeof p.iterations === "number") ? p.iterations : 10;
+      scratch[21] = (typeof p.radius     === "number") ? p.radius     : 1.5;
+      scratch[22] = (typeof p.strength   === "number") ? p.strength   : 1.0;
+      scratch[23] = 0;
+    },
+    description: "Hydraulic + thermal erosion approximation (Phase 7 §5.5.d). Drops between ProceduralTerrain → Terrain.heightmap to carve raw fBm into geologically plausible terrain. thermal: settles material on slopes steeper than talus (talus = slope threshold in heightmap units, 0.02–0.08 typical). hydraulic: smooths convex ridges via averaged neighbors (concave valleys retain shape, mimicking sediment deposition). iterations: number of multi-radius passes (more = more pronounced; 8–16 looks good, max 32). radius: starting neighbor-sample radius in framebuffer pixels. strength: overall mix vs original heightmap (1 = full erosion, 0 = pass-through). True iterative hydraulic erosion (per-droplet simulation with feedback) lands when chunked-streaming infra arrives — see §5.5.e."
+  },
+
   /* Phase 6.6.20.7 — WireframeCalibration. AlloSphere-style
    * calibration pattern: lat/long sphere wireframe + 3 axis-aligned
    * great circles (RGB-coded) + 3 beacon small-circles around the
@@ -31640,7 +31784,7 @@ const _demos = [
       // upgrade adds warpAmount (organic meandering) + erosion
       // (settled valleys) on top of the ridge fbm for a more
       // realistic mountain landscape.
-      const proc = makeNode("ProceduralTerrain", -240, 40, {
+      const proc = makeNode("ProceduralTerrain", -440, 40, {
         type:          "ridges",
         seed:          7.42,
         frequency:     2.5,
@@ -31650,9 +31794,24 @@ const _demos = [
         ridges:        0.0,        // base already ridges via type
         warpAmount:    0.35,
         warpFreq:      0.6,
-        erosion:       0.35,
+        erosion:       0.15,       // light power-remap; main carving handled by TerrainErosion below
         continentMask: 0.0,
         terrace:       0.0
+      });
+      // §5.5.d TerrainErosion: hydraulic + thermal pass that
+      // smooths convex ridges, settles material on slopes above
+      // the talus threshold, and lets concave valleys hold
+      // sediment. Drops in between ProceduralTerrain and Terrain
+      // for a noticeably more geologically-plausible silhouette
+      // (vs the bare procedural heightmap, which has uniform
+      // sharpness everywhere).
+      const ero = makeNode("TerrainErosion", -200, 40, {
+        thermal:    0.5,
+        hydraulic:  0.6,
+        talus:      0.045,
+        iterations: 12,
+        radius:     1.5,
+        strength:   1.0
       });
       // TerrainMaterial: altitude- and slope-blended bands so the
       // valleys read as sand, mid-slopes as grass, upper slopes
@@ -31696,8 +31855,12 @@ const _demos = [
       });
       const vo  = makeNode("VisualOutput", 1440, 240, { display: 0 });
 
-      // Mesh chain + heightmap wire (§5.5.c-3 GPU displacement).
-      state.edges.push({ from: { node: proc, port: "out"  }, to: { node: ter, port: "heightmap" } });
+      // Mesh chain + heightmap wire (§5.5.c-3 GPU displacement),
+      // now routed through TerrainErosion (§5.5.d) for a final
+      // pass before the heightmap reaches the displaced vertex
+      // shader.
+      state.edges.push({ from: { node: proc, port: "out"  }, to: { node: ero, port: "in"        } });
+      state.edges.push({ from: { node: ero,  port: "out"  }, to: { node: ter, port: "heightmap" } });
       state.edges.push({ from: { node: ter,  port: "mesh" }, to: { node: mat, port: "mesh"      } });
       state.edges.push({ from: { node: mat,  port: "mesh" }, to: { node: scn, port: "mesh1"     } });
       // Camera orbit math: phase * (1/32) * 2π → sin/cos → posX/posZ.
