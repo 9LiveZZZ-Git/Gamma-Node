@@ -62,6 +62,7 @@
     --light:        #f5e6c8;     /* Sprint 7.5.3c — light source (DirectionalLight → Scene) */
     --environment:  #7ad6c4;     /* Sprint 7.5.4 — environment / sky (GradientSky → Scene.environment) */
     --hud:          #ff79c6;     /* §5.5.g — HUD overlay node (Minimap → Scene.hud1) */
+    --heightmap:    #c89060;     /* §5.5.h — terrain heightmap reference (TiledTerrain → Water.heightmap) */
     --selected:     #4a8fdc;
     --danger:       #e24b4a;
     --info:         #83e8ff;
@@ -828,6 +829,10 @@
      layer, not scene geometry" -- distinguishable from texture's
      pure-dotted ring + camera/light double-rings. */
   .port.hud         { border-color: var(--hud);         border-style: dashed; border-width: 3px; }
+  /* §5.5.h -- heightmap-ref port. Carries terrain geometry + noise
+     params from a TiledTerrain into a Water node so the water shader
+     can compute LOD-matched depth that aligns with the rendered mesh. */
+  .port.heightmap   { border-color: var(--heightmap);   border-style: dashed; border-width: 3px; }
   .port.connected.param { background: var(--param); border-style: solid; }
   .port.connected.gate  { background: var(--gate); }
   .port.connected.clock { background: var(--clock); border-style: solid; }
@@ -10872,7 +10877,15 @@ public:
       { n: "islandMaskThreshold", t: "param" },
       { n: "islandMaskSoftness",  t: "param" }
     ],
-    outs: [{ n: "mesh", t: "mesh" }],
+    outs: [
+      { n: "mesh",      t: "mesh" },
+      // §5.5.h -- heightmap-ref output. Wire into Water.heightmap so
+      // the water shader can sample the SAME noise + island LERP +
+      // LOD discretization the rendered terrain mesh uses. Without
+      // this wire the water has no shore detection at all (foam
+      // disabled, just open water).
+      { n: "heightmap", t: "heightmap" }
+    ],
     params: {
       chunkSize:   64,           // world units per chunk side (= meters at 1u=1m)
       chunkRadius: 8,            // chunks from center -> 17×17 grid = 1088m visible disc
@@ -10957,7 +10970,12 @@ public:
       { n: "waveShoreFreq",    t: "param" },
       { n: "foamR",            t: "param" },
       { n: "foamG",            t: "param" },
-      { n: "foamB",            t: "param" }
+      { n: "foamB",            t: "param" },
+      // §5.5.h-5 -- explicit terrain reference. Wire a TiledTerrain's
+      // `heightmap` output here so the water shader can compute
+      // LOD-matched depth that aligns with the rendered mesh. Without
+      // this wire the foam line drifts off the visible shore.
+      { n: "heightmap",        t: "heightmap" }
     ],
     outs: [{ n: "mesh", t: "mesh" }],
     params: {
@@ -32520,6 +32538,12 @@ const _demos = [
       // Water node bakes fs_water into the encoder when its mesh
       // hits a Scene slot.
       state.edges.push({ from: { node: water, port: "mesh" }, to: { node: scn, port: "mesh2"  } });
+      // §5.5.h-5 -- explicit terrain reference wire. Water's
+      // heightmap input takes a TiledTerrain reference so the
+      // shader can sample the same LOD-discretized field the
+      // rendered terrain mesh uses. Without this wire the foam
+      // disabled (open ocean everywhere).
+      state.edges.push({ from: { node: ter, port: "heightmap" }, to: { node: water, port: "heightmap" } });
       state.edges.push({ from: { node: cam, port: "camera" }, to: { node: scn, port: "camera" } });
       state.edges.push({ from: { node: light, port: "light"} , to: { node: scn, port: "light1" } });
       state.edges.push({ from: { node: scn, port: "out"    }, to: { node: mb,  port: "in"     } });
@@ -35778,6 +35802,9 @@ function renderWires(temp) {
       // §5.5.g -- HUD wire. Long-dashed hot pink, signals "overlay
       // layer that draws on top of this Scene's output."
       html += `<path d="${path}" fill="none" stroke="var(--hud)" stroke-width="3" stroke-linecap="round" stroke-dasharray="8,4" />`;
+    } else if (t === "heightmap") {
+      // §5.5.h -- heightmap-ref wire (TiledTerrain -> Water). Earth-tone dashed.
+      html += `<path d="${path}" fill="none" stroke="var(--heightmap)" stroke-width="3" stroke-linecap="round" stroke-dasharray="6,4" />`;
     } else if (t === "transform") {
       // Double-stripe like clock but in transform-violet to keep the
       // 4×4 mat semantics visually distinct from rhythmic data.
@@ -51556,6 +51583,12 @@ struct PerDraw {
   // Read only by fs_terrain. Other fragment shaders ignore.
   detailParams: vec4<f32>,
   bumpParams:   vec4<f32>,
+  // §5.5.h-5 -- Water-specific extra slot. waterExtra.xy = disc
+  // center tile (X, Z) so the LOD-match shader uses the ACTUAL
+  // disc center (with forwardBias applied) instead of the camera
+  // tile -- otherwise water foam misaligns east/west of the
+  // player when they look around. Other material shaders ignore.
+  waterExtra:   vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> uS: PerScene;
 @group(0) @binding(1) var<uniform> uD: PerDraw;
@@ -51942,11 +51975,15 @@ fn fs_water(in: VsOut) -> @location(0) vec4<f32> {
   let chunkRadP  = i32(uD.bumpParams.w);
   var depth: f32 = 1000.0;   // open-ocean fallback when terrain unconfigured
   if (t_hs > 0.001 && t_freq > 0.0000001 && chunkSize > 0.001 && baseSegsP > 0) {
-    let camTx = i32(floor(uS.eye.x / chunkSize + 0.5));
-    let camTz = i32(floor(uS.eye.z / chunkSize + 0.5));
-    let myTx  = i32(floor(wp.x / chunkSize));
-    let myTz  = i32(floor(wp.z / chunkSize));
-    let segs  = _tw_lodSegs(abs(myTx - camTx), abs(myTz - camTz), max(0, chunkRadP), baseSegsP);
+    // §5.5.h-5 -- use the ACTUAL disc center (with forwardBias),
+    // not just the camera tile. Otherwise the LOD ring calculation
+    // is off by the forwardBias shift and water foam misaligns
+    // east/west of the player.
+    let discTx = i32(uD.waterExtra.x);
+    let discTz = i32(uD.waterExtra.y);
+    let myTx   = i32(floor(wp.x / chunkSize));
+    let myTz   = i32(floor(wp.z / chunkSize));
+    let segs   = _tw_lodSegs(abs(myTx - discTx), abs(myTz - discTz), max(0, chunkRadP), baseSegsP);
     let dStep = chunkSize / f32(segs);
     let gx = floor(wp.x / dStep) * dStep;
     let gz = floor(wp.z / dStep) * dStep;
@@ -54481,7 +54518,7 @@ function _ensureSceneInstance(sceneNode) {
       // v0.3.129 TerrainMaterial v2 -- grown 192 → 224 for
       // detailParams + bumpParams (AAA-style multi-scale detail
       // noise + slope-masked snow + procedural bump mapping).
-      size: 224,
+      size: 240,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
     });
     // Sprint 7.5.4.b -- env texture (HDRI / Skybox) at bindings 4+5.
@@ -54519,7 +54556,7 @@ function _ensureSceneInstance(sceneNode) {
     // v0.3.129 -- 56 floats / 224 B. Slots [48..55] hold the
     // TerrainMaterial v2 detail + bump param blocks for AAA-
     // style multi-scale noise / procedural bump / snow masking.
-    drawScratch:  new Float32Array(56)
+    drawScratch:  new Float32Array(60)
   };
   Visual.sceneInstances.set(sceneNode.id, inst);
   return inst;
@@ -54849,15 +54886,20 @@ function _encodeScenePass(enc, entry) {
       inst.drawScratch[26] = (typeof mp.skyB === "number") ? mp.skyB : 0.92;
       if (!Visual._waterStartT) Visual._waterStartT = performance.now();
       inst.drawScratch[27] = (performance.now() - Visual._waterStartT) * 0.001;
-      // §5.5.h-3 -- shore detection. Pull the patch's first
-      // TiledTerrain noise params so fs_water can sample the
-      // terrain height under each water fragment and compute
-      // depth. If no TiledTerrain exists, pack zeros + a 0 flag
-      // for archipelago -> shader skips the LERP and just returns
-      // depth = +infinity (deep open water).
+      // §5.5.h-5 -- shore detection. The Water node's `heightmap`
+      // input takes a wire from a TiledTerrain's `heightmap` output;
+      // we walk state.edges to find that wire's source. If unwired,
+      // shore detect is disabled (depth defaults to "open ocean
+      // everywhere" in fs_water).
       let tt = null;
-      if (state && Array.isArray(state.nodes)) {
-        tt = state.nodes.find(n => n && n.type === "TiledTerrain");
+      if (state && Array.isArray(state.edges)) {
+        const hmWire = state.edges.find(e =>
+          e && e.to && e.to.node === m.node.id && e.to.port === "heightmap"
+        );
+        if (hmWire && hmWire.from) {
+          const src = state.nodes.find(n => n && n.id === hmWire.from.node);
+          if (src && src.type === "TiledTerrain") tt = src;
+        }
       }
       if (tt && tt.params) {
         const tp2 = tt.params;
@@ -54894,8 +54936,19 @@ function _encodeScenePass(enc, entry) {
         inst.drawScratch[49] = (typeof tt.params.chunkSize   === "number") ? tt.params.chunkSize   : 64;
         inst.drawScratch[50] = (typeof tt.params.segments    === "number") ? tt.params.segments    : 24;
         inst.drawScratch[51] = (typeof tt.params.chunkRadius === "number") ? tt.params.chunkRadius : 8;
+        // §5.5.h-5 -- actual disc center tile (with forwardBias).
+        // Using camera tile as fallback caused east/west water to
+        // disappear because the LOD ring calc was off by the bias
+        // shift. _tiledTerrainCenterTile applies the bias internally.
+        const dc = (typeof _tiledTerrainCenterTile === "function")
+          ? _tiledTerrainCenterTile(tt) : { tx: 0, tz: 0 };
+        inst.drawScratch[52] = dc.tx;
+        inst.drawScratch[53] = dc.tz;
+        inst.drawScratch[54] = 0;
+        inst.drawScratch[55] = 0;
       } else {
         inst.drawScratch[49] = 0; inst.drawScratch[50] = 0; inst.drawScratch[51] = 0;
+        inst.drawScratch[52] = 0; inst.drawScratch[53] = 0;
       }
     }
     // Phase 7 §5.5.c -- TerrainMaterial uses the extended band
@@ -55024,7 +55077,7 @@ function _encodeScenePass(enc, entry) {
       inst.drawScratch[42] = 0;
       inst.drawScratch[43] = 0;
     }
-    Visual.device.queue.writeBuffer(slot.perDrawBuffer, 0, inst.drawScratch.buffer, 0, 224);
+    Visual.device.queue.writeBuffer(slot.perDrawBuffer, 0, inst.drawScratch.buffer, 0, 240);
     // v0.3.120 -- pick the bind group whose binding 2 is OPPOSITE
     // parity to the scratch layer we're writing to. Prevents the
     // texture-as-binding-and-attachment aliasing that silently broke
