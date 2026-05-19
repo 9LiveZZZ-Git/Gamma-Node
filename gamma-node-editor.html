@@ -10875,7 +10875,9 @@ public:
       { n: "islandMaskFreq",      t: "param" },
       { n: "islandMaskSeed",      t: "param" },
       { n: "islandMaskThreshold", t: "param" },
-      { n: "islandMaskSoftness",  t: "param" }
+      { n: "islandMaskSoftness",  t: "param" },
+      { n: "islandBeachStrength", t: "param" },
+      { n: "islandBeachFreq",     t: "param" }
     ],
     outs: [
       { n: "mesh",      t: "mesh" },
@@ -10924,6 +10926,14 @@ public:
       islandMaskSeed:      11.7,
       islandMaskThreshold: 0.50,      // mask value above this = land
       islandMaskSoftness:  0.08,      // smoothstep width around the threshold
+      // §5.5.h-9 -- patchy beaches around island shores. Flattens land
+      // elevation toward yOff+4m where coastal noise (controlled by
+      // BeachFreq) is high AND the island mask is in the shore band.
+      // Beach noise seed is derived as MaskSeed+17.3 so adjusting the
+      // island layout naturally varies beach placement too. Default
+      // 0 = off; existing patches don't get beaches without opt-in.
+      islandBeachStrength: 0.0,
+      islandBeachFreq:     0.0008,    // ~1 cycle per ~1.3km -> beach patches a few hundred m wide
       // Tiling-config-popup-only knobs (hidden from the default port row).
       anchorMode:  "auto",       // "auto" follows first FPCamera; "manual" uses centerX/Z
       centerX:     0,
@@ -32435,7 +32445,13 @@ const _demos = [
       // per 8km -> several distinct islands in the visible disc.
       const ter = makeNode("TiledTerrain", 40, 80, {
         chunkSize:   256,
-        chunkRadius: 20,
+        // §5.5.h-9 -- chunkRadius at the system cap. With chunkSize=256
+        // that gives a ~16km visible diameter. The 5-LOD-ring system
+        // already auto-LODs the outer ~60% of the disc down toward 2-
+        // segment quads, so the bulk of the new chunks ship as the
+        // "very far 2D low-res representation" the player sees on the
+        // horizon, with a sharp inner disc near the camera.
+        chunkRadius: 32,
         segments:    24,
         // §5.5.h-2 -- bigger more-distinct islands, deeper ocean.
         // heightScale=1200 + yOffset=1500 → island terrain spans
@@ -32470,6 +32486,11 @@ const _demos = [
         islandMaskThreshold: 0.50,
         islandMaskSoftness:  0.06,
         islandSinkDepth:     3000,
+        // §5.5.h-9 -- patchy beaches around island shores. Strength=0.85
+        // gives full-height flattening where beach noise is high; lower
+        // values leave more rocky cliffs interleaved with sand zones.
+        islandBeachStrength: 0.85,
+        islandBeachFreq:     0.0006,
         anchorMode:  "auto"
       });
       // Material: same band defaults as Walkable Terrain but with
@@ -32496,7 +32517,9 @@ const _demos = [
       const cam = makeNode("FPCamera", 520, 80, {
         posX: 0, posY: 400, posZ: 0,
         yaw: 0, pitch: -0.18,
-        fov: 70, near: 0.5, far: 15000,
+        // §5.5.h-9 -- far plane bumped to 25km so the new 16km terrain
+        // disc + horizon don't clip when looking out across the archipelago.
+        fov: 70, near: 0.5, far: 25000,
         walkMode: 0,
         walkSpeed: 30, lookSpeed: 2.2,
         mouseSensitivity: 0.0025, eyeHeight: 1.7
@@ -32527,8 +32550,10 @@ const _demos = [
         waveFreq: 0.012, waveSpeed: 0.6, waveAmp: 1.0,
         fresnelStrength: 1.0,
         skyR: 0.62, skyG: 0.78, skyB: 0.92,
-        foamWidth: 10,
-        shallowDepth: 60,
+        // §5.5.h-9 -- wider foam + much deeper shallow band so the
+        // turquoise shallow tint reads clearly from far away.
+        foamWidth: 18,
+        shallowDepth: 220,
         waveShoreFreq: 0.018,
         foamR: 0.96, foamG: 0.97, foamB: 1.00
       });
@@ -51921,11 +51946,23 @@ fn _tw_finalY_at(wx: f32, wz: f32,
                  t_freq: f32, t_octs: i32, t_lac: f32, t_gain: f32, t_ridges: f32,
                  t_seed: f32, t_plateau: f32, t_hs: f32, t_yOff: f32,
                  archipel: f32, t_sink: f32,
-                 m_freq: f32, m_seed: f32, m_thresh: f32, m_soft: f32) -> f32 {
+                 m_freq: f32, m_seed: f32, m_thresh: f32, m_soft: f32,
+                 beachStr: f32, beachFreq: f32) -> f32 {
   let h = _tw_baseHeight(wx, wz, t_freq, t_octs, t_lac, t_gain, t_ridges, t_seed, t_plateau);
   var ty = (h - 1.0) * t_hs + t_yOff;
   if (archipel > 0.5) {
     let landAmt = _tw_islandLand(wx, wz, m_freq, m_seed, m_thresh, m_soft);
+    // §5.5.h-9 beach band -- mirror of the JS _tiledFinalY beach
+    // blend so the water shader's shore detect samples the same
+    // flattened beach elevation the rendered mesh shows.
+    if (beachStr > 0.0 && landAmt > 0.0 && landAmt < 0.95) {
+      let bn = _tw_valueNoise(vec2<f32>(wx, wz) * beachFreq, m_seed + 17.3);
+      let coastal = min(1.0, landAmt / 0.5) * min(1.0, (0.95 - landAmt) / 0.4);
+      let beachy = max(0.0, (bn - 0.45) / 0.25);
+      let blend = min(1.0, coastal * beachy * beachStr);
+      let beachY = t_yOff + 4.0;
+      ty = ty * (1.0 - blend) + beachY * blend;
+    }
     let seaFloor = t_yOff - t_sink;
     ty = ty * landAmt + seaFloor * (1.0 - landAmt);
   }
@@ -51994,6 +52031,10 @@ fn fs_water(in: VsOut) -> @location(0) vec4<f32> {
     // east/west of the player.
     let discTx = i32(uD.waterExtra.x);
     let discTz = i32(uD.waterExtra.y);
+    // §5.5.h-9 -- beach band params from upstream TiledTerrain. Z=0
+    // disables beaches; otherwise W is the beach noise freq.
+    let beachStr  = uD.waterExtra.z;
+    let beachFreq = uD.waterExtra.w;
     let myTx   = i32(floor(wp.x / chunkSize));
     let myTz   = i32(floor(wp.z / chunkSize));
     let segs   = _tw_lodSegs(abs(myTx - discTx), abs(myTz - discTz), max(0, chunkRadP), baseSegsP);
@@ -52004,16 +52045,20 @@ fn fs_water(in: VsOut) -> @location(0) vec4<f32> {
     let fz = clamp((wp.z - gz) / dStep, 0.0, 1.0);
     let y00 = _tw_finalY_at(gx,         gz,
                             t_freq, t_octs, t_lac, t_gain, t_ridges, t_seed, t_plateau,
-                            t_hs, t_yOff, archipel, t_sink, m_freq, m_seed, m_thresh, m_soft);
+                            t_hs, t_yOff, archipel, t_sink, m_freq, m_seed, m_thresh, m_soft,
+                            beachStr, beachFreq);
     let y10 = _tw_finalY_at(gx + dStep, gz,
                             t_freq, t_octs, t_lac, t_gain, t_ridges, t_seed, t_plateau,
-                            t_hs, t_yOff, archipel, t_sink, m_freq, m_seed, m_thresh, m_soft);
+                            t_hs, t_yOff, archipel, t_sink, m_freq, m_seed, m_thresh, m_soft,
+                            beachStr, beachFreq);
     let y01 = _tw_finalY_at(gx,         gz + dStep,
                             t_freq, t_octs, t_lac, t_gain, t_ridges, t_seed, t_plateau,
-                            t_hs, t_yOff, archipel, t_sink, m_freq, m_seed, m_thresh, m_soft);
+                            t_hs, t_yOff, archipel, t_sink, m_freq, m_seed, m_thresh, m_soft,
+                            beachStr, beachFreq);
     let y11 = _tw_finalY_at(gx + dStep, gz + dStep,
                             t_freq, t_octs, t_lac, t_gain, t_ridges, t_seed, t_plateau,
-                            t_hs, t_yOff, archipel, t_sink, m_freq, m_seed, m_thresh, m_soft);
+                            t_hs, t_yOff, archipel, t_sink, m_freq, m_seed, m_thresh, m_soft,
+                            beachStr, beachFreq);
     let terrainY = y00 * (1.0 - fx) * (1.0 - fz)
                  + y10 * fx        * (1.0 - fz)
                  + y01 * (1.0 - fx) * fz
@@ -53705,10 +53750,25 @@ function _tiledIslandLandAmount(wx, wz, ip) {
  * vertex only. */
 function _tiledFinalY(wx, wz, noise, hs, yOff) {
   const h = _tiledTerrainHeightAt(wx, wz, noise);
-  const terrainY = (h - 1) * hs + yOff;
+  let terrainY = (h - 1) * hs + yOff;
   if (!noise || !noise.islandParams) return terrainY;
   const ip = noise.islandParams;
   const f  = _tiledIslandLandAmount(wx, wz, ip);
+  // §5.5.h-9 beach band. Where coastal noise (seed derived from
+  // maskSeed) is high AND the island mask is in the shore band, blend
+  // terrain elevation toward a flat beach plane at yOff + 4m. Mirrors
+  // the WGSL water shader's shore-detect path so the foam line still
+  // lands at the visible beach edge.
+  if (ip.beachStrength > 0 && f > 0.0 && f < 0.95) {
+    const bn = _terrainValueNoise(wx * ip.beachFreq, wz * ip.beachFreq, ip.maskSeed + 17.3);
+    const coastal = Math.min(1, f / 0.5) * Math.min(1, (0.95 - f) / 0.4);
+    const beachy = Math.max(0, (bn - 0.45) / 0.25);
+    const blend = Math.min(1, coastal * beachy * ip.beachStrength);
+    if (blend > 0) {
+      const beachY = yOff + 4;
+      terrainY = terrainY * (1 - blend) + beachY * blend;
+    }
+  }
   if (f >= 0.9999) return terrainY;
   const seaFloor = yOff - ip.sinkDepth;
   return terrainY * f + seaFloor * (1 - f);
@@ -53803,7 +53863,9 @@ function _findTiledIslandParams(ttNode) {
     maskFreq:      (typeof p.islandMaskFreq      === "number") ? p.islandMaskFreq      : 0.00012,
     maskSeed:      (typeof p.islandMaskSeed      === "number") ? p.islandMaskSeed      : 11.7,
     maskThreshold: (typeof p.islandMaskThreshold === "number") ? p.islandMaskThreshold : 0.50,
-    maskSoftness:  (typeof p.islandMaskSoftness  === "number") ? p.islandMaskSoftness  : 0.08
+    maskSoftness:  (typeof p.islandMaskSoftness  === "number") ? p.islandMaskSoftness  : 0.08,
+    beachStrength: (typeof p.islandBeachStrength === "number") ? p.islandBeachStrength : 0.0,
+    beachFreq:     (typeof p.islandBeachFreq     === "number") ? p.islandBeachFreq     : 0.0008
   };
 }
 
@@ -54975,8 +55037,11 @@ function _encodeScenePass(enc, entry) {
           ? _tiledTerrainCenterTile(tt) : { tx: 0, tz: 0 };
         inst.drawScratch[52] = dc.tx;
         inst.drawScratch[53] = dc.tz;
-        inst.drawScratch[54] = 0;
-        inst.drawScratch[55] = 0;
+        // §5.5.h-9 -- beach band params from upstream TiledTerrain.
+        // Drives fs_water's beach blend so shore detect lines up with
+        // the mesh's flattened beach zones.
+        inst.drawScratch[54] = (typeof tt.params.islandBeachStrength === "number") ? tt.params.islandBeachStrength : 0;
+        inst.drawScratch[55] = (typeof tt.params.islandBeachFreq     === "number") ? tt.params.islandBeachFreq     : 0.0008;
       } else {
         inst.drawScratch[49] = 0; inst.drawScratch[50] = 0; inst.drawScratch[51] = 0;
         inst.drawScratch[52] = 0; inst.drawScratch[53] = 0;
