@@ -10833,7 +10833,8 @@ public:
       { n: "lacunarity",  t: "param" },
       { n: "gain",        t: "param" },
       { n: "ridges",      t: "param" },
-      { n: "plateau",     t: "param" }
+      { n: "plateau",     t: "param" },
+      { n: "forwardBias", t: "param" }
     ],
     outs: [{ n: "mesh", t: "mesh" }],
     params: {
@@ -10849,6 +10850,7 @@ public:
       gain:        0.5,
       ridges:      0.5,          // mountain-crest sharpening
       plateau:     0.0,          // 0 = rolling-hill fBm; 1 = sharp isolated peaks in flat plain
+      forwardBias: 0.0,          // 0 = symmetric disc; 0.4 = shifts loaded disc 40% radius forward of camera look direction (yaw-quantized to 45°)
       // Tiling-config-popup-only knobs (hidden from the default port row).
       anchorMode:  "auto",       // "auto" follows first FPCamera; "manual" uses centerX/Z
       centerX:     0,
@@ -10857,7 +10859,7 @@ public:
     paramOptions: { anchorMode: ["auto", "manual"] },
     uiOnlyParams: ["anchorMode", "centerX", "centerZ"],
     methods: {},
-    description: "Phase 7 §5.5.e chunked terrain at mountain scale. Emits an (2*chunkRadius+1)² grid of chunks centered on the wired FPCamera, with distance-LOD (inner = full segments, mid = half, outer = quarter) and vertical skirts to mask T-junction seams between LOD rings. Per-chunk frustum culling skips chunks outside the view -- typically only 30-50% of chunks draw per frame. Mesh regenerates only when the camera crosses a chunk boundary. World-space fBm sampling: seams are exact along same-LOD edges, skirts cover the gaps along LOD edges. Defaults are mountain-scale at 1u=1m: chunkSize=64m, chunkRadius=8 (17×17 = 289 chunks = 1088m disc), segments=24 (inner LOD; mid=12, outer=6), heightScale=80m peaks. ridges=0.5 for alpine crests. Pair with TerrainMaterial + FPCamera. Drop a Minimap node into the patch to overlay a top-down view. Open the ⚙ Tiling Config popup on the node for the full knob set + a live vertex-count + memory estimate. Anchor mode = manual locks the grid origin to (centerX, centerZ) instead of camera-follow."
+    description: "Phase 7 §5.5.e chunked terrain at mountain scale with per-chunk streaming. Each chunk has its own VBO+IBO and is built incrementally (~6ms budget per frame) -- the camera can cross tile boundaries without the old monolithic-mesh stall. As the camera moves, chunks leaving the visible disc are destroyed and new chunks build in their place. Per-chunk frustum culling skips off-view chunks at draw time. Distance-LOD (inner = full segments, mid = half, outer = quarter) with vertical skirts to mask T-junction seams between rings. World-space fBm sampling: seams are exact along same-LOD edges, skirts cover gaps along LOD edges. Defaults are mountain-scale at 1u=1m: chunkSize=64m, chunkRadius=8, segments=24, heightScale=80m. plateau (0..1) flattens low/mid altitudes for isolated peaks in plains. forwardBias (0..1) shifts the loaded disc toward the camera's look direction (yaw-quantized to 45° to stay cache-friendly) so the player sees further forward than behind. Pair with TerrainMaterial + FPCamera. Drop a Minimap node to overlay a top-down view. Open the ⚙ Tiling Config popup on the node for the full knob set + a live preview. Anchor mode = manual locks the grid origin to (centerX, centerZ) instead of camera-follow."
   },
 
   /* =========================================================================
@@ -32084,6 +32086,7 @@ const _demos = [
         gain:        0.45,
         ridges:      0.35,      // tone ridges down -- plateau does the peak isolation now
         plateau:     0.7,       // squish low/mid altitudes flat -- isolated mountains in plains
+        forwardBias: 0.4,       // shift loaded disc 40% radius forward of look direction (see further forward, less behind)
         anchorMode:  "auto"
       });
       // TerrainMaterial: auto-detects upstream TiledTerrain and
@@ -52282,6 +52285,13 @@ function _ensureSkyPipeline(sampleCount) {
  * version counter set when relevant params mutate). */
 function _ensureMeshBuffers(meshEntry) {
   const node = meshEntry.node;
+  // §5.5.e-6 -- TiledTerrain uses incremental per-chunk streaming
+  // (own VBO+IBO per chunk, dropped/built individually as the camera
+  // disc shifts). Route to the dedicated path so the monolithic
+  // cache-or-rebuild logic below is bypassed entirely.
+  if (node.type === "TiledTerrain") {
+    return _ensureTiledTerrainChunks(node);
+  }
   const cached = Visual.meshBufferCache.get(node.id);
   if (cached && _meshCacheKey(node) === cached.cacheKey) return cached;
   // Params changed -- destroy + rebuild. Cheap (just a couple of
@@ -52442,18 +52452,8 @@ function _meshCacheKey(node) {
         wired ? "g" : "c"
       ].join(",");
     }
-    case "TiledTerrain":  {
-      // §5.5.e -- cache key includes the CURRENT anchor tile so the
-      // mesh rebuilds when the camera crosses a chunk boundary. Other
-      // params (segments / chunkSize / noise) also force a rebuild.
-      const t = _tiledTerrainCenterTile(node);
-      return "tiledTer:" + [
-        p.chunkSize, p.chunkRadius, p.segments, p.heightScale, p.yOffset,
-        p.seed, p.frequency, p.octaves, p.lacunarity, p.gain, p.ridges,
-        p.plateau,
-        t.tx, t.tz
-      ].join(",");
-    }
+    // TiledTerrain doesn't use _meshCacheKey -- _ensureTiledTerrainChunks
+    // manages its own per-chunk cache keyed by (tileX, tileZ, lod).
     default:              return node.type;
   }
 }
@@ -52476,7 +52476,6 @@ function _buildMeshData(node) {
     case "Cylinder":      return _buildCylinder(node);
     case "Cone":          return _buildCone(node);
     case "Terrain":       return _buildTerrain(node);
-    case "TiledTerrain":  return _buildTiledTerrain(node);
     default: return null;
   }
 }
@@ -52842,10 +52841,28 @@ function _tiledTerrainAnchor(node) {
 function _tiledTerrainCenterTile(node) {
   const p = node.params || {};
   const chunkSize = Math.max(1, (typeof p.chunkSize === "number") ? p.chunkSize : 32);
+  const radius = Math.max(0, (typeof p.chunkRadius === "number") ? p.chunkRadius : 0);
   const a = _tiledTerrainAnchor(node);
+  let cx = a.cx;
+  let cz = a.cz;
+  // §5.5.e-6 -- forward bias. Shifts the loaded-disc center toward
+  // the camera's look direction so the player sees further forward
+  // than behind (asymmetric loading). Yaw is quantized to 8 cardinal
+  // directions so small head-turns don't churn the chunk cache.
+  const forwardBias = Math.max(0, Math.min(1, (typeof p.forwardBias === "number") ? p.forwardBias : 0));
+  if (forwardBias > 0 && state && Array.isArray(state.nodes)) {
+    const cam = state.nodes.find(n => n && (n.type === "FPCamera" || n.type === "Camera"));
+    if (cam && cam.params && typeof cam.params.yaw === "number") {
+      const q = Math.PI / 4;                          // 45° quantum
+      const yawQ = Math.round(cam.params.yaw / q) * q;
+      const shift = forwardBias * radius * chunkSize;
+      cx += Math.sin(yawQ) * shift;
+      cz += Math.cos(yawQ) * shift;
+    }
+  }
   return {
-    tx: Math.round(a.cx / chunkSize),
-    tz: Math.round(a.cz / chunkSize)
+    tx: Math.round(cx / chunkSize),
+    tz: Math.round(cz / chunkSize)
   };
 }
 
@@ -52892,13 +52909,64 @@ function _tiledTerrainLodSegments(dxAbs, dzAbs, radius, baseSegs) {
   return Math.max(2, baseSegs >> 2);
 }
 
-function _buildTiledTerrain(node) {
+/* §5.5.e-6 -- TiledTerrain streaming. Each chunk gets its own
+ * VBO+IBO, cached in Visual.tiledChunkCache per-node. As the camera
+ * disc shifts (tile crossing OR yaw quantum crossing in forwardBias
+ * mode), only NEW chunks build and old chunks drop -- the rest
+ * stays put. Eliminates the ~200ms full-mesh rebuild stall.
+ *
+ * Cache layout:
+ *   Visual.tiledChunkCache: Map<nodeId, { chunks: Map<key, chunkBuf>, globalKey }>
+ *   key  = "tileX,tileZ,lod"  (LOD bake-in invalidates per-chunk on LOD change)
+ *   buf  = { vertexBuffer, indexBuffer, indexCount, aabbMin, aabbMax,
+ *            tileX, tileZ, lod }
+ *
+ * Global cache key encodes the non-anchor params (chunkSize, segments,
+ * heightScale, noise...). Changing any drops EVERY chunk so geometry
+ * never lingers stale. Anchor changes (centerTile shift) are handled
+ * incrementally -- only chunks no longer in the visible set are
+ * dropped + new ones build. */
+
+function _tiledTerrainGlobalCacheKey(node) {
   const p = node.params || {};
-  const chunkSize = Math.max(1,  (typeof p.chunkSize   === "number") ? p.chunkSize   : 64);
-  const radius    = Math.max(0, Math.min(16, Math.floor((typeof p.chunkRadius === "number") ? p.chunkRadius : 8)));
-  const baseSegs  = Math.max(2, Math.min(64, Math.floor((typeof p.segments    === "number") ? p.segments    : 24)));
-  const hs        = (typeof p.heightScale === "number") ? p.heightScale : 80;
-  const yOff      = (typeof p.yOffset === "number")     ? p.yOffset     : 0;
+  return [
+    p.chunkSize, p.chunkRadius, p.segments, p.heightScale, p.yOffset,
+    p.seed, p.frequency, p.octaves, p.lacunarity, p.gain, p.ridges,
+    p.plateau
+  ].join(",");
+}
+
+/* Visible-chunk set for the current frame. Returns Map<key, info>
+ * where info has { tileX, tileZ, segs (= LOD) }. The chunk grid is
+ * symmetric around the (possibly-biased) center tile. */
+function _computeVisibleChunkSet(node) {
+  const p = node.params || {};
+  const radius   = Math.max(0, Math.min(16, Math.floor((typeof p.chunkRadius === "number") ? p.chunkRadius : 8)));
+  const baseSegs = Math.max(2, Math.min(64, Math.floor((typeof p.segments    === "number") ? p.segments    : 24)));
+  const center = _tiledTerrainCenterTile(node);
+  const visible = new Map();
+  for (let cz = -radius; cz <= radius; cz++) {
+    for (let cx = -radius; cx <= radius; cx++) {
+      const segs = _tiledTerrainLodSegments(Math.abs(cx), Math.abs(cz), radius, baseSegs);
+      const tileX = center.tx + cx;
+      const tileZ = center.tz + cz;
+      const key = tileX + "," + tileZ + "," + segs;
+      visible.set(key, { tileX, tileZ, segs });
+    }
+  }
+  return visible;
+}
+
+/* Build ONE chunk's vertex + index data and upload to GPU. Returns
+ * { vertexBuffer, indexBuffer, indexCount, aabbMin, aabbMax,
+ *   tileX, tileZ, lod }. Same per-chunk geometry the old
+ * monolithic builder produced (chunk grid + 4 vertical skirts);
+ * factored out so it can be called incrementally. */
+function _buildSingleChunk(node, info) {
+  const p = node.params || {};
+  const chunkSize = Math.max(1, (typeof p.chunkSize === "number") ? p.chunkSize : 64);
+  const hs   = (typeof p.heightScale === "number") ? p.heightScale : 80;
+  const yOff = (typeof p.yOffset === "number")     ? p.yOffset     : 0;
   const noise = {
     seed:       (typeof p.seed       === "number") ? p.seed       : 7.42,
     frequency:  (typeof p.frequency  === "number") ? p.frequency  : 0.008,
@@ -52908,218 +52976,277 @@ function _buildTiledTerrain(node) {
     ridges:     (typeof p.ridges     === "number") ? p.ridges     : 0.5,
     plateau:    (typeof p.plateau    === "number") ? p.plateau    : 0.0
   };
-  const center = _tiledTerrainCenterTile(node);
-
-  const chunksAcross = 2 * radius + 1;
-  const totalChunks  = chunksAcross * chunksAcross;
-
-  // Upper-bound allocation. Every chunk could in theory be at
-  // baseSegs LOD with full skirts, so size the typed arrays for that
-  // worst case + trim at the end via subarray. Per chunk:
-  //   verts = (s+1)² (grid) + 4*(s+1) (skirt-bottom rows)
-  //   inds  = s²*6  (grid) + 4*s*6   (skirt quads)
-  const maxN = baseSegs + 1;
-  const maxVertsPerChunk = maxN * maxN + 4 * maxN;
-  const maxIndsPerChunk  = baseSegs * baseSegs * 6 + 4 * baseSegs * 6;
-  const verts   = new Float32Array(totalChunks * maxVertsPerChunk * 11);
-  const indices = new Uint32Array(totalChunks * maxIndsPerChunk);
-  let vi = 0, ii = 0;
-
-  // Per-chunk metadata: minimap bounds + the GPU-side draw range
-  // (baseIndex / indexCount) + world-space AABB for per-chunk
-  // frustum culling. All sized to totalChunks; we fill exactly N
-  // entries (every chunk is built, none skipped at build time --
-  // culling decides at draw time).
-  const minimapChunks = new Array(totalChunks);
-  const chunkDraws    = new Array(totalChunks);
-
-  // Skirt depth: hang down far enough below the deepest valley
-  // that LOD-boundary T-junctions are always covered. yOff - hs*3
-  // is well below the valley floor (yOff - hs).
   const skirtY = yOff - hs * 3;
 
-  let chunkIdx = 0;
-  for (let cz = -radius; cz <= radius; cz++) {
-    for (let cx = -radius; cx <= radius; cx++) {
-      const tileX = center.tx + cx;
-      const tileZ = center.tz + cz;
-      const originX = tileX * chunkSize;
-      const originZ = tileZ * chunkSize;
-      const segs = _tiledTerrainLodSegments(Math.abs(cx), Math.abs(cz), radius, baseSegs);
-      const N = segs + 1;
-      const dStep = chunkSize / segs;
-      const chunkVertStart   = (vi / 11) | 0;
-      const chunkIndexStart  = ii;
+  const tileX = info.tileX;
+  const tileZ = info.tileZ;
+  const segs  = info.segs;
+  const originX = tileX * chunkSize;
+  const originZ = tileZ * chunkSize;
+  const N = segs + 1;
+  const dStep = chunkSize / segs;
 
-      // Pre-sample chunk heights. Sized to THIS chunk's N -- a fresh
-      // Float32Array on every chunk so LOD changes per chunk are safe.
-      const heights = new Float32Array(N * N);
-      let chunkMinY = Infinity, chunkMaxY = -Infinity;
-      for (let j = 0; j < N; j++) {
-        for (let i = 0; i < N; i++) {
-          const wx = originX + i * dStep;
-          const wz = originZ + j * dStep;
-          const y = (_tiledTerrainHeightAt(wx, wz, noise) - 1) * hs + yOff;
-          heights[j * N + i] = y;
-          if (y < chunkMinY) chunkMinY = y;
-          if (y > chunkMaxY) chunkMaxY = y;
-        }
-      }
+  // Exact-size allocation (no padding) since each chunk knows its LOD.
+  const vertCount = N * N + 4 * N;                          // grid + 4 skirt-bottom rows
+  const indCount  = segs * segs * 6 + 4 * segs * 6;         // grid quads + skirt quads
+  const verts   = new Float32Array(vertCount * 11);
+  const indices = new Uint32Array(indCount);
+  let vi = 0, ii = 0;
 
-      // Chunk grid verts.
-      for (let j = 0; j < N; j++) {
-        for (let i = 0; i < N; i++) {
-          const wx = originX + i * dStep;
-          const wz = originZ + j * dStep;
-          const y = heights[j * N + i];
-
-          // Central-difference normal, sampling neighbors in WORLD
-          // space at chunk-edges so the normal field is continuous
-          // across LOD boundaries (the height value differs across
-          // LOD seams but the underlying world-space fBm does not).
-          const yL = (i > 0)    ? heights[j * N + (i - 1)] : (_tiledTerrainHeightAt(wx - dStep, wz, noise) - 1) * hs + yOff;
-          const yR = (i < segs) ? heights[j * N + (i + 1)] : (_tiledTerrainHeightAt(wx + dStep, wz, noise) - 1) * hs + yOff;
-          const yD = (j > 0)    ? heights[(j - 1) * N + i] : (_tiledTerrainHeightAt(wx, wz - dStep, noise) - 1) * hs + yOff;
-          const yU = (j < segs) ? heights[(j + 1) * N + i] : (_tiledTerrainHeightAt(wx, wz + dStep, noise) - 1) * hs + yOff;
-          const dydx = (yR - yL) / (2 * dStep);
-          const dydz = (yU - yD) / (2 * dStep);
-          let nx = -dydx, ny = 1, nz = -dydz;
-          const nlen = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
-          nx /= nlen; ny /= nlen; nz /= nlen;
-
-          // Altitude-based color gradient (matches _buildTerrain's
-          // band scheme so the unlit-vc fallback looks consistent).
-          const h01 = (hs > 0) ? Math.max(0, Math.min(1, (y - yOff) / hs + 1)) : 0;
-          let rC, gC, bC;
-          if (h01 < 0.25) {
-            const t = h01 / 0.25;
-            rC = 0.25 + t * 0.20; gC = 0.35 + t * 0.30; bC = 0.55 - t * 0.30;
-          } else if (h01 < 0.55) {
-            const t = (h01 - 0.25) / 0.30;
-            rC = 0.45 - t * 0.10; gC = 0.65 - t * 0.20; bC = 0.25 - t * 0.05;
-          } else if (h01 < 0.80) {
-            const t = (h01 - 0.55) / 0.25;
-            rC = 0.35 + t * 0.30; gC = 0.45 + t * 0.20; bC = 0.20 + t * 0.30;
-          } else {
-            const t = (h01 - 0.80) / 0.20;
-            rC = 0.65 + t * 0.35; gC = 0.65 + t * 0.35; bC = 0.50 + t * 0.50;
-          }
-          const slope = 1 - ny;
-          const slopeMul = 1 - slope * 0.4;
-          rC *= slopeMul; gC *= slopeMul; bC *= slopeMul;
-
-          verts[vi++] = wx;
-          verts[vi++] = y;
-          verts[vi++] = wz;
-          verts[vi++] = Math.max(0, Math.min(1, rC));
-          verts[vi++] = Math.max(0, Math.min(1, gC));
-          verts[vi++] = Math.max(0, Math.min(1, bC));
-          verts[vi++] = nx;
-          verts[vi++] = ny;
-          verts[vi++] = nz;
-          verts[vi++] = i / segs;
-          verts[vi++] = j / segs;
-        }
-      }
-
-      // Chunk grid indices (relative to chunkVertStart).
-      for (let j = 0; j < segs; j++) {
-        for (let i = 0; i < segs; i++) {
-          const a = chunkVertStart + j * N + i;
-          const b = a + 1;
-          const c = chunkVertStart + (j + 1) * N + i;
-          const d = c + 1;
-          indices[ii++] = a;
-          indices[ii++] = b;
-          indices[ii++] = d;
-          indices[ii++] = a;
-          indices[ii++] = d;
-          indices[ii++] = c;
-        }
-      }
-
-      // SKIRTS: 4 vertical strips, one per chunk edge, hanging down
-      // to skirtY. Each strip reuses the chunk's edge verts (top
-      // row) by INDEX and adds N new bottom verts at skirtY. Total
-      // skirt bottom verts per chunk = 4 * N. Quads stitch top<->
-      // bottom. With cull mode "none" winding doesn't affect
-      // visibility, so we just emit consistent CCW.
-      //
-      // Edge layout (verts already in the VBO at chunkVertStart):
-      //   edge 0 = j=0       (top, +Z origin side), top vert k = chunkVertStart + 0*N + k    (i = k)
-      //   edge 1 = j=segs    (bottom, +Z far side),  top vert k = chunkVertStart + segs*N + k
-      //   edge 2 = i=0       (left, -X side),         top vert k = chunkVertStart + k*N + 0
-      //   edge 3 = i=segs    (right, +X side),        top vert k = chunkVertStart + k*N + segs
-      const skirtBottomBase = (vi / 11) | 0;
-      const skirtColor = [0.18, 0.16, 0.14];  // dark earth tone; only shows in T-junction gaps
-      const writeSkirtBottom = (edgeIdx, k, wx, wz) => {
-        verts[vi++] = wx;
-        verts[vi++] = skirtY;
-        verts[vi++] = wz;
-        verts[vi++] = skirtColor[0];
-        verts[vi++] = skirtColor[1];
-        verts[vi++] = skirtColor[2];
-        // Normal facing outward from the chunk (rough -- exact
-        // outward direction depends on edge but a flat-down works
-        // visually since skirts are barely visible).
-        verts[vi++] = 0; verts[vi++] = -1; verts[vi++] = 0;
-        verts[vi++] = k / segs;
-        verts[vi++] = 1;
-      };
-      // Write the 4*N skirt-bottom verts.
-      for (let k = 0; k < N; k++) writeSkirtBottom(0, k, originX + k * dStep, originZ);
-      for (let k = 0; k < N; k++) writeSkirtBottom(1, k, originX + k * dStep, originZ + chunkSize);
-      for (let k = 0; k < N; k++) writeSkirtBottom(2, k, originX, originZ + k * dStep);
-      for (let k = 0; k < N; k++) writeSkirtBottom(3, k, originX + chunkSize, originZ + k * dStep);
-      // Indices: 4 edges × segs quads × 2 tris × 3 indices = 24*segs
-      // per chunk skirts.
-      for (let edge = 0; edge < 4; edge++) {
-        for (let k = 0; k < segs; k++) {
-          let topA, topB;
-          if (edge === 0)      { topA = chunkVertStart + 0       * N + k; topB = chunkVertStart + 0       * N + (k + 1); }
-          else if (edge === 1) { topA = chunkVertStart + segs    * N + k; topB = chunkVertStart + segs    * N + (k + 1); }
-          else if (edge === 2) { topA = chunkVertStart + k       * N + 0; topB = chunkVertStart + (k + 1) * N + 0; }
-          else                 { topA = chunkVertStart + k       * N + segs; topB = chunkVertStart + (k + 1) * N + segs; }
-          const botA = skirtBottomBase + edge * N + k;
-          const botB = skirtBottomBase + edge * N + (k + 1);
-          indices[ii++] = topA; indices[ii++] = botA; indices[ii++] = botB;
-          indices[ii++] = topA; indices[ii++] = botB; indices[ii++] = topB;
-        }
-      }
-
-      const indexCount = ii - chunkIndexStart;
-      chunkDraws[chunkIdx] = {
-        baseIndex:  chunkIndexStart,
-        indexCount: indexCount,
-        aabbMin: new Float32Array([originX,             Math.min(chunkMinY, skirtY), originZ]),
-        aabbMax: new Float32Array([originX + chunkSize, chunkMaxY,                    originZ + chunkSize])
-      };
-      minimapChunks[chunkIdx] = {
-        tileX, tileZ,
-        x0: originX, z0: originZ,
-        x1: originX + chunkSize, z1: originZ + chunkSize,
-        lod: segs
-      };
-      chunkIdx++;
+  // Heights for normals + AABB.
+  const heights = new Float32Array(N * N);
+  let chunkMinY = Infinity, chunkMaxY = -Infinity;
+  for (let j = 0; j < N; j++) {
+    for (let i = 0; i < N; i++) {
+      const wx = originX + i * dStep;
+      const wz = originZ + j * dStep;
+      const y = (_tiledTerrainHeightAt(wx, wz, noise) - 1) * hs + yOff;
+      heights[j * N + i] = y;
+      if (y < chunkMinY) chunkMinY = y;
+      if (y > chunkMaxY) chunkMaxY = y;
     }
   }
 
-  // Stash minimap data + draw ranges on the node so the overlay +
-  // encoder can read without rewalking the params.
+  // Grid verts.
+  for (let j = 0; j < N; j++) {
+    for (let i = 0; i < N; i++) {
+      const wx = originX + i * dStep;
+      const wz = originZ + j * dStep;
+      const y = heights[j * N + i];
+      // Central-difference normal sampled in world space so it
+      // matches across chunk boundaries (the underlying fBm field
+      // is continuous; LOD seams only affect mesh-level vertex
+      // placement, not the world-space gradient).
+      const yL = (i > 0)    ? heights[j * N + (i - 1)] : (_tiledTerrainHeightAt(wx - dStep, wz, noise) - 1) * hs + yOff;
+      const yR = (i < segs) ? heights[j * N + (i + 1)] : (_tiledTerrainHeightAt(wx + dStep, wz, noise) - 1) * hs + yOff;
+      const yD = (j > 0)    ? heights[(j - 1) * N + i] : (_tiledTerrainHeightAt(wx, wz - dStep, noise) - 1) * hs + yOff;
+      const yU = (j < segs) ? heights[(j + 1) * N + i] : (_tiledTerrainHeightAt(wx, wz + dStep, noise) - 1) * hs + yOff;
+      const dydx = (yR - yL) / (2 * dStep);
+      const dydz = (yU - yD) / (2 * dStep);
+      let nx = -dydx, ny = 1, nz = -dydz;
+      const nlen = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+      nx /= nlen; ny /= nlen; nz /= nlen;
+
+      const h01 = (hs > 0) ? Math.max(0, Math.min(1, (y - yOff) / hs + 1)) : 0;
+      let rC, gC, bC;
+      if (h01 < 0.25) {
+        const t = h01 / 0.25;
+        rC = 0.25 + t * 0.20; gC = 0.35 + t * 0.30; bC = 0.55 - t * 0.30;
+      } else if (h01 < 0.55) {
+        const t = (h01 - 0.25) / 0.30;
+        rC = 0.45 - t * 0.10; gC = 0.65 - t * 0.20; bC = 0.25 - t * 0.05;
+      } else if (h01 < 0.80) {
+        const t = (h01 - 0.55) / 0.25;
+        rC = 0.35 + t * 0.30; gC = 0.45 + t * 0.20; bC = 0.20 + t * 0.30;
+      } else {
+        const t = (h01 - 0.80) / 0.20;
+        rC = 0.65 + t * 0.35; gC = 0.65 + t * 0.35; bC = 0.50 + t * 0.50;
+      }
+      const slope = 1 - ny;
+      const slopeMul = 1 - slope * 0.4;
+      rC *= slopeMul; gC *= slopeMul; bC *= slopeMul;
+
+      verts[vi++] = wx;
+      verts[vi++] = y;
+      verts[vi++] = wz;
+      verts[vi++] = Math.max(0, Math.min(1, rC));
+      verts[vi++] = Math.max(0, Math.min(1, gC));
+      verts[vi++] = Math.max(0, Math.min(1, bC));
+      verts[vi++] = nx;
+      verts[vi++] = ny;
+      verts[vi++] = nz;
+      verts[vi++] = i / segs;
+      verts[vi++] = j / segs;
+    }
+  }
+
+  // Grid indices (chunk vert offset = 0 since each chunk now has its
+  // own private VBO, no need to baseIndex into a shared buffer).
+  for (let j = 0; j < segs; j++) {
+    for (let i = 0; i < segs; i++) {
+      const a = j * N + i;
+      const b = a + 1;
+      const c = (j + 1) * N + i;
+      const d = c + 1;
+      indices[ii++] = a;
+      indices[ii++] = b;
+      indices[ii++] = d;
+      indices[ii++] = a;
+      indices[ii++] = d;
+      indices[ii++] = c;
+    }
+  }
+
+  // Skirts (4 vertical strips). Same structure as the monolithic
+  // build: top row reuses chunk edge verts by index; bottom row is
+  // a new ring of verts at skirtY.
+  const skirtBottomBase = N * N;
+  const skirtR = 0.18, skirtG = 0.16, skirtB = 0.14;
+  const writeSkirtBottom = (k, wx, wz) => {
+    verts[vi++] = wx;
+    verts[vi++] = skirtY;
+    verts[vi++] = wz;
+    verts[vi++] = skirtR;
+    verts[vi++] = skirtG;
+    verts[vi++] = skirtB;
+    verts[vi++] = 0; verts[vi++] = -1; verts[vi++] = 0;
+    verts[vi++] = k / segs;
+    verts[vi++] = 1;
+  };
+  for (let k = 0; k < N; k++) writeSkirtBottom(k, originX + k * dStep, originZ);
+  for (let k = 0; k < N; k++) writeSkirtBottom(k, originX + k * dStep, originZ + chunkSize);
+  for (let k = 0; k < N; k++) writeSkirtBottom(k, originX, originZ + k * dStep);
+  for (let k = 0; k < N; k++) writeSkirtBottom(k, originX + chunkSize, originZ + k * dStep);
+  for (let edge = 0; edge < 4; edge++) {
+    for (let k = 0; k < segs; k++) {
+      let topA, topB;
+      if (edge === 0)      { topA = 0       * N + k; topB = 0       * N + (k + 1); }
+      else if (edge === 1) { topA = segs    * N + k; topB = segs    * N + (k + 1); }
+      else if (edge === 2) { topA = k       * N + 0; topB = (k + 1) * N + 0; }
+      else                 { topA = k       * N + segs; topB = (k + 1) * N + segs; }
+      const botA = skirtBottomBase + edge * N + k;
+      const botB = skirtBottomBase + edge * N + (k + 1);
+      indices[ii++] = topA; indices[ii++] = botA; indices[ii++] = botB;
+      indices[ii++] = topA; indices[ii++] = botB; indices[ii++] = topB;
+    }
+  }
+
+  // Upload to GPU. Per-chunk VBO + IBO so each chunk can be destroyed
+  // independently when it leaves the disc.
+  if (!Visual.device) return null;
+  const vertexBuffer = Visual.device.createBuffer({
+    label: "tiled-vb-" + tileX + "-" + tileZ + "-" + segs,
+    size: verts.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    mappedAtCreation: true
+  });
+  new Float32Array(vertexBuffer.getMappedRange()).set(verts);
+  vertexBuffer.unmap();
+  const indexBuffer = Visual.device.createBuffer({
+    label: "tiled-ib-" + tileX + "-" + tileZ + "-" + segs,
+    size: indices.byteLength,
+    usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+    mappedAtCreation: true
+  });
+  new Uint32Array(indexBuffer.getMappedRange()).set(indices);
+  indexBuffer.unmap();
+
+  return {
+    vertexBuffer,
+    indexBuffer,
+    indexCount: ii,
+    aabbMin: new Float32Array([originX,             Math.min(chunkMinY, skirtY), originZ]),
+    aabbMax: new Float32Array([originX + chunkSize, chunkMaxY,                    originZ + chunkSize]),
+    tileX,
+    tileZ,
+    lod: segs
+  };
+}
+
+/* Main streaming entry. Drops chunks that left the disc, builds new
+ * ones (within a per-frame time budget so tile-crossings don't
+ * stall), returns the full live chunk list for the encoder. */
+function _ensureTiledTerrainChunks(node) {
+  if (!Visual.device) return null;
+  if (!Visual.tiledChunkCache) Visual.tiledChunkCache = new Map();
+  let entry = Visual.tiledChunkCache.get(node.id);
+  if (!entry) {
+    entry = { chunks: new Map(), globalKey: null };
+    Visual.tiledChunkCache.set(node.id, entry);
+  }
+
+  // Global param change -> nuke every chunk (geometry is invalid).
+  const globalKey = _tiledTerrainGlobalCacheKey(node);
+  if (globalKey !== entry.globalKey) {
+    for (const c of entry.chunks.values()) {
+      try { c.vertexBuffer && c.vertexBuffer.destroy(); } catch (_) {}
+      try { c.indexBuffer  && c.indexBuffer.destroy();  } catch (_) {}
+    }
+    entry.chunks.clear();
+    entry.globalKey = globalKey;
+  }
+
+  const visible = _computeVisibleChunkSet(node);
+
+  // Drop chunks no longer in the visible set (camera moved away).
+  const keysToDrop = [];
+  for (const key of entry.chunks.keys()) {
+    if (!visible.has(key)) keysToDrop.push(key);
+  }
+  for (const key of keysToDrop) {
+    const c = entry.chunks.get(key);
+    try { c.vertexBuffer && c.vertexBuffer.destroy(); } catch (_) {}
+    try { c.indexBuffer  && c.indexBuffer.destroy();  } catch (_) {}
+    entry.chunks.delete(key);
+  }
+
+  // Build new chunks under a per-frame time budget so tile-crossings
+  // amortize across several frames instead of producing one big stall.
+  // 6ms cap leaves room for the rest of the render frame at 60fps.
+  const BUILD_BUDGET_MS = 6;
+  const buildStart = performance.now();
+  let built = 0;
+  for (const [key, info] of visible) {
+    if (entry.chunks.has(key)) continue;
+    const chunk = _buildSingleChunk(node, info);
+    if (chunk) entry.chunks.set(key, chunk);
+    built++;
+    if (performance.now() - buildStart > BUILD_BUDGET_MS) break;
+  }
+  if (built > 0 && !Visual._tiledStreamLogged) {
+    Visual._tiledStreamLogged = true;
+    console.log("[tiled] per-chunk streaming active: built " + built +
+                " chunks this frame, " + entry.chunks.size + " loaded total.");
+  }
+
+  // Aggregate AABB for the mesh-level outer frustum cull.
+  let aabbMin, aabbMax;
+  if (entry.chunks.size === 0) {
+    aabbMin = new Float32Array([0, 0, 0]);
+    aabbMax = new Float32Array([0, 0, 0]);
+  } else {
+    aabbMin = new Float32Array([Infinity, Infinity, Infinity]);
+    aabbMax = new Float32Array([-Infinity, -Infinity, -Infinity]);
+    for (const c of entry.chunks.values()) {
+      if (c.aabbMin[0] < aabbMin[0]) aabbMin[0] = c.aabbMin[0];
+      if (c.aabbMin[1] < aabbMin[1]) aabbMin[1] = c.aabbMin[1];
+      if (c.aabbMin[2] < aabbMin[2]) aabbMin[2] = c.aabbMin[2];
+      if (c.aabbMax[0] > aabbMax[0]) aabbMax[0] = c.aabbMax[0];
+      if (c.aabbMax[1] > aabbMax[1]) aabbMax[1] = c.aabbMax[1];
+      if (c.aabbMax[2] > aabbMax[2]) aabbMax[2] = c.aabbMax[2];
+    }
+  }
+
+  // Live chunk list (encoder iterates this for per-chunk draws).
+  const allChunks = [];
+  for (const c of entry.chunks.values()) allChunks.push(c);
+
+  // Minimap metadata: chunk world bounds + LOD per loaded chunk.
+  const center = _tiledTerrainCenterTile(node);
+  const p = node.params || {};
   node._tiledMinimap = {
     centerTile: center,
-    chunkSize,
-    radius,
-    chunks: minimapChunks
+    chunkSize: (typeof p.chunkSize === "number") ? p.chunkSize : 64,
+    radius:    (typeof p.chunkRadius === "number") ? p.chunkRadius : 8,
+    chunks: allChunks.map(function (c) {
+      return {
+        tileX: c.tileX, tileZ: c.tileZ, lod: c.lod,
+        x0: c.aabbMin[0], z0: c.aabbMin[2],
+        x1: c.aabbMax[0], z1: c.aabbMax[2]
+      };
+    })
   };
 
-  // Trim the typed arrays to actual used size so VBO/IBO uploads
-  // don't include trailing zero-padding (would draw degenerate
-  // triangles at origin if indexed; doesn't matter for verts since
-  // we never index past `vi`).
-  const usedVerts   = verts.subarray(0, vi);
-  const usedIndices = indices.subarray(0, ii);
-  return { verts: usedVerts, indices: usedIndices, chunks: chunkDraws };
+  return {
+    tiledChunks: allChunks,
+    vertexBuffer: null,         // dummy -- encoder branches on tiledChunks
+    indexBuffer: null,
+    vertexCount: 0,
+    indexCount: 0,
+    aabbMin,
+    aabbMax,
+    cacheKey: "tiled"
+  };
 }
 
 /* Torus -- (majorSlices+1)*(minorSlices+1) verts. Standard parametric
@@ -53655,7 +53782,11 @@ function _encodeScenePass(enc, entry) {
     const m = meshes[i];
     const slot = inst.slots[i];
     const buf = _ensureMeshBuffers(m);
-    if (!buf || !buf.vertexBuffer) continue;
+    // §5.5.e-6 -- TiledTerrain returns buf.tiledChunks (per-chunk
+    // VBOs) instead of a single buf.vertexBuffer. Both shapes are
+    // valid; skip only if neither is present.
+    if (!buf) continue;
+    if (!buf.vertexBuffer && !(buf.tiledChunks && buf.tiledChunks.length)) continue;
     // 5.10 -- frustum cull. Skip mesh draws entirely outside the
     // camera frustum. Tested in world space via 8-corner-transform
     // of the cached local AABB. Diagnostic count logged once per
@@ -53828,33 +53959,35 @@ function _encodeScenePass(enc, entry) {
     // Scene → composition chains (Scene → CRT, Scene → Blur, etc.).
     const bg = (entry.readKey === "b") ? slot.bindGroupB : slot.bindGroupA;
     pass.setBindGroup(0, bg);
-    pass.setVertexBuffer(0, buf.vertexBuffer);
-    if (buf.indexBuffer) {
-      pass.setIndexBuffer(buf.indexBuffer, "uint32");
-      // §5.5.e-2 -- TiledTerrain emits per-chunk draw ranges. We
-      // frustum-cull each chunk and issue one drawIndexed per
-      // visible chunk; off-frustum chunks are skipped. AABBs are
-      // already in world space (TiledTerrain bakes world XYZ into
-      // the verts) so we transform through m.transform too in case
-      // the user wired a Translate / Rotate downstream.
-      if (buf.chunks && cullEnable && camera.frustumPlanes) {
-        let chunkCulled = 0;
-        for (let ck = 0; ck < buf.chunks.length; ck++) {
-          const c = buf.chunks[ck];
+    // §5.5.e-6 -- per-chunk VBO/IBO draw for TiledTerrain streaming.
+    // Each chunk has its OWN vertex + index buffer (so chunks can
+    // be destroyed independently when they leave the visible disc).
+    // Frustum-cull per chunk, then bind chunk's buffers + draw.
+    if (buf.tiledChunks) {
+      let chunkCulled = 0;
+      for (let ck = 0; ck < buf.tiledChunks.length; ck++) {
+        const c = buf.tiledChunks[ck];
+        if (cullEnable && camera.frustumPlanes) {
           _transformAABB(c.aabbMin, c.aabbMax, m.transform,
                          _aabbMinScratch, _aabbMaxScratch);
           if (!_aabbInsideFrustum(camera.frustumPlanes, _aabbMinScratch, _aabbMaxScratch)) {
             chunkCulled++;
             continue;
           }
-          pass.drawIndexed(c.indexCount, 1, c.baseIndex, 0);
         }
-        culledCount += chunkCulled;
-      } else {
-        pass.drawIndexed(buf.indexCount);
+        pass.setVertexBuffer(0, c.vertexBuffer);
+        pass.setIndexBuffer(c.indexBuffer, "uint32");
+        pass.drawIndexed(c.indexCount);
       }
+      culledCount += chunkCulled;
     } else {
-      pass.draw(buf.vertexCount);
+      pass.setVertexBuffer(0, buf.vertexBuffer);
+      if (buf.indexBuffer) {
+        pass.setIndexBuffer(buf.indexBuffer, "uint32");
+        pass.drawIndexed(buf.indexCount);
+      } else {
+        pass.draw(buf.vertexCount);
+      }
     }
     if (!_SCENE_DIAG.draw) {
       _SCENE_DIAG.draw = true;
@@ -63235,6 +63368,7 @@ function openTilingConfigPopup(nodeId) {
   body.appendChild(makeRow("gain",          "gain",        "number", { step: 0.05 }).row);
   body.appendChild(makeRow("ridges (0..1)", "ridges",      "number", { step: 0.05, min: 0, max: 1 }).row);
   body.appendChild(makeRow("plateau (0..1)", "plateau",    "number", { step: 0.05, min: 0, max: 1 }).row);
+  body.appendChild(makeRow("forward bias",   "forwardBias","number", { step: 0.05, min: 0, max: 1 }).row);
 
   // Footer with revert + done buttons.
   const foot = document.createElement("div");
