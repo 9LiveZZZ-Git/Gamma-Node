@@ -10849,17 +10849,24 @@ public:
       { n: "ridges",      t: "param" },
       { n: "plateau",     t: "param" },
       { n: "forwardBias", t: "param" },
-      // §5.5.e-8 -- built-in erosion. Baked into the chunk mesh at
-      // build time so there's no per-frame cost; the streaming budget
-      // absorbs the extra fBm calls into the same 3-second first-load.
-      // Wired directly here (not via a separate TerrainErosion node)
-      // because erosion is a property of the terrain, not a chain.
+      // §5.5.e-8 -- built-in erosion. Baked at chunk build time.
       { n: "erosionThermal",    t: "param" },
       { n: "erosionHydraulic",  t: "param" },
       { n: "erosionTalus",      t: "param" },
       { n: "erosionIterations", t: "param" },
       { n: "erosionRadius",     t: "param" },
-      { n: "erosionStrength",   t: "param" }
+      { n: "erosionStrength",   t: "param" },
+      // §5.5.e-10 -- island mode. Applies a radial falloff around
+      // (islandCenterX, islandCenterZ) so the terrain heights ramp
+      // down to a sea-floor depth outside `islandRadius`. Needed
+      // before water makes sense -- otherwise the player can walk
+      // out infinitely. Off by default (islandMode=0).
+      { n: "islandMode",      t: "param" },
+      { n: "islandCenterX",   t: "param" },
+      { n: "islandCenterZ",   t: "param" },
+      { n: "islandRadius",    t: "param" },
+      { n: "islandFalloff",   t: "param" },
+      { n: "islandSinkDepth", t: "param" }
     ],
     outs: [{ n: "mesh", t: "mesh" }],
     params: {
@@ -10886,6 +10893,13 @@ public:
       erosionIterations: 4,
       erosionRadius:     80,
       erosionStrength:   0.0,
+      // §5.5.e-10 island mode. Off by default; demos opt in.
+      islandMode:      0,
+      islandCenterX:   0,
+      islandCenterZ:   0,
+      islandRadius:    2500,  // meters
+      islandFalloff:   2.0,   // power-curve exponent (1 = linear, 2 = quadratic, 4 = steep cliff edge)
+      islandSinkDepth: 4000,  // meters BELOW the normal valley floor at island edge
       // Tiling-config-popup-only knobs (hidden from the default port row).
       anchorMode:  "auto",       // "auto" follows first FPCamera; "manual" uses centerX/Z
       centerX:     0,
@@ -32208,6 +32222,16 @@ const _demos = [
         erosionIterations: 4,
         erosionRadius:     80,
         erosionStrength:   0.6,
+        // §5.5.e-10 -- island mode. Bounds the terrain in a 3.5km
+        // radius around the player spawn, with a 4000m sink depth
+        // at the edge -- sets up the ocean trench for the upcoming
+        // Water node. Power-2 falloff = quadratic slope to the edge.
+        islandMode:      1,
+        islandCenterX:   0,
+        islandCenterZ:   0,
+        islandRadius:    3500,
+        islandFalloff:   2.0,
+        islandSinkDepth: 4000,
         anchorMode:  "auto"
       });
       // TerrainMaterial: auto-detects upstream TiledTerrain and
@@ -45748,7 +45772,8 @@ function _fpcSampleGroundY(wx, wz) {
     gain:       (typeof p.gain       === "number") ? p.gain       : 0.5,
     ridges:     (typeof p.ridges     === "number") ? p.ridges     : 0.0,
     plateau:    (typeof p.plateau    === "number") ? p.plateau    : 0.0,
-    erosionParams: _findTiledErosionParams(tt)
+    erosionParams: _findTiledErosionParams(tt),
+    islandParams:  _findTiledIslandParams(tt)
   };
   const hs   = (typeof p.heightScale === "number") ? p.heightScale : 80;
   const yOff = (typeof p.yOffset === "number")     ? p.yOffset     : 0;
@@ -45773,7 +45798,9 @@ function _fpcSampleGroundY(wx, wz) {
   const gz = Math.floor(wz / dStep) * dStep;
   const fx = Math.max(0, Math.min(1, (wx - gx) / dStep));
   const fz = Math.max(0, Math.min(1, (wz - gz) / dStep));
-  const sampleAt = (x, z) => (_tiledTerrainHeightAt(x, z, noise) - 1) * hs + yOff;
+  const sampleAt = (x, z) =>
+    (_tiledTerrainHeightAt(x, z, noise) - 1) * hs + yOff
+    + _tiledIslandYShift(x, z, noise);
   const y00 = sampleAt(gx,         gz        );
   const y10 = sampleAt(gx + dStep, gz        );
   const y01 = sampleAt(gx,         gz + dStep);
@@ -53115,16 +53142,47 @@ function _tiledTerrainCenterTile(node) {
  * The "frequency" param at this layer is cycles-per-world-unit (not
  * cycles-per-chunk). At freq=0.02 the noise wraps once every 50 units
  * which matches typical open-world rolling-terrain feature scale. */
-/* Base height field: pure fBm + plateau remap. Does NOT apply
- * erosion -- erosion's neighbor sampling must hit the pre-erosion
- * field to avoid recursion. This is the "ground truth" noise the
- * mesh builder and the erosion kernel both read from. */
+/* §5.5.e-10 -- island-mode falloff (radial), shared between the
+ * height-amplitude squish and the Y-shift sink. Returns falloff in
+ * [0, 1]: 1 = full terrain at island center, 0 = ocean floor at
+ * edge. Power curve = sharper cliffs at higher exponents. */
+function _tiledIslandFalloff(wx, wz, ip) {
+  if (!ip) return 1;
+  const dx = wx - ip.cx;
+  const dz = wz - ip.cz;
+  const dist = Math.sqrt(dx * dx + dz * dz);
+  const t = (ip.radius > 0) ? (dist / ip.radius) : 0;
+  if (t >= 1) return 0;
+  return Math.pow(1 - t, ip.power);
+}
+
+/* Island Y-shift: how far BELOW yOff to sink the terrain at this
+ * world XZ when island mode is active. 0 at center, -sinkDepth at
+ * the edge. Applied as an additive shift in the height-to-Y mapping
+ * (separately from the height-amplitude squish in _tiledBaseHeight)
+ * so the ocean floor sits well below sea level. */
+function _tiledIslandYShift(wx, wz, noise) {
+  if (!noise || !noise.islandParams) return 0;
+  const ip = noise.islandParams;
+  const f = _tiledIslandFalloff(wx, wz, ip);
+  return -ip.sinkDepth * (1 - f);
+}
+
+/* Base height field: pure fBm + plateau remap + (optional) island
+ * radial squish. Does NOT apply erosion -- erosion's neighbor
+ * sampling must hit the pre-erosion field to avoid recursion. */
 function _tiledBaseHeight(wx, wz, noise) {
   let h = _terrainFBM(wx, wz, noise);
   const p = (noise && typeof noise.plateau === "number") ? noise.plateau : 0;
   if (p > 0) {
     const k = 1 + Math.max(0, Math.min(1, p)) * 4;
     h = Math.pow(Math.max(0, Math.min(1, h)), k);
+  }
+  // Island mode: shrink peak amplitude toward the edge so the
+  // island silhouette tapers off naturally. The full sea-floor
+  // sink is applied as an additive Y-shift in the caller.
+  if (noise && noise.islandParams) {
+    h = h * _tiledIslandFalloff(wx, wz, noise.islandParams);
   }
   return h;
 }
@@ -53183,6 +53241,23 @@ function _tiledTerrainHeightAt(wx, wz, noise) {
     h = _tiledApplyErosionJS(h, wx, wz, noise);
   }
   return h;
+}
+
+/* §5.5.e-10 -- read island-mode params off the TiledTerrain node.
+ * Returns null when islandMode is off so the no-island path stays
+ * a zero-overhead branch in _tiledBaseHeight + the Y mapping. */
+function _findTiledIslandParams(ttNode) {
+  const p = ttNode && ttNode.params;
+  if (!p) return null;
+  const mode = (typeof p.islandMode === "number") ? p.islandMode : 0;
+  if (mode < 0.5) return null;
+  return {
+    cx:        (typeof p.islandCenterX   === "number") ? p.islandCenterX   : 0,
+    cz:        (typeof p.islandCenterZ   === "number") ? p.islandCenterZ   : 0,
+    radius:    (typeof p.islandRadius    === "number") ? p.islandRadius    : 2500,
+    power:     (typeof p.islandFalloff   === "number") ? p.islandFalloff   : 2.0,
+    sinkDepth: (typeof p.islandSinkDepth === "number") ? p.islandSinkDepth : 4000
+  };
 }
 
 /* Read built-in erosion params off the TiledTerrain node itself.
@@ -53248,17 +53323,18 @@ function _tiledTerrainLodSegments(dxAbs, dzAbs, radius, baseSegs) {
 
 function _tiledTerrainGlobalCacheKey(node) {
   const p = node.params || {};
-  // §5.5.e-8 -- erosion params come from a wired TerrainErosion. Pull
-  // them into the cache key so toggling/editing the upstream erosion
-  // rebuilds chunks.
   const ep = _findTiledErosionParams(node);
   const epKey = ep
     ? ("e:" + [ep.thermal, ep.hydraulic, ep.talus, ep.iterations, ep.radius, ep.strength].join(","))
     : "e0";
+  const ip = _findTiledIslandParams(node);
+  const ipKey = ip
+    ? ("i:" + [ip.cx, ip.cz, ip.radius, ip.power, ip.sinkDepth].join(","))
+    : "i0";
   return [
     p.chunkSize, p.chunkRadius, p.segments, p.heightScale, p.yOffset,
     p.seed, p.frequency, p.octaves, p.lacunarity, p.gain, p.ridges,
-    p.plateau, epKey
+    p.plateau, epKey, ipKey
   ].join(",");
 }
 
@@ -53301,9 +53377,8 @@ function _buildSingleChunk(node, info) {
     gain:       (typeof p.gain       === "number") ? p.gain       : 0.5,
     ridges:     (typeof p.ridges     === "number") ? p.ridges     : 0.5,
     plateau:    (typeof p.plateau    === "number") ? p.plateau    : 0.0,
-    // §5.5.e-8 -- pull erosion params off the wired TerrainErosion
-    // node (if any). null when unwired -> erosion JS is skipped.
-    erosionParams: _findTiledErosionParams(node)
+    erosionParams: _findTiledErosionParams(node),
+    islandParams:  _findTiledIslandParams(node)
   };
   const skirtY = yOff - hs * 3;
 
@@ -53329,7 +53404,10 @@ function _buildSingleChunk(node, info) {
     for (let i = 0; i < N; i++) {
       const wx = originX + i * dStep;
       const wz = originZ + j * dStep;
-      const y = (_tiledTerrainHeightAt(wx, wz, noise) - 1) * hs + yOff;
+      // §5.5.e-10 -- island Y-shift (additive sink below sea level
+      // at the island edge). 0 when island mode is off.
+      const y = (_tiledTerrainHeightAt(wx, wz, noise) - 1) * hs + yOff
+              + _tiledIslandYShift(wx, wz, noise);
       heights[j * N + i] = y;
       if (y < chunkMinY) chunkMinY = y;
       if (y > chunkMaxY) chunkMaxY = y;
@@ -53346,10 +53424,15 @@ function _buildSingleChunk(node, info) {
       // matches across chunk boundaries (the underlying fBm field
       // is continuous; LOD seams only affect mesh-level vertex
       // placement, not the world-space gradient).
-      const yL = (i > 0)    ? heights[j * N + (i - 1)] : (_tiledTerrainHeightAt(wx - dStep, wz, noise) - 1) * hs + yOff;
-      const yR = (i < segs) ? heights[j * N + (i + 1)] : (_tiledTerrainHeightAt(wx + dStep, wz, noise) - 1) * hs + yOff;
-      const yD = (j > 0)    ? heights[(j - 1) * N + i] : (_tiledTerrainHeightAt(wx, wz - dStep, noise) - 1) * hs + yOff;
-      const yU = (j < segs) ? heights[(j + 1) * N + i] : (_tiledTerrainHeightAt(wx, wz + dStep, noise) - 1) * hs + yOff;
+      // §5.5.e-10 -- edge-sample heights need the same island Y-shift
+      // applied or normals at chunk borders kink in island mode.
+      const sampleY = (sx, sz) =>
+        (_tiledTerrainHeightAt(sx, sz, noise) - 1) * hs + yOff
+        + _tiledIslandYShift(sx, sz, noise);
+      const yL = (i > 0)    ? heights[j * N + (i - 1)] : sampleY(wx - dStep, wz);
+      const yR = (i < segs) ? heights[j * N + (i + 1)] : sampleY(wx + dStep, wz);
+      const yD = (j > 0)    ? heights[(j - 1) * N + i] : sampleY(wx,         wz - dStep);
+      const yU = (j < segs) ? heights[(j + 1) * N + i] : sampleY(wx,         wz + dStep);
       const dydx = (yR - yL) / (2 * dStep);
       const dydz = (yU - yD) / (2 * dStep);
       let nx = -dydx, ny = 1, nz = -dydz;
@@ -53509,17 +53592,30 @@ function _ensureTiledTerrainChunks(node) {
     entry.chunks.delete(key);
   }
 
-  // Build new chunks under a per-frame time budget so tile-crossings
-  // amortize across several frames instead of producing one big stall.
-  // 10ms cap clears backlog faster (player still gets ~50fps even on
-  // worst-case frames; transient builds are usually <2 chunks anyway).
-  const BUILD_BUDGET_MS = 10;
-  const buildStart = performance.now();
-  let built = 0;
+  // §5.5.e-9 -- sort visible chunks by Chebyshev ring distance from
+  // the disc center BEFORE building, so chunks NEAREST the player
+  // build first. Without this, the Map iteration order is corner-
+  // first (-radius corner onward) which fills the FAR edge of the
+  // disc before the player's nearby chunks -- that's what produced
+  // the "temporary sinkholes" effect during streaming. Closest-first
+  // keeps the gap under the player closed at all times.
+  const center  = _tiledTerrainCenterTile(node);
+  const pending = [];
   for (const [key, info] of visible) {
     if (entry.chunks.has(key)) continue;
-    const chunk = _buildSingleChunk(node, info);
-    if (chunk) entry.chunks.set(key, chunk);
+    const ring = Math.max(Math.abs(info.tileX - center.tx),
+                          Math.abs(info.tileZ - center.tz));
+    pending.push({ key, info, ring });
+  }
+  pending.sort((a, b) => a.ring - b.ring);
+  // Budget bumped 10ms -> 16ms (worst-case frame still ~45fps) so a
+  // tile-crossing's batch of new chunks usually finishes in 1 frame.
+  const BUILD_BUDGET_MS = 16;
+  const buildStart = performance.now();
+  let built = 0;
+  for (let i = 0; i < pending.length; i++) {
+    const chunk = _buildSingleChunk(node, pending[i].info);
+    if (chunk) entry.chunks.set(pending[i].key, chunk);
     built++;
     if (performance.now() - buildStart > BUILD_BUDGET_MS) break;
   }
@@ -53552,7 +53648,7 @@ function _ensureTiledTerrainChunks(node) {
   for (const c of entry.chunks.values()) allChunks.push(c);
 
   // Minimap metadata: chunk world bounds + LOD per loaded chunk.
-  const center = _tiledTerrainCenterTile(node);
+  // Reuses `center` computed earlier for the build-order sort.
   const p = node.params || {};
   node._tiledMinimap = {
     centerTile: center,
@@ -63703,6 +63799,18 @@ function openTilingConfigPopup(nodeId) {
   body.appendChild(makeRow("ridges (0..1)", "ridges",      "number", { step: 0.05, min: 0, max: 1 }).row);
   body.appendChild(makeRow("plateau (0..1)", "plateau",    "number", { step: 0.05, min: 0, max: 1 }).row);
   body.appendChild(makeRow("forward bias",   "forwardBias","number", { step: 0.05, min: 0, max: 1 }).row);
+
+  // Section: island mode.
+  const secIsland = document.createElement("div");
+  secIsland.style.cssText = "margin-top:14px;font-size:10px;color:var(--text-3);text-transform:uppercase;letter-spacing:0.15em;";
+  secIsland.textContent = "island mode";
+  body.appendChild(secIsland);
+  body.appendChild(makeRow("island mode (0/1)", "islandMode",      "number", { step: 1, min: 0, max: 1 }).row);
+  body.appendChild(makeRow("center X",          "islandCenterX",   "number", { step: 50 }).row);
+  body.appendChild(makeRow("center Z",          "islandCenterZ",   "number", { step: 50 }).row);
+  body.appendChild(makeRow("radius (m)",        "islandRadius",    "number", { step: 50, min: 1 }).row);
+  body.appendChild(makeRow("falloff exponent",  "islandFalloff",   "number", { step: 0.1, min: 0.5 }).row);
+  body.appendChild(makeRow("sink depth (m)",    "islandSinkDepth", "number", { step: 100, min: 0 }).row);
 
   // Section: erosion (baked into chunks at build time).
   const secErosion = document.createElement("div");
