@@ -51958,11 +51958,14 @@ function _buildTerrain(node) {
   const customSize = (typeof p.worldSize === "number") ? p.worldSize : 100;
   const w = (mode === "custom") ? customSize : (sizePresets[mode] || customSize);
   const dd = w;                                         // square terrain for now
-  // Scale vertical gain proportionally to the size preset so the
-  // height-to-width ratio stays constant across small/med/large/inf.
-  // Reference = medium (100u). Custom honors the literal heightScale.
+  // Scale vertical gain proportionally to world size so the
+  // height-to-width ratio stays constant across ALL modes
+  // including custom. Reference = medium (100u) where the literal
+  // heightScale is applied; any other world size scales the
+  // vertical gain by (w / 100) so a person walking a worldSize=1000
+  // landscape sees peaks 10x taller than a worldSize=100 landscape.
   const hsRaw = (typeof p.heightScale === "number") ? p.heightScale : 12;
-  const hsScale = (mode === "custom") ? 1 : (w / 100);
+  const hsScale = w / 100;
   const hs = hsRaw * hsScale;
   // yOffset: peaks land at Y = 0 + yOffset by default, valleys at
   // Y = -hs + yOffset. Default 0 (peaks at horizon) so the terrain
@@ -52684,27 +52687,54 @@ function _encodeScenePass(enc, entry) {
     // materials don't touch [24..39] -- the GPU just reads from
     // its own slots and ignores the rest of the uniform.
     if (matType === "terrain") {
+      // Auto-scale Y-dependent material params by the upstream
+      // Terrain's effective heightScale, so altitude bands stay
+      // proportional when the user changes sizeMode (small / medium
+      // / large / infinite / custom). Default heightScale = 12 at
+      // worldSize = 100 (medium) matches the alt defaults (-8/-4/-1).
+      // For any other (heightScale × worldSize/100) pair, scale alts,
+      // edgeJitter, and softness by the ratio so a "large" landscape
+      // sees the snow line at Y=-10 instead of where the whole
+      // terrain sits. Inverse-scale detail / micro noise frequencies
+      // so a person walking the larger world sees roughly the same
+      // visual texture density per step. If the mesh source isn't
+      // a Terrain node (rare -- material on a Sphere, etc.), bandScale
+      // stays at 1 and behavior matches v0.3.131.
+      let bandScale = 1;
+      let xzScale   = 1;
+      if (m.node && m.node.type === "Terrain") {
+        const ttp = m.node.params || {};
+        const sizePresetsM = { small: 20, medium: 100, large: 1000, infinite: 10000 };
+        const tMode = (typeof ttp.sizeMode === "string") ? ttp.sizeMode : "medium";
+        const tCustomSize = (typeof ttp.worldSize === "number") ? ttp.worldSize : 100;
+        const tWS = (tMode === "custom") ? tCustomSize : (sizePresetsM[tMode] || tCustomSize);
+        const tHsRaw = (typeof ttp.heightScale === "number") ? ttp.heightScale : 12;
+        const tEffectiveHs = tHsRaw * (tWS / 100);
+        bandScale = tEffectiveHs / 12;        // default 1
+        xzScale   = 100 / Math.max(1, tWS);   // default 1 at medium; <1 at larger
+      }
       inst.drawScratch[20] = mp.shininess;
       inst.drawScratch[21] = mp.ambient;
       inst.drawScratch[22] = mp.slopeRockiness;
       inst.drawScratch[23] = mp.vertexMix;
       // band1 = sand
-      inst.drawScratch[24] = mp.color1R; inst.drawScratch[25] = mp.color1G; inst.drawScratch[26] = mp.color1B; inst.drawScratch[27] = mp.alt1;
+      inst.drawScratch[24] = mp.color1R; inst.drawScratch[25] = mp.color1G; inst.drawScratch[26] = mp.color1B; inst.drawScratch[27] = mp.alt1 * bandScale;
       // band2 = grass
-      inst.drawScratch[28] = mp.color2R; inst.drawScratch[29] = mp.color2G; inst.drawScratch[30] = mp.color2B; inst.drawScratch[31] = mp.alt2;
+      inst.drawScratch[28] = mp.color2R; inst.drawScratch[29] = mp.color2G; inst.drawScratch[30] = mp.color2B; inst.drawScratch[31] = mp.alt2 * bandScale;
       // band3 = rock
-      inst.drawScratch[32] = mp.color3R; inst.drawScratch[33] = mp.color3G; inst.drawScratch[34] = mp.color3B; inst.drawScratch[35] = mp.alt3;
-      // band4 = snow + softness
-      inst.drawScratch[36] = mp.color4R; inst.drawScratch[37] = mp.color4G; inst.drawScratch[38] = mp.color4B; inst.drawScratch[39] = mp.softness;
-      // v0.3.129 v2 detail/bump/snow-mask params at [44..51].
-      // (vsParams sits at [40..43]; we leave it as already-packed
-      // above so terrain-displaced Terrain still gets its vs uniforms.)
+      inst.drawScratch[32] = mp.color3R; inst.drawScratch[33] = mp.color3G; inst.drawScratch[34] = mp.color3B; inst.drawScratch[35] = mp.alt3 * bandScale;
+      // band4 = snow + softness (smoothstep width in Y units -> scales).
+      inst.drawScratch[36] = mp.color4R; inst.drawScratch[37] = mp.color4G; inst.drawScratch[38] = mp.color4B; inst.drawScratch[39] = mp.softness * bandScale;
       // detailParams (vec4) at [44..47]; bumpParams (vec4) at [48..51].
-      inst.drawScratch[44] = mp.detailScale;
+      // Noise frequencies (detailScale / microScale) are cycles per
+      // world unit -- inverse-scale so larger worlds get coarser
+      // noise per step. Strengths + bump are dimensionless, pass-through.
+      // edgeJitter is in Y world units, so it scales like alt.
+      inst.drawScratch[44] = mp.detailScale * xzScale;
       inst.drawScratch[45] = mp.detailStrength;
-      inst.drawScratch[46] = mp.microScale;
+      inst.drawScratch[46] = mp.microScale * xzScale;
       inst.drawScratch[47] = mp.microStrength;
-      inst.drawScratch[48] = mp.edgeJitter;
+      inst.drawScratch[48] = mp.edgeJitter * bandScale;
       inst.drawScratch[49] = mp.bumpStrength;
       inst.drawScratch[50] = mp.snowMaskAmount;
       inst.drawScratch[51] = 0;
@@ -52737,10 +52767,11 @@ function _encodeScenePass(enc, entry) {
       const mode = (typeof tp.sizeMode === "string") ? tp.sizeMode : "medium";
       const customSize = (typeof tp.worldSize === "number") ? tp.worldSize : 100;
       const ws = (mode === "custom") ? customSize : (sizePresets[mode] || customSize);
-      // Match _buildTerrain: scale vertical gain by preset ratio so
-      // the GPU-displaced path stays in sync with the CPU path.
+      // Match _buildTerrain: scale vertical gain by world size so
+      // the GPU-displaced path stays in sync with the CPU path
+      // (always-on ratio, including custom mode).
       const hsRawT = (typeof tp.heightScale === "number") ? tp.heightScale : 12;
-      const hsScaleT = (mode === "custom") ? 1 : (ws / 100);
+      const hsScaleT = ws / 100;
       const hsT = hsRawT * hsScaleT;
       let hmLayer = 0;
       const planMap = Visual._currentRenderPlan;
