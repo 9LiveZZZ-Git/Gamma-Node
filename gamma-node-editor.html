@@ -10950,7 +10950,14 @@ public:
       { n: "fresnelStrength",  t: "param" },
       { n: "skyR",             t: "param" },
       { n: "skyG",             t: "param" },
-      { n: "skyB",             t: "param" }
+      { n: "skyB",             t: "param" },
+      // §5.5.h-3 -- shore + wave-shore-interaction knobs.
+      { n: "foamWidth",        t: "param" },
+      { n: "shallowDepth",     t: "param" },
+      { n: "waveShoreFreq",    t: "param" },
+      { n: "foamR",            t: "param" },
+      { n: "foamG",            t: "param" },
+      { n: "foamB",            t: "param" }
     ],
     outs: [{ n: "mesh", t: "mesh" }],
     params: {
@@ -10962,10 +10969,15 @@ public:
       fresnelStrength: 1.0,
       // Sky color for the Fresnel reflection. Soft hazy blue by
       // default; future: read from wired Environment.
-      skyR:            0.62, skyG: 0.78, skyB: 0.92
+      skyR:            0.62, skyG: 0.78, skyB: 0.92,
+      // §5.5.h-3 shore + wave-shore interaction.
+      foamWidth:       6,        // meters of water depth where foam fades out
+      shallowDepth:    40,       // meters depth where shallow-shore color blend fades
+      waveShoreFreq:   0.018,    // moving wave-crest spatial frequency (cycles/m of depth)
+      foamR:           0.96, foamG: 0.97, foamB: 1.00
     },
     methods: {},
-    description: "Phase 7 §5.5.h water surface. Emits a 100km × 100km plane mesh at Y=seaLevel with a baked water material -- Scene auto-applies the fs_water fragment shader when the mesh's source node is `Water`. Effects: animated wave normals (time-shifted fBm UV sample → perturbed normal each fragment); Fresnel sky-color reflection (Schlick power 5); transparent-feeling water color underneath. waveFreq is cycles per world unit (default 0.012 ≈ ~80m wavelength). waveSpeed scales wave-time advance (0.6 ≈ leisurely). waveAmp scales the normal perturbation magnitude. Defaults give a calm sea look. Wire `mesh` into a Scene mesh slot like any other mesh. Phase 2 (next push) will add SSR ray-march reflections."
+    description: "Phase 7 §5.5.h water surface. Emits a 100km × 100km plane mesh at Y=seaLevel with a baked water material -- Scene auto-applies the fs_water fragment shader when the mesh's source node is `Water`. Effects: animated wave normals (time-shifted fBm UV sample → perturbed normal each fragment); Fresnel sky-color reflection (Schlick power 5); shore detection by sampling the patch's TiledTerrain noise in-shader → shallow-water tint + foam band + moving wave-crests that sweep toward the coastline. waveFreq is cycles per world unit (default 0.012 ≈ ~80m wavelength). foamWidth (m) controls how far from the shoreline foam fades out; shallowDepth (m) is the shallow-color blend range. waveShoreFreq controls the spacing of moving wave-crest lines near the coast. Wire `mesh` into a Scene mesh slot like any other mesh. Phase 2 (SSR ray-march reflection) ships next."
   },
 
   /* =========================================================================
@@ -51785,34 +51797,118 @@ fn fs_phong(in: VsOut) -> @location(0) vec4<f32> {
   return vec4<f32>(tonemap_aces(fogged), 1.0);
 }
 
-// Phase 7 §5.5.h -- fs_water. Animated wave normals from time-
-// shifted fBm UV sample (two octaves layered for choppy +
-// gentle-swell mix). Fresnel-weighted blend between water color
-// (looking down) and sky color (grazing) via Schlick. Time is
-// packed into uD.band1.w by the encoder so the shader stays in
-// the per-draw uniform without needing a separate time field on
-// PerScene. Phase 2 will add SSR ray-march using the Scene's
-// depth + color attachments.
+// Phase 7 §5.5.h-3 -- terrain noise helpers ported from JS so the
+// water shader can sample the terrain height directly at each
+// fragment's world XZ. This is the source-of-truth for shore
+// detection: depth = waterY - terrainY. Matches _terrainHash /
+// _terrainValueNoise / _terrainFBM / _tiledBaseHeight / island
+// LERP in gamma-node-editor.html exactly so the shore band lines
+// up pixel-perfect with the rendered mesh edge.
+fn _t_hash(p: vec2<f32>, seed: f32) -> f32 {
+  let hx = p.x * 127.1 + p.y * 311.7;
+  let hy = p.x * 269.5 + p.y * 183.3;
+  return fract(sin(hx + hy + seed) * 43758.5453);
+}
+fn _t_valueNoise(p: vec2<f32>, seed: f32) -> f32 {
+  let i = floor(p);
+  let f = p - i;
+  let a = _t_hash(i,                               seed);
+  let b = _t_hash(i + vec2<f32>(1.0, 0.0),         seed);
+  let c = _t_hash(i + vec2<f32>(0.0, 1.0),         seed);
+  let d = _t_hash(i + vec2<f32>(1.0, 1.0),         seed);
+  let s = f * f * (3.0 - 2.0 * f);
+  return mix(mix(a, b, s.x), mix(c, d, s.x), s.y);
+}
+fn _t_fbm(wx: f32, wz: f32, freq: f32, octaves: i32, lac: f32, gain: f32, ridges: f32, seed: f32) -> f32 {
+  var p = vec2<f32>(wx, wz) * max(0.001, freq);
+  var amp: f32 = 1.0;
+  var sum: f32 = 0.0;
+  var maxAmp: f32 = 0.0;
+  let r = clamp(ridges, 0.0, 1.0);
+  let octs = max(1, min(8, octaves));
+  for (var i: i32 = 0; i < octs; i = i + 1) {
+    var s = _t_valueNoise(p, seed);
+    let ridge = 1.0 - abs(2.0 * s - 1.0);
+    s = s * (1.0 - r) + ridge * ridge * r;
+    sum = sum + s * amp;
+    maxAmp = maxAmp + amp;
+    p = p * lac;
+    amp = amp * gain;
+  }
+  return clamp(sum / max(1e-6, maxAmp), 0.0, 1.0);
+}
+fn _t_baseHeight(wx: f32, wz: f32, freq: f32, octs: i32, lac: f32, gain: f32, ridges: f32, seed: f32, plateau: f32) -> f32 {
+  var h = _t_fbm(wx, wz, freq, octs, lac, gain, ridges, seed);
+  if (plateau > 0.001) {
+    let k = 1.0 + clamp(plateau, 0.0, 1.0) * 4.0;
+    h = pow(clamp(h, 0.0, 1.0), k);
+  }
+  return h;
+}
+fn _t_islandLand(wx: f32, wz: f32, maskFreq: f32, maskSeed: f32, threshold: f32, softness: f32) -> f32 {
+  let m = _t_valueNoise(vec2<f32>(wx, wz) * maskFreq, maskSeed);
+  let lo = threshold - softness;
+  let hi = threshold + softness;
+  let u = clamp((m - lo) / max(1e-6, hi - lo), 0.0, 1.0);
+  return u * u * (3.0 - 2.0 * u);
+}
+
+// Phase 7 §5.5.h -- fs_water. Animated wave normals + Fresnel sky
+// mix + shore detect from terrain sampling. Per-draw layout:
+//   baseColor.rgb = water color, baseColor.a = fresnelStrength
+//   matParams    = (seaLevel, waveFreq, waveSpeed, waveAmp)
+//   band1.rgba   = (skyR, skyG, skyB, time)
+//   band2.rgba   = (noiseSeed, noiseFreq, noiseOctaves, plateau)
+//   band3.rgba   = (lacunarity, gain, ridges, heightScale)
+//   band4.rgba   = (yOffset, sinkDepth, archipelagoFlag, islandMaskFreq)
+//   vsParams     = (islandMaskSeed, threshold, softness, foamWidth)
+//   detailParams = (shallowDepth, waveShoreFreq, foamR, foamG)
+//   bumpParams   = (foamB, _, _, _)
 @fragment
 fn fs_water(in: VsOut) -> @location(0) vec4<f32> {
   let waterColor = uD.baseColor.rgb;
   let fresnelStr = max(0.0, uD.baseColor.a);
+  let seaLevel   = uD.matParams.x;
   let waveFreq   = max(0.00001, uD.matParams.y);
   let waveSpeed  = uD.matParams.z;
   let waveAmp    = max(0.0, uD.matParams.w);
   let skyColor   = uD.band1.rgb;
   let t          = uD.band1.w;
+  // Terrain noise params (auto-pulled from patch's TiledTerrain by encoder).
+  let t_seed     = uD.band2.x;
+  let t_freq     = uD.band2.y;
+  let t_octs     = i32(uD.band2.z);
+  let t_plateau  = uD.band2.w;
+  let t_lac      = uD.band3.x;
+  let t_gain     = uD.band3.y;
+  let t_ridges   = uD.band3.z;
+  let t_hs       = uD.band3.w;
+  let t_yOff     = uD.band4.x;
+  let t_sink     = uD.band4.y;
+  let archipel   = uD.band4.z;        // 1.0 = archipelago, 0.0 = no island mask
+  let m_freq     = uD.band4.w;
+  let m_seed     = uD.vsParams.x;
+  let m_thresh   = uD.vsParams.y;
+  let m_soft     = uD.vsParams.z;
+  let foamWidth  = max(0.001, uD.vsParams.w);
+  let shallowDp  = max(0.001, uD.detailParams.x);
+  let waveShoreF = uD.detailParams.y;
+  let foamColor  = vec3<f32>(uD.detailParams.z, uD.detailParams.w, uD.bumpParams.x);
 
-  // Wave UV in world XZ scaled by waveFreq. Two sets at different
-  // scales + opposite drift directions give a more natural ocean
-  // look than a single fBm.
   let wp = in.worldPos;
-  let uvA = wp.xz * waveFreq           + vec2<f32>( t * waveSpeed * 0.6,  t * waveSpeed * 0.4);
-  let uvB = wp.xz * waveFreq * 2.3     + vec2<f32>(-t * waveSpeed * 0.3,  t * waveSpeed * 0.5);
 
-  // Central-difference normal of the height field defined by fBm.
-  // eps is in UV space (i.e. cycles-per-step). Larger -> smoother
-  // waves; smaller -> sharper crests.
+  // ---- Terrain height under this water fragment ----
+  var terrainY = (_t_baseHeight(wp.x, wp.z, t_freq, t_octs, t_lac, t_gain, t_ridges, t_seed, t_plateau) - 1.0) * t_hs + t_yOff;
+  if (archipel > 0.5) {
+    let landAmt = _t_islandLand(wp.x, wp.z, m_freq, m_seed, m_thresh, m_soft);
+    let seaFloor = t_yOff - t_sink;
+    terrainY = terrainY * landAmt + seaFloor * (1.0 - landAmt);
+  }
+  let depth = max(0.0, seaLevel - terrainY);   // water depth at this pixel (positive)
+
+  // ---- Wave normal (two layered fBm UVs) ----
+  let uvA = wp.xz * waveFreq       + vec2<f32>( t * waveSpeed * 0.6,  t * waveSpeed * 0.4);
+  let uvB = wp.xz * waveFreq * 2.3 + vec2<f32>(-t * waveSpeed * 0.3,  t * waveSpeed * 0.5);
   let eps = 0.025;
   let hC = _fbm(uvA)                          + _fbm(uvB) * 0.5;
   let hX = _fbm(uvA + vec2<f32>(eps, 0.0))    + _fbm(uvB + vec2<f32>(eps, 0.0)) * 0.5;
@@ -51821,16 +51917,47 @@ fn fs_water(in: VsOut) -> @location(0) vec4<f32> {
   let dz = (hZ - hC) / eps;
   let n = normalize(vec3<f32>(-dx * waveAmp, 1.0, -dz * waveAmp));
 
-  // View direction surface -> camera.
   let v = normalize(uS.eye.xyz - in.worldPos);
 
-  // Schlick Fresnel. F0 ~= 0.02 for water-to-air at 0° incidence.
+  // ---- Shore color: shallow water tints toward foam-light, depth
+  // > shallowDp tints toward dark deep-blue. Smoothstep both for
+  // soft gradients. ----
+  let shallowAmt = 1.0 - smoothstep(0.0, shallowDp, depth);
+  let deepAmt    = smoothstep(shallowDp, shallowDp * 8.0, depth);
+  // Shallow shore color = water shifted toward sand-tinted teal.
+  let shoreColor = vec3<f32>(0.55, 0.78, 0.74);
+  let deepColor  = vec3<f32>(0.05, 0.10, 0.20);
+  var bodyColor = mix(waterColor, shoreColor, shallowAmt);
+  bodyColor = mix(bodyColor, deepColor, deepAmt);
+
+  // ---- Fresnel mix with sky ----
   let cosTheta = max(0.0, dot(n, v));
   let f0 = 0.02;
   let fresnel = clamp(f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0), 0.0, 1.0);
-  let mixT = clamp(fresnel * fresnelStr, 0.0, 1.0);
+  // Shallow water reflects sky LESS (because the bottom is visible
+  // through the surface) -- multiply Fresnel by depth fade.
+  let depthFresnelFade = clamp(depth / (shallowDp * 0.5), 0.0, 1.0);
+  let mixT = clamp(fresnel * fresnelStr * depthFresnelFade, 0.0, 1.0);
+  var outRGB = mix(bodyColor, skyColor, mixT);
 
-  let outRGB = mix(waterColor, skyColor, mixT);
+  // ---- SHORE FOAM ----
+  // Foam intensity peaks where depth < foamWidth and falls off
+  // toward open water. Two layers:
+  //   1. Static foam band at the shoreline (just depth-driven)
+  //   2. Moving "wave crest" lines that sweep TOWARD shore as the
+  //      sin wave's phase advances with t. Crests appear at integer
+  //      values of (depth * waveShoreF - t * waveSpeed * 0.8).
+  let depthN  = depth / foamWidth;                // 0 at shore, 1 at foamWidth deep
+  let staticFoam = pow(clamp(1.0 - depthN, 0.0, 1.0), 1.5);
+  let phase = depth * waveShoreF - t * waveSpeed * 1.2;
+  let crest = 0.5 + 0.5 * sin(phase * 6.28318);
+  // Wave-noise modulation so the crests aren't perfectly parallel.
+  let crestNoise = _fbm(wp.xz * 0.04 + vec2<f32>(t * 0.3, 0.0));
+  let movingFoam = pow(crest, 6.0) * (0.5 + 0.5 * crestNoise)
+                   * clamp(1.0 - depthN * 1.5, 0.0, 1.0);   // only near shore
+  let foamAmt = clamp(staticFoam + movingFoam, 0.0, 1.0);
+  outRGB = mix(outRGB, foamColor, foamAmt);
+
   let fogged = apply_fog(outRGB, in.worldPos);
   return vec4<f32>(tonemap_aces(fogged), 1.0);
 }
@@ -54610,8 +54737,7 @@ function _encodeScenePass(enc, entry) {
     inst.drawScratch[21] = (typeof mp.ambient   === "number") ? mp.ambient   : 0.15;
     inst.drawScratch[22] = (typeof mp.metallic  === "number") ? mp.metallic  : 0.0;
     inst.drawScratch[23] = (typeof mp.roughness === "number") ? mp.roughness : 0.5;
-    // §5.5.h -- Water remap: baseColor.a = fresnelStrength, matParams =
-    // (seaLevel, waveFreq, waveSpeed, waveAmp), band1.rgba = (skyR, skyG, skyB, time).
+    // §5.5.h -- Water remap. See fs_water for the per-slot legend.
     if (matType === "water") {
       inst.drawScratch[19] = (typeof mp.fresnelStrength === "number") ? mp.fresnelStrength : 1.0;
       inst.drawScratch[20] = (typeof mp.seaLevel  === "number") ? mp.seaLevel  : 0;
@@ -54621,10 +54747,44 @@ function _encodeScenePass(enc, entry) {
       inst.drawScratch[24] = (typeof mp.skyR === "number") ? mp.skyR : 0.62;
       inst.drawScratch[25] = (typeof mp.skyG === "number") ? mp.skyG : 0.78;
       inst.drawScratch[26] = (typeof mp.skyB === "number") ? mp.skyB : 0.92;
-      // Time, seconds since the device acquired. Lazy-init the start
-      // time so animation begins at 0 the first time water is drawn.
       if (!Visual._waterStartT) Visual._waterStartT = performance.now();
       inst.drawScratch[27] = (performance.now() - Visual._waterStartT) * 0.001;
+      // §5.5.h-3 -- shore detection. Pull the patch's first
+      // TiledTerrain noise params so fs_water can sample the
+      // terrain height under each water fragment and compute
+      // depth. If no TiledTerrain exists, pack zeros + a 0 flag
+      // for archipelago -> shader skips the LERP and just returns
+      // depth = +infinity (deep open water).
+      let tt = null;
+      if (state && Array.isArray(state.nodes)) {
+        tt = state.nodes.find(n => n && n.type === "TiledTerrain");
+      }
+      if (tt && tt.params) {
+        const tp2 = tt.params;
+        inst.drawScratch[28] = (typeof tp2.seed       === "number") ? tp2.seed       : 7.42;
+        inst.drawScratch[29] = (typeof tp2.frequency  === "number") ? tp2.frequency  : 0.008;
+        inst.drawScratch[30] = (typeof tp2.octaves    === "number") ? tp2.octaves    : 6;
+        inst.drawScratch[31] = (typeof tp2.plateau    === "number") ? tp2.plateau    : 0;
+        inst.drawScratch[32] = (typeof tp2.lacunarity === "number") ? tp2.lacunarity : 2.0;
+        inst.drawScratch[33] = (typeof tp2.gain       === "number") ? tp2.gain       : 0.5;
+        inst.drawScratch[34] = (typeof tp2.ridges     === "number") ? tp2.ridges     : 0;
+        inst.drawScratch[35] = (typeof tp2.heightScale=== "number") ? tp2.heightScale: 80;
+        inst.drawScratch[36] = (typeof tp2.yOffset    === "number") ? tp2.yOffset    : 0;
+        inst.drawScratch[37] = (typeof tp2.islandSinkDepth === "number") ? tp2.islandSinkDepth : 0;
+        inst.drawScratch[38] = (tp2.islandMode === "archipelago") ? 1 : 0;
+        inst.drawScratch[39] = (typeof tp2.islandMaskFreq      === "number") ? tp2.islandMaskFreq      : 0.0001;
+        inst.drawScratch[40] = (typeof tp2.islandMaskSeed      === "number") ? tp2.islandMaskSeed      : 0;
+        inst.drawScratch[41] = (typeof tp2.islandMaskThreshold === "number") ? tp2.islandMaskThreshold : 0.5;
+        inst.drawScratch[42] = (typeof tp2.islandMaskSoftness  === "number") ? tp2.islandMaskSoftness  : 0.08;
+      } else {
+        for (let s = 28; s <= 42; s++) inst.drawScratch[s] = 0;
+      }
+      inst.drawScratch[43] = (typeof mp.foamWidth      === "number") ? mp.foamWidth      : 6;
+      inst.drawScratch[44] = (typeof mp.shallowDepth   === "number") ? mp.shallowDepth   : 40;
+      inst.drawScratch[45] = (typeof mp.waveShoreFreq  === "number") ? mp.waveShoreFreq  : 0.018;
+      inst.drawScratch[46] = (typeof mp.foamR === "number") ? mp.foamR : 0.96;
+      inst.drawScratch[47] = (typeof mp.foamG === "number") ? mp.foamG : 0.97;
+      inst.drawScratch[48] = (typeof mp.foamB === "number") ? mp.foamB : 1.00;
     }
     // Phase 7 §5.5.c -- TerrainMaterial uses the extended band
     // slots [24..39] and reinterprets matParams as
