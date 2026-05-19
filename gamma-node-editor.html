@@ -11024,30 +11024,30 @@ public:
     cppType: "",
     kind: "mesh-gen",
     ins: [
-      { n: "altitude",    t: "param" },
-      { n: "thickness",   t: "param" },
-      { n: "coverage",    t: "param" },
-      { n: "density",     t: "param" },
-      { n: "scale",       t: "param" },
-      { n: "colorR",      t: "param" },
-      { n: "colorG",      t: "param" },
-      { n: "colorB",      t: "param" },
-      { n: "windSpeedX",  t: "param" },
-      { n: "windSpeedZ",  t: "param" }
+      { n: "altitude",     t: "param" },
+      { n: "puffHeight",   t: "param" },
+      { n: "subdivisions", t: "param" },
+      { n: "coverage",     t: "param" },
+      { n: "density",      t: "param" },
+      { n: "scale",        t: "param" },
+      { n: "seed",         t: "param" },
+      { n: "colorR",       t: "param" },
+      { n: "colorG",       t: "param" },
+      { n: "colorB",       t: "param" }
     ],
     outs: [{ n: "mesh", t: "mesh" }],
     params: {
-      altitude:   2500,    // base cloud Y (bottom of slab) in world units
-      thickness:  900,     // vertical extent of cloud slab in meters
-      coverage:   0.45,    // 0..1 -- fraction of sky with clouds
-      density:    1.0,     // multiplier on cloud opacity
-      scale:      0.00045, // noise frequency on world XZ
-      colorR:     1.0, colorG: 1.0, colorB: 1.0,
-      windSpeedX: 0.0,
-      windSpeedZ: 0.0
+      altitude:     2500,    // base cloud Y in world units (the mesh's "ground")
+      puffHeight:   600,     // how high cloud puffs displace above altitude
+      subdivisions: 128,     // grid resolution -- (n+1)^2 verts; bigger = finer puffs
+      coverage:     0.45,    // 0..1 -- fraction of sky with clouds
+      density:      1.0,     // opacity multiplier (alpha output scale)
+      scale:        0.0008,  // noise frequency on world XZ
+      seed:         11.3,
+      colorR:       1.0, colorG: 1.0, colorB: 1.0
     },
     methods: {},
-    description: "Volumetric 3D cloud layer rendered as a real world-space mesh. Emits a 100km × 100km plane at Y=altitude with a baked cloud material; the fragment shader ray-marches a vertical slab of `thickness` meters above the plane, accumulating fbm-noise density samples with a vertical peak-in-middle profile and sun-direction forward-scatter shading. Because the geometry sits at a fixed world altitude, parallax behaves naturally under both translation AND rotation. coverage (0-1) is the fraction of sky with clouds; density scales overall opacity; scale is the noise frequency (lower = bigger cloud features); thickness controls how deep the cloud layer is (~1000m gives proper cumulus volume; 200m gives thin stratus). Wire `mesh` into a Scene mesh slot."
+    description: "Cloud layer rendered as a subdivided displaced mesh -- not a ray-marched slab. Each vertex sits at Y=altitude by default; where the fbm noise exceeds the coverage threshold, the vertex displaces upward by up to puffHeight meters, producing actual 3D puffy cumulus shapes that read correctly from any angle. Per-vertex alpha smooth-fades the cloud edges into the sky. ~50x cheaper than the previous volumetric ray-march (Phong shading + cheap fbm at build time, no per-pixel marching). subdivisions controls the grid resolution (128 = 16k verts, gives ~500m-wide puffs at the default 60km extent); scale is the noise frequency (lower = bigger puffs); coverage is the sky fraction with cloud. Wire `mesh` into a Scene mesh slot."
   },
 
   /* =========================================================================
@@ -32600,18 +32600,18 @@ const _demos = [
       // (under both translation AND rotation) without any of the
       // angular-distortion games the sky-pass shell had to play.
       const clouds = makeNode("Clouds3D", 40, 680, {
-        // §5.5.h-15 -- volumetric cumulus. Slab base at 2.5km, 900m
-        // thick gives proper cumulus puff volume; coverage 0.45 keeps
-        // about half the sky open. Scale tuned so cloud features
-        // span a few hundred meters horizontally.
-        altitude:   2500,
-        thickness:  900,
-        coverage:   0.45,
-        density:    1.0,
-        scale:      0.00045,
-        colorR:     1.0, colorG: 1.0, colorB: 1.0,
-        windSpeedX: 0.4,
-        windSpeedZ: 0.1
+        // §5.5.h-17 -- subdivided displaced mesh cloud layer. Base
+        // at 2.5km, puffs displace up to 600m above that. 128
+        // subdivisions over the 60km cloud extent = ~470m per puff.
+        // Cheap mesh shading, real 3D puff shapes, no ray-march.
+        altitude:     2500,
+        puffHeight:   600,
+        subdivisions: 128,
+        coverage:     0.45,
+        density:      1.0,
+        scale:        0.0008,
+        seed:         11.3,
+        colorR:       1.0, colorG: 1.0, colorB: 1.0
       });
       const scn = makeNode("Scene", 760, 80, {
         // ProceduralSky drives the visible background -- clear color is
@@ -52248,142 +52248,43 @@ fn fs_water(in: VsOut) -> @location(0) vec4<f32> {
 //                   by the encoder so the noise sample tracks world
 //                   coords; windX/Z continues to drift via the
 //                   ProceduralSky-style wind params on the node.
-// §5.5.h-15 v2 -- volumetric ray-marched clouds. The cloud mesh is a
-// horizontal plane at world Y = altitude (the bottom of the cloud
-// slab); fs_clouds marches up through the slab thickness along the
-// view ray, accumulating fbm-noise density samples with a vertical
-// peak-in-middle profile so density tapers at top + bottom of the
-// slab (proper cumulus shape, not a flat sheet). Sun-direction
-// lighting + cheap interior-darkness proxy give 3D-feeling shading.
-// PerDraw legend for the v2 shader:
+// §5.5.h-17 -- fs_clouds. Reads from a CPU-built displaced cloud
+// mesh (Clouds3D builder). All shape info is baked into vertex
+// positions + normals; per-vertex alpha (color.r) was set by the
+// builder via a smoothstep around the coverage threshold, so cloud
+// edges fade softly into the sky. The shader does cheap Phong-style
+// lighting + sky-color composite. No ray-marching.
 //   baseColor.rgb = cloud color, baseColor.a = density multiplier
-//   matParams     = (coverage, scale, time, thickness)
-//   band1.xy      = (windX, windZ)
-fn _cloud_density(pos: vec3<f32>, altMin: f32, thickness: f32,
-                  scale: f32, windX: f32, windZ: f32, lo: f32) -> f32 {
-  // Vertical profile: density peaks in middle of slab, 0 at edges.
-  // 4 * y * (1-y) reaches 1.0 at y=0.5 and 0 at y=0/1; clamp to
-  // protect against samples outside the slab (when called for sun
-  // shadowing the secondary march can go above altMax).
-  let yNorm = clamp((pos.y - altMin) / max(thickness, 1.0), 0.0, 1.0);
-  let yMask = yNorm * (1.0 - yNorm) * 4.0;
-  if (yMask <= 0.0) { return 0.0; }
-  // Noise shifted with Y for 3D-shape variation (without paying for
-  // a true 3D noise lookup).
-  let xz   = vec2<f32>(pos.x - windX, pos.z - windZ) * scale;
-  let yOff = vec2<f32>(pos.y * scale * 0.8, pos.y * scale * 0.4);
-  let n1 = _fbm(xz + yOff);
-  let n2 = _fbm((xz + yOff) * 2.07 + vec2<f32>(7.13, 3.27));
-  let combined = n1 * 0.7 + n2 * 0.5;
-  // Coverage gate sharpens fbm into cloud-like blobs.
-  let raw = smoothstep(lo, lo + 0.18, combined) * yMask;
-  return raw;
-}
-
+//   matParams.x   = ambient (overall fill light, 0..1)
+//   matParams.y   = sunStrength (sun-dot contribution, 0..2)
 @fragment
 fn fs_clouds(in: VsOut) -> @location(0) vec4<f32> {
   let cloudColor  = uD.baseColor.rgb;
   let densityMult = max(0.0, uD.baseColor.a);
-  let coverage    = clamp(uD.matParams.x, 0.0, 1.0);
-  let scale       = max(1e-7, uD.matParams.y);
-  let altMin      = uD.matParams.z;             // from uniform, not mesh Y
-  let thickness   = max(1.0,  uD.matParams.w);
-  let altMax      = altMin + thickness;
-  let windX       = uD.band1.x;
-  let windZ       = uD.band1.y;
+  let ambientK    = clamp(uD.matParams.x, 0.0, 1.0);
+  let sunK        = max(0.0, uD.matParams.y);
 
-  let camPos = uS.eye.xyz;
-  let viewDir = normalize(in.worldPos - camPos);
-  let dy = viewDir.y;
+  // Per-vertex soft-edge alpha was packed into color.r by the
+  // mesh builder. Drop fragments where the cloud has fully faded
+  // into a gap; gives clean sky breaks instead of polygon edges.
+  let edgeAlpha = clamp(in.color.r, 0.0, 1.0);
+  let alpha = clamp(edgeAlpha * densityMult, 0.0, 1.0);
+  if (alpha <= 0.005) { discard; }
 
-  // §5.5.h-16 -- compute slab entry/exit for every camera placement.
-  // Below / inside / above the slab are all valid; the shader picks
-  // the right tEnter/tExit pair so the ray-march always traverses
-  // only the part of the volume the camera can actually see.
-  var tEnter: f32 = 0.0;
-  var tExit:  f32 = 0.0;
-  if (camPos.y < altMin) {
-    // Below slab. Look up to see it.
-    if (dy <= 0.0001) { discard; }
-    tEnter = (altMin - camPos.y) / dy;
-    tExit  = (altMax - camPos.y) / dy;
-  } else if (camPos.y > altMax) {
-    // Above slab. Look down to see it.
-    if (dy >= -0.0001) { discard; }
-    tEnter = (altMax - camPos.y) / dy;
-    tExit  = (altMin - camPos.y) / dy;
-  } else {
-    // Inside slab. March from camera to the boundary the ray exits.
-    tEnter = 0.0;
-    if (dy > 0.0001) {
-      tExit = (altMax - camPos.y) / dy;
-    } else if (dy < -0.0001) {
-      tExit = (altMin - camPos.y) / dy;
-    } else {
-      // Looking nearly horizontal inside the cloud layer: march a
-      // bounded distance so we still pick up local cloud density.
-      tExit = thickness * 6.0;
-    }
-  }
-
-  let marchLen = max(0.0, tExit - tEnter);
-  if (marchLen <= 0.0) { discard; }
-  let lo = (1.0 - coverage) * 0.85;
-
-  // Sun-direction forward scatter -- bright halo on the sun side,
-  // cool ambient on the away side. Real volumetrics integrate this
-  // through the slab; this single-sample approximation already
-  // reads correctly because clouds are far away (small angular
-  // change across the slab).
+  // Phong-ish shading. Vertex normals were finite-differenced from
+  // the displaced height field so the sides of puffs catch sun and
+  // the flat tops + valleys read as different shades.
+  let n = normalize(in.normal);
   let sunDir = uS.envSun.xyz;
-  let cosTheta = clamp(dot(viewDir, sunDir), -1.0, 1.0);
-  let scatter  = pow(max(cosTheta * 0.5 + 0.5, 0.0), 2.2);
-  let shadowCol = vec3<f32>(0.62, 0.68, 0.78);
-  let litTop    = mix(shadowCol, cloudColor, scatter);
+  let sunDot = max(0.0, dot(n, sunDir)) * uS.envSun.w;
+  let lit = cloudColor * (ambientK + sunDot * sunK);
 
-  // March front-to-back through the slab. 24 steps is enough at the
-  // typical 1km thickness; quality scales gracefully if the slab
-  // grows because step length is thickness-relative.
-  // §5.5.h-16 -- per-pixel jitter on the ray start so the regular
-  // sampling stride doesn't appear as concentric bands. Without
-  // this you can see the discrete step boundaries as visible layers
-  // in the cloud volume (the "16 layers" symptom the user reported).
-  // The jitter turns the banding into high-freq noise that the eye
-  // reads as cloud texture instead of geometry.
-  let STEPS: i32 = 24;
-  let stepLen = marchLen / f32(STEPS);
-  let pixHash = fract(sin(dot(in.pos.xy, vec2<f32>(12.9898, 78.233))) * 43758.5453);
-  var accAlpha: f32 = 0.0;
-  var accCol:   vec3<f32> = vec3<f32>(0.0);
-
-  for (var i: i32 = 0; i < STEPS; i = i + 1) {
-    if (accAlpha >= 0.985) { break; }
-    let t   = tEnter + (f32(i) + pixHash) * stepLen;
-    let pos = camPos + viewDir * t;
-    let d   = _cloud_density(pos, altMin, thickness, scale, windX, windZ, lo) * densityMult;
-    if (d <= 0.001) { continue; }
-
-    // Cheap self-shadow: density a short distance toward the sun.
-    // §5.5.h-16 -- gentler attenuation. The previous multiplier of
-    // 4.5 made interior cloud samples go nearly black, which read
-    // as the light getting too dark too fast. 1.8 leaves real
-    // contrast between lit and shadowed sides without crushing.
-    let sunPos = pos + sunDir * 180.0;
-    let dSun = _cloud_density(sunPos, altMin, thickness, scale, windX, windZ, lo);
-    let sunShade = max(0.45, exp(-dSun * 1.8));
-
-    // Beer-Lambert step opacity along the view ray.
-    let alphaStep = 1.0 - exp(-d * stepLen * 0.012);
-    let sampleCol = litTop * sunShade;
-    // Front-to-back accumulation.
-    accCol   = accCol + sampleCol * alphaStep * (1.0 - accAlpha);
-    accAlpha = accAlpha + alphaStep * (1.0 - accAlpha);
-  }
-  if (accAlpha <= 0.002) { discard; }
-
-  // Composite against the sky background sampled inline (same
-  // dispatch as fs_sky). Opaque output + depth-write so the sky
-  // pass cleanly skips these pixels instead of overwriting them.
+  // Composite against the sky background sampled inline so the
+  // shader can output opaque (alpha=1) with depth-write enabled.
+  // The sky pass runs last and skips pixels with depth < 1, so
+  // we'd otherwise see the Scene.clearR/G/B bleeding through any
+  // translucent cloud fragments.
+  let viewDir = normalize(in.worldPos - uS.eye.xyz);
   let mode = u32(uS.envParams.x);
   var bgCol: vec3<f32>;
   if (mode == 2u) {
@@ -52391,7 +52292,7 @@ fn fs_clouds(in: VsOut) -> @location(0) vec4<f32> {
   } else {
     bgCol = sample_env(viewDir);
   }
-  let outRGB = accCol + bgCol * (1.0 - accAlpha);
+  let outRGB = mix(bgCol, lit, alpha);
   return vec4<f32>(tonemap_aces(outRGB), 1.0);
 }
 
@@ -54219,45 +54120,115 @@ function _buildWater(node) {
   return { verts, indices };
 }
 
-/* Phase 7 §5.5.h-16 -- Clouds3D slab geometry. Two horizontal
- * 100km × 100km planes -- one at the bottom of the cloud slab
- * (Y = altitude) and one at the top (Y = altitude + thickness).
- * Together they cover the three camera placements:
- *   - Below slab: bottom plane is visible (look up), shader marches
- *     from altMin to altMax.
- *   - Above slab: top plane is visible (look down), shader marches
- *     from altMax to altMin.
- *   - Inside slab: one or the other plane is visible depending on
- *     look direction -- whichever the view ray hits, the shader
- *     marches from camera (t=0) to the slab boundary opposite the
- *     view direction.
- * Depth-write keeps things consistent when both planes would be in
- * view; the nearer one wins. Without both planes the cloud volume
- * disappears the moment the camera crosses altMin. */
+/* Phase 7 §5.5.h-17 -- Clouds3D as a subdivided displaced mesh.
+ * Replaces the ray-marched slab from §5.5.h-15/16. Each vertex sits
+ * at Y = altitude by default; where the fbm noise > coverage
+ * threshold, the vertex pushes upward by up to puffHeight meters,
+ * producing actual 3D puffy cumulus shapes. Per-vertex alpha (stored
+ * in color.r) smooth-fades the cloud edges so the gaps between puffs
+ * read as actual sky breaks instead of hard-cut polygon edges.
+ * Normals from finite-difference of neighbor heights so Phong
+ * shading lights the puff sides correctly. ~50x cheaper than the
+ * volumetric ray-march because all noise sampling is one-time CPU
+ * work at build time, not per-pixel per-frame on the GPU. */
 function _buildClouds3D(node) {
   const p = node.params || {};
-  const cy  = (typeof p.altitude  === "number") ? p.altitude  : 2500;
-  const th  = (typeof p.thickness === "number") ? p.thickness : 900;
-  const cy2 = cy + th;
-  const half = 50000;
-  const verts = new Float32Array([
-    // bottom plane (Y = altMin), normals point DOWN
-    -half, cy,  -half,   1, 1, 1,   0, -1, 0,   -half, -half,
-     half, cy,  -half,   1, 1, 1,   0, -1, 0,    half, -half,
-     half, cy,   half,   1, 1, 1,   0, -1, 0,    half,  half,
-    -half, cy,   half,   1, 1, 1,   0, -1, 0,   -half,  half,
-    // top plane (Y = altMax), normals point UP
-    -half, cy2, -half,   1, 1, 1,   0,  1, 0,   -half, -half,
-     half, cy2, -half,   1, 1, 1,   0,  1, 0,    half, -half,
-     half, cy2,  half,   1, 1, 1,   0,  1, 0,    half,  half,
-    -half, cy2,  half,   1, 1, 1,   0,  1, 0,   -half,  half
-  ]);
-  // cullMode=none on the cloud pipeline, so winding doesn't matter
-  // for visibility; either order draws both sides.
-  const indices = new Uint32Array([
-    0, 2, 1,  0, 3, 2,
-    4, 5, 6,  4, 6, 7
-  ]);
+  const cy        = (typeof p.altitude    === "number") ? p.altitude    : 2500;
+  const puffH     = (typeof p.puffHeight  === "number") ? p.puffHeight  : 600;
+  const segCount  = Math.max(8, Math.min(256, Math.floor((typeof p.subdivisions === "number") ? p.subdivisions : 128)));
+  const coverage  = (typeof p.coverage    === "number") ? p.coverage    : 0.45;
+  const scale     = (typeof p.scale       === "number") ? p.scale       : 0.0008;
+  const seed      = (typeof p.seed        === "number") ? p.seed        : 11.3;
+  const halfExt   = 30000;                // 60km × 60km cloud area
+  const segStep   = (halfExt * 2) / segCount;
+  const vertSide  = segCount + 1;
+  const vertCount = vertSide * vertSide;
+  const idxCount  = segCount * segCount * 6;
+
+  // Pass 1: noise + height per vertex. Stored in scratch so pass 2
+  // can compute normals via finite difference.
+  const heightArr = new Float32Array(vertCount);
+  const noiseArr  = new Float32Array(vertCount);
+  const threshold = 1.0 - coverage;
+  for (let iz = 0; iz <= segCount; iz++) {
+    const z = -halfExt + iz * segStep;
+    for (let ix = 0; ix <= segCount; ix++) {
+      const x = -halfExt + ix * segStep;
+      // 4-octave fbm. Independent of TiledTerrain noise so cloud
+      // seeds don't shift if the user retunes the terrain.
+      let n = 0, amp = 0.5, freq = 1, maxAmp = 0;
+      for (let oct = 0; oct < 4; oct++) {
+        n += amp * _terrainValueNoise(x * scale * freq, z * scale * freq, seed + oct * 3.7);
+        maxAmp += amp;
+        amp  *= 0.55;
+        freq *= 2.07;
+      }
+      n = n / maxAmp;                     // 0..1
+      const displ = Math.max(0, n - threshold) / Math.max(0.001, 1 - threshold);
+      const vi = iz * vertSide + ix;
+      noiseArr[vi]  = n;
+      heightArr[vi] = cy + displ * puffH;
+    }
+  }
+
+  // Pass 2: emit the 11-float-per-vertex stream (pos, color, normal,
+  // uv). color.r carries the smooth-edge alpha for fs_clouds; the
+  // other color slots stay 0.
+  const verts   = new Float32Array(vertCount * 11);
+  const indices = new Uint32Array(idxCount);
+  const alphaBand = 0.10;                 // smoothstep half-width around threshold
+  for (let iz = 0; iz <= segCount; iz++) {
+    for (let ix = 0; ix <= segCount; ix++) {
+      const vi = iz * vertSide + ix;
+      const x  = -halfExt + ix * segStep;
+      const z  = -halfExt + iz * segStep;
+      const y  = heightArr[vi];
+      // Central-difference normal. (-dy/dx, 1, -dy/dz) for a surface
+      // y = f(x, z), normalized. Clamped at the edges.
+      const ixn = (ix > 0)         ? ix - 1 : ix;
+      const ixp = (ix < segCount)  ? ix + 1 : ix;
+      const izn = (iz > 0)         ? iz - 1 : iz;
+      const izp = (iz < segCount)  ? iz + 1 : iz;
+      const yL  = heightArr[iz * vertSide + ixn];
+      const yR  = heightArr[iz * vertSide + ixp];
+      const yU  = heightArr[izn * vertSide + ix];
+      const yD  = heightArr[izp * vertSide + ix];
+      const dx  = (ixp - ixn) * segStep || 1;
+      const dz  = (izp - izn) * segStep || 1;
+      let nx = -(yR - yL) / dx;
+      let ny = 1;
+      let nz = -(yD - yU) / dz;
+      const nl = Math.hypot(nx, ny, nz);
+      if (nl > 1e-6) { nx /= nl; ny /= nl; nz /= nl; }
+      // Soft alpha around the coverage threshold.
+      const t  = noiseArr[vi];
+      const a  = Math.max(0, Math.min(1, (t - (threshold - alphaBand)) / (2 * alphaBand)));
+      const base = vi * 11;
+      verts[base + 0] = x;
+      verts[base + 1] = y;
+      verts[base + 2] = z;
+      verts[base + 3] = a;            // alpha in color.r
+      verts[base + 4] = 0;
+      verts[base + 5] = 0;
+      verts[base + 6] = nx;
+      verts[base + 7] = ny;
+      verts[base + 8] = nz;
+      verts[base + 9] = ix / segCount;
+      verts[base + 10] = iz / segCount;
+    }
+  }
+
+  let idx = 0;
+  for (let iz = 0; iz < segCount; iz++) {
+    for (let ix = 0; ix < segCount; ix++) {
+      const v00 = iz * vertSide + ix;
+      const v10 = v00 + 1;
+      const v01 = v00 + vertSide;
+      const v11 = v01 + 1;
+      indices[idx++] = v00; indices[idx++] = v01; indices[idx++] = v10;
+      indices[idx++] = v10; indices[idx++] = v01; indices[idx++] = v11;
+    }
+  }
   return { verts, indices };
 }
 
@@ -55390,33 +55361,23 @@ function _encodeScenePass(enc, entry) {
         inst.drawScratch[52] = 0; inst.drawScratch[53] = 0;
       }
     }
-    // §5.5.h-14/16 -- Clouds3D remap. fs_clouds reads:
-    //   baseColor.rgb = cloud color, baseColor.a = density
-    //   matParams.x = coverage, matParams.y = scale,
-    //   matParams.z = altitude (slab bottom Y), matParams.w = thickness
-    //   band1.x = windX, band1.y = windZ (already camera-XZ-anchored
-    //                                     so the noise sample tracks
-    //                                     world XZ as the camera moves).
+    // §5.5.h-17 -- Clouds3D remap. fs_clouds is now a Phong-style
+    // shader over a CPU-built displaced mesh. Reads:
+    //   baseColor.rgb = cloud color, baseColor.a = density (alpha mult)
+    //   matParams.x = ambient fill light strength
+    //   matParams.y = sun-dot contribution strength
+    //   matParams.zw = unused
     if (matType === "clouds") {
       inst.drawScratch[16] = (typeof mp.colorR === "number") ? mp.colorR : 1.0;
       inst.drawScratch[17] = (typeof mp.colorG === "number") ? mp.colorG : 1.0;
       inst.drawScratch[18] = (typeof mp.colorB === "number") ? mp.colorB : 1.0;
       inst.drawScratch[19] = (typeof mp.density === "number") ? mp.density : 1.0;
-      inst.drawScratch[20] = (typeof mp.coverage  === "number") ? mp.coverage  : 0.45;
-      inst.drawScratch[21] = (typeof mp.scale     === "number") ? mp.scale     : 0.00045;
-      inst.drawScratch[22] = (typeof mp.altitude  === "number") ? mp.altitude  : 2500;
-      inst.drawScratch[23] = (typeof mp.thickness === "number") ? mp.thickness : 900;
-      if (!Visual._cloudsStartT) Visual._cloudsStartT = performance.now();
-      const elapsedC = (performance.now() - Visual._cloudsStartT) * 0.001;
-      const camXc = (camera && camera.eye) ? camera.eye[0] : 0;
-      const camZc = (camera && camera.eye) ? camera.eye[2] : 0;
-      const wsX = (typeof mp.windSpeedX === "number") ? mp.windSpeedX : 0;
-      const wsZ = (typeof mp.windSpeedZ === "number") ? mp.windSpeedZ : 0;
-      inst.drawScratch[24] = (wsX * elapsedC) - camXc;
-      inst.drawScratch[25] = (wsZ * elapsedC) - camZc;
-      inst.drawScratch[26] = 0; inst.drawScratch[27] = 0;
+      inst.drawScratch[20] = (typeof mp.ambient     === "number") ? mp.ambient     : 0.55;
+      inst.drawScratch[21] = (typeof mp.sunStrength === "number") ? mp.sunStrength : 0.65;
+      inst.drawScratch[22] = 0;
+      inst.drawScratch[23] = 0;
       // Clear remaining slots so stale water/terrain data doesn't bleed.
-      for (let s = 28; s < 56; s++) inst.drawScratch[s] = 0;
+      for (let s = 24; s < 56; s++) inst.drawScratch[s] = 0;
     }
     // Phase 7 §5.5.c -- TerrainMaterial uses the extended band
     // slots [24..39] and reinterprets matParams as
