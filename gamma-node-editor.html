@@ -10677,6 +10677,12 @@ public:
     cppType: "",
     kind: "mesh-gen",
     ins: [
+      // v0.3.126 §5.5.c-3 -- heightmap texture input. When wired,
+      // the mesh emits a FLAT grid (no CPU-side displacement) and
+      // vs_terrain samples the wired texture per-vertex for Y
+      // displacement. When unwired, the built-in noise params
+      // below drive a CPU-side displaced grid (the §5.5.a path).
+      { n: "heightmap",   t: "texture" },
       { n: "sizeMode",    t: "param" },
       { n: "worldSize",   t: "param" },
       { n: "heightScale", t: "param" },
@@ -10705,7 +10711,7 @@ public:
     },
     paramOptions: { sizeMode: ["custom", "small", "medium", "large", "infinite"] },
     methods: {},
-    description: "Heightmap-displaced terrain grid (Phase 7 §5.5.a). sizeMode picks the overall extent — custom (uses worldSize), small (20u), medium (100u), large (1000u), infinite (10000u; single-mesh, heavy — proper chunked streaming lands in §5.5.c). worldSize in world units (square; effective only when sizeMode = custom). heightScale scales peak height. Peaks land at Y = 0 + yOffset, valleys extend down to Y = -heightScale + yOffset; default yOffset = 0 keeps peaks at horizon level so the terrain doesn't dominate the upper screen with the default camera at (0, 0, 5). segments (1..256) controls mesh resolution per axis (64 = 4225 verts, 8192 tris). Noise params match ProceduralTerrain. Vertex color grades by altitude (blue valleys → grass → rock → snow caps) so it reads as terrain under unlit-vc — wire a PhongMat or PhysicalMat between Terrain and Scene for proper lit shading with wired lights."
+    description: "Heightmap-displaced terrain grid. heightmap input (Phase 7 §5.5.c-3) — wire ProceduralTerrain.out (or any texture source) and the mesh becomes a FLAT grid + the vertex shader samples your heightmap per-vertex for the Y displacement (cheap to animate). When unwired, the built-in fBm noise params (seed / frequency / octaves / lacunarity / gain / ridges) drive a CPU-displaced grid (the §5.5.a fallback path; same algorithm ProceduralTerrain uses, so visually equivalent for matching params). sizeMode picks the overall extent: custom (uses worldSize), small (20u), medium (100u), large (1000u), infinite (10000u; single-mesh, heavy — proper chunked streaming lands in §5.10). heightScale scales peak height. yOffset shifts the whole stack vertically (default 0 = peaks at horizon, valleys descend to -heightScale). segments (1..256) controls mesh resolution per axis (64 = 4225 verts, 8192 tris). Vertex color grades by altitude (blue valleys → grass → rock → snow caps); pair with PhongMat / PhysicalMat / TerrainMaterial between Terrain and Scene for lit shading."
   },
 
   /* =========================================================================
@@ -31454,14 +31460,33 @@ const _demos = [
     </svg>`,
     build: () => {
       // Terrain: medium preset (100u square), 6-octave fBm, gentle
-      // ridges for a mountain-y feel without going full crag. seed
-      // tuned so the default view has at least one prominent peak.
+      // ridges for a mountain-y feel without going full crag. The
+      // built-in noise params are kept for reference but the actual
+      // displacement comes from the wired ProceduralTerrain below
+      // (§5.5.c-3 GPU vertex-shader path).
       const ter = makeNode("Terrain", 40, 40, {
         sizeMode:   "medium",
         worldSize:  100,
         heightScale: 12,
         yOffset:    0,
         segments:   96,
+        // These noise params are also passed to the ProceduralTerrain
+        // below so the visual shape matches the §5.5.a CPU fallback
+        // if the user un-wires the heightmap.
+        seed:       7.42,
+        frequency:  2.5,
+        octaves:    6,
+        lacunarity: 2.05,
+        gain:       0.5,
+        ridges:     0.35
+      });
+      // ProceduralTerrain feeds the heightmap input -- vs_terrain
+      // samples this texture per-vertex for the Y displacement
+      // instead of running the noise CPU-side. Same fBm formula,
+      // same params; running on the GPU lets the heightmap update
+      // per-frame if any noise param is animated (e.g. seed wired
+      // to MasterClock for a slow morph).
+      const proc = makeNode("ProceduralTerrain", -240, 40, {
         seed:       7.42,
         frequency:  2.5,
         octaves:    6,
@@ -31511,9 +31536,10 @@ const _demos = [
       });
       const vo  = makeNode("VisualOutput", 1440, 240, { display: 0 });
 
-      // Mesh chain
-      state.edges.push({ from: { node: ter, port: "mesh" }, to: { node: mat, port: "mesh"   } });
-      state.edges.push({ from: { node: mat, port: "mesh" }, to: { node: scn, port: "mesh1"  } });
+      // Mesh chain + heightmap wire (§5.5.c-3 GPU displacement).
+      state.edges.push({ from: { node: proc, port: "out"  }, to: { node: ter, port: "heightmap" } });
+      state.edges.push({ from: { node: ter,  port: "mesh" }, to: { node: mat, port: "mesh"      } });
+      state.edges.push({ from: { node: mat,  port: "mesh" }, to: { node: scn, port: "mesh1"     } });
       // Camera orbit math: phase * (1/32) * 2π → sin/cos → posX/posZ.
       state.edges.push({ from: { node: clk,    port: "phase" }, to: { node: mulQ,   port: "a" } });
       state.edges.push({ from: { node: mulQ,   port: "out"   }, to: { node: mulTau, port: "a" } });
@@ -50037,6 +50063,15 @@ struct PerDraw {
   band2:      vec4<f32>,   // .rgb = grass color,  .a = alt2
   band3:      vec4<f32>,   // .rgb = rock color,   .a = alt3
   band4:      vec4<f32>,   // .rgb = snow color,   .a = softness (smoothstep half-width)
+  // v0.3.126 Phase 7 §5.5.c-3 -- vsParams for vertex-shader
+  // heightmap displacement (ProceduralTerrain → Terrain.heightmap).
+  //   x = heightScale   (multiplier applied to sampled height)
+  //   y = worldSize     (full extent of the grid, used to compute
+  //                      world-space derivatives for the normal)
+  //   z = unused
+  //   w = heightmap layer index in the scratch texture array
+  // Read only by vs_terrain. vs_main ignores it.
+  vsParams:   vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> uS: PerScene;
 @group(0) @binding(1) var<uniform> uD: PerDraw;
@@ -50133,6 +50168,72 @@ fn vs_main(in: VsIn) -> VsOut {
   let n4     = uD.model * vec4<f32>(in.normal, 0.0);
   out.normal = normalize(n4.xyz);
   out.uv     = in.uv;
+  return out;
+}
+
+// Phase 7 §5.5.c-3 -- vs_terrain. Samples the heightmap texture
+// (the bound scratch texture array at the layer vsParams.w
+// occupies) for per-vertex Y displacement, and recomputes the
+// surface normal via central-difference of texel neighbors. The
+// fragment side sees this through the standard VsOut interface
+// (worldPos / normal / uv) so any fragment shader (Phong, PBR,
+// Unlit, Terrain) works on top -- the pipeline cache pairs
+// vs_terrain with whichever fragment entry the material picks.
+//
+// textureLoad (not textureSample) since:
+//   1. WebGPU restricts vertex shaders from using filtering
+//      samplers (the binding 3 sampler is filterable).
+//   2. We want exact texel reads for the finite-difference
+//      normal computation anyway.
+fn vs_terrain(in: VsIn) -> VsOut {
+  var out: VsOut;
+  let layer     = i32(uD.vsParams.w);
+  let hScale    = uD.vsParams.x;
+  let worldSize = max(uD.vsParams.y, 0.0001);
+
+  let dims  = vec2<i32>(textureDimensions(srcTexture));
+  let dimsF = vec2<f32>(dims);
+
+  // Clamp UV to [0, 1] then map to texel coords. Read center +
+  // four cardinal neighbors with one-texel offset for the
+  // finite-difference normal.
+  let uvC = clamp(in.uv, vec2<f32>(0.0), vec2<f32>(1.0));
+  let cC  = vec2<i32>(clamp(uvC * dimsF, vec2<f32>(0.0), dimsF - vec2<f32>(1.0)));
+  let cL  = vec2<i32>(max(cC.x - 1, 0),         cC.y);
+  let cR  = vec2<i32>(min(cC.x + 1, dims.x - 1), cC.y);
+  let cD  = vec2<i32>(cC.x, max(cC.y - 1, 0));
+  let cU  = vec2<i32>(cC.x, min(cC.y + 1, dims.y - 1));
+
+  let hC = textureLoad(srcTexture, cC, layer, 0).r;
+  let hL = textureLoad(srcTexture, cL, layer, 0).r;
+  let hR = textureLoad(srcTexture, cR, layer, 0).r;
+  let hD = textureLoad(srcTexture, cD, layer, 0).r;
+  let hU = textureLoad(srcTexture, cU, layer, 0).r;
+
+  // World units per texel = worldSize / textureDimension. Tangent
+  // along X is (worldDx, dydx, 0); along Z is (0, dydz, worldDz);
+  // cross(tangent_z, tangent_x) gives the up-pointing normal.
+  let worldDx = worldSize / dimsF.x;
+  let worldDz = worldSize / dimsF.y;
+  let dydx = (hR - hL) * hScale * 0.5 / worldDx;
+  let dydz = (hU - hD) * hScale * 0.5 / worldDz;
+  let nLocal = normalize(vec3<f32>(-dydx, 1.0, -dydz));
+
+  // Y-displace by sampled height. (hC - 1) keeps the same Y
+  // convention as the CPU-build path: peaks (hC=1) land at the
+  // mesh baseline (in.pos.y = yOffset), valleys (hC=0) descend
+  // to in.pos.y - heightScale. Matches §5.5.a's "peaks at horizon"
+  // default so the wired-up version looks the same as the
+  // unwired CPU mode.
+  let displaced = vec3<f32>(in.pos.x, in.pos.y + (hC - 1.0) * hScale, in.pos.z);
+  let world     = uD.model * vec4<f32>(displaced, 1.0);
+  let n4        = uD.model * vec4<f32>(nLocal, 0.0);
+
+  out.worldPos = world.xyz;
+  out.pos      = uS.viewProj * world;
+  out.color    = in.color;
+  out.normal   = normalize(n4.xyz);
+  out.uv       = in.uv;
   return out;
 }
 
@@ -50641,7 +50742,12 @@ function _ensureMeshBindGroupLayout() {
       // texture sampling. Always present in the BGL so the pipeline
       // layout matches for all material types; non-texture materials
       // simply don't reference the bindings in their WGSL.
-      { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d-array", multisampled: false } },
+      // v0.3.126 §5.5.c-3 -- VERTEX visibility added so vs_terrain
+      // can textureLoad the heightmap for per-vertex Y displacement.
+      // The sampler at binding 3 stays fragment-only (vertex
+      // textureLoad doesn't use a sampler, so the constraint that
+      // "vertex shaders can't use filtering samplers" doesn't bite).
+      { binding: 2, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d-array", multisampled: false } },
       { binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
       // Sprint 7.5.4.b -- env texture + sampler for HDRI / Skybox
       // equirectangular sampling (mode 3 in sample_env). Always
@@ -50885,13 +50991,16 @@ function _applyHdriToEnvTexture(hdri, urlForLabel) {
   }
 }
 
-function _ensureMeshPipeline(materialType, sampleCount) {
+function _ensureMeshPipeline(materialType, sampleCount, displaced) {
   if (!Number.isFinite(sampleCount) || sampleCount < 1) sampleCount = 1;
-  // Sprint 7.5.3c -- pipeline cache keyed by both material type AND
-  // sample count. Each material flavor picks a different fragment
-  // entry point in the shared shader module.
+  // Sprint 7.5.3c -- pipeline cache keyed by material type AND
+  // sample count. v0.3.126 §5.5.c-3 -- added a third axis,
+  // `displaced` (boolean), for the GPU heightmap-displacement
+  // vertex shader. When true, the pipeline uses vs_terrain
+  // instead of vs_main; same fragment entry. Doubles cache
+  // capacity but stays cheap (first build is the only cost).
   if (!materialType) materialType = "unlit-vc";
-  const key = materialType + "-" + sampleCount + "x";
+  const key = materialType + "-" + (displaced ? "d" : "s") + "-" + sampleCount + "x";
   if (Visual.meshPipelineCache.has(key)) {
     return Visual.meshPipelineCache.get(key);
   }
@@ -50942,14 +51051,18 @@ function _ensureMeshPipeline(materialType, sampleCount) {
       materialType === "unlit"    ? "fs_unlit"   :
       /* default unlit-vc */        "fs_unlit_vc";
   }
+  // v0.3.126 §5.5.c-3 -- vs_terrain samples the bound scratch
+  // heightmap for per-vertex Y displacement when `displaced` is
+  // true. Same VsOut interface so any fragment shader works on top.
+  const vsEntry = displaced ? "vs_terrain" : "vs_main";
   let pipeline;
   try {
     pipeline = Visual.device.createRenderPipeline({
-      label: "mesh-pipeline-" + materialType + "-" + sampleCount + "x",
+      label: "mesh-pipeline-" + materialType + "-" + (displaced ? "d-" : "") + sampleCount + "x",
       layout: Visual.meshPipelineLayout,
       vertex: {
         module,
-        entryPoint: "vs_main",
+        entryPoint: vsEntry,
         buffers: [{
           // Vertex layout (sprint 7.5.3c push 6): 11 floats per
           // vertex = position (3) + color (3) + normal (3) + uv (2).
@@ -50995,7 +51108,7 @@ function _ensureMeshPipeline(materialType, sampleCount) {
       Visual.msaaSampleCount = 1;
       _ensureMsaa3DTextures();
       _updateMsaaPill();
-      return _ensureMeshPipeline(materialType, 1);
+      return _ensureMeshPipeline(materialType, 1, displaced);
     }
     return null;
   }
@@ -51215,10 +51328,19 @@ function _meshCacheKey(node) {
     case "Torus":         return "tor:" + [p.majorRadius, p.minorRadius, p.majorSlices, p.minorSlices].join(",");
     case "Cylinder":      return "cyl:" + [p.radius, p.height, p.slices].join(",");
     case "Cone":          return "con:" + [p.radius, p.height, p.slices].join(",");
-    case "Terrain":       return "ter:" + [
-      p.sizeMode, p.worldSize, p.heightScale, p.yOffset, p.segments,
-      p.seed, p.frequency, p.octaves, p.lacunarity, p.gain, p.ridges
-    ].join(",");
+    case "Terrain":       {
+      // v0.3.126 §5.5.c-3 -- include heightmap-wired state so the
+      // mesh cache rebuilds when the user wires / unwires
+      // ProceduralTerrain (flat-grid vs CPU-displaced).
+      const wired = Array.isArray(state.edges) && state.edges.some(e =>
+        e && e.to && e.to.node === node.id && e.to.port === "heightmap"
+      );
+      return "ter:" + [
+        p.sizeMode, p.worldSize, p.heightScale, p.yOffset, p.segments,
+        p.seed, p.frequency, p.octaves, p.lacunarity, p.gain, p.ridges,
+        wired ? "g" : "c"
+      ].join(",");
+    }
     default:              return node.type;
   }
 }
@@ -51448,6 +51570,18 @@ function _buildTerrain(node) {
   const hw = w * 0.5, hd = dd * 0.5;
   const dx = w / segs, dz = dd / segs;
 
+  // v0.3.126 §5.5.c-3 -- if a heightmap texture is wired into this
+  // Terrain, the GPU vertex shader (vs_terrain) does the Y
+  // displacement at render time. The CPU build emits a flat grid
+  // (Y=0 + yOffset) with valid UVs so vs_terrain has something
+  // to sample. Normals stay flat-up (+Y); vs_terrain recomputes
+  // them per-vertex from neighbor heightmap samples. When NO
+  // heightmap is wired, fall through to the original CPU-side
+  // fBm displacement path (the §5.5.a behavior).
+  const hmWired = Array.isArray(state.edges) && state.edges.some(e =>
+    e && e.to && e.to.node === node.id && e.to.port === "heightmap"
+  );
+
   // Pre-sample the height field. Reused for the central-difference
   // normal computation -- without the cache we'd re-evaluate 4× per
   // vertex which gets expensive at segments=256 (~260k extra fBm calls).
@@ -51455,10 +51589,15 @@ function _buildTerrain(node) {
   // land at Y = 0 and valleys (fBm=0) descend to Y = -hs. yOffset
   // shifts the whole stack so users can re-position vertically.
   const heights = new Float32Array(N * N);
-  for (let j = 0; j < N; j++) {
-    for (let i = 0; i < N; i++) {
-      heights[j * N + i] = (_terrainFBM(i / segs, j / segs, noise) - 1) * hs + yOff;
+  if (!hmWired) {
+    for (let j = 0; j < N; j++) {
+      for (let i = 0; i < N; i++) {
+        heights[j * N + i] = (_terrainFBM(i / segs, j / segs, noise) - 1) * hs + yOff;
+      }
     }
+  } else {
+    // Flat baseline; vs_terrain will displace per-vertex on the GPU.
+    for (let k = 0; k < N * N; k++) heights[k] = yOff;
   }
 
   const verts = new Float32Array(N * N * 11);
@@ -51812,11 +51951,12 @@ function _ensureSceneInstance(sceneNode) {
   for (let i = 0; i < SLOT_COUNT; i++) {
     const perDrawBuffer = Visual.device.createBuffer({
       label: "scene-perdraw-" + sceneNode.id + "-slot" + i,
-      // v0.3.123 -- grown from 96 -> 160 to fit TerrainMaterial's
-      // four RGB band colors + their alt thresholds + softness in
-      // four extra vec4 slots after baseColor/matParams. Phong /
-      // PBR / Unlit ignore bytes 96..160 and read only the first 96.
-      size: 160,
+      // v0.3.123 -- grown 96 → 160 for TerrainMaterial bands.
+      // v0.3.126 §5.5.c-3 -- grown 160 → 192 for vsParams (vertex-
+      // shader displacement: heightScale, worldSize, layer, _).
+      // Each material's fragment / vertex shader reads only the
+      // slots it needs; the rest are inert.
+      size: 192,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
     });
     // Sprint 7.5.4.b -- env texture (HDRI / Skybox) at bindings 4+5.
@@ -51847,10 +51987,11 @@ function _ensureSceneInstance(sceneNode) {
     perSceneBuffer,
     slots,
     sceneScratch: new Float32Array(132),  // 528 bytes (sprint 7.5.4.d/e -- + clouds + fog)
-    // v0.3.123 -- 40 floats = 160 B. First 24 floats are the legacy
-    // model + baseColor + matParams (Phong/PBR/Unlit/ShaderMat read
-    // only these). TerrainMaterial adds band1..band4 in [24..39].
-    drawScratch:  new Float32Array(40)
+    // v0.3.123 -- 40 floats / 160 B for TerrainMaterial band slots.
+    // v0.3.126 §5.5.c-3 -- bumped 40 → 48 / 192 B; slots [40..43]
+    // are vsParams (vertex-shader displacement params for
+    // ProceduralTerrain → Terrain.heightmap).
+    drawScratch:  new Float32Array(48)
   };
   Visual.sceneInstances.set(sceneNode.id, inst);
   return inst;
@@ -52091,11 +52232,25 @@ function _encodeScenePass(enc, entry) {
       }
     }
     const matType = (m.material && m.material.type) || "unlit-vc";
-    if (matType !== curMaterialType) {
-      const pipeline = _ensureMeshPipeline(matType, sampleCount);
+    // v0.3.126 §5.5.c-3 -- detect Terrain w/ heightmap wired ->
+    // pick the `displaced` pipeline variant so vs_terrain runs in
+    // place of vs_main. Plan walker schedules the heightmap source
+    // (ProceduralTerrain or whatever) into a scratch slot before
+    // Scene's pass; we resolve the layer index below for vsParams.
+    const isTerrainGen = m.node && m.node.type === "Terrain";
+    let hmWire = null;
+    if (isTerrainGen) {
+      hmWire = state.edges.find(e =>
+        e && e.to && e.to.node === m.node.id && e.to.port === "heightmap"
+      );
+    }
+    const useDisplaced = !!(isTerrainGen && hmWire && hmWire.from);
+    const pipelineKeyStr = matType + (useDisplaced ? "+d" : "");
+    if (pipelineKeyStr !== curMaterialType) {
+      const pipeline = _ensureMeshPipeline(matType, sampleCount, useDisplaced);
       if (!pipeline) continue;
       pass.setPipeline(pipeline);
-      curMaterialType = matType;
+      curMaterialType = pipelineKeyStr;
     }
     // Write model + material into THIS slot's per-draw buffer.
     inst.drawScratch.set(m.transform, 0);
@@ -52145,7 +52300,35 @@ function _encodeScenePass(enc, entry) {
         }
       }
     }
-    Visual.device.queue.writeBuffer(slot.perDrawBuffer, 0, inst.drawScratch.buffer, 0, 160);
+    // v0.3.126 §5.5.c-3 -- when this Terrain draw uses the
+    // displaced vertex shader, pack vsParams: heightScale,
+    // worldSize, _, heightmap-layer-index. Pulls the layer from
+    // the render plan (same lookup ShaderMat.texture uses).
+    if (useDisplaced) {
+      const tp = m.node.params || {};
+      const sizePresets = { small: 20, medium: 100, large: 1000, infinite: 10000 };
+      const mode = (typeof tp.sizeMode === "string") ? tp.sizeMode : "medium";
+      const customSize = (typeof tp.worldSize === "number") ? tp.worldSize : 100;
+      const ws = (mode === "custom") ? customSize : (sizePresets[mode] || customSize);
+      const hsT = (typeof tp.heightScale === "number") ? tp.heightScale : 12;
+      let hmLayer = 0;
+      const planMap = Visual._currentRenderPlan;
+      const upstreamEntry = planMap && planMap.get(hmWire.from.node + "@" + entry.consumerVO.id);
+      if (upstreamEntry) hmLayer = upstreamEntry.layerIdx;
+      // vsParams lives at slots [40..43]. vs_terrain reads .x/.y/.w.
+      inst.drawScratch[40] = hsT;
+      inst.drawScratch[41] = ws;
+      inst.drawScratch[42] = 0;
+      inst.drawScratch[43] = hmLayer;
+    } else {
+      // Clear vsParams when not displaced (avoids stale layer values
+      // from a previous draw on the same slot in the same frame).
+      inst.drawScratch[40] = 0;
+      inst.drawScratch[41] = 0;
+      inst.drawScratch[42] = 0;
+      inst.drawScratch[43] = 0;
+    }
+    Visual.device.queue.writeBuffer(slot.perDrawBuffer, 0, inst.drawScratch.buffer, 0, 192);
     // v0.3.120 -- pick the bind group whose binding 2 is OPPOSITE
     // parity to the scratch layer we're writing to. Prevents the
     // texture-as-binding-and-attachment aliasing that silently broke
