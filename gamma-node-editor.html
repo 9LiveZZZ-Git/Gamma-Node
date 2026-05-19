@@ -10968,19 +10968,30 @@ public:
     cppType: "",
     kind: "mesh-gen",
     ins: [
-      { n: "extent",       t: "param" },
-      { n: "subdivisions", t: "param" },
-      { n: "tileSize",     t: "param" },
-      { n: "yBias",        t: "param" },
-      { n: "octaves",      t: "param" }
+      { n: "extent",        t: "param" },
+      { n: "subdivisions",  t: "param" },
+      { n: "tileSize",      t: "param" },
+      { n: "yBias",         t: "param" },
+      { n: "octaves",       t: "param" },
+      { n: "curveAltLow",   t: "param" },
+      { n: "curveAltHigh",  t: "param" },
+      { n: "planetRadius",  t: "param" }
     ],
     outs: [{ n: "mesh", t: "mesh" }],
     params: {
-      extent:       100000,   // 100km mesh extent
-      subdivisions: 96,       // 97x97 verts = ~9.4k; ~1km per vertex
-      tileSize:     10000,    // macro-tile snap; rebuild only on crossing
-      yBias:        -0.5,     // lower vs. TiledTerrain so inner overlap loses depth test
-      octaves:      3         // <= upstream TiledTerrain octaves; cheap noise
+      extent:        100000,  // 100km mesh extent
+      subdivisions:  96,      // 97x97 verts = ~9.4k; ~1km per vertex
+      tileSize:      10000,   // macro-tile snap; rebuild only on crossing
+      yBias:         -0.5,    // lower vs. TiledTerrain so inner overlap loses depth test
+      octaves:       3,       // <= upstream TiledTerrain octaves; cheap noise
+      // §5.5.h-25 planet curvature blend. Curvature factor smoothsteps
+      // from 0 to 1 over [curveAltLow, curveAltHigh] (camera Y). Above
+      // curveAltHigh, distant vertices drop by d²/(2*planetRadius).
+      // planetRadius = 200km gives a noticeable curve from a few km
+      // up; Earth-scale 6378km would barely register over a 50km disc.
+      curveAltLow:   2000,
+      curveAltHigh:  8000,
+      planetRadius:  200000
     },
     methods: {},
     description: "Low-poly terrain impostor that extends visible coverage past TiledTerrain's chunked disc out to ~50km from the camera. Auto-detects the patch's TiledTerrain and samples the same noise (capped at `octaves`, no erosion) so big-shape silhouettes match the chunked disc at the inner-edge meeting line. Macro-tile camera-follow (default 10km) keeps the mesh roughly centered without per-frame rebuilds. Per-vertex altitude colors baked in so it renders unlit-vc with no material wire needed. `yBias` is a small downward offset (default -0.5m) so the chunked terrain wins the depth test in the overlap zone."
@@ -32731,13 +32742,19 @@ const _demos = [
       // entering live mode. Fly mode (walkMode=0) so the user can
       // hop between islands without having to walk the ocean floor.
       const cam = makeNode("FPCamera", 520, 80, {
-        posX: 0, posY: 400, posZ: 0,
+        // §5.5.h-25 -- start above the highest expected island peak
+        // at spawn (yOff=1500 + peak height varies with island mask)
+        // so the player doesn't load inside terrain.
+        posX: 0, posY: 1700, posZ: 0,
         yaw: 0, pitch: -0.18,
         // §5.5.h-9 -- far plane bumped to 25km so the new 16km terrain
         // disc + horizon don't clip when looking out across the archipelago.
         fov: 70, near: 0.5, far: 25000,
         walkMode: 0,
-        walkSpeed: 30, lookSpeed: 2.2,
+        // §5.5.h-25 -- faster fly mode so the user can actually cross
+        // the 100km horizon impostor extent in reasonable time.
+        // Shift sprint is ×4 -> sprinting hits ~480 m/s.
+        walkSpeed: 120, lookSpeed: 2.2,
         mouseSensitivity: 0.0025, eyeHeight: 1.7
       });
       // §5.5.h-10 -- Sun + ProceduralSky replace the static
@@ -52027,6 +52044,40 @@ fn vs_main(in: VsIn) -> VsOut {
   return out;
 }
 
+// Phase 7 §5.5.h-25 -- vs_horizon. Same VsOut shape as vs_main, but
+// applies a planet-curvature Y warp to each vertex based on the
+// camera's altitude. At low altitude the warp factor is 0 (flat
+// world); as the camera flies up past altLow, the factor ramps to
+// 1 over [altLow, altHigh], at which point distant vertices drop
+// by  d * d / (2R)  where d = horizontal distance from the camera
+// and R is the planet radius. From up high the horizon impostor
+// curves off into a sphere section, giving a planet look.
+//   band1.x = altLow  (no curve below this camera Y)
+//   band1.y = altHigh (full curve above this camera Y)
+//   band1.z = planetRadius
+//   band1.w = unused
+fn vs_horizon(in: VsIn) -> VsOut {
+  var out: VsOut;
+  let world4 = uD.model * vec4<f32>(in.pos, 1.0);
+  let altLow  = uD.band1.x;
+  let altHigh = max(altLow + 1.0, uD.band1.y);
+  let R       = max(1000.0, uD.band1.z);
+  let camY    = uS.eye.y;
+  let t = clamp((camY - altLow) / (altHigh - altLow), 0.0, 1.0);
+  let curvature = t * t * (3.0 - 2.0 * t);     // smoothstep
+  let dxz = world4.xz - uS.eye.xz;
+  let d2  = dot(dxz, dxz);
+  let yDrop = (d2 / (2.0 * R)) * curvature;
+  let warped = vec4<f32>(world4.x, world4.y - yDrop, world4.z, 1.0);
+  out.worldPos = warped.xyz;
+  out.pos    = uS.viewProj * warped;
+  out.color  = in.color;
+  let n4     = uD.model * vec4<f32>(in.normal, 0.0);
+  out.normal = normalize(n4.xyz);
+  out.uv     = in.uv;
+  return out;
+}
+
 // Phase 7 §5.5.c-3 -- vs_terrain. Samples the heightmap texture
 // (the bound scratch texture array at the layer vsParams.w
 // occupies) for per-vertex Y displacement, and recomputes the
@@ -53475,7 +53526,11 @@ function _ensureMeshPipeline(materialType, sampleCount, displaced) {
   // v0.3.126 §5.5.c-3 -- vs_terrain samples the bound scratch
   // heightmap for per-vertex Y displacement when `displaced` is
   // true. Same VsOut interface so any fragment shader works on top.
-  const vsEntry = displaced ? "vs_terrain" : "vs_main";
+  // §5.5.h-25 -- horizon material gets vs_horizon for planet-
+  // curvature blend.
+  const vsEntry = (materialType === "horizon") ? "vs_horizon"
+                : displaced                    ? "vs_terrain"
+                :                                "vs_main";
   let pipeline;
   try {
     pipeline = Visual.device.createRenderPipeline({
@@ -56218,6 +56273,14 @@ function _encodeScenePass(enc, entry) {
       inst.drawScratch[22] = 0.55;                              // ambient
       inst.drawScratch[23] = 0.65;                              // sunStrength
       for (let s = 24; s < 56; s++) inst.drawScratch[s] = 0;
+      // §5.5.h-25 -- planet curvature params for vs_horizon. Read
+      // from the TerrainHorizon node's own params with sensible
+      // defaults; band1.xyz = (altLow, altHigh, planetRadius).
+      const hp = (m.node && m.node.params) || {};
+      inst.drawScratch[24] = (typeof hp.curveAltLow      === "number") ? hp.curveAltLow      : 2000;
+      inst.drawScratch[25] = (typeof hp.curveAltHigh     === "number") ? hp.curveAltHigh     : 8000;
+      inst.drawScratch[26] = (typeof hp.planetRadius     === "number") ? hp.planetRadius     : 200000;
+      inst.drawScratch[27] = 0;
     }
     // Phase 7 §5.5.c -- TerrainMaterial uses the extended band
     // slots [24..39] and reinterprets matParams as
