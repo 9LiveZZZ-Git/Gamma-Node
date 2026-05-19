@@ -11025,6 +11025,7 @@ public:
     kind: "mesh-gen",
     ins: [
       { n: "altitude",    t: "param" },
+      { n: "thickness",   t: "param" },
       { n: "coverage",    t: "param" },
       { n: "density",     t: "param" },
       { n: "scale",       t: "param" },
@@ -11036,7 +11037,8 @@ public:
     ],
     outs: [{ n: "mesh", t: "mesh" }],
     params: {
-      altitude:   2500,    // base cloud Y in world units
+      altitude:   2500,    // base cloud Y (bottom of slab) in world units
+      thickness:  900,     // vertical extent of cloud slab in meters
       coverage:   0.45,    // 0..1 -- fraction of sky with clouds
       density:    1.0,     // multiplier on cloud opacity
       scale:      0.00045, // noise frequency on world XZ
@@ -11045,7 +11047,7 @@ public:
       windSpeedZ: 0.0
     },
     methods: {},
-    description: "3D cloud layer rendered as a real world-space mesh, not a skybox sample. Emits a 100km × 100km plane mesh at Y=altitude with a baked cloud material; Scene auto-applies the fs_clouds fragment shader. Because the geometry sits at a fixed world altitude, parallax behaves naturally under both translation AND rotation -- unlike the sky-pass cloud shell which had non-uniform angular response. coverage (0-1) is the fraction of sky with clouds, density scales opacity, scale is the noise frequency (lower = bigger cloud features). Wire `mesh` into a Scene mesh slot. Future v2 will add real volumetric ray-marching for depth."
+    description: "Volumetric 3D cloud layer rendered as a real world-space mesh. Emits a 100km × 100km plane at Y=altitude with a baked cloud material; the fragment shader ray-marches a vertical slab of `thickness` meters above the plane, accumulating fbm-noise density samples with a vertical peak-in-middle profile and sun-direction forward-scatter shading. Because the geometry sits at a fixed world altitude, parallax behaves naturally under both translation AND rotation. coverage (0-1) is the fraction of sky with clouds; density scales overall opacity; scale is the noise frequency (lower = bigger cloud features); thickness controls how deep the cloud layer is (~1000m gives proper cumulus volume; 200m gives thin stratus). Wire `mesh` into a Scene mesh slot."
   },
 
   /* =========================================================================
@@ -32598,7 +32600,12 @@ const _demos = [
       // (under both translation AND rotation) without any of the
       // angular-distortion games the sky-pass shell had to play.
       const clouds = makeNode("Clouds3D", 40, 680, {
+        // §5.5.h-15 -- volumetric cumulus. Slab base at 2.5km, 900m
+        // thick gives proper cumulus puff volume; coverage 0.45 keeps
+        // about half the sky open. Scale tuned so cloud features
+        // span a few hundred meters horizontally.
         altitude:   2500,
+        thickness:  900,
         coverage:   0.45,
         density:    1.0,
         scale:      0.00045,
@@ -52241,51 +52248,112 @@ fn fs_water(in: VsOut) -> @location(0) vec4<f32> {
 //                   by the encoder so the noise sample tracks world
 //                   coords; windX/Z continues to drift via the
 //                   ProceduralSky-style wind params on the node.
+// §5.5.h-15 v2 -- volumetric ray-marched clouds. The cloud mesh is a
+// horizontal plane at world Y = altitude (the bottom of the cloud
+// slab); fs_clouds marches up through the slab thickness along the
+// view ray, accumulating fbm-noise density samples with a vertical
+// peak-in-middle profile so density tapers at top + bottom of the
+// slab (proper cumulus shape, not a flat sheet). Sun-direction
+// lighting + cheap interior-darkness proxy give 3D-feeling shading.
+// PerDraw legend for the v2 shader:
+//   baseColor.rgb = cloud color, baseColor.a = density multiplier
+//   matParams     = (coverage, scale, time, thickness)
+//   band1.xy      = (windX, windZ)
+fn _cloud_density(pos: vec3<f32>, altMin: f32, thickness: f32,
+                  scale: f32, windX: f32, windZ: f32, lo: f32) -> f32 {
+  // Vertical profile: density peaks in middle of slab, 0 at edges.
+  // 4 * y * (1-y) reaches 1.0 at y=0.5 and 0 at y=0/1; clamp to
+  // protect against samples outside the slab (when called for sun
+  // shadowing the secondary march can go above altMax).
+  let yNorm = clamp((pos.y - altMin) / max(thickness, 1.0), 0.0, 1.0);
+  let yMask = yNorm * (1.0 - yNorm) * 4.0;
+  if (yMask <= 0.0) { return 0.0; }
+  // Noise shifted with Y for 3D-shape variation (without paying for
+  // a true 3D noise lookup).
+  let xz   = vec2<f32>(pos.x - windX, pos.z - windZ) * scale;
+  let yOff = vec2<f32>(pos.y * scale * 0.8, pos.y * scale * 0.4);
+  let n1 = _fbm(xz + yOff);
+  let n2 = _fbm((xz + yOff) * 2.07 + vec2<f32>(7.13, 3.27));
+  let combined = n1 * 0.7 + n2 * 0.5;
+  // Coverage gate sharpens fbm into cloud-like blobs.
+  let raw = smoothstep(lo, lo + 0.18, combined) * yMask;
+  return raw;
+}
+
 @fragment
 fn fs_clouds(in: VsOut) -> @location(0) vec4<f32> {
   let cloudColor  = uD.baseColor.rgb;
   let densityMult = max(0.0, uD.baseColor.a);
   let coverage    = clamp(uD.matParams.x, 0.0, 1.0);
   let scale       = max(1e-7, uD.matParams.y);
+  let thickness   = max(1.0,  uD.matParams.w);
   let windX       = uD.band1.x;
   let windZ       = uD.band1.y;
 
-  let wp = in.worldPos;
-  let viewDir = normalize(wp - uS.eye.xyz);
+  let camPos = uS.eye.xyz;
+  let viewDir = normalize(in.worldPos - camPos);
+  let altMin = in.worldPos.y;       // mesh Y == bottom of slab
+  let altMax = altMin + thickness;
 
-  // World-anchored noise. Wind is the only motion contribution.
-  let xz = vec2<f32>(wp.x - windX, wp.z - windZ) * scale;
-  let raw = _fbm(xz);
-  // Second layer for puffy depth -- slightly different scale +
-  // offset, blended in. Reads as 3D-ish even on a single plane.
-  let xz2 = (xz + vec2<f32>(7.13, 3.27)) * 1.93;
-  let raw2 = _fbm(xz2);
-  let combined = raw * 0.7 + raw2 * 0.5;
+  // v2 MVP: camera must be below the slab (the typical case --
+  // archipelago + flight up to a few hundred meters). Looking down
+  // at clouds from above the slab is rare; bail out.
+  if (camPos.y >= altMin) { discard; }
+  if (viewDir.y <= 0.0)  { discard; }
 
-  // Sharpen the noise into cloud-like blobs via the coverage gate.
   let lo = (1.0 - coverage) * 0.85;
-  let alpha = smoothstep(lo, lo + 0.18, combined) * densityMult;
-  let alphaC = clamp(alpha, 0.0, 0.95);
-  if (alphaC <= 0.001) {
-    discard;
-  }
+  let tEnter = (altMin - camPos.y) / viewDir.y;
+  let tExit  = (altMax - camPos.y) / viewDir.y;
+  let marchLen = max(0.0, tExit - tEnter);
+  if (marchLen <= 0.0) { discard; }
 
-  // Sun-direction lighting: forward-scatter brightening on the sun
-  // side, cooler ambient on the away side. Real volumetric clouds
-  // would integrate this along the ray; single-sample approximation
-  // already reads as "lit from the sun".
+  // Sun-direction forward scatter -- bright halo on the sun side,
+  // cool ambient on the away side. Real volumetrics integrate this
+  // through the slab; this single-sample approximation already
+  // reads correctly because clouds are far away (small angular
+  // change across the slab).
   let sunDir = uS.envSun.xyz;
   let cosTheta = clamp(dot(viewDir, sunDir), -1.0, 1.0);
   let scatter  = pow(max(cosTheta * 0.5 + 0.5, 0.0), 2.2);
-  let shadow   = vec3<f32>(0.55, 0.62, 0.74);
-  let lit      = mix(shadow, cloudColor, scatter);
+  let shadowCol = vec3<f32>(0.55, 0.62, 0.74);
+  let litTop    = mix(shadowCol, cloudColor, scatter);
 
-  // §5.5.h-14 -- composite the sky background BEHIND the cloud here
-  // and output opaque (alpha=1) with depth-write enabled. The sky
-  // pass runs last and skips pixels where any mesh wrote depth, so
-  // if the cloud were translucent we'd see the Scene.clearR/G/B
-  // bleed through instead of the actual sky color. Sampling and
-  // compositing inline avoids that ordering issue cleanly.
+  // March front-to-back through the slab. 16 steps is enough at the
+  // typical 1km thickness; quality scales gracefully if the slab
+  // grows because step length is thickness-relative.
+  let STEPS: i32 = 16;
+  let stepLen = marchLen / f32(STEPS);
+  var accAlpha: f32 = 0.0;
+  var accCol:   vec3<f32> = vec3<f32>(0.0);
+
+  for (var i: i32 = 0; i < STEPS; i = i + 1) {
+    if (accAlpha >= 0.985) { break; }
+    let t   = tEnter + (f32(i) + 0.5) * stepLen;
+    let pos = camPos + viewDir * t;
+    let d   = _cloud_density(pos, altMin, thickness, scale, windX, windZ, lo) * densityMult;
+    if (d <= 0.001) { continue; }
+
+    // Cheap self-shadow: density a short distance toward the sun.
+    // If the cloud is thick that way, this sample is interior and
+    // sun light is attenuated; if thin, sun reaches the sample.
+    // One extra sample per step is the right perf trade for the
+    // visual lift (clouds look LIT from one side).
+    let sunPos = pos + sunDir * 220.0;
+    let dSun = _cloud_density(sunPos, altMin, thickness, scale, windX, windZ, lo);
+    let sunShade = exp(-dSun * 4.5);
+
+    // Beer-Lambert step opacity along the view ray.
+    let alphaStep = 1.0 - exp(-d * stepLen * 0.012);
+    let sampleCol = litTop * sunShade;
+    // Front-to-back accumulation.
+    accCol   = accCol + sampleCol * alphaStep * (1.0 - accAlpha);
+    accAlpha = accAlpha + alphaStep * (1.0 - accAlpha);
+  }
+  if (accAlpha <= 0.002) { discard; }
+
+  // Composite against the sky background sampled inline (same
+  // dispatch as fs_sky). Opaque output + depth-write so the sky
+  // pass cleanly skips these pixels instead of overwriting them.
   let mode = u32(uS.envParams.x);
   var bgCol: vec3<f32>;
   if (mode == 2u) {
@@ -52293,7 +52361,7 @@ fn fs_clouds(in: VsOut) -> @location(0) vec4<f32> {
   } else {
     bgCol = sample_env(viewDir);
   }
-  let outRGB = mix(bgCol, lit, alphaC);
+  let outRGB = accCol + bgCol * (1.0 - accAlpha);
   return vec4<f32>(tonemap_aces(outRGB), 1.0);
 }
 
@@ -55275,11 +55343,10 @@ function _encodeScenePass(enc, entry) {
     // §5.5.h-14 -- Clouds3D remap. fs_clouds reads:
     //   baseColor.rgb = cloud color, baseColor.a = density
     //   matParams.x = coverage, matParams.y = scale,
-    //   matParams.z = time (unused for now), matParams.w = unused
-    //   band1.x = windX, band1.y = windZ (both already camera-XZ-
-    //                                     anchored so the noise
-    //                                     sample tracks world XZ as
-    //                                     the camera translates).
+    //   matParams.z = time, matParams.w = thickness (slab height, m)
+    //   band1.x = windX, band1.y = windZ (already camera-XZ-anchored
+    //                                     so the noise sample tracks
+    //                                     world XZ as the camera moves).
     if (matType === "clouds") {
       inst.drawScratch[16] = (typeof mp.colorR === "number") ? mp.colorR : 1.0;
       inst.drawScratch[17] = (typeof mp.colorG === "number") ? mp.colorG : 1.0;
@@ -55289,7 +55356,7 @@ function _encodeScenePass(enc, entry) {
       inst.drawScratch[21] = (typeof mp.scale    === "number") ? mp.scale    : 0.00045;
       if (!Visual._cloudsStartT) Visual._cloudsStartT = performance.now();
       inst.drawScratch[22] = (performance.now() - Visual._cloudsStartT) * 0.001;
-      inst.drawScratch[23] = 0;
+      inst.drawScratch[23] = (typeof mp.thickness === "number") ? mp.thickness : 900;
       const camXc = (camera && camera.eye) ? camera.eye[0] : 0;
       const camZc = (camera && camera.eye) ? camera.eye[2] : 0;
       const wsX = (typeof mp.windSpeedX === "number") ? mp.windSpeedX : 0;
