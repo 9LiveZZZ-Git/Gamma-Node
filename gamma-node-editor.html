@@ -51797,37 +51797,36 @@ fn fs_phong(in: VsOut) -> @location(0) vec4<f32> {
   return vec4<f32>(tonemap_aces(fogged), 1.0);
 }
 
-// Phase 7 §5.5.h-3 -- terrain noise helpers ported from JS so the
-// water shader can sample the terrain height directly at each
-// fragment's world XZ. This is the source-of-truth for shore
-// detection: depth = waterY - terrainY. Matches _terrainHash /
-// _terrainValueNoise / _terrainFBM / _tiledBaseHeight / island
-// LERP in gamma-node-editor.html exactly so the shore band lines
-// up pixel-perfect with the rendered mesh edge.
-fn _t_hash(p: vec2<f32>, seed: f32) -> f32 {
-  let hx = p.x * 127.1 + p.y * 311.7;
-  let hy = p.x * 269.5 + p.y * 183.3;
-  return fract(sin(hx + hy + seed) * 43758.5453);
+// Phase 7 §5.5.h-3 -- terrain noise helpers, JS-mirror in WGSL.
+// Each function shadows its JS namesake exactly so shore foam
+// lines up with the rendered terrain mesh edge. Explicit type
+// literals throughout to avoid any abstract-int / abstract-float
+// inference surprise.
+fn _tw_hash(p: vec2<f32>, seed: f32) -> f32 {
+  let v = sin(p.x * 127.1 + p.y * 311.7 + p.x * 269.5 + p.y * 183.3 + seed) * 43758.5453;
+  return fract(v);
 }
-fn _t_valueNoise(p: vec2<f32>, seed: f32) -> f32 {
+fn _tw_valueNoise(p: vec2<f32>, seed: f32) -> f32 {
   let i = floor(p);
-  let f = p - i;
-  let a = _t_hash(i,                               seed);
-  let b = _t_hash(i + vec2<f32>(1.0, 0.0),         seed);
-  let c = _t_hash(i + vec2<f32>(0.0, 1.0),         seed);
-  let d = _t_hash(i + vec2<f32>(1.0, 1.0),         seed);
-  let s = f * f * (3.0 - 2.0 * f);
-  return mix(mix(a, b, s.x), mix(c, d, s.x), s.y);
+  let fr = p - i;
+  let a = _tw_hash(i,                               seed);
+  let b = _tw_hash(i + vec2<f32>(1.0, 0.0),         seed);
+  let c = _tw_hash(i + vec2<f32>(0.0, 1.0),         seed);
+  let d = _tw_hash(i + vec2<f32>(1.0, 1.0),         seed);
+  let s = fr * fr * (vec2<f32>(3.0) - vec2<f32>(2.0) * fr);
+  let ab = a + (b - a) * s.x;
+  let cd = c + (d - c) * s.x;
+  return ab + (cd - ab) * s.y;
 }
-fn _t_fbm(wx: f32, wz: f32, freq: f32, octaves: i32, lac: f32, gain: f32, ridges: f32, seed: f32) -> f32 {
+fn _tw_baseHeight(wx: f32, wz: f32, freq: f32, octs: i32, lac: f32, gain: f32, ridges: f32, seed: f32, plateau: f32) -> f32 {
   var p = vec2<f32>(wx, wz) * max(0.001, freq);
   var amp: f32 = 1.0;
   var sum: f32 = 0.0;
   var maxAmp: f32 = 0.0;
   let r = clamp(ridges, 0.0, 1.0);
-  let octs = max(1, min(8, octaves));
-  for (var i: i32 = 0; i < octs; i = i + 1) {
-    var s = _t_valueNoise(p, seed);
+  let octsClamped: i32 = max(1, min(8, octs));
+  for (var ii: i32 = 0; ii < octsClamped; ii = ii + 1) {
+    var s = _tw_valueNoise(p, seed);
     let ridge = 1.0 - abs(2.0 * s - 1.0);
     s = s * (1.0 - r) + ridge * ridge * r;
     sum = sum + s * amp;
@@ -51835,18 +51834,15 @@ fn _t_fbm(wx: f32, wz: f32, freq: f32, octaves: i32, lac: f32, gain: f32, ridges
     p = p * lac;
     amp = amp * gain;
   }
-  return clamp(sum / max(1e-6, maxAmp), 0.0, 1.0);
-}
-fn _t_baseHeight(wx: f32, wz: f32, freq: f32, octs: i32, lac: f32, gain: f32, ridges: f32, seed: f32, plateau: f32) -> f32 {
-  var h = _t_fbm(wx, wz, freq, octs, lac, gain, ridges, seed);
+  var h = clamp(sum / max(1e-6, maxAmp), 0.0, 1.0);
   if (plateau > 0.001) {
     let k = 1.0 + clamp(plateau, 0.0, 1.0) * 4.0;
     h = pow(clamp(h, 0.0, 1.0), k);
   }
   return h;
 }
-fn _t_islandLand(wx: f32, wz: f32, maskFreq: f32, maskSeed: f32, threshold: f32, softness: f32) -> f32 {
-  let m = _t_valueNoise(vec2<f32>(wx, wz) * maskFreq, maskSeed);
+fn _tw_islandLand(wx: f32, wz: f32, maskFreq: f32, maskSeed: f32, threshold: f32, softness: f32) -> f32 {
+  let m = _tw_valueNoise(vec2<f32>(wx, wz) * maskFreq, maskSeed);
   let lo = threshold - softness;
   let hi = threshold + softness;
   let u = clamp((m - lo) / max(1e-6, hi - lo), 0.0, 1.0);
@@ -51898,13 +51894,18 @@ fn fs_water(in: VsOut) -> @location(0) vec4<f32> {
   let wp = in.worldPos;
 
   // ---- Terrain height under this water fragment ----
-  var terrainY = (_t_baseHeight(wp.x, wp.z, t_freq, t_octs, t_lac, t_gain, t_ridges, t_seed, t_plateau) - 1.0) * t_hs + t_yOff;
-  if (archipel > 0.5) {
-    let landAmt = _t_islandLand(wp.x, wp.z, m_freq, m_seed, m_thresh, m_soft);
-    let seaFloor = t_yOff - t_sink;
-    terrainY = terrainY * landAmt + seaFloor * (1.0 - landAmt);
+  // Bail out cleanly if terrain params look uninitialized; the water
+  // still renders, just without shore detection in that case.
+  var depth: f32 = 1000.0;   // sensible "open ocean" fallback
+  if (t_hs > 0.001 && t_freq > 0.0000001) {
+    var terrainY = (_tw_baseHeight(wp.x, wp.z, t_freq, t_octs, t_lac, t_gain, t_ridges, t_seed, t_plateau) - 1.0) * t_hs + t_yOff;
+    if (archipel > 0.5) {
+      let landAmt = _tw_islandLand(wp.x, wp.z, m_freq, m_seed, m_thresh, m_soft);
+      let seaFloor = t_yOff - t_sink;
+      terrainY = terrainY * landAmt + seaFloor * (1.0 - landAmt);
+    }
+    depth = max(0.0, seaLevel - terrainY);
   }
-  let depth = max(0.0, seaLevel - terrainY);   // water depth at this pixel (positive)
 
   // ---- Wave normal (two layered fBm UVs) ----
   let uvA = wp.xz * waveFreq       + vec2<f32>( t * waveSpeed * 0.6,  t * waveSpeed * 0.4);
@@ -52813,6 +52814,10 @@ function _ensureMeshPipeline(materialType, sampleCount, displaced) {
     });
   } catch (e) {
     console.warn("[scene] mesh pipeline " + materialType + " " + sampleCount + "x failed:", e);
+    if (materialType === "water") {
+      console.error("[water] PIPELINE CREATION FAILED. fragEntry=" + fragEntry + " err=", e);
+      console.error("[water] this means fs_water has a WGSL error -- check the earlier '[scene] mesh shader WGSL errors:' log for the line + column of the error.");
+    }
     if (sampleCount !== 1) {
       console.warn("[scene] falling back to 1x MSAA");
       Visual.msaaSampleCount = 1;
@@ -52823,6 +52828,9 @@ function _ensureMeshPipeline(materialType, sampleCount, displaced) {
     return null;
   }
   Visual.meshPipelineCache.set(key, pipeline);
+  if (materialType === "water") {
+    console.log("[water] pipeline created OK. fragEntry=" + fragEntry + " key=" + key);
+  }
   if (!_SCENE_DIAG.pipeline) {
     _SCENE_DIAG.pipeline = true;
     console.log("[scene] first mesh pipeline built (" + materialType + ", sampleCount=" + sampleCount + "x, fbFormat=" + Visual.fbFormat + ")");
@@ -54677,8 +54685,20 @@ function _encodeScenePass(enc, entry) {
     // §5.5.e-6 -- TiledTerrain returns buf.tiledChunks (per-chunk
     // VBOs) instead of a single buf.vertexBuffer. Both shapes are
     // valid; skip only if neither is present.
-    if (!buf) continue;
-    if (!buf.vertexBuffer && !(buf.tiledChunks && buf.tiledChunks.length)) continue;
+    if (!buf) {
+      if (m.node && m.node.type === "Water" && !Visual._waterSkipBufLogged) {
+        Visual._waterSkipBufLogged = true;
+        console.error("[water] SKIPPED: _ensureMeshBuffers returned null. Mesh build failed?");
+      }
+      continue;
+    }
+    if (!buf.vertexBuffer && !(buf.tiledChunks && buf.tiledChunks.length)) {
+      if (m.node && m.node.type === "Water" && !Visual._waterSkipVbLogged) {
+        Visual._waterSkipVbLogged = true;
+        console.error("[water] SKIPPED: no vertexBuffer + no tiledChunks. buf=", buf);
+      }
+      continue;
+    }
     // 5.10 -- frustum cull. Skip mesh draws entirely outside the
     // camera frustum. Tested in world space via 8-corner-transform
     // of the cached local AABB. Diagnostic count logged once per
@@ -54698,9 +54718,25 @@ function _encodeScenePass(enc, entry) {
       matType = "water";
       if (!Visual._waterDrawLogged) {
         Visual._waterDrawLogged = true;
-        console.log("[water] first water mesh draw: slot=" + i +
+        const tt = state && state.nodes && state.nodes.find(n => n && n.type === "TiledTerrain");
+        const ttp = tt && tt.params;
+        console.log("[water] reached encoder: slot=" + i +
                     " verts=" + buf.vertexCount +
-                    " indices=" + buf.indexCount);
+                    " indices=" + buf.indexCount +
+                    " aabb=[" + (buf.aabbMin ? buf.aabbMin.join(",") : "?") +
+                    "..." + (buf.aabbMax ? buf.aabbMax.join(",") : "?") + "]");
+        if (ttp) {
+          console.log("[water] terrain noise params from TiledTerrain: " +
+                      "seed=" + ttp.seed +
+                      " freq=" + ttp.frequency +
+                      " octs=" + ttp.octaves +
+                      " hs=" + ttp.heightScale +
+                      " yOff=" + ttp.yOffset +
+                      " plateau=" + ttp.plateau +
+                      " islandMode=" + ttp.islandMode);
+        } else {
+          console.log("[water] no TiledTerrain found -- shore detect will use fallback (open ocean everywhere).");
+        }
       }
     }
     // v0.3.126 §5.5.c-3 -- detect Terrain w/ heightmap wired ->
