@@ -11024,30 +11024,38 @@ public:
     cppType: "",
     kind: "mesh-gen",
     ins: [
-      { n: "altitude",     t: "param" },
-      { n: "puffHeight",   t: "param" },
-      { n: "subdivisions", t: "param" },
-      { n: "coverage",     t: "param" },
-      { n: "density",      t: "param" },
-      { n: "scale",        t: "param" },
-      { n: "seed",         t: "param" },
-      { n: "colorR",       t: "param" },
-      { n: "colorG",       t: "param" },
-      { n: "colorB",       t: "param" }
+      { n: "altitude",    t: "param" },
+      { n: "puffHeight",  t: "param" },
+      { n: "bottomRound", t: "param" },
+      { n: "chunkSize",   t: "param" },
+      { n: "chunkRadius", t: "param" },
+      { n: "segments",    t: "param" },
+      { n: "coverage",    t: "param" },
+      { n: "density",     t: "param" },
+      { n: "scale",       t: "param" },
+      { n: "seed",        t: "param" },
+      { n: "colorR",      t: "param" },
+      { n: "colorG",      t: "param" },
+      { n: "colorB",      t: "param" }
     ],
     outs: [{ n: "mesh", t: "mesh" }],
     params: {
-      altitude:     2500,    // base cloud Y in world units (the mesh's "ground")
-      puffHeight:   600,     // how high cloud puffs displace above altitude
-      subdivisions: 128,     // grid resolution -- (n+1)^2 verts; bigger = finer puffs
-      coverage:     0.45,    // 0..1 -- fraction of sky with clouds
-      density:      1.0,     // opacity multiplier (alpha output scale)
-      scale:        0.0008,  // noise frequency on world XZ
-      seed:         11.3,
-      colorR:       1.0, colorG: 1.0, colorB: 1.0
+      altitude:    2500,    // base cloud Y in world units (mid-puff plane)
+      puffHeight:  600,     // upward displacement above altitude
+      bottomRound: 0.7,     // downward displacement scale (1.0 = mirror top, 0 = flat bottom)
+      // Chunked-streaming controls (mirror TiledTerrain semantics):
+      chunkSize:   1800,    // world units per chunk side
+      chunkRadius: 5,       // chunks from center -> 11x11 grid -> 19.8km visible disc
+      segments:    28,      // per-chunk subdivisions at inner LOD
+      // Cloud shape:
+      coverage:    0.45,    // 0..1 -- fraction of sky with clouds
+      density:     1.0,     // opacity multiplier
+      scale:       0.0008,  // noise frequency on world XZ
+      seed:        11.3,
+      colorR:      1.0, colorG: 1.0, colorB: 1.0
     },
     methods: {},
-    description: "Cloud layer rendered as a subdivided displaced mesh -- not a ray-marched slab. Each vertex sits at Y=altitude by default; where the fbm noise exceeds the coverage threshold, the vertex displaces upward by up to puffHeight meters, producing actual 3D puffy cumulus shapes that read correctly from any angle. Per-vertex alpha smooth-fades the cloud edges into the sky. ~50x cheaper than the previous volumetric ray-march (Phong shading + cheap fbm at build time, no per-pixel marching). subdivisions controls the grid resolution (128 = 16k verts, gives ~500m-wide puffs at the default 60km extent); scale is the noise frequency (lower = bigger puffs); coverage is the sky fraction with cloud. Wire `mesh` into a Scene mesh slot."
+    description: "Chunked, streaming 3D cloud layer rendered as displaced mesh puffs. Each chunk emits two heightfield surfaces -- top displaces UP by up to puffHeight where noise exceeds the coverage threshold, bottom displaces DOWN by puffHeight × bottomRound so puffs are rounded on BOTH sides (not flat-bottomed slabs). The chunk grid streams like TiledTerrain: chunks within chunkRadius of the camera are built, far ones drop, and a 5-ring LOD distribution makes inner chunks denser than outer ones. ~50x cheaper than volumetric ray-march; chunking on top buys per-frame frustum cull + lets per-chunk segment counts go higher for nicer detail without exploding total verts. Wire `mesh` into a Scene mesh slot."
   },
 
   /* =========================================================================
@@ -32600,18 +32608,21 @@ const _demos = [
       // (under both translation AND rotation) without any of the
       // angular-distortion games the sky-pass shell had to play.
       const clouds = makeNode("Clouds3D", 40, 680, {
-        // §5.5.h-17 -- subdivided displaced mesh cloud layer. Base
-        // at 2.5km, puffs displace up to 600m above that. 128
-        // subdivisions over the 60km cloud extent = ~470m per puff.
-        // Cheap mesh shading, real 3D puff shapes, no ray-march.
-        altitude:     2500,
-        puffHeight:   600,
-        subdivisions: 128,
-        coverage:     0.45,
-        density:      1.0,
-        scale:        0.0008,
-        seed:         11.3,
-        colorR:       1.0, colorG: 1.0, colorB: 1.0
+        // §5.5.h-18 -- chunked cloud streaming with rounded tops AND
+        // bottoms. 1.8km chunks × 11×11 disc -> 20km visible cloud
+        // area. 28 segments per chunk at inner LOD = ~64m per vertex,
+        // way finer detail than the old single-mesh build could afford.
+        altitude:    2500,
+        puffHeight:  650,
+        bottomRound: 0.7,
+        chunkSize:   1800,
+        chunkRadius: 5,
+        segments:    28,
+        coverage:    0.45,
+        density:     1.0,
+        scale:       0.0008,
+        seed:        11.3,
+        colorR:      1.0, colorG: 1.0, colorB: 1.0
       });
       const scn = makeNode("Scene", 760, 80, {
         // ProceduralSky drives the visible background -- clear color is
@@ -53249,6 +53260,9 @@ function _ensureMeshBuffers(meshEntry) {
   if (node.type === "TiledTerrain") {
     return _ensureTiledTerrainChunks(node);
   }
+  if (node.type === "Clouds3D") {
+    return _ensureClouds3DChunks(node);
+  }
   const cached = Visual.meshBufferCache.get(node.id);
   if (cached && _meshCacheKey(node) === cached.cacheKey) return cached;
   // Params changed -- destroy + rebuild. Cheap (just a couple of
@@ -53440,7 +53454,8 @@ function _buildMeshData(node) {
     case "Cone":          return _buildCone(node);
     case "Terrain":       return _buildTerrain(node);
     case "Water":         return _buildWater(node);
-    case "Clouds3D":      return _buildClouds3D(node);
+    // Clouds3D handled by the chunked streaming path in
+    // _ensureMeshBuffers; not reachable here.
     default: return null;
   }
 }
@@ -54120,42 +54135,108 @@ function _buildWater(node) {
   return { verts, indices };
 }
 
-/* Phase 7 §5.5.h-17 -- Clouds3D as a subdivided displaced mesh.
- * Replaces the ray-marched slab from §5.5.h-15/16. Each vertex sits
- * at Y = altitude by default; where the fbm noise > coverage
- * threshold, the vertex pushes upward by up to puffHeight meters,
- * producing actual 3D puffy cumulus shapes. Per-vertex alpha (stored
- * in color.r) smooth-fades the cloud edges so the gaps between puffs
- * read as actual sky breaks instead of hard-cut polygon edges.
- * Normals from finite-difference of neighbor heights so Phong
- * shading lights the puff sides correctly. ~50x cheaper than the
- * volumetric ray-march because all noise sampling is one-time CPU
- * work at build time, not per-pixel per-frame on the GPU. */
-function _buildClouds3D(node) {
+/* Phase 7 §5.5.h-18 -- Clouds3D chunked + rounded-bottom streaming.
+ * Mirrors TiledTerrain's per-chunk VBO/IBO architecture so chunks
+ * stream in/out as the camera moves, frustum-cull individually, and
+ * LOD-down at distance. Each chunk emits TWO heightfield surfaces:
+ *   - Top displaces UP from altitude by (noise - threshold) * puffHeight
+ *   - Bottom displaces DOWN by the same amount × bottomRound
+ * Top and bottom share per-vertex alpha (smoothstep around the
+ * coverage threshold) so cloud edges meet at altitude where the
+ * displacement goes to zero -- gives proper rounded puffs from
+ * either side instead of flat-bottomed slabs.
+ *
+ * State lives in Visual.cloudsChunkCache, keyed by node.id:
+ *   { chunks: Map<key, chunkBuf>, globalKey }
+ * Same two-phase streaming as TiledTerrain (placeholder + upgrade
+ * under separate time budgets) so tile crossings don't stall. */
+
+function _cloudsCenterTile(node) {
+  const p = node.params || {};
+  const chunkSize = Math.max(1, (typeof p.chunkSize === "number") ? p.chunkSize : 1800);
+  // Anchor to the first FPCamera / Camera in the patch -- same logic
+  // TiledTerrain uses (camera-follow disc). Falls back to origin if
+  // no camera is wired yet.
+  let cx = 0, cz = 0;
+  if (state && Array.isArray(state.nodes)) {
+    const cam = state.nodes.find(n => n && (n.type === "FPCamera" || n.type === "Camera"));
+    if (cam && cam.params) {
+      if (typeof cam.params.posX === "number") cx = cam.params.posX;
+      if (typeof cam.params.posZ === "number") cz = cam.params.posZ;
+    }
+  }
+  return { tx: Math.floor(cx / chunkSize), tz: Math.floor(cz / chunkSize), chunkSize };
+}
+
+function _cloudsLodSegments(dxAbs, dzAbs, radius, baseSegs) {
+  const ring = Math.max(dxAbs, dzAbs);
+  if (radius <= 0) return baseSegs;
+  const t = ring / radius;
+  if (t <= 0.30) return baseSegs;
+  if (t <= 0.55) return Math.max(4, baseSegs >> 1);
+  if (t <= 0.80) return Math.max(4, baseSegs >> 2);
+  return Math.max(2, baseSegs >> 3);
+}
+
+function _cloudsGlobalCacheKey(node) {
+  const p = node.params || {};
+  return [
+    p.chunkSize, p.chunkRadius, p.segments,
+    p.altitude, p.puffHeight, p.bottomRound,
+    p.coverage, p.scale, p.seed
+  ].join(",");
+}
+
+function _computeVisibleCloudChunks(node) {
+  const p = node.params || {};
+  const radius   = Math.max(0, Math.min(16, Math.floor((typeof p.chunkRadius === "number") ? p.chunkRadius : 5)));
+  const baseSegs = Math.max(4, Math.min(64, Math.floor((typeof p.segments    === "number") ? p.segments    : 28)));
+  const center = _cloudsCenterTile(node);
+  const visible = new Map();
+  for (let cz = -radius; cz <= radius; cz++) {
+    for (let cx = -radius; cx <= radius; cx++) {
+      const segs = _cloudsLodSegments(Math.abs(cx), Math.abs(cz), radius, baseSegs);
+      const tileX = center.tx + cx;
+      const tileZ = center.tz + cz;
+      const key = tileX + "," + tileZ;
+      visible.set(key, { tileX, tileZ, segs });
+    }
+  }
+  return visible;
+}
+
+/* Build ONE cloud chunk: top + bottom heightfields stitched together
+ * into a single VBO/IBO so the encoder can issue one draw per chunk.
+ * Returns { vertexBuffer, indexBuffer, indexCount, aabbMin, aabbMax,
+ *           tileX, tileZ, lod }. */
+function _buildSingleCloudChunk(node, info) {
+  if (!Visual.device) return null;
   const p = node.params || {};
   const cy        = (typeof p.altitude    === "number") ? p.altitude    : 2500;
   const puffH     = (typeof p.puffHeight  === "number") ? p.puffHeight  : 600;
-  const segCount  = Math.max(8, Math.min(256, Math.floor((typeof p.subdivisions === "number") ? p.subdivisions : 128)));
+  const botRound  = Math.max(0, (typeof p.bottomRound === "number") ? p.bottomRound : 0.7);
   const coverage  = (typeof p.coverage    === "number") ? p.coverage    : 0.45;
   const scale     = (typeof p.scale       === "number") ? p.scale       : 0.0008;
   const seed      = (typeof p.seed        === "number") ? p.seed        : 11.3;
-  const halfExt   = 30000;                // 60km × 60km cloud area
-  const segStep   = (halfExt * 2) / segCount;
-  const vertSide  = segCount + 1;
-  const vertCount = vertSide * vertSide;
-  const idxCount  = segCount * segCount * 6;
-
-  // Pass 1: noise + height per vertex. Stored in scratch so pass 2
-  // can compute normals via finite difference.
-  const heightArr = new Float32Array(vertCount);
-  const noiseArr  = new Float32Array(vertCount);
+  const chunkSize = Math.max(1, (typeof p.chunkSize === "number") ? p.chunkSize : 1800);
+  const segs      = Math.max(2, Math.floor(info.segs));
+  const x0        = info.tileX * chunkSize;
+  const z0        = info.tileZ * chunkSize;
+  const step      = chunkSize / segs;
+  const side      = segs + 1;
+  const gridCount = side * side;
   const threshold = 1.0 - coverage;
-  for (let iz = 0; iz <= segCount; iz++) {
-    const z = -halfExt + iz * segStep;
-    for (let ix = 0; ix <= segCount; ix++) {
-      const x = -halfExt + ix * segStep;
-      // 4-octave fbm. Independent of TiledTerrain noise so cloud
-      // seeds don't shift if the user retunes the terrain.
+
+  // Pass 1: sample noise, compute top + bottom heights for each grid cell.
+  const noiseArr = new Float32Array(gridCount);
+  const topY     = new Float32Array(gridCount);
+  const botY     = new Float32Array(gridCount);
+  for (let iz = 0; iz <= segs; iz++) {
+    const z = z0 + iz * step;
+    for (let ix = 0; ix <= segs; ix++) {
+      const x = x0 + ix * step;
+      // 4-octave fbm in world coords -- chunk boundaries are seamless
+      // because we sample world XZ, not local.
       let n = 0, amp = 0.5, freq = 1, maxAmp = 0;
       for (let oct = 0; oct < 4; oct++) {
         n += amp * _terrainValueNoise(x * scale * freq, z * scale * freq, seed + oct * 3.7);
@@ -54163,73 +54244,228 @@ function _buildClouds3D(node) {
         amp  *= 0.55;
         freq *= 2.07;
       }
-      n = n / maxAmp;                     // 0..1
+      n = n / maxAmp;
       const displ = Math.max(0, n - threshold) / Math.max(0.001, 1 - threshold);
-      const vi = iz * vertSide + ix;
-      noiseArr[vi]  = n;
-      heightArr[vi] = cy + displ * puffH;
+      const vi = iz * side + ix;
+      noiseArr[vi] = n;
+      topY[vi] = cy + displ * puffH;
+      botY[vi] = cy - displ * puffH * botRound;
     }
   }
 
-  // Pass 2: emit the 11-float-per-vertex stream (pos, color, normal,
-  // uv). color.r carries the smooth-edge alpha for fs_clouds; the
-  // other color slots stay 0.
-  const verts   = new Float32Array(vertCount * 11);
+  // Pass 2: emit two vertex buffers (top + bottom), with finite-
+  // difference normals. Top normals point up-ish, bottom normals
+  // point down-ish so Phong shading reads correctly from each side.
+  const verts = new Float32Array(gridCount * 2 * 11);
+  const idxCount = segs * segs * 6 * 2;       // both surfaces
   const indices = new Uint32Array(idxCount);
-  const alphaBand = 0.10;                 // smoothstep half-width around threshold
-  for (let iz = 0; iz <= segCount; iz++) {
-    for (let ix = 0; ix <= segCount; ix++) {
-      const vi = iz * vertSide + ix;
-      const x  = -halfExt + ix * segStep;
-      const z  = -halfExt + iz * segStep;
-      const y  = heightArr[vi];
-      // Central-difference normal. (-dy/dx, 1, -dy/dz) for a surface
-      // y = f(x, z), normalized. Clamped at the edges.
-      const ixn = (ix > 0)         ? ix - 1 : ix;
-      const ixp = (ix < segCount)  ? ix + 1 : ix;
-      const izn = (iz > 0)         ? iz - 1 : iz;
-      const izp = (iz < segCount)  ? iz + 1 : iz;
-      const yL  = heightArr[iz * vertSide + ixn];
-      const yR  = heightArr[iz * vertSide + ixp];
-      const yU  = heightArr[izn * vertSide + ix];
-      const yD  = heightArr[izp * vertSide + ix];
-      const dx  = (ixp - ixn) * segStep || 1;
-      const dz  = (izp - izn) * segStep || 1;
-      let nx = -(yR - yL) / dx;
-      let ny = 1;
-      let nz = -(yD - yU) / dz;
-      const nl = Math.hypot(nx, ny, nz);
-      if (nl > 1e-6) { nx /= nl; ny /= nl; nz /= nl; }
-      // Soft alpha around the coverage threshold.
-      const t  = noiseArr[vi];
-      const a  = Math.max(0, Math.min(1, (t - (threshold - alphaBand)) / (2 * alphaBand)));
-      const base = vi * 11;
-      verts[base + 0] = x;
-      verts[base + 1] = y;
-      verts[base + 2] = z;
-      verts[base + 3] = a;            // alpha in color.r
-      verts[base + 4] = 0;
-      verts[base + 5] = 0;
-      verts[base + 6] = nx;
-      verts[base + 7] = ny;
-      verts[base + 8] = nz;
-      verts[base + 9] = ix / segCount;
-      verts[base + 10] = iz / segCount;
+  const alphaBand = 0.10;
+  let aMinX = Infinity, aMinY = Infinity, aMinZ = Infinity;
+  let aMaxX = -Infinity, aMaxY = -Infinity, aMaxZ = -Infinity;
+
+  function writeSide(yArr, normalSign, vOff) {
+    for (let iz = 0; iz <= segs; iz++) {
+      for (let ix = 0; ix <= segs; ix++) {
+        const vi = iz * side + ix;
+        const x  = x0 + ix * step;
+        const z  = z0 + iz * step;
+        const y  = yArr[vi];
+        const ixn = (ix > 0)        ? ix - 1 : ix;
+        const ixp = (ix < segs)     ? ix + 1 : ix;
+        const izn = (iz > 0)        ? iz - 1 : iz;
+        const izp = (iz < segs)     ? iz + 1 : iz;
+        const yL  = yArr[iz * side + ixn];
+        const yR  = yArr[iz * side + ixp];
+        const yU  = yArr[izn * side + ix];
+        const yD  = yArr[izp * side + ix];
+        const dx  = (ixp - ixn) * step || 1;
+        const dz  = (izp - izn) * step || 1;
+        let nx = -(yR - yL) / dx;
+        let ny = normalSign;
+        let nz = -(yD - yU) / dz;
+        const nl = Math.hypot(nx, ny, nz);
+        if (nl > 1e-6) { nx /= nl; ny /= nl; nz /= nl; }
+        const t  = noiseArr[vi];
+        const a  = Math.max(0, Math.min(1, (t - (threshold - alphaBand)) / (2 * alphaBand)));
+        const base = (vOff + vi) * 11;
+        verts[base + 0] = x;
+        verts[base + 1] = y;
+        verts[base + 2] = z;
+        verts[base + 3] = a;
+        verts[base + 4] = 0;
+        verts[base + 5] = 0;
+        verts[base + 6] = nx;
+        verts[base + 7] = ny;
+        verts[base + 8] = nz;
+        verts[base + 9]  = ix / segs;
+        verts[base + 10] = iz / segs;
+        if (x < aMinX) aMinX = x; if (x > aMaxX) aMaxX = x;
+        if (y < aMinY) aMinY = y; if (y > aMaxY) aMaxY = y;
+        if (z < aMinZ) aMinZ = z; if (z > aMaxZ) aMaxZ = z;
+      }
     }
   }
+
+  writeSide(topY, +1, 0);                       // top surface, vertex slot 0..gridCount-1
+  writeSide(botY, -1, gridCount);               // bottom surface, gridCount..2*gridCount-1
 
   let idx = 0;
-  for (let iz = 0; iz < segCount; iz++) {
-    for (let ix = 0; ix < segCount; ix++) {
-      const v00 = iz * vertSide + ix;
+  // Top: CCW from above
+  for (let iz = 0; iz < segs; iz++) {
+    for (let ix = 0; ix < segs; ix++) {
+      const v00 = iz * side + ix;
       const v10 = v00 + 1;
-      const v01 = v00 + vertSide;
+      const v01 = v00 + side;
       const v11 = v01 + 1;
       indices[idx++] = v00; indices[idx++] = v01; indices[idx++] = v10;
       indices[idx++] = v10; indices[idx++] = v01; indices[idx++] = v11;
     }
   }
-  return { verts, indices };
+  // Bottom: opposite winding so its normals' "front face" sense matches
+  for (let iz = 0; iz < segs; iz++) {
+    for (let ix = 0; ix < segs; ix++) {
+      const v00 = gridCount + iz * side + ix;
+      const v10 = v00 + 1;
+      const v01 = v00 + side;
+      const v11 = v01 + 1;
+      indices[idx++] = v00; indices[idx++] = v10; indices[idx++] = v01;
+      indices[idx++] = v10; indices[idx++] = v11; indices[idx++] = v01;
+    }
+  }
+
+  const vertexBuffer = Visual.device.createBuffer({
+    label: "clouds-vb-" + node.id + "-" + info.tileX + "," + info.tileZ + "-l" + segs,
+    size: verts.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    mappedAtCreation: true
+  });
+  new Float32Array(vertexBuffer.getMappedRange()).set(verts);
+  vertexBuffer.unmap();
+  const indexBuffer = Visual.device.createBuffer({
+    label: "clouds-ib-" + node.id + "-" + info.tileX + "," + info.tileZ + "-l" + segs,
+    size: indices.byteLength,
+    usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+    mappedAtCreation: true
+  });
+  new Uint32Array(indexBuffer.getMappedRange()).set(indices);
+  indexBuffer.unmap();
+
+  return {
+    vertexBuffer, indexBuffer,
+    indexCount: indices.length,
+    vertexCount: gridCount * 2,
+    aabbMin: new Float32Array([aMinX, aMinY, aMinZ]),
+    aabbMax: new Float32Array([aMaxX, aMaxY, aMaxZ]),
+    tileX: info.tileX, tileZ: info.tileZ, lod: segs
+  };
+}
+
+/* Streaming entry. Drop chunks that left the disc, build new ones
+ * under a per-frame time budget, return the live chunk list for the
+ * encoder. Identical two-phase (placeholder + upgrade) shape as
+ * _ensureTiledTerrainChunks. */
+function _ensureClouds3DChunks(node) {
+  if (!Visual.device) return null;
+  if (!Visual.cloudsChunkCache) Visual.cloudsChunkCache = new Map();
+  let entry = Visual.cloudsChunkCache.get(node.id);
+  if (!entry) {
+    entry = { chunks: new Map(), globalKey: null };
+    Visual.cloudsChunkCache.set(node.id, entry);
+  }
+  const globalKey = _cloudsGlobalCacheKey(node);
+  if (globalKey !== entry.globalKey) {
+    for (const c of entry.chunks.values()) {
+      try { c.vertexBuffer && c.vertexBuffer.destroy(); } catch (_) {}
+      try { c.indexBuffer  && c.indexBuffer.destroy();  } catch (_) {}
+    }
+    entry.chunks.clear();
+    entry.globalKey = globalKey;
+  }
+
+  const visible = _computeVisibleCloudChunks(node);
+
+  // Drop chunks that left the disc.
+  const keysToDrop = [];
+  for (const key of entry.chunks.keys()) {
+    if (!visible.has(key)) keysToDrop.push(key);
+  }
+  for (const key of keysToDrop) {
+    const c = entry.chunks.get(key);
+    try { c.vertexBuffer && c.vertexBuffer.destroy(); } catch (_) {}
+    try { c.indexBuffer  && c.indexBuffer.destroy();  } catch (_) {}
+    entry.chunks.delete(key);
+  }
+
+  const center = _cloudsCenterTile(node);
+  const ringOf = (i) => Math.max(Math.abs(i.tileX - center.tx), Math.abs(i.tileZ - center.tz));
+
+  // Phase 1: cheap LOD-4 placeholders for visible tiles not yet built.
+  const phPending = [];
+  for (const [key, info] of visible) {
+    if (entry.chunks.has(key)) continue;
+    phPending.push({ key, info, ring: ringOf(info) });
+  }
+  phPending.sort((a, b) => a.ring - b.ring);
+  const phStart = performance.now();
+  for (let i = 0; i < phPending.length; i++) {
+    const item = phPending[i];
+    const ph = _buildSingleCloudChunk(node, { tileX: item.info.tileX, tileZ: item.info.tileZ, segs: 4 });
+    if (ph) {
+      ph.currentLod = 4;
+      entry.chunks.set(item.key, ph);
+    }
+    if (performance.now() - phStart > 6) break;
+  }
+
+  // Phase 2: upgrade to desired LOD.
+  const upPending = [];
+  for (const [key, info] of visible) {
+    const c = entry.chunks.get(key);
+    if (!c) continue;
+    if (c.currentLod === info.segs) continue;
+    upPending.push({ key, info, c, ring: ringOf(info) });
+  }
+  upPending.sort((a, b) => a.ring - b.ring);
+  const upStart = performance.now();
+  for (let i = 0; i < upPending.length; i++) {
+    const item = upPending[i];
+    const proper = _buildSingleCloudChunk(node, { tileX: item.info.tileX, tileZ: item.info.tileZ, segs: item.info.segs });
+    if (proper) {
+      try { item.c.vertexBuffer && item.c.vertexBuffer.destroy(); } catch (_) {}
+      try { item.c.indexBuffer  && item.c.indexBuffer.destroy();  } catch (_) {}
+      proper.currentLod = item.info.segs;
+      entry.chunks.set(item.key, proper);
+    }
+    if (performance.now() - upStart > 10) break;
+  }
+
+  let aabbMin = new Float32Array([0, 0, 0]);
+  let aabbMax = new Float32Array([0, 0, 0]);
+  if (entry.chunks.size > 0) {
+    aabbMin = new Float32Array([Infinity, Infinity, Infinity]);
+    aabbMax = new Float32Array([-Infinity, -Infinity, -Infinity]);
+    for (const c of entry.chunks.values()) {
+      if (c.aabbMin[0] < aabbMin[0]) aabbMin[0] = c.aabbMin[0];
+      if (c.aabbMin[1] < aabbMin[1]) aabbMin[1] = c.aabbMin[1];
+      if (c.aabbMin[2] < aabbMin[2]) aabbMin[2] = c.aabbMin[2];
+      if (c.aabbMax[0] > aabbMax[0]) aabbMax[0] = c.aabbMax[0];
+      if (c.aabbMax[1] > aabbMax[1]) aabbMax[1] = c.aabbMax[1];
+      if (c.aabbMax[2] > aabbMax[2]) aabbMax[2] = c.aabbMax[2];
+    }
+  }
+
+  const allChunks = [];
+  for (const c of entry.chunks.values()) allChunks.push(c);
+
+  return {
+    tiledChunks: allChunks,
+    vertexBuffer: null,
+    indexBuffer: null,
+    vertexCount: 0,
+    indexCount: 0,
+    aabbMin, aabbMax,
+    cacheKey: globalKey
+  };
 }
 
 /* §5.5.e-6 -- TiledTerrain streaming. Each chunk gets its own
