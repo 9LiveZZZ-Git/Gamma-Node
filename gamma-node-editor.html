@@ -32484,7 +32484,11 @@ const _demos = [
         islandMaskFreq:      0.0003,
         islandMaskSeed:      1.2,
         islandMaskThreshold: 0.50,
-        islandMaskSoftness:  0.06,
+        // §5.5.h-11 -- wider softness (was 0.06). Combined with the new
+        // f^2 coastal peak squash this gives islands a long gentle
+        // slope from coast to interior, with broad shallow-water
+        // bands and room for proper beaches.
+        islandMaskSoftness:  0.20,
         islandSinkDepth:     3000,
         // §5.5.h-10 -- bigger and more aggressive beaches. Strength 1.0
         // gives full flattening to the beach plane where beach noise is
@@ -51455,14 +51459,17 @@ fn sample_procedural_sky_smooth(dir: vec3<f32>) -> vec3<f32> {
   let hor_night = vec3<f32>(0.045, 0.050, 0.095);
   let sky_night = mix(hor_night, zen_night, smoothstep(0.0, 1.0, max(view_y, 0.0)));
 
-  // Ground (below horizon): warm-dim for day, near-black for night.
-  let ground_day   = vec3<f32>(0.18, 0.13, 0.10);
-  let ground_night = vec3<f32>(0.010, 0.012, 0.025);
-  let ground       = mix(ground_night, ground_day, day);
-
+  // §5.5.h-11 -- below-horizon "ground" used to be a hard-coded warm-
+  // brown (vec3(0.18, 0.13, 0.10)) which read as a brown earth band at
+  // the horizon when the sky was exposed past the edge of a finite
+  // water/terrain plane. Continue the sky color instead, just darker.
+  // Real terrain/water overdraws this where it covers; where it's
+  // exposed (water plane edges, gaps), it now reads as a darker
+  // continuation of the atmospheric horizon rather than fake earth.
   var col = mix(sky_night, sky_day, day);
   if (view_y < 0.0) {
-    col = ground;
+    let fade = clamp(1.0 + view_y * 1.5, 0.4, 1.0);
+    col = col * fade;
   }
 
   // Sun-halo Mie glow (smooth; the disk itself lives in _features).
@@ -51972,6 +51979,14 @@ fn _tw_finalY_at(wx: f32, wz: f32,
   var ty = (h - 1.0) * t_hs + t_yOff;
   if (archipel > 0.5) {
     let landAmt = _tw_islandLand(wx, wz, m_freq, m_seed, m_thresh, m_soft);
+    // §5.5.h-11 coastal peak squash. Mirror of JS _tiledFinalY: scale
+    // above-sea-level elevation by landAmt^2 so peaks only emerge
+    // well inland. Keeps the water shader's shore-detect aligned
+    // with the rendered mesh.
+    if (ty > t_yOff) {
+      let peakAmt = landAmt * landAmt;
+      ty = t_yOff + (ty - t_yOff) * peakAmt;
+    }
     // §5.5.h-9 beach band -- mirror of the JS _tiledFinalY beach
     // blend so the water shader's shore detect samples the same
     // flattened beach elevation the rendered mesh shows.
@@ -53774,6 +53789,16 @@ function _tiledFinalY(wx, wz, noise, hs, yOff) {
   if (!noise || !noise.islandParams) return terrainY;
   const ip = noise.islandParams;
   const f  = _tiledIslandLandAmount(wx, wz, ip);
+  // §5.5.h-11 -- coastal peak squash. Scale terrain elevation ABOVE
+  // sea level by f^2 so peaks only emerge well inland; near the
+  // shoreline (low f) the surface stays close to sea level. Combined
+  // with a wider mask softness this gives islands a natural conical
+  // slope from coast to interior, which in turn gives the beach band
+  // and the water's shallow band more horizontal real estate.
+  if (terrainY > yOff) {
+    const peakAmt = f * f;
+    terrainY = yOff + (terrainY - yOff) * peakAmt;
+  }
   // §5.5.h-9 beach band. Where coastal noise (seed derived from
   // maskSeed) is high AND the island mask is in the shore band, blend
   // terrain elevation toward a flat beach plane at yOff + 4m. Mirrors
@@ -54859,8 +54884,18 @@ function _encodeScenePass(enc, entry) {
   inst.sceneScratch[112] = cU[0]; inst.sceneScratch[113] = cU[1]; inst.sceneScratch[114] = cU[2]; inst.sceneScratch[115] = cU[3];
   inst.sceneScratch[116] = cF[0]; inst.sceneScratch[117] = cF[1]; inst.sceneScratch[118] = cF[2]; inst.sceneScratch[119] = cF[3];
   // Sprint 7.5.4.d -- cloud params (from env source, typically ProceduralSky).
+  // §5.5.h-11 -- subtract camera.xz from the wind offset so the cloud
+  // noise sample stays world-anchored as the camera moves. Without
+  // this, the cloud shader's `pos = dir * t` puts every cloud at a
+  // fixed direction from the camera, making them drag along with
+  // motion. The shader does `pos.xz - wind`, so pre-subtracting
+  // camera position from wind effectively adds camera position to pos.
   const cl = (env && env.cloud) || [0, 0, 0, 0];
-  inst.sceneScratch[120] = cl[0]; inst.sceneScratch[121] = cl[1]; inst.sceneScratch[122] = cl[2]; inst.sceneScratch[123] = cl[3];
+  const camX = (camera && camera.eye) ? camera.eye[0] : 0;
+  const camZ = (camera && camera.eye) ? camera.eye[2] : 0;
+  inst.sceneScratch[120] = cl[0]; inst.sceneScratch[121] = cl[1];
+  inst.sceneScratch[122] = cl[2] - camX;
+  inst.sceneScratch[123] = cl[3] - camZ;
   // Sprint 7.5.4.e -- fog params (from Scene node's fog* params).
   const sp = _resolveNodeParams(node);
   const fogDensity = (typeof sp.fogDensity === "number") ? sp.fogDensity : 0;
