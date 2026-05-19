@@ -52217,14 +52217,43 @@ fn fs_water(in: VsOut) -> @location(0) vec4<f32> {
   bodyColor = mix(bodyColor, deepColor, deepAmt);
 
   // ---- Fresnel mix with sky ----
+  // §5.5.h-19 -- sample the upstream Environment (ProceduralSky /
+  // HDRI / Gradient) along the reflected view ray so the water's
+  // reflection actually matches what's in the sky. Falls back to
+  // the static skyR/G/B params when no env is wired (mode=0).
   let cosTheta = max(0.0, dot(n, v));
   let f0 = 0.02;
   let fresnel = clamp(f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0), 0.0, 1.0);
-  // Shallow water reflects sky LESS (because the bottom is visible
-  // through the surface) -- multiply Fresnel by depth fade.
   let depthFresnelFade = clamp(depth / (shallowDp * 0.5), 0.0, 1.0);
   let mixT = clamp(fresnel * fresnelStr * depthFresnelFade, 0.0, 1.0);
-  var outRGB = mix(bodyColor, skyColor, mixT);
+  let reflectedDir = reflect(-v, n);
+  let envMode = u32(uS.envParams.x);
+  var skySample: vec3<f32>;
+  if (envMode == 2u) {
+    // smooth-only so sun-disk doesn't double-up with the explicit
+    // glint pass below; the disk lives in sample_procedural_sky.
+    skySample = sample_procedural_sky_smooth(reflectedDir);
+  } else if (envMode != 0u) {
+    skySample = sample_env(reflectedDir);
+  } else {
+    skySample = skyColor;
+  }
+  var outRGB = mix(bodyColor, skySample, mixT);
+
+  // §5.5.h-19 -- sun glint. Sharp Blinn-Phong highlight at the
+  // half-vector. shininess=300 keeps the spot tight, sunCol is hot
+  // (HDR > 1) so it survives tonemap as a bright sparkle. Modulated
+  // by sun visibility (uS.envSun.w) so glint dies at night and at
+  // the depth-fresnel fade so it doesn't appear on shallow shore
+  // water where you can see straight to the bottom.
+  let sunDir = uS.envSun.xyz;
+  let sunVis = max(0.0, uS.envSun.w);
+  let halfV  = normalize(sunDir + v);
+  let specCos = max(0.0, dot(n, halfV));
+  let specPow: f32 = 300.0;
+  let spec = pow(specCos, specPow) * sunVis * 2.6 * depthFresnelFade;
+  let sunCol = vec3<f32>(1.7, 1.55, 1.25);
+  outRGB = outRGB + spec * sunCol;
 
   // ---- SHORE FOAM ----
   // Foam intensity peaks where depth < foamWidth and falls off
