@@ -52620,6 +52620,57 @@ fn fs_clouds(in: VsOut) -> @location(0) vec4<f32> {
   return vec4<f32>(tonemap_aces(outRGB), 1.0);
 }
 
+// Phase 7 §5.5.h-24 -- fs_horizon. Per-fragment cull of the
+// TerrainHorizon impostor inside the chunked-disc radius, plus
+// gentle Phong shading from the sun so lighting matches fs_terrain
+// at the meeting line. The fragment shader is the cleanest fix for
+// the impostor "swatching over" the chunked terrain: depth-test
+// alone can't reliably keep the chunked detail in front because
+// the impostor uses fewer noise octaves and isn't always slightly
+// below the chunked surface.
+//   baseColor.rgb = unused (vertex colors drive surface color)
+//   matParams.x   = innerRadius (discard within this XZ distance)
+//   matParams.y   = fadeWidth   (smoothstep band beyond innerRadius)
+//   matParams.z   = ambient
+//   matParams.w   = sunStrength
+@fragment
+fn fs_horizon(in: VsOut) -> @location(0) vec4<f32> {
+  let innerR   = max(0.0, uD.matParams.x);
+  let fadeW    = max(1.0, uD.matParams.y);
+  let ambientK = clamp(uD.matParams.z, 0.0, 1.0);
+  let sunK     = max(0.0, uD.matParams.w);
+
+  let camPos = uS.eye.xyz;
+  let dxz = in.worldPos.xz - camPos.xz;
+  let r = length(dxz);
+  if (r < innerR) { discard; }
+  let fadeIn = clamp((r - innerR) / fadeW, 0.0, 1.0);
+
+  let n = normalize(in.normal);
+  let sunDir = uS.envSun.xyz;
+  let sunDot = max(0.0, dot(n, sunDir)) * uS.envSun.w;
+  let baseCol = in.color;
+  let lit = baseCol * (ambientK + sunDot * sunK);
+  // Apply fog so the impostor blends to atmosphere color at the
+  // outer edge, matching how the chunked terrain reads at distance.
+  let fogged = apply_fog(lit, in.worldPos);
+  // fadeIn ramps the impostor in over the band; the fade is done by
+  // alpha-blending against the sky color sampled inline (so we can
+  // output opaque + depth-write like the cloud shader).
+  let viewDir = normalize(in.worldPos - camPos);
+  let mode = u32(uS.envParams.x);
+  var bgCol: vec3<f32>;
+  if (mode == 2u) {
+    bgCol = sample_procedural_sky_smooth(viewDir);
+  } else if (mode != 0u) {
+    bgCol = sample_env(viewDir);
+  } else {
+    bgCol = fogged;
+  }
+  let outRGB = mix(bgCol, fogged, fadeIn);
+  return vec4<f32>(tonemap_aces(outRGB), 1.0);
+}
+
 // Phase 7 §5.5.c TerrainMaterial v2 (v0.3.129) -- AAA-style
 // terrain shading. Altitude bands + slope rock + slope-masked
 // snow + multi-scale detail noise (macro variation + micro
@@ -53417,6 +53468,7 @@ function _ensureMeshPipeline(materialType, sampleCount, displaced) {
       materialType === "terrain"  ? "fs_terrain" :
       materialType === "water"    ? "fs_water"   :
       materialType === "clouds"   ? "fs_clouds"  :
+      materialType === "horizon"  ? "fs_horizon" :
       materialType === "unlit"    ? "fs_unlit"   :
       /* default unlit-vc */        "fs_unlit_vc";
   }
@@ -54481,8 +54533,10 @@ function _terrainHorizonMacroTile(node) {
     }
   }
   return {
-    tx: Math.floor(cx / tileSize),
-    tz: Math.floor(cz / tileSize),
+    // §5.5.h-24 -- round (not floor) so the tile center stays within
+    // ±tileSize/2 of the camera; impostor extent stays symmetric.
+    tx: Math.round(cx / tileSize),
+    tz: Math.round(cz / tileSize),
     tileSize
   };
 }
@@ -54522,8 +54576,10 @@ function _buildTerrainHorizon(node) {
   const yOff = tt ? ((typeof ttp.yOffset    === "number") ? ttp.yOffset    : 0) : 0;
 
   const macro = _terrainHorizonMacroTile(node);
-  const centerX = macro.tx * macro.tileSize + macro.tileSize * 0.5;
-  const centerZ = macro.tz * macro.tileSize + macro.tileSize * 0.5;
+  // §5.5.h-24 -- macro tile uses round() so center is tx*tileSize
+  // exactly (was floor + halfTile offset before).
+  const centerX = macro.tx * macro.tileSize;
+  const centerZ = macro.tz * macro.tileSize;
   const half    = extent * 0.5;
   const step    = extent / segs;
   const side    = segs + 1;
@@ -54544,6 +54600,15 @@ function _buildTerrainHorizon(node) {
     }
   }
 
+  // §5.5.h-24 -- sea level for altitude bands + blue-water check.
+  // Pulled from any Water node in the patch; defaults to 0.
+  let seaLevel = 0;
+  if (state && Array.isArray(state.nodes)) {
+    const wn = state.nodes.find(n => n && n.type === "Water");
+    if (wn && wn.params && typeof wn.params.seaLevel === "number") {
+      seaLevel = wn.params.seaLevel;
+    }
+  }
   // Pass 2: emit verts with normals + altitude-band colors.
   const verts   = new Float32Array(vertCount * 11);
   const indices = new Uint32Array(segs * segs * 6);
@@ -54551,9 +54616,13 @@ function _buildTerrainHorizon(node) {
   const grass  = [0.36, 0.50, 0.28];
   const rock   = [0.55, 0.50, 0.45];
   const snow   = [0.97, 0.97, 0.99];
+  const deepW  = [0.05, 0.13, 0.24];
   function lerp3(a, b, t) {
     return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
   }
+  // Reference altitude band width: 1500m peak-to-sea is reasonable
+  // for the archipelago demo and tracks heightScale for other patches.
+  const bandRef = Math.max(200, hs * 1.25);
   for (let iz = 0; iz <= segs; iz++) {
     for (let ix = 0; ix <= segs; ix++) {
       const vi = iz * side + ix;
@@ -54576,22 +54645,21 @@ function _buildTerrainHorizon(node) {
       let nz = -(yD - yU) / dz;
       const nl = Math.hypot(nx, ny, nz);
       if (nl > 1e-6) { nx /= nl; ny /= nl; nz /= nl; }
-      // Altitude band color. Normalized vs. yOff and heightScale so
-      // higher peaks read snowy regardless of the absolute scale.
-      const altAbove = Math.max(0, y - yOff);
-      const altNorm = Math.min(1, altAbove / Math.max(1, hs));
+      // §5.5.h-24 -- altitude bands referenced to actual SEA LEVEL,
+      // not yOff. Vertices below sea level get the deep-water blue;
+      // above-sea verts band by altitude over bandRef meters.
       let col;
-      if (altNorm < 0.15) {
-        col = lerp3(sand, grass, altNorm / 0.15);
-      } else if (altNorm < 0.55) {
-        col = lerp3(grass, rock, (altNorm - 0.15) / 0.40);
+      if (y < seaLevel - 5) {
+        col = deepW;
       } else {
-        col = lerp3(rock, snow, Math.min(1, (altNorm - 0.55) / 0.30));
-      }
-      // Below-sea-level vertices render as deep-water blue so the
-      // impostor doesn't look like dry brown sea floor at distance.
-      if (y < yOff - 5) {
-        col = [0.08, 0.18, 0.32];
+        const altNorm = Math.min(1, Math.max(0, (y - seaLevel) / bandRef));
+        if (altNorm < 0.20) {
+          col = lerp3(sand, grass, altNorm / 0.20);
+        } else if (altNorm < 0.60) {
+          col = lerp3(grass, rock, (altNorm - 0.20) / 0.40);
+        } else {
+          col = lerp3(rock, snow, Math.min(1, (altNorm - 0.60) / 0.30));
+        }
       }
       const base = vi * 11;
       verts[base + 0] = wx;
@@ -55945,6 +56013,12 @@ function _encodeScenePass(enc, entry) {
     if (m.node && m.node.type === "Clouds3D") {
       matType = "clouds";
     }
+    // §5.5.h-24 -- TerrainHorizon gets its own pipeline with a
+    // camera-distance discard so it doesn't draw over the chunked
+    // TiledTerrain inside the visible disc.
+    if (m.node && m.node.type === "TerrainHorizon") {
+      matType = "horizon";
+    }
     if (m.node && m.node.type === "Water") {
       matType = "water";
       if (!Visual._waterDrawLogged) {
@@ -56119,6 +56193,30 @@ function _encodeScenePass(enc, entry) {
       inst.drawScratch[22] = 0;
       inst.drawScratch[23] = 0;
       // Clear remaining slots so stale water/terrain data doesn't bleed.
+      for (let s = 24; s < 56; s++) inst.drawScratch[s] = 0;
+    }
+    // §5.5.h-24 -- TerrainHorizon remap. fs_horizon reads:
+    //   matParams.x = innerRadius (camera-XZ discard radius)
+    //   matParams.y = fadeWidth   (smoothstep band beyond innerRadius)
+    //   matParams.z = ambient
+    //   matParams.w = sunStrength
+    // innerRadius pulls from the patch's TiledTerrain (chunkRadius *
+    // chunkSize, scaled by 0.9 so the impostor fades in just before
+    // the chunked disc's outer edge instead of leaving a visible gap).
+    if (matType === "horizon") {
+      let innerR = 4000;
+      const ttx = state && Array.isArray(state.nodes) && state.nodes.find(n => n && n.type === "TiledTerrain");
+      if (ttx && ttx.params) {
+        const cs = (typeof ttx.params.chunkSize   === "number") ? ttx.params.chunkSize   : 256;
+        const cr = (typeof ttx.params.chunkRadius === "number") ? ttx.params.chunkRadius : 8;
+        innerR = Math.max(1000, cs * cr * 0.9);
+      }
+      inst.drawScratch[16] = 1; inst.drawScratch[17] = 1; inst.drawScratch[18] = 1;
+      inst.drawScratch[19] = 1;
+      inst.drawScratch[20] = innerR;
+      inst.drawScratch[21] = Math.max(200, innerR * 0.15);     // fadeWidth ~ 15% of innerR
+      inst.drawScratch[22] = 0.55;                              // ambient
+      inst.drawScratch[23] = 0.65;                              // sunStrength
       for (let s = 24; s < 56; s++) inst.drawScratch[s] = 0;
     }
     // Phase 7 §5.5.c -- TerrainMaterial uses the extended band
