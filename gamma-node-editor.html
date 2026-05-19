@@ -10337,6 +10337,52 @@ public:
     description: "3D camera. Wire its `camera` output into a Scene sink. Position + target are world-space points (camera looks from posX/Y/Z toward targetX/Y/Z); fov is vertical field-of-view in degrees (perspective mode); orthoSize is world-units half-height (ortho mode); near + far are clip distances. Up vector defaults to +Y; advanced users can edit it via the upX/upY/upZ uiOnly params for unusual orientations. All scalar params accept wires -- modulate the camera position from a MasterClock for orbit cameras, or from MediaPipe hands for VR-like control."
   },
 
+  /* Phase 7 §5.5.f -- FPCamera. First-person video-game camera for
+   * walking / flying around terrain demos. Click the visual canvas
+   * to engage pointer lock; ESC to release. Controls: WASD = move,
+   * mouse = look (yaw/pitch), Space = up, C / Ctrl = down, Shift =
+   * sprint (×4). When pointer-locked the editor swallows WASD so the
+   * QWERTY musical keyboard doesn't fire notes. Output shape matches
+   * Camera (posX/Y/Z + targetX/Y/Z + fov + near + far) -- the tick
+   * computes target from yaw/pitch each frame so the Scene reads a
+   * standard Camera record. */
+  FPCamera: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "camera",
+    ins: [
+      { n: "posX",             t: "param" },
+      { n: "posY",             t: "param" },
+      { n: "posZ",             t: "param" },
+      { n: "yaw",              t: "param" },
+      { n: "pitch",            t: "param" },
+      { n: "fov",              t: "param" },
+      { n: "near",             t: "param" },
+      { n: "far",              t: "param" },
+      { n: "walkSpeed",        t: "param" },
+      { n: "mouseSensitivity", t: "param" },
+      { n: "eyeHeight",        t: "param" }
+    ],
+    outs: [{ n: "camera", t: "camera" }],
+    params: {
+      posX: 0, posY: 2, posZ: 0,
+      yaw: 0, pitch: 0,
+      fov: 75, near: 0.1, far: 2000,
+      walkSpeed: 12,
+      mouseSensitivity: 0.0025,
+      eyeHeight: 1.7,
+      // Computed each tick; written into params so _evaluateCamera
+      // reads the same shape as Camera. Hidden from the UI.
+      targetX: 0, targetY: 2, targetZ: 1,
+      mode: 0,
+      orthoSize: 4,
+      upX: 0, upY: 1, upZ: 0
+    },
+    methods: {},
+    uiOnlyParams: ["targetX", "targetY", "targetZ", "mode", "orthoSize", "upX", "upY", "upZ"],
+    description: "First-person camera. Click the visual canvas to engage pointer-lock (ESC to release). WASD walks / strafes, mouse looks, Space rises, C or Ctrl descends, Shift sprints (×4). Outputs the same shape as Camera (target computed from yaw + pitch), so wire its `camera` output into a Scene like any other camera. fov defaults to 75° (FP feel), far defaults to 2000 (for large / infinite terrains). walkSpeed in units/sec (default 12 ≈ a brisk run at 1 unit = 1 meter); mouseSensitivity in radians per pixel of mouse movement (default 0.0025 = typical FPS feel). When pointer-locked, the editor swallows WASD so the musical keyboard doesn't fire notes; release lock to use the keyboard normally."
+  },
+
   /* Sprint 7.5.3a -- DebugTriangle. Smoke-test mesh source. Emits a
    * single colored triangle (RGB vertices) as a `mesh` output, used
    * to validate the Scene render pipeline end-to-end. Disappears
@@ -43430,6 +43476,19 @@ const Visual = {
   },
   theaterInputWired: false, // set once the document-level listeners are attached
 
+  // §5.5.f FPCamera input state. One pointer-lock + key set is
+  // shared across all FPCamera nodes (only the first FPCamera in
+  // state.nodes gets ticked by _tickFPCameras -- typical setups
+  // have one). Mouse deltas are accumulated between frames and
+  // zeroed inside the tick.
+  fpcInput: {
+    pointerLocked: false,
+    keys:    new Set(),   // KeyboardEvent.code strings (layout-stable)
+    mouseDx: 0,
+    mouseDy: 0
+  },
+  fpcInputWired: false,
+
   // Phase 6.1.5 — HUD state. `frozen` pauses the future rAF render
   // loop without touching audio. `fps` is updated each frame by
   // _tickFpsReadout (called from the rAF loop in 6.1.7+); for now
@@ -45207,6 +45266,138 @@ function _wireTheaterInput() {
     document.body.classList.add("theater-touch-capable");
     _wireTouchPads();
   }
+}
+
+/* Phase 7 §5.5.f -- FPCamera input wiring. Pointer-lock on canvas
+ * click when an FPCamera exists in the patch + we're NOT in theater
+ * mode (theater has its own pointer-lock handler). WASD + Space + C
+ * + Shift drive the FPCamera tick; mouse delta updates yaw / pitch
+ * directly. KeyboardEvent.code is layout-stable so this works on
+ * AZERTY / DVORAK keyboards too. When pointer-locked we swallow
+ * WASD via preventDefault so the QWERTY musical keyboard doesn't
+ * fire notes; release lock to type normally. */
+function _wireFPCameraInput() {
+  if (Visual.fpcInputWired) return;
+  Visual.fpcInputWired = true;
+
+  const canvas = Visual.canvas;
+  const hasFPCamera = () => Array.isArray(state && state.nodes) &&
+                            state.nodes.some(n => n && n.type === "FPCamera");
+  const inTheater = () => state && state.rig && state.rig.previewMode === "theater";
+
+  if (canvas) {
+    canvas.addEventListener("click", () => {
+      if (!hasFPCamera() || inTheater()) return;
+      try { canvas.requestPointerLock(); } catch (_) {}
+    });
+  }
+  document.addEventListener("pointerlockchange", () => {
+    const locked = (document.pointerLockElement === canvas) && hasFPCamera() && !inTheater();
+    Visual.fpcInput.pointerLocked = locked;
+    document.body.classList.toggle("fpc-locked", locked);
+    if (!locked) {
+      Visual.fpcInput.keys.clear();
+      Visual.fpcInput.mouseDx = 0;
+      Visual.fpcInput.mouseDy = 0;
+    }
+  });
+  document.addEventListener("mousemove", (e) => {
+    if (!Visual.fpcInput.pointerLocked) return;
+    Visual.fpcInput.mouseDx += e.movementX || 0;
+    Visual.fpcInput.mouseDy += e.movementY || 0;
+  });
+  const FPC_KEYS = new Set([
+    "KeyW", "KeyA", "KeyS", "KeyD", "KeyC",
+    "Space", "ShiftLeft", "ShiftRight",
+    "ControlLeft", "ControlRight"
+  ]);
+  document.addEventListener("keydown", (e) => {
+    if (!Visual.fpcInput.pointerLocked) return;
+    if (FPC_KEYS.has(e.code)) {
+      Visual.fpcInput.keys.add(e.code);
+      e.preventDefault();
+    }
+  });
+  document.addEventListener("keyup", (e) => {
+    if (FPC_KEYS.has(e.code)) Visual.fpcInput.keys.delete(e.code);
+  });
+}
+
+/* Per-frame tick for FPCamera nodes. Reads accumulated mouse delta
+ * + held keys from Visual.fpcInput, integrates yaw / pitch +
+ * position on the FPCamera's params, and writes back targetX/Y/Z
+ * (= pos + forward) so _evaluateCamera can read it like any Camera. */
+function _tickFPCameras(dt) {
+  if (!state || !Array.isArray(state.nodes)) return;
+  const input = Visual.fpcInput;
+  if (!input || !input.pointerLocked) {
+    // Even when unlocked, ensure FPCameras still have valid target
+    // values written from their current yaw/pitch so _evaluateCamera
+    // doesn't read stale targets (important on first frame after the
+    // node is created, before the user clicks to lock).
+    for (const node of state.nodes) {
+      if (!node || node.type !== "FPCamera") continue;
+      const p = node.params = node.params || {};
+      const yaw   = (typeof p.yaw   === "number") ? p.yaw   : 0;
+      const pitch = (typeof p.pitch === "number") ? p.pitch : 0;
+      const cy = Math.cos(yaw), sy = Math.sin(yaw);
+      const cp = Math.cos(pitch), sp = Math.sin(pitch);
+      p.targetX = (typeof p.posX === "number" ? p.posX : 0) + sy * cp;
+      p.targetY = (typeof p.posY === "number" ? p.posY : 2) + sp;
+      p.targetZ = (typeof p.posZ === "number" ? p.posZ : 0) + cy * cp;
+    }
+    return;
+  }
+
+  for (const node of state.nodes) {
+    if (!node || node.type !== "FPCamera") continue;
+    const p = node.params = node.params || {};
+    let yaw   = (typeof p.yaw   === "number") ? p.yaw   : 0;
+    let pitch = (typeof p.pitch === "number") ? p.pitch : 0;
+    const sens  = (typeof p.mouseSensitivity === "number") ? p.mouseSensitivity : 0.0025;
+    const speed = (typeof p.walkSpeed        === "number") ? p.walkSpeed        : 12;
+
+    yaw   -= input.mouseDx * sens;
+    pitch -= input.mouseDy * sens;
+    const lim = Math.PI * 0.49;
+    if (pitch >  lim) pitch =  lim;
+    if (pitch < -lim) pitch = -lim;
+
+    // yaw=0 looks toward +Z (matches Camera default convention).
+    const cy = Math.cos(yaw),   sy = Math.sin(yaw);
+    const cp = Math.cos(pitch), sp = Math.sin(pitch);
+    const fx = sy * cp, fy = sp, fz = cy * cp;
+    const rx = cy,      ry = 0,  rz = -sy;
+
+    const k = input.keys;
+    let dx = 0, dy = 0, dz = 0;
+    if (k.has("KeyW")) { dx += fx; dy += fy; dz += fz; }
+    if (k.has("KeyS")) { dx -= fx; dy -= fy; dz -= fz; }
+    if (k.has("KeyD")) { dx += rx; dy += ry; dz += rz; }
+    if (k.has("KeyA")) { dx -= rx; dy -= ry; dz -= rz; }
+    if (k.has("Space")) { dy += 1; }
+    if (k.has("KeyC") || k.has("ControlLeft") || k.has("ControlRight")) { dy -= 1; }
+    const sprint = (k.has("ShiftLeft") || k.has("ShiftRight")) ? 4 : 1;
+
+    let px = (typeof p.posX === "number") ? p.posX : 0;
+    let py = (typeof p.posY === "number") ? p.posY : 2;
+    let pz = (typeof p.posZ === "number") ? p.posZ : 0;
+    const l = Math.hypot(dx, dy, dz);
+    if (l > 0.0001) {
+      const step = speed * sprint * dt;
+      px += (dx / l) * step;
+      py += (dy / l) * step;
+      pz += (dz / l) * step;
+    }
+
+    p.posX = px; p.posY = py; p.posZ = pz;
+    p.yaw  = yaw; p.pitch = pitch;
+    p.targetX = px + fx;
+    p.targetY = py + fy;
+    p.targetZ = pz + fz;
+  }
+  input.mouseDx = 0;
+  input.mouseDy = 0;
 }
 
 /* Phase 6.6.13 — virtual on-screen sticks for touch navigation.
@@ -49153,7 +49344,7 @@ function _resolveSceneCamera(sceneNode, fbW, fbH) {
     const cached = Visual._frameCameraCache.get(wire.from.node);
     if (cached) return cached;
     const src = state.nodes.find(n => n && n.id === wire.from.node);
-    if (src && src.type === "Camera") {
+    if (src && (src.type === "Camera" || src.type === "FPCamera")) {
       const c = _evaluateCamera(src, fbW, fbH);
       Visual._frameCameraCache.set(wire.from.node, c);
       return c;
@@ -55595,6 +55786,12 @@ function renderVisualFrame() {
   // lets unwired shaders also tempo-sync.
   _updateAudioFft();
   _writeAudioUniform();
+
+  // §5.5.f -- FPCamera tick (mouse + keys -> per-frame pos / yaw / pitch).
+  // Lazy-wires the document-level input listeners on first call so the
+  // setup cost is paid once when the user is actually using an FPCamera.
+  _wireFPCameraInput();
+  _tickFPCameras(dtSec);
 
   const enc = Visual.device.createCommandEncoder({ label: "visual-frame" });
 
