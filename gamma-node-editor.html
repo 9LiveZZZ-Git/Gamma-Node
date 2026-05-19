@@ -16885,25 +16885,40 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     cppType: "",
     kind: "shader-frag",
     ins: [
-      { n: "seed",       t: "param" },
-      { n: "frequency",  t: "param" },
-      { n: "octaves",    t: "param" },
-      { n: "lacunarity", t: "param" },
-      { n: "gain",       t: "param" },
-      { n: "ridges",     t: "param" }
+      { n: "type",          t: "param" },
+      { n: "seed",          t: "param" },
+      { n: "frequency",     t: "param" },
+      { n: "octaves",       t: "param" },
+      { n: "lacunarity",    t: "param" },
+      { n: "gain",          t: "param" },
+      { n: "ridges",        t: "param" },
+      // v0.3.128 game-dev upgrade -- five post-processing knobs
+      // that turn raw fBm into a recognizable terrain style.
+      { n: "warpAmount",    t: "param" },
+      { n: "warpFreq",      t: "param" },
+      { n: "erosion",       t: "param" },
+      { n: "continentMask", t: "param" },
+      { n: "terrace",       t: "param" }
     ],
     outs: [{ n: "out", t: "texture" }],
     params: {
-      seed:       1.234,
-      frequency:  4.0,
-      octaves:    5,
-      lacunarity: 2.0,
-      gain:       0.5,
-      ridges:     0.0
+      type:          "fbm",
+      seed:          1.234,
+      frequency:     4.0,
+      octaves:       5,
+      lacunarity:    2.0,
+      gain:          0.5,
+      ridges:        0.0,
+      warpAmount:    0.0,
+      warpFreq:      1.0,
+      erosion:       0.0,
+      continentMask: 0.0,
+      terrace:       0.0
     },
+    paramOptions: { type: ["fbm", "ridges", "billowy"] },
     methods: {},
-    // 16-float preamble + 6 params + 2 pad = 24 floats = 96 bytes.
-    uniformBytes: 96,
+    // 16-float preamble + 12 params + 4 pad = 32 floats = 128 bytes.
+    uniformBytes: 128,
     wgsl:
 `struct U {
   u_resolution: vec4f,
@@ -16912,13 +16927,19 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   _pad0:        vec2f,
   u_view:       vec4f,
   u_world_uv:   vec4f,
-  seed:         f32,
-  frequency:    f32,
-  octaves:      f32,
-  lacunarity:   f32,
-  gain:         f32,
-  ridges:       f32,
-  _pad1:        vec2f,
+  seed:          f32,
+  frequency:     f32,
+  octaves:       f32,
+  lacunarity:    f32,
+  gain:          f32,
+  ridges:        f32,
+  noiseType:     f32,
+  warpAmount:    f32,
+  warpFreq:      f32,
+  erosion:       f32,
+  continentMask: f32,
+  terrace:       f32,
+  _pad1:         vec2f,
 };
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -16929,12 +16950,12 @@ struct VsOut {
 
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
-  var p = array<vec2f, 3>(
+  var pp = array<vec2f, 3>(
     vec2f(-1.0, -1.0),
     vec2f( 3.0, -1.0),
     vec2f(-1.0,  3.0),
   );
-  let pos = p[vi];
+  let pos = pp[vi];
   var out: VsOut;
   out.pos = vec4f(pos, 0.0, 1.0);
   out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
@@ -16960,39 +16981,153 @@ fn _value_noise(p: vec2f) -> f32 {
   return mix(mix(a, b, s.x), mix(c, d, s.x), s.y);
 }
 
-@fragment
-fn fs_main(in: VsOut) -> @location(0) vec4f {
-  var p = in.uv * max(u.frequency, 0.001);
+// Standard fBm: sum of N octaves of value noise.
+fn _fbm(p0: vec2f, octs: i32, lac: f32, gn: f32) -> f32 {
+  var p = p0;
   var amp: f32 = 1.0;
   var sum: f32 = 0.0;
   var maxAmp: f32 = 0.0;
-  let octs = i32(clamp(u.octaves, 1.0, 8.0));
   for (var i = 0; i < octs; i = i + 1) {
-    var n = _value_noise(p);
-    // Ridge multifractal mix: 0 = standard fBm, 1 = sharp ridges
-    // (1 - |2n - 1|)^2 emphasizes the boundaries where n ≈ 0.5.
-    let ridge = 1.0 - abs(2.0 * n - 1.0);
-    n = mix(n, ridge * ridge, clamp(u.ridges, 0.0, 1.0));
-    sum = sum + n * amp;
+    sum = sum + _value_noise(p) * amp;
     maxAmp = maxAmp + amp;
-    p = p * u.lacunarity;
-    amp = amp * u.gain;
+    p = p * lac;
+    amp = amp * gn;
   }
-  let h = clamp(sum / max(maxAmp, 1e-6), 0.0, 1.0);
+  return sum / max(maxAmp, 1e-6);
+}
+
+// Ridge multifractal: each octave is (1 - |2n - 1|)^2 -- sharp
+// ridges where the underlying value noise crosses 0.5. Reads as
+// mountain crests vs fBm's rolling hills.
+fn _ridges_noise(p0: vec2f, octs: i32, lac: f32, gn: f32) -> f32 {
+  var p = p0;
+  var amp: f32 = 1.0;
+  var sum: f32 = 0.0;
+  var maxAmp: f32 = 0.0;
+  for (var i = 0; i < octs; i = i + 1) {
+    let nv = _value_noise(p);
+    let r  = 1.0 - abs(2.0 * nv - 1.0);
+    sum = sum + r * r * amp;
+    maxAmp = maxAmp + amp;
+    p = p * lac;
+    amp = amp * gn;
+  }
+  return sum / max(maxAmp, 1e-6);
+}
+
+// Billowy: per-octave |2n - 1|. Puffy mound look -- the
+// flavor-inverse of ridges. Good for cloud-like / rocky outcrops.
+fn _billowy_noise(p0: vec2f, octs: i32, lac: f32, gn: f32) -> f32 {
+  var p = p0;
+  var amp: f32 = 1.0;
+  var sum: f32 = 0.0;
+  var maxAmp: f32 = 0.0;
+  for (var i = 0; i < octs; i = i + 1) {
+    sum = sum + abs(2.0 * _value_noise(p) - 1.0) * amp;
+    maxAmp = maxAmp + amp;
+    p = p * lac;
+    amp = amp * gn;
+  }
+  return sum / max(maxAmp, 1e-6);
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let baseFreq = max(u.frequency, 0.001);
+  let nOcts = i32(clamp(u.octaves, 1.0, 8.0));
+  let lac = u.lacunarity;
+  let gn  = u.gain;
+
+  // 1. Domain warping. Offset the sample UV by another fbm
+  //    evaluation. Turns stripey fbm into meandering organic
+  //    features (rivers / coastlines / convoluted ridges).
+  //    warpFreq scales the warp relative to base: ~0.5 = larger
+  //    swirly warps; ~2 = fine wiggling.
+  var uv = in.uv;
+  if (u.warpAmount > 0.001) {
+    let warpScale = baseFreq * max(u.warpFreq, 0.01);
+    let wp = uv * warpScale;
+    let wx = _fbm(wp + vec2f(13.7, 91.2), 3, 2.0, 0.5);
+    let wy = _fbm(wp + vec2f(47.3, 31.1), 3, 2.0, 0.5);
+    uv = uv + (vec2f(wx, wy) - vec2f(0.5)) * u.warpAmount;
+  }
+
+  // 2. Base sample by type.
+  let p = uv * baseFreq;
+  let typeIdx = i32(u.noiseType + 0.5);
+  var n: f32;
+  if (typeIdx == 1) {
+    n = _ridges_noise(p, nOcts, lac, gn);
+  } else if (typeIdx == 2) {
+    n = _billowy_noise(p, nOcts, lac, gn);
+  } else {
+    n = _fbm(p, nOcts, lac, gn);
+  }
+
+  // 3. Optional secondary ridges mix on top of the base type.
+  //    Backward-compat slider that v0.3.127's params used as the
+  //    only ridge control. Independent of the type pick, so
+  //    type=fbm + ridges=1 still produces ridge-like output.
+  if (u.ridges > 0.001 && typeIdx != 1) {
+    let r = _ridges_noise(p, nOcts, lac, gn);
+    n = mix(n, r, clamp(u.ridges, 0.0, 1.0));
+  }
+
+  // 4. Continental mask (radial falloff). Pushes the edges of the
+  //    UV toward 0, leaving an island / continent-shaped landmass
+  //    centered on the UV space. Strength controls falloff
+  //    steepness: 0.3 = soft coastal fade, 1.0 = strong island.
+  if (u.continentMask > 0.001) {
+    let center = in.uv - vec2f(0.5);
+    let d = length(center) * 2.0;
+    let edge = pow(clamp(1.0 - d, 0.0, 1.0), 1.0 + u.continentMask * 3.0);
+    n = mix(0.0, n, edge);
+  }
+
+  // 5. Erosion fakery via power remapping. Raises noise to a
+  //    power > 1 to settle valleys (push low values lower) while
+  //    keeping peaks. Doesn't simulate actual hydraulic / thermal
+  //    erosion; imitates the silhouette result cheaply.
+  if (u.erosion > 0.001) {
+    let nc = clamp(n, 0.0, 1.0);
+    let exponent = 1.0 + u.erosion * 2.0;
+    n = pow(nc, exponent);
+  }
+
+  // 6. Terrace quantization (plateau / mesa look). 8-step
+  //    quantization blended with the smooth value by terrace
+  //    weight. 0 = smooth, 1 = full plateaus.
+  if (u.terrace > 0.001) {
+    let steps: f32 = 8.0;
+    let nc = clamp(n, 0.0, 1.0);
+    let quantized = floor(nc * steps) / max(steps - 1.0, 1.0);
+    n = mix(nc, quantized, clamp(u.terrace, 0.0, 1.0));
+  }
+
+  let h = clamp(n, 0.0, 1.0);
   return vec4f(h, h, h, 1.0);
 }`,
     writeUniforms(node, scratch) {
       const p = node.params || {};
+      // type dropdown -- map enum string to numeric index for shader.
+      const TYPE_MAP = { "fbm": 0, "ridges": 1, "billowy": 2 };
+      const typeIdx = (typeof p.type === "string" && TYPE_MAP[p.type] !== undefined)
+                    ? TYPE_MAP[p.type] : 0;
       scratch[16] = (typeof p.seed       === "number") ? p.seed       : 1.234;
       scratch[17] = (typeof p.frequency  === "number") ? p.frequency  : 4.0;
       scratch[18] = (typeof p.octaves    === "number") ? p.octaves    : 5.0;
       scratch[19] = (typeof p.lacunarity === "number") ? p.lacunarity : 2.0;
       scratch[20] = (typeof p.gain       === "number") ? p.gain       : 0.5;
       scratch[21] = (typeof p.ridges     === "number") ? p.ridges     : 0.0;
-      scratch[22] = 0;
-      scratch[23] = 0;
+      scratch[22] = typeIdx;
+      scratch[23] = (typeof p.warpAmount    === "number") ? p.warpAmount    : 0.0;
+      scratch[24] = (typeof p.warpFreq      === "number") ? p.warpFreq      : 1.0;
+      scratch[25] = (typeof p.erosion       === "number") ? p.erosion       : 0.0;
+      scratch[26] = (typeof p.continentMask === "number") ? p.continentMask : 0.0;
+      scratch[27] = (typeof p.terrace       === "number") ? p.terrace       : 0.0;
+      scratch[28] = 0; scratch[29] = 0; scratch[30] = 0; scratch[31] = 0;
     },
-    description: "Noise-based heightmap source for Terrain (Phase 7 §5.5.b). fBm + optional ridge multifractal. seed: changes the noise field. frequency: base cell count across the UV span (higher = smaller features). octaves: how many fBm bands stack (1-8). lacunarity: frequency multiplier per octave (~2 = standard). gain: amplitude multiplier per octave (~0.5 = standard). ridges: 0 = smooth fBm hills, 1 = sharp mountain ridges. Output is a single-channel texture (R=G=B=height ∈ [0,1]); wire into Terrain.heightmap or any other texture sink."
+    description: "Game-dev procedural heightmap (Phase 7 §5.5.b/c-3). type picks the base algorithm: 'fbm' (rolling hills, default), 'ridges' (sharp mountain crests via (1-|2n-1|)²), 'billowy' (puffy mounds). frequency / octaves / lacunarity / gain / seed are the standard fBm knobs; ridges is a secondary 0..1 mix that layers ridge math on top of any base type. Five post-processing layers stack on the base — each goes from no-op at 0 to fully applied at 1: warpAmount + warpFreq (domain warp — biggest single visual upgrade; turns stripey noise into meandering organic features); erosion (power remap that settles valleys); continentMask (radial falloff for island / continent shapes); terrace (8-step plateau quantization for mesa / cliff terrain). Wire `out` into Terrain.heightmap or any other texture sink. Recipes: mountains = type=ridges + erosion 0.4 + warpAmount 0.5. archipelago = type=ridges + continentMask 0.7 + warpAmount 0.3. mesa = type=fbm + terrace 0.7 + erosion 0.2. canyons = type=fbm + warpAmount 0.8 + erosion 0.6."
   },
 
   /* Phase 6.6.20.7 — WireframeCalibration. AlloSphere-style
@@ -31481,18 +31616,24 @@ const _demos = [
         ridges:     0.35
       });
       // ProceduralTerrain feeds the heightmap input -- vs_terrain
-      // samples this texture per-vertex for the Y displacement
-      // instead of running the noise CPU-side. Same fBm formula,
-      // same params; running on the GPU lets the heightmap update
-      // per-frame if any noise param is animated (e.g. seed wired
-      // to MasterClock for a slow morph).
+      // samples this texture per-vertex for Y displacement on the
+      // GPU instead of running noise CPU-side. v0.3.128 game-dev
+      // upgrade adds warpAmount (organic meandering) + erosion
+      // (settled valleys) on top of the ridge fbm for a more
+      // realistic mountain landscape.
       const proc = makeNode("ProceduralTerrain", -240, 40, {
-        seed:       7.42,
-        frequency:  2.5,
-        octaves:    6,
-        lacunarity: 2.05,
-        gain:       0.5,
-        ridges:     0.35
+        type:          "ridges",
+        seed:          7.42,
+        frequency:     2.5,
+        octaves:       6,
+        lacunarity:    2.05,
+        gain:          0.5,
+        ridges:        0.0,        // base already ridges via type
+        warpAmount:    0.35,
+        warpFreq:      0.6,
+        erosion:       0.35,
+        continentMask: 0.0,
+        terrace:       0.0
       });
       // TerrainMaterial: altitude- and slope-blended bands so the
       // valleys read as sand, mid-slopes as grass, upper slopes
