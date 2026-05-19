@@ -19954,6 +19954,78 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
    * BlendShader in screen mode).
    * ======================================================================== */
 
+  /* MotionBlur — temporal smoothing. Blends the previous frame on
+   * top of the current at `amount` (0..1) so fast camera motion
+   * smears across multiple frames. Cheap (no per-pixel velocity
+   * sampling, just temporal accumulation). Useful as polish for
+   * walkable-terrain demos where chunk pop-in or fast turns look
+   * choppy. amount=0 = pass-through, amount=0.5 = noticeable trail,
+   * amount=0.85+ = exaggerated streaking ("ghost" effect). */
+  MotionBlur: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition-feedback",
+    ins: [
+      { n: "in",     t: "texture" },
+      { n: "amount", t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16 },
+    params: { inLayer: 0, amount: 0.35 },
+    methods: {},
+    uniformBytes: 96,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  params:        vec4f,    // x=inLayer, y=amount, zw=_
+  _pad1:         vec4f,
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory:  texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler:  sampler;
+@group(0) @binding(4) var fbFeedback: texture_2d_array<f32>;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layer  = u32(max(0.0, u.params.x));
+  let amount = clamp(u.params.y, 0.0, 0.98);     // cap so we never freeze
+  // Current frame: read from the composition chain (fbHistory at
+  // the input layer = whatever was wired into `in`).
+  let cur = textureSampleLevel(fbHistory, fbSampler, in.uv, layer, 0.0);
+  // Previous frame: this MotionBlur's OWN output last frame, lives
+  // at u_layer in fbFeedback (the composition-feedback binding).
+  let outLayer = u32(max(0.0, u.u_layer));
+  let prev = textureSampleLevel(fbFeedback, fbSampler, in.uv, outLayer, 0.0);
+  return mix(cur, prev, amount);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      scratch[16] = (typeof p.inLayer === "number") ? p.inLayer : 0;
+      scratch[17] = (typeof p.amount  === "number") ? p.amount  : 0.35;
+      scratch[18] = 0; scratch[19] = 0;
+    },
+    description: "Temporal motion blur. Blends the previous frame on top of the current at `amount` (0..1). amount=0 is pass-through; amount=0.35 smooths fast camera motion without leaving heavy trails; amount=0.7+ leaves visible ghost trails. Cheap (single texture-sample feedback, no velocity reconstruction). Pair with FPCamera turning quickly to mask chunk-pop or LOD-shimmer artifacts."
+  },
+
   /* DirectionalBlur — 13-tap Gaussian-weighted samples along a single
    * axis. Motion-blur look (horizontal scroll, vertical streaks, etc).
    * Direction is angle in degrees; length is the half-extent of the
@@ -32133,7 +32205,11 @@ const _demos = [
       const scn = makeNode("Scene", 760, 80, {
         clearR: 0.62, clearG: 0.75, clearB: 0.88
       });
-      const vo = makeNode("VisualOutput", 1000, 80, { display: 0 });
+      // §5.5.e-7 MotionBlur smooths fast camera turns / chunk pop-in.
+      // amount=0.30 is light -- noticeable on quick sweeps, invisible
+      // on slow movement. Crank to 0.6+ for stylized "speed-feel".
+      const mb = makeNode("MotionBlur", 940, 80, { amount: 0.30 });
+      const vo = makeNode("VisualOutput", 1140, 80, { display: 0 });
       // §5.5.e-4 Minimap HUD node. Renders the actual terrain top-
       // down (heightmap colored by altitude) + camera dot + heading
       // into a fixed-position overlay. Multiple HUD nodes will share
@@ -32151,7 +32227,8 @@ const _demos = [
       state.edges.push({ from: { node: mat, port: "mesh"   }, to: { node: scn, port: "mesh1"  } });
       state.edges.push({ from: { node: cam, port: "camera" }, to: { node: scn, port: "camera" } });
       state.edges.push({ from: { node: light, port: "light"} , to: { node: scn, port: "light1" } });
-      state.edges.push({ from: { node: scn, port: "out"    }, to: { node: vo,  port: "in"     } });
+      state.edges.push({ from: { node: scn, port: "out"    }, to: { node: mb,  port: "in"     } });
+      state.edges.push({ from: { node: mb,  port: "out"    }, to: { node: vo,  port: "in"     } });
     }
   },
 
@@ -45696,6 +45773,26 @@ function _tickFPCameras(dt) {
       pz += (dz / l) * step;
     }
 
+    // §5.5.f-2 -- track player's WALKING direction (low-pass filtered
+    // 2D unit vector in XZ plane). Used by TiledTerrain forwardBias
+    // to shift the loaded disc in the direction the player is moving,
+    // NOT the direction they're looking. So turning your head doesn't
+    // reload chunks. The smoothing time constant (~0.7s) is also a
+    // natural form of hysteresis -- the bias direction only crosses
+    // a 45° quantum after the player has been moving that way for a
+    // while.
+    const horizMoveLen = Math.hypot(dx, dz);
+    if (horizMoveLen > 0.001) {
+      const ndx = dx / horizMoveLen, ndz = dz / horizMoveLen;
+      const tcFactor = Math.min(1, dt * 1.5);   // 1/τ ≈ 1.5 → τ ≈ 0.67s
+      const wdx0 = (typeof p.walkDirX === "number") ? p.walkDirX : ndx;
+      const wdz0 = (typeof p.walkDirZ === "number") ? p.walkDirZ : ndz;
+      p.walkDirX = wdx0 + (ndx - wdx0) * tcFactor;
+      p.walkDirZ = wdz0 + (ndz - wdz0) * tcFactor;
+    }
+    // (No update when stationary -- keep last walk direction so the
+    // disc stays put while the player pauses or looks around.)
+
     // Walk mode: lock Y to terrain surface + eyeHeight, sampled
     // from the patch's first TiledTerrain. Falls through (keeps
     // computed py) when no terrain is wired.
@@ -52845,19 +52942,38 @@ function _tiledTerrainCenterTile(node) {
   const a = _tiledTerrainAnchor(node);
   let cx = a.cx;
   let cz = a.cz;
-  // §5.5.e-6 -- forward bias. Shifts the loaded-disc center toward
-  // the camera's look direction so the player sees further forward
-  // than behind (asymmetric loading). Yaw is quantized to 8 cardinal
-  // directions so small head-turns don't churn the chunk cache.
+  // §5.5.e-7 -- forward bias. Shifts the loaded-disc center toward
+  // the player's WALKING direction (NOT look direction). Walking
+  // direction is a low-pass-filtered unit vector tracked by the
+  // FPCamera tick; turning your head doesn't move it, so look-only
+  // turns don't churn the chunk cache. Direction is quantized to
+  // 8 cardinal directions so the disc only re-shifts after the
+  // player has been walking that way long enough to cross a 45°
+  // quantum.
   const forwardBias = Math.max(0, Math.min(1, (typeof p.forwardBias === "number") ? p.forwardBias : 0));
   if (forwardBias > 0 && state && Array.isArray(state.nodes)) {
     const cam = state.nodes.find(n => n && (n.type === "FPCamera" || n.type === "Camera"));
-    if (cam && cam.params && typeof cam.params.yaw === "number") {
+    if (cam && cam.params) {
+      let bx, bz;
+      if (typeof cam.params.walkDirX === "number" &&
+          typeof cam.params.walkDirZ === "number" &&
+          (cam.params.walkDirX !== 0 || cam.params.walkDirZ !== 0)) {
+        bx = cam.params.walkDirX;
+        bz = cam.params.walkDirZ;
+      } else if (typeof cam.params.yaw === "number") {
+        // No walk-dir cached yet -- fall back to look direction so
+        // the first frame has a sensible bias.
+        bx = Math.sin(cam.params.yaw);
+        bz = Math.cos(cam.params.yaw);
+      } else {
+        bx = 0; bz = 1;
+      }
+      const angle = Math.atan2(bx, bz);
       const q = Math.PI / 4;                          // 45° quantum
-      const yawQ = Math.round(cam.params.yaw / q) * q;
+      const angleQ = Math.round(angle / q) * q;
       const shift = forwardBias * radius * chunkSize;
-      cx += Math.sin(yawQ) * shift;
-      cz += Math.cos(yawQ) * shift;
+      cx += Math.sin(angleQ) * shift;
+      cz += Math.cos(angleQ) * shift;
     }
   }
   return {
@@ -53182,8 +53298,9 @@ function _ensureTiledTerrainChunks(node) {
 
   // Build new chunks under a per-frame time budget so tile-crossings
   // amortize across several frames instead of producing one big stall.
-  // 6ms cap leaves room for the rest of the render frame at 60fps.
-  const BUILD_BUDGET_MS = 6;
+  // 10ms cap clears backlog faster (player still gets ~50fps even on
+  // worst-case frames; transient builds are usually <2 chunks anyway).
+  const BUILD_BUDGET_MS = 10;
   const buildStart = performance.now();
   let built = 0;
   for (const [key, info] of visible) {
