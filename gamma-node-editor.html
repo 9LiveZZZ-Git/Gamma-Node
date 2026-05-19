@@ -10948,6 +10948,44 @@ public:
     description: "Phase 7 §5.5.e chunked terrain at mountain scale with per-chunk streaming. Each chunk has its own VBO+IBO and is built incrementally (~10ms budget per frame); crossing tile boundaries doesn't stall. As the camera moves, chunks leaving the visible disc are destroyed and new chunks build in their place. Per-chunk frustum culling skips off-view chunks at draw time. 5-ring distance-LOD (24/12/6/3/2 segments) with vertical skirts masking T-junction seams. World-space fBm sampling: seams are exact along same-LOD edges, skirts cover gaps at LOD edges. Defaults are mountain-scale at 1u=1m: chunkSize=64m, chunkRadius=8, segments=24, heightScale=80m. plateau (0..1) flattens low/mid altitudes for isolated peaks in plains. forwardBias (0..1) shifts the loaded disc toward the player's walk direction (8-cardinal-direction snap with 700ms hysteresis) so they see further forward than behind. erosionStrength (0..1) bakes a hydraulic+thermal erosion pass into the chunk mesh at build time -- carves ridges + settles valleys with no per-frame cost. Pair with TerrainMaterial + FPCamera. Drop a Minimap node + wire it to Scene.hud1 for a top-down overlay. Open the ⚙ Tiling Config popup on the node for the full knob set + a live preview. Anchor mode = manual locks the grid origin to (centerX, centerZ) instead of camera-follow."
   },
 
+  /* Phase 7 §5.5.h-23 -- TerrainHorizon. Single low-poly mesh that
+   * extends terrain coverage far past the chunked TiledTerrain disc.
+   * Samples the SAME noise field at lower octaves + skips erosion,
+   * so the big-shape mountain silhouettes match TiledTerrain at the
+   * inner-edge meeting line. Camera-follows in coarse macro-tile
+   * steps (default 10km) -- mesh stays put within a tile, jumps to a
+   * new center when the camera crosses a tile boundary. Per-vertex
+   * altitude-band coloring is baked in (sand / grass / rock / snow)
+   * so the impostor doesn't need a TerrainMaterial; renders with the
+   * default fs_unlit_vc pipeline, dirt-cheap.
+   *
+   * Bridges TODAY's 16km chunked disc to ~100km out, and is the
+   * geometric foundation for the future planet-curvature blend (the
+   * single mesh can be vertex-shader-warped into a sphere section
+   * progressively as the camera flies high). */
+  TerrainHorizon: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "mesh-gen",
+    ins: [
+      { n: "extent",       t: "param" },
+      { n: "subdivisions", t: "param" },
+      { n: "tileSize",     t: "param" },
+      { n: "yBias",        t: "param" },
+      { n: "octaves",      t: "param" }
+    ],
+    outs: [{ n: "mesh", t: "mesh" }],
+    params: {
+      extent:       100000,   // 100km mesh extent
+      subdivisions: 96,       // 97x97 verts = ~9.4k; ~1km per vertex
+      tileSize:     10000,    // macro-tile snap; rebuild only on crossing
+      yBias:        -0.5,     // lower vs. TiledTerrain so inner overlap loses depth test
+      octaves:      3         // <= upstream TiledTerrain octaves; cheap noise
+    },
+    methods: {},
+    description: "Low-poly terrain impostor that extends visible coverage past TiledTerrain's chunked disc out to ~50km from the camera. Auto-detects the patch's TiledTerrain and samples the same noise (capped at `octaves`, no erosion) so big-shape silhouettes match the chunked disc at the inner-edge meeting line. Macro-tile camera-follow (default 10km) keeps the mesh roughly centered without per-frame rebuilds. Per-vertex altitude colors baked in so it renders unlit-vc with no material wire needed. `yBias` is a small downward offset (default -0.5m) so the chunked terrain wins the depth test in the overlap zone."
+  },
+
   /* Phase 7 §5.5.h -- Water. Mesh-gen + baked-in water material.
    * Emits a single huge XZ plane at Y = seaLevel (100km × 100km --
    * effectively infinite for any walking session). Material is
@@ -32729,6 +32767,18 @@ const _demos = [
       // mesh so the standard projection pipeline handles parallax
       // (under both translation AND rotation) without any of the
       // angular-distortion games the sky-pass shell had to play.
+      // §5.5.h-23 -- TerrainHorizon impostor. Extends terrain coverage
+      // past the chunked TiledTerrain disc out to ~50km. Lower octaves
+      // (3) keep build cheap; macro-tile follow (10km) means rebuild
+      // only every ~5 chunks of camera travel. yBias=-0.5 ensures
+      // chunked TiledTerrain wins the depth test in overlap zone.
+      const horizon = makeNode("TerrainHorizon", 280, 680, {
+        extent:       100000,
+        subdivisions: 96,
+        tileSize:     10000,
+        yBias:        -0.5,
+        octaves:      3
+      });
       const clouds = makeNode("Clouds3D", 40, 680, {
         // §5.5.h-18 -- chunked cloud streaming with rounded tops AND
         // bottoms. 1.8km chunks × 11×11 disc -> 20km visible cloud
@@ -32786,6 +32836,12 @@ const _demos = [
       // §5.5.h-14 -- Clouds3D as a third mesh slot. Like Water, the
       // node bakes fs_clouds into the encoder; no Material wire.
       state.edges.push({ from: { node: clouds, port: "mesh" }, to: { node: scn, port: "mesh3" } });
+      // §5.5.h-23 -- TerrainHorizon impostor as a fourth mesh slot.
+      // Renders unlit-vc with baked altitude-band colors -- no Material
+      // wire needed. Goes BEFORE Water in the slot order so when both
+      // are in view (e.g. the impostor's sea-floor floor below the
+      // ocean), water draws over it instead of vice versa.
+      state.edges.push({ from: { node: horizon, port: "mesh" }, to: { node: scn, port: "mesh4" } });
       // §5.5.h-5 -- explicit terrain reference wire. Water's
       // heightmap input takes a TiledTerrain reference so the
       // shader can sample the same LOD-discretized field the
@@ -53680,6 +53736,25 @@ function _meshCacheKey(node) {
         wired ? "g" : "c"
       ].join(",");
     }
+    case "TerrainHorizon": {
+      // §5.5.h-23 -- include the macro-tile in the key so crossing
+      // tileSize triggers a rebuild centered on the new tile. Also
+      // include the upstream TiledTerrain's noise params so the
+      // horizon stays in sync with the chunked disc.
+      const tile = _terrainHorizonMacroTile(node);
+      const tt = (state && Array.isArray(state.nodes))
+        ? state.nodes.find(n => n && n.type === "TiledTerrain") : null;
+      const ttp = (tt && tt.params) || {};
+      const ip  = tt ? _findTiledIslandParams(tt) : null;
+      return "thr:" + [
+        p.extent, p.subdivisions, p.tileSize, p.yBias, p.octaves,
+        tile.tx, tile.tz,
+        ttp.seed, ttp.frequency, ttp.octaves, ttp.lacunarity, ttp.gain,
+        ttp.ridges, ttp.plateau, ttp.heightScale, ttp.yOffset,
+        ip ? (ip.mode + ":" + ip.maskFreq + ":" + ip.maskSeed + ":" + ip.maskThreshold +
+              ":" + ip.maskSoftness + ":" + ip.sinkDepth) : "i0"
+      ].join(",");
+    }
     // TiledTerrain doesn't use _meshCacheKey -- _ensureTiledTerrainChunks
     // manages its own per-chunk cache keyed by (tileX, tileZ, lod).
     case "Water":         {
@@ -53710,7 +53785,8 @@ function _buildMeshData(node) {
     case "Cylinder":      return _buildCylinder(node);
     case "Cone":          return _buildCone(node);
     case "Terrain":       return _buildTerrain(node);
-    case "Water":         return _buildWater(node);
+    case "Water":            return _buildWater(node);
+    case "TerrainHorizon":   return _buildTerrainHorizon(node);
     // Clouds3D handled by the chunked streaming path in
     // _ensureMeshBuffers; not reachable here.
     default: return null;
@@ -54389,6 +54465,160 @@ function _buildWater(node) {
     -half, seaY,  half,   0.2, 0.4, 0.6,   0, 1, 0,   -half,  half
   ]);
   const indices = new Uint32Array([0, 1, 2,  0, 2, 3]);
+  return { verts, indices };
+}
+
+/* Phase 7 §5.5.h-23 -- TerrainHorizon. Macro-tile camera-follow helper. */
+function _terrainHorizonMacroTile(node) {
+  const p = node.params || {};
+  const tileSize = Math.max(1000, (typeof p.tileSize === "number") ? p.tileSize : 10000);
+  let cx = 0, cz = 0;
+  if (state && Array.isArray(state.nodes)) {
+    const cam = state.nodes.find(n => n && (n.type === "FPCamera" || n.type === "Camera"));
+    if (cam && cam.params) {
+      if (typeof cam.params.posX === "number") cx = cam.params.posX;
+      if (typeof cam.params.posZ === "number") cz = cam.params.posZ;
+    }
+  }
+  return {
+    tx: Math.floor(cx / tileSize),
+    tz: Math.floor(cz / tileSize),
+    tileSize
+  };
+}
+
+/* TerrainHorizon mesh builder. One subdivided plane covering `extent`
+ * world units centered on the camera's current macro-tile. Samples the
+ * upstream TiledTerrain's noise (capped at `octaves` for cheapness,
+ * skipping erosion) so silhouettes match the chunked disc at their
+ * meeting line. Per-vertex altitude-banded colors so it can render
+ * unlit-vc without a separate Material node. */
+function _buildTerrainHorizon(node) {
+  const p = node.params || {};
+  const extent  = Math.max(10000, (typeof p.extent === "number") ? p.extent : 100000);
+  const segs    = Math.max(8, Math.min(256, Math.floor((typeof p.subdivisions === "number") ? p.subdivisions : 96)));
+  const yBias   = (typeof p.yBias === "number") ? p.yBias : -0.5;
+  const octCap  = Math.max(1, Math.min(6, Math.floor((typeof p.octaves === "number") ? p.octaves : 3)));
+
+  // Pull noise from any TiledTerrain in the patch. Without one, the
+  // impostor falls back to a flat sea-level plane (still useful as a
+  // distance-fading horizon, even with no terrain wired).
+  let tt = null;
+  if (state && Array.isArray(state.nodes)) {
+    tt = state.nodes.find(n => n && n.type === "TiledTerrain") || null;
+  }
+  const ttp = (tt && tt.params) || {};
+  const noise = tt ? {
+    seed:        (typeof ttp.seed       === "number") ? ttp.seed       : 7.42,
+    frequency:   (typeof ttp.frequency  === "number") ? ttp.frequency  : 0.0008,
+    octaves:     Math.min(octCap, (typeof ttp.octaves === "number") ? ttp.octaves : 5),
+    lacunarity:  (typeof ttp.lacunarity === "number") ? ttp.lacunarity : 2.0,
+    gain:        (typeof ttp.gain       === "number") ? ttp.gain       : 0.5,
+    ridges:      (typeof ttp.ridges     === "number") ? ttp.ridges     : 0,
+    plateau:     (typeof ttp.plateau    === "number") ? ttp.plateau    : 0,
+    islandParams: _findTiledIslandParams(tt)
+  } : null;
+  const hs   = tt ? ((typeof ttp.heightScale === "number") ? ttp.heightScale : 80) : 0;
+  const yOff = tt ? ((typeof ttp.yOffset    === "number") ? ttp.yOffset    : 0) : 0;
+
+  const macro = _terrainHorizonMacroTile(node);
+  const centerX = macro.tx * macro.tileSize + macro.tileSize * 0.5;
+  const centerZ = macro.tz * macro.tileSize + macro.tileSize * 0.5;
+  const half    = extent * 0.5;
+  const step    = extent / segs;
+  const side    = segs + 1;
+  const vertCount = side * side;
+
+  // Pass 1: sample heights so pass 2 can compute normals via finite
+  // difference. Cheap reuse of the existing _tiledFinalY (erosion is
+  // gated inside _tiledTerrainHeightAt, off when noise.erosionParams
+  // is null -- which is always true for the horizon since we don't
+  // copy it from TiledTerrain).
+  const heightArr = new Float32Array(vertCount);
+  for (let iz = 0; iz <= segs; iz++) {
+    const wz = centerZ - half + iz * step;
+    for (let ix = 0; ix <= segs; ix++) {
+      const wx = centerX - half + ix * step;
+      const vi = iz * side + ix;
+      heightArr[vi] = tt ? _tiledFinalY(wx, wz, noise, hs, yOff) + yBias : yOff + yBias;
+    }
+  }
+
+  // Pass 2: emit verts with normals + altitude-band colors.
+  const verts   = new Float32Array(vertCount * 11);
+  const indices = new Uint32Array(segs * segs * 6);
+  const sand   = [0.78, 0.72, 0.52];
+  const grass  = [0.36, 0.50, 0.28];
+  const rock   = [0.55, 0.50, 0.45];
+  const snow   = [0.97, 0.97, 0.99];
+  function lerp3(a, b, t) {
+    return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+  }
+  for (let iz = 0; iz <= segs; iz++) {
+    for (let ix = 0; ix <= segs; ix++) {
+      const vi = iz * side + ix;
+      const wx = centerX - half + ix * step;
+      const wz = centerZ - half + iz * step;
+      const y  = heightArr[vi];
+      // Central difference normal.
+      const ixn = (ix > 0)     ? ix - 1 : ix;
+      const ixp = (ix < segs)  ? ix + 1 : ix;
+      const izn = (iz > 0)     ? iz - 1 : iz;
+      const izp = (iz < segs)  ? iz + 1 : iz;
+      const yL  = heightArr[iz * side + ixn];
+      const yR  = heightArr[iz * side + ixp];
+      const yU  = heightArr[izn * side + ix];
+      const yD  = heightArr[izp * side + ix];
+      const dx  = (ixp - ixn) * step || 1;
+      const dz  = (izp - izn) * step || 1;
+      let nx = -(yR - yL) / dx;
+      let ny = 1;
+      let nz = -(yD - yU) / dz;
+      const nl = Math.hypot(nx, ny, nz);
+      if (nl > 1e-6) { nx /= nl; ny /= nl; nz /= nl; }
+      // Altitude band color. Normalized vs. yOff and heightScale so
+      // higher peaks read snowy regardless of the absolute scale.
+      const altAbove = Math.max(0, y - yOff);
+      const altNorm = Math.min(1, altAbove / Math.max(1, hs));
+      let col;
+      if (altNorm < 0.15) {
+        col = lerp3(sand, grass, altNorm / 0.15);
+      } else if (altNorm < 0.55) {
+        col = lerp3(grass, rock, (altNorm - 0.15) / 0.40);
+      } else {
+        col = lerp3(rock, snow, Math.min(1, (altNorm - 0.55) / 0.30));
+      }
+      // Below-sea-level vertices render as deep-water blue so the
+      // impostor doesn't look like dry brown sea floor at distance.
+      if (y < yOff - 5) {
+        col = [0.08, 0.18, 0.32];
+      }
+      const base = vi * 11;
+      verts[base + 0] = wx;
+      verts[base + 1] = y;
+      verts[base + 2] = wz;
+      verts[base + 3] = col[0];
+      verts[base + 4] = col[1];
+      verts[base + 5] = col[2];
+      verts[base + 6] = nx;
+      verts[base + 7] = ny;
+      verts[base + 8] = nz;
+      verts[base + 9] = ix / segs;
+      verts[base + 10] = iz / segs;
+    }
+  }
+
+  let idx = 0;
+  for (let iz = 0; iz < segs; iz++) {
+    for (let ix = 0; ix < segs; ix++) {
+      const v00 = iz * side + ix;
+      const v10 = v00 + 1;
+      const v01 = v00 + side;
+      const v11 = v01 + 1;
+      indices[idx++] = v00; indices[idx++] = v01; indices[idx++] = v10;
+      indices[idx++] = v10; indices[idx++] = v01; indices[idx++] = v11;
+    }
+  }
   return { verts, indices };
 }
 
