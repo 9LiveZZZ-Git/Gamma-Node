@@ -20222,6 +20222,128 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     description: "Temporal motion blur. Blends the previous frame on top of the current at `amount` (0..1). amount=0 is pass-through; amount=0.35 smooths fast camera motion without leaving heavy trails; amount=0.7+ leaves visible ghost trails. Cheap (single texture-sample feedback, no velocity reconstruction). Pair with FPCamera turning quickly to mask chunk-pop or LOD-shimmer artifacts."
   },
 
+  /* Underwater — Phase 7 §5.5.h-22. Post-process tint + depth fog
+   * applied when the patch's first FPCamera/Camera is below seaLevel.
+   * Auto-detects via state lookup in writeUniforms; pass-through above
+   * water. Tint deepens with depth (more blue + lower visibility the
+   * deeper you go). Wire AFTER Scene's post chain, before the final
+   * output node. */
+  Underwater: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "shader-frag",
+    bindLayout: "composition",
+    ins: [
+      { n: "in",          t: "texture" },
+      { n: "seaLevel",    t: "param" },
+      { n: "tintR",       t: "param" },
+      { n: "tintG",       t: "param" },
+      { n: "tintB",       t: "param" },
+      { n: "fogDensity",  t: "param" },
+      { n: "maxDepth",    t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    textureInputSlots: { in: 16 },
+    params: {
+      inLayer:    0,
+      seaLevel:   0,
+      tintR:      0.10, tintG: 0.30, tintB: 0.45,
+      fogDensity: 0.85,
+      maxDepth:   80
+    },
+    methods: {},
+    uniformBytes: 112,
+    wgsl:
+`struct U {
+  u_resolution:  vec4f,
+  u_time:        f32,
+  u_dt:          f32,
+  u_layer:       f32,
+  u_fov_v_deg:   f32,
+  u_view:        vec4f,
+  u_world_uv:    vec4f,
+  // p.x = inLayer
+  // p.y = camDepth (sea - camY; positive when underwater, <=0 above)
+  // p.z = fogDensity (how strongly the tint blends in with depth)
+  // p.w = maxDepth (depth at which tint maxes out)
+  params:        vec4f,
+  // tint.rgb = underwater color, tint.a = unused
+  tint:          vec4f,
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var fbHistory: texture_2d_array<f32>;
+@group(0) @binding(2) var fbSampler: sampler;
+
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  let pos = p[vi];
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv  = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  let layer = u32(max(0.0, u.params.x));
+  let depth = u.params.y;
+  // Above water -> straight pass-through, zero cost.
+  if (depth <= 0.0) {
+    return textureSampleLevel(fbHistory, fbSampler, in.uv, layer, 0.0);
+  }
+  let fogD = max(0.0, u.params.z);
+  let maxD = max(1.0, u.params.w);
+  let depthN = clamp(depth / maxD, 0.0, 1.0);
+  // Subtle UV wobble for the "looking through water" feel. Amplitude
+  // scales with depth so the wobble grows as you go deeper.
+  let wob = 0.0035 * depthN;
+  let warpedU = in.uv + vec2f(sin(in.uv.y * 38.0 + u.u_time * 1.7) * wob,
+                              cos(in.uv.x * 32.0 + u.u_time * 1.3) * wob);
+  let src = textureSampleLevel(fbHistory, fbSampler, warpedU, layer, 0.0).rgb;
+  // Blend toward the tint; deeper = more saturated tint. Fog density
+  // controls how aggressively the tint takes over.
+  let blendT = clamp(depthN * fogD, 0.0, 0.98);
+  let tinted = mix(src, u.tint.rgb, blendT);
+  // Light-from-above shaft suggestion: vertical brightness gradient
+  // makes upper pixels slightly brighter (sun streaming down through
+  // water) and lower pixels slightly darker. Cheap visual cue.
+  let upBias = (1.0 - in.uv.y) - 0.5;
+  let shafted = tinted * (1.0 + upBias * 0.12 * depthN);
+  return vec4f(shafted, 1.0);
+}`,
+    writeUniforms(node, scratch) {
+      const p = node.params || {};
+      const seaLevel = (typeof p.seaLevel === "number") ? p.seaLevel : 0;
+      // Detect underwater by looking up the patch's FPCamera/Camera
+      // and reading its posY. Falls back to 0 (above water) if nothing
+      // wired. Doing it here in JS keeps the shader stateless across
+      // patches without the AlloSphere/composition-uniform layout
+      // having to grow a camera-eye slot.
+      let camY = 0;
+      try {
+        if (typeof state !== "undefined" && state && Array.isArray(state.nodes)) {
+          const cam = state.nodes.find(n => n && (n.type === "FPCamera" || n.type === "Camera"));
+          if (cam && cam.params && typeof cam.params.posY === "number") {
+            camY = cam.params.posY;
+          }
+        }
+      } catch (_) { /* state not in scope */ }
+      const depth = Math.max(0, seaLevel - camY);
+      scratch[16] = (typeof p.inLayer    === "number") ? p.inLayer    : 0;
+      scratch[17] = depth;
+      scratch[18] = (typeof p.fogDensity === "number") ? p.fogDensity : 0.85;
+      scratch[19] = (typeof p.maxDepth   === "number") ? p.maxDepth   : 80;
+      scratch[20] = (typeof p.tintR      === "number") ? p.tintR      : 0.10;
+      scratch[21] = (typeof p.tintG      === "number") ? p.tintG      : 0.30;
+      scratch[22] = (typeof p.tintB      === "number") ? p.tintB      : 0.45;
+      scratch[23] = 0;
+    },
+    description: "Post-process underwater tint + depth fog + subtle UV wobble. Activates automatically when the patch's FPCamera/Camera posY is below seaLevel; above water it's a zero-cost pass-through. Tint deepens with how far below the surface the camera is (capped at maxDepth). Wire AFTER the Scene's post chain, before the final output node."
+  },
+
   /* DirectionalBlur — 13-tap Gaussian-weighted samples along a single
    * axis. Motion-blur look (horizontal scroll, vertical streaks, etc).
    * Direction is angle in degrees; length is the half-extent of the
@@ -32673,9 +32795,21 @@ const _demos = [
       state.edges.push({ from: { node: cam, port: "camera" }, to: { node: scn, port: "camera" } });
       state.edges.push({ from: { node: sun, port: "light"} ,  to: { node: scn, port: "light1" } });
       state.edges.push({ from: { node: sky, port: "env"   } , to: { node: scn, port: "environment" } });
-      state.edges.push({ from: { node: scn, port: "out"    }, to: { node: mb,  port: "in"     } });
-      state.edges.push({ from: { node: mb,  port: "out"    }, to: { node: vo,  port: "in"     } });
-      state.edges.push({ from: { node: map, port: "hud"    }, to: { node: scn, port: "hud1"   } });
+      // §5.5.h-22 -- post chain: Scene -> MotionBlur -> Underwater
+      // -> VisualOutput. Underwater is a zero-cost pass-through above
+      // sea level; when the camera dives below it kicks in with a
+      // blue tint, depth fog, and subtle UV wobble for the "you're
+      // submerged" look.
+      const uw = makeNode("Underwater", 1040, 80, {
+        seaLevel:   0,
+        tintR:      0.06, tintG: 0.24, tintB: 0.36,
+        fogDensity: 0.95,
+        maxDepth:   60
+      });
+      state.edges.push({ from: { node: scn, port: "out" }, to: { node: mb,  port: "in"  } });
+      state.edges.push({ from: { node: mb,  port: "out" }, to: { node: uw,  port: "in"  } });
+      state.edges.push({ from: { node: uw,  port: "out" }, to: { node: vo,  port: "in"  } });
+      state.edges.push({ from: { node: map, port: "hud" }, to: { node: scn, port: "hud1" } });
     }
   },
 
