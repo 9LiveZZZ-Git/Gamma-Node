@@ -52192,16 +52192,54 @@ fn fs_water(in: VsOut) -> @location(0) vec4<f32> {
     // distant patches. Shore + shallow tint visible to the horizon.
   }
 
-  // ---- Wave normal (two layered fBm UVs) ----
-  let uvA = wp.xz * waveFreq       + vec2<f32>( t * waveSpeed * 0.6,  t * waveSpeed * 0.4);
-  let uvB = wp.xz * waveFreq * 2.3 + vec2<f32>(-t * waveSpeed * 0.3,  t * waveSpeed * 0.5);
+  // ---- Wave normals: multi-scale + landmass-aware drift ----
+  // §5.5.h-20 -- three fBm layers (long swell, chop, fine ripple)
+  // each drifting in a different direction so the surface reads as
+  // a real hierarchy of motion instead of one big sloshing field.
+  // Drift gets BIASED by the island mask gradient so when shore is
+  // off to one side, the wave field bends TOWARD land -- waves
+  // approach the beach perpendicular instead of flowing straight
+  // past as if the island weren't there. Only sampled when the
+  // archipelago mask is active; open-ocean patches pay nothing.
+  var shoreBias = vec2<f32>(0.0);
+  if (archipel > 0.5) {
+    let dR = 90.0;
+    let mE_ = _tw_islandLand(wp.x + dR, wp.z, m_freq, m_seed, m_thresh, m_soft);
+    let mW_ = _tw_islandLand(wp.x - dR, wp.z, m_freq, m_seed, m_thresh, m_soft);
+    let mN_ = _tw_islandLand(wp.x, wp.z - dR, m_freq, m_seed, m_thresh, m_soft);
+    let mS_ = _tw_islandLand(wp.x, wp.z + dR, m_freq, m_seed, m_thresh, m_soft);
+    let grad = vec2<f32>((mE_ - mW_) * 0.5, (mS_ - mN_) * 0.5);
+    let gMag = length(grad);
+    let biasAmt = clamp(gMag * 5.0, 0.0, 1.0);
+    if (biasAmt > 0.0) {
+      shoreBias = normalize(grad + vec2<f32>(1e-6)) * biasAmt * waveSpeed * 1.4;
+    }
+  }
+  let driftA = vec2<f32>( t * waveSpeed * 0.6,  t * waveSpeed * 0.4) + t * shoreBias;
+  let driftB = vec2<f32>(-t * waveSpeed * 0.3,  t * waveSpeed * 0.5) + t * shoreBias * 0.7;
+  let driftC = vec2<f32>( t * waveSpeed * 0.9, -t * waveSpeed * 0.7) + t * shoreBias * 0.5;
+  let uvA = wp.xz * waveFreq        + driftA;
+  let uvB = wp.xz * waveFreq * 2.5  + driftB;
+  let uvC = wp.xz * waveFreq * 6.2  + driftC;
   let eps = 0.025;
-  let hC = _fbm(uvA)                          + _fbm(uvB) * 0.5;
-  let hX = _fbm(uvA + vec2<f32>(eps, 0.0))    + _fbm(uvB + vec2<f32>(eps, 0.0)) * 0.5;
-  let hZ = _fbm(uvA + vec2<f32>(0.0, eps))    + _fbm(uvB + vec2<f32>(0.0, eps)) * 0.5;
+  let hC = _fbm(uvA)
+         + _fbm(uvB) * 0.5
+         + _fbm(uvC) * 0.28;
+  let hX = _fbm(uvA + vec2<f32>(eps, 0.0))
+         + _fbm(uvB + vec2<f32>(eps, 0.0)) * 0.5
+         + _fbm(uvC + vec2<f32>(eps, 0.0)) * 0.28;
+  let hZ = _fbm(uvA + vec2<f32>(0.0, eps))
+         + _fbm(uvB + vec2<f32>(0.0, eps)) * 0.5
+         + _fbm(uvC + vec2<f32>(0.0, eps)) * 0.28;
+  // §5.5.h-20 -- shore amplitude fade. Wave chop tapers in shallow
+  // water so the surface lies flatter near the beach (real wave
+  // physics: friction with the seafloor damps amplitude before the
+  // wave breaks; here we just attenuate the normal perturbation).
+  let shoreAmpFade = clamp(depth / (shallowDp * 0.6), 0.25, 1.0);
+  let waveAmpEff = waveAmp * shoreAmpFade;
   let dx = (hX - hC) / eps;
   let dz = (hZ - hC) / eps;
-  let n = normalize(vec3<f32>(-dx * waveAmp, 1.0, -dz * waveAmp));
+  let n = normalize(vec3<f32>(-dx * waveAmpEff, 1.0, -dz * waveAmpEff));
 
   let v = normalize(uS.eye.xyz - in.worldPos);
 
