@@ -51729,6 +51729,15 @@ struct PerDraw {
   // tile -- otherwise water foam misaligns east/west of the
   // player when they look around. Other material shaders ignore.
   waterExtra:   vec4<f32>,
+  // §5.5.h-21 -- cloud-shadow params (Clouds3D node, if wired).
+  //   cloudExtra.x = cloud altitude (slab base Y)
+  //   cloudExtra.y = cloud coverage (0..1; 0 = disabled)
+  //   cloudExtra.z = cloud noise scale (world XZ frequency)
+  //   cloudExtra.w = cloud seed
+  // Read by fs_water to project the water pixel up along the sun
+  // ray and sample cloud density; if a cloud is overhead the water
+  // pixel is shadowed. Other material shaders ignore.
+  cloudExtra:   vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> uS: PerScene;
 @group(0) @binding(1) var<uniform> uD: PerDraw;
@@ -52030,6 +52039,25 @@ fn _tw_baseHeight(wx: f32, wz: f32, freq: f32, octs: i32, lac: f32, gain: f32, r
   }
   return h;
 }
+// §5.5.h-21 -- 4-octave fbm matched bit-for-bit with the JS-side
+// Clouds3D mesh build (_terrainValueNoise + the same 4-octave loop).
+// Used by fs_water to project water pixels up along the sun ray
+// and sample cloud density for shadow. Returns 0..1; threshold the
+// result against (1 - coverage) to get a binary in-cloud mask.
+fn _tw_cloudDensity(wx: f32, wz: f32, scale: f32, seed: f32) -> f32 {
+  var n: f32 = 0.0;
+  var amp: f32 = 0.5;
+  var freq: f32 = 1.0;
+  var maxAmp: f32 = 0.0;
+  for (var oct: i32 = 0; oct < 4; oct = oct + 1) {
+    n = n + amp * _tw_valueNoise(vec2<f32>(wx * scale * freq, wz * scale * freq), seed + f32(oct) * 3.7);
+    maxAmp = maxAmp + amp;
+    amp  = amp  * 0.55;
+    freq = freq * 2.07;
+  }
+  return n / max(1e-6, maxAmp);
+}
+
 fn _tw_islandLand(wx: f32, wz: f32, maskFreq: f32, maskSeed: f32, threshold: f32, softness: f32) -> f32 {
   let m = _tw_valueNoise(vec2<f32>(wx, wz) * maskFreq, maskSeed);
   let lo = threshold - softness;
@@ -52310,6 +52338,34 @@ fn fs_water(in: VsOut) -> @location(0) vec4<f32> {
                    * clamp(1.0 - depthN * 1.5, 0.0, 1.0);   // only near shore
   let foamAmt = clamp(staticFoam + movingFoam, 0.0, 1.0);
   outRGB = mix(outRGB, foamColor, foamAmt);
+
+  // §5.5.h-21 -- cloud shadows. Project this water pixel UP the sun
+  // ray to the cloud altitude and sample cloud density there; if a
+  // puff is overhead, darken the water + cut the sun glint. The
+  // cloud params come from any Clouds3D node in the patch (packed
+  // by the encoder into cloudExtra). coverage=0 disables. Skip
+  // entirely when the sun is below the horizon -- nothing to cast.
+  let cloudCov = uD.cloudExtra.y;
+  let sunUp    = max(0.0, sunDir.y);
+  if (cloudCov > 0.001 && sunUp > 0.05 && sunVis > 0.01) {
+    let cloudAlt = uD.cloudExtra.x;
+    let cScale   = uD.cloudExtra.z;
+    let cSeed    = uD.cloudExtra.w;
+    // Trace from water surface up to cloud altitude along the
+    // sun direction. dx/dz are the XZ offset to the sample point.
+    let tCloud = (cloudAlt - wp.y) / max(sunDir.y, 0.05);
+    let cx = wp.x + sunDir.x * tCloud;
+    let cz = wp.z + sunDir.z * tCloud;
+    let cn = _tw_cloudDensity(cx, cz, cScale, cSeed);
+    let lo = 1.0 - cloudCov;
+    let shadowAmt = smoothstep(lo - 0.08, lo + 0.10, cn);
+    // 0.50 max darkening keeps shadowed water still visible, just
+    // overcast. Multiply on top of the existing color (shadow tints
+    // toward a cooler dim variant of itself, not pure black).
+    let shadowTint = vec3<f32>(0.55, 0.62, 0.74);
+    let shadowMix  = mix(vec3<f32>(1.0), shadowTint, shadowAmt * 0.5);
+    outRGB = outRGB * shadowMix;
+  }
 
   let fogged = apply_fog(outRGB, in.worldPos);
   return vec4<f32>(tonemap_aces(fogged), 1.0);
@@ -55212,7 +55268,9 @@ function _ensureSceneInstance(sceneNode) {
       // v0.3.129 TerrainMaterial v2 -- grown 192 → 224 for
       // detailParams + bumpParams (AAA-style multi-scale detail
       // noise + slope-masked snow + procedural bump mapping).
-      size: 240,
+      // v0.3.171 §5.5.h-21 -- grown 240 → 256 for cloudExtra (sun-
+      // projected cloud-shadow params on water).
+      size: 256,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
     });
     // Sprint 7.5.4.b -- env texture (HDRI / Skybox) at bindings 4+5.
@@ -55250,7 +55308,7 @@ function _ensureSceneInstance(sceneNode) {
     // v0.3.129 -- 56 floats / 224 B. Slots [48..55] hold the
     // TerrainMaterial v2 detail + bump param blocks for AAA-
     // style multi-scale noise / procedural bump / snow masking.
-    drawScratch:  new Float32Array(60)
+    drawScratch:  new Float32Array(64)
   };
   Visual.sceneInstances.set(sceneNode.id, inst);
   return inst;
@@ -55663,6 +55721,23 @@ function _encodeScenePass(enc, entry) {
         inst.drawScratch[49] = 0; inst.drawScratch[50] = 0; inst.drawScratch[51] = 0;
         inst.drawScratch[52] = 0; inst.drawScratch[53] = 0;
       }
+      // §5.5.h-21 -- cloud-shadow params from any Clouds3D node in
+      // the patch. Slots 56..59 map to PerDraw.cloudExtra.xyzw =
+      // (altitude, coverage, scale, seed). coverage=0 disables the
+      // shadow path in fs_water.
+      let cl = null;
+      if (state && Array.isArray(state.nodes)) {
+        cl = state.nodes.find(n => n && n.type === "Clouds3D");
+      }
+      if (cl && cl.params) {
+        inst.drawScratch[56] = (typeof cl.params.altitude === "number") ? cl.params.altitude : 2500;
+        inst.drawScratch[57] = (typeof cl.params.coverage === "number") ? cl.params.coverage : 0;
+        inst.drawScratch[58] = (typeof cl.params.scale    === "number") ? cl.params.scale    : 0.0008;
+        inst.drawScratch[59] = (typeof cl.params.seed     === "number") ? cl.params.seed     : 11.3;
+      } else {
+        inst.drawScratch[56] = 0; inst.drawScratch[57] = 0;
+        inst.drawScratch[58] = 0; inst.drawScratch[59] = 0;
+      }
     }
     // §5.5.h-17 -- Clouds3D remap. fs_clouds is now a Phong-style
     // shader over a CPU-built displaced mesh. Reads:
@@ -55808,7 +55883,7 @@ function _encodeScenePass(enc, entry) {
       inst.drawScratch[42] = 0;
       inst.drawScratch[43] = 0;
     }
-    Visual.device.queue.writeBuffer(slot.perDrawBuffer, 0, inst.drawScratch.buffer, 0, 240);
+    Visual.device.queue.writeBuffer(slot.perDrawBuffer, 0, inst.drawScratch.buffer, 0, 256);
     // v0.3.120 -- pick the bind group whose binding 2 is OPPOSITE
     // parity to the scratch layer we're writing to. Prevents the
     // texture-as-binding-and-attachment aliasing that silently broke
