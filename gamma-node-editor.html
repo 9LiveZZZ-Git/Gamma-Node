@@ -56371,6 +56371,154 @@ function _planetClimate(cells, seaLevel) {
   }
 }
 
+/* §planet-spec Phase 7.e-rivers -- port Azgaar's hydrology
+ * (ref-azgaar-fmg/src/modules/river-generator.ts) to the spherical
+ * cell graph. Pipeline:
+ *
+ *   1. Depression filling (Planchon-Darboux iteration): for each
+ *      land cell, if the lowest neighbor is higher than this cell,
+ *      raise this cell to (lowest + ε) so water always has a path
+ *      downhill. Operates on a COPY of elevations so visible
+ *      terrain isn't perturbed.
+ *
+ *   2. Flow direction: each land cell's lowest neighbor on the
+ *      filled grid. Stored in cells.flowDir.
+ *
+ *   3. Flux accumulation: sort land cells by filled-height
+ *      descending (highest first). Each cell adds its
+ *      precipitation to its own flux, then donates the total
+ *      to its flow-target. Result: cells.flux[i] = total water
+ *      passing through cell i.
+ *
+ *   4. River extraction: cells with flux ≥ MIN_FLUX are river
+ *      cells. Walk forward from each "source" (river cell with
+ *      no upstream river inflow) along flowDir until the path
+ *      ends in ocean or merges into another river. cells.riverId
+ *      identifies which river each cell belongs to.
+ *
+ * Output: cells.filledH, cells.flowDir, cells.flux, cells.riverId,
+ * cells.riverPaths (Array<{cells: number[], mouthFlux: number}>). */
+function _planetRivers(cells, neighbors, K, seaLevel) {
+  const N = cells.count;
+  const filledH = new Float32Array(cells.elevations);
+
+  // Pass 1: depression filling.
+  const EPS = 1e-4;
+  const MAX_ITER = 40;
+  let iter;
+  for (iter = 0; iter < MAX_ITER; iter++) {
+    let changed = 0;
+    for (let i = 0; i < N; i++) {
+      if (filledH[i] < seaLevel) continue;
+      let lowest = Infinity;
+      for (let k = 0; k < K; k++) {
+        const j = neighbors[i * K + k];
+        if (j < 0) continue;
+        if (filledH[j] < lowest) lowest = filledH[j];
+      }
+      if (filledH[i] < lowest + EPS) {
+        filledH[i] = lowest + EPS;
+        changed++;
+      }
+    }
+    if (changed === 0) break;
+  }
+
+  // Pass 2: flow direction per cell.
+  const flowDir = new Int32Array(N).fill(-1);
+  for (let i = 0; i < N; i++) {
+    if (filledH[i] < seaLevel) continue;
+    let bestJ = -1, bestH = filledH[i];
+    for (let k = 0; k < K; k++) {
+      const j = neighbors[i * K + k];
+      if (j < 0) continue;
+      if (filledH[j] < bestH) { bestH = filledH[j]; bestJ = j; }
+    }
+    flowDir[i] = bestJ;
+  }
+
+  // Pass 3: flux accumulation. Sort land cells by filledH desc.
+  const flux = new Float32Array(N);
+  const landCells = [];
+  for (let i = 0; i < N; i++) {
+    if (cells.elevations[i] >= seaLevel) landCells.push(i);
+  }
+  landCells.sort(function(a, b) { return filledH[b] - filledH[a]; });
+  for (let idx = 0; idx < landCells.length; idx++) {
+    const i = landCells[idx];
+    const prec = cells.prec ? cells.prec[i] : 1.0;
+    flux[i] += Math.max(0.1, prec * 0.1);
+    const j = flowDir[i];
+    if (j >= 0 && filledH[j] >= seaLevel) {
+      flux[j] += flux[i];
+    }
+  }
+
+  cells.filledH = filledH;
+  cells.flowDir = flowDir;
+  cells.flux = flux;
+
+  // Pass 4: river extraction.
+  const MIN_FLUX = 30;
+  const isRiver = new Uint8Array(N);
+  for (let i = 0; i < N; i++) {
+    if (flux[i] >= MIN_FLUX && cells.elevations[i] >= seaLevel) isRiver[i] = 1;
+  }
+  const inDeg = new Int32Array(N);
+  for (let i = 0; i < N; i++) {
+    if (!isRiver[i]) continue;
+    const j = flowDir[i];
+    if (j >= 0 && isRiver[j]) inDeg[j]++;
+  }
+  const riverId = new Int32Array(N).fill(-1);
+  const riverPaths = [];
+  const visited = new Uint8Array(N);
+  let nextRiverId = 0;
+  for (let i = 0; i < N; i++) {
+    if (!isRiver[i] || inDeg[i] > 0 || visited[i]) continue;
+    const path = [];
+    let cur = i;
+    while (cur >= 0 && isRiver[cur] && !visited[cur]) {
+      path.push(cur);
+      visited[cur] = 1;
+      riverId[cur] = nextRiverId;
+      cur = flowDir[cur];
+    }
+    // Include the final ocean cell so the river visibly reaches the coast.
+    if (cur >= 0 && !isRiver[cur]) path.push(cur);
+    if (path.length >= 3) {
+      const mouthCell = path[path.length - 2];
+      riverPaths.push({ cells: path, mouthFlux: flux[mouthCell] || 0 });
+      nextRiverId++;
+    }
+  }
+  cells.riverId = riverId;
+  cells.riverPaths = riverPaths;
+
+  return {
+    riverCells: riverPaths.reduce(function(s, r) { return s + r.cells.length; }, 0),
+    riverCount: riverPaths.length,
+    depressionIters: iter
+  };
+}
+
+function _ensurePlanetRivers(pmapNode, seaLevel) {
+  if (!pmapNode || !pmapNode._cells || !pmapNode._cellNeighbors) return null;
+  const key = pmapNode._cellsKey + ":sea=" + seaLevel.toFixed(4) + ":r";
+  if (pmapNode._riversKey === key && pmapNode._cells.flux) return pmapNode._cells;
+  const t0 = (typeof performance !== "undefined") ? performance.now() : 0;
+  const stats = _planetRivers(pmapNode._cells, pmapNode._cellNeighbors, pmapNode._cellNeighborsK, seaLevel);
+  pmapNode._riversKey = key;
+  if (!Visual._planetRiversLogged) {
+    Visual._planetRiversLogged = true;
+    const dt = ((typeof performance !== "undefined") ? performance.now() : 0) - t0;
+    console.log("[planet-mesh] rivers computed in " + dt.toFixed(0) + "ms: "
+      + stats.riverCount + " rivers across "
+      + stats.riverCells + " cells (depression-fill " + stats.depressionIters + " iters)");
+  }
+  return pmapNode._cells;
+}
+
 function _ensurePlanetClimate(pmapNode, seaLevel) {
   if (!pmapNode || !pmapNode._cells) return null;
   const key = pmapNode._cellsKey + ":sea=" + seaLevel.toFixed(4);
@@ -57408,12 +57556,13 @@ function _buildPlanetMesh(node) {
   }
   const tris = pmap._cellTris;
 
-  // §planet-spec Phase 7.e -- compute climate + biomes once per
-  // (cellsKey, seaLevel) combination. Painter edits to elevation
-  // currently DO NOT invalidate this cache (cellsKey is stable
-  // across the painter's elevation tweaks); add an explicit
-  // bump if/when sub-cell biome edits are needed.
+  // §planet-spec Phase 7.e -- compute climate + biomes + rivers
+  // once per (cellsKey, seaLevel) combination. Painter edits to
+  // elevation currently DO NOT invalidate this cache (cellsKey is
+  // stable across the painter's elevation tweaks); add an explicit
+  // bump if/when sub-cell edits are needed.
   _ensurePlanetClimate(pmap, seaLevel);
+  _ensurePlanetRivers(pmap, seaLevel);
 
   // Build vertex array in three passes:
   //   Pass 1: compute displaced positions (cell radial + altitude).
@@ -57515,30 +57664,38 @@ function _buildPlanetMesh(node) {
     }
     const radialDot = nx * (px - cxC) + ny * (py - cyC) + nz * (pz - czC);
     if (radialDot < 0) { nx = -nx; ny = -ny; nz = -nz; }
-    // Per-vertex elevation + biome lookup: cell index for the first
-    // N vertices; mean / blend of the two endpoint cells for
-    // subdivided edge vertices. When climate has been computed we
-    // color by biome (Azgaar palette); else fall back to the
-    // elevation-band gradient.
+    // Per-vertex elevation + biome + river lookup. Cell index for
+    // the first N vertices; mean / blend of the two endpoint cells
+    // for subdivided edge vertices. River cells override the biome
+    // color with a flux-modulated blue (darker blue for big rivers,
+    // lighter for tributaries).
+    const RIVER_BLUE   = [0.20, 0.45, 0.75];
+    const RIVER_BIG    = [0.15, 0.32, 0.62];
     let h, baseCol;
+    const colorForCell = function(idx, elev) {
+      if (cells.riverId && cells.riverId[idx] >= 0 && cells.flux && elev >= seaLevel) {
+        // Map flux to blue intensity: larger river = darker, more saturated.
+        const flx = cells.flux[idx];
+        const t = Math.min(1, Math.max(0, (flx - 30) / 200));
+        return [
+          RIVER_BLUE[0] + (RIVER_BIG[0] - RIVER_BLUE[0]) * t,
+          RIVER_BLUE[1] + (RIVER_BIG[1] - RIVER_BLUE[1]) * t,
+          RIVER_BLUE[2] + (RIVER_BIG[2] - RIVER_BLUE[2]) * t
+        ];
+      }
+      if (cells.biome) return PLANET_BIOMES_COLORS[cells.biome[idx]];
+      return _planetColorForHeight(elev, seaLevel);
+    };
     if (i < N) {
       h = cells.elevations[i];
-      if (cells.biome) {
-        baseCol = PLANET_BIOMES_COLORS[cells.biome[i]];
-      } else {
-        baseCol = _planetColorForHeight(h, seaLevel);
-      }
+      baseCol = colorForCell(i, h);
     } else if (edgeParents) {
       const a = edgeParents[(i - N) * 2 + 0];
       const b = edgeParents[(i - N) * 2 + 1];
       h = 0.5 * (cells.elevations[a] + cells.elevations[b]);
-      if (cells.biome) {
-        const cA = PLANET_BIOMES_COLORS[cells.biome[a]];
-        const cB = PLANET_BIOMES_COLORS[cells.biome[b]];
-        baseCol = [0.5*(cA[0]+cB[0]), 0.5*(cA[1]+cB[1]), 0.5*(cA[2]+cB[2])];
-      } else {
-        baseCol = _planetColorForHeight(h, seaLevel);
-      }
+      const cA = colorForCell(a, cells.elevations[a]);
+      const cB = colorForCell(b, cells.elevations[b]);
+      baseCol = [0.5*(cA[0]+cB[0]), 0.5*(cA[1]+cB[1]), 0.5*(cA[2]+cB[2])];
     } else {
       h = seaLevel;
       baseCol = _planetColorForHeight(h, seaLevel);
