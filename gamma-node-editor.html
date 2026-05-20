@@ -32901,19 +32901,30 @@ const _demos = [
         radius:           PLANET_R,
         polarRadiusRatio: 0.9966,      // WGS84 Earth flattening (~21km bulge)
         centerX:          0,
-        centerY:          -PLANET_R - 5000,
+        // §planet-spec Phase 5+ -- Planet pole aligned with world Y=0
+        // so TiledTerrain's sea level sits exactly on the planet
+        // sphere surface. _buildSingleChunk's sphere projection
+        // depends on this: the spawn at (0,0,0) IS the planet pole.
+        centerY:          -PLANET_R,
         centerZ:          0,
         segments:         16,
         maxDepth:         9,           // ≈ 25km per leaf at the camera-facing point
         splitFactor:      5.0,
-        heightScale:      1000,
-        seaLevel:    0.50,
-        seed:        7.3,
-        frequency:   5e-7,
-        octaves:     5,
-        lacunarity:  2.0,
-        gain:        0.5,
-        ridges:      0.45
+        // §planet-spec Phase 5+ -- bumped contrast for legibility from
+        // orbit. heightScale 3000 puts continent peaks at ~3km above
+        // sea level (still well below TiledTerrain's 1500m spawn so
+        // local terrain dominates at ground level). seaLevel 0.42 →
+        // ~58% land, gives clearly recognisable continent shapes.
+        // ridges 0.6 sharpens mountain spines so they read as ranges
+        // rather than blobs at planet scale.
+        heightScale:      3000,
+        seaLevel:         0.42,
+        seed:             7.3,
+        frequency:        5e-7,
+        octaves:          5,
+        lacunarity:       2.0,
+        gain:             0.5,
+        ridges:           0.6
       });
       const clouds = makeNode("Clouds3D", 40, 680, {
         // §5.5.h-18 -- chunked cloud streaming with rounded tops AND
@@ -54565,6 +54576,55 @@ function _planetCameraPos(node) {
  * a helper so the chunk-split center calculation matches what the
  * vertex builder writes. Pass cube-face position in [-1, 1]^3,
  * receive unit-sphere position. */
+/* §planet-spec Phase 5+ -- find a Planet node in the patch and
+ * return its center + radius + polRatio for sphere-projection of
+ * other mesh-gen nodes (TiledTerrain, Water, Clouds3D). Returns null
+ * if no Planet is wired -- callers fall back to flat-XZ behavior so
+ * non-planet patches (Walkable Terrain etc.) keep working unchanged. */
+function _findPlanetForProjection() {
+  if (!state || !Array.isArray(state.nodes)) return null;
+  const pl = state.nodes.find(n => n && n.type === "Planet");
+  if (!pl || !pl.params) return null;
+  const r = (typeof pl.params.radius === "number") ? pl.params.radius : 1000;
+  return {
+    cx: (typeof pl.params.centerX === "number") ? pl.params.centerX : 0,
+    cy: (typeof pl.params.centerY === "number") ? pl.params.centerY : 0,
+    cz: (typeof pl.params.centerZ === "number") ? pl.params.centerZ : 0,
+    r:  r,
+    polRatio: Math.max(0.5, Math.min(1.5, (typeof pl.params.polarRadiusRatio === "number") ? pl.params.polarRadiusRatio : 1.0))
+  };
+}
+
+/* §planet-spec Phase 5+ -- project a flat-XZ world position onto the
+ * Planet's actual sphere. The spawn point at world (0, 0, 0) is treated
+ * as the planet's pole (unit_vec (0, 1, 0)). A vertex at world (wx, y,
+ * wz) is on the planet's sphere at lat/lon corresponding to arc-length
+ * offset (wx, wz) from the pole, at radius (R + y). This is the exact
+ * spherical projection -- works at any distance from the pole, unlike
+ * the parabolic d²/(2R) approximation that diverges past d > R/2.
+ *
+ * planet = { cx, cy, cz, r, polRatio }. Returns [x, y, z]. */
+function _projectFlatToPlanet(wx, y, wz, planet) {
+  const d = Math.sqrt(wx * wx + wz * wz);
+  let ux, uy, uz;
+  if (d < 1e-6) {
+    ux = 0; uy = 1; uz = 0;
+  } else {
+    const theta = d / planet.r;
+    const ct = Math.cos(theta);
+    const st = Math.sin(theta);
+    ux = st * wx / d;
+    uy = ct;
+    uz = st * wz / d;
+  }
+  const rad = planet.r + y;
+  return [
+    planet.cx + rad * ux,
+    planet.cy + rad * uy * planet.polRatio,
+    planet.cz + rad * uz
+  ];
+}
+
 function _planetSpherify(cx, cy, cz) {
   const cxx = cx * cx, cyy = cy * cy, czz = cz * cz;
   const sx = cx * Math.sqrt(Math.max(0, 1 - cyy * 0.5 - czz * 0.5 + cyy * czz / 3));
@@ -56105,10 +56165,17 @@ function _tiledTerrainGlobalCacheKey(node) {
   const ipKey = ip
     ? ("i:" + [ip.cx, ip.cz, ip.radius, ip.power, ip.sinkDepth].join(","))
     : "i0";
+  // §planet-spec Phase 5+ -- include Planet projection parameters in
+  // the cache key so chunks regenerate if a Planet is added/removed
+  // or its center/radius changes (geometry depends on it).
+  const planetProj = _findPlanetForProjection();
+  const planetKey = planetProj
+    ? ("p:" + [planetProj.cx, planetProj.cy, planetProj.cz, planetProj.r, planetProj.polRatio].join(","))
+    : "p0";
   return [
     p.chunkSize, p.chunkRadius, p.segments, p.heightScale, p.yOffset,
     p.seed, p.frequency, p.octaves, p.lacunarity, p.gain, p.ridges,
-    p.plateau, epKey, ipKey
+    p.plateau, epKey, ipKey, planetKey
   ].join(",");
 }
 
@@ -56147,6 +56214,15 @@ function _buildSingleChunk(node, info) {
   const chunkSize = Math.max(1, (typeof p.chunkSize === "number") ? p.chunkSize : 64);
   const hs   = (typeof p.heightScale === "number") ? p.heightScale : 80;
   const yOff = (typeof p.yOffset === "number")     ? p.yOffset     : 0;
+  // §planet-spec Phase 5+ -- if a Planet is in the patch, every chunk
+  // vertex projects onto the planet's sphere so the local terrain
+  // disc visibly bends with the planet's curvature instead of
+  // floating as a flat square at altitude. The spawn (world 0, 0, 0)
+  // is treated as the planet's pole; chunks at horizontal distance d
+  // map to lat/lon offset arc d on the sphere. No projection if there
+  // is no Planet (preserves the flat-XZ behavior of Walkable Terrain
+  // and other non-planet demos).
+  const planetProj = _findPlanetForProjection();
   const tileX = info.tileX;
   const tileZ = info.tileZ;
   const segs  = info.segs;
@@ -56188,6 +56264,13 @@ function _buildSingleChunk(node, info) {
   // Heights for normals + AABB.
   const heights = new Float32Array(N * N);
   let chunkMinY = Infinity, chunkMaxY = -Infinity;
+  // §planet-spec Phase 5+ -- projected-position AABB bounds. When
+  // planetProj is non-null we track these during vertex emission;
+  // the AABB at the bottom uses them instead of the flat-XZ origin
+  // rectangle. Frustum culling depends on a tight correct AABB.
+  let projMinX = Infinity, projMaxX = -Infinity;
+  let projMinY = Infinity, projMaxY = -Infinity;
+  let projMinZ = Infinity, projMaxZ = -Infinity;
   for (let j = 0; j < N; j++) {
     for (let i = 0; i < N; i++) {
       const wx = originX + i * dStep;
@@ -56238,9 +56321,26 @@ function _buildSingleChunk(node, info) {
       const slopeMul = 1 - slope * 0.4;
       rC *= slopeMul; gC *= slopeMul; bC *= slopeMul;
 
-      verts[vi++] = wx;
-      verts[vi++] = y;
-      verts[vi++] = wz;
+      // §planet-spec Phase 5+ -- sphere-project this vertex if a
+      // Planet exists. The normal stays in local (Y-up) frame -- at
+      // chunk scale (≤ 256m) the arc rotation is < 0.0025° so the
+      // approximation is invisible. Lambert shading on the projected
+      // chunks uses this local normal, which gives correct ground
+      // shading near the pole and degrades smoothly elsewhere.
+      let px = wx, py = y, pz = wz;
+      if (planetProj) {
+        const proj = _projectFlatToPlanet(wx, y, wz, planetProj);
+        px = proj[0]; py = proj[1]; pz = proj[2];
+      }
+      if (px < projMinX) projMinX = px;
+      if (px > projMaxX) projMaxX = px;
+      if (py < projMinY) projMinY = py;
+      if (py > projMaxY) projMaxY = py;
+      if (pz < projMinZ) projMinZ = pz;
+      if (pz > projMaxZ) projMaxZ = pz;
+      verts[vi++] = px;
+      verts[vi++] = py;
+      verts[vi++] = pz;
       verts[vi++] = Math.max(0, Math.min(1, rC));
       verts[vi++] = Math.max(0, Math.min(1, gC));
       verts[vi++] = Math.max(0, Math.min(1, bC));
@@ -56275,9 +56375,20 @@ function _buildSingleChunk(node, info) {
   const skirtBottomBase = N * N;
   const skirtR = 0.18, skirtG = 0.16, skirtB = 0.14;
   const writeSkirtBottom = (k, wx, wz) => {
-    verts[vi++] = wx;
-    verts[vi++] = skirtY;
-    verts[vi++] = wz;
+    let px = wx, py = skirtY, pz = wz;
+    if (planetProj) {
+      const proj = _projectFlatToPlanet(wx, skirtY, wz, planetProj);
+      px = proj[0]; py = proj[1]; pz = proj[2];
+    }
+    if (px < projMinX) projMinX = px;
+    if (px > projMaxX) projMaxX = px;
+    if (py < projMinY) projMinY = py;
+    if (py > projMaxY) projMaxY = py;
+    if (pz < projMinZ) projMinZ = pz;
+    if (pz > projMaxZ) projMaxZ = pz;
+    verts[vi++] = px;
+    verts[vi++] = py;
+    verts[vi++] = pz;
     verts[vi++] = skirtR;
     verts[vi++] = skirtG;
     verts[vi++] = skirtB;
@@ -56323,12 +56434,18 @@ function _buildSingleChunk(node, info) {
   new Uint32Array(indexBuffer.getMappedRange()).set(indices);
   indexBuffer.unmap();
 
+  const aabbMin = planetProj
+    ? new Float32Array([projMinX, projMinY, projMinZ])
+    : new Float32Array([originX,             Math.min(chunkMinY, skirtY), originZ]);
+  const aabbMax = planetProj
+    ? new Float32Array([projMaxX, projMaxY, projMaxZ])
+    : new Float32Array([originX + chunkSize, chunkMaxY,                    originZ + chunkSize]);
   return {
     vertexBuffer,
     indexBuffer,
     indexCount: ii,
-    aabbMin: new Float32Array([originX,             Math.min(chunkMinY, skirtY), originZ]),
-    aabbMax: new Float32Array([originX + chunkSize, chunkMaxY,                    originZ + chunkSize]),
+    aabbMin,
+    aabbMax,
     tileX,
     tileZ,
     lod: segs
