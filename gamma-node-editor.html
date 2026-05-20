@@ -57074,36 +57074,78 @@ function _buildPlanetMesh(node) {
   }
   const tris = pmap._cellTris;
 
-  // Build vertex array. Each cell → one vertex with position, color,
-  // normal, uv (uv unused, set to 0). Sun-Lambert shading baked in.
+  // Build vertex array in three passes:
+  //   Pass 1: compute displaced positions (cell radial + altitude).
+  //   Pass 2: accumulate face normals (area-weighted) onto each
+  //           vertex; this is the standard "smooth shading" recipe
+  //           and produces real terrain shading -- mountain slopes
+  //           catch the sun, valleys go dark. Without this the
+  //           planet shaded as a smooth sphere regardless of
+  //           heightScale, hiding all 3D relief.
+  //   Pass 3: normalize normals, compute Lambert + bake into vertex
+  //           color, write the interleaved layout the renderer
+  //           expects (pos, col, normal, uv).
   const sun = _planetSunDir();
   const sunX = sun[0], sunY = sun[1], sunZ = sun[2];
   const ambient = 0.18;
-  const verts = new Float32Array(N * 11);
+
+  // Pass 1: positions.
+  const positions3 = new Float32Array(N * 3);
   for (let i = 0; i < N; i++) {
     const ux = cells.positions[i * 3 + 0];
     const uy = cells.positions[i * 3 + 1];
     const uz = cells.positions[i * 3 + 2];
     const h  = cells.elevations[i];
-    // Cells at or below seaLevel sit on the smooth ellipsoid; cells
-    // above poke radially outward by heightScale * (h - seaLevel) /
-    // (1 - seaLevel). Same formula Planet's chunk builder uses, so
-    // visual scale matches if you swap PlanetMesh ↔ Planet.
     let altitude = 0;
     if (h > seaLevel && hs !== 0) {
       altitude = hs * (h - seaLevel) / Math.max(1e-6, 1 - seaLevel);
     }
-    // Ellipsoid surface normal (gradient of x²/a² + y²/b² + z²/a²).
-    const nxn = ux;
-    const nyn = uy / polRatio2;
-    const nzn = uz;
-    const ninv = 1 / Math.max(1e-12, Math.sqrt(nxn * nxn + nyn * nyn + nzn * nzn));
-    const nuX = nxn * ninv, nuY = nyn * ninv, nuZ = nzn * ninv;
-    const lambert = Math.max(ambient, nuX * sunX + nuY * sunY + nuZ * sunZ);
+    positions3[i*3+0] = cxC + r * ux           + altitude * ux;
+    positions3[i*3+1] = cyC + r * uy * polRatio + altitude * uy;
+    positions3[i*3+2] = czC + r * uz           + altitude * uz;
+  }
+
+  // Pass 2: face-normal accumulation.
+  const normals3 = new Float32Array(N * 3);
+  for (let t = 0; t < tris.length; t += 3) {
+    const a = tris[t], b = tris[t+1], c = tris[t+2];
+    const ax = positions3[a*3], ay = positions3[a*3+1], az = positions3[a*3+2];
+    const bx = positions3[b*3], by = positions3[b*3+1], bz = positions3[b*3+2];
+    const cx = positions3[c*3], cy = positions3[c*3+1], cz = positions3[c*3+2];
+    const e1x = bx - ax, e1y = by - ay, e1z = bz - az;
+    const e2x = cx - ax, e2y = cy - ay, e2z = cz - az;
+    // Cross product = face normal × 2*area, so adding it to each
+    // vertex naturally weights big triangles more.
+    const fnx = e1y*e2z - e1z*e2y;
+    const fny = e1z*e2x - e1x*e2z;
+    const fnz = e1x*e2y - e1y*e2x;
+    normals3[a*3+0] += fnx; normals3[a*3+1] += fny; normals3[a*3+2] += fnz;
+    normals3[b*3+0] += fnx; normals3[b*3+1] += fny; normals3[b*3+2] += fnz;
+    normals3[c*3+0] += fnx; normals3[c*3+1] += fny; normals3[c*3+2] += fnz;
+  }
+
+  // Pass 3: interleave + Lambert.
+  const verts = new Float32Array(N * 11);
+  for (let i = 0; i < N; i++) {
+    const px = positions3[i*3+0], py = positions3[i*3+1], pz = positions3[i*3+2];
+    let nx = normals3[i*3+0], ny = normals3[i*3+1], nz = normals3[i*3+2];
+    let nl = Math.hypot(nx, ny, nz);
+    if (nl > 1e-9) { nx /= nl; ny /= nl; nz /= nl; }
+    else { // Fallback to ellipsoid normal if accumulator was zero.
+      const ux = cells.positions[i*3+0], uy = cells.positions[i*3+1], uz = cells.positions[i*3+2];
+      const ny0 = uy / polRatio2;
+      const inv = 1 / Math.max(1e-12, Math.sqrt(ux*ux + ny0*ny0 + uz*uz));
+      nx = ux * inv; ny = ny0 * inv; nz = uz * inv;
+    }
+    // Sign-check: normal should point outward from planet center
+    // (3-cycle triangulation already does CCW-from-outside, but a
+    // misclassified normal is a one-cell visible artifact, so flip
+    // if it's pointing inward).
+    const radialDot = nx * (px - cxC) + ny * (py - cyC) + nz * (pz - czC);
+    if (radialDot < 0) { nx = -nx; ny = -ny; nz = -nz; }
+    const h = cells.elevations[i];
     const baseCol = _planetColorForHeight(h, seaLevel);
-    const px = cxC + r * ux + altitude * ux;
-    const py = cyC + r * uy * polRatio + altitude * uy;
-    const pz = czC + r * uz + altitude * uz;
+    const lambert = Math.max(ambient, nx * sunX + ny * sunY + nz * sunZ);
     const base = i * 11;
     verts[base + 0] = px;
     verts[base + 1] = py;
@@ -57111,9 +57153,9 @@ function _buildPlanetMesh(node) {
     verts[base + 3] = baseCol[0] * lambert;
     verts[base + 4] = baseCol[1] * lambert;
     verts[base + 5] = baseCol[2] * lambert;
-    verts[base + 6] = nuX;
-    verts[base + 7] = nuY;
-    verts[base + 8] = nuZ;
+    verts[base + 6] = nx;
+    verts[base + 7] = ny;
+    verts[base + 8] = nz;
     verts[base + 9] = 0;
     verts[base + 10] = 0;
   }
