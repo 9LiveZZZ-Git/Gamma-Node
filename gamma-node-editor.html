@@ -56889,10 +56889,29 @@ function _capInsideMask(cells, cap) {
   return mask;
 }
 
-// --- Verb implementations (cap-aware) ---
+// Azgaar's blobPower / linePower scale with cell count so blobs and
+// ranges cover the same ANGULAR area on the sphere regardless of how
+// dense the cell graph is. Without this, at 240k cells our blobs
+// only spread through the same NUMBER of cells as at 10k -- but
+// each cell is 1/24 the area, so continents look tiny. Curve fit
+// to Azgaar's lookup (heightmap-generator.ts getBlobPower /
+// getLinePower):
+//   blobPower(N) = 1 − 100 / N^0.87  → 240k ≈ 0.9988
+//   linePower(N) = 1 − 10  / N^0.43  → 240k ≈ 0.939
+// Per-vertex detail stays intact (cells are still small for sharp
+// peaks); blobs / ranges just spread to more of them so continents
+// fill the cap properly.
+function _planetTemplatePowers(N) {
+  const blobPower = Math.max(0.93, Math.min(0.9995, 1 - 100 / Math.pow(N, 0.87)));
+  const linePower = Math.max(0.75, Math.min(0.96, 1 - 10  / Math.pow(N, 0.43)));
+  return { blobPower, linePower };
+}
 
-function _planetVerbHillXY(cells, neighbors, K, cap, count, heightRange, xRange, yRange) {
+// --- Verb implementations (cap-aware, cell-count-scaled decay) ---
+
+function _planetVerbHillXY(cells, neighbors, K, cap, count, heightRange, xRange, yRange, powers) {
   const N = cells.count;
+  const blobPower = powers.blobPower;
   const mask = _capBBoxMask(cells, cap, xRange, yRange);
   const delta = new Float32Array(N);
   const visited = new Uint8Array(N);
@@ -56907,7 +56926,7 @@ function _planetVerbHillXY(cells, neighbors, K, cap, count, heightRange, xRange,
       const next = [];
       for (let p = 0; p < q.length; p++) {
         const c = q[p];
-        const prop = Math.pow(delta[c], 0.99);
+        const prop = Math.pow(delta[c], blobPower);
         if (prop <= 0.01) continue;
         for (let k = 0; k < K; k++) {
           const n = neighbors[c*K+k];
@@ -56924,8 +56943,9 @@ function _planetVerbHillXY(cells, neighbors, K, cap, count, heightRange, xRange,
   }
 }
 
-function _planetVerbPitXY(cells, neighbors, K, cap, count, heightRange, xRange, yRange) {
+function _planetVerbPitXY(cells, neighbors, K, cap, count, heightRange, xRange, yRange, powers) {
   const N = cells.count;
+  const blobPower = powers.blobPower;
   const mask = _capBBoxMask(cells, cap, xRange, yRange);
   const delta = new Float32Array(N);
   const visited = new Uint8Array(N);
@@ -56940,7 +56960,7 @@ function _planetVerbPitXY(cells, neighbors, K, cap, count, heightRange, xRange, 
       const next = [];
       for (let p = 0; p < q.length; p++) {
         const c = q[p];
-        const prop = Math.pow(delta[c], 0.99);
+        const prop = Math.pow(delta[c], blobPower);
         if (prop <= 0.01) continue;
         for (let k = 0; k < K; k++) {
           const n = neighbors[c*K+k];
@@ -56957,9 +56977,16 @@ function _planetVerbPitXY(cells, neighbors, K, cap, count, heightRange, xRange, 
   }
 }
 
-function _planetVerbRangeXY(cells, neighbors, K, cap, count, heightRange, xRange, yRange, sign) {
+// Range / Trough: greedy ridge walk start → end, then BFS frontier
+// expansion with linePower-decayed height per layer. Matches
+// Azgaar's addRange (heightmap-generator.ts:158). Decay runs in his
+// 0-100 scale (h = h^linePower - 1) so the curve behaves correctly
+// at our N=240k where linePower ≈ 0.94. Result: proper mountain
+// ranges with sloped sides, not the old single-row ridges.
+function _planetVerbRangeXY(cells, neighbors, K, cap, count, heightRange, xRange, yRange, sign, powers) {
   sign = (sign === undefined) ? 1 : sign;
   const N = cells.count;
+  const linePower = powers.linePower;
   const mask = _capBBoxMask(cells, cap, xRange, yRange);
   for (let r = 0; r < count; r++) {
     const startIdx = _pickCellInBBox(cells, mask);
@@ -56968,31 +56995,48 @@ function _planetVerbRangeXY(cells, neighbors, K, cap, count, heightRange, xRange
     let tries = 0;
     while ((endIdx < 0 || endIdx === startIdx) && tries < 4) { endIdx = _pickCellInBBox(cells, mask); tries++; }
     if (endIdx < 0) endIdx = startIdx;
-    const peak = sign * _pickInRange(heightRange) / 100;
+    const used = new Uint8Array(N);
+    // Greedy ridge walk.
     const tex = cells.positions[endIdx*3+0], tey = cells.positions[endIdx*3+1], tez = cells.positions[endIdx*3+2];
-    let current = startIdx;
-    const trace = [current];
-    const visited = new Uint8Array(N);
-    visited[current] = 1;
-    for (let step = 0; step < 200; step++) {
-      if (current === endIdx) break;
+    const range = [startIdx];
+    used[startIdx] = 1;
+    let cur = startIdx;
+    for (let step = 0; step < 400; step++) {
+      if (cur === endIdx) break;
       let best = -1, bestDot = -2;
       for (let k = 0; k < K; k++) {
-        const ni = neighbors[current*K+k];
-        if (ni < 0 || visited[ni]) continue;
+        const ni = neighbors[cur*K+k];
+        if (ni < 0 || used[ni]) continue;
         const dot = tex*cells.positions[ni*3] + tey*cells.positions[ni*3+1] + tez*cells.positions[ni*3+2];
-        if (dot > bestDot) { bestDot = dot; best = ni; }
+        // Azgaar's 15% chance to weaken the metric so the ridge wanders.
+        const adj = (Math.random() > 0.85) ? dot * 0.5 + 0.5 : dot;
+        if (adj > bestDot) { bestDot = adj; best = ni; }
       }
       if (best < 0) break;
-      visited[best] = 1; trace.push(best); current = best;
+      used[best] = 1; range.push(best); cur = best;
     }
-    for (let t = 0; t < trace.length; t++) {
-      const idx = trace[t];
-      cells.elevations[idx] = Math.max(0, Math.min(1, cells.elevations[idx] + peak));
-      for (let k = 0; k < K; k++) {
-        const ni = neighbors[idx*K+k];
-        if (ni < 0) continue;
-        cells.elevations[ni] = Math.max(0, Math.min(1, cells.elevations[ni] + peak * 0.5));
+    // BFS frontier expansion with height decay.
+    let h100 = _pickInRange(heightRange);  // Azgaar 0-100 scale
+    let queue = range.slice();
+    while (queue.length > 0) {
+      const frontier = queue;
+      queue = [];
+      const delta = sign * (h100 / 100);
+      for (let f = 0; f < frontier.length; f++) {
+        const idx = frontier[f];
+        const jitter = 0.85 + Math.random() * 0.30;
+        cells.elevations[idx] = Math.max(0, Math.min(1, cells.elevations[idx] + delta * jitter));
+      }
+      h100 = Math.pow(h100, linePower) - 1;
+      if (h100 < 2) break;
+      for (let f = 0; f < frontier.length; f++) {
+        const idx = frontier[f];
+        for (let k = 0; k < K; k++) {
+          const ni = neighbors[idx*K+k];
+          if (ni < 0 || used[ni]) continue;
+          used[ni] = 1;
+          queue.push(ni);
+        }
       }
     }
   }
@@ -57114,7 +57158,7 @@ function _planetVerbSmoothCap(cells, neighbors, K, cap, iterations) {
 
 // --- DSL parser / executor ---
 
-function _planetRunDSL(template, cells, neighbors, K, cap) {
+function _planetRunDSL(template, cells, neighbors, K, cap, powers) {
   const lines = template.split("\n");
   for (let li = 0; li < lines.length; li++) {
     const line = lines[li].trim();
@@ -57126,25 +57170,25 @@ function _planetRunDSL(template, cells, neighbors, K, cap) {
       case "Hill": {
         const count = _pickInRangeInt(_parseRange(arg1, [1,1]));
         const h = _parseRange(arg2, [50,50]);
-        _planetVerbHillXY(cells, neighbors, K, cap, count, h, _parseRange(arg3, [0,100]), _parseRange(arg4, [0,100]));
+        _planetVerbHillXY(cells, neighbors, K, cap, count, h, _parseRange(arg3, [0,100]), _parseRange(arg4, [0,100]), powers);
         break;
       }
       case "Pit": {
         const count = _pickInRangeInt(_parseRange(arg1, [1,1]));
         const h = _parseRange(arg2, [10,20]);
-        _planetVerbPitXY(cells, neighbors, K, cap, count, h, _parseRange(arg3, [0,100]), _parseRange(arg4, [0,100]));
+        _planetVerbPitXY(cells, neighbors, K, cap, count, h, _parseRange(arg3, [0,100]), _parseRange(arg4, [0,100]), powers);
         break;
       }
       case "Range": {
         const count = _pickInRangeInt(_parseRange(arg1, [1,1]));
         const h = _parseRange(arg2, [30,50]);
-        _planetVerbRangeXY(cells, neighbors, K, cap, count, h, _parseRange(arg3, [0,100]), _parseRange(arg4, [0,100]), 1);
+        _planetVerbRangeXY(cells, neighbors, K, cap, count, h, _parseRange(arg3, [0,100]), _parseRange(arg4, [0,100]), 1, powers);
         break;
       }
       case "Trough": {
         const count = _pickInRangeInt(_parseRange(arg1, [1,1]));
         const h = _parseRange(arg2, [10,20]);
-        _planetVerbRangeXY(cells, neighbors, K, cap, count, h, _parseRange(arg3, [0,100]), _parseRange(arg4, [0,100]), -1);
+        _planetVerbRangeXY(cells, neighbors, K, cap, count, h, _parseRange(arg3, [0,100]), _parseRange(arg4, [0,100]), -1, powers);
         break;
       }
       case "Strait": {
@@ -57369,6 +57413,7 @@ function _planetApplyTemplate(name, cells, neighbors, K, seaLevel, lockedCenter)
   const meta = PLANET_TEMPLATE_CAPS[name] || { count: 1, radiusDeg: 30 };
   const radiusRad = meta.radiusDeg * Math.PI / 180;
   const dsl = PLANET_TEMPLATES_DSL[name];
+  const powers = _planetTemplatePowers(cells.count);
   for (let i = 0; i < meta.count; i++) {
     let cap;
     if (i === 0 && lockedCenter && typeof lockedCenter.lat === "number" && typeof lockedCenter.lon === "number") {
@@ -57376,7 +57421,7 @@ function _planetApplyTemplate(name, cells, neighbors, K, seaLevel, lockedCenter)
     } else {
       cap = _makeRandomCap(radiusRad);
     }
-    _planetRunDSL(dsl, cells, neighbors, K, cap);
+    _planetRunDSL(dsl, cells, neighbors, K, cap, powers);
   }
   // Piecewise remap Azgaar's logical 0-1 (0.20 = sea level) → ours
   // (seaLevel arg). Anchors h=0 → 0, h=0.20 → seaLevel, h=1 → 1.
@@ -57393,7 +57438,8 @@ function _planetApplyTemplate(name, cells, neighbors, K, seaLevel, lockedCenter)
     }
   }
   console.log("[planet-map] applied template '" + name + "' in " + (performance.now() - t0).toFixed(0)
-    + "ms (" + meta.count + " caps × " + meta.radiusDeg + "° radius, sea=" + sl.toFixed(2) + ")");
+    + "ms (" + meta.count + " caps × " + meta.radiusDeg + "° radius, sea=" + sl.toFixed(2)
+    + ", blobPower=" + powers.blobPower.toFixed(4) + ", linePower=" + powers.linePower.toFixed(3) + ")");
 }
 
 /* §planet-spec Phase 7.b -- serialize / deserialize the cubemap as
