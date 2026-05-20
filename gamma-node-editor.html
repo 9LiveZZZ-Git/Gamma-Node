@@ -36197,6 +36197,26 @@ function render() {
         // Shift the ✎ handle to the right so they don't overlap.
         handle.style.left = "calc(50% + 16px)";
       }
+      // §planet-spec Phase 7.d -- PlanetMap gets a gear that opens the
+      // equirect painter popup (raise/lower brush on the cell graph).
+      if (node.type === "PlanetMap") {
+        const gear = document.createElement("button");
+        gear.className = "node-edit-handle node-tiling-handle";
+        gear.title = "Open Planet Map Editor";
+        gear.textContent = "⚙";
+        gear.style.left = "calc(50% - 16px)";
+        gear.addEventListener("pointerdown", (ev) => {
+          ev.stopPropagation();
+          ev.preventDefault();
+        });
+        gear.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          ev.preventDefault();
+          openPlanetMapEditor(node.id);
+        });
+        el.appendChild(gear);
+        handle.style.left = "calc(50% + 16px)";
+      }
     }
 
     canvasWorld.appendChild(el);
@@ -54965,10 +54985,16 @@ const _PLANET_FACES = [
  * of the bake's face projection, by construction. */
 function _planetMapCacheKey(node) {
   const p = node.params || {};
+  // §planet-spec Phase 7.d -- cellsVersion gets bumped by the painter
+  // each time a brush stroke mutates cells.elevations. Including it
+  // in the cache key forces the cubemap to re-bake from the modified
+  // cells on the next _ensurePlanetMapCubemap call.
+  const ver = (typeof node._cellsVersion === "number") ? node._cellsVersion : 0;
   return [
     p.resolution, p.cellCount,
     p.seed, p.frequency, p.octaves,
-    p.lacunarity, p.gain, p.ridges
+    p.lacunarity, p.gain, p.ridges,
+    "v" + ver
   ].join(",");
 }
 
@@ -67554,6 +67580,232 @@ const PORT_TYPE_OPTS_OUT = ["audio", "param", "gate", "clock", "texture", "trans
  * preview as they dial knobs. Closing the modal pushes one history
  * entry covering the whole edit session (debounced rebuild not
  * needed at this scale -- the mesh cache key gates on params). */
+/* §planet-spec Phase 7.d -- PlanetMap equirect painter popup. Modal
+ * with a 720×360 equirect canvas + raise/lower brush controls. On
+ * pointerdown/move the brush modifies cells.elevations within a
+ * geodesic radius of the cursor's lat/lon; the canvas re-renders
+ * from the modified cells; on modal close (or every stroke end) we
+ * bump node._cellsVersion which invalidates the cubemap cache and
+ * triggers a re-bake next time Planet reads heights.
+ *
+ * Equirect mapping: pixel (px, py) ∈ [0, W) × [0, H) →
+ *   lon = (px + 0.5) / W * 2π - π        (left edge = -π, right = +π)
+ *   lat = π/2 - (py + 0.5) / H * π       (top = +π/2, bottom = -π/2)
+ *   unit_vec = (cos(lat)*sin(lon), sin(lat), cos(lat)*cos(lon))
+ *
+ * Pole-pinching: a constant-pixel brush radius covers a tiny patch
+ * at the equator and a huge patch at the poles. We brush in
+ * GEODESIC distance (angle from the cursor's unit_vec) so the
+ * affected area on the sphere is uniform regardless of latitude. */
+function openPlanetMapEditor(nodeId) {
+  const node = state && state.nodes && state.nodes.find(n => n && n.id === nodeId);
+  if (!node || node.type !== "PlanetMap") return;
+  const cells = _ensurePlanetMapCells(node);
+  if (!cells) return;
+  const hash = node._cellsHash;
+  pushHistory("planet-map-edit:open");
+
+  let prev = document.getElementById("planet-map-modal");
+  if (prev) prev.remove();
+  const back = document.createElement("div");
+  back.className = "modal-backdrop";
+  back.id        = "planet-map-modal";
+  back.style.display = "flex";
+  back.style.zIndex = 60;
+  const modal = document.createElement("div");
+  modal.className = "modal";
+  modal.style.width = "780px";
+  modal.style.maxHeight = "90vh";
+  modal.style.overflowY = "auto";
+  modal.innerHTML =
+    '<div class="modal-head">' +
+      '<span class="modal-title" style="font-family: var(--font-instr); letter-spacing: 0.18em; color: var(--phosphor); text-transform: lowercase;">planet map · ' + node.type + '#' + node.id + ' · ' + cells.count + ' cells</span>' +
+      '<button class="btn modal-x" id="pmap-close" type="button">×</button>' +
+    '</div>' +
+    '<div id="pmap-body" style="padding: 12px 16px 16px;"></div>';
+  back.appendChild(modal);
+  document.body.appendChild(back);
+  const body = modal.querySelector("#pmap-body");
+
+  // Canvas (equirect view of the planet's elevation, cells flat-shaded).
+  const W = 720, H = 360;
+  const canvas = document.createElement("canvas");
+  canvas.width = W; canvas.height = H;
+  canvas.style.cssText =
+    "width:720px;height:360px;background:rgba(8,12,20,0.85);" +
+    "border:1px solid var(--border);border-radius:3px;cursor:crosshair;" +
+    "image-rendering:pixelated;display:block;margin-bottom:10px;";
+  body.appendChild(canvas);
+  const ctx = canvas.getContext("2d");
+
+  // Controls.
+  const ctrls = document.createElement("div");
+  ctrls.style.cssText =
+    "display:flex;align-items:center;gap:14px;flex-wrap:wrap;" +
+    "font-family:var(--font-mono);font-size:11px;color:var(--text-2);" +
+    "padding:6px 0;";
+  ctrls.innerHTML =
+    '<label>brush&nbsp;<input type="range" id="pmap-size" min="2" max="40" value="8" step="1" style="vertical-align:middle"><span id="pmap-size-v" style="display:inline-block;min-width:26px;text-align:right">8°</span></label>' +
+    '<label>strength&nbsp;<input type="range" id="pmap-str" min="1" max="100" value="25" step="1" style="vertical-align:middle"><span id="pmap-str-v" style="display:inline-block;min-width:30px;text-align:right">0.025</span></label>' +
+    '<label><input type="radio" name="pmap-mode" value="raise" checked> raise</label>' +
+    '<label><input type="radio" name="pmap-mode" value="lower"> lower</label>' +
+    '<button class="btn" id="pmap-revert" type="button" style="padding:3px 10px;">revert</button>';
+  body.appendChild(ctrls);
+  const helpRow = document.createElement("div");
+  helpRow.style.cssText =
+    "font-family:var(--font-mono);font-size:10px;color:var(--text-3);margin-top:6px;line-height:1.5;";
+  helpRow.innerHTML =
+    "drag on the canvas to paint. brush radius is in degrees of arc on the sphere " +
+    "(equator: 1° ≈ 111km on earth). closing the modal bakes the modified cells " +
+    "into the cubemap; the planet picks up the change on the next chunk rebuild.";
+  body.appendChild(helpRow);
+
+  // Snapshot for revert.
+  const elevSnapshot = new Float32Array(cells.elevations);
+
+  // Pre-compute pixel → nearest-cell mapping. ~260k queries × ~50
+  // dot products via the spatial hash = ~13M ops, runs in 50-150ms on
+  // a desktop. Done once on open; reads from it per-render are O(1).
+  const pixelToCell = new Int32Array(W * H);
+  const t0 = (typeof performance !== "undefined") ? performance.now() : 0;
+  for (let py = 0; py < H; py++) {
+    const lat = Math.PI * 0.5 - ((py + 0.5) / H) * Math.PI;
+    const clat = Math.cos(lat), slat = Math.sin(lat);
+    for (let px = 0; px < W; px++) {
+      const lon = ((px + 0.5) / W) * (Math.PI * 2) - Math.PI;
+      const ux = clat * Math.sin(lon);
+      const uy = slat;
+      const uz = clat * Math.cos(lon);
+      pixelToCell[py * W + px] = _findNearestCell(cells, hash, ux, uy, uz);
+    }
+  }
+  const dtMs = ((typeof performance !== "undefined") ? performance.now() : 0) - t0;
+  console.log("[planet-map] painter pixelToCell map built in " + dtMs.toFixed(0) + "ms");
+
+  // Render: walk pixels, look up cell elevation, write RGB color.
+  const seaLevel = 0.45;   // for color palette; doesn't need to match Planet's exactly
+  const imageData = ctx.createImageData(W, H);
+  function render() {
+    const data = imageData.data;
+    for (let i = 0; i < W * H; i++) {
+      const elev = cells.elevations[pixelToCell[i]];
+      const c = _planetColorForHeight(elev, seaLevel);
+      const k = i * 4;
+      data[k    ] = Math.max(0, Math.min(255, Math.round(c[0] * 255)));
+      data[k + 1] = Math.max(0, Math.min(255, Math.round(c[1] * 255)));
+      data[k + 2] = Math.max(0, Math.min(255, Math.round(c[2] * 255)));
+      data[k + 3] = 255;
+    }
+    ctx.putImageData(imageData, 0, 0);
+  }
+  render();
+
+  // Brush controls state.
+  let brushRadiusDeg = 8;
+  let brushStrength = 0.025;
+  let mode = "raise";
+  let painting = false;
+  let dirty = false;
+  const sizeIn = modal.querySelector("#pmap-size");
+  const sizeV  = modal.querySelector("#pmap-size-v");
+  const strIn  = modal.querySelector("#pmap-str");
+  const strV   = modal.querySelector("#pmap-str-v");
+  sizeIn.addEventListener("input", () => {
+    brushRadiusDeg = +sizeIn.value;
+    sizeV.textContent = brushRadiusDeg + "°";
+  });
+  strIn.addEventListener("input", () => {
+    brushStrength = (+strIn.value) / 1000;
+    strV.textContent = brushStrength.toFixed(3);
+  });
+  modal.querySelectorAll('input[name="pmap-mode"]').forEach(r => {
+    r.addEventListener("change", () => { if (r.checked) mode = r.value; });
+  });
+  modal.querySelector("#pmap-revert").addEventListener("click", () => {
+    for (let i = 0; i < cells.elevations.length; i++) cells.elevations[i] = elevSnapshot[i];
+    dirty = true;
+    render();
+  });
+
+  // Apply one brush stamp at pixel (px, py).
+  function stamp(px, py) {
+    const lat = Math.PI * 0.5 - ((py + 0.5) / H) * Math.PI;
+    const lon = ((px + 0.5) / W) * (Math.PI * 2) - Math.PI;
+    const clat = Math.cos(lat), slat = Math.sin(lat);
+    const cx = clat * Math.sin(lon);
+    const cy = slat;
+    const cz = clat * Math.cos(lon);
+    const radRad = brushRadiusDeg * Math.PI / 180;
+    const cosThresh = Math.cos(radRad);
+    const sign = (mode === "raise") ? 1 : -1;
+    // Brute-force over cells -- 10k dot products is trivial per stamp.
+    for (let i = 0; i < cells.count; i++) {
+      const ix = i * 3;
+      const dot = cx * cells.positions[ix] + cy * cells.positions[ix + 1] + cz * cells.positions[ix + 2];
+      if (dot < cosThresh) continue;
+      // Falloff: smoothstep from edge (dot=cosThresh, weight=0) to
+      // center (dot=1, weight=1) so brush edges don't show hard rings.
+      const t = (dot - cosThresh) / Math.max(1e-6, 1 - cosThresh);
+      const fall = t * t * (3 - 2 * t);
+      const delta = sign * brushStrength * fall;
+      cells.elevations[i] = Math.max(0, Math.min(1, cells.elevations[i] + delta));
+    }
+    dirty = true;
+    render();
+  }
+
+  // Pointer events.
+  canvas.addEventListener("pointerdown", (ev) => {
+    canvas.setPointerCapture(ev.pointerId);
+    painting = true;
+    const r = canvas.getBoundingClientRect();
+    const px = Math.floor((ev.clientX - r.left) / r.width * W);
+    const py = Math.floor((ev.clientY - r.top) / r.height * H);
+    stamp(px, py);
+  });
+  canvas.addEventListener("pointermove", (ev) => {
+    if (!painting) return;
+    const r = canvas.getBoundingClientRect();
+    const px = Math.floor((ev.clientX - r.left) / r.width * W);
+    const py = Math.floor((ev.clientY - r.top) / r.height * H);
+    stamp(px, py);
+  });
+  function endPaint(ev) {
+    if (painting) {
+      painting = false;
+      try { canvas.releasePointerCapture(ev.pointerId); } catch (_) {}
+    }
+  }
+  canvas.addEventListener("pointerup", endPaint);
+  canvas.addEventListener("pointercancel", endPaint);
+  canvas.addEventListener("pointerleave", endPaint);
+
+  // Close handler: bump cellsVersion so the cubemap re-bakes from
+  // the painted cells. We do NOT immediately re-bake here (potentially
+  // 100-500ms hang); the next _ensurePlanetMapCubemap call (triggered
+  // by Planet's next chunk build) does it under whatever stream
+  // budget exists.
+  function closeModal() {
+    if (dirty) {
+      node._cellsVersion = ((typeof node._cellsVersion === "number") ? node._cellsVersion : 0) + 1;
+      // Clear cached cubemap so the next access re-bakes from cells.
+      // Also clear params.cubemapData so the stale .gpatch-serialized
+      // version doesn't get used on next load.
+      node._cubemap = null;
+      node._cubemapKey = null;
+      if (node.params) {
+        delete node.params.cubemapData;
+        delete node.params.cubemapDataRes;
+        delete node.params.cubemapKey;
+      }
+      pushHistory("planet-map-edit:apply");
+    }
+    back.remove();
+  }
+  modal.querySelector("#pmap-close").addEventListener("click", closeModal);
+  back.addEventListener("click", (ev) => { if (ev.target === back) closeModal(); });
+}
+
 function openTilingConfigPopup(nodeId) {
   const node = state && state.nodes && state.nodes.find(n => n && n.id === nodeId);
   if (!node || node.type !== "TiledTerrain") return;
