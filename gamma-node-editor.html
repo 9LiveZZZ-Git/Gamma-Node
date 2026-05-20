@@ -55164,24 +55164,20 @@ function _buildCellTriangulation(positions, neighbors, K, N, hash) {
   // ---- Degree-distribution diagnostic ----
   // Voronoi cells on a sphere should have avg degree (3N-6)*2/N ≈ 6.
   // Cells with degree < 5 are under-connected -> likely sources of
-  // triangle holes. Log degree histogram + position of worst offenders
-  // so we can see if they cluster at the Fibonacci poles (y≈±1).
+  // triangle holes.
   {
     const degHist = new Array(20).fill(0);
-    const lowDegCells = []; // {i, deg, pos:[x,y,z], y_abs}
-    let deg0 = 0, degMax = 0, sumDeg = 0;
+    const lowDegCells = [];
+    let degMax = 0, sumDeg = 0;
     for (let i = 0; i < N; i++) {
       const d = vAdj[i].length;
       sumDeg += d;
       if (d > degMax) degMax = d;
       if (d < degHist.length) degHist[d]++;
-      if (d === 0) deg0++;
       if (d < 5) {
         lowDegCells.push({
-          i: i,
-          deg: d,
-          y: positions[i*3+1],
-          pos: [positions[i*3], positions[i*3+1], positions[i*3+2]]
+          i: i, deg: d,
+          x: positions[i*3], y: positions[i*3+1], z: positions[i*3+2]
         });
       }
     }
@@ -55189,23 +55185,83 @@ function _buildCellTriangulation(positions, neighbors, K, N, hash) {
     let histStr = "";
     for (let d = 0; d < 12; d++) histStr += "d" + d + "=" + degHist[d] + " ";
     console.log("[planet-mesh] degree histogram: " + histStr + "avg=" + avgDeg.toFixed(3) + " max=" + degMax + " #low(<5)=" + lowDegCells.length);
+
+    // Lat/lon 2D histogram: 6 lat bands × 6 lon bands = 36 cells
+    // lat bands: [-90, -60), [-60, -30), [-30, 0), [0, 30), [30, 60), [60, 90]
+    // lon bands: [-180, -120), [-120, -60), [-60, 0), [0, 60), [60, 120), [120, 180]
     if (lowDegCells.length > 0) {
-      // Sort by |y| descending to surface polar clustering first
-      lowDegCells.sort(function(a, b) { return Math.abs(b.y) - Math.abs(a.y); });
-      const sample = lowDegCells.slice(0, Math.min(12, lowDegCells.length));
-      console.log("[planet-mesh] low-degree cell positions (sorted by |y| desc, first " + sample.length + "):");
-      for (let k = 0; k < sample.length; k++) {
-        const c = sample[k];
-        const lat = Math.asin(Math.max(-1, Math.min(1, c.y))) * 180 / Math.PI;
-        const lon = Math.atan2(c.pos[2], c.pos[0]) * 180 / Math.PI;
-        console.log("  cell " + c.i + " deg=" + c.deg + " y=" + c.y.toFixed(4) + " lat=" + lat.toFixed(1) + "° lon=" + lon.toFixed(1) + "°");
-      }
-      // How many low-degree cells are in the top/bottom 5% by |y|?
-      let polarLow = 0;
+      const latLonHist = []; for (let r = 0; r < 6; r++) { latLonHist[r] = [0,0,0,0,0,0]; }
       for (let k = 0; k < lowDegCells.length; k++) {
-        if (Math.abs(lowDegCells[k].y) > 0.95) polarLow++;
+        const c = lowDegCells[k];
+        const lat = Math.asin(Math.max(-1, Math.min(1, c.y))) * 180 / Math.PI;
+        const lon = Math.atan2(c.z, c.x) * 180 / Math.PI;
+        const latBand = Math.max(0, Math.min(5, Math.floor((lat + 90) / 30)));
+        const lonBand = Math.max(0, Math.min(5, Math.floor((lon + 180) / 60)));
+        latLonHist[latBand][lonBand]++;
       }
-      console.log("[planet-mesh] low-degree cells with |y|>0.95 (polar): " + polarLow + "/" + lowDegCells.length);
+      console.log("[planet-mesh] low-deg cells by lat × lon (6×6 grid, 30°×60° bins):");
+      console.log("  lat\\lon  -180..-120  -120..-60  -60..0  0..60  60..120  120..180");
+      const latLabels = ["-90..-60", "-60..-30", "-30..0  ", "0..30   ", "30..60  ", "60..90  "];
+      for (let r = 5; r >= 0; r--) {
+        let row = "  " + latLabels[r] + "  ";
+        for (let cc = 0; cc < 6; cc++) {
+          row += "    " + String(latLonHist[r][cc]).padStart(3);
+        }
+        console.log(row);
+      }
+    }
+
+    // ---- Single-cell trace: pick first deg=0 cell, dump its 12 K-nearest
+    // and the Voronoi-test outcome for each. Reveals exactly why every
+    // edge from this cell is being rejected. ----
+    let traceCell = -1;
+    for (let i = 0; i < N; i++) { if (vAdj[i].length === 0) { traceCell = i; break; } }
+    if (traceCell < 0) {
+      for (let i = 0; i < N; i++) { if (vAdj[i].length < 3) { traceCell = i; break; } }
+    }
+    if (traceCell >= 0) {
+      const i = traceCell;
+      const ix = positions[i*3], iy = positions[i*3+1], iz = positions[i*3+2];
+      const lat = Math.asin(iy) * 180 / Math.PI, lon = Math.atan2(iz, ix) * 180 / Math.PI;
+      console.log("[planet-mesh] trace cell " + i + " deg=" + vAdj[i].length + " pos=(" + ix.toFixed(4) + "," + iy.toFixed(4) + "," + iz.toFixed(4) + ") lat=" + lat.toFixed(1) + "° lon=" + lon.toFixed(1) + "°");
+      console.log("  cosMaxEdge=" + cosMaxEdge.toFixed(6) + " (= reject if dot(i,j) < this) typicalAng=" + typicalAngular.toFixed(6) + " rad = " + (typicalAngular*180/Math.PI).toFixed(3) + "°");
+      for (let k = 0; k < K; k++) {
+        const j = neighbors[i * K + k];
+        if (j < 0) { console.log("  k=" + k + " j=-1 (empty slot)"); continue; }
+        const jx = positions[j*3], jy = positions[j*3+1], jz = positions[j*3+2];
+        const dotIJ = ix*jx + iy*jy + iz*jz;
+        const ang = Math.acos(Math.max(-1, Math.min(1, dotIJ))) * 180 / Math.PI;
+        let verdict;
+        if (dotIJ < cosMaxEdge) {
+          verdict = "REJECT prefilter (dot=" + dotIJ.toFixed(6) + " < " + cosMaxEdge.toFixed(6) + ", ang=" + ang.toFixed(3) + "°)";
+        } else {
+          // Re-run the empty-circle test, find first falsifier
+          let mx = ix+jx, my = iy+jy, mz = iz+jz;
+          const ml = Math.sqrt(mx*mx+my*my+mz*mz); mx/=ml; my/=ml; mz/=ml;
+          const dotIM = ix*mx+iy*my+iz*mz;
+          let falsifier = -1, falsifierAdv = 0, falsifierSrc = "";
+          for (let k2 = 0; k2 < K && falsifier < 0; k2++) {
+            const c = neighbors[i*K+k2];
+            if (c < 0 || c === j) continue;
+            const dotCM = positions[c*3]*mx + positions[c*3+1]*my + positions[c*3+2]*mz;
+            if (dotCM > dotIM + slack) { falsifier = c; falsifierAdv = dotCM - dotIM; falsifierSrc = "N(i)"; }
+          }
+          for (let k2 = 0; k2 < K && falsifier < 0; k2++) {
+            const c = neighbors[j*K+k2];
+            if (c < 0 || c === i) continue;
+            const dotCM = positions[c*3]*mx + positions[c*3+1]*my + positions[c*3+2]*mz;
+            if (dotCM > dotIM + slack) { falsifier = c; falsifierAdv = dotCM - dotIM; falsifierSrc = "N(j)"; }
+          }
+          if (falsifier >= 0) {
+            const fx = positions[falsifier*3], fy = positions[falsifier*3+1], fz = positions[falsifier*3+2];
+            const fLat = Math.asin(fy)*180/Math.PI, fLon = Math.atan2(fz,fx)*180/Math.PI;
+            verdict = "REJECT by " + falsifierSrc + " falsifier=" + falsifier + " adv=" + falsifierAdv.toExponential(2) + " falsifierLat=" + fLat.toFixed(1) + "° lon=" + fLon.toFixed(1) + "°";
+          } else {
+            verdict = "ACCEPT (but vAdj says rejected -- bug in M-bucket scan?)";
+          }
+        }
+        console.log("  k=" + k + " j=" + j + " ang=" + ang.toFixed(3) + "° " + verdict);
+      }
     }
   }
 
