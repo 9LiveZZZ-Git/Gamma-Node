@@ -10802,16 +10802,18 @@ public:
       { n: "centerZ",           t: "param" },
       { n: "heightScale",       t: "param" },
       { n: "seaLevel",          t: "param" },
+      { n: "subdivide",         t: "param" },
       { n: "heightmap",         t: "heightmap" }
     ],
     outs: [{ n: "mesh", t: "mesh" }],
     params: {
       radius: 1000, polarRadiusRatio: 1.0,
       centerX: 0, centerY: 0, centerZ: 0,
-      heightScale: 0, seaLevel: 0.5
+      heightScale: 0, seaLevel: 0.5,
+      subdivide: 0
     },
     methods: {},
-    description: "Phase 7.d-azgaar of planet-spec -- direct cell-mesh planet, mirrors Azgaar's 3D scene mode (one mesh vertex per cell, triangles between mutually-adjacent cells). NO chunking, NO cubemap intermediate -- the PlanetMap's cells map DIRECTLY to mesh vertices, so peak cells produce sharp peaks instead of the plateaus the cubemap-bake path produces. Wire a PlanetMap's heightmap output to the heightmap input; each cell becomes one vertex at unit_direction * (R + cell.h * heightScale * altitudeFactor) with the cell's color from _planetColorForHeight. Triangulation built once from the cell-graph's K=6 nearest-neighbor table (Delaunay approximation; ~120k triangles at default cellCount=30000). Best for orbit views where you want the heightmap to read faithfully -- foot-level detail not provided (cells are ~130km arc at Earth scale = no sub-cell variation, each triangle is ~130km wide on the rendered surface)."
+    description: "Phase 7.d-azgaar of planet-spec -- direct cell-mesh planet, mirrors Azgaar's 3D scene mode (one mesh vertex per cell, triangles between mutually-adjacent cells). NO chunking, NO cubemap intermediate. Wire a PlanetMap's heightmap output; each cell becomes one vertex at unit_direction * (R + cell.h * heightScale * altitudeFactor) with color from _planetColorForHeight. Triangulation is built once from the cell-graph K-neighbor table (~120k triangles at cellCount=30000). subdivide=1 applies one Loop subdivision pass (Azgaar `loopSubdivision.modify(geometry, 1)` equivalent) -- 4× triangle count, smooths cell-faceting between mountains, gives the rounded terrain look from Azgaar's 3D scene. Best for orbit views; foot-level detail not provided (~130km per cell at Earth scale)."
   },
 
   Plane: {
@@ -33227,7 +33229,8 @@ const _demos = [
         centerY:          -PLANET_R * PLANET_POL,
         centerZ:          0,
         heightScale:      20000,
-        seaLevel:         0.55
+        seaLevel:         0.55,
+        subdivide:        1  // one Loop subdivision pass -- smooths cell-faceting
       });
 
       // Late-morning Sun + ProceduralSky -- same setup as the
@@ -57025,6 +57028,119 @@ function _buildPlanet(node) {
  * intermediate, NO smoothing of cell elevations -- peak cells produce
  * sharp peaks because each peak cell IS one mesh vertex with its own
  * elevation. */
+/* Loop subdivision for the displaced PlanetMesh. One pass:
+ *   - For each existing edge {a, b} (shared by 2 triangles on a
+ *     closed manifold), create new "edge vertex" at
+ *       p_new = (3/8)(p_a + p_b) + (1/8)(p_c1 + p_c2)
+ *     where c1, c2 are the apex vertices of the two adjacent
+ *     triangles. Classic Loop edge-vertex stencil.
+ *   - For each existing vertex v with degree n, move it to
+ *       p_new = (1 - n*β) * p_v + β * sum(neighbors)
+ *     with Warren's β = (5/8 - (3/8 + (1/4)*cos(2π/n))²) / n
+ *     for n > 3, β = 3/16 for n = 3. (n = 6 gives β = 1/16 — the
+ *     limit case for the regular hex tiling.)
+ *   - For each triangle (a, b, c), emit 4 children using the new
+ *     edge vertices eAB, eBC, eCA: three corner triangles
+ *     (a,eAB,eCA), (b,eBC,eAB), (c,eCA,eBC) + one center
+ *     triangle (eAB,eBC,eCA), preserving CCW-from-outside winding.
+ *
+ * Vertex count goes from N → N + E, triangle count goes 4×.
+ * At N=60k that's 240k verts / 480k triangles — fine for WebGPU.
+ * Returns edgeParents so the caller can interpolate vertex
+ * attributes (elevation, color) for the new edge vertices. */
+function _loopSubdividePlanet(positions3, tris, N) {
+  const T = tris.length / 3;
+  const edgeMap = new Map();
+  for (let t = 0; t < T; t++) {
+    const i0 = tris[t*3], i1 = tris[t*3+1], i2 = tris[t*3+2];
+    for (let e = 0; e < 3; e++) {
+      const a = (e === 0) ? i0 : (e === 1) ? i1 : i2;
+      const b = (e === 0) ? i1 : (e === 1) ? i2 : i0;
+      const c = (e === 0) ? i2 : (e === 1) ? i0 : i1;
+      const lo = (a < b) ? a : b, hi = (a < b) ? b : a;
+      const key = lo * N + hi;
+      let edge = edgeMap.get(key);
+      if (!edge) {
+        edge = { a: lo, b: hi, c1: c, c2: -1, newIdx: -1 };
+        edgeMap.set(key, edge);
+      } else if (edge.c2 < 0) {
+        edge.c2 = c;
+      }
+    }
+  }
+  const adj = new Array(N);
+  for (let i = 0; i < N; i++) adj[i] = [];
+  for (const edge of edgeMap.values()) {
+    adj[edge.a].push(edge.b);
+    adj[edge.b].push(edge.a);
+  }
+  const E = edgeMap.size;
+  const newV = N + E;
+  let eIdx = N;
+  for (const edge of edgeMap.values()) edge.newIdx = eIdx++;
+
+  const newPositions = new Float32Array(newV * 3);
+  for (let i = 0; i < N; i++) {
+    const n = adj[i].length;
+    if (n === 0) {
+      newPositions[i*3+0] = positions3[i*3+0];
+      newPositions[i*3+1] = positions3[i*3+1];
+      newPositions[i*3+2] = positions3[i*3+2];
+      continue;
+    }
+    let beta;
+    if (n === 3) beta = 3/16;
+    else {
+      const inner = 3/8 + 0.25 * Math.cos(2 * Math.PI / n);
+      beta = (5/8 - inner * inner) / n;
+    }
+    const selfW = 1 - n * beta;
+    let sx = positions3[i*3+0] * selfW;
+    let sy = positions3[i*3+1] * selfW;
+    let sz = positions3[i*3+2] * selfW;
+    for (let j = 0; j < n; j++) {
+      const k = adj[i][j];
+      sx += positions3[k*3+0] * beta;
+      sy += positions3[k*3+1] * beta;
+      sz += positions3[k*3+2] * beta;
+    }
+    newPositions[i*3+0] = sx;
+    newPositions[i*3+1] = sy;
+    newPositions[i*3+2] = sz;
+  }
+  for (const edge of edgeMap.values()) {
+    const a = edge.a, b = edge.b;
+    const c1 = edge.c1, c2 = (edge.c2 >= 0) ? edge.c2 : edge.c1;
+    const idx = edge.newIdx;
+    newPositions[idx*3+0] = 0.375 * (positions3[a*3+0] + positions3[b*3+0])
+                          + 0.125 * (positions3[c1*3+0] + positions3[c2*3+0]);
+    newPositions[idx*3+1] = 0.375 * (positions3[a*3+1] + positions3[b*3+1])
+                          + 0.125 * (positions3[c1*3+1] + positions3[c2*3+1]);
+    newPositions[idx*3+2] = 0.375 * (positions3[a*3+2] + positions3[b*3+2])
+                          + 0.125 * (positions3[c1*3+2] + positions3[c2*3+2]);
+  }
+
+  const newTris = new Uint32Array(T * 4 * 3);
+  let outIdx = 0;
+  for (let t = 0; t < T; t++) {
+    const a = tris[t*3], b = tris[t*3+1], c = tris[t*3+2];
+    const eAB = edgeMap.get((a<b?a:b) * N + (a<b?b:a)).newIdx;
+    const eBC = edgeMap.get((b<c?b:c) * N + (b<c?c:b)).newIdx;
+    const eCA = edgeMap.get((c<a?c:a) * N + (c<a?a:c)).newIdx;
+    newTris[outIdx++] = a;   newTris[outIdx++] = eAB; newTris[outIdx++] = eCA;
+    newTris[outIdx++] = b;   newTris[outIdx++] = eBC; newTris[outIdx++] = eAB;
+    newTris[outIdx++] = c;   newTris[outIdx++] = eCA; newTris[outIdx++] = eBC;
+    newTris[outIdx++] = eAB; newTris[outIdx++] = eBC; newTris[outIdx++] = eCA;
+  }
+
+  const edgeParents = new Int32Array(E * 2);
+  for (const edge of edgeMap.values()) {
+    edgeParents[(edge.newIdx - N) * 2 + 0] = edge.a;
+    edgeParents[(edge.newIdx - N) * 2 + 1] = edge.b;
+  }
+  return { positions: newPositions, tris: newTris, edgeParents: edgeParents, oldCount: N, newCount: newV };
+}
+
 function _buildPlanetMesh(node) {
   if (!state || !Array.isArray(state.edges)) {
     console.warn("[planet-mesh] no state.edges yet, skipping mesh");
@@ -57105,17 +57221,34 @@ function _buildPlanetMesh(node) {
     positions3[i*3+2] = czC + r * uz           + altitude * uz;
   }
 
-  // Pass 2: face-normal accumulation.
-  const normals3 = new Float32Array(N * 3);
-  for (let t = 0; t < tris.length; t += 3) {
-    const a = tris[t], b = tris[t+1], c = tris[t+2];
-    const ax = positions3[a*3], ay = positions3[a*3+1], az = positions3[a*3+2];
-    const bx = positions3[b*3], by = positions3[b*3+1], bz = positions3[b*3+2];
-    const cx = positions3[c*3], cy = positions3[c*3+1], cz = positions3[c*3+2];
+  // Pass 1.5 (optional): Loop subdivide. New edge vertices are
+  // weighted averages of their endpoint + apex parents (the standard
+  // Loop stencil); old vertices move slightly via the β-rule, which
+  // is what makes mountains "round off" instead of staying spiky.
+  const subdivide = ((typeof p.subdivide === "number") ? p.subdivide : 0) >= 0.5;
+  let outPositions = positions3;
+  let outTris = tris;
+  let outCount = N;
+  let edgeParents = null;
+  if (subdivide) {
+    const t0 = performance.now();
+    const sub = _loopSubdividePlanet(positions3, tris, N);
+    outPositions = sub.positions;
+    outTris = sub.tris;
+    outCount = sub.newCount;
+    edgeParents = sub.edgeParents;
+    console.log("[planet-mesh] loop-subdivided " + N + "→" + outCount + " verts (" + (tris.length/3) + "→" + (outTris.length/3) + " tris) in " + (performance.now() - t0).toFixed(0) + "ms");
+  }
+
+  // Pass 2: face-normal accumulation on the final geometry.
+  const normals3 = new Float32Array(outCount * 3);
+  for (let t = 0; t < outTris.length; t += 3) {
+    const a = outTris[t], b = outTris[t+1], c = outTris[t+2];
+    const ax = outPositions[a*3], ay = outPositions[a*3+1], az = outPositions[a*3+2];
+    const bx = outPositions[b*3], by = outPositions[b*3+1], bz = outPositions[b*3+2];
+    const cx = outPositions[c*3], cy = outPositions[c*3+1], cz = outPositions[c*3+2];
     const e1x = bx - ax, e1y = by - ay, e1z = bz - az;
     const e2x = cx - ax, e2y = cy - ay, e2z = cz - az;
-    // Cross product = face normal × 2*area, so adding it to each
-    // vertex naturally weights big triangles more.
     const fnx = e1y*e2z - e1z*e2y;
     const fny = e1z*e2x - e1x*e2z;
     const fnz = e1x*e2y - e1y*e2x;
@@ -57124,26 +57257,39 @@ function _buildPlanetMesh(node) {
     normals3[c*3+0] += fnx; normals3[c*3+1] += fny; normals3[c*3+2] += fnz;
   }
 
-  // Pass 3: interleave + Lambert.
-  const verts = new Float32Array(N * 11);
-  for (let i = 0; i < N; i++) {
-    const px = positions3[i*3+0], py = positions3[i*3+1], pz = positions3[i*3+2];
+  // Pass 3: interleave + Lambert. For subdivided meshes, the edge-
+  // vertex elevation is interpolated from its two endpoint cells so
+  // color blends smoothly across the new vertex (matches the
+  // texture-interpolation behavior of Azgaar's UV-mapped path).
+  const verts = new Float32Array(outCount * 11);
+  for (let i = 0; i < outCount; i++) {
+    const px = outPositions[i*3+0], py = outPositions[i*3+1], pz = outPositions[i*3+2];
     let nx = normals3[i*3+0], ny = normals3[i*3+1], nz = normals3[i*3+2];
     let nl = Math.hypot(nx, ny, nz);
     if (nl > 1e-9) { nx /= nl; ny /= nl; nz /= nl; }
-    else { // Fallback to ellipsoid normal if accumulator was zero.
+    else if (i < N) {
       const ux = cells.positions[i*3+0], uy = cells.positions[i*3+1], uz = cells.positions[i*3+2];
       const ny0 = uy / polRatio2;
       const inv = 1 / Math.max(1e-12, Math.sqrt(ux*ux + ny0*ny0 + uz*uz));
       nx = ux * inv; ny = ny0 * inv; nz = uz * inv;
+    } else {
+      nx = 0; ny = 1; nz = 0;
     }
-    // Sign-check: normal should point outward from planet center
-    // (3-cycle triangulation already does CCW-from-outside, but a
-    // misclassified normal is a one-cell visible artifact, so flip
-    // if it's pointing inward).
     const radialDot = nx * (px - cxC) + ny * (py - cyC) + nz * (pz - czC);
     if (radialDot < 0) { nx = -nx; ny = -ny; nz = -nz; }
-    const h = cells.elevations[i];
+    // Per-vertex elevation lookup: cell index for the first N
+    // vertices; mean of the two endpoint cells for subdivided
+    // edge vertices.
+    let h;
+    if (i < N) {
+      h = cells.elevations[i];
+    } else if (edgeParents) {
+      const a = edgeParents[(i - N) * 2 + 0];
+      const b = edgeParents[(i - N) * 2 + 1];
+      h = 0.5 * (cells.elevations[a] + cells.elevations[b]);
+    } else {
+      h = seaLevel;
+    }
     const baseCol = _planetColorForHeight(h, seaLevel);
     const lambert = Math.max(ambient, nx * sunX + ny * sunY + nz * sunZ);
     const base = i * 11;
@@ -57161,9 +57307,9 @@ function _buildPlanetMesh(node) {
   }
   if (!Visual._planetMeshBuiltLogged) {
     Visual._planetMeshBuiltLogged = true;
-    console.log("[planet-mesh] built mesh with " + N + " verts + " + (tris.length / 3) + " triangles for node", node.id);
+    console.log("[planet-mesh] built mesh with " + outCount + " verts + " + (outTris.length / 3) + " triangles for node", node.id);
   }
-  return { verts, indices: tris };
+  return { verts, indices: outTris };
 }
 
 
