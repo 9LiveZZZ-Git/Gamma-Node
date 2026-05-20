@@ -47454,7 +47454,72 @@ function _tickAltimeterNodes() {
   const opacity   = Math.max(0.05, Math.min(1.0, (typeof p.opacity === "number") ? p.opacity : 0.90));
   const showSpeed = ((typeof p.showSpeed === "number") ? p.showSpeed : 1) >= 0.5;
 
-  const W = 180, H = showSpeed ? 76 : 44;
+  const posX = (typeof cam.params.posX === "number") ? cam.params.posX : 0;
+  const posY = (typeof cam.params.posY === "number") ? cam.params.posY : 0;
+  const posZ = (typeof cam.params.posZ === "number") ? cam.params.posZ : 0;
+
+  // §planet-spec Phase 7.h-overhaul -- globe altimeter.
+  //   MSL = |camera - planet_center| - planet_radius
+  //   AGL = MSL - heightmap_at_camera's_surface_projection
+  // For terrain patches (no planet), MSL falls back to plain posY
+  // (legacy behavior) and AGL is hidden.
+  let mslMeters = posY, aglMeters = null;
+  const pl = _findPlanetInfo();
+  if (pl) {
+    const dx = posX - pl.centerX, dy = posY - pl.centerY, dz = posZ - pl.centerZ;
+    const r = Math.hypot(dx, dy, dz);
+    mslMeters = r - pl.radius;
+    // AGL via planet-map cell sample. PlanetMap builds its cells +
+    // spatial hash lazily on first PlanetMesh build; until then AGL
+    // stays null (hidden in the UI).
+    if (pl.mapNode && pl.mapNode._cells && pl.mapNode._cellsHash && r > 1e-6 && pl.heightScale > 0) {
+      const ux = dx / r, uy = dy / r, uz = dz / r;
+      const cells = pl.mapNode._cells;
+      const hash = pl.mapNode._cellsHash;
+      const GRID = hash.GRID;
+      const ix0 = Math.max(0, Math.min(GRID - 1, Math.floor((ux + 1) * 0.5 * GRID)));
+      const iy0 = Math.max(0, Math.min(GRID - 1, Math.floor((uy + 1) * 0.5 * GRID)));
+      const iz0 = Math.max(0, Math.min(GRID - 1, Math.floor((uz + 1) * 0.5 * GRID)));
+      let bestDot = -2, bestIdx = -1;
+      for (let bx = ix0 - 1; bx <= ix0 + 1; bx++) {
+        if (bx < 0 || bx >= GRID) continue;
+        for (let by = iy0 - 1; by <= iy0 + 1; by++) {
+          if (by < 0 || by >= GRID) continue;
+          for (let bz = iz0 - 1; bz <= iz0 + 1; bz++) {
+            if (bz < 0 || bz >= GRID) continue;
+            const bucket = hash.buckets.get(bx * GRID * GRID + by * GRID + bz);
+            if (!bucket) continue;
+            for (let b = 0; b < bucket.length; b++) {
+              const ci = bucket[b];
+              const d = ux * cells.positions[ci*3] + uy * cells.positions[ci*3+1] + uz * cells.positions[ci*3+2];
+              if (d > bestDot) { bestDot = d; bestIdx = ci; }
+            }
+          }
+        }
+      }
+      if (bestIdx >= 0) {
+        const e = cells.elevations[bestIdx];
+        // Ocean cells (e < seaLevel) sit at planet.radius; land cells
+        // push outward by (e - seaLevel) * heightScale.
+        const surfaceR = pl.radius + Math.max(0, e - pl.seaLevel) * pl.heightScale;
+        aglMeters = r - surfaceR;
+      }
+    }
+  }
+
+  const fmtAlt = function(m) {
+    const a = Math.abs(m);
+    if (a >= 1000) return (m / 1000).toFixed(a >= 100000 ? 0 : 2) + " km";
+    return m.toFixed(0) + " m";
+  };
+  const mslStr = fmtAlt(mslMeters);
+  const aglStr = (aglMeters === null) ? null : fmtAlt(aglMeters);
+
+  const W = 200;
+  let H = 44;
+  if (aglStr !== null) H += 22;
+  if (showSpeed)       H += 32;
+
   canvas.style.display = "block";
   canvas.style.opacity = opacity;
   if (canvas.width !== W || canvas.height !== H) {
@@ -47470,57 +47535,36 @@ function _tickAltimeterNodes() {
   const ctx = canvas.getContext("2d");
   ctx.clearRect(0, 0, W, H);
 
-  const posX = (typeof cam.params.posX === "number") ? cam.params.posX : 0;
-  const posY = (typeof cam.params.posY === "number") ? cam.params.posY : 0;
-  const posZ = (typeof cam.params.posZ === "number") ? cam.params.posZ : 0;
-  // §planet-spec Phase 6+ -- if a Planet is in the patch, altitude is
-  // measured from the planet's local surface at the camera's lat/lon,
-  // not from world Y=0. _planetSurfaceYAt returns the radial world Y
-  // of the planet at (posX, posZ) accounting for curvature + height-
-  // field. For non-planet patches we fall back to plain posY.
-  let altMeters = posY;
-  if (state && Array.isArray(state.nodes)) {
-    const pl = state.nodes.find(n => n && n.type === "Planet");
-    if (pl && pl.params) {
-      const planet = _findPlanetForProjection();
-      if (planet) {
-        const surfY = _planetSurfaceYAt(posX, posZ, planet, pl.params);
-        altMeters = posY - surfY;
-      }
-    }
-  }
-  let altStr;
-  if (Math.abs(altMeters) >= 1000) {
-    altStr = (altMeters / 1000).toFixed(altMeters >= 100000 ? 0 : 2) + " km";
-  } else {
-    altStr = altMeters.toFixed(0) + " m";
-  }
-
+  let y = 16;
   ctx.fillStyle = "rgba(255,255,255,0.65)";
   ctx.font = "10px ui-monospace, monospace";
-  ctx.fillText("ALT", 12, 16);
-
+  ctx.fillText(pl ? "MSL" : "ALT", 12, y);
   ctx.fillStyle = "rgba(255,255,255,0.95)";
   ctx.font = "bold 22px ui-monospace, monospace";
-  ctx.fillText(altStr, 12, 38);
+  ctx.fillText(mslStr, 12, y + 22);
+  y += 38;
+
+  if (aglStr !== null) {
+    ctx.fillStyle = "rgba(255,255,255,0.55)";
+    ctx.font = "10px ui-monospace, monospace";
+    ctx.fillText("AGL", 12, y);
+    ctx.fillStyle = "rgba(255,255,255,0.82)";
+    ctx.font = "bold 14px ui-monospace, monospace";
+    ctx.fillText(aglStr, 40, y);
+    y += 22;
+  }
 
   if (showSpeed) {
     const baseSpeed = (typeof cam.params.walkSpeed === "number") ? cam.params.walkSpeed : 10;
-    // No way to read "sprint held" from outside the camera tick, but
-    // walkSpeed * 4 is the sprint cap; we just show base + sprint cap.
-    // Use a unit-aware speed format: km/s once we cross 1000 m/s.
     let speedStr;
-    if (baseSpeed >= 1000) {
-      speedStr = (baseSpeed / 1000).toFixed(2) + " km/s";
-    } else {
-      speedStr = Math.round(baseSpeed) + " m/s";
-    }
+    if (baseSpeed >= 1000) speedStr = (baseSpeed / 1000).toFixed(2) + " km/s";
+    else                   speedStr = Math.round(baseSpeed) + " m/s";
     ctx.fillStyle = "rgba(255,255,255,0.55)";
     ctx.font = "10px ui-monospace, monospace";
-    ctx.fillText("SPEED  " + speedStr + "  (×4 sprint)", 12, 60);
+    ctx.fillText("SPEED  " + speedStr + "  (×4 sprint)", 12, y + 12);
     ctx.fillStyle = "rgba(255,255,255,0.45)";
     ctx.font = "9px ui-monospace, monospace";
-    ctx.fillText("hold X faster · Z slower", 12, 72);
+    ctx.fillText("hold X faster · Z slower", 12, y + 24);
   }
 }
 
