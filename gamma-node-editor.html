@@ -10998,7 +10998,7 @@ public:
       { n: "subdivisions",  t: "param" },
       { n: "tileSize",      t: "param" },
       { n: "yBias",         t: "param" },
-      { n: "octaves",       t: "param" },
+      { n: "octavesCap",    t: "param" },
       { n: "curveAltLow",   t: "param" },
       { n: "curveAltHigh",  t: "param" },
       { n: "planetRadius",  t: "param" },
@@ -11007,20 +11007,20 @@ public:
     ],
     outs: [{ n: "mesh", t: "mesh" }],
     params: {
-      // §5.5.h-27 -- "effectively infinite" planet defaults. 5000km
-      // extent (=2500km radius) is enough that even from a 200km
-      // orbit-altitude view the visible Earth horizon (~1600km from
-      // sub-camera point) sits well inside the mesh. 128 subdivisions
-      // over that = ~39km/vertex; noiseFreqScale=0.05 (~17km wavelength
-      // out of the upstream 1.25km) keeps coherent big-shape features
-      // showing at that vertex spacing. Macro-tile bumped to 500km so
-      // the user can fly 100s of km without triggering a rebuild.
+      // §planet-spec Phase 3 -- the impostor now samples the SAME
+      // noise field as the upstream chunked TiledTerrain (no
+      // frequency rescaling). Octave count is derived per-build from
+      // the impostor's vertex spacing via the Nyquist rule -- coarse
+      // spacing automatically truncates to the few low-freq octaves
+      // that can be resolved without aliasing. 5000km extent + 128
+      // subs = ~39km/vert; octavesCap=20 means "no extra ceiling
+      // beyond what spacing allows", just inherit the TiledTerrain's
+      // octaves as the upper bound.
       extent:         5000000,
       subdivisions:   128,
       tileSize:       500000,
       yBias:          -0.5,
-      octaves:        2,
-      noiseFreqScale: 0.05,
+      octavesCap:     20,
       // §5.5.h-27 -- curve activation altitude dropped 8km -> 1km so
       // the user sees the bend kick in as soon as they leave ground
       // level, instead of needing to climb 8km of invisible-flat-Earth
@@ -32743,13 +32743,18 @@ const _demos = [
         erosionRadius:     80,
         erosionStrength:   0.55,
         islandMode:          "archipelago",
-        // §5.5.h-8 -- mask freq raised so several islands fit in the
-        // visible disc (~10km diameter at chunkRadius=20 * 256). At
-        // 0.0003 the mask period is ~3.3km, giving ~3 island/sea
-        // features per axis. Seed 1.2 puts the spawn (world origin)
-        // on solid land (mask~0.71) with ocean visible in multiple
-        // directions and ~48% land coverage in view.
-        islandMaskFreq:      0.0003,
+        // §planet-spec Phase 3 -- continental-scale mask. Old 0.0003
+        // (3km island periods) is replaced by 0.000003 (333km
+        // continent periods). The TiledTerrain fbm noise itself
+        // stays at 0.0008 (archipelago-scale variation), so within
+        // a continent you still see undulating terrain at km scale;
+        // the LARGE-SCALE shape (land vs ocean across hundreds of
+        // km) is what's now driven by a continental-frequency mask.
+        // Seed 1.2 puts (0,0) on land (mask~0.71) regardless of
+        // freq (mask at origin is just hash(0,0,seed)), so spawn is
+        // still on a continent. From orbit the horizon impostor's
+        // low-octave noise reveals the continent silhouettes.
+        islandMaskFreq:      0.000003,
         islandMaskSeed:      1.2,
         islandMaskThreshold: 0.50,
         // §5.5.h-11 -- wider softness (was 0.06). Combined with the new
@@ -32841,12 +32846,18 @@ const _demos = [
       // from sub-camera point) is fully inside the mesh. Macro-tile
       // 500km so the user can fly very far without rebuild stalls.
       const horizon = makeNode("TerrainHorizon", 280, 680, {
+        // §planet-spec Phase 3 -- impostor uses the SAME noise as
+        // the chunked TiledTerrain (no rescaled freq). Octave count
+        // is auto-truncated by the impostor's vertex spacing, so it
+        // shows the low-freq big-shape silhouette of the same noise
+        // field. With the demo's current freq=0.0008 the impostor
+        // spacing is too coarse to resolve any octaves -- impostor
+        // renders effectively flat until Phase 4 lowers base freq.
         extent:         5000000,
         subdivisions:   128,
         tileSize:       500000,
         yBias:          -0.5,
-        octaves:        2,
-        noiseFreqScale: 0.05,
+        octavesCap:     20,
         curveAltLow:    1000,
         curveAltHigh:   25000,
         planetRadius:   6378000,
@@ -52562,19 +52573,29 @@ fn _tw_valueNoise(p: vec2<f32>, seed: f32) -> f32 {
   let b = _tw_hash(ix + 1, iy,     seed);
   let c = _tw_hash(ix,     iy + 1, seed);
   let d = _tw_hash(ix + 1, iy + 1, seed);
-  let s = fr * fr * (vec2<f32>(3.0) - vec2<f32>(2.0) * fr);
+  // §planet-spec Phase 3 -- quintic interpolation matches the JS
+  // _terrainValueNoise. C2 continuous; kills second-derivative seams
+  // at lattice cell boundaries.
+  let s = fr * fr * fr * (fr * (fr * vec2<f32>(6.0) - vec2<f32>(15.0)) + vec2<f32>(10.0));
   let ab = a + (b - a) * s.x;
   let cd = c + (d - c) * s.x;
   return ab + (cd - ab) * s.y;
 }
-fn _tw_baseHeight(wx: f32, wz: f32, freq: f32, octs: i32, lac: f32, gain: f32, ridges: f32, seed: f32, plateau: f32) -> f32 {
+// §planet-spec Phase 3 -- continuous octave count. Caller passes
+// octavesF as f32 (not i32 like before); fractional values fade
+// the last octave in by their fractional amount so LOD transitions
+// stop popping. octavesF == 5.0 reproduces the legacy 5-octave fBm
+// behavior exactly. Mirrors the JS _terrainFBM.
+fn _tw_baseHeight(wx: f32, wz: f32, freq: f32, octavesF: f32, lac: f32, gain: f32, ridges: f32, seed: f32, plateau: f32) -> f32 {
   var p = vec2<f32>(wx, wz) * max(0.001, freq);
   var amp: f32 = 1.0;
   var sum: f32 = 0.0;
   var maxAmp: f32 = 0.0;
   let r = clamp(ridges, 0.0, 1.0);
-  let octsClamped: i32 = max(1, min(8, octs));
-  for (var ii: i32 = 0; ii < octsClamped; ii = ii + 1) {
+  let totalOctF: f32 = clamp(octavesF, 0.0, 20.0);
+  let fullOcts: i32 = i32(floor(totalOctF));
+  let frac: f32   = totalOctF - f32(fullOcts);
+  for (var ii: i32 = 0; ii < fullOcts; ii = ii + 1) {
     var s = _tw_valueNoise(p, seed);
     let ridge = 1.0 - abs(2.0 * s - 1.0);
     s = s * (1.0 - r) + ridge * ridge * r;
@@ -52582,6 +52603,13 @@ fn _tw_baseHeight(wx: f32, wz: f32, freq: f32, octs: i32, lac: f32, gain: f32, r
     maxAmp = maxAmp + amp;
     p = p * lac;
     amp = amp * gain;
+  }
+  if (frac > 0.0) {
+    var s = _tw_valueNoise(p, seed);
+    let ridge = 1.0 - abs(2.0 * s - 1.0);
+    s = s * (1.0 - r) + ridge * ridge * r;
+    sum = sum + s * amp * frac;
+    maxAmp = maxAmp + amp * frac;
   }
   var h = clamp(sum / max(1e-6, maxAmp), 0.0, 1.0);
   if (plateau > 0.001) {
@@ -52636,12 +52664,12 @@ fn _tw_lodSegs(dxAbs: i32, dzAbs: i32, radius: i32, baseSegs: i32) -> i32 {
   return 2;
 }
 fn _tw_finalY_at(wx: f32, wz: f32,
-                 t_freq: f32, t_octs: i32, t_lac: f32, t_gain: f32, t_ridges: f32,
+                 t_freq: f32, t_octsF: f32, t_lac: f32, t_gain: f32, t_ridges: f32,
                  t_seed: f32, t_plateau: f32, t_hs: f32, t_yOff: f32,
                  archipel: f32, t_sink: f32,
                  m_freq: f32, m_seed: f32, m_thresh: f32, m_soft: f32,
                  beachStr: f32, beachFreq: f32) -> f32 {
-  let h = _tw_baseHeight(wx, wz, t_freq, t_octs, t_lac, t_gain, t_ridges, t_seed, t_plateau);
+  let h = _tw_baseHeight(wx, wz, t_freq, t_octsF, t_lac, t_gain, t_ridges, t_seed, t_plateau);
   var ty = (h - 1.0) * t_hs + t_yOff;
   if (archipel > 0.5) {
     let landAmt = _tw_islandLand(wx, wz, m_freq, m_seed, m_thresh, m_soft);
@@ -52694,7 +52722,8 @@ fn fs_water(in: VsOut) -> @location(0) vec4<f32> {
   // Terrain noise params (auto-pulled from patch's TiledTerrain by encoder).
   let t_seed     = uD.band2.x;
   let t_freq     = uD.band2.y;
-  let t_octs     = i32(uD.band2.z);
+  // §planet-spec Phase 3 -- continuous octave count (was i32 cast).
+  let t_octsF    = uD.band2.z;
   let t_plateau  = uD.band2.w;
   let t_lac      = uD.band3.x;
   let t_gain     = uD.band3.y;
@@ -52744,20 +52773,26 @@ fn fs_water(in: VsOut) -> @location(0) vec4<f32> {
     let gz = floor(wp.z / dStep) * dStep;
     let fx = clamp((wp.x - gx) / dStep, 0.0, 1.0);
     let fz = clamp((wp.z - gz) / dStep, 0.0, 1.0);
+    // §planet-spec Phase 3 -- LOD-aware octave count. Sample at the
+    // SAME truncated octave count the chunked mesh used for this
+    // chunk's LOD; otherwise water foam picks up high-freq detail
+    // that the chunked mesh doesn't have and drifts off the shore.
+    let octavesByLod = clamp(log2(1.0 / (2.0 * t_freq * dStep)), 0.0, 20.0);
+    let t_octsF_lod  = min(t_octsF, octavesByLod);
     let y00 = _tw_finalY_at(gx,         gz,
-                            t_freq, t_octs, t_lac, t_gain, t_ridges, t_seed, t_plateau,
+                            t_freq, t_octsF_lod, t_lac, t_gain, t_ridges, t_seed, t_plateau,
                             t_hs, t_yOff, archipel, t_sink, m_freq, m_seed, m_thresh, m_soft,
                             beachStr, beachFreq);
     let y10 = _tw_finalY_at(gx + dStep, gz,
-                            t_freq, t_octs, t_lac, t_gain, t_ridges, t_seed, t_plateau,
+                            t_freq, t_octsF_lod, t_lac, t_gain, t_ridges, t_seed, t_plateau,
                             t_hs, t_yOff, archipel, t_sink, m_freq, m_seed, m_thresh, m_soft,
                             beachStr, beachFreq);
     let y01 = _tw_finalY_at(gx,         gz + dStep,
-                            t_freq, t_octs, t_lac, t_gain, t_ridges, t_seed, t_plateau,
+                            t_freq, t_octsF_lod, t_lac, t_gain, t_ridges, t_seed, t_plateau,
                             t_hs, t_yOff, archipel, t_sink, m_freq, m_seed, m_thresh, m_soft,
                             beachStr, beachFreq);
     let y11 = _tw_finalY_at(gx + dStep, gz + dStep,
-                            t_freq, t_octs, t_lac, t_gain, t_ridges, t_seed, t_plateau,
+                            t_freq, t_octsF_lod, t_lac, t_gain, t_ridges, t_seed, t_plateau,
                             t_hs, t_yOff, archipel, t_sink, m_freq, m_seed, m_thresh, m_soft,
                             beachStr, beachFreq);
     let terrainY = y00 * (1.0 - fx) * (1.0 - fz)
@@ -54184,8 +54219,9 @@ function _meshCacheKey(node) {
       // be in the cache key (the mesh geometry is identical at any
       // altitude; only the fragment shader's discard threshold
       // changes, and that's a per-frame uniform).
+      // §planet-spec Phase 3 -- noiseFreqScale gone; octavesCap added.
       return "thr:" + [
-        p.extent, p.subdivisions, p.tileSize, p.yBias, p.octaves, p.noiseFreqScale,
+        p.extent, p.subdivisions, p.tileSize, p.yBias, p.octavesCap,
         tile.tx, tile.tz,
         ttp.seed, ttp.frequency, ttp.octaves, ttp.lacunarity, ttp.gain,
         ttp.ridges, ttp.plateau, ttp.heightScale, ttp.yOffset,
@@ -54387,18 +54423,38 @@ function _terrainValueNoise(x, y, seed) {
   const b = _terrainHash(ix + 1, iy,     seed);
   const c = _terrainHash(ix,     iy + 1, seed);
   const d = _terrainHash(ix + 1, iy + 1, seed);
-  // Smoothstep weights -- matches WGSL's f*f*(3-2f).
-  const sx = fx * fx * (3 - 2 * fx);
-  const sy = fy * fy * (3 - 2 * fy);
-  return (a + (b - a) * sx) + ((c + (d - c) * sx) - (a + (b - a) * sx)) * sy;
+  // §planet-spec Phase 3 -- quintic interpolation (6t^5 - 15t^4 +
+  // 10t^3). C2 continuous: kills the second-derivative kinks at
+  // lattice cell boundaries that show as faint seam artifacts when
+  // adjacent vertices fall on opposite sides of a cell border at
+  // different LODs. Cheap (two more multiplies per axis vs cubic).
+  const sx = fx * fx * fx * (fx * (fx * 6 - 15) + 10);
+  const sy = fy * fy * fy * (fy * (fy * 6 - 15) + 10);
+  const ab = a + (b - a) * sx;
+  const cd = c + (d - c) * sx;
+  return ab + (cd - ab) * sy;
 }
 function _terrainFBM(u, v, n) {
+  // §planet-spec Phase 3 -- fBm with CONTINUOUS fractional octave
+  // count. Caller sets n.effectiveOctavesF (a Number) to vary the
+  // octave count per-sample based on local mesh spacing; this is
+  // the LOD knob that keeps the silhouette stable across zoom
+  // levels (Nyquist: an octave with wavelength lambda_k can't be
+  // resolved at sample spacing Δx > lambda_k / 2, so we truncate).
+  // The fractional part fades the last octave in proportionally so
+  // there's no popping when chunks cross LOD boundaries.
+  // Fallback: if n.effectiveOctavesF is undefined, use n.octaves as
+  // an integer count (legacy path).
   let px = u * Math.max(0.001, n.frequency);
   let py = v * Math.max(0.001, n.frequency);
+  const totalOctF = (typeof n.effectiveOctavesF === "number")
+    ? Math.max(0.0, Math.min(20, n.effectiveOctavesF))
+    : Math.max(1, Math.min(8, Math.floor(n.octaves)));
+  const fullOcts = Math.floor(totalOctF);
+  const frac = totalOctF - fullOcts;
   let amp = 1.0, sum = 0.0, maxAmp = 0.0;
-  const octs = Math.max(1, Math.min(8, Math.floor(n.octaves)));
   const r = Math.max(0, Math.min(1, n.ridges));
-  for (let i = 0; i < octs; i++) {
+  for (let i = 0; i < fullOcts; i++) {
     let s = _terrainValueNoise(px, py, n.seed);
     const ridge = 1 - Math.abs(2 * s - 1);
     s = s * (1 - r) + ridge * ridge * r;
@@ -54408,7 +54464,29 @@ function _terrainFBM(u, v, n) {
     py *= n.lacunarity;
     amp *= n.gain;
   }
+  if (frac > 0) {
+    let s = _terrainValueNoise(px, py, n.seed);
+    const ridge = 1 - Math.abs(2 * s - 1);
+    s = s * (1 - r) + ridge * ridge * r;
+    sum += s * amp * frac;
+    maxAmp += amp * frac;
+  }
   return Math.max(0, Math.min(1, sum / Math.max(1e-6, maxAmp)));
+}
+
+/* §planet-spec Phase 3 -- derive the fractional octave count to
+ * evaluate for a given sample spacing. Implements the Nyquist rule
+ * (octave k has wavelength 1/(freq * lac^k); spacing must be
+ * <= wavelength/2 to resolve it without aliasing). lacunarity 2 is
+ * assumed -- close enough for our typical noise. Pass a small
+ * positive `pad` to evaluate slightly less than Nyquist for a
+ * safety margin against aliasing on grid-aligned sample patterns. */
+function _octavesForSpacing(freq, spacing, maxOctaves) {
+  const f = Math.max(1e-9, freq);
+  const dx = Math.max(1e-3, spacing);
+  // log2(1 / (2 * f * dx))
+  const k = Math.log2(1.0 / (2.0 * f * dx));
+  return Math.max(0, Math.min(maxOctaves || 16, k));
 }
 
 /* Terrain -- heightmap-displaced XZ grid. (segments+1)² verts laid
@@ -54942,25 +55020,40 @@ function _buildTerrainHorizon(node) {
   const extent  = Math.max(10000, (typeof p.extent === "number") ? p.extent : 100000);
   const segs    = Math.max(8, Math.min(256, Math.floor((typeof p.subdivisions === "number") ? p.subdivisions : 96)));
   const yBias   = (typeof p.yBias === "number") ? p.yBias : -0.5;
-  const octCap  = Math.max(1, Math.min(6, Math.floor((typeof p.octaves === "number") ? p.octaves : 3)));
-  // §5.5.h-26 -- multiply the upstream TiledTerrain's frequency by
-  // this scale so the impostor samples coherent big-shape features
-  // at its much coarser vertex spacing instead of aliasing the
-  // chunked terrain's fine detail.
-  const noiseFreqScale = (typeof p.noiseFreqScale === "number") ? Math.max(0.001, p.noiseFreqScale) : 0.15;
 
   // Pull noise from any TiledTerrain in the patch. Without one, the
-  // impostor falls back to a flat sea-level plane (still useful as a
-  // distance-fading horizon, even with no terrain wired).
+  // impostor falls back to a flat sea-level plane.
   let tt = null;
   if (state && Array.isArray(state.nodes)) {
     tt = state.nodes.find(n => n && n.type === "TiledTerrain") || null;
   }
   const ttp = (tt && tt.params) || {};
+  const macro = _terrainHorizonMacroTile(node);
+  const centerX = macro.tx * macro.tileSize;
+  const centerZ = macro.tz * macro.tileSize;
+  const half    = extent * 0.5;
+  const step    = extent / segs;
+  const side    = segs + 1;
+  const vertCount = side * side;
+
+  // §planet-spec Phase 3 -- the impostor uses the SAME noise field
+  // as the chunked TiledTerrain (no frequency rescaling). The LOD
+  // truncation comes from the impostor's coarse vertex spacing
+  // (`step`) feeding _octavesForSpacing -- octaves smaller than the
+  // Nyquist limit are dropped, so the impostor naturally shows the
+  // low-frequency big-shape silhouette of the same noise without
+  // aliasing the high-freq detail. No more silhouette mismatch with
+  // the chunked disc at the meeting line.
+  const ttFreq    = (typeof ttp.frequency === "number") ? ttp.frequency : 0.0008;
+  const ttOctaves = (typeof ttp.octaves   === "number") ? ttp.octaves   : 5;
+  const horizonCap = (typeof p.octavesCap === "number") ? p.octavesCap : 20;
+  const lodOctF   = _octavesForSpacing(ttFreq, step, 20);
+  const effOctavesF = Math.min(ttOctaves, horizonCap, lodOctF);
   const noise = tt ? {
     seed:        (typeof ttp.seed       === "number") ? ttp.seed       : 7.42,
-    frequency:   ((typeof ttp.frequency  === "number") ? ttp.frequency  : 0.0008) * noiseFreqScale,
-    octaves:     Math.min(octCap, (typeof ttp.octaves === "number") ? ttp.octaves : 5),
+    frequency:   ttFreq,
+    octaves:     ttOctaves,
+    effectiveOctavesF: effOctavesF,
     lacunarity:  (typeof ttp.lacunarity === "number") ? ttp.lacunarity : 2.0,
     gain:        (typeof ttp.gain       === "number") ? ttp.gain       : 0.5,
     ridges:      (typeof ttp.ridges     === "number") ? ttp.ridges     : 0,
@@ -54969,16 +55062,6 @@ function _buildTerrainHorizon(node) {
   } : null;
   const hs   = tt ? ((typeof ttp.heightScale === "number") ? ttp.heightScale : 80) : 0;
   const yOff = tt ? ((typeof ttp.yOffset    === "number") ? ttp.yOffset    : 0) : 0;
-
-  const macro = _terrainHorizonMacroTile(node);
-  // §5.5.h-24 -- macro tile uses round() so center is tx*tileSize
-  // exactly (was floor + halfTile offset before).
-  const centerX = macro.tx * macro.tileSize;
-  const centerZ = macro.tz * macro.tileSize;
-  const half    = extent * 0.5;
-  const step    = extent / segs;
-  const side    = segs + 1;
-  const vertCount = side * side;
 
   // Pass 1: sample heights so pass 2 can compute normals via finite
   // difference. Cheap reuse of the existing _tiledFinalY (erosion is
@@ -55488,10 +55571,28 @@ function _buildSingleChunk(node, info) {
   const chunkSize = Math.max(1, (typeof p.chunkSize === "number") ? p.chunkSize : 64);
   const hs   = (typeof p.heightScale === "number") ? p.heightScale : 80;
   const yOff = (typeof p.yOffset === "number")     ? p.yOffset     : 0;
+  const tileX = info.tileX;
+  const tileZ = info.tileZ;
+  const segs  = info.segs;
+  const originX = tileX * chunkSize;
+  const originZ = tileZ * chunkSize;
+  const N = segs + 1;
+  const dStep = chunkSize / segs;
+  // §planet-spec Phase 3 -- truncate octaves to the chunk's actual
+  // vertex spacing. The outermost LOD rings (segs=2) have ~chunkSize/2
+  // m vertex spacing; evaluating all 6 octaves there would alias the
+  // high-freq detail into low-freq garbage that shimmers as the
+  // camera moves. min() with node.octaves so a coarse-noise patch
+  // doesn't suddenly grow octaves it never had.
+  const nodeOctaves = (typeof p.octaves === "number") ? p.octaves : 6;
+  const nodeFreq    = (typeof p.frequency === "number") ? p.frequency : 0.008;
+  const lodOctF     = _octavesForSpacing(nodeFreq, dStep, 20);
+  const effOctavesF = Math.min(nodeOctaves, lodOctF);
   const noise = {
     seed:       (typeof p.seed       === "number") ? p.seed       : 7.42,
-    frequency:  (typeof p.frequency  === "number") ? p.frequency  : 0.008,
-    octaves:    (typeof p.octaves    === "number") ? p.octaves    : 6,
+    frequency:  nodeFreq,
+    octaves:    nodeOctaves,
+    effectiveOctavesF: effOctavesF,
     lacunarity: (typeof p.lacunarity === "number") ? p.lacunarity : 2.05,
     gain:       (typeof p.gain       === "number") ? p.gain       : 0.5,
     ridges:     (typeof p.ridges     === "number") ? p.ridges     : 0.5,
@@ -55500,14 +55601,6 @@ function _buildSingleChunk(node, info) {
     islandParams:  _findTiledIslandParams(node)
   };
   const skirtY = yOff - hs * 3;
-
-  const tileX = info.tileX;
-  const tileZ = info.tileZ;
-  const segs  = info.segs;
-  const originX = tileX * chunkSize;
-  const originZ = tileZ * chunkSize;
-  const N = segs + 1;
-  const dStep = chunkSize / segs;
 
   // Exact-size allocation (no padding) since each chunk knows its LOD.
   const vertCount = N * N + 4 * N;                          // grid + 4 skirt-bottom rows
