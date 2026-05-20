@@ -55149,9 +55149,21 @@ function _buildCellTriangulation(positions, neighbors, K, N, hash) {
   }
   console.log("[planet-mesh] voronoi-edge stats: cands=" + candCount + " rejPre=" + rejPre + " rejI=" + rejI + " rejJ=" + rejJ + " rejM=" + rejM + " accepted=" + accepted);
 
-  // ---- Pass 2: Fan triangulation via azimuth sort ----
+  // ---- Pass 2: 3-cycle enumeration on the Voronoi adjacency graph ----
+  //
+  // For every triple (i, j, c) with i < j < c that's mutually
+  // Voronoi-adjacent (j ∈ vAdj[i], c ∈ vAdj[i], c ∈ vAdj[j]),
+  // emit triangle (i, j, c). The strict ordering guarantees each
+  // triangle emits exactly once. Voronoi adjacency is symmetric by
+  // construction (pass 1 pushes both i→j and j→i into vAdj), so
+  // this catches ALL Delaunay triangles -- including the ~0.16% the
+  // azimuth-fan approach missed (where 3 mutually-adjacent cells
+  // weren't azimuth-consecutive in the smallest vertex's fan).
+  //
+  // Cost: O(N × avgDeg²). avgDeg ≈ 6 for Voronoi, so per-cell work
+  // is ~36 ops + |vAdj[j]| linear scan per candidate. At N=60k:
+  // ~2.2M outer ops × ~6 inner = 13M ops. Fast.
   const tris = [];
-  const azBuf = [];
   for (let i = 0; i < N; i++) {
     const vNbrs = vAdj[i];
     const len = vNbrs.length;
@@ -55159,52 +55171,33 @@ function _buildCellTriangulation(positions, neighbors, K, N, hash) {
     const ix = positions[i * 3 + 0];
     const iy = positions[i * 3 + 1];
     const iz = positions[i * 3 + 2];
-    // Build a tangent frame at i. Pick reference axis perpendicular
-    // to i's radial: if |iy| < 0.9 use Y, else use X (avoids the
-    // degenerate case where the reference is parallel to i).
-    let refx, refy, refz;
-    if (Math.abs(iy) < 0.9) { refx = 0; refy = 1; refz = 0; }
-    else                     { refx = 1; refy = 0; refz = 0; }
-    const dotRI = refx*ix + refy*iy + refz*iz;
-    let txX = refx - dotRI*ix;
-    let tyX = refy - dotRI*iy;
-    let tzX = refz - dotRI*iz;
-    const txLen = 1/Math.sqrt(txX*txX + tyX*tyX + tzX*tzX);
-    txX *= txLen; tyX *= txLen; tzX *= txLen;
-    // Tangent Y = i × tangent X (so X,Y,i form a right-handed frame).
-    const txY = iy*tzX - iz*tyX;
-    const tyY = iz*txX - ix*tzX;
-    const tzY = ix*tyX - iy*txX;
-    // Azimuth of each neighbor in the tangent plane.
-    azBuf.length = 0;
-    for (let k = 0; k < len; k++) {
-      const n = vNbrs[k];
-      const dxn = positions[n*3] - ix;
-      const dyn = positions[n*3+1] - iy;
-      const dzn = positions[n*3+2] - iz;
-      const aX = dxn*txX + dyn*tyX + dzn*tzX;
-      const aY = dxn*txY + dyn*tyY + dzn*tzY;
-      azBuf.push({ idx: n, angle: Math.atan2(aY, aX) });
-    }
-    azBuf.sort((a, b) => a.angle - b.angle);
-    for (let k = 0; k < len; k++) {
-      const n1 = azBuf[k].idx;
-      const n2 = azBuf[(k + 1) % len].idx;
-      // Dedup: emit only when i is the smallest of (i, n1, n2).
-      if (i >= n1 || i >= n2) continue;
-      // CCW winding from outside.
-      const e01x = positions[n1*3]   - ix;
-      const e01y = positions[n1*3+1] - iy;
-      const e01z = positions[n1*3+2] - iz;
-      const e02x = positions[n2*3]   - ix;
-      const e02y = positions[n2*3+1] - iy;
-      const e02z = positions[n2*3+2] - iz;
-      const cxn = e01y * e02z - e01z * e02y;
-      const cyn = e01z * e02x - e01x * e02z;
-      const czn = e01x * e02y - e01y * e02x;
-      const outward = cxn * ix + cyn * iy + czn * iz;
-      if (outward >= 0) tris.push(i, n1, n2);
-      else              tris.push(i, n2, n1);
+    for (let a = 0; a < len - 1; a++) {
+      const n1 = vNbrs[a];
+      if (n1 <= i) continue;
+      const vAdjN1 = vAdj[n1];
+      for (let b = a + 1; b < len; b++) {
+        const n2 = vNbrs[b];
+        if (n2 <= n1) continue;
+        // Check n2 ∈ vAdj[n1] (n1 and n2 mutually Voronoi-adjacent).
+        let mutual = false;
+        for (let q = 0; q < vAdjN1.length; q++) {
+          if (vAdjN1[q] === n2) { mutual = true; break; }
+        }
+        if (!mutual) continue;
+        // CCW winding from outside.
+        const e01x = positions[n1*3]   - ix;
+        const e01y = positions[n1*3+1] - iy;
+        const e01z = positions[n1*3+2] - iz;
+        const e02x = positions[n2*3]   - ix;
+        const e02y = positions[n2*3+1] - iy;
+        const e02z = positions[n2*3+2] - iz;
+        const cxn = e01y * e02z - e01z * e02y;
+        const cyn = e01z * e02x - e01x * e02z;
+        const czn = e01x * e02y - e01y * e02x;
+        const outward = cxn * ix + cyn * iy + czn * iz;
+        if (outward >= 0) tris.push(i, n1, n2);
+        else              tris.push(i, n2, n1);
+      }
     }
   }
   return new Uint32Array(tris);
