@@ -54394,6 +54394,13 @@ function _ensureMeshBuffers(meshEntry) {
   if (node.type === "Clouds3D") {
     return _ensureClouds3DChunks(node);
   }
+  // §planet-spec Phase 6b -- Planet uses the same per-chunk streaming
+  // pattern (per-chunk VBOs + two-phase placeholder/upgrade build under
+  // a time budget) so deep maxDepth + flying close to the surface
+  // doesn't stall the main thread on monolithic-mesh rebuilds.
+  if (node.type === "Planet") {
+    return _ensurePlanetChunks(node);
+  }
   const cached = Visual.meshBufferCache.get(node.id);
   if (cached && _meshCacheKey(node) === cached.cacheKey) return cached;
   // Params changed -- destroy + rebuild. Cheap (just a couple of
@@ -54885,6 +54892,10 @@ const _PLANET_FACES = [
  * the rebuild cadence is governed by _meshCacheKey, which quantizes
  * the camera position to ~radius/2^maxDepth so we only rebuild when
  * the camera crosses a finest-level chunk boundary. */
+function _planetChunkKey(face, depth, ix, iy) {
+  return face + "|" + depth + "|" + ix + "|" + iy;
+}
+
 function _planetVisibleChunks(camPos, radius, heightScale, maxDepth, splitFactor) {
   const out = [];
   // §planet-spec Phase 4.d -- horizon-occlusion cull. The visible cap
@@ -54907,7 +54918,7 @@ function _planetVisibleChunks(camPos, radius, heightScale, maxDepth, splitFactor
   const camDZ = camOutside ? camPos.z / cMag : 0;
   const horizonDot     = camOutside ? (radius / cMag) : -2;
   const elevationSlack = camOutside ? (Math.max(0, heightScale) / Math.max(1e-6, radius)) : 0;
-  function recurse(face, uMin, uMax, vMin, vMax, depth) {
+  function recurse(face, uMin, uMax, vMin, vMax, depth, ix, iy) {
     const uMid = (uMin + uMax) * 0.5;
     const vMid = (vMin + vMax) * 0.5;
     const f = _PLANET_FACES[face];
@@ -54936,194 +54947,360 @@ function _planetVisibleChunks(camPos, radius, heightScale, maxDepth, splitFactor
     // π/2 radians; one unit of (u,v) ∈ [-1,1] spans half of that).
     const chunkEdge = (uMax - uMin) * radius * (Math.PI * 0.25);
     if (depth < maxDepth && dist < chunkEdge * splitFactor) {
-      recurse(face, uMin, uMid, vMin, vMid, depth + 1);
-      recurse(face, uMid, uMax, vMin, vMid, depth + 1);
-      recurse(face, uMin, uMid, vMid, vMax, depth + 1);
-      recurse(face, uMid, uMax, vMid, vMax, depth + 1);
+      const cd = depth + 1;
+      recurse(face, uMin, uMid, vMin, vMid, cd, ix*2,   iy*2);
+      recurse(face, uMid, uMax, vMin, vMid, cd, ix*2+1, iy*2);
+      recurse(face, uMin, uMid, vMid, vMax, cd, ix*2,   iy*2+1);
+      recurse(face, uMid, uMax, vMid, vMax, cd, ix*2+1, iy*2+1);
       return;
     }
-    out.push({ face, uMin, uMax, vMin, vMax, depth });
+    out.push({ face, uMin, uMax, vMin, vMax, depth, ix, iy });
   }
-  for (let f = 0; f < 6; f++) recurse(f, -1, 1, -1, 1, 0);
+  for (let f = 0; f < 6; f++) recurse(f, -1, 1, -1, 1, 0, 0, 0);
   return out;
 }
 
-/* Planet -- spherified-cube primitive. 6 faces of a subdivided cube,
- * each (segs+1)² verts. Each vert at cube-face coord (u, v) in [-1, 1]
- * is placed at axis_n + tangent*u + bitangent*v (cube position in
- * [-1, 1]^3) then warped to the sphere via the Phil Nowell projection:
- *   x' = x * sqrt(1 - y²/2 - z²/2 + y²z²/3)
- *   y' = y * sqrt(1 - x²/2 - z²/2 + x²z²/3)
- *   z' = z * sqrt(1 - x²/2 - y²/2 + x²y²/3)
- * Distortion is much smaller than a naive `normalize(cube_pos)` warp
- * (max edge-vs-center distortion ~1.06× vs ~1.73×). Outward normal at
- * each vertex IS the normalized position. Foundation for the Phase 4
- * cube-sphere quadtree -- per-face (segs+1)² grid is exactly the leaf-
- * chunk shape the quadtree will subdivide. */
-function _buildPlanet(node) {
-  const p = node.params || {};
-  const r    = (typeof p.radius   === "number") ? p.radius   : 1000;
-  // §planet-spec Phase 4.g -- oblate spheroid. Earth's actual
-  // flattening f = (a-b)/a ≈ 1/298.257 → polarRadiusRatio b/a ≈
-  // 0.9966. Default 1.0 = perfect sphere (no behavior change). The
-  // Y axis gets multiplied by this ratio AFTER the spherify warp;
-  // the true ellipsoid surface normal (gradient of x²/a² + y²/b² +
-  // z²/a² = 1) is computed for Lambert shading + the normal slot,
-  // so per-vertex lighting is geometrically correct on the squashed
-  // spheroid. Chunk visibility (split + horizon cull) still treats
-  // the planet as a sphere -- the ~0.3% error is well inside the
-  // safety margins.
+/* §planet-spec Phase 6b -- shared planet params resolver. Same logic
+ * the old monolithic _buildPlanet ran at its top; pulled out so both
+ * the per-chunk builder and the streaming entry can read identical
+ * values without duplicating param defaults. */
+function _resolvePlanetGeom(p) {
   const polRatio = Math.max(0.5, Math.min(1.5, (typeof p.polarRadiusRatio === "number") ? p.polarRadiusRatio : 1.0));
-  const polRatio2 = polRatio * polRatio;
-  const cxC  = (typeof p.centerX === "number") ? p.centerX : 0;
-  const cyC  = (typeof p.centerY === "number") ? p.centerY : 0;
-  const czC  = (typeof p.centerZ === "number") ? p.centerZ : 0;
-  const segs = Math.max(1, Math.min(64, Math.floor((typeof p.segments === "number") ? p.segments : 16)));
-  const maxDepth    = Math.max(0, Math.min(14, Math.floor((typeof p.maxDepth    === "number") ? p.maxDepth    : 6)));
-  const splitFactor = Math.max(0.1, Math.min(50, (typeof p.splitFactor === "number") ? p.splitFactor : 5.0));
-  const hs       = (typeof p.heightScale === "number") ? p.heightScale : 0;
-  const seaLevel = Math.max(0, Math.min(1, (typeof p.seaLevel === "number") ? p.seaLevel : 0.5));
-  const noiseDef = {
-    seed:       (typeof p.seed       === "number") ? p.seed       : 7.3,
-    frequency:  (typeof p.frequency  === "number") ? p.frequency  : 1.0,
-    octaves:    Math.max(1, Math.min(20, Math.floor((typeof p.octaves === "number") ? p.octaves : 6))),
-    lacunarity: (typeof p.lacunarity === "number") ? p.lacunarity : 2.0,
-    gain:       (typeof p.gain       === "number") ? p.gain       : 0.5,
-    ridges:     (typeof p.ridges     === "number") ? p.ridges     : 0
-  };
-  // §planet-spec 4.e -- planet may be centered anywhere in world
-  // space. Quadtree split + horizon cull operate in planet-LOCAL
-  // coords (camera minus center), then we add the center back at
-  // vertex-write time so the VBO has world-space positions.
-  const camPosWorld = _planetCameraPos(node);
-  const camPos = { x: camPosWorld.x - cxC, y: camPosWorld.y - cyC, z: camPosWorld.z - czC };
-  const chunks = _planetVisibleChunks(camPos, r, hs, maxDepth, splitFactor);
-  // §planet-spec Phase 4.f -- bake Sun lambertian into per-vertex
-  // color. Planet renders with the unlit-vc shader (no GPU lighting),
-  // so day/night terminator + sphere shading have to come from CPU.
-  // At each vertex: lambert = max(ambient, dot(normal, sunDir)). The
-  // sun direction is read from the patch's Sun node (timeOfDay) or
-  // falls back to late-morning if no Sun exists.
-  const sun = _planetSunDir();
-  const sunX = sun[0], sunY = sun[1], sunZ = sun[2];
-  const ambient = 0.18;
-  const vertsPerChunk = (segs + 1) * (segs + 1);
-  const trisPerChunk  = segs * segs * 2;
-  const verts   = new Float32Array(chunks.length * vertsPerChunk * 11);
-  const indices = new Uint32Array(chunks.length * trisPerChunk * 3);
-  let vWrite = 0, iWrite = 0;
-  for (let ck = 0; ck < chunks.length; ck++) {
-    const ch = chunks[ck];
-    const face = _PLANET_FACES[ch.face];
-    const nX = face.n[0], nY = face.n[1], nZ = face.n[2];
-    const tX = face.t[0], tY = face.t[1], tZ = face.t[2];
-    const bX = face.b[0], bY = face.b[1], bZ = face.b[2];
-    const vertBase = ck * vertsPerChunk;
-    // §planet-spec Phase 4.c -- truncate octaves to the chunk's own
-    // vertex spacing (Nyquist rule). Chunk world-edge ≈ (uMax-uMin)*
-    // r*π/4 (cube-face arc length); per-vertex spacing = that / segs.
-    // log2(1 / (2 * f * Δx)) clamped to the param-supplied octaves.
-    const chunkEdge = (ch.uMax - ch.uMin) * r * (Math.PI * 0.25);
-    const spacing = chunkEdge / Math.max(1, segs);
-    const lodOctF = (hs !== 0)
-      ? _octavesForSpacing(noiseDef.frequency, spacing, noiseDef.octaves)
-      : 0;
-    const effOctavesF = Math.min(noiseDef.octaves, lodOctF);
-    // §planet-spec Phase 5 -- CDLOD via octave morph. As a leaf chunk
-    // approaches the distance at which IT would merge into its
-    // parent (= 2 × the depth's split threshold), fade the octave
-    // count by 1 toward the parent's. At full morph this chunk
-    // evaluates fBm with exactly the parent's effectiveOctavesF, so
-    // its boundary heights match the unsplit neighbor chunk at the
-    // parent's LOD -- no T-junction crack.
-    //
-    // morph(dist) = clamp(dist / splitThreshold - 1, 0, 1):
-    //   dist <= splitThreshold     → 0 (deep inside LOD region)
-    //   dist >= 2 * splitThreshold → 1 (= parent's merge boundary)
-    // splitThreshold matches the visibility test (chunkEdge * splitFactor).
-    const uMid = (ch.uMin + ch.uMax) * 0.5;
-    const vMid = (ch.vMin + ch.vMax) * 0.5;
-    const cxMid = nX + tX * uMid + bX * vMid;
-    const cyMid = nY + tY * uMid + bY * vMid;
-    const czMid = nZ + tZ * uMid + bZ * vMid;
-    const sphMid = _planetSpherify(cxMid, cyMid, czMid);
-    const ddx = camPos.x - sphMid[0] * r;
-    const ddy = camPos.y - sphMid[1] * r;
-    const ddz = camPos.z - sphMid[2] * r;
-    const chunkDist = Math.sqrt(ddx*ddx + ddy*ddy + ddz*ddz);
-    const splitThreshold = chunkEdge * splitFactor;
-    const morph = Math.max(0, Math.min(1, (chunkDist / Math.max(1e-6, splitThreshold)) - 1));
-    const morphedOctavesF = Math.max(0, effOctavesF - morph);
-    const chunkNoise = Object.assign({}, noiseDef, { effectiveOctavesF: morphedOctavesF });
-    for (let iy = 0; iy <= segs; iy++) {
-      const fy01 = iy / segs;
-      const v = ch.vMin + (ch.vMax - ch.vMin) * fy01;
-      for (let ix = 0; ix <= segs; ix++) {
-        const fx01 = ix / segs;
-        const u = ch.uMin + (ch.uMax - ch.uMin) * fx01;
-        const cx = nX + tX * u + bX * v;
-        const cy = nY + tY * u + bY * v;
-        const cz = nZ + tZ * u + bZ * v;
-        const cxx = cx * cx, cyy = cy * cy, czz = cz * cz;
-        const sx = cx * Math.sqrt(Math.max(0, 1 - cyy * 0.5 - czz * 0.5 + cyy * czz / 3));
-        const sy = cy * Math.sqrt(Math.max(0, 1 - cxx * 0.5 - czz * 0.5 + cxx * czz / 3));
-        const sz = cz * Math.sqrt(Math.max(0, 1 - cxx * 0.5 - cyy * 0.5 + cxx * cyy / 3));
-        const invLen = 1 / Math.max(1e-12, Math.sqrt(sx*sx + sy*sy + sz*sz));
-        const ux = sx * invLen, uy = sy * invLen, uz = sz * invLen;
-        const h = (hs !== 0) ? _terrainFBM3D(ux, uy, uz, chunkNoise) : 0;
-        let rad;
-        if (h <= seaLevel || hs === 0) {
-          rad = r;
-        } else {
-          const above = (h - seaLevel) / Math.max(1e-6, 1 - seaLevel);
-          rad = r + hs * above;
-        }
-        const baseCol = (hs !== 0) ? _planetColorForHeight(h, seaLevel) :
-                                     [ux * 0.5 + 0.5, uy * 0.5 + 0.5, uz * 0.5 + 0.5];
-        // §planet-spec Phase 4.g -- oblate ellipsoid normal. For the
-        // implicit surface x²/a² + y²/b² + z²/a² = 1 with a=R, b=R*
-        // polRatio, the gradient is (2x/a², 2y/b², 2z/a²) so the unit
-        // normal direction = (ux, uy/polRatio², uz) normalized. When
-        // polRatio = 1 this reduces to (ux, uy, uz) identically.
-        const nx = ux;
-        const ny = uy / polRatio2;
-        const nz = uz;
-        const ninv = 1 / Math.max(1e-12, Math.sqrt(nx*nx + ny*ny + nz*nz));
-        const nuX = nx * ninv, nuY = ny * ninv, nuZ = nz * ninv;
-        // Lambertian uses the true ellipsoid normal so per-pixel
-        // shading on a squashed planet is geometrically correct.
-        const lambert = Math.max(ambient, nuX * sunX + nuY * sunY + nuZ * sunZ);
-        // §planet-spec Phase 6+ -- consistent with _projectFlatToPlanet:
-        // ellipsoid surface point + altitude added along radial
-        // direction (NOT scaled by polRatio). Previously rad*uy*polRatio
-        // also scaled altitude, making land slightly lower at non-pole
-        // points than at the pole. ~0.3% effect on Earth, mostly invisible.
-        const altitude = rad - r;
-        verts[vWrite++] = cxC + r * ux + altitude * ux;
-        verts[vWrite++] = cyC + r * uy * polRatio + altitude * uy;
-        verts[vWrite++] = czC + r * uz + altitude * uz;
-        verts[vWrite++] = baseCol[0] * lambert;
-        verts[vWrite++] = baseCol[1] * lambert;
-        verts[vWrite++] = baseCol[2] * lambert;
-        verts[vWrite++] = nuX; verts[vWrite++] = nuY; verts[vWrite++] = nuZ;
-        // UV: per-chunk 0..1. Multi-chunk UV atlasing isn't meaningful
-        // here so we just give each chunk a fresh unit square.
-        verts[vWrite++] = fx01; verts[vWrite++] = fy01;
-      }
+  return {
+    r:        (typeof p.radius   === "number") ? p.radius   : 1000,
+    polRatio,
+    polRatio2: polRatio * polRatio,
+    cxC: (typeof p.centerX === "number") ? p.centerX : 0,
+    cyC: (typeof p.centerY === "number") ? p.centerY : 0,
+    czC: (typeof p.centerZ === "number") ? p.centerZ : 0,
+    segs: Math.max(1, Math.min(64, Math.floor((typeof p.segments === "number") ? p.segments : 16))),
+    maxDepth:    Math.max(0, Math.min(14, Math.floor((typeof p.maxDepth    === "number") ? p.maxDepth    : 6))),
+    splitFactor: Math.max(0.1, Math.min(50, (typeof p.splitFactor === "number") ? p.splitFactor : 5.0)),
+    hs:       (typeof p.heightScale === "number") ? p.heightScale : 0,
+    seaLevel: Math.max(0, Math.min(1, (typeof p.seaLevel === "number") ? p.seaLevel : 0.5)),
+    noiseDef: {
+      seed:       (typeof p.seed       === "number") ? p.seed       : 7.3,
+      frequency:  (typeof p.frequency  === "number") ? p.frequency  : 1.0,
+      octaves:    Math.max(1, Math.min(20, Math.floor((typeof p.octaves === "number") ? p.octaves : 6))),
+      lacunarity: (typeof p.lacunarity === "number") ? p.lacunarity : 2.0,
+      gain:       (typeof p.gain       === "number") ? p.gain       : 0.5,
+      ridges:     (typeof p.ridges     === "number") ? p.ridges     : 0
     }
-    for (let iy = 0; iy < segs; iy++) {
-      for (let ix = 0; ix < segs; ix++) {
-        const a = vertBase + iy * (segs + 1) + ix;
-        const b = a + 1;
-        const c = a + (segs + 1);
-        const d = c + 1;
-        indices[iWrite++] = a; indices[iWrite++] = c; indices[iWrite++] = b;
-        indices[iWrite++] = b; indices[iWrite++] = c; indices[iWrite++] = d;
+  };
+}
+
+/* §planet-spec Phase 6b -- per-chunk Planet vertex / index builder.
+ * Carved out of the old monolithic _buildPlanet so the streaming entry
+ * can build chunks one at a time under a per-frame time budget --
+ * mirrors TiledTerrain's _buildSingleChunk pattern. Each chunk gets
+ * its OWN GPU vertex+index buffer (destroyed when the chunk leaves
+ * the visible quadtree set). Caller supplies info = { face, uMin,
+ * uMax, vMin, vMax, depth, ix, iy, segs } -- segs is the per-chunk
+ * resolution (placeholder phase passes segs=2 for instant builds;
+ * upgrade phase passes the param's full segs). camPos is the planet-
+ * LOCAL camera position used for CDLOD morph + chunk-distance octave
+ * truncation. */
+function _buildSinglePlanetChunk(node, info, camPos, sun, ambient) {
+  if (!Visual.device) return null;
+  const p = node.params || {};
+  const geom = _resolvePlanetGeom(p);
+  const r = geom.r, polRatio = geom.polRatio, polRatio2 = geom.polRatio2;
+  const cxC = geom.cxC, cyC = geom.cyC, czC = geom.czC;
+  const hs = geom.hs, seaLevel = geom.seaLevel;
+  const splitFactor = geom.splitFactor;
+  const segs = info.segs;
+  const sunX = sun[0], sunY = sun[1], sunZ = sun[2];
+  const noiseDef = geom.noiseDef;
+
+  const face = _PLANET_FACES[info.face];
+  const nX = face.n[0], nY = face.n[1], nZ = face.n[2];
+  const tX = face.t[0], tY = face.t[1], tZ = face.t[2];
+  const bX = face.b[0], bY = face.b[1], bZ = face.b[2];
+
+  // Per-chunk octave count + CDLOD morph (Phase 3 + Phase 5).
+  const chunkEdge = (info.uMax - info.uMin) * r * (Math.PI * 0.25);
+  const spacing = chunkEdge / Math.max(1, segs);
+  const lodOctF = (hs !== 0)
+    ? _octavesForSpacing(noiseDef.frequency, spacing, noiseDef.octaves)
+    : 0;
+  const effOctavesF = Math.min(noiseDef.octaves, lodOctF);
+  const uMidC = (info.uMin + info.uMax) * 0.5;
+  const vMidC = (info.vMin + info.vMax) * 0.5;
+  const cxMid = nX + tX * uMidC + bX * vMidC;
+  const cyMid = nY + tY * uMidC + bY * vMidC;
+  const czMid = nZ + tZ * uMidC + bZ * vMidC;
+  const sphMid = _planetSpherify(cxMid, cyMid, czMid);
+  const ddx = camPos.x - sphMid[0] * r;
+  const ddy = camPos.y - sphMid[1] * r;
+  const ddz = camPos.z - sphMid[2] * r;
+  const chunkDist = Math.sqrt(ddx*ddx + ddy*ddy + ddz*ddz);
+  const splitThreshold = chunkEdge * splitFactor;
+  const morph = Math.max(0, Math.min(1, (chunkDist / Math.max(1e-6, splitThreshold)) - 1));
+  const morphedOctavesF = Math.max(0, effOctavesF - morph);
+  const chunkNoise = Object.assign({}, noiseDef, { effectiveOctavesF: morphedOctavesF });
+
+  const N = segs + 1;
+  const verts = new Float32Array(N * N * 11);
+  const indices = new Uint32Array(segs * segs * 6);
+  let vWrite = 0, iWrite = 0;
+  let minX = Infinity, minY = Infinity, minZ = Infinity;
+  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+
+  for (let iy = 0; iy <= segs; iy++) {
+    const fy01 = iy / segs;
+    const v = info.vMin + (info.vMax - info.vMin) * fy01;
+    for (let ix = 0; ix <= segs; ix++) {
+      const fx01 = ix / segs;
+      const u = info.uMin + (info.uMax - info.uMin) * fx01;
+      const cx = nX + tX * u + bX * v;
+      const cy = nY + tY * u + bY * v;
+      const cz = nZ + tZ * u + bZ * v;
+      const cxx = cx * cx, cyy = cy * cy, czz = cz * cz;
+      const sx = cx * Math.sqrt(Math.max(0, 1 - cyy * 0.5 - czz * 0.5 + cyy * czz / 3));
+      const sy = cy * Math.sqrt(Math.max(0, 1 - cxx * 0.5 - czz * 0.5 + cxx * czz / 3));
+      const sz = cz * Math.sqrt(Math.max(0, 1 - cxx * 0.5 - cyy * 0.5 + cxx * cyy / 3));
+      const invLen = 1 / Math.max(1e-12, Math.sqrt(sx*sx + sy*sy + sz*sz));
+      const ux = sx * invLen, uy = sy * invLen, uz = sz * invLen;
+      const h = (hs !== 0) ? _terrainFBM3D(ux, uy, uz, chunkNoise) : 0;
+      let rad;
+      if (h <= seaLevel || hs === 0) {
+        rad = r;
+      } else {
+        const above = (h - seaLevel) / Math.max(1e-6, 1 - seaLevel);
+        rad = r + hs * above;
       }
+      const baseCol = (hs !== 0) ? _planetColorForHeight(h, seaLevel) :
+                                   [ux * 0.5 + 0.5, uy * 0.5 + 0.5, uz * 0.5 + 0.5];
+      const nxn = ux;
+      const nyn = uy / polRatio2;
+      const nzn = uz;
+      const ninv = 1 / Math.max(1e-12, Math.sqrt(nxn*nxn + nyn*nyn + nzn*nzn));
+      const nuX = nxn * ninv, nuY = nyn * ninv, nuZ = nzn * ninv;
+      const lambert = Math.max(ambient, nuX * sunX + nuY * sunY + nuZ * sunZ);
+      const altitude = rad - r;
+      const px = cxC + r * ux + altitude * ux;
+      const py = cyC + r * uy * polRatio + altitude * uy;
+      const pz = czC + r * uz + altitude * uz;
+      if (px < minX) minX = px; if (px > maxX) maxX = px;
+      if (py < minY) minY = py; if (py > maxY) maxY = py;
+      if (pz < minZ) minZ = pz; if (pz > maxZ) maxZ = pz;
+      verts[vWrite++] = px;
+      verts[vWrite++] = py;
+      verts[vWrite++] = pz;
+      verts[vWrite++] = baseCol[0] * lambert;
+      verts[vWrite++] = baseCol[1] * lambert;
+      verts[vWrite++] = baseCol[2] * lambert;
+      verts[vWrite++] = nuX; verts[vWrite++] = nuY; verts[vWrite++] = nuZ;
+      verts[vWrite++] = fx01; verts[vWrite++] = fy01;
     }
   }
-  return { verts, indices };
+  for (let iy = 0; iy < segs; iy++) {
+    for (let ix = 0; ix < segs; ix++) {
+      const a = iy * N + ix;
+      const b = a + 1;
+      const c = a + N;
+      const d = c + 1;
+      indices[iWrite++] = a; indices[iWrite++] = c; indices[iWrite++] = b;
+      indices[iWrite++] = b; indices[iWrite++] = c; indices[iWrite++] = d;
+    }
+  }
+
+  const vertexBuffer = Visual.device.createBuffer({
+    label: "planet-vb-" + info.face + "-" + info.depth + "-" + info.ix + "-" + info.iy + "-" + segs,
+    size: verts.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    mappedAtCreation: true
+  });
+  new Float32Array(vertexBuffer.getMappedRange()).set(verts);
+  vertexBuffer.unmap();
+  const indexBuffer = Visual.device.createBuffer({
+    label: "planet-ib-" + info.face + "-" + info.depth + "-" + info.ix + "-" + info.iy + "-" + segs,
+    size: indices.byteLength,
+    usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+    mappedAtCreation: true
+  });
+  new Uint32Array(indexBuffer.getMappedRange()).set(indices);
+  indexBuffer.unmap();
+
+  return {
+    vertexBuffer,
+    indexBuffer,
+    indexCount: iWrite,
+    aabbMin: new Float32Array([minX, minY, minZ]),
+    aabbMax: new Float32Array([maxX, maxY, maxZ]),
+    face: info.face,
+    depth: info.depth,
+    ix: info.ix,
+    iy: info.iy
+  };
 }
+
+/* §planet-spec Phase 6b -- cache key for Planet GLOBAL geometry
+ * params. When any of these change, every cached chunk is destroyed
+ * and re-built fresh. Camera position is NOT in the key; chunk
+ * visibility is managed by _ensurePlanetChunks via the visible-set
+ * Map diff (chunks leaving the set get dropped, chunks entering get
+ * built incrementally under a budget). */
+function _planetGlobalCacheKey(node) {
+  const p = node.params || {};
+  return [
+    p.radius, p.polarRadiusRatio,
+    p.centerX, p.centerY, p.centerZ,
+    p.segments, p.maxDepth, p.splitFactor,
+    p.heightScale, p.seaLevel,
+    p.seed, p.frequency, p.octaves, p.lacunarity, p.gain, p.ridges
+  ].join(",");
+}
+
+/* §planet-spec Phase 6b -- streaming entry for Planet meshes.
+ * Mirrors _ensureTiledTerrainChunks: per-chunk VBO+IBO+AABB stored in
+ * a Map keyed by (face, depth, ix, iy). Each frame:
+ *   1. Nuke everything if global geometry params changed.
+ *   2. Compute the visible chunk set (quadtree split + horizon cull).
+ *   3. Drop chunks no longer in the visible set (destroy GPU buffers).
+ *   4. Two-phase incremental build under a time budget:
+ *      - Phase 1: any visible chunk WITHOUT a cached entry gets a
+ *        segs=2 placeholder (~9 verts, builds in <0.5ms). Guarantees
+ *        every visible chunk has SOMETHING to draw within a frame or
+ *        two of entering the visible set.
+ *      - Phase 2: chunks whose currentLod < segs get upgraded. Old
+ *        buffer destroyed only after the new one is in hand so the
+ *        visible mesh never goes empty.
+ * Returns the same {tiledChunks, aabbMin, aabbMax} shape the encoder
+ * already understands -- the field name is "tiledChunks" purely for
+ * encoder compatibility (the encoder doesn't care what produced it). */
+function _ensurePlanetChunks(node) {
+  if (!Visual.device) return null;
+  if (!Visual.planetChunkCache) Visual.planetChunkCache = new Map();
+  let entry = Visual.planetChunkCache.get(node.id);
+  if (!entry) {
+    entry = { chunks: new Map(), globalKey: null };
+    Visual.planetChunkCache.set(node.id, entry);
+  }
+
+  // Global params changed -> destroy every chunk and start fresh.
+  const globalKey = _planetGlobalCacheKey(node);
+  if (globalKey !== entry.globalKey) {
+    for (const c of entry.chunks.values()) {
+      try { c.vertexBuffer && c.vertexBuffer.destroy(); } catch (_) {}
+      try { c.indexBuffer  && c.indexBuffer.destroy();  } catch (_) {}
+    }
+    entry.chunks.clear();
+    entry.globalKey = globalKey;
+  }
+
+  const p = node.params || {};
+  const geom = _resolvePlanetGeom(p);
+  const r = geom.r, hs = geom.hs, maxDepth = geom.maxDepth, splitFactor = geom.splitFactor, segs = geom.segs;
+  const camPosWorld = _planetCameraPos(node);
+  const camPos = {
+    x: camPosWorld.x - geom.cxC,
+    y: camPosWorld.y - geom.cyC,
+    z: camPosWorld.z - geom.czC
+  };
+  const visList = _planetVisibleChunks(camPos, r, hs, maxDepth, splitFactor);
+  // Keyed visible map for O(1) lookup + diff against cache.
+  const visible = new Map();
+  for (const v of visList) {
+    visible.set(_planetChunkKey(v.face, v.depth, v.ix, v.iy), v);
+  }
+
+  // Drop chunks no longer visible.
+  const keysToDrop = [];
+  for (const key of entry.chunks.keys()) {
+    if (!visible.has(key)) keysToDrop.push(key);
+  }
+  for (const key of keysToDrop) {
+    const c = entry.chunks.get(key);
+    try { c.vertexBuffer && c.vertexBuffer.destroy(); } catch (_) {}
+    try { c.indexBuffer  && c.indexBuffer.destroy();  } catch (_) {}
+    entry.chunks.delete(key);
+  }
+
+  const sun = _planetSunDir();
+  const ambient = 0.18;
+
+  // Sort pending work closest-first so the near-camera chunks build
+  // before the limb. Use chunk depth as a "closer is deeper" proxy.
+  const phPending = [];
+  for (const [key, info] of visible) {
+    if (entry.chunks.has(key)) continue;
+    phPending.push({ key, info });
+  }
+  phPending.sort((a, b) => b.info.depth - a.info.depth);
+  const PH_BUDGET_MS = 8;
+  const phStart = performance.now();
+  for (let i = 0; i < phPending.length; i++) {
+    const item = phPending[i];
+    const ph = _buildSinglePlanetChunk(node, Object.assign({}, item.info, { segs: 2 }), camPos, sun, ambient);
+    if (ph) {
+      ph.currentLod = 2;
+      entry.chunks.set(item.key, ph);
+    }
+    if (performance.now() - phStart > PH_BUDGET_MS) break;
+  }
+
+  const upPending = [];
+  for (const [key, info] of visible) {
+    const c = entry.chunks.get(key);
+    if (!c || c.currentLod === segs) continue;
+    upPending.push({ key, info, c });
+  }
+  upPending.sort((a, b) => b.info.depth - a.info.depth);
+  const UP_BUDGET_MS = 12;
+  const upStart = performance.now();
+  for (let i = 0; i < upPending.length; i++) {
+    const item = upPending[i];
+    const proper = _buildSinglePlanetChunk(node, Object.assign({}, item.info, { segs }), camPos, sun, ambient);
+    if (proper) {
+      try { item.c.vertexBuffer && item.c.vertexBuffer.destroy(); } catch (_) {}
+      try { item.c.indexBuffer  && item.c.indexBuffer.destroy();  } catch (_) {}
+      proper.currentLod = segs;
+      entry.chunks.set(item.key, proper);
+    }
+    if (performance.now() - upStart > UP_BUDGET_MS) break;
+  }
+
+  // Aggregate AABB for outer-frustum cull.
+  let aabbMin, aabbMax;
+  if (entry.chunks.size === 0) {
+    aabbMin = new Float32Array([0, 0, 0]);
+    aabbMax = new Float32Array([0, 0, 0]);
+  } else {
+    aabbMin = new Float32Array([Infinity, Infinity, Infinity]);
+    aabbMax = new Float32Array([-Infinity, -Infinity, -Infinity]);
+    for (const c of entry.chunks.values()) {
+      if (c.aabbMin[0] < aabbMin[0]) aabbMin[0] = c.aabbMin[0];
+      if (c.aabbMin[1] < aabbMin[1]) aabbMin[1] = c.aabbMin[1];
+      if (c.aabbMin[2] < aabbMin[2]) aabbMin[2] = c.aabbMin[2];
+      if (c.aabbMax[0] > aabbMax[0]) aabbMax[0] = c.aabbMax[0];
+      if (c.aabbMax[1] > aabbMax[1]) aabbMax[1] = c.aabbMax[1];
+      if (c.aabbMax[2] > aabbMax[2]) aabbMax[2] = c.aabbMax[2];
+    }
+  }
+  const allChunks = [];
+  for (const c of entry.chunks.values()) allChunks.push(c);
+  return {
+    tiledChunks: allChunks,
+    vertexBuffer: null,
+    indexBuffer: null,
+    vertexCount: 0,
+    indexCount: 0,
+    aabbMin,
+    aabbMax,
+    cacheKey: "planet-streamed"
+  };
+}
+
+/* §planet-spec Phase 6b -- legacy monolithic builder kept as a no-op
+ * fallback. The streaming path (_ensurePlanetChunks) is the only
+ * caller route now via _ensureMeshBuffers's type dispatch. If
+ * something ever routes through _buildMeshData for a Planet node
+ * (unexpected), return an empty mesh rather than crashing. */
+function _buildPlanet(node) {
+  return { verts: new Float32Array(0), indices: new Uint32Array(0) };
+}
+
 
 /* Plane -- flat quad in the XZ plane, +Y normal. 4 verts, 6 indices.
  * Colored by a soft cyan-to-violet gradient by U coord so even the
