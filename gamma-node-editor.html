@@ -10441,6 +10441,32 @@ public:
     description: "HUD minimap overlay. Top-down view of the patch's first TiledTerrain heightmap, colored by altitude band (blue valleys → grass → rock → snow). Camera dot + heading line render on top. corner picks one of the four screen corners; size is pixels; margin is the gap from the screen edge; range scales how much world to show (1 = exactly the terrain's visible disc, 2 = 2× zoomed out, 0.5 = zoomed in). opacity is the overlay alpha (0..1). Drop the node into the patch to show; delete to hide. No wires required -- it auto-discovers the terrain and camera."
   },
 
+  /* Phase 7 §5.5.h-27 -- Altimeter HUD. Reads the patch's first
+   * FPCamera / Camera posY and renders an altitude + speed readout
+   * in a screen corner. Auto-discovers everything; wire `hud` into
+   * Scene.hud1..hud4 to make it appear in live mode. */
+  Altimeter: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "hud",
+    ins: [
+      { n: "corner",  t: "param" },
+      { n: "margin",  t: "param" },
+      { n: "opacity", t: "param" },
+      { n: "showSpeed", t: "param" }
+    ],
+    outs: [{ n: "hud", t: "hud" }],
+    params: {
+      corner:    "top-left",
+      margin:    18,
+      opacity:   0.90,
+      showSpeed: 1
+    },
+    paramOptions: { corner: ["top-right", "top-left", "bottom-right", "bottom-left"] },
+    methods: {},
+    description: "HUD altimeter overlay. Live readout of the patch's first FPCamera/Camera altitude (posY) in meters, plus optional speed/sprint indicator. Useful for the planet-scale archipelago demo where you need to know if you're at curve altitude (8km+) or in space (80km+). corner picks the screen anchor; margin is gap from edge; opacity is overlay alpha; showSpeed (0/1) toggles the secondary speed readout. Drop the node into a patch + wire `hud` into Scene.hud1..hud4 to make it appear in live mode."
+  },
+
   /* Sprint 7.5.3a -- DebugTriangle. Smoke-test mesh source. Emits a
    * single colored triangle (RGB vertices) as a `mesh` output, used
    * to validate the Scene render pipeline end-to-end. Disappears
@@ -10979,26 +11005,28 @@ public:
     ],
     outs: [{ n: "mesh", t: "mesh" }],
     params: {
-      // §5.5.h-26 -- Earth-scale planet defaults. To see real Earth
-      // curvature you need to climb high AND have the horizon mesh
-      // extending far enough that distant verts can drop meaningfully.
-      // 800km extent at 96 subdivisions = ~8.3km per vertex; we lower
-      // the noise freq via noiseFreqScale so big-shape features still
-      // show coherently at that spacing.
-      extent:         800000,
-      subdivisions:   96,
-      tileSize:       50000,
+      // §5.5.h-27 -- "effectively infinite" planet defaults. 5000km
+      // extent (=2500km radius) is enough that even from a 200km
+      // orbit-altitude view the visible Earth horizon (~1600km from
+      // sub-camera point) sits well inside the mesh. 128 subdivisions
+      // over that = ~39km/vertex; noiseFreqScale=0.05 (~17km wavelength
+      // out of the upstream 1.25km) keeps coherent big-shape features
+      // showing at that vertex spacing. Macro-tile bumped to 500km so
+      // the user can fly 100s of km without triggering a rebuild.
+      extent:         5000000,
+      subdivisions:   128,
+      tileSize:       500000,
       yBias:          -0.5,
       octaves:        2,
-      noiseFreqScale: 0.15,
-      // §5.5.h-26 -- Earth-scale curvature. planetRadius=6378km is
-      // the real Earth. Curve is invisible at sea level (~0.2m drop
-      // at 50km horizon) but kicks in dramatically once the camera
-      // climbs past curveAltLow: at altitude 30km with the impostor
-      // extending out 400km, the far edge drops by ~12.5km -- visible
-      // Earth curve.
-      curveAltLow:    8000,
-      curveAltHigh:   30000,
+      noiseFreqScale: 0.05,
+      // §5.5.h-27 -- curve activation altitude dropped 8km -> 1km so
+      // the user sees the bend kick in as soon as they leave ground
+      // level, instead of needing to climb 8km of invisible-flat-Earth
+      // before the curvature warp starts ramping. A small artistic
+      // compromise vs. real Earth (where curvature is invisible until
+      // ~20km altitude), but the user can crank these back up.
+      curveAltLow:    1000,
+      curveAltHigh:   25000,
       planetRadius:   6378000
     },
     methods: {},
@@ -32755,17 +32783,18 @@ const _demos = [
         // so the player doesn't load inside terrain.
         posX: 0, posY: 1700, posZ: 0,
         yaw: 0, pitch: -0.18,
-        // §5.5.h-26 -- far plane large enough to contain the 800km
-        // horizon impostor at low altitude AND the curved-planet view
-        // from 30km+ up. WebGPU depth precision is f32 + reverse-Z
-        // friendly enough that 1Mm far works without z-fighting on
-        // the chunked terrain near the camera.
-        fov: 70, near: 0.5, far: 1000000,
+        // §5.5.h-27 -- far plane 2000km covers the new 5000km-extent
+        // impostor's near half from any reasonable altitude. Verts
+        // beyond 2000km get culled, which is fine -- they're below
+        // the planet curve anyway and not visible from low orbit.
+        fov: 70, near: 0.5, far: 2000000,
         walkMode: 0,
-        // §5.5.h-25 -- faster fly mode so the user can actually cross
-        // the 100km horizon impostor extent in reasonable time.
-        // Shift sprint is ×4 -> sprinting hits ~480 m/s.
-        walkSpeed: 120, lookSpeed: 2.2,
+        // §5.5.h-27 -- fast initial fly speed. Hold X in-game to
+        // crank further (4×/sec geometric ramp, up to 50 km/s cap)
+        // or Z to slow down. With walkSpeed=500 the user reaches
+        // 20km altitude (curve fully on) in ~10 seconds without
+        // even pressing X.
+        walkSpeed: 500, lookSpeed: 2.2,
         mouseSensitivity: 0.0025, eyeHeight: 1.7
       });
       // §5.5.h-10 -- Sun + ProceduralSky replace the static
@@ -32795,20 +32824,20 @@ const _demos = [
       // mesh so the standard projection pipeline handles parallax
       // (under both translation AND rotation) without any of the
       // angular-distortion games the sky-pass shell had to play.
-      // §5.5.h-26 -- TerrainHorizon at Earth scale. 800km extent so
-      // distant Earth curvature reads visibly once the camera climbs
-      // past curveAltLow (8km). At ground level the curve is invisible
-      // (~0.2m drop at 50km horizon) -- you have to fly up to see
-      // the planet shape.
+      // §5.5.h-27 -- TerrainHorizon sized to feel "effectively
+      // infinite" at planet scale. 5000km extent so even from low-
+      // orbit altitude (~200km) the visible Earth horizon (~1600km
+      // from sub-camera point) is fully inside the mesh. Macro-tile
+      // 500km so the user can fly very far without rebuild stalls.
       const horizon = makeNode("TerrainHorizon", 280, 680, {
-        extent:         800000,
-        subdivisions:   96,
-        tileSize:       50000,
+        extent:         5000000,
+        subdivisions:   128,
+        tileSize:       500000,
         yBias:          -0.5,
         octaves:        2,
-        noiseFreqScale: 0.15,
-        curveAltLow:    8000,
-        curveAltHigh:   30000,
+        noiseFreqScale: 0.05,
+        curveAltLow:    1000,
+        curveAltHigh:   25000,
         planetRadius:   6378000
       });
       const clouds = makeNode("Clouds3D", 40, 680, {
@@ -32840,6 +32869,15 @@ const _demos = [
         size: 220,
         margin: 18,
         range: 1.4               // zoomed out a bit so multiple islands fit
+      });
+      // §5.5.h-27 -- altitude readout so the user can tell when
+      // they're at curve altitude (curveAltLow=1km in this demo)
+      // or space (80km+). Plus hint for X/Z speed adjust.
+      const alt = makeNode("Altimeter", 280, 480, {
+        corner:    "top-left",
+        margin:    18,
+        opacity:   0.92,
+        showSpeed: 1
       });
       // §5.5.h-4 Water. With LOD-matched bilinear sampling in
       // fs_water, the depth field now matches the rendered mesh
@@ -32898,6 +32936,7 @@ const _demos = [
       state.edges.push({ from: { node: mb,  port: "out" }, to: { node: uw,  port: "in"  } });
       state.edges.push({ from: { node: uw,  port: "out" }, to: { node: vo,  port: "in"  } });
       state.edges.push({ from: { node: map, port: "hud" }, to: { node: scn, port: "hud1" } });
+      state.edges.push({ from: { node: alt, port: "hud" }, to: { node: scn, port: "hud2" } });
     }
   },
 
@@ -46328,7 +46367,10 @@ function _wireFPCameraInput() {
     "KeyI", "KeyJ", "KeyK", "KeyL",
     "KeyC", "Space",
     "ShiftLeft", "ShiftRight",
-    "ControlLeft", "ControlRight"
+    "ControlLeft", "ControlRight",
+    // §5.5.h-27 -- live fly-speed adjust: hold X to speed up,
+    // hold Z to slow down. Geometric 4×/sec rate of change.
+    "KeyX", "KeyZ"
   ]);
   document.addEventListener("keydown", (e) => {
     if (!fpcActive()) return;
@@ -46418,6 +46460,16 @@ function _tickFPCameras(dt) {
     let yaw   = (typeof p.yaw   === "number") ? p.yaw   : 0;
     let pitch = (typeof p.pitch === "number") ? p.pitch : 0;
     const sens     = (typeof p.mouseSensitivity === "number") ? p.mouseSensitivity : 0.0025;
+    // §5.5.h-27 -- X = speed up, Z = slow down. Hold either to
+    // continuously adjust walkSpeed (geometric 4×/sec change),
+    // clamped to [1 m/s, 50 km/s]. Mouse is reserved for the
+    // theater cam so we use keyboard for live speed instead.
+    if (k && (k.has("KeyX") || k.has("KeyZ"))) {
+      const cur = (typeof p.walkSpeed === "number") ? p.walkSpeed : 12;
+      const rate = Math.pow(4, dt);
+      const factor = k.has("KeyX") ? rate : (1 / rate);
+      p.walkSpeed = Math.max(1, Math.min(50000, cur * factor));
+    }
     const speed    = (typeof p.walkSpeed        === "number") ? p.walkSpeed        : 12;
     const lookRate = (typeof p.lookSpeed        === "number") ? p.lookSpeed        : 2.0;
     const eyeH     = (typeof p.eyeHeight        === "number") ? p.eyeHeight        : 1.7;
@@ -46724,6 +46776,103 @@ function _tickMinimapNodes() {
   ctx.fillStyle = "rgba(255, 255, 255, 0.75)";
   ctx.font = "10px ui-monospace, monospace";
   ctx.fillText(`${Math.round(worldDiameter).toLocaleString()}m`, 6, H - 6);
+}
+
+/* Phase 7 §5.5.h-27 -- Altimeter HUD overlay. Renders a small
+ * fixed-position canvas in a screen corner with the patch's
+ * FPCamera/Camera altitude + optional speed indicator. */
+function _ensureAltimeterCanvas() {
+  let c = document.getElementById("hud-altimeter");
+  if (c) return c;
+  c = document.createElement("canvas");
+  c.id = "hud-altimeter";
+  c.style.cssText =
+    "position:fixed;z-index:85;border:1px solid rgba(120,140,170,0.35);" +
+    "border-radius:6px;background:rgba(8,11,16,0.55);" +
+    "backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);" +
+    "box-shadow:0 4px 18px rgba(0,0,0,0.45);pointer-events:none;display:none;";
+  document.body.appendChild(c);
+  return c;
+}
+
+function _tickAltimeterNodes() {
+  if (!state || !Array.isArray(state.nodes)) return;
+  const altNode = state.nodes.find(n => n && n.type === "Altimeter");
+  const canvas = _ensureAltimeterCanvas();
+  if (!altNode || (typeof isLiveMode === "function" && !isLiveMode())) {
+    canvas.style.display = "none";
+    return;
+  }
+  const hudWire = state.edges && state.edges.find(e =>
+    e && e.from && e.from.node === altNode.id && e.from.port === "hud"
+  );
+  if (!hudWire || !hudWire.to) {
+    canvas.style.display = "none";
+    return;
+  }
+  const cam = state.nodes.find(n => n && (n.type === "FPCamera" || n.type === "Camera"));
+  if (!cam || !cam.params) {
+    canvas.style.display = "none";
+    return;
+  }
+  const p = altNode.params || {};
+  const corner    = (typeof p.corner === "string") ? p.corner : "top-left";
+  const margin    = Math.max(0, p.margin || 18);
+  const opacity   = Math.max(0.05, Math.min(1.0, (typeof p.opacity === "number") ? p.opacity : 0.90));
+  const showSpeed = ((typeof p.showSpeed === "number") ? p.showSpeed : 1) >= 0.5;
+
+  const W = 180, H = showSpeed ? 76 : 44;
+  canvas.style.display = "block";
+  canvas.style.opacity = opacity;
+  if (canvas.width !== W || canvas.height !== H) {
+    canvas.width = W; canvas.height = H;
+  }
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  canvas.style.top = canvas.style.bottom = canvas.style.left = canvas.style.right = "";
+  if (corner === "top-right")    { canvas.style.top    = margin + "px"; canvas.style.right = margin + "px"; }
+  else if (corner === "top-left"){ canvas.style.top    = margin + "px"; canvas.style.left  = margin + "px"; }
+  else if (corner === "bottom-left") { canvas.style.bottom = margin + "px"; canvas.style.left  = margin + "px"; }
+  else                           { canvas.style.bottom = margin + "px"; canvas.style.right = margin + "px"; }
+
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, W, H);
+
+  const posY = (typeof cam.params.posY === "number") ? cam.params.posY : 0;
+  // Choose units based on magnitude so we don't show "12345m"
+  // when "12.3km" reads better. Switch at 1km.
+  let altStr;
+  if (Math.abs(posY) >= 1000) {
+    altStr = (posY / 1000).toFixed(posY >= 100000 ? 0 : 2) + " km";
+  } else {
+    altStr = posY.toFixed(0) + " m";
+  }
+
+  ctx.fillStyle = "rgba(255,255,255,0.65)";
+  ctx.font = "10px ui-monospace, monospace";
+  ctx.fillText("ALT", 12, 16);
+
+  ctx.fillStyle = "rgba(255,255,255,0.95)";
+  ctx.font = "bold 22px ui-monospace, monospace";
+  ctx.fillText(altStr, 12, 38);
+
+  if (showSpeed) {
+    const baseSpeed = (typeof cam.params.walkSpeed === "number") ? cam.params.walkSpeed : 10;
+    // No way to read "sprint held" from outside the camera tick, but
+    // walkSpeed * 4 is the sprint cap; we just show base + sprint cap.
+    // Use a unit-aware speed format: km/s once we cross 1000 m/s.
+    let speedStr;
+    if (baseSpeed >= 1000) {
+      speedStr = (baseSpeed / 1000).toFixed(2) + " km/s";
+    } else {
+      speedStr = Math.round(baseSpeed) + " m/s";
+    }
+    ctx.fillStyle = "rgba(255,255,255,0.55)";
+    ctx.font = "10px ui-monospace, monospace";
+    ctx.fillText("SPEED  " + speedStr + "  (×4 sprint)", 12, 60);
+    ctx.fillStyle = "rgba(255,255,255,0.45)";
+    ctx.font = "9px ui-monospace, monospace";
+    ctx.fillText("hold X faster · Z slower", 12, 72);
+  }
 }
 
 /* Phase 6.6.13 — virtual on-screen sticks for touch navigation.
@@ -59281,6 +59430,7 @@ function renderVisualFrame() {
   // HealthBar / Inventory will plug in here as separate functions.
   // Each renders only when its driving node exists in the patch.
   _tickMinimapNodes();
+  _tickAltimeterNodes();
 
   const enc = Visual.device.createCommandEncoder({ label: "visual-frame" });
 
