@@ -56786,19 +56786,121 @@ function _pickCellInBBox(cells, mask) {
   return pick;
 }
 
-// --- Verb implementations (sphere-adapted) ---
+// --- Cap geometry: a "continent area" on the sphere ---
+//
+// Azgaar's templates describe ONE landmass on a rectangular grid.
+// To make them produce a recognizable continent on our sphere, we
+// constrain the template to a circular cap (center direction + radius
+// in radians). All x/y coordinates in the DSL map to cap-local
+// stereographic coords (0..100% within the cap), so x=50% is the
+// cap center, x=0 / x=100 are the cap edges. Cells outside the cap
+// are untouched by the template's verbs -- they stay at sea level
+// (= ocean).
+//
+// Per-template metadata (PLANET_TEMPLATE_CAPS) controls how many
+// caps to place per "apply" and how big each one is, matching Azgaar's
+// stock template intent: volcano = 1 tiny cap, pangea = 1 huge cap,
+// archipelago = many small scattered caps, etc.
 
-function _planetVerbHillXY(cells, neighbors, K, count, heightRange, xRange, yRange) {
+function _makeCap(cx, cy, cz, radiusRad) {
+  // Orthonormalize basis at cap center. Use world +Y as the "north"
+  // hint; if the cap is near a pole, fall back to +X so the basis
+  // doesn't collapse.
+  let nx = 0, ny = 1, nz = 0;
+  if (Math.abs(cy) > 0.95) { nx = 1; ny = 0; nz = 0; }
+  // v = north projected onto tangent plane at c (i.e., n − (n·c)c).
+  const ndotc = nx*cx + ny*cy + nz*cz;
+  let vx = nx - cx*ndotc, vy = ny - cy*ndotc, vz = nz - cz*ndotc;
+  const vlen = Math.hypot(vx, vy, vz) || 1;
+  vx /= vlen; vy /= vlen; vz /= vlen;
+  // u = c × v (east axis, right-handed).
+  const ux = cy*vz - cz*vy;
+  const uy = cz*vx - cx*vz;
+  const uz = cx*vy - cy*vx;
+  return { cx, cy, cz, ux, uy, uz, vx, vy, vz,
+           radius: radiusRad, cosRadius: Math.cos(radiusRad) };
+}
+
+function _makeRandomCap(radiusRad) {
+  // Uniform-on-sphere center pick.
+  const y = 1 - Math.random() * 2;
+  const r = Math.sqrt(Math.max(0, 1 - y*y));
+  const theta = Math.random() * 2 * Math.PI;
+  return _makeCap(Math.cos(theta)*r, y, Math.sin(theta)*r, radiusRad);
+}
+
+function _makeCapAtLatLon(latDeg, lonDeg, radiusRad) {
+  const lat = latDeg * Math.PI / 180;
+  const lon = lonDeg * Math.PI / 180;
+  const r = Math.cos(lat);
+  return _makeCap(r * Math.cos(lon), Math.sin(lat), r * Math.sin(lon), radiusRad);
+}
+
+// Project cell i to cap-local Azgaar coords. Returns { inCap, x, y }
+// with x,y ∈ [0, 100]: x=50 at cap center horizontally, y=0 at the
+// top of the cap (north), y=100 at the bottom.
+function _capProject(cells, i, cap) {
+  const px = cells.positions[i*3+0];
+  const py = cells.positions[i*3+1];
+  const pz = cells.positions[i*3+2];
+  const dot = px*cap.cx + py*cap.cy + pz*cap.cz;
+  if (dot < cap.cosRadius) return { inCap: false, x: 50, y: 50 };
+  // Tangent direction = p − (p·c)c, normalized.
+  const tx = px - dot*cap.cx, ty = py - dot*cap.cy, tz = pz - dot*cap.cz;
+  const tlen = Math.hypot(tx, ty, tz);
+  if (tlen < 1e-9) return { inCap: true, x: 50, y: 50 };
+  const ang = Math.acos(Math.max(-1, Math.min(1, dot)));
+  const fraction = ang / cap.radius;  // 0 = center, 1 = edge
+  const tnx = tx/tlen, tny = ty/tlen, tnz = tz/tlen;
+  const localU = tnx*cap.ux + tny*cap.uy + tnz*cap.uz;
+  const localV = tnx*cap.vx + tny*cap.vy + tnz*cap.vz;
+  // [-1, 1] disc coords scaled by radial fraction (so cells span the
+  // full cap-local extent linearly with angle).
+  const sx = localU * fraction;
+  const sy = localV * fraction;
+  // North-on-top convention matches Azgaar's y=0 = top of map.
+  return { inCap: true, x: (sx + 1) * 50, y: (1 - sy) * 50 };
+}
+
+function _capBBoxMask(cells, cap, xRange, yRange) {
   const N = cells.count;
-  const { lonMin, lonMax, latMin, latMax } = _xyRangeToLatLon(xRange, yRange);
-  const mask = _cellsInBBox(cells, lonMin, lonMax, latMin, latMax);
+  const mask = new Uint8Array(N);
+  const xMin = xRange[0], xMax = xRange[1];
+  const yMin = yRange[0], yMax = yRange[1];
+  for (let i = 0; i < N; i++) {
+    const p = _capProject(cells, i, cap);
+    if (!p.inCap) continue;
+    if (p.x < xMin || p.x > xMax) continue;
+    if (p.y < yMin || p.y > yMax) continue;
+    mask[i] = 1;
+  }
+  return mask;
+}
+
+function _capInsideMask(cells, cap) {
+  const N = cells.count;
+  const mask = new Uint8Array(N);
+  for (let i = 0; i < N; i++) {
+    const px = cells.positions[i*3+0];
+    const py = cells.positions[i*3+1];
+    const pz = cells.positions[i*3+2];
+    if (px*cap.cx + py*cap.cy + pz*cap.cz >= cap.cosRadius) mask[i] = 1;
+  }
+  return mask;
+}
+
+// --- Verb implementations (cap-aware) ---
+
+function _planetVerbHillXY(cells, neighbors, K, cap, count, heightRange, xRange, yRange) {
+  const N = cells.count;
+  const mask = _capBBoxMask(cells, cap, xRange, yRange);
   const delta = new Float32Array(N);
   const visited = new Uint8Array(N);
   for (let h = 0; h < count; h++) {
     delta.fill(0); visited.fill(0);
     const seed = _pickCellInBBox(cells, mask);
     if (seed < 0) continue;
-    const peak = _pickInRange(heightRange) / 100;  // Azgaar 0-100 → our 0-1
+    const peak = _pickInRange(heightRange) / 100;
     delta[seed] = peak; visited[seed] = 1;
     let q = [seed];
     while (q.length > 0) {
@@ -56822,10 +56924,9 @@ function _planetVerbHillXY(cells, neighbors, K, count, heightRange, xRange, yRan
   }
 }
 
-function _planetVerbPitXY(cells, neighbors, K, count, heightRange, xRange, yRange) {
+function _planetVerbPitXY(cells, neighbors, K, cap, count, heightRange, xRange, yRange) {
   const N = cells.count;
-  const { lonMin, lonMax, latMin, latMax } = _xyRangeToLatLon(xRange, yRange);
-  const mask = _cellsInBBox(cells, lonMin, lonMax, latMin, latMax);
+  const mask = _capBBoxMask(cells, cap, xRange, yRange);
   const delta = new Float32Array(N);
   const visited = new Uint8Array(N);
   for (let h = 0; h < count; h++) {
@@ -56856,11 +56957,10 @@ function _planetVerbPitXY(cells, neighbors, K, count, heightRange, xRange, yRang
   }
 }
 
-function _planetVerbRangeXY(cells, neighbors, K, count, heightRange, xRange, yRange, sign) {
+function _planetVerbRangeXY(cells, neighbors, K, cap, count, heightRange, xRange, yRange, sign) {
   sign = (sign === undefined) ? 1 : sign;
   const N = cells.count;
-  const { lonMin, lonMax, latMin, latMax } = _xyRangeToLatLon(xRange, yRange);
-  const mask = _cellsInBBox(cells, lonMin, lonMax, latMin, latMax);
+  const mask = _capBBoxMask(cells, cap, xRange, yRange);
   for (let r = 0; r < count; r++) {
     const startIdx = _pickCellInBBox(cells, mask);
     if (startIdx < 0) continue;
@@ -56898,105 +56998,123 @@ function _planetVerbRangeXY(cells, neighbors, K, count, heightRange, xRange, yRa
   }
 }
 
-function _planetVerbStrait(cells, neighbors, K, count, orientation) {
-  // "vertical" = great circle through the poles (constant lon).
-  // "horizontal" = great circle in the equatorial plane (constant lat).
-  // Either way: lower elevations of cells within ~5° of the chosen
-  // great circle to create a sea-like channel.
+// Strait cuts a finite line WITHIN the cap. "vertical" = a line along
+// the cap's local v-axis (north-south), "horizontal" = along the
+// cap's local u-axis (east-west). Width ~5% of the cap's diameter.
+function _planetVerbStrait(cells, neighbors, K, cap, count, orientation) {
   const N = cells.count;
   for (let r = 0; r < count; r++) {
-    let ax, ay, az;  // normal of the great-circle plane
-    if (orientation === "vertical") {
-      // Plane contains the Y axis; pick a random longitude for the
-      // plane's normal direction.
-      const phi = Math.random() * 2 * Math.PI;
-      ax = Math.cos(phi); ay = 0; az = Math.sin(phi);
-    } else {
-      // "horizontal": plane perpendicular to a tilted axis (almost
-      // equator but jittered).
-      const lat = (Math.random() - 0.5) * Math.PI * 0.4;  // ±36° equatorial belt
-      ax = 0; ay = Math.cos(lat); az = Math.sin(lat);
-    }
-    const ahLen = Math.hypot(ax, ay, az) || 1;
-    ax /= ahLen; ay /= ahLen; az /= ahLen;
-    const widthCos = Math.cos(5 * Math.PI / 180);
+    // Pick a random offset along the perpendicular axis within the
+    // cap's range so straits aren't all centered.
+    const offset = (Math.random() - 0.5) * 0.8;  // ±40% of cap radius
+    const width = 0.10;  // cap-radius units
     for (let i = 0; i < N; i++) {
-      const d = Math.abs(cells.positions[i*3]*ax + cells.positions[i*3+1]*ay + cells.positions[i*3+2]*az);
-      // d ≈ 0 means cell sits on the great circle. Convert to width
-      // factor: sin(angularDist) = d → cells with d < sin(5°) qualify.
-      if (d < Math.sin(5 * Math.PI / 180)) {
-        const t = 1 - d / Math.sin(5 * Math.PI / 180);
-        const drop = 0.15 * t;
-        cells.elevations[i] = Math.max(0, cells.elevations[i] - drop);
+      const proj = _capProject(cells, i, cap);
+      if (!proj.inCap) continue;
+      // proj.x/y are in [0, 100]; convert to [-1, 1].
+      const lx = (proj.x - 50) / 50;
+      const ly = (50 - proj.y) / 50;
+      let d;
+      if (orientation === "vertical") {
+        d = Math.abs(lx - offset);
+      } else {
+        d = Math.abs(ly - offset);
+      }
+      if (d < width) {
+        const t = 1 - d / width;
+        cells.elevations[i] = Math.max(0, cells.elevations[i] - 0.15 * t);
       }
     }
   }
 }
 
-function _planetVerbAdd(cells, value, heightFilter) {
+// Add / Multiply / Invert operate on cells INSIDE the cap. heightFilter
+// can be "all", "land", or a [lo, hi] elevation range (Azgaar 0-100).
+function _planetVerbAdd(cells, cap, value, heightFilter) {
   const N = cells.count;
-  const v = value / 100;  // Azgaar's 0-100 scale → our 0-1
+  const v = value / 100;
   let elevMin = 0, elevMax = 1;
   if (heightFilter === "land") elevMin = 0.20;
-  else if (heightFilter === "all") { /* keep defaults */ }
   else if (Array.isArray(heightFilter)) { elevMin = heightFilter[0] / 100; elevMax = heightFilter[1] / 100; }
+  const inMask = _capInsideMask(cells, cap);
   for (let i = 0; i < N; i++) {
+    if (!inMask[i]) continue;
     if (cells.elevations[i] < elevMin || cells.elevations[i] > elevMax) continue;
     cells.elevations[i] = Math.max(0, Math.min(1, cells.elevations[i] + v));
   }
 }
 
-function _planetVerbMultiply(cells, factor, heightFilter) {
+function _planetVerbMultiply(cells, cap, factor, heightFilter) {
   const N = cells.count;
   let elevMin = 0, elevMax = 1;
   if (heightFilter === "land") elevMin = 0.20;
   else if (Array.isArray(heightFilter)) { elevMin = heightFilter[0] / 100; elevMax = heightFilter[1] / 100; }
+  const inMask = _capInsideMask(cells, cap);
   for (let i = 0; i < N; i++) {
+    if (!inMask[i]) continue;
     if (cells.elevations[i] < elevMin || cells.elevations[i] > elevMax) continue;
     cells.elevations[i] = Math.max(0, Math.min(1, cells.elevations[i] * factor));
   }
 }
 
-function _planetVerbInvert(cells, probability, axis) {
-  // Azgaar: with probability p, invert heights around the mean. We
-  // do a coin flip and on success apply: e → 1 - e (clamped).
+function _planetVerbInvert(cells, cap, probability) {
   if (Math.random() > probability) return;
   const N = cells.count;
+  const inMask = _capInsideMask(cells, cap);
   for (let i = 0; i < N; i++) {
+    if (!inMask[i]) continue;
     cells.elevations[i] = Math.max(0, Math.min(1, 1 - cells.elevations[i]));
   }
 }
 
-function _planetVerbMask(cells, power) {
-  // Azgaar's Mask dampens cells by their distance from the center of
-  // the rectangular map. On a sphere we don't have a "center" -- but
-  // his use is to attenuate edges of the playable area, so map it to
-  // "distance from a random great-circle center direction" with the
-  // mask power controlling the falloff steepness. Negative power
-  // inverts (favors the edges instead). Idiomatic uses (Mask 3 = soft
-  // edge dampening; Mask -2 / Mask 4 = strong dampening) translate
-  // to a falloff that pulls coastal cells down toward sea level.
+// Mask centered on the cap. radial distance from cap center → mask
+// weight. Power > 0 dampens edges (typical island-fade). Negative
+// power dampens center (rare; Azgaar's `Mask -2` etc.).
+function _planetVerbMask(cells, cap, power) {
   const N = cells.count;
-  // Pick a random "center" direction once per call.
-  const cy = 1 - Math.random() * 2;
-  const r = Math.sqrt(Math.max(0, 1 - cy*cy));
-  const theta = Math.random() * 2 * Math.PI;
-  const cx = Math.cos(theta) * r, cz = Math.sin(theta) * r;
   const absPow = Math.max(1, Math.abs(power));
   const invert = power < 0;
   for (let i = 0; i < N; i++) {
-    const dot = cells.positions[i*3]*cx + cells.positions[i*3+1]*cy + cells.positions[i*3+2]*cz;
-    // dot ∈ [-1, 1]; convert to 0..1 with 1 = center.
-    let t = (dot + 1) * 0.5;
-    if (invert) t = 1 - t;
-    const w = Math.pow(t, absPow);
-    cells.elevations[i] *= w;
+    const proj = _capProject(cells, i, cap);
+    if (!proj.inCap) {
+      // Outside the cap: full dampening (push ocean toward 0)
+      cells.elevations[i] *= 0;
+      continue;
+    }
+    const lx = (proj.x - 50) / 50;
+    const ly = (50 - proj.y) / 50;
+    const dist = Math.min(1, Math.hypot(lx, ly));
+    let t = 1 - dist;          // 1 at center → 0 at edge
+    if (invert) t = dist;
+    cells.elevations[i] *= Math.pow(Math.max(0, Math.min(1, t)), absPow);
+  }
+}
+
+// Smooth runs only on cap-interior cells; the cap boundary then
+// naturally smooths toward 0 (ocean) for a soft coastline instead of
+// a hard edge.
+function _planetVerbSmoothCap(cells, neighbors, K, cap, iterations) {
+  const N = cells.count;
+  const inMask = _capInsideMask(cells, cap);
+  const next = new Float32Array(N);
+  for (let it = 0; it < iterations; it++) {
+    for (let i = 0; i < N; i++) {
+      if (!inMask[i]) { next[i] = cells.elevations[i]; continue; }
+      let sum = cells.elevations[i];
+      let cnt = 1;
+      for (let k = 0; k < K; k++) {
+        const ni = neighbors[i * K + k];
+        if (ni >= 0) { sum += cells.elevations[ni]; cnt++; }
+      }
+      next[i] = sum / cnt;
+    }
+    for (let i = 0; i < N; i++) cells.elevations[i] = next[i];
   }
 }
 
 // --- DSL parser / executor ---
 
-function _planetRunDSL(template, cells, neighbors, K) {
+function _planetRunDSL(template, cells, neighbors, K, cap) {
   const lines = template.split("\n");
   for (let li = 0; li < lines.length; li++) {
     const line = lines[li].trim();
@@ -57008,56 +57126,56 @@ function _planetRunDSL(template, cells, neighbors, K) {
       case "Hill": {
         const count = _pickInRangeInt(_parseRange(arg1, [1,1]));
         const h = _parseRange(arg2, [50,50]);
-        _planetVerbHillXY(cells, neighbors, K, count, h, _parseRange(arg3, [0,100]), _parseRange(arg4, [0,100]));
+        _planetVerbHillXY(cells, neighbors, K, cap, count, h, _parseRange(arg3, [0,100]), _parseRange(arg4, [0,100]));
         break;
       }
       case "Pit": {
         const count = _pickInRangeInt(_parseRange(arg1, [1,1]));
         const h = _parseRange(arg2, [10,20]);
-        _planetVerbPitXY(cells, neighbors, K, count, h, _parseRange(arg3, [0,100]), _parseRange(arg4, [0,100]));
+        _planetVerbPitXY(cells, neighbors, K, cap, count, h, _parseRange(arg3, [0,100]), _parseRange(arg4, [0,100]));
         break;
       }
       case "Range": {
         const count = _pickInRangeInt(_parseRange(arg1, [1,1]));
         const h = _parseRange(arg2, [30,50]);
-        _planetVerbRangeXY(cells, neighbors, K, count, h, _parseRange(arg3, [0,100]), _parseRange(arg4, [0,100]), 1);
+        _planetVerbRangeXY(cells, neighbors, K, cap, count, h, _parseRange(arg3, [0,100]), _parseRange(arg4, [0,100]), 1);
         break;
       }
       case "Trough": {
         const count = _pickInRangeInt(_parseRange(arg1, [1,1]));
         const h = _parseRange(arg2, [10,20]);
-        _planetVerbRangeXY(cells, neighbors, K, count, h, _parseRange(arg3, [0,100]), _parseRange(arg4, [0,100]), -1);
+        _planetVerbRangeXY(cells, neighbors, K, cap, count, h, _parseRange(arg3, [0,100]), _parseRange(arg4, [0,100]), -1);
         break;
       }
       case "Strait": {
         const count = _pickInRangeInt(_parseRange(arg1, [1,1]));
-        _planetVerbStrait(cells, neighbors, K, count, arg2);
+        _planetVerbStrait(cells, neighbors, K, cap, count, arg2);
         break;
       }
       case "Smooth": {
         const iter = _pickInRangeInt(_parseRange(arg1, [1,1]));
-        _planetVerbSmooth(cells, neighbors, K, iter);
+        _planetVerbSmoothCap(cells, neighbors, K, cap, iter);
         break;
       }
       case "Add": {
         const v = parseFloat(arg1);
         const filt = (arg2 === "all" || arg2 === "land") ? arg2 : _parseRange(arg2, "all");
-        _planetVerbAdd(cells, v, filt);
+        _planetVerbAdd(cells, cap, v, filt);
         break;
       }
       case "Multiply": {
         const f = parseFloat(arg1);
         const filt = (arg2 === "all" || arg2 === "land") ? arg2 : _parseRange(arg2, "all");
-        _planetVerbMultiply(cells, f, filt);
+        _planetVerbMultiply(cells, cap, f, filt);
         break;
       }
       case "Mask": {
-        _planetVerbMask(cells, parseFloat(arg1));
+        _planetVerbMask(cells, cap, parseFloat(arg1));
         break;
       }
       case "Invert": {
         const p = parseFloat(arg1);
-        _planetVerbInvert(cells, p, arg2);
+        _planetVerbInvert(cells, cap, p);
         break;
       }
       default:
@@ -57065,6 +57183,28 @@ function _planetRunDSL(template, cells, neighbors, K) {
     }
   }
 }
+
+// Per-template cap layout: count of continents + angular radius per
+// cap (degrees). Matches Azgaar's stock-template intent: volcano =
+// 1 tiny cap, pangea = 1 huge cap, archipelago = many scattered
+// caps. Templates are still tweakable per-name; tuning these values
+// is the main knob for "how does my planet look".
+const PLANET_TEMPLATE_CAPS = {
+  volcano:       { count: 1, radiusDeg: 10 },
+  highIsland:    { count: 1, radiusDeg: 18 },
+  lowIsland:     { count: 1, radiusDeg: 22 },
+  continents:    { count: 3, radiusDeg: 38 },
+  archipelago:   { count: 6, radiusDeg: 25 },
+  atoll:         { count: 1, radiusDeg: 7 },
+  mediterranean: { count: 1, radiusDeg: 35 },
+  peninsula:     { count: 2, radiusDeg: 26 },
+  pangea:        { count: 1, radiusDeg: 85 },
+  isthmus:       { count: 1, radiusDeg: 45 },
+  shattered:     { count: 8, radiusDeg: 20 },
+  taklamakan:    { count: 1, radiusDeg: 30 },
+  oldWorld:      { count: 2, radiusDeg: 36 },
+  fractious:     { count: 4, radiusDeg: 28 }
+};
 
 /* §planet-spec Phase 7.d/templates -- the 14 stock Azgaar templates,
  * source: ref-azgaar-fmg/public/config/heightmap-templates.js. Verbatim
@@ -57205,25 +57345,41 @@ const PLANET_TEMPLATES_DSL = {
     Range 6-8 40-50 5-95 10-90`
 };
 
+// Names list (used by painter's dropdown).
 const PLANET_TEMPLATES = {};
 Object.keys(PLANET_TEMPLATES_DSL).forEach(function(name) {
-  PLANET_TEMPLATES[name] = function(cells, neighbors, K) {
-    _planetVerbReset(cells);
-    _planetRunDSL(PLANET_TEMPLATES_DSL[name], cells, neighbors, K);
-  };
+  PLANET_TEMPLATES[name] = true;
 });
 
-function _planetApplyTemplate(name, cells, neighbors, K, seaLevel) {
-  const fn = PLANET_TEMPLATES[name];
-  if (!fn) { console.warn("[planet-map] unknown template:", name); return; }
+/* Apply a template to the cell graph. Each template's caps metadata
+ * (PLANET_TEMPLATE_CAPS) controls how many continents to place and
+ * how big each one is. If a `lockedCenter` is provided (lat/lon
+ * degrees, set by clicking on the painter), the FIRST cap gets
+ * placed there; the rest are random. Otherwise all caps are random.
+ * After all caps run, the elevation field is piecewise-remapped from
+ * Azgaar's logical scale (0.20 = sea level) to our [0, 1] with the
+ * wired PlanetMesh's seaLevel. */
+function _planetApplyTemplate(name, cells, neighbors, K, seaLevel, lockedCenter) {
+  if (!PLANET_TEMPLATES_DSL[name]) {
+    console.warn("[planet-map] unknown template:", name);
+    return;
+  }
   const t0 = performance.now();
-  fn(cells, neighbors, K);
-  // Azgaar's templates assume sea level at h=20 on a 0-100 scale
-  // (0.20 after the /100 conversion in the verbs). Our PlanetMesh
-  // demo uses seaLevel=0.55, so without a remap the templates
-  // produce mostly-submerged worlds (archipelago peaks at 0.15-0.20
-  // = invisible under 0.55). Piecewise-linear: Azgaar's 0.20 →
-  // our seaLevel, anchored at 0 → 0 and 1 → 1.
+  _planetVerbReset(cells);
+  const meta = PLANET_TEMPLATE_CAPS[name] || { count: 1, radiusDeg: 30 };
+  const radiusRad = meta.radiusDeg * Math.PI / 180;
+  const dsl = PLANET_TEMPLATES_DSL[name];
+  for (let i = 0; i < meta.count; i++) {
+    let cap;
+    if (i === 0 && lockedCenter && typeof lockedCenter.lat === "number" && typeof lockedCenter.lon === "number") {
+      cap = _makeCapAtLatLon(lockedCenter.lat, lockedCenter.lon, radiusRad);
+    } else {
+      cap = _makeRandomCap(radiusRad);
+    }
+    _planetRunDSL(dsl, cells, neighbors, K, cap);
+  }
+  // Piecewise remap Azgaar's logical 0-1 (0.20 = sea level) → ours
+  // (seaLevel arg). Anchors h=0 → 0, h=0.20 → seaLevel, h=1 → 1.
   const sl = (typeof seaLevel === "number") ? seaLevel : 0.55;
   if (Math.abs(sl - 0.20) > 1e-6) {
     const AZ_SL = 0.20;
@@ -57236,7 +57392,8 @@ function _planetApplyTemplate(name, cells, neighbors, K, seaLevel) {
       cells.elevations[i] = Math.max(0, Math.min(1, e));
     }
   }
-  console.log("[planet-map] applied template '" + name + "' in " + (performance.now() - t0).toFixed(0) + "ms (sea=" + sl.toFixed(2) + ")");
+  console.log("[planet-map] applied template '" + name + "' in " + (performance.now() - t0).toFixed(0)
+    + "ms (" + meta.count + " caps × " + meta.radiusDeg + "° radius, sea=" + sl.toFixed(2) + ")");
 }
 
 /* §planet-spec Phase 7.b -- serialize / deserialize the cubemap as
@@ -70104,7 +70261,8 @@ function openPlanetMapEditor(nodeId) {
   tplRow.innerHTML =
     '<label>template&nbsp;<select id="pmap-tpl" style="background:var(--surface);color:var(--text);border:1px solid var(--border);padding:3px 6px;font-family:var(--font-mono);font-size:11px;">' + tplOptions + '</select></label>' +
     '<button class="btn" id="pmap-roll" type="button" style="padding:3px 10px;">re-roll</button>' +
-    '<span style="color:var(--text-3);font-size:10px;">overwrites all cells with a new random map of the picked type</span>';
+    '<button class="btn" id="pmap-clearlock" type="button" style="padding:3px 10px;display:none;">clear target</button>' +
+    '<span id="pmap-lockinfo" style="color:var(--text-3);font-size:10px;">re-roll places continents randomly. shift-click the map to lock the first continent’s position; click again to move it.</span>';
   body.appendChild(tplRow);
   const helpRow = document.createElement("div");
   helpRow.style.cssText =
@@ -70114,6 +70272,10 @@ function openPlanetMapEditor(nodeId) {
     "(equator: 1° ≈ 111km on earth). closing the modal bakes the modified cells " +
     "into the cubemap; the planet picks up the change on the next chunk rebuild.";
   body.appendChild(helpRow);
+
+  // Locked continent target (shift-click on the map). When set, the
+  // next re-roll places the template's first cap here.
+  let lockedCenter = null;  // { lat, lon } in degrees
 
   // Snapshot for revert.
   const elevSnapshot = new Float32Array(cells.elevations);
@@ -70192,6 +70354,19 @@ function openPlanetMapEditor(nodeId) {
       data[k + 3] = 255;
     }
     ctx.putImageData(imageData, 0, 0);
+    // Draw the locked continent-target as a crosshair on top so the
+    // user sees where re-roll will place the first cap.
+    if (lockedCenter) {
+      const py = Math.floor(((90 - lockedCenter.lat) / 180) * H);
+      const px = Math.floor(((lockedCenter.lon + 180) / 360) * W);
+      ctx.save();
+      ctx.strokeStyle = "rgba(255, 220, 90, 0.95)";
+      ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(px - 8, py); ctx.lineTo(px + 8, py);
+      ctx.moveTo(px, py - 8); ctx.lineTo(px, py + 8); ctx.stroke();
+      ctx.beginPath(); ctx.arc(px, py, 5, 0, Math.PI * 2); ctx.stroke();
+      ctx.restore();
+    }
   }
   render();
 
@@ -70246,9 +70421,21 @@ function openPlanetMapEditor(nodeId) {
 
   // Template dropdown + re-roll wire-up.
   const tplSel = modal.querySelector("#pmap-tpl");
+  const lockInfo = modal.querySelector("#pmap-lockinfo");
+  const clearLockBtn = modal.querySelector("#pmap-clearlock");
+  function updateLockInfo() {
+    if (lockedCenter) {
+      lockInfo.textContent = "first continent locked at lat " + lockedCenter.lat.toFixed(1) + "° lon " + lockedCenter.lon.toFixed(1) + "°. re-roll places it here.";
+      clearLockBtn.style.display = "";
+    } else {
+      lockInfo.textContent = "re-roll places continents randomly. shift-click the map to lock the first continent’s position.";
+      clearLockBtn.style.display = "none";
+    }
+  }
+  clearLockBtn.addEventListener("click", () => { lockedCenter = null; updateLockInfo(); render(); });
   modal.querySelector("#pmap-roll").addEventListener("click", () => {
     const name = tplSel.value;
-    _planetApplyTemplate(name, cells, node._cellNeighbors, node._cellNeighborsK, seaLevel);
+    _planetApplyTemplate(name, cells, node._cellNeighbors, node._cellNeighborsK, seaLevel, lockedCenter);
     dirty = true;
     node._cellsVersion = ((typeof node._cellsVersion === "number") ? node._cellsVersion : 0) + 1;
     if (showClimate) {
@@ -70285,13 +70472,24 @@ function openPlanetMapEditor(nodeId) {
     render();
   }
 
-  // Pointer events.
+  // Pointer events. Shift-click sets the continent-target lock for
+  // re-roll instead of painting -- so the next template apply places
+  // its first cap where you clicked. Subsequent re-rolls keep using
+  // the locked point until "clear target" or another shift-click.
   canvas.addEventListener("pointerdown", (ev) => {
-    canvas.setPointerCapture(ev.pointerId);
-    painting = true;
     const r = canvas.getBoundingClientRect();
     const px = Math.floor((ev.clientX - r.left) / r.width * W);
     const py = Math.floor((ev.clientY - r.top) / r.height * H);
+    if (ev.shiftKey) {
+      const lat = 90 - ((py + 0.5) / H) * 180;
+      const lon = ((px + 0.5) / W) * 360 - 180;
+      lockedCenter = { lat, lon };
+      updateLockInfo();
+      render();
+      return;
+    }
+    canvas.setPointerCapture(ev.pointerId);
+    painting = true;
     stamp(px, py);
   });
   canvas.addEventListener("pointermove", (ev) => {
