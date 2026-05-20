@@ -55021,37 +55021,133 @@ function _planetSpherify(cx, cy, cz) {
  * far from the camera. Spherical-Delaunay-via-stereographic would be
  * the rigorous fix; this is the simple approximation. */
 function _buildCellTriangulation(positions, neighbors, K, N) {
-  const tris = [];
+  // Proper spherical Delaunay triangulation in two passes:
+  //
+  //  Pass 1 -- Voronoi-edge test. For each candidate edge (i, j) in
+  //  i's K-nearest, compute the spherical midpoint M = normalize(i+j)
+  //  on the unit sphere. dot(i, M) = dot(j, M) (i and j equidistant
+  //  from M by symmetry). The edge (i, j) is a Voronoi edge iff no
+  //  other cell c is closer to M than i is, i.e. dot(c, M) <=
+  //  dot(i, M) for all c. We check this against i's K-nearest AND
+  //  j's K-nearest -- those are the only candidates that could
+  //  possibly be closer. Voronoi-edge implies BOTH cells lie on
+  //  each other's boundary, so the test is symmetric (no asymmetric-
+  //  K-nearest problem like the earlier emit-everything approach).
+  //
+  //  Pass 2 -- Per-cell fan triangulation. For each cell i, sort its
+  //  Voronoi neighbors by azimuth in i's local tangent plane. Emit a
+  //  triangle for each consecutive pair (n1, n2) of sorted neighbors,
+  //  guarded by i < n1 && i < n2 to ensure each triangle emits
+  //  exactly once (from the smallest-index vertex's fan). Winding
+  //  fixed to CCW-from-outside via the cross-product check.
+  //
+  //  Result: ~120k triangles at N=60k (matches sphere topology
+  //  2(N-2) ≈ 2N) without the spike-fin artifacts the naive emit-
+  //  all-pairs approach produced.
+
+  // ---- Pass 1: Voronoi adjacency lists ----
+  const vAdj = new Array(N);
+  for (let i = 0; i < N; i++) vAdj[i] = [];
   for (let i = 0; i < N; i++) {
     const ix = positions[i * 3 + 0];
     const iy = positions[i * 3 + 1];
     const iz = positions[i * 3 + 2];
-    for (let k1 = 0; k1 < K - 1; k1++) {
-      const n1 = neighbors[i * K + k1];
-      if (n1 < 0 || n1 <= i) continue;
-      for (let k2 = k1 + 1; k2 < K; k2++) {
-        const n2 = neighbors[i * K + k2];
-        if (n2 < 0 || n2 <= n1) continue;
-        // Mutual-adjacency check (n2 in n1's K-nearest list) was here
-        // but K-nearest isn't symmetric on Fibonacci points -- ~95%
-        // of triangles failed it, leaving 8k instead of ~120k. We
-        // emit every i<n1<n2 pair of i's neighbors as a triangle
-        // instead. Some emitted triangles aren't true Delaunay
-        // (overlap is possible) but the rendered surface still reads
-        // correctly at orbital scale.
-        const v1x = positions[n1 * 3 + 0] - ix;
-        const v1y = positions[n1 * 3 + 1] - iy;
-        const v1z = positions[n1 * 3 + 2] - iz;
-        const v2x = positions[n2 * 3 + 0] - ix;
-        const v2y = positions[n2 * 3 + 1] - iy;
-        const v2z = positions[n2 * 3 + 2] - iz;
-        const cxn = v1y * v2z - v1z * v2y;
-        const cyn = v1z * v2x - v1x * v2z;
-        const czn = v1x * v2y - v1y * v2x;
-        const outward = cxn * ix + cyn * iy + czn * iz;
-        if (outward >= 0) tris.push(i, n1, n2);
-        else              tris.push(i, n2, n1);
+    for (let k = 0; k < K; k++) {
+      const j = neighbors[i * K + k];
+      if (j < 0 || j <= i) continue;          // dedup: process each pair once
+      const jx = positions[j * 3 + 0];
+      const jy = positions[j * 3 + 1];
+      const jz = positions[j * 3 + 2];
+      // Spherical midpoint M = normalize(i + j).
+      let mx = ix + jx, my = iy + jy, mz = iz + jz;
+      const ml = Math.sqrt(mx*mx + my*my + mz*mz);
+      if (ml < 1e-9) continue;                 // antipodal pair, skip
+      const mlinv = 1 / ml;
+      mx *= mlinv; my *= mlinv; mz *= mlinv;
+      const dotIM = ix * mx + iy * my + iz * mz;
+      // Eps: dotIM has float-precision noise; allow 1e-9 slack.
+      const slack = 1e-9;
+      let isVoronoi = true;
+      // Check i's K-nearest (other than j).
+      for (let k2 = 0; k2 < K; k2++) {
+        const c = neighbors[i * K + k2];
+        if (c < 0 || c === j) continue;
+        const dotCM = positions[c*3]*mx + positions[c*3+1]*my + positions[c*3+2]*mz;
+        if (dotCM > dotIM + slack) { isVoronoi = false; break; }
       }
+      if (isVoronoi) {
+        // Check j's K-nearest too -- could be a cell that's closer to
+        // M but isn't in i's K-nearest.
+        for (let k2 = 0; k2 < K; k2++) {
+          const c = neighbors[j * K + k2];
+          if (c < 0 || c === i) continue;
+          const dotCM = positions[c*3]*mx + positions[c*3+1]*my + positions[c*3+2]*mz;
+          if (dotCM > dotIM + slack) { isVoronoi = false; break; }
+        }
+      }
+      if (isVoronoi) {
+        vAdj[i].push(j);
+        vAdj[j].push(i);
+      }
+    }
+  }
+
+  // ---- Pass 2: Fan triangulation via azimuth sort ----
+  const tris = [];
+  const azBuf = [];
+  for (let i = 0; i < N; i++) {
+    const vNbrs = vAdj[i];
+    const len = vNbrs.length;
+    if (len < 2) continue;
+    const ix = positions[i * 3 + 0];
+    const iy = positions[i * 3 + 1];
+    const iz = positions[i * 3 + 2];
+    // Build a tangent frame at i. Pick reference axis perpendicular
+    // to i's radial: if |iy| < 0.9 use Y, else use X (avoids the
+    // degenerate case where the reference is parallel to i).
+    let refx, refy, refz;
+    if (Math.abs(iy) < 0.9) { refx = 0; refy = 1; refz = 0; }
+    else                     { refx = 1; refy = 0; refz = 0; }
+    const dotRI = refx*ix + refy*iy + refz*iz;
+    let txX = refx - dotRI*ix;
+    let tyX = refy - dotRI*iy;
+    let tzX = refz - dotRI*iz;
+    const txLen = 1/Math.sqrt(txX*txX + tyX*tyX + tzX*tzX);
+    txX *= txLen; tyX *= txLen; tzX *= txLen;
+    // Tangent Y = i × tangent X (so X,Y,i form a right-handed frame).
+    const txY = iy*tzX - iz*tyX;
+    const tyY = iz*txX - ix*tzX;
+    const tzY = ix*tyX - iy*txX;
+    // Azimuth of each neighbor in the tangent plane.
+    azBuf.length = 0;
+    for (let k = 0; k < len; k++) {
+      const n = vNbrs[k];
+      const dxn = positions[n*3] - ix;
+      const dyn = positions[n*3+1] - iy;
+      const dzn = positions[n*3+2] - iz;
+      const aX = dxn*txX + dyn*tyX + dzn*tzX;
+      const aY = dxn*txY + dyn*tyY + dzn*tzY;
+      azBuf.push({ idx: n, angle: Math.atan2(aY, aX) });
+    }
+    azBuf.sort((a, b) => a.angle - b.angle);
+    for (let k = 0; k < len; k++) {
+      const n1 = azBuf[k].idx;
+      const n2 = azBuf[(k + 1) % len].idx;
+      // Dedup: emit only when i is the smallest of (i, n1, n2).
+      if (i >= n1 || i >= n2) continue;
+      // CCW winding from outside.
+      const e01x = positions[n1*3]   - ix;
+      const e01y = positions[n1*3+1] - iy;
+      const e01z = positions[n1*3+2] - iz;
+      const e02x = positions[n2*3]   - ix;
+      const e02y = positions[n2*3+1] - iy;
+      const e02z = positions[n2*3+2] - iz;
+      const cxn = e01y * e02z - e01z * e02y;
+      const cyn = e01z * e02x - e01x * e02z;
+      const czn = e01x * e02y - e01y * e02x;
+      const outward = cxn * ix + cyn * iy + czn * iz;
+      if (outward >= 0) tris.push(i, n1, n2);
+      else              tris.push(i, n2, n1);
     }
   }
   return new Uint32Array(tris);
@@ -55368,7 +55464,12 @@ function _ensurePlanetMapCells(node) {
   const t0 = (typeof performance !== "undefined") ? performance.now() : 0;
   const cells = _buildFibonacciCells(N, noiseDef);
   const hash = _buildCellSpatialHash(cells);
-  const NEIGHBORS_K = 6;
+  // K=10 (was 6). Voronoi cells on a sphere typically have 5-8
+  // true neighbors but the spherical Delaunay test inspects all K
+  // candidates for the empty-circle property; K=10 catches edges
+  // that K=6 would miss (the 7th-10th nearest can still be true
+  // Voronoi neighbors when local cell density varies).
+  const NEIGHBORS_K = 10;
   const neighbors = _buildCellNeighbors(cells, hash, NEIGHBORS_K);
   const dt = ((typeof performance !== "undefined") ? performance.now() : 0) - t0;
   node._cells = cells;
