@@ -10773,8 +10773,14 @@ public:
     ],
     outs: [{ n: "heightmap", t: "heightmap" }],
     params: {
-      resolution: 256,
-      cellCount: 10000,
+      // Defaults bumped for immediate quality. The virtualized mip-chain
+      // + cell-graph density LOD (memory:planetmap-virtualized-mip) is
+      // the proper fix for 16k+ resolution; these defaults are the
+      // best we can do statically.
+      // resolution 512² × 6 = 1.5M texels (~3MB R16 = ~4MB base64 in .gpatch).
+      // cellCount 30k = ~130km arc per cell at Earth scale.
+      resolution: 512,
+      cellCount: 30000,
       seed: 7.3, frequency: 1.0, octaves: 6,
       lacunarity: 2.0, gain: 0.5, ridges: 0
     },
@@ -33254,8 +33260,13 @@ const _demos = [
       // continue the surface at the same Y -- the boundary is invisible.
       // seaLevel=0 matches Planet's pole surface (which sits at world
       // Y=0 because Planet centerY = -R*polRatio).
+      // §planet-spec Phase 7.d -- bump water +50m above smooth-sphere
+      // surface so it visibly sits ON TOP of Planet's blue ocean cells
+      // (which render at exactly R and z-fight Water at seaLevel=0).
+      // Land at h > Planet.seaLevel still pokes above (178m+ at h=0.56,
+      // heightScale=8km).
       const water = makeNode("Water", 40, 480, {
-        seaLevel: 0,
+        seaLevel: 50,
         colorR: 0.10, colorG: 0.32, colorB: 0.48,
         waveFreq: 0.012, waveSpeed: 0.6, waveAmp: 1.0,
         fresnelStrength: 1.0,
@@ -33278,7 +33289,8 @@ const _demos = [
       // line up with what Planet would have computed -- the visible
       // would shift even though the field is the same fBm function.
       const pmap = makeNode("PlanetMap", 40, 580, {
-        resolution: 256,                  // 256² × 6 = 393k texels (~3MB at f32)
+        resolution: 512,                  // 512² × 6 = 1.5M texels (~3MB R16 in .gpatch)
+        cellCount:  30000,                // ~130km arc per cell at Earth scale
         seed:       3.7,
         frequency:  5e-7,
         octaves:    8,
@@ -55116,6 +55128,69 @@ function _planetMapCellsKey(node) {
   ].join(",");
 }
 
+/* §planet-spec Phase 7.d-templates -- pre-compute K=6 nearest other
+ * cells per cell. Used by template verbs (Hill BFS, Range walk, Smooth)
+ * to traverse the spherical cell graph -- our equivalent of Azgaar's
+ * 2D `cells.c[i]` neighbor array. Spatial hash scan over 5×5×5 buckets
+ * around each cell (~190 candidates at 30k cells in a 16³ grid),
+ * partial sort to keep top K. ~10ms at N=30k cells. Stored as a
+ * flat Int32Array(N*K) for cache-friendly iteration. */
+function _buildCellNeighbors(cells, hash, K) {
+  const N = cells.count;
+  const result = new Int32Array(N * K);
+  const GRID = hash.GRID;
+  // Reusable arrays to avoid per-cell GC churn.
+  const candIdx = new Int32Array(256);
+  const candDot = new Float32Array(256);
+  for (let i = 0; i < N; i++) {
+    const px = cells.positions[i * 3 + 0];
+    const py = cells.positions[i * 3 + 1];
+    const pz = cells.positions[i * 3 + 2];
+    const ix0 = Math.max(0, Math.min(GRID - 1, Math.floor((px + 1) * 0.5 * GRID)));
+    const iy0 = Math.max(0, Math.min(GRID - 1, Math.floor((py + 1) * 0.5 * GRID)));
+    const iz0 = Math.max(0, Math.min(GRID - 1, Math.floor((pz + 1) * 0.5 * GRID)));
+    let nCand = 0;
+    for (let dx = -2; dx <= 2 && nCand < 256; dx++) {
+      const bx = ix0 + dx; if (bx < 0 || bx >= GRID) continue;
+      for (let dy = -2; dy <= 2 && nCand < 256; dy++) {
+        const by = iy0 + dy; if (by < 0 || by >= GRID) continue;
+        for (let dz = -2; dz <= 2 && nCand < 256; dz++) {
+          const bz = iz0 + dz; if (bz < 0 || bz >= GRID) continue;
+          const k = bx * GRID * GRID + by * GRID + bz;
+          const bucket = hash.buckets.get(k);
+          if (!bucket) continue;
+          for (let b = 0; b < bucket.length && nCand < 256; b++) {
+            const cidx = bucket[b];
+            if (cidx === i) continue;
+            const dot = px * cells.positions[cidx * 3 + 0]
+                      + py * cells.positions[cidx * 3 + 1]
+                      + pz * cells.positions[cidx * 3 + 2];
+            candIdx[nCand] = cidx;
+            candDot[nCand] = dot;
+            nCand++;
+          }
+        }
+      }
+    }
+    // Partial selection sort -- pick top K by max dot product.
+    for (let k = 0; k < K; k++) {
+      let bestPos = -1, bestDot = -2;
+      for (let c = k; c < nCand; c++) {
+        if (candDot[c] > bestDot) { bestDot = candDot[c]; bestPos = c; }
+      }
+      if (bestPos < 0) {
+        result[i * K + k] = -1;
+      } else {
+        result[i * K + k] = candIdx[bestPos];
+        // Swap into the front so subsequent picks don't reconsider.
+        candIdx[bestPos] = candIdx[k]; candIdx[k] = result[i * K + k];
+        candDot[bestPos] = candDot[k]; candDot[k] = bestDot;
+      }
+    }
+  }
+  return result;
+}
+
 function _ensurePlanetMapCells(node) {
   if (!node || !node.params) return null;
   const key = _planetMapCellsKey(node);
@@ -55135,15 +55210,223 @@ function _ensurePlanetMapCells(node) {
   const t0 = (typeof performance !== "undefined") ? performance.now() : 0;
   const cells = _buildFibonacciCells(N, noiseDef);
   const hash = _buildCellSpatialHash(cells);
+  const NEIGHBORS_K = 6;
+  const neighbors = _buildCellNeighbors(cells, hash, NEIGHBORS_K);
   const dt = ((typeof performance !== "undefined") ? performance.now() : 0) - t0;
   node._cells = cells;
   node._cellsHash = hash;
+  node._cellNeighbors = neighbors;
+  node._cellNeighborsK = NEIGHBORS_K;
   node._cellsKey = key;
   if (!Visual._planetMapCellsLogged) {
     Visual._planetMapCellsLogged = true;
-    console.log("[planet-map] built " + N + "-cell Fibonacci graph + 16³ spatial hash in " + dt.toFixed(1) + "ms");
+    console.log("[planet-map] built " + N + "-cell Fibonacci graph + 16³ spatial hash + " + NEIGHBORS_K + "-neighbor table in " + dt.toFixed(1) + "ms");
   }
   return cells;
+}
+
+/* §planet-spec Phase 7.d-templates -- verb primitives + stock recipes.
+ * Mirrors Azgaar's heightmap-generator pattern (addHill, addRange,
+ * smooth, etc.) ported to operate on our spherical cell graph instead
+ * of his 2D Voronoi. Verbs mutate cells.elevations directly; the
+ * painter calls _planetApplyTemplate(name, cells, neighbors, K) which
+ * runs a sequence of verbs that produces a recognisable map type
+ * (continents, pangea, archipelago, plateau, fragmented). */
+
+function _planetVerbReset(cells) {
+  for (let i = 0; i < cells.count; i++) cells.elevations[i] = 0;
+}
+
+function _planetVerbHill(cells, neighbors, K, count, heightRange) {
+  // BFS from random seed with multiplicative-decay-along-edges. Each
+  // step: nextDelta = currDelta ^ blobPower * jitter(0.9..1.1). When
+  // delta drops below 0.01, propagation stops naturally.
+  const blobPower = 0.99;
+  const N = cells.count;
+  const delta = new Float32Array(N);
+  const visited = new Uint8Array(N);
+  for (let h = 0; h < count; h++) {
+    delta.fill(0);
+    visited.fill(0);
+    const seedIdx = Math.floor(Math.random() * N);
+    const peak = heightRange[0] + Math.random() * (heightRange[1] - heightRange[0]);
+    delta[seedIdx] = peak;
+    visited[seedIdx] = 1;
+    let queue = [seedIdx];
+    while (queue.length > 0) {
+      const next = [];
+      for (let q = 0; q < queue.length; q++) {
+        const c = queue[q];
+        const cd = delta[c];
+        const propagated = Math.pow(cd, blobPower);
+        if (propagated <= 0.01) continue;
+        for (let k = 0; k < K; k++) {
+          const n = neighbors[c * K + k];
+          if (n < 0 || visited[n]) continue;
+          const nd = propagated * (0.9 + Math.random() * 0.2);
+          if (nd > 0.01) {
+            delta[n] = nd;
+            visited[n] = 1;
+            next.push(n);
+          }
+        }
+      }
+      queue = next;
+    }
+    for (let i = 0; i < N; i++) {
+      cells.elevations[i] = Math.max(0, Math.min(1, cells.elevations[i] + delta[i]));
+    }
+  }
+}
+
+function _planetVerbPit(cells, neighbors, K, count, heightRange) {
+  const blobPower = 0.99;
+  const N = cells.count;
+  const delta = new Float32Array(N);
+  const visited = new Uint8Array(N);
+  for (let h = 0; h < count; h++) {
+    delta.fill(0);
+    visited.fill(0);
+    const seedIdx = Math.floor(Math.random() * N);
+    const peak = heightRange[0] + Math.random() * (heightRange[1] - heightRange[0]);
+    delta[seedIdx] = peak;
+    visited[seedIdx] = 1;
+    let queue = [seedIdx];
+    while (queue.length > 0) {
+      const next = [];
+      for (let q = 0; q < queue.length; q++) {
+        const c = queue[q];
+        const propagated = Math.pow(delta[c], blobPower);
+        if (propagated <= 0.01) continue;
+        for (let k = 0; k < K; k++) {
+          const n = neighbors[c * K + k];
+          if (n < 0 || visited[n]) continue;
+          const nd = propagated * (0.9 + Math.random() * 0.2);
+          if (nd > 0.01) {
+            delta[n] = nd;
+            visited[n] = 1;
+            next.push(n);
+          }
+        }
+      }
+      queue = next;
+    }
+    for (let i = 0; i < N; i++) {
+      cells.elevations[i] = Math.max(0, Math.min(1, cells.elevations[i] - delta[i]));
+    }
+  }
+}
+
+function _planetVerbRange(cells, neighbors, K, count, heightRange) {
+  const N = cells.count;
+  for (let r = 0; r < count; r++) {
+    const startIdx = Math.floor(Math.random() * N);
+    let endIdx = Math.floor(Math.random() * N);
+    // Reroll if endpoints too close (degenerate range).
+    let tries = 0;
+    while (endIdx === startIdx && tries < 4) { endIdx = Math.floor(Math.random() * N); tries++; }
+    const peak = heightRange[0] + Math.random() * (heightRange[1] - heightRange[0]);
+    // Greedy walk: each step pick the neighbor closest to endpoint.
+    const tex = cells.positions[endIdx * 3 + 0];
+    const tey = cells.positions[endIdx * 3 + 1];
+    const tez = cells.positions[endIdx * 3 + 2];
+    let current = startIdx;
+    const trace = [current];
+    const visited = new Uint8Array(N);
+    visited[current] = 1;
+    for (let step = 0; step < 200; step++) {
+      if (current === endIdx) break;
+      let best = -1, bestDot = -2;
+      for (let k = 0; k < K; k++) {
+        const ni = neighbors[current * K + k];
+        if (ni < 0 || visited[ni]) continue;
+        const dot = tex * cells.positions[ni * 3 + 0]
+                  + tey * cells.positions[ni * 3 + 1]
+                  + tez * cells.positions[ni * 3 + 2];
+        if (dot > bestDot) { bestDot = dot; best = ni; }
+      }
+      if (best < 0) break;
+      visited[best] = 1;
+      trace.push(best);
+      current = best;
+    }
+    // Apply peak at trace + 0.5 to immediate neighbors (range slope).
+    for (let t = 0; t < trace.length; t++) {
+      const idx = trace[t];
+      cells.elevations[idx] = Math.max(0, Math.min(1, cells.elevations[idx] + peak));
+      for (let k = 0; k < K; k++) {
+        const ni = neighbors[idx * K + k];
+        if (ni < 0) continue;
+        cells.elevations[ni] = Math.max(0, Math.min(1, cells.elevations[ni] + peak * 0.5));
+      }
+    }
+  }
+}
+
+function _planetVerbSmooth(cells, neighbors, K, iterations) {
+  const N = cells.count;
+  const next = new Float32Array(N);
+  for (let it = 0; it < iterations; it++) {
+    for (let i = 0; i < N; i++) {
+      let sum = cells.elevations[i];
+      let cnt = 1;
+      for (let k = 0; k < K; k++) {
+        const ni = neighbors[i * K + k];
+        if (ni >= 0) { sum += cells.elevations[ni]; cnt++; }
+      }
+      next[i] = sum / cnt;
+    }
+    for (let i = 0; i < N; i++) cells.elevations[i] = next[i];
+  }
+}
+
+/* Stock templates -- recognisable map archetypes built from verb
+ * sequences. Each function takes cells + neighbors + K and mutates
+ * cells.elevations in place. Random per call, so a "Re-roll" button
+ * produces a new map of the same type. */
+const PLANET_TEMPLATES = {
+  continents: function(cells, neighbors, K) {
+    _planetVerbReset(cells);
+    _planetVerbHill(cells, neighbors, K, 4, [0.65, 0.85]);
+    _planetVerbHill(cells, neighbors, K, 8, [0.15, 0.30]);
+    _planetVerbRange(cells, neighbors, K, 4, [0.20, 0.35]);
+    _planetVerbSmooth(cells, neighbors, K, 2);
+  },
+  pangea: function(cells, neighbors, K) {
+    _planetVerbReset(cells);
+    _planetVerbHill(cells, neighbors, K, 1, [0.85, 0.95]);
+    _planetVerbHill(cells, neighbors, K, 3, [0.25, 0.40]);
+    _planetVerbRange(cells, neighbors, K, 3, [0.30, 0.45]);
+    _planetVerbSmooth(cells, neighbors, K, 2);
+  },
+  archipelago: function(cells, neighbors, K) {
+    _planetVerbReset(cells);
+    _planetVerbHill(cells, neighbors, K, 24, [0.10, 0.25]);
+    _planetVerbHill(cells, neighbors, K, 8,  [0.05, 0.15]);
+    _planetVerbSmooth(cells, neighbors, K, 1);
+  },
+  plateau: function(cells, neighbors, K) {
+    _planetVerbReset(cells);
+    _planetVerbHill(cells, neighbors, K, 2, [0.55, 0.70]);
+    _planetVerbRange(cells, neighbors, K, 6, [0.20, 0.35]);
+    _planetVerbPit(cells, neighbors, K, 4, [0.10, 0.20]);
+    _planetVerbSmooth(cells, neighbors, K, 3);
+  },
+  fragmented: function(cells, neighbors, K) {
+    _planetVerbReset(cells);
+    _planetVerbHill(cells, neighbors, K, 6, [0.40, 0.60]);
+    _planetVerbPit(cells, neighbors, K, 8, [0.15, 0.30]);
+    _planetVerbRange(cells, neighbors, K, 2, [0.25, 0.40]);
+    _planetVerbSmooth(cells, neighbors, K, 1);
+  }
+};
+
+function _planetApplyTemplate(name, cells, neighbors, K) {
+  const fn = PLANET_TEMPLATES[name];
+  if (!fn) { console.warn("[planet-map] unknown template:", name); return; }
+  const t0 = performance.now();
+  fn(cells, neighbors, K);
+  console.log("[planet-map] applied template '" + name + "' in " + (performance.now() - t0).toFixed(0) + "ms");
 }
 
 /* §planet-spec Phase 7.b -- serialize / deserialize the cubemap as
@@ -67651,6 +67934,21 @@ function openPlanetMapEditor(nodeId) {
     '<label><input type="radio" name="pmap-mode" value="lower"> lower</label>' +
     '<button class="btn" id="pmap-revert" type="button" style="padding:3px 10px;">revert</button>';
   body.appendChild(ctrls);
+
+  // §planet-spec Phase 7.d-templates -- Template dropdown + Re-roll.
+  // Apply runs the named template's verb sequence with fresh random
+  // seeds; cells are overwritten + canvas re-rendered.
+  const tplRow = document.createElement("div");
+  tplRow.style.cssText =
+    "display:flex;align-items:center;gap:10px;margin-top:8px;flex-wrap:wrap;" +
+    "font-family:var(--font-mono);font-size:11px;color:var(--text-2);";
+  const tplNames = Object.keys(PLANET_TEMPLATES);
+  const tplOptions = tplNames.map(n => '<option value="' + n + '">' + n + '</option>').join("");
+  tplRow.innerHTML =
+    '<label>template&nbsp;<select id="pmap-tpl" style="background:var(--surface);color:var(--text);border:1px solid var(--border);padding:3px 6px;font-family:var(--font-mono);font-size:11px;">' + tplOptions + '</select></label>' +
+    '<button class="btn" id="pmap-roll" type="button" style="padding:3px 10px;">re-roll</button>' +
+    '<span style="color:var(--text-3);font-size:10px;">overwrites all cells with a new random map of the picked type</span>';
+  body.appendChild(tplRow);
   const helpRow = document.createElement("div");
   helpRow.style.cssText =
     "font-family:var(--font-mono);font-size:10px;color:var(--text-3);margin-top:6px;line-height:1.5;";
@@ -67723,6 +68021,15 @@ function openPlanetMapEditor(nodeId) {
   });
   modal.querySelector("#pmap-revert").addEventListener("click", () => {
     for (let i = 0; i < cells.elevations.length; i++) cells.elevations[i] = elevSnapshot[i];
+    dirty = true;
+    render();
+  });
+
+  // Template dropdown + re-roll wire-up.
+  const tplSel = modal.querySelector("#pmap-tpl");
+  modal.querySelector("#pmap-roll").addEventListener("click", () => {
+    const name = tplSel.value;
+    _planetApplyTemplate(name, cells, node._cellNeighbors, node._cellNeighborsK);
     dirty = true;
     render();
   });
