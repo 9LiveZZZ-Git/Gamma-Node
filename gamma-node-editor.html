@@ -32899,8 +32899,8 @@ const _demos = [
         segments:    16,
         maxDepth:    9,            // ≈ 25km per leaf at the camera-facing point
         splitFactor: 5.0,
-        heightScale: 200,
-        seaLevel:    0.45,
+        heightScale: 1000,
+        seaLevel:    0.50,
         seed:        7.3,
         frequency:   5e-7,
         octaves:     5,
@@ -54676,6 +54676,15 @@ function _buildPlanet(node) {
   const camPosWorld = _planetCameraPos(node);
   const camPos = { x: camPosWorld.x - cxC, y: camPosWorld.y - cyC, z: camPosWorld.z - czC };
   const chunks = _planetVisibleChunks(camPos, r, hs, maxDepth, splitFactor);
+  // §planet-spec Phase 4.f -- bake Sun lambertian into per-vertex
+  // color. Planet renders with the unlit-vc shader (no GPU lighting),
+  // so day/night terminator + sphere shading have to come from CPU.
+  // At each vertex: lambert = max(ambient, dot(normal, sunDir)). The
+  // sun direction is read from the patch's Sun node (timeOfDay) or
+  // falls back to late-morning if no Sun exists.
+  const sun = _planetSunDir();
+  const sunX = sun[0], sunY = sun[1], sunZ = sun[2];
+  const ambient = 0.18;
   const vertsPerChunk = (segs + 1) * (segs + 1);
   const trisPerChunk  = segs * segs * 2;
   const verts   = new Float32Array(chunks.length * vertsPerChunk * 11);
@@ -54722,12 +54731,19 @@ function _buildPlanet(node) {
           const above = (h - seaLevel) / Math.max(1e-6, 1 - seaLevel);
           rad = r + hs * above;
         }
-        const col = (hs !== 0) ? _planetColorForHeight(h, seaLevel) :
-                                 [ux * 0.5 + 0.5, uy * 0.5 + 0.5, uz * 0.5 + 0.5];
+        const baseCol = (hs !== 0) ? _planetColorForHeight(h, seaLevel) :
+                                     [ux * 0.5 + 0.5, uy * 0.5 + 0.5, uz * 0.5 + 0.5];
+        // Lambertian: dot(normal, sunDir). Normal = vertex's unit
+        // direction from planet center = (ux, uy, uz). Clamp to
+        // [ambient, 1] so the night side stays visible against the
+        // black space sky rather than going opaque black.
+        const lambert = Math.max(ambient, ux * sunX + uy * sunY + uz * sunZ);
         verts[vWrite++] = cxC + rad * ux;
         verts[vWrite++] = cyC + rad * uy;
         verts[vWrite++] = czC + rad * uz;
-        verts[vWrite++] = col[0]; verts[vWrite++] = col[1]; verts[vWrite++] = col[2];
+        verts[vWrite++] = baseCol[0] * lambert;
+        verts[vWrite++] = baseCol[1] * lambert;
+        verts[vWrite++] = baseCol[2] * lambert;
         verts[vWrite++] = ux; verts[vWrite++] = uy; verts[vWrite++] = uz;
         // UV: per-chunk 0..1. Multi-chunk UV atlasing isn't meaningful
         // here so we just give each chunk a fresh unit square.
@@ -54891,8 +54907,13 @@ function _terrainFBM3D(x, y, z, n) {
  * reads under the unlit-vc shader without needing a material yet. */
 function _planetColorForHeight(h, seaLevel) {
   if (h < seaLevel) {
+    // Brighter ocean than the original 4.b palette so the planet
+    // doesn't blend with the black space sky at high altitudes. Base
+    // floor lifted from 0.03/0.08/0.28 (near-black navy) to a clearly
+    // visible mid-blue. Lambert shading applied at build time on top
+    // of this gives the day/night terminator.
     const t = h / Math.max(1e-6, seaLevel);
-    return [0.03 + t * 0.07, 0.08 + t * 0.20, 0.28 + t * 0.32];
+    return [0.12 + t * 0.10, 0.22 + t * 0.20, 0.42 + t * 0.28];
   }
   const t = (h - seaLevel) / Math.max(1e-6, 1 - seaLevel);
   if (t < 0.06) return [0.85, 0.78, 0.55];
@@ -54905,6 +54926,22 @@ function _planetColorForHeight(h, seaLevel) {
     return [0.35 + u * 0.22, 0.30 + u * 0.16, 0.20 + u * 0.10];
   }
   return [0.92, 0.94, 0.98];
+}
+
+/* §planet-spec Phase 4.f -- Planet sun shading helper. Reads the
+ * patch's Sun node (if any) and returns a unit sun direction matching
+ * the WGSL sample_procedural_sky_* path. Falls back to a fixed "late
+ * morning" direction if no Sun is wired so Planet still looks 3D in
+ * scenes without explicit lighting. */
+function _planetSunDir() {
+  let t = 0.42;
+  if (state && Array.isArray(state.nodes)) {
+    const sun = state.nodes.find(n => n && n.type === "Sun");
+    if (sun && sun.params && typeof sun.params.timeOfDay === "number") {
+      t = sun.params.timeOfDay;
+    }
+  }
+  return _sunDirFromTime(t);
 }
 
 function _terrainFBM(u, v, n) {
