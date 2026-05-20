@@ -56702,46 +56702,516 @@ function _planetVerbSmooth(cells, neighbors, K, iterations) {
   }
 }
 
-/* Stock templates -- recognisable map archetypes built from verb
- * sequences. Each function takes cells + neighbors + K and mutates
- * cells.elevations in place. Random per call, so a "Re-roll" button
- * produces a new map of the same type. */
-const PLANET_TEMPLATES = {
-  continents: function(cells, neighbors, K) {
-    _planetVerbReset(cells);
-    _planetVerbHill(cells, neighbors, K, 4, [0.65, 0.85]);
-    _planetVerbHill(cells, neighbors, K, 8, [0.15, 0.30]);
-    _planetVerbRange(cells, neighbors, K, 4, [0.20, 0.35]);
-    _planetVerbSmooth(cells, neighbors, K, 2);
-  },
-  pangea: function(cells, neighbors, K) {
-    _planetVerbReset(cells);
-    _planetVerbHill(cells, neighbors, K, 1, [0.85, 0.95]);
-    _planetVerbHill(cells, neighbors, K, 3, [0.25, 0.40]);
-    _planetVerbRange(cells, neighbors, K, 3, [0.30, 0.45]);
-    _planetVerbSmooth(cells, neighbors, K, 2);
-  },
-  archipelago: function(cells, neighbors, K) {
-    _planetVerbReset(cells);
-    _planetVerbHill(cells, neighbors, K, 24, [0.10, 0.25]);
-    _planetVerbHill(cells, neighbors, K, 8,  [0.05, 0.15]);
-    _planetVerbSmooth(cells, neighbors, K, 1);
-  },
-  plateau: function(cells, neighbors, K) {
-    _planetVerbReset(cells);
-    _planetVerbHill(cells, neighbors, K, 2, [0.55, 0.70]);
-    _planetVerbRange(cells, neighbors, K, 6, [0.20, 0.35]);
-    _planetVerbPit(cells, neighbors, K, 4, [0.10, 0.20]);
-    _planetVerbSmooth(cells, neighbors, K, 3);
-  },
-  fragmented: function(cells, neighbors, K) {
-    _planetVerbReset(cells);
-    _planetVerbHill(cells, neighbors, K, 6, [0.40, 0.60]);
-    _planetVerbPit(cells, neighbors, K, 8, [0.15, 0.30]);
-    _planetVerbRange(cells, neighbors, K, 2, [0.25, 0.40]);
-    _planetVerbSmooth(cells, neighbors, K, 1);
+/* §planet-spec Phase 7.d/templates -- the Azgaar template DSL.
+ *
+ * Each template is a verbatim port of Azgaar's
+ * public/config/heightmap-templates.js line, with verbs run against
+ * our spherical cell graph (cells.elevations[i] in [0,1]) instead of
+ * his 2D grid (cells.h[i] in [0,100]). The DSL row format is:
+ *
+ *   Verb count height x-range y-range
+ *
+ * where count + height + x/y-range can each be "N" or "M-N" (random
+ * pick within range), and on the sphere x ∈ [0,100] maps to longitude
+ * [-180°, +180°], y ∈ [0,100] maps to latitude [+90°, -90°] (top-of-
+ * map convention matches Azgaar's). Special height tokens "all",
+ * "land", "0-100" act as elevation filters for Add/Multiply. Strait
+ * uses "vertical" or "horizontal" instead of x-range. Mask ignores
+ * x/y. Add/Multiply factors: a leading minus is preserved. */
+
+function _parseRange(s, def) {
+  if (s === undefined || s === null) return def;
+  const str = String(s);
+  if (str === "all" || str === "land" || str === "vertical" || str === "horizontal") return str;
+  // Range like "20-30" but also handle "Add -20" where the value
+  // itself is negative (no range, just a single signed number).
+  const m = str.match(/^(-?\d+(?:\.\d+)?)(?:-(-?\d+(?:\.\d+)?))?$/);
+  if (!m) return def;
+  const a = parseFloat(m[1]);
+  if (m[2] === undefined) return [a, a];
+  return [a, parseFloat(m[2])];
+}
+function _pickInRange(r) {
+  if (!Array.isArray(r)) return r;
+  return r[0] + Math.random() * (r[1] - r[0]);
+}
+function _pickInRangeInt(r) {
+  if (!Array.isArray(r)) return Math.floor(r);
+  return Math.floor(r[0] + Math.random() * (r[1] - r[0] + 1));
+}
+
+// Convert Azgaar's percentage x/y range to a (lon, lat) bounding box
+// on the sphere. x ∈ [0,100] → lon [-π, +π]; y ∈ [0,100] → lat
+// [+π/2, -π/2] (north on top, matches a map).
+function _xyRangeToLatLon(xRange, yRange) {
+  const xs = Array.isArray(xRange) ? xRange : [0, 100];
+  const ys = Array.isArray(yRange) ? yRange : [0, 100];
+  const lonMin = (xs[0] / 100) * 2 * Math.PI - Math.PI;
+  const lonMax = (xs[1] / 100) * 2 * Math.PI - Math.PI;
+  const latMin = Math.PI * 0.5 - (ys[1] / 100) * Math.PI;
+  const latMax = Math.PI * 0.5 - (ys[0] / 100) * Math.PI;
+  return { lonMin, lonMax, latMin, latMax };
+}
+
+// Filter: cells whose unit-sphere direction falls in the (lat, lon)
+// bbox. Returns a Uint8Array(N) where 1 = in-box.
+function _cellsInBBox(cells, lonMin, lonMax, latMin, latMax) {
+  const N = cells.count;
+  const mask = new Uint8Array(N);
+  for (let i = 0; i < N; i++) {
+    const x = cells.positions[i*3+0], y = cells.positions[i*3+1], z = cells.positions[i*3+2];
+    const lat = Math.asin(Math.max(-1, Math.min(1, y)));
+    const lon = Math.atan2(z, x);
+    if (lat < latMin || lat > latMax) continue;
+    if (lonMin <= lonMax) {
+      if (lon < lonMin || lon > lonMax) continue;
+    } else {
+      // wraps the dateline
+      if (lon < lonMin && lon > lonMax) continue;
+    }
+    mask[i] = 1;
   }
+  return mask;
+}
+
+function _pickCellInBBox(cells, mask) {
+  // Reservoir-sample one cell from the masked set.
+  const N = cells.count;
+  let count = 0, pick = -1;
+  for (let i = 0; i < N; i++) {
+    if (!mask[i]) continue;
+    count++;
+    if (Math.random() < 1 / count) pick = i;
+  }
+  return pick;
+}
+
+// --- Verb implementations (sphere-adapted) ---
+
+function _planetVerbHillXY(cells, neighbors, K, count, heightRange, xRange, yRange) {
+  const N = cells.count;
+  const { lonMin, lonMax, latMin, latMax } = _xyRangeToLatLon(xRange, yRange);
+  const mask = _cellsInBBox(cells, lonMin, lonMax, latMin, latMax);
+  const delta = new Float32Array(N);
+  const visited = new Uint8Array(N);
+  for (let h = 0; h < count; h++) {
+    delta.fill(0); visited.fill(0);
+    const seed = _pickCellInBBox(cells, mask);
+    if (seed < 0) continue;
+    const peak = _pickInRange(heightRange) / 100;  // Azgaar 0-100 → our 0-1
+    delta[seed] = peak; visited[seed] = 1;
+    let q = [seed];
+    while (q.length > 0) {
+      const next = [];
+      for (let p = 0; p < q.length; p++) {
+        const c = q[p];
+        const prop = Math.pow(delta[c], 0.99);
+        if (prop <= 0.01) continue;
+        for (let k = 0; k < K; k++) {
+          const n = neighbors[c*K+k];
+          if (n < 0 || visited[n]) continue;
+          const nd = prop * (0.9 + Math.random() * 0.2);
+          if (nd > 0.01) { delta[n] = nd; visited[n] = 1; next.push(n); }
+        }
+      }
+      q = next;
+    }
+    for (let i = 0; i < N; i++) {
+      cells.elevations[i] = Math.max(0, Math.min(1, cells.elevations[i] + delta[i]));
+    }
+  }
+}
+
+function _planetVerbPitXY(cells, neighbors, K, count, heightRange, xRange, yRange) {
+  const N = cells.count;
+  const { lonMin, lonMax, latMin, latMax } = _xyRangeToLatLon(xRange, yRange);
+  const mask = _cellsInBBox(cells, lonMin, lonMax, latMin, latMax);
+  const delta = new Float32Array(N);
+  const visited = new Uint8Array(N);
+  for (let h = 0; h < count; h++) {
+    delta.fill(0); visited.fill(0);
+    const seed = _pickCellInBBox(cells, mask);
+    if (seed < 0) continue;
+    const depth = _pickInRange(heightRange) / 100;
+    delta[seed] = depth; visited[seed] = 1;
+    let q = [seed];
+    while (q.length > 0) {
+      const next = [];
+      for (let p = 0; p < q.length; p++) {
+        const c = q[p];
+        const prop = Math.pow(delta[c], 0.99);
+        if (prop <= 0.01) continue;
+        for (let k = 0; k < K; k++) {
+          const n = neighbors[c*K+k];
+          if (n < 0 || visited[n]) continue;
+          const nd = prop * (0.9 + Math.random() * 0.2);
+          if (nd > 0.01) { delta[n] = nd; visited[n] = 1; next.push(n); }
+        }
+      }
+      q = next;
+    }
+    for (let i = 0; i < N; i++) {
+      cells.elevations[i] = Math.max(0, Math.min(1, cells.elevations[i] - delta[i]));
+    }
+  }
+}
+
+function _planetVerbRangeXY(cells, neighbors, K, count, heightRange, xRange, yRange, sign) {
+  sign = (sign === undefined) ? 1 : sign;
+  const N = cells.count;
+  const { lonMin, lonMax, latMin, latMax } = _xyRangeToLatLon(xRange, yRange);
+  const mask = _cellsInBBox(cells, lonMin, lonMax, latMin, latMax);
+  for (let r = 0; r < count; r++) {
+    const startIdx = _pickCellInBBox(cells, mask);
+    if (startIdx < 0) continue;
+    let endIdx = _pickCellInBBox(cells, mask);
+    let tries = 0;
+    while ((endIdx < 0 || endIdx === startIdx) && tries < 4) { endIdx = _pickCellInBBox(cells, mask); tries++; }
+    if (endIdx < 0) endIdx = startIdx;
+    const peak = sign * _pickInRange(heightRange) / 100;
+    const tex = cells.positions[endIdx*3+0], tey = cells.positions[endIdx*3+1], tez = cells.positions[endIdx*3+2];
+    let current = startIdx;
+    const trace = [current];
+    const visited = new Uint8Array(N);
+    visited[current] = 1;
+    for (let step = 0; step < 200; step++) {
+      if (current === endIdx) break;
+      let best = -1, bestDot = -2;
+      for (let k = 0; k < K; k++) {
+        const ni = neighbors[current*K+k];
+        if (ni < 0 || visited[ni]) continue;
+        const dot = tex*cells.positions[ni*3] + tey*cells.positions[ni*3+1] + tez*cells.positions[ni*3+2];
+        if (dot > bestDot) { bestDot = dot; best = ni; }
+      }
+      if (best < 0) break;
+      visited[best] = 1; trace.push(best); current = best;
+    }
+    for (let t = 0; t < trace.length; t++) {
+      const idx = trace[t];
+      cells.elevations[idx] = Math.max(0, Math.min(1, cells.elevations[idx] + peak));
+      for (let k = 0; k < K; k++) {
+        const ni = neighbors[idx*K+k];
+        if (ni < 0) continue;
+        cells.elevations[ni] = Math.max(0, Math.min(1, cells.elevations[ni] + peak * 0.5));
+      }
+    }
+  }
+}
+
+function _planetVerbStrait(cells, neighbors, K, count, orientation) {
+  // "vertical" = great circle through the poles (constant lon).
+  // "horizontal" = great circle in the equatorial plane (constant lat).
+  // Either way: lower elevations of cells within ~5° of the chosen
+  // great circle to create a sea-like channel.
+  const N = cells.count;
+  for (let r = 0; r < count; r++) {
+    let ax, ay, az;  // normal of the great-circle plane
+    if (orientation === "vertical") {
+      // Plane contains the Y axis; pick a random longitude for the
+      // plane's normal direction.
+      const phi = Math.random() * 2 * Math.PI;
+      ax = Math.cos(phi); ay = 0; az = Math.sin(phi);
+    } else {
+      // "horizontal": plane perpendicular to a tilted axis (almost
+      // equator but jittered).
+      const lat = (Math.random() - 0.5) * Math.PI * 0.4;  // ±36° equatorial belt
+      ax = 0; ay = Math.cos(lat); az = Math.sin(lat);
+    }
+    const ahLen = Math.hypot(ax, ay, az) || 1;
+    ax /= ahLen; ay /= ahLen; az /= ahLen;
+    const widthCos = Math.cos(5 * Math.PI / 180);
+    for (let i = 0; i < N; i++) {
+      const d = Math.abs(cells.positions[i*3]*ax + cells.positions[i*3+1]*ay + cells.positions[i*3+2]*az);
+      // d ≈ 0 means cell sits on the great circle. Convert to width
+      // factor: sin(angularDist) = d → cells with d < sin(5°) qualify.
+      if (d < Math.sin(5 * Math.PI / 180)) {
+        const t = 1 - d / Math.sin(5 * Math.PI / 180);
+        const drop = 0.15 * t;
+        cells.elevations[i] = Math.max(0, cells.elevations[i] - drop);
+      }
+    }
+  }
+}
+
+function _planetVerbAdd(cells, value, heightFilter) {
+  const N = cells.count;
+  const v = value / 100;  // Azgaar's 0-100 scale → our 0-1
+  let elevMin = 0, elevMax = 1;
+  if (heightFilter === "land") elevMin = 0.20;
+  else if (heightFilter === "all") { /* keep defaults */ }
+  else if (Array.isArray(heightFilter)) { elevMin = heightFilter[0] / 100; elevMax = heightFilter[1] / 100; }
+  for (let i = 0; i < N; i++) {
+    if (cells.elevations[i] < elevMin || cells.elevations[i] > elevMax) continue;
+    cells.elevations[i] = Math.max(0, Math.min(1, cells.elevations[i] + v));
+  }
+}
+
+function _planetVerbMultiply(cells, factor, heightFilter) {
+  const N = cells.count;
+  let elevMin = 0, elevMax = 1;
+  if (heightFilter === "land") elevMin = 0.20;
+  else if (Array.isArray(heightFilter)) { elevMin = heightFilter[0] / 100; elevMax = heightFilter[1] / 100; }
+  for (let i = 0; i < N; i++) {
+    if (cells.elevations[i] < elevMin || cells.elevations[i] > elevMax) continue;
+    cells.elevations[i] = Math.max(0, Math.min(1, cells.elevations[i] * factor));
+  }
+}
+
+function _planetVerbInvert(cells, probability, axis) {
+  // Azgaar: with probability p, invert heights around the mean. We
+  // do a coin flip and on success apply: e → 1 - e (clamped).
+  if (Math.random() > probability) return;
+  const N = cells.count;
+  for (let i = 0; i < N; i++) {
+    cells.elevations[i] = Math.max(0, Math.min(1, 1 - cells.elevations[i]));
+  }
+}
+
+function _planetVerbMask(cells, power) {
+  // Azgaar's Mask dampens cells by their distance from the center of
+  // the rectangular map. On a sphere we don't have a "center" -- but
+  // his use is to attenuate edges of the playable area, so map it to
+  // "distance from a random great-circle center direction" with the
+  // mask power controlling the falloff steepness. Negative power
+  // inverts (favors the edges instead). Idiomatic uses (Mask 3 = soft
+  // edge dampening; Mask -2 / Mask 4 = strong dampening) translate
+  // to a falloff that pulls coastal cells down toward sea level.
+  const N = cells.count;
+  // Pick a random "center" direction once per call.
+  const cy = 1 - Math.random() * 2;
+  const r = Math.sqrt(Math.max(0, 1 - cy*cy));
+  const theta = Math.random() * 2 * Math.PI;
+  const cx = Math.cos(theta) * r, cz = Math.sin(theta) * r;
+  const absPow = Math.max(1, Math.abs(power));
+  const invert = power < 0;
+  for (let i = 0; i < N; i++) {
+    const dot = cells.positions[i*3]*cx + cells.positions[i*3+1]*cy + cells.positions[i*3+2]*cz;
+    // dot ∈ [-1, 1]; convert to 0..1 with 1 = center.
+    let t = (dot + 1) * 0.5;
+    if (invert) t = 1 - t;
+    const w = Math.pow(t, absPow);
+    cells.elevations[i] *= w;
+  }
+}
+
+// --- DSL parser / executor ---
+
+function _planetRunDSL(template, cells, neighbors, K) {
+  const lines = template.split("\n");
+  for (let li = 0; li < lines.length; li++) {
+    const line = lines[li].trim();
+    if (!line) continue;
+    const parts = line.split(/\s+/);
+    const verb = parts[0];
+    const arg1 = parts[1], arg2 = parts[2], arg3 = parts[3], arg4 = parts[4];
+    switch (verb) {
+      case "Hill": {
+        const count = _pickInRangeInt(_parseRange(arg1, [1,1]));
+        const h = _parseRange(arg2, [50,50]);
+        _planetVerbHillXY(cells, neighbors, K, count, h, _parseRange(arg3, [0,100]), _parseRange(arg4, [0,100]));
+        break;
+      }
+      case "Pit": {
+        const count = _pickInRangeInt(_parseRange(arg1, [1,1]));
+        const h = _parseRange(arg2, [10,20]);
+        _planetVerbPitXY(cells, neighbors, K, count, h, _parseRange(arg3, [0,100]), _parseRange(arg4, [0,100]));
+        break;
+      }
+      case "Range": {
+        const count = _pickInRangeInt(_parseRange(arg1, [1,1]));
+        const h = _parseRange(arg2, [30,50]);
+        _planetVerbRangeXY(cells, neighbors, K, count, h, _parseRange(arg3, [0,100]), _parseRange(arg4, [0,100]), 1);
+        break;
+      }
+      case "Trough": {
+        const count = _pickInRangeInt(_parseRange(arg1, [1,1]));
+        const h = _parseRange(arg2, [10,20]);
+        _planetVerbRangeXY(cells, neighbors, K, count, h, _parseRange(arg3, [0,100]), _parseRange(arg4, [0,100]), -1);
+        break;
+      }
+      case "Strait": {
+        const count = _pickInRangeInt(_parseRange(arg1, [1,1]));
+        _planetVerbStrait(cells, neighbors, K, count, arg2);
+        break;
+      }
+      case "Smooth": {
+        const iter = _pickInRangeInt(_parseRange(arg1, [1,1]));
+        _planetVerbSmooth(cells, neighbors, K, iter);
+        break;
+      }
+      case "Add": {
+        const v = parseFloat(arg1);
+        const filt = (arg2 === "all" || arg2 === "land") ? arg2 : _parseRange(arg2, "all");
+        _planetVerbAdd(cells, v, filt);
+        break;
+      }
+      case "Multiply": {
+        const f = parseFloat(arg1);
+        const filt = (arg2 === "all" || arg2 === "land") ? arg2 : _parseRange(arg2, "all");
+        _planetVerbMultiply(cells, f, filt);
+        break;
+      }
+      case "Mask": {
+        _planetVerbMask(cells, parseFloat(arg1));
+        break;
+      }
+      case "Invert": {
+        const p = parseFloat(arg1);
+        _planetVerbInvert(cells, p, arg2);
+        break;
+      }
+      default:
+        console.warn("[planet-map] unknown DSL verb:", verb);
+    }
+  }
+}
+
+/* §planet-spec Phase 7.d/templates -- the 14 stock Azgaar templates,
+ * source: ref-azgaar-fmg/public/config/heightmap-templates.js. Verbatim
+ * DSL strings; _planetRunDSL parses and executes against our spherical
+ * cell graph. */
+const PLANET_TEMPLATES_DSL = {
+  volcano: `Hill 1 90-100 44-56 40-60
+    Multiply 0.8 50-100 0 0
+    Range 1.5 30-55 45-55 40-60
+    Smooth 3 0 0 0
+    Hill 1.5 35-45 25-30 20-75
+    Hill 1 35-55 75-80 25-75
+    Hill 0.5 20-25 10-15 20-25
+    Mask 3 0 0 0`,
+  highIsland: `Hill 1 90-100 65-75 47-53
+    Add 7 all 0 0
+    Hill 5-6 20-30 25-55 45-55
+    Range 1 40-50 45-55 45-55
+    Multiply 0.8 land 0 0
+    Mask 3 0 0 0
+    Smooth 2 0 0 0
+    Trough 2-3 20-30 20-30 20-30
+    Trough 2-3 20-30 60-80 70-80
+    Hill 1 10-15 60-60 50-50
+    Hill 1.5 13-16 15-20 20-75
+    Range 1.5 30-40 15-85 30-40
+    Range 1.5 30-40 15-85 60-70
+    Pit 3-5 10-30 15-85 20-80`,
+  lowIsland: `Hill 1 90-99 60-80 45-55
+    Hill 1-2 20-30 10-30 10-90
+    Smooth 2 0 0 0
+    Hill 6-7 25-35 20-70 30-70
+    Range 1 40-50 45-55 45-55
+    Trough 2-3 20-30 15-85 20-30
+    Trough 2-3 20-30 15-85 70-80
+    Hill 1.5 10-15 5-15 20-80
+    Hill 1 10-15 85-95 70-80
+    Pit 5-7 15-25 15-85 20-80
+    Multiply 0.4 20-100 0 0
+    Mask 4 0 0 0`,
+  continents: `Hill 1 80-85 60-80 40-60
+    Hill 1 80-85 20-30 40-60
+    Hill 6-7 15-30 25-75 15-85
+    Multiply 0.6 land 0 0
+    Hill 8-10 5-10 15-85 20-80
+    Range 1-2 30-60 5-15 25-75
+    Range 1-2 30-60 80-95 25-75
+    Range 0-3 30-60 80-90 20-80
+    Strait 2 vertical 0 0
+    Strait 1 vertical 0 0
+    Smooth 3 0 0 0
+    Trough 3-4 15-20 15-85 20-80
+    Trough 3-4 5-10 45-55 45-55
+    Pit 3-4 10-20 15-85 20-80
+    Mask 4 0 0 0`,
+  archipelago: `Add 11 all 0 0
+    Range 2-3 40-60 20-80 20-80
+    Hill 5 15-20 10-90 30-70
+    Hill 2 10-15 10-30 20-80
+    Hill 2 10-15 60-90 20-80
+    Smooth 3 0 0 0
+    Trough 10 20-30 5-95 5-95
+    Strait 2 vertical 0 0
+    Strait 2 horizontal 0 0`,
+  atoll: `Hill 1 75-80 50-60 45-55
+    Hill 1.5 30-50 25-75 30-70
+    Hill .5 30-50 25-35 30-70
+    Smooth 1 0 0 0
+    Multiply 0.2 25-100 0 0
+    Hill 0.5 10-20 50-55 48-52`,
+  mediterranean: `Range 4-6 30-80 0-100 0-10
+    Range 4-6 30-80 0-100 90-100
+    Hill 6-8 30-50 10-90 0-5
+    Hill 6-8 30-50 10-90 95-100
+    Multiply 0.9 land 0 0
+    Mask -2 0 0 0
+    Smooth 1 0 0 0
+    Hill 2-3 30-70 0-5 20-80
+    Hill 2-3 30-70 95-100 20-80
+    Trough 3-6 40-50 0-100 0-10
+    Trough 3-6 40-50 0-100 90-100`,
+  peninsula: `Range 2-3 20-35 40-50 0-15
+    Add 5 all 0 0
+    Hill 1 90-100 10-90 0-5
+    Add 13 all 0 0
+    Hill 3-4 3-5 5-95 80-100
+    Hill 1-2 3-5 5-95 40-60
+    Trough 5-6 10-25 5-95 5-95
+    Smooth 3 0 0 0
+    Invert 0.4 both 0 0`,
+  pangea: `Hill 1-2 25-40 15-50 0-10
+    Hill 1-2 5-40 50-85 0-10
+    Hill 1-2 25-40 50-85 90-100
+    Hill 1-2 5-40 15-50 90-100
+    Hill 8-12 20-40 20-80 48-52
+    Smooth 2 0 0 0
+    Multiply 0.7 land 0 0
+    Trough 3-4 25-35 5-95 10-20
+    Trough 3-4 25-35 5-95 80-90
+    Range 5-6 30-40 10-90 35-65`,
+  isthmus: `Hill 5-10 15-30 0-30 0-20
+    Hill 5-10 15-30 10-50 20-40
+    Hill 5-10 15-30 30-70 40-60
+    Hill 5-10 15-30 50-90 60-80
+    Hill 5-10 15-30 70-100 80-100
+    Smooth 2 0 0 0
+    Trough 4-8 15-30 0-30 0-20
+    Trough 4-8 15-30 10-50 20-40
+    Trough 4-8 15-30 30-70 40-60
+    Trough 4-8 15-30 50-90 60-80
+    Trough 4-8 15-30 70-100 80-100
+    Invert 0.25 x 0 0`,
+  shattered: `Hill 8 35-40 15-85 30-70
+    Trough 10-20 40-50 5-95 5-95
+    Range 5-7 30-40 10-90 20-80
+    Pit 12-20 30-40 15-85 20-80`,
+  taklamakan: `Hill 1-3 20-30 30-70 30-70
+    Hill 2-4 60-85 0-5 0-100
+    Hill 2-4 60-85 95-100 0-100
+    Hill 3-4 60-85 20-80 0-5
+    Hill 3-4 60-85 20-80 95-100
+    Smooth 3 0 0 0`,
+  oldWorld: `Range 3 70 15-85 20-80
+    Hill 2-3 50-70 15-45 20-80
+    Hill 2-3 50-70 65-85 20-80
+    Hill 4-6 20-25 15-85 20-80
+    Multiply 0.5 land 0 0
+    Smooth 2 0 0 0
+    Range 3-4 20-50 15-35 20-45
+    Range 2-4 20-50 65-85 45-80
+    Strait 3-7 vertical 0 0
+    Trough 6-8 20-50 15-85 45-65
+    Pit 5-6 20-30 10-90 10-90`,
+  fractious: `Hill 12-15 50-80 5-95 5-95
+    Mask -1.5 0 0 0
+    Mask 3 0 0 0
+    Add -20 30-100 0 0
+    Range 6-8 40-50 5-95 10-90`
 };
+
+const PLANET_TEMPLATES = {};
+Object.keys(PLANET_TEMPLATES_DSL).forEach(function(name) {
+  PLANET_TEMPLATES[name] = function(cells, neighbors, K) {
+    _planetVerbReset(cells);
+    _planetRunDSL(PLANET_TEMPLATES_DSL[name], cells, neighbors, K);
+  };
+});
 
 function _planetApplyTemplate(name, cells, neighbors, K) {
   const fn = PLANET_TEMPLATES[name];
