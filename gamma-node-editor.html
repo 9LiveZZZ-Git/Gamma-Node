@@ -10722,6 +10722,8 @@ public:
     ins: [
       { n: "radius",      t: "param" },
       { n: "segments",    t: "param" },
+      { n: "maxDepth",    t: "param" },
+      { n: "splitFactor", t: "param" },
       { n: "heightScale", t: "param" },
       { n: "seaLevel",    t: "param" },
       { n: "seed",        t: "param" },
@@ -10733,13 +10735,14 @@ public:
     ],
     outs: [{ n: "mesh", t: "mesh" }],
     params: {
-      radius: 1000, segments: 32,
+      radius: 1000, segments: 16,
+      maxDepth: 6, splitFactor: 5.0,
       heightScale: 0, seaLevel: 0.5,
       seed: 7.3, frequency: 1.0, octaves: 6,
       lacunarity: 2.0, gain: 0.5, ridges: 0
     },
     methods: {},
-    description: "Spherified-cube planet (Phase 4.a + 4.b of planet-spec). 6 cube faces projected via Phil Nowell's spherify warp; per-vertex radial displacement by 3D fBm so continents + oceans emerge naturally. params: radius (world units), segments (per-face grid, default 32). heightScale = peak radial displacement in world units (0 = flat sphere). seaLevel ∈ [0,1] = fBm cutoff below which terrain is clamped to ocean. frequency is sampled in unit-sphere space (1.0 = ~1 feature per π/2 radians ≈ 1/4 of the equator). Vertex color is a terrain palette (deep ocean → beach → vegetation → rock → snow) keyed off the same h ∈ [0,1] used for displacement. Foundation for Phase 4.c per-face quadtree LOD."
+    description: "Spherified-cube planet with per-face quadtree LOD (Phase 4.a-c of planet-spec). 6 cube faces, each adaptively subdivided into a quadtree of leaf chunks by camera distance. Each leaf is a regular (segments+1)² grid in cube-face (u,v) coords, spherified + radially displaced by 3D fBm. params: radius (world units), segments (per-chunk grid, default 16). maxDepth = max quadtree depth per face (default 6 → 2^6 = 64-wide subdivision on the camera-facing chunks). splitFactor = ratio of distance/chunk-edge below which we split (default 5 → split chunks larger than ~11° on screen). heightScale, seaLevel, seed, frequency, octaves, lacunarity, gain, ridges as in 4.b. Mesh rebuilds when the camera crosses a chunk-boundary quantum (~ radius / 2^maxDepth)."
   },
 
   Plane: {
@@ -33006,7 +33009,7 @@ const _demos = [
   {
     id: "scene-planet-preview",
     name: "Planet (preview)",
-    sub: "spherified cube · Phase 4.a",
+    sub: "spherified cube + fBm + LOD",
     type: "visual",
     thumb: `<svg viewBox="0 0 100 44">
       <defs>
@@ -33024,24 +33027,22 @@ const _demos = [
       <line x1="34" y1="22" x2="66" y2="22" stroke="rgba(255,255,255,0.18)" stroke-width="0.4"/>
     </svg>`,
     build: () => {
-      // Radius small enough to see the whole thing in one frame.
-      // Camera orbits at radius * 2.4 so you see ~hemisphere with a
-      // bit of curve. segments=64 -> 6 × 65² = 25k verts, gives the
-      // 3D fBm enough resolution for the continents to read.
-      const RADIUS = 5;
+      // Phase 4.c -- per-face quadtree LOD. Radius bumped to 50 (vs
+      // 5 in 4.b) so the LOD ramp has room to operate: chunks near
+      // the camera-facing point split to maxDepth=6 while back-face
+      // chunks stay at depth=0 (one cube face = one chunk). Camera
+      // orbits at radius * 2.4 = 120.
+      const RADIUS = 50;
       const planet = makeNode("Planet",     40,  80, {
         radius:      RADIUS,
-        segments:    64,
-        // Phase 4.b -- heightfield params. heightScale 0.5 = 10% of
-        // radius, exaggerated vs Earth (~0.14%) so mountains read at
-        // demo scale. seaLevel 0.5 puts ~half the sphere underwater
-        // for a clean continent layout. frequency 0.7 gives ~3-4
-        // continent-scale undulations per axis on a unit sphere.
-        heightScale: 0.5,
+        segments:    16,         // verts/chunk side; 17² = 289 per chunk
+        maxDepth:    6,
+        splitFactor: 5.0,
+        heightScale: 5.0,        // 10% of radius
         seaLevel:    0.5,
         seed:        7.3,
         frequency:   0.7,
-        octaves:     6,
+        octaves:     7,
         lacunarity:  2.0,
         gain:        0.5,
         ridges:      0.35
@@ -54292,10 +54293,25 @@ function _meshCacheKey(node) {
     case "DebugTriangle": return "tri:" + (p.scale || 1);
     case "Box":           return "box:" + [p.width, p.height, p.depth].join(",");
     case "Sphere":        return "sph:" + [p.radius, p.stacks, p.slices].join(",");
-    case "Planet":        return "plt:" + [
-      p.radius, p.segments, p.heightScale, p.seaLevel,
-      p.seed, p.frequency, p.octaves, p.lacunarity, p.gain, p.ridges
-    ].join(",");
+    case "Planet":        {
+      // §planet-spec Phase 4.c -- include a quantized camera position
+      // so the quadtree rebuilds when the camera crosses a finest-
+      // depth chunk boundary. Quantum = radius / 2^maxDepth (≈ size
+      // of a leaf chunk's edge near the camera).
+      const r = (typeof p.radius === "number") ? p.radius : 1000;
+      const md = Math.max(0, Math.min(14, Math.floor((typeof p.maxDepth === "number") ? p.maxDepth : 6)));
+      const quantum = r / Math.pow(2, md);
+      const c = _planetCameraPos(node);
+      const qx = Math.round(c.x / quantum);
+      const qy = Math.round(c.y / quantum);
+      const qz = Math.round(c.z / quantum);
+      return "plt:" + [
+        p.radius, p.segments, p.maxDepth, p.splitFactor,
+        p.heightScale, p.seaLevel,
+        p.seed, p.frequency, p.octaves, p.lacunarity, p.gain, p.ridges,
+        qx, qy, qz
+      ].join(",");
+    }
     case "Plane":         return "pln:" + [p.width, p.depth].join(",");
     case "Torus":         return "tor:" + [p.majorRadius, p.minorRadius, p.majorSlices, p.minorSlices].join(",");
     case "Cylinder":      return "cyl:" + [p.radius, p.height, p.slices].join(",");
@@ -54482,6 +54498,96 @@ function _buildSphere(node) {
   return { verts, indices };
 }
 
+/* §planet-spec Phase 4.c -- camera position for the Planet's
+ * quadtree split. Mirrors _tiledTerrainAnchor but in 3D: prefers
+ * FPCamera, falls back to any Camera. The Planet is assumed centered
+ * at the world origin (no Translate wrapping yet); future origin-
+ * shifting RTC anchors will subtract the planet center here. */
+function _planetCameraPos(node) {
+  if (state && Array.isArray(state.nodes)) {
+    const fpc = state.nodes.find(n => n && n.type === "FPCamera");
+    const cam = fpc || state.nodes.find(n => n && n.type === "Camera");
+    if (cam && cam.params) {
+      return {
+        x: (typeof cam.params.posX === "number") ? cam.params.posX : 0,
+        y: (typeof cam.params.posY === "number") ? cam.params.posY : 0,
+        z: (typeof cam.params.posZ === "number") ? cam.params.posZ : 0
+      };
+    }
+  }
+  // Fall back to a "no camera, show coarse 6-root quadtree" position:
+  // sit a few radii away on +Z. Not great but keeps the demo browsable
+  // before a camera is wired.
+  const p = node && node.params ? node.params : {};
+  const r = (typeof p.radius === "number") ? p.radius : 1000;
+  return { x: 0, y: 0, z: r * 3 };
+}
+
+/* Phil Nowell spherified-cube warp on a single point. Pulled out as
+ * a helper so the chunk-split center calculation matches what the
+ * vertex builder writes. Pass cube-face position in [-1, 1]^3,
+ * receive unit-sphere position. */
+function _planetSpherify(cx, cy, cz) {
+  const cxx = cx * cx, cyy = cy * cy, czz = cz * cz;
+  const sx = cx * Math.sqrt(Math.max(0, 1 - cyy * 0.5 - czz * 0.5 + cyy * czz / 3));
+  const sy = cy * Math.sqrt(Math.max(0, 1 - cxx * 0.5 - czz * 0.5 + cxx * czz / 3));
+  const sz = cz * Math.sqrt(Math.max(0, 1 - cxx * 0.5 - cyy * 0.5 + cxx * cyy / 3));
+  const invLen = 1 / Math.max(1e-12, Math.sqrt(sx*sx + sy*sy + sz*sz));
+  return [sx * invLen, sy * invLen, sz * invLen];
+}
+
+/* Cube-face basis lookup (n, t, b) for face 0..5. Same axes as
+ * _buildPlanet's `faces[]` table. Pulled into a top-level constant so
+ * the chunk-set helper and the builder agree. */
+const _PLANET_FACES = [
+  { n: [ 1, 0, 0], t: [0, 0,-1], b: [0, 1, 0] }, // +X
+  { n: [-1, 0, 0], t: [0, 0, 1], b: [0, 1, 0] }, // -X
+  { n: [ 0, 1, 0], t: [1, 0, 0], b: [0, 0, 1] }, // +Y
+  { n: [ 0,-1, 0], t: [1, 0, 0], b: [0, 0,-1] }, // -Y
+  { n: [ 0, 0, 1], t: [1, 0, 0], b: [0, 1, 0] }, // +Z
+  { n: [ 0, 0,-1], t: [-1,0, 0], b: [0, 1, 0] }  // -Z
+];
+
+/* §planet-spec Phase 4.c -- recursive quadtree split per face. Each
+ * node represents a square region of one cube face in (u, v) ∈
+ * [uMin, uMax] × [vMin, vMax]. Split rule: distance from camera to
+ * chunk's sphere-center < chunkEdge * splitFactor → split. Bounded
+ * by maxDepth so a camera on the surface doesn't infinitely recurse.
+ *
+ * Returns a flat array of leaf descriptors. Built per mesh-rebuild;
+ * the rebuild cadence is governed by _meshCacheKey, which quantizes
+ * the camera position to ~radius/2^maxDepth so we only rebuild when
+ * the camera crosses a finest-level chunk boundary. */
+function _planetVisibleChunks(camPos, radius, maxDepth, splitFactor) {
+  const out = [];
+  function recurse(face, uMin, uMax, vMin, vMax, depth) {
+    const uMid = (uMin + uMax) * 0.5;
+    const vMid = (vMin + vMax) * 0.5;
+    const f = _PLANET_FACES[face];
+    const cx = f.n[0] + f.t[0] * uMid + f.b[0] * vMid;
+    const cy = f.n[1] + f.t[1] * uMid + f.b[1] * vMid;
+    const cz = f.n[2] + f.t[2] * uMid + f.b[2] * vMid;
+    const sph = _planetSpherify(cx, cy, cz);
+    const wx = sph[0] * radius, wy = sph[1] * radius, wz = sph[2] * radius;
+    const dx = camPos.x - wx, dy = camPos.y - wy, dz = camPos.z - wz;
+    const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+    // Chunk world-edge length ≈ (uMax-uMin) * radius * π/4. The π/4
+    // factor is the per-radian-of-face conversion (one cube face spans
+    // π/2 radians; one unit of (u,v) ∈ [-1,1] spans half of that).
+    const chunkEdge = (uMax - uMin) * radius * (Math.PI * 0.25);
+    if (depth < maxDepth && dist < chunkEdge * splitFactor) {
+      recurse(face, uMin, uMid, vMin, vMid, depth + 1);
+      recurse(face, uMid, uMax, vMin, vMid, depth + 1);
+      recurse(face, uMin, uMid, vMid, vMax, depth + 1);
+      recurse(face, uMid, uMax, vMid, vMax, depth + 1);
+      return;
+    }
+    out.push({ face, uMin, uMax, vMin, vMax, depth });
+  }
+  for (let f = 0; f < 6; f++) recurse(f, -1, 1, -1, 1, 0);
+  return out;
+}
+
 /* Planet -- spherified-cube primitive. 6 faces of a subdivided cube,
  * each (segs+1)² verts. Each vert at cube-face coord (u, v) in [-1, 1]
  * is placed at axis_n + tangent*u + bitangent*v (cube position in
@@ -54497,10 +54603,9 @@ function _buildSphere(node) {
 function _buildPlanet(node) {
   const p = node.params || {};
   const r    = (typeof p.radius   === "number") ? p.radius   : 1000;
-  const segs = Math.max(1, Math.min(256, Math.floor((typeof p.segments === "number") ? p.segments : 32)));
-  // Phase 4.b -- heightfield params. heightScale 0 = flat sphere
-  // (Phase 4.a behavior). seaLevel ∈ [0, 1] is the fBm cutoff below
-  // which we clamp to ocean (flat shell at sea radius).
+  const segs = Math.max(1, Math.min(64, Math.floor((typeof p.segments === "number") ? p.segments : 16)));
+  const maxDepth    = Math.max(0, Math.min(14, Math.floor((typeof p.maxDepth    === "number") ? p.maxDepth    : 6)));
+  const splitFactor = Math.max(0.1, Math.min(50, (typeof p.splitFactor === "number") ? p.splitFactor : 5.0));
   const hs       = (typeof p.heightScale === "number") ? p.heightScale : 0;
   const seaLevel = Math.max(0, Math.min(1, (typeof p.seaLevel === "number") ? p.seaLevel : 0.5));
   const noiseDef = {
@@ -54511,52 +54616,47 @@ function _buildPlanet(node) {
     gain:       (typeof p.gain       === "number") ? p.gain       : 0.5,
     ridges:     (typeof p.ridges     === "number") ? p.ridges     : 0
   };
-  // 6 faces: (n, tangent, bitangent). CCW winding viewed from outside
-  // means tangent×bitangent must point outward (= +n). Per-face local
-  // (u,v) sweeps [-1,1] across the face.
-  const faces = [
-    { n: [ 1, 0, 0], t: [0, 0,-1], b: [0, 1, 0] }, // +X
-    { n: [-1, 0, 0], t: [0, 0, 1], b: [0, 1, 0] }, // -X
-    { n: [ 0, 1, 0], t: [1, 0, 0], b: [0, 0, 1] }, // +Y
-    { n: [ 0,-1, 0], t: [1, 0, 0], b: [0, 0,-1] }, // -Y
-    { n: [ 0, 0, 1], t: [1, 0, 0], b: [0, 1, 0] }, // +Z
-    { n: [ 0, 0,-1], t: [-1,0, 0], b: [0, 1, 0] }  // -Z
-  ];
-  const vertsPerFace = (segs + 1) * (segs + 1);
-  const trisPerFace  = segs * segs * 2;
-  const verts   = new Float32Array(6 * vertsPerFace * 11);
-  const indices = new Uint32Array(6 * trisPerFace * 3);
+  const camPos = _planetCameraPos(node);
+  const chunks = _planetVisibleChunks(camPos, r, maxDepth, splitFactor);
+  const vertsPerChunk = (segs + 1) * (segs + 1);
+  const trisPerChunk  = segs * segs * 2;
+  const verts   = new Float32Array(chunks.length * vertsPerChunk * 11);
+  const indices = new Uint32Array(chunks.length * trisPerChunk * 3);
   let vWrite = 0, iWrite = 0;
-  for (let f = 0; f < 6; f++) {
-    const face = faces[f];
+  for (let ck = 0; ck < chunks.length; ck++) {
+    const ch = chunks[ck];
+    const face = _PLANET_FACES[ch.face];
     const nX = face.n[0], nY = face.n[1], nZ = face.n[2];
     const tX = face.t[0], tY = face.t[1], tZ = face.t[2];
     const bX = face.b[0], bY = face.b[1], bZ = face.b[2];
-    const vertBase = f * vertsPerFace;
+    const vertBase = ck * vertsPerChunk;
+    // §planet-spec Phase 4.c -- truncate octaves to the chunk's own
+    // vertex spacing (Nyquist rule). Chunk world-edge ≈ (uMax-uMin)*
+    // r*π/4 (cube-face arc length); per-vertex spacing = that / segs.
+    // log2(1 / (2 * f * Δx)) clamped to the param-supplied octaves.
+    const chunkEdge = (ch.uMax - ch.uMin) * r * (Math.PI * 0.25);
+    const spacing = chunkEdge / Math.max(1, segs);
+    const lodOctF = (hs !== 0)
+      ? _octavesForSpacing(noiseDef.frequency, spacing, noiseDef.octaves)
+      : 0;
+    const effOctavesF = Math.min(noiseDef.octaves, lodOctF);
+    const chunkNoise = Object.assign({}, noiseDef, { effectiveOctavesF: effOctavesF });
     for (let iy = 0; iy <= segs; iy++) {
-      const v01 = iy / segs;
-      const v = v01 * 2 - 1;                 // [-1, 1]
+      const fy01 = iy / segs;
+      const v = ch.vMin + (ch.vMax - ch.vMin) * fy01;
       for (let ix = 0; ix <= segs; ix++) {
-        const u01 = ix / segs;
-        const u = u01 * 2 - 1;
-        // Cube-face position in [-1, 1]^3
+        const fx01 = ix / segs;
+        const u = ch.uMin + (ch.uMax - ch.uMin) * fx01;
         const cx = nX + tX * u + bX * v;
         const cy = nY + tY * u + bY * v;
         const cz = nZ + tZ * u + bZ * v;
-        // Phil Nowell spherified-cube warp
         const cxx = cx * cx, cyy = cy * cy, czz = cz * cz;
         const sx = cx * Math.sqrt(Math.max(0, 1 - cyy * 0.5 - czz * 0.5 + cyy * czz / 3));
         const sy = cy * Math.sqrt(Math.max(0, 1 - cxx * 0.5 - czz * 0.5 + cxx * czz / 3));
         const sz = cz * Math.sqrt(Math.max(0, 1 - cxx * 0.5 - cyy * 0.5 + cxx * cyy / 3));
         const invLen = 1 / Math.max(1e-12, Math.sqrt(sx*sx + sy*sy + sz*sz));
         const ux = sx * invLen, uy = sy * invLen, uz = sz * invLen;
-        // Phase 4.b -- sample 3D fBm on the unit sphere. Above
-        // seaLevel: radial displacement scaled by (h - seaLevel) /
-        // (1 - seaLevel) so the cutoff lies exactly at the sphere
-        // surface (= world-unit radius `r`). Below seaLevel: clamp
-        // to the ocean shell so the silhouette reads as a sphere
-        // with continents, not a spiky chestnut.
-        const h = (hs !== 0) ? _terrainFBM3D(ux, uy, uz, noiseDef) : 0;
+        const h = (hs !== 0) ? _terrainFBM3D(ux, uy, uz, chunkNoise) : 0;
         let rad;
         if (h <= seaLevel || hs === 0) {
           rad = r;
@@ -54569,11 +54669,11 @@ function _buildPlanet(node) {
         verts[vWrite++] = rad * ux; verts[vWrite++] = rad * uy; verts[vWrite++] = rad * uz;
         verts[vWrite++] = col[0]; verts[vWrite++] = col[1]; verts[vWrite++] = col[2];
         verts[vWrite++] = ux; verts[vWrite++] = uy; verts[vWrite++] = uz;
-        verts[vWrite++] = u01; verts[vWrite++] = v01;
+        // UV: per-chunk 0..1. Multi-chunk UV atlasing isn't meaningful
+        // here so we just give each chunk a fresh unit square.
+        verts[vWrite++] = fx01; verts[vWrite++] = fy01;
       }
     }
-    // Indices: per-quad two triangles, CCW from outside (= tangent
-    // sweep × bitangent sweep = +normal by construction).
     for (let iy = 0; iy < segs; iy++) {
       for (let ix = 0; ix < segs; ix++) {
         const a = vertBase + iy * (segs + 1) + ix;
