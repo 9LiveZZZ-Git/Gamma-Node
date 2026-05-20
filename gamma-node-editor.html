@@ -10721,6 +10721,9 @@ public:
     kind: "mesh-gen",
     ins: [
       { n: "radius",      t: "param" },
+      { n: "centerX",     t: "param" },
+      { n: "centerY",     t: "param" },
+      { n: "centerZ",     t: "param" },
       { n: "segments",    t: "param" },
       { n: "maxDepth",    t: "param" },
       { n: "splitFactor", t: "param" },
@@ -10735,14 +10738,14 @@ public:
     ],
     outs: [{ n: "mesh", t: "mesh" }],
     params: {
-      radius: 1000, segments: 16,
-      maxDepth: 6, splitFactor: 5.0,
+      radius: 1000, centerX: 0, centerY: 0, centerZ: 0,
+      segments: 16, maxDepth: 6, splitFactor: 5.0,
       heightScale: 0, seaLevel: 0.5,
       seed: 7.3, frequency: 1.0, octaves: 6,
       lacunarity: 2.0, gain: 0.5, ridges: 0
     },
     methods: {},
-    description: "Spherified-cube planet with per-face quadtree LOD (Phase 4.a-c of planet-spec). 6 cube faces, each adaptively subdivided into a quadtree of leaf chunks by camera distance. Each leaf is a regular (segments+1)² grid in cube-face (u,v) coords, spherified + radially displaced by 3D fBm. params: radius (world units), segments (per-chunk grid, default 16). maxDepth = max quadtree depth per face (default 6 → 2^6 = 64-wide subdivision on the camera-facing chunks). splitFactor = ratio of distance/chunk-edge below which we split (default 5 → split chunks larger than ~11° on screen). heightScale, seaLevel, seed, frequency, octaves, lacunarity, gain, ridges as in 4.b. Mesh rebuilds when the camera crosses a chunk-boundary quantum (~ radius / 2^maxDepth)."
+    description: "Spherified-cube planet with per-face quadtree LOD (Phase 4.a-d of planet-spec). 6 cube faces, each adaptively subdivided into a quadtree of leaf chunks by camera distance with horizon-occlusion culling. Each leaf is a regular (segments+1)² grid in cube-face (u,v) coords, spherified + radially displaced by 3D fBm. params: radius, (centerX, centerY, centerZ) = planet center in world space (default origin; archipelago integration places it at (0, -R, 0) so the surface passes through the spawn). segments = per-chunk grid (default 16). maxDepth, splitFactor govern LOD aggressiveness. heightScale, seaLevel, seed, frequency, octaves, lacunarity, gain, ridges as in 4.b. Mesh rebuilds when the camera (relative to planet center) crosses a chunk-boundary quantum (~ radius / 2^maxDepth)."
   },
 
   Plane: {
@@ -32870,33 +32873,40 @@ const _demos = [
       // mesh so the standard projection pipeline handles parallax
       // (under both translation AND rotation) without any of the
       // angular-distortion games the sky-pass shell had to play.
-      // §5.5.h-27 -- TerrainHorizon sized to feel "effectively
-      // infinite" at planet scale. 5000km extent so even from low-
-      // orbit altitude (~200km) the visible Earth horizon (~1600km
-      // from sub-camera point) is fully inside the mesh. Macro-tile
-      // 500km so the user can fly very far without rebuild stalls.
-      const horizon = makeNode("TerrainHorizon", 280, 680, {
-        // §planet-spec Phase 3 -- impostor uses the SAME noise as
-        // the chunked TiledTerrain (no rescaled freq). Octave count
-        // is auto-truncated by the impostor's vertex spacing, so it
-        // shows the low-freq big-shape silhouette of the same noise
-        // field. With the demo's current freq=0.0008 the impostor
-        // spacing is too coarse to resolve any octaves -- impostor
-        // renders effectively flat until Phase 4 lowers base freq.
-        extent:         5000000,
-        subdivisions:   128,
-        tileSize:       500000,
-        yBias:          -0.5,
-        octavesCap:     20,
-        curveAltLow:    1000,
-        curveAltHigh:   25000,
-        planetRadius:   6378000,
-        // §planet-spec Phase 1.5 -- impostor only visible past 60km
-        // altitude (full visibility by 100km). Below that the
-        // chunked TiledTerrain disc + sky alone fill the view; the
-        // coarse impostor doesn't interfere with the ground view.
-        visAltLow:      60000,
-        visAltHigh:     100000
+      // §planet-spec Phase 4.e -- Planet replaces the TerrainHorizon
+      // impostor. Earth radius (6.378e6 m) centered at (0, -R - 5000)
+      // so Planet's surface near spawn is at y=-5000 -- 5km below
+      // local sea level. That puts the entire Planet mesh BELOW
+      // TiledTerrain's ocean basin (lowest point y=-1500), so from
+      // ground level the ocean basin occludes Planet and there's no
+      // z-fighting between Planet's continents and the local archipelago.
+      //
+      // From altitude (past the chunked-disc edge), Planet shows the
+      // global curving ocean + ~200m continent reliefs as far horizon
+      // detail. From orbit you see the whole planet's continent
+      // layout via the per-vertex color palette baked from the same
+      // h ∈ [0,1] used for displacement.
+      //
+      // frequency 5e-7 → ~13000km wavelength (planet circumference
+      // 40075km, ~3 continents per great circle). seed 7.3, seaLevel
+      // 0.45 = mild land bias.
+      const PLANET_R = 6378000;
+      const horizon = makeNode("Planet", 280, 680, {
+        radius:      PLANET_R,
+        centerX:     0,
+        centerY:     -PLANET_R - 5000,
+        centerZ:     0,
+        segments:    16,
+        maxDepth:    9,            // ≈ 25km per leaf at the camera-facing point
+        splitFactor: 5.0,
+        heightScale: 200,
+        seaLevel:    0.45,
+        seed:        7.3,
+        frequency:   5e-7,
+        octaves:     5,
+        lacunarity:  2.0,
+        gain:        0.5,
+        ridges:      0.45
       });
       const clouds = makeNode("Clouds3D", 40, 680, {
         // §5.5.h-18 -- chunked cloud streaming with rounded tops AND
@@ -32967,11 +32977,11 @@ const _demos = [
       // §5.5.h-14 -- Clouds3D as a third mesh slot. Like Water, the
       // node bakes fs_clouds into the encoder; no Material wire.
       state.edges.push({ from: { node: clouds, port: "mesh" }, to: { node: scn, port: "mesh3" } });
-      // §5.5.h-23 -- TerrainHorizon impostor as a fourth mesh slot.
-      // Renders unlit-vc with baked altitude-band colors -- no Material
-      // wire needed. Goes BEFORE Water in the slot order so when both
-      // are in view (e.g. the impostor's sea-floor floor below the
-      // ocean), water draws over it instead of vice versa.
+      // §planet-spec Phase 4.e -- Planet as the fourth mesh slot
+      // (variable named `horizon` for continuity with the old wiring;
+      // the geometry is now a real cube-sphere quadtree, not the old
+      // flat-plane impostor). Renders unlit-vc with the terrain
+      // palette baked into vertex colors.
       state.edges.push({ from: { node: horizon, port: "mesh" }, to: { node: scn, port: "mesh4" } });
       // §5.5.h-5 -- explicit terrain reference wire. Water's
       // heightmap input takes a TiledTerrain reference so the
@@ -54294,19 +54304,26 @@ function _meshCacheKey(node) {
     case "Box":           return "box:" + [p.width, p.height, p.depth].join(",");
     case "Sphere":        return "sph:" + [p.radius, p.stacks, p.slices].join(",");
     case "Planet":        {
-      // §planet-spec Phase 4.c -- include a quantized camera position
-      // so the quadtree rebuilds when the camera crosses a finest-
-      // depth chunk boundary. Quantum = radius / 2^maxDepth (≈ size
-      // of a leaf chunk's edge near the camera).
+      // §planet-spec Phase 4.c/e -- include a quantized PLANET-LOCAL
+      // camera position so the quadtree rebuilds when the camera
+      // crosses a finest-depth chunk boundary. Quantum = radius /
+      // 2^maxDepth (≈ leaf-chunk edge near the camera). The center
+      // params shift the cam-to-planet origin -- two Planet nodes at
+      // different centers can share the same camera and still rebuild
+      // independently.
       const r = (typeof p.radius === "number") ? p.radius : 1000;
       const md = Math.max(0, Math.min(14, Math.floor((typeof p.maxDepth === "number") ? p.maxDepth : 6)));
       const quantum = r / Math.pow(2, md);
+      const cxC = (typeof p.centerX === "number") ? p.centerX : 0;
+      const cyC = (typeof p.centerY === "number") ? p.centerY : 0;
+      const czC = (typeof p.centerZ === "number") ? p.centerZ : 0;
       const c = _planetCameraPos(node);
-      const qx = Math.round(c.x / quantum);
-      const qy = Math.round(c.y / quantum);
-      const qz = Math.round(c.z / quantum);
+      const qx = Math.round((c.x - cxC) / quantum);
+      const qy = Math.round((c.y - cyC) / quantum);
+      const qz = Math.round((c.z - czC) / quantum);
       return "plt:" + [
-        p.radius, p.segments, p.maxDepth, p.splitFactor,
+        p.radius, p.centerX, p.centerY, p.centerZ,
+        p.segments, p.maxDepth, p.splitFactor,
         p.heightScale, p.seaLevel,
         p.seed, p.frequency, p.octaves, p.lacunarity, p.gain, p.ridges,
         qx, qy, qz
@@ -54636,6 +54653,9 @@ function _planetVisibleChunks(camPos, radius, heightScale, maxDepth, splitFactor
 function _buildPlanet(node) {
   const p = node.params || {};
   const r    = (typeof p.radius   === "number") ? p.radius   : 1000;
+  const cxC  = (typeof p.centerX === "number") ? p.centerX : 0;
+  const cyC  = (typeof p.centerY === "number") ? p.centerY : 0;
+  const czC  = (typeof p.centerZ === "number") ? p.centerZ : 0;
   const segs = Math.max(1, Math.min(64, Math.floor((typeof p.segments === "number") ? p.segments : 16)));
   const maxDepth    = Math.max(0, Math.min(14, Math.floor((typeof p.maxDepth    === "number") ? p.maxDepth    : 6)));
   const splitFactor = Math.max(0.1, Math.min(50, (typeof p.splitFactor === "number") ? p.splitFactor : 5.0));
@@ -54649,7 +54669,12 @@ function _buildPlanet(node) {
     gain:       (typeof p.gain       === "number") ? p.gain       : 0.5,
     ridges:     (typeof p.ridges     === "number") ? p.ridges     : 0
   };
-  const camPos = _planetCameraPos(node);
+  // §planet-spec 4.e -- planet may be centered anywhere in world
+  // space. Quadtree split + horizon cull operate in planet-LOCAL
+  // coords (camera minus center), then we add the center back at
+  // vertex-write time so the VBO has world-space positions.
+  const camPosWorld = _planetCameraPos(node);
+  const camPos = { x: camPosWorld.x - cxC, y: camPosWorld.y - cyC, z: camPosWorld.z - czC };
   const chunks = _planetVisibleChunks(camPos, r, hs, maxDepth, splitFactor);
   const vertsPerChunk = (segs + 1) * (segs + 1);
   const trisPerChunk  = segs * segs * 2;
@@ -54699,7 +54724,9 @@ function _buildPlanet(node) {
         }
         const col = (hs !== 0) ? _planetColorForHeight(h, seaLevel) :
                                  [ux * 0.5 + 0.5, uy * 0.5 + 0.5, uz * 0.5 + 0.5];
-        verts[vWrite++] = rad * ux; verts[vWrite++] = rad * uy; verts[vWrite++] = rad * uz;
+        verts[vWrite++] = cxC + rad * ux;
+        verts[vWrite++] = cyC + rad * uy;
+        verts[vWrite++] = czC + rad * uz;
         verts[vWrite++] = col[0]; verts[vWrite++] = col[1]; verts[vWrite++] = col[2];
         verts[vWrite++] = ux; verts[vWrite++] = uy; verts[vWrite++] = uz;
         // UV: per-chunk 0..1. Multi-chunk UV atlasing isn't meaningful
