@@ -50637,16 +50637,22 @@ function _mat4LookAt(eye, target, up) {
 }
 
 function _mat4Perspective(fovYRad, aspect, near, far) {
-  // WebGPU clip space: z in [0,1] (NOT [-1,1] like OpenGL). Matrix
-  // built accordingly so depth-test "less" works without flipping.
+  // WebGPU clip space: z in [0,1].
+  // §planet-spec Phase 1 -- reverse-Z. The near plane now maps to
+  // ndc_z = 1, far plane to ndc_z = 0. f32 depth precision is
+  // distributed near-uniformly across the range instead of being
+  // 99% bunched up at the near plane like the standard mapping; with
+  // depth32float + reverse-Z, near=0.1 / far=1e8 z-fights becomes
+  // a non-issue. Paired with depthCompare: "greater" and
+  // depthClearValue: 0.0 in the pipeline + pass setup.
   const f = 1.0 / Math.tan(fovYRad * 0.5);
   const m = new Float32Array(16);
   const nf = 1.0 / (near - far);
   m[0]  = f / aspect;
   m[5]  = f;
-  m[10] = far * nf;            // -(far) / (far - near)  with nf = 1/(near-far)
+  m[10] = -near * nf;          // (near)/(far - near)
   m[11] = -1;
-  m[14] = far * near * nf;     // -(far*near) / (far - near)
+  m[14] = -near * far * nf;    // (near*far)/(far - near)
   return m;
 }
 
@@ -51726,10 +51732,11 @@ fn vs_sky(@builtin(vertex_index) vid: u32) -> SkyVsOut {
   );
   let p = positions[vid];
   var out: SkyVsOut;
-  // Far plane in WebGPU clip space (z=1). With depth-test less-equal
-  // + initial depth-clear=1, this fragment passes wherever no mesh
-  // drew (depth still = 1) and fails wherever a mesh wrote depth<1.
-  out.pos = vec4<f32>(p.x, p.y, 1.0, 1.0);
+  // §planet-spec Phase 1 -- reverse-Z. Far plane in WebGPU clip
+  // space is now ndc_z=0 (was 1). With depth-test "greater-equal"
+  // + depth-clear=0, this fragment passes wherever no mesh wrote
+  // anything closer to the near plane (ndc_z=1).
+  out.pos = vec4<f32>(p.x, p.y, 0.0, 1.0);
   // Reconstruct world-space ray dir from screen coords + camera
   // basis. Perspective: dir = forward + p.x * tanHFov*aspect * right
   //                                    + p.y * tanHFov        * up
@@ -53751,11 +53758,14 @@ function _ensureMeshPipeline(materialType, sampleCount, displaced) {
       },
       depthStencil: {
         format: "depth32float",
-        depthCompare: "less",
+        // §planet-spec Phase 1 -- reverse-Z. Near plane is ndc_z=1,
+        // far plane is ndc_z=0. "greater" passes closer-to-near
+        // fragments (was "less" under the standard mapping).
+        depthCompare: "greater",
         // §5.5.h-14 -- clouds composite the sky background inline
         // and output opaque (alpha=1), so they DO write depth like
         // any other opaque mesh. This lets the sky pass skip the
-        // cloud pixels (depth < 1) instead of overwriting them.
+        // cloud pixels (depth > 0) instead of overwriting them.
         depthWriteEnabled: true
       },
       multisample: { count: sampleCount }
@@ -53830,7 +53840,10 @@ function _ensureSkyPipeline(sampleCount) {
       primitive: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" },
       depthStencil: {
         format: "depth32float",
-        depthCompare: "less-equal",   // pass where depth still == 1 (no mesh)
+        // §planet-spec Phase 1 -- reverse-Z. Sky vertex writes ndc_z=0
+        // (the new "far plane"); pass where depth still == 0 (no mesh
+        // has drawn anything closer to ndc_z=1).
+        depthCompare: "greater-equal",
         depthWriteEnabled: false
       },
       multisample: { count: sampleCount }
@@ -56078,7 +56091,9 @@ function _encodeScenePass(enc, entry) {
     depthStencilAttachment: {
       view: Visual.depthTextureView,
       depthLoadOp: "clear",
-      depthClearValue: 1.0,
+      // §planet-spec Phase 1 -- reverse-Z. Clear to 0.0 (far plane);
+      // mesh fragments at ndc_z>0 then pass depthCompare:"greater".
+      depthClearValue: 0.0,
       depthStoreOp: (sampleCount > 1) ? "discard" : "store"
     }
   });
