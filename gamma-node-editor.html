@@ -55069,7 +55069,12 @@ function _buildCellTriangulation(positions, neighbors, K, N, hash) {
   // spike-fin triangle. Spatial-hash-near-M fixes this.
   const typicalAngular = Math.sqrt(4 * Math.PI / N);
   const cosMaxEdge = Math.cos(3 * typicalAngular);  // reject edges with dot(i,j) < this
-  const slack = 1e-9;
+  // 1e-9 was too tight: Fibonacci has many near-equidistant
+  // candidates and float-precision noise made the empty-circle test
+  // reject genuine Voronoi edges. 1e-6 ≈ ~0.1° tolerance, well
+  // below the ~0.8° typical-cell-spacing.
+  const slack = 1e-6;
+  let candCount = 0, rejPre = 0, rejI = 0, rejJ = 0, rejM = 0, accepted = 0;
   const GRID = hash.GRID;
   const vAdj = new Array(N);
   for (let i = 0; i < N; i++) vAdj[i] = [];
@@ -55080,13 +55085,12 @@ function _buildCellTriangulation(positions, neighbors, K, N, hash) {
     for (let k = 0; k < K; k++) {
       const j = neighbors[i * K + k];
       if (j < 0 || j <= i) continue;
+      candCount++;
       const jx = positions[j * 3 + 0];
       const jy = positions[j * 3 + 1];
       const jz = positions[j * 3 + 2];
-      // Stage A: angular distance pre-filter.
       const dotIJ = ix * jx + iy * jy + iz * jz;
-      if (dotIJ < cosMaxEdge) continue;
-      // Stage B: empty-circle test at the spherical midpoint M.
+      if (dotIJ < cosMaxEdge) { rejPre++; continue; }
       let mx = ix + jx, my = iy + jy, mz = iz + jz;
       const ml = Math.sqrt(mx*mx + my*my + mz*mz);
       if (ml < 1e-9) continue;
@@ -55094,24 +55098,22 @@ function _buildCellTriangulation(positions, neighbors, K, N, hash) {
       mx *= mlinv; my *= mlinv; mz *= mlinv;
       const dotIM = ix * mx + iy * my + iz * mz;
       let isVoronoi = true;
-      // Check i's K-nearest.
+      let rejBy = 0;
       for (let k2 = 0; k2 < K; k2++) {
         const c = neighbors[i * K + k2];
         if (c < 0 || c === j) continue;
         const dotCM = positions[c*3]*mx + positions[c*3+1]*my + positions[c*3+2]*mz;
-        if (dotCM > dotIM + slack) { isVoronoi = false; break; }
+        if (dotCM > dotIM + slack) { isVoronoi = false; rejBy = 1; break; }
       }
       if (isVoronoi) {
-        // Check j's K-nearest.
         for (let k2 = 0; k2 < K; k2++) {
           const c = neighbors[j * K + k2];
           if (c < 0 || c === i) continue;
           const dotCM = positions[c*3]*mx + positions[c*3+1]*my + positions[c*3+2]*mz;
-          if (dotCM > dotIM + slack) { isVoronoi = false; break; }
+          if (dotCM > dotIM + slack) { isVoronoi = false; rejBy = 2; break; }
         }
       }
       if (isVoronoi) {
-        // Check cells in 3³ spatial-hash buckets around M.
         const mix = Math.max(0, Math.min(GRID - 1, Math.floor((mx + 1) * 0.5 * GRID)));
         const miy = Math.max(0, Math.min(GRID - 1, Math.floor((my + 1) * 0.5 * GRID)));
         const miz = Math.max(0, Math.min(GRID - 1, Math.floor((mz + 1) * 0.5 * GRID)));
@@ -55128,18 +55130,24 @@ function _buildCellTriangulation(positions, neighbors, K, N, hash) {
                 const c = bucket[b];
                 if (c === i || c === j) continue;
                 const dotCM = positions[c*3]*mx + positions[c*3+1]*my + positions[c*3+2]*mz;
-                if (dotCM > dotIM + slack) { isVoronoi = false; break outer; }
+                if (dotCM > dotIM + slack) { isVoronoi = false; rejBy = 3; break outer; }
               }
             }
           }
         }
       }
-      if (isVoronoi) {
+      if (!isVoronoi) {
+        if (rejBy === 1) rejI++;
+        else if (rejBy === 2) rejJ++;
+        else rejM++;
+      } else {
+        accepted++;
         vAdj[i].push(j);
         vAdj[j].push(i);
       }
     }
   }
+  console.log("[planet-mesh] voronoi-edge stats: cands=" + candCount + " rejPre=" + rejPre + " rejI=" + rejI + " rejJ=" + rejJ + " rejM=" + rejM + " accepted=" + accepted);
 
   // ---- Pass 2: Fan triangulation via azimuth sort ----
   const tris = [];
