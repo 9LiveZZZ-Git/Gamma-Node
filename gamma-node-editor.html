@@ -10720,13 +10720,26 @@ public:
     cppType: "",
     kind: "mesh-gen",
     ins: [
-      { n: "radius",   t: "param" },
-      { n: "segments", t: "param" }
+      { n: "radius",      t: "param" },
+      { n: "segments",    t: "param" },
+      { n: "heightScale", t: "param" },
+      { n: "seaLevel",    t: "param" },
+      { n: "seed",        t: "param" },
+      { n: "frequency",   t: "param" },
+      { n: "octaves",     t: "param" },
+      { n: "lacunarity",  t: "param" },
+      { n: "gain",        t: "param" },
+      { n: "ridges",      t: "param" }
     ],
     outs: [{ n: "mesh", t: "mesh" }],
-    params: { radius: 1000, segments: 32 },
+    params: {
+      radius: 1000, segments: 32,
+      heightScale: 0, seaLevel: 0.5,
+      seed: 7.3, frequency: 1.0, octaves: 6,
+      lacunarity: 2.0, gain: 0.5, ridges: 0
+    },
     methods: {},
-    description: "Spherified-cube planet primitive (Phase 4.a of planet-spec). 6 faces of a subdivided cube, each face's verts projected to a sphere via Phil Nowell's spherify warp (smoother + more even than a UV sphere -- no pole singularity). radius is world-units (default 1000); segments is per-face grid resolution (default 32 → 6 × 33² = 6534 verts, 12k tris). Vertex color = normal-as-RGB so the smoothing reads without a material. Foundation for Phase 4 quadtree LOD + heightfield work -- those build on this same projection."
+    description: "Spherified-cube planet (Phase 4.a + 4.b of planet-spec). 6 cube faces projected via Phil Nowell's spherify warp; per-vertex radial displacement by 3D fBm so continents + oceans emerge naturally. params: radius (world units), segments (per-face grid, default 32). heightScale = peak radial displacement in world units (0 = flat sphere). seaLevel ∈ [0,1] = fBm cutoff below which terrain is clamped to ocean. frequency is sampled in unit-sphere space (1.0 = ~1 feature per π/2 radians ≈ 1/4 of the equator). Vertex color is a terrain palette (deep ocean → beach → vegetation → rock → snow) keyed off the same h ∈ [0,1] used for displacement. Foundation for Phase 4.c per-face quadtree LOD."
   },
 
   Plane: {
@@ -33013,9 +33026,26 @@ const _demos = [
     build: () => {
       // Radius small enough to see the whole thing in one frame.
       // Camera orbits at radius * 2.4 so you see ~hemisphere with a
-      // bit of curve. segments=32 -> 6 × 33² = 6534 verts.
+      // bit of curve. segments=64 -> 6 × 65² = 25k verts, gives the
+      // 3D fBm enough resolution for the continents to read.
       const RADIUS = 5;
-      const planet = makeNode("Planet",     40,  80, { radius: RADIUS, segments: 32 });
+      const planet = makeNode("Planet",     40,  80, {
+        radius:      RADIUS,
+        segments:    64,
+        // Phase 4.b -- heightfield params. heightScale 0.5 = 10% of
+        // radius, exaggerated vs Earth (~0.14%) so mountains read at
+        // demo scale. seaLevel 0.5 puts ~half the sphere underwater
+        // for a clean continent layout. frequency 0.7 gives ~3-4
+        // continent-scale undulations per axis on a unit sphere.
+        heightScale: 0.5,
+        seaLevel:    0.5,
+        seed:        7.3,
+        frequency:   0.7,
+        octaves:     6,
+        lacunarity:  2.0,
+        gain:        0.5,
+        ridges:      0.35
+      });
       const clk    = makeNode("MasterClock",    40, 220, { bpm: 12 });
       const mulTau = makeNode("Mul",           240, 220, { b: 6.283185307 });
       const sinN   = makeNode("Sin",           420, 180);
@@ -54262,7 +54292,10 @@ function _meshCacheKey(node) {
     case "DebugTriangle": return "tri:" + (p.scale || 1);
     case "Box":           return "box:" + [p.width, p.height, p.depth].join(",");
     case "Sphere":        return "sph:" + [p.radius, p.stacks, p.slices].join(",");
-    case "Planet":        return "plt:" + [p.radius, p.segments].join(",");
+    case "Planet":        return "plt:" + [
+      p.radius, p.segments, p.heightScale, p.seaLevel,
+      p.seed, p.frequency, p.octaves, p.lacunarity, p.gain, p.ridges
+    ].join(",");
     case "Plane":         return "pln:" + [p.width, p.depth].join(",");
     case "Torus":         return "tor:" + [p.majorRadius, p.minorRadius, p.majorSlices, p.minorSlices].join(",");
     case "Cylinder":      return "cyl:" + [p.radius, p.height, p.slices].join(",");
@@ -54464,7 +54497,20 @@ function _buildSphere(node) {
 function _buildPlanet(node) {
   const p = node.params || {};
   const r    = (typeof p.radius   === "number") ? p.radius   : 1000;
-  const segs = Math.max(1, Math.min(128, Math.floor((typeof p.segments === "number") ? p.segments : 32)));
+  const segs = Math.max(1, Math.min(256, Math.floor((typeof p.segments === "number") ? p.segments : 32)));
+  // Phase 4.b -- heightfield params. heightScale 0 = flat sphere
+  // (Phase 4.a behavior). seaLevel ∈ [0, 1] is the fBm cutoff below
+  // which we clamp to ocean (flat shell at sea radius).
+  const hs       = (typeof p.heightScale === "number") ? p.heightScale : 0;
+  const seaLevel = Math.max(0, Math.min(1, (typeof p.seaLevel === "number") ? p.seaLevel : 0.5));
+  const noiseDef = {
+    seed:       (typeof p.seed       === "number") ? p.seed       : 7.3,
+    frequency:  (typeof p.frequency  === "number") ? p.frequency  : 1.0,
+    octaves:    Math.max(1, Math.min(20, Math.floor((typeof p.octaves === "number") ? p.octaves : 6))),
+    lacunarity: (typeof p.lacunarity === "number") ? p.lacunarity : 2.0,
+    gain:       (typeof p.gain       === "number") ? p.gain       : 0.5,
+    ridges:     (typeof p.ridges     === "number") ? p.ridges     : 0
+  };
   // 6 faces: (n, tangent, bitangent). CCW winding viewed from outside
   // means tangent×bitangent must point outward (= +n). Per-face local
   // (u,v) sweeps [-1,1] across the face.
@@ -54502,14 +54548,26 @@ function _buildPlanet(node) {
         const sx = cx * Math.sqrt(Math.max(0, 1 - cyy * 0.5 - czz * 0.5 + cyy * czz / 3));
         const sy = cy * Math.sqrt(Math.max(0, 1 - cxx * 0.5 - czz * 0.5 + cxx * czz / 3));
         const sz = cz * Math.sqrt(Math.max(0, 1 - cxx * 0.5 - cyy * 0.5 + cxx * cyy / 3));
-        // sx² + sy² + sz² ≈ 1 (the warp lands on the unit sphere to
-        // f64 precision). Outward normal = the unit vector itself.
         const invLen = 1 / Math.max(1e-12, Math.sqrt(sx*sx + sy*sy + sz*sz));
         const ux = sx * invLen, uy = sy * invLen, uz = sz * invLen;
-        verts[vWrite++] = r * ux; verts[vWrite++] = r * uy; verts[vWrite++] = r * uz;
-        verts[vWrite++] = ux * 0.5 + 0.5;
-        verts[vWrite++] = uy * 0.5 + 0.5;
-        verts[vWrite++] = uz * 0.5 + 0.5;
+        // Phase 4.b -- sample 3D fBm on the unit sphere. Above
+        // seaLevel: radial displacement scaled by (h - seaLevel) /
+        // (1 - seaLevel) so the cutoff lies exactly at the sphere
+        // surface (= world-unit radius `r`). Below seaLevel: clamp
+        // to the ocean shell so the silhouette reads as a sphere
+        // with continents, not a spiky chestnut.
+        const h = (hs !== 0) ? _terrainFBM3D(ux, uy, uz, noiseDef) : 0;
+        let rad;
+        if (h <= seaLevel || hs === 0) {
+          rad = r;
+        } else {
+          const above = (h - seaLevel) / Math.max(1e-6, 1 - seaLevel);
+          rad = r + hs * above;
+        }
+        const col = (hs !== 0) ? _planetColorForHeight(h, seaLevel) :
+                                 [ux * 0.5 + 0.5, uy * 0.5 + 0.5, uz * 0.5 + 0.5];
+        verts[vWrite++] = rad * ux; verts[vWrite++] = rad * uy; verts[vWrite++] = rad * uz;
+        verts[vWrite++] = col[0]; verts[vWrite++] = col[1]; verts[vWrite++] = col[2];
         verts[vWrite++] = ux; verts[vWrite++] = uy; verts[vWrite++] = uz;
         verts[vWrite++] = u01; verts[vWrite++] = v01;
       }
@@ -54591,6 +54649,104 @@ function _terrainValueNoise(x, y, seed) {
   const cd = c + (d - c) * sx;
   return ab + (cd - ab) * sy;
 }
+/* §planet-spec Phase 4.b -- 3D analogues of _terrainHash /
+ * _terrainValueNoise / _terrainFBM. Same bit-mix hash + quintic
+ * interpolation, extended to a 3D lattice with 8-corner trilinear
+ * blend. Used by the Planet node to sample fBm on a unit sphere
+ * (rotationally symmetric, no face-seam concerns -- cuberact /
+ * Outerra / NMS all use 3D noise on the surface).
+ *
+ * Distinct prime for z (1597334677) keeps the bit-mix entropy across
+ * the new axis. Same Math.imul + unsigned shifts so the result is
+ * deterministic and matches a future WGSL port. */
+function _terrainHash3D(x, y, z, seed) {
+  const sx = x | 0;
+  const sy = y | 0;
+  const sz = z | 0;
+  const ss = (Math.floor(seed * 1000) | 0);
+  let h = Math.imul(sx, 374761393) ^ Math.imul(sy, 668265263) ^ Math.imul(sz, 1597334677) ^ Math.imul(ss, 2147483647);
+  h = h ^ (h >>> 13);
+  h = Math.imul(h, 1274126177);
+  h = h ^ (h >>> 16);
+  return (h >>> 0) / 4294967296;
+}
+function _terrainValueNoise3D(x, y, z, seed) {
+  const ix = Math.floor(x), iy = Math.floor(y), iz = Math.floor(z);
+  const fx = x - ix, fy = y - iy, fz = z - iz;
+  const c000 = _terrainHash3D(ix,     iy,     iz,     seed);
+  const c100 = _terrainHash3D(ix + 1, iy,     iz,     seed);
+  const c010 = _terrainHash3D(ix,     iy + 1, iz,     seed);
+  const c110 = _terrainHash3D(ix + 1, iy + 1, iz,     seed);
+  const c001 = _terrainHash3D(ix,     iy,     iz + 1, seed);
+  const c101 = _terrainHash3D(ix + 1, iy,     iz + 1, seed);
+  const c011 = _terrainHash3D(ix,     iy + 1, iz + 1, seed);
+  const c111 = _terrainHash3D(ix + 1, iy + 1, iz + 1, seed);
+  const sx = fx * fx * fx * (fx * (fx * 6 - 15) + 10);
+  const sy = fy * fy * fy * (fy * (fy * 6 - 15) + 10);
+  const sz = fz * fz * fz * (fz * (fz * 6 - 15) + 10);
+  const ab0 = c000 + (c100 - c000) * sx;
+  const cd0 = c010 + (c110 - c010) * sx;
+  const v0  = ab0  + (cd0  - ab0) * sy;
+  const ab1 = c001 + (c101 - c001) * sx;
+  const cd1 = c011 + (c111 - c011) * sx;
+  const v1  = ab1  + (cd1  - ab1) * sy;
+  return v0 + (v1 - v0) * sz;
+}
+function _terrainFBM3D(x, y, z, n) {
+  let px = x * Math.max(1e-9, n.frequency);
+  let py = y * Math.max(1e-9, n.frequency);
+  let pz = z * Math.max(1e-9, n.frequency);
+  const totalOctF = (typeof n.effectiveOctavesF === "number")
+    ? Math.max(0.0, Math.min(20, n.effectiveOctavesF))
+    : Math.max(1, Math.min(20, Math.floor(n.octaves)));
+  const fullOcts = Math.floor(totalOctF);
+  const frac = totalOctF - fullOcts;
+  const lac = (typeof n.lacunarity === "number") ? n.lacunarity : 2.0;
+  const gain = (typeof n.gain === "number") ? n.gain : 0.5;
+  const r = Math.max(0, Math.min(1, (typeof n.ridges === "number") ? n.ridges : 0));
+  let amp = 1.0, sum = 0.0, maxAmp = 0.0;
+  for (let i = 0; i < fullOcts; i++) {
+    let s = _terrainValueNoise3D(px, py, pz, n.seed);
+    const ridge = 1 - Math.abs(2 * s - 1);
+    s = s * (1 - r) + ridge * ridge * r;
+    sum += s * amp;
+    maxAmp += amp;
+    px *= lac; py *= lac; pz *= lac;
+    amp *= gain;
+  }
+  if (frac > 0) {
+    let s = _terrainValueNoise3D(px, py, pz, n.seed);
+    const ridge = 1 - Math.abs(2 * s - 1);
+    s = s * (1 - r) + ridge * ridge * r;
+    sum += s * amp * frac;
+    maxAmp += amp * frac;
+  }
+  return Math.max(0, Math.min(1, sum / Math.max(1e-6, maxAmp)));
+}
+
+/* §planet-spec Phase 4.b -- per-vertex terrain-palette color from
+ * normalized fBm height h ∈ [0, 1] and a seaLevel cutoff. Below
+ * seaLevel: deep-to-shallow ocean blue. Above: beach → vegetation
+ * → rock → snow gradient. Used by _buildPlanet so the heightfield
+ * reads under the unlit-vc shader without needing a material yet. */
+function _planetColorForHeight(h, seaLevel) {
+  if (h < seaLevel) {
+    const t = h / Math.max(1e-6, seaLevel);
+    return [0.03 + t * 0.07, 0.08 + t * 0.20, 0.28 + t * 0.32];
+  }
+  const t = (h - seaLevel) / Math.max(1e-6, 1 - seaLevel);
+  if (t < 0.06) return [0.85, 0.78, 0.55];
+  if (t < 0.60) {
+    const u = (t - 0.06) / 0.54;
+    return [0.20 + u * 0.18, 0.50 - u * 0.22, 0.15 + u * 0.04];
+  }
+  if (t < 0.85) {
+    const u = (t - 0.60) / 0.25;
+    return [0.35 + u * 0.22, 0.30 + u * 0.16, 0.20 + u * 0.10];
+  }
+  return [0.92, 0.94, 0.98];
+}
+
 function _terrainFBM(u, v, n) {
   // §planet-spec Phase 3 -- fBm with CONTINUOUS fractional octave
   // count. Caller sets n.effectiveOctavesF (a Number) to vary the
