@@ -10355,18 +10355,20 @@ public:
   },
 
   /* Phase 7 §5.5.f -- FPCamera. First-person camera for walking
-   * through terrain demos. Controls:
+   * through terrain demos AND flying around planets in 6DoF. Controls:
    *   WASD    move (W=forward, S=back, A/D=strafe)
-   *   IJKL    look (I/K=pitch, J/L=yaw) -- works WITHOUT pointer-lock
-   *   Mouse   look (additional, only after canvas click locks)
-   *   Space   up (fly mode only)
-   *   C/Ctrl  down (fly mode only)
+   *   IJKL    pitch + yaw (I/K=pitch, J/L=yaw) -- works WITHOUT lock
+   *   U/O     roll (flight mode only -- spacecraft-style)
+   *   Mouse   pitch + yaw (after canvas click locks)
+   *   Space   up (flight mode -- planet-radial if a planet's in patch)
+   *   C/Ctrl  down (flight mode -- planet-radial)
    *   Shift   sprint (×4)
-   * walkMode (default 1) locks posY to terrain surface + eyeHeight
-   * so the player walks ON the ground; set walkMode=0 for free flight.
-   * Output shape matches Camera (posX/Y/Z + targetX/Y/Z + fov + near
-   * + far) -- the tick computes target from yaw/pitch each frame
-   * so the Scene reads a standard Camera record. */
+   *   X/Z     +/- walkSpeed (geometric 4×/sec, [1 m/s, 50 km/s])
+   * walkMode (default 1) locks posY to terrain surface + eyeHeight.
+   * walkMode=0 is true 6DoF: forward+up basis on the node, all
+   * rotations are camera-local (proper spacecraft, no Euler gimbal
+   * snap). Output shape matches Camera (posX/Y/Z + targetX/Y/Z +
+   * upX/Y/Z + fov + near + far) so Scene reads a standard cam. */
   FPCamera: {
     category: "Visual", color: COLOR.visual, header: null,
     cppType: "",
@@ -10405,7 +10407,7 @@ public:
     },
     methods: {},
     uiOnlyParams: ["targetX", "targetY", "targetZ", "mode", "orthoSize", "upX", "upY", "upZ"],
-    description: "First-person camera. WASD walks (horizontal-only in walk mode), IJKL looks (no pointer-lock required -- works in theater mode too), Shift sprints (×4). Optional mouse-look: click the visual canvas to lock; ESC releases. walkMode (default 1) clamps posY to (terrainHeight + eyeHeight) by sampling the patch's first TiledTerrain, so the player stays ON the ground at any X / Z. Set walkMode=0 for free flight (Space rises, C / Ctrl descends). Output shape matches Camera so wire `camera` into a Scene like any other camera. Defaults: fov 75°, far 3000m, walkSpeed 10 m/s (≈ brisk run at 1 unit = 1 meter), eyeHeight 1.7 m. mouseSensitivity in radians per pixel (default 0.0025 = typical FPS feel). lookSpeed in radians/sec for IJKL (default 2.0)."
+    description: "First-person camera. WASD walks/strafes, IJKL pitch+yaw (no pointer-lock required), Shift sprints (×4). walkMode=1 (default) clamps posY to terrainHeight + eyeHeight by sampling the patch's first TiledTerrain. walkMode=0 is 6DoF spacecraft flight: U/O roll, Space/Ctrl move along planet-radial up/down (when a Planet/PlanetMesh/PlanetMap is in the patch -- world Y otherwise), all rotations are camera-local so there's no gimbal-lock when looking near 'up'. The flight orientation is carried as forward (= target - pos) + upX/Y/Z; demos can pre-set these to spawn the camera at any pose, e.g. tangent to a planet's equator. Optional mouse-look: click the canvas to lock; ESC releases. Output shape matches Camera (posX/Y/Z + targetX/Y/Z + upX/Y/Z + fov + near + far) so wire `camera` into a Scene like any other camera. Defaults: fov 75°, far 3000m, walkSpeed 10 m/s, eyeHeight 1.7 m. mouseSensitivity = radians/pixel (default 0.0025). lookSpeed = radians/sec for IJKL/UO (default 2.0)."
   },
 
   /* Phase 7 §5.5.g -- Minimap HUD node. First member of a planned
@@ -46903,13 +46905,58 @@ function _fpcSampleGroundY(wx, wz) {
        + y11 * fx       * fz;
 }
 
-/* Per-frame tick for FPCamera nodes. Reads accumulated mouse delta
- * (when pointer-locked) + held WASD/IJKL/Space/Shift keys from
- * Visual.fpcInput, integrates yaw / pitch + position, and writes
- * back targetX/Y/Z so _evaluateCamera reads the same shape as
- * Camera. Walk mode locks posY to (terrainHeight + eyeHeight) so
- * the player stays on the ground; fly mode is the older free-flight
- * behavior. */
+/* Helper: find the first planet-like node in the patch + return its
+ * center / radius so flight-mode Space/C can move radially and the
+ * altimeter / minimap can do globe math. Returns null if no planet
+ * present (terrain-only patches). */
+function _findPlanetInfo() {
+  if (!state || !Array.isArray(state.nodes)) return null;
+  let pNode = null;
+  let pMap = null;
+  for (const n of state.nodes) {
+    if (!n) continue;
+    if (n.type === "PlanetMesh" || n.type === "Planet") { if (!pNode) pNode = n; }
+    else if (n.type === "PlanetMap") { if (!pMap) pMap = n; }
+  }
+  const src = pNode || pMap;
+  if (!src) return null;
+  const pr = src.params || {};
+  const r = (typeof pr.radius === "number") ? pr.radius : 0;
+  if (r <= 0) return null;
+  return {
+    centerX:     (typeof pr.centerX === "number") ? pr.centerX : 0,
+    centerY:     (typeof pr.centerY === "number") ? pr.centerY : 0,
+    centerZ:     (typeof pr.centerZ === "number") ? pr.centerZ : 0,
+    radius:      r,
+    polRatio:    (typeof pr.polarRadiusRatio === "number") ? pr.polarRadiusRatio : 1,
+    heightScale: (typeof pr.heightScale === "number") ? pr.heightScale : 0,
+    seaLevel:    (typeof pr.seaLevel === "number") ? pr.seaLevel : 0,
+    // PlanetMap-bearing node for heightmap sampling. May not have
+    // built its cells yet -- callers check pMap._cells before using.
+    mapNode:     pMap
+  };
+}
+
+/* Helper: radial-up unit vector at world position p, relative to the
+ * patch's planet. Used by flight-mode Space/C ("up" = away from
+ * planet) and by initial-orientation math. Returns null if no
+ * planet in the patch. */
+function _planetRadialUp(px, py, pz) {
+  const pl = _findPlanetInfo();
+  if (!pl) return null;
+  const dx = px - pl.centerX, dy = py - pl.centerY, dz = pz - pl.centerZ;
+  const r = Math.hypot(dx, dy, dz);
+  if (r < 1e-6) return null;
+  return [dx / r, dy / r, dz / r];
+}
+
+/* Per-frame tick for FPCamera nodes. Walk mode keeps the older
+ * yaw+pitch Euler controls and locks posY to terrain + eyeHeight.
+ * Flight mode uses true 6DoF: forward + up basis vectors stored
+ * on the node (upX/Y/Z) + derived right, rotated incrementally
+ * by I/K (pitch), J/L (yaw), U/O (roll). Space/C move along the
+ * planet-radial direction when a planet is in the patch, falling
+ * back to world Y otherwise. */
 function _tickFPCameras(dt) {
   if (!state || !Array.isArray(state.nodes)) return;
   const input = Visual.fpcInput;
@@ -46919,115 +46966,239 @@ function _tickFPCameras(dt) {
   for (const node of state.nodes) {
     if (!node || node.type !== "FPCamera") continue;
     const p = node.params = node.params || {};
-    let yaw   = (typeof p.yaw   === "number") ? p.yaw   : 0;
-    let pitch = (typeof p.pitch === "number") ? p.pitch : 0;
-    const sens     = (typeof p.mouseSensitivity === "number") ? p.mouseSensitivity : 0.0025;
-    // §5.5.h-27 -- X = speed up, Z = slow down. Hold either to
-    // continuously adjust walkSpeed (geometric 4×/sec change),
-    // clamped to [1 m/s, 50 km/s]. Mouse is reserved for the
-    // theater cam so we use keyboard for live speed instead.
-    if (k && (k.has("KeyX") || k.has("KeyZ"))) {
-      const cur = (typeof p.walkSpeed === "number") ? p.walkSpeed : 12;
-      const rate = Math.pow(4, dt);
-      const factor = k.has("KeyX") ? rate : (1 / rate);
-      p.walkSpeed = Math.max(1, Math.min(50000, cur * factor));
-    }
-    const speed    = (typeof p.walkSpeed        === "number") ? p.walkSpeed        : 12;
-    const lookRate = (typeof p.lookSpeed        === "number") ? p.lookSpeed        : 2.0;
-    const eyeH     = (typeof p.eyeHeight        === "number") ? p.eyeHeight        : 1.7;
-    const walkMode = (typeof p.walkMode         === "number") ? (p.walkMode >= 0.5) : true;
-
-    // Mouse-look (only when pointer-locked).
-    if (input.pointerLocked) {
-      yaw   -= input.mouseDx * sens;
-      pitch -= input.mouseDy * sens;
-    }
-    // Keyboard look (IJKL). Signs match the mouse direction so
-    // both controls feel consistent: J = mouse-left, L = mouse-
-    // right, I = mouse-up, K = mouse-down.
-    if (k.has("KeyJ")) yaw   += lookRate * dt;
-    if (k.has("KeyL")) yaw   -= lookRate * dt;
-    if (k.has("KeyI")) pitch += lookRate * dt;
-    if (k.has("KeyK")) pitch -= lookRate * dt;
-
-    const lim = Math.PI * 0.49;
-    if (pitch >  lim) pitch =  lim;
-    if (pitch < -lim) pitch = -lim;
-
-    // Forward + right vectors. yaw=0 looks toward +Z.
-    const cy = Math.cos(yaw),   sy = Math.sin(yaw);
-    const cp = Math.cos(pitch), sp = Math.sin(pitch);
-    const fx = sy * cp, fy = sp, fz = cy * cp;
-    const rx = cy,      ry = 0,  rz = -sy;
-
-    // Movement. In walk mode forward is HORIZONTAL only (looking up
-    // doesn't make you fly up) and Space / C are ignored; the Y
-    // axis is clamped to terrain + eyeHeight below.
-    let dx = 0, dy = 0, dz = 0;
-    if (walkMode) {
-      const hfLen = Math.sqrt(fx * fx + fz * fz) || 1;
-      const hfx = fx / hfLen, hfz = fz / hfLen;
-      if (k.has("KeyW")) { dx += hfx; dz += hfz; }
-      if (k.has("KeyS")) { dx -= hfx; dz -= hfz; }
-      if (k.has("KeyD")) { dx += rx;  dz += rz;  }
-      if (k.has("KeyA")) { dx -= rx;  dz -= rz;  }
-    } else {
-      if (k.has("KeyW")) { dx += fx; dy += fy; dz += fz; }
-      if (k.has("KeyS")) { dx -= fx; dy -= fy; dz -= fz; }
-      if (k.has("KeyD")) { dx += rx; dy += ry; dz += rz; }
-      if (k.has("KeyA")) { dx -= rx; dy -= ry; dz -= rz; }
-      if (k.has("Space")) { dy += 1; }
-      if (k.has("KeyC") || k.has("ControlLeft") || k.has("ControlRight")) { dy -= 1; }
-    }
-    const sprint = (k.has("ShiftLeft") || k.has("ShiftRight")) ? 4 : 1;
-
-    let px = (typeof p.posX === "number") ? p.posX : 0;
-    let py = (typeof p.posY === "number") ? p.posY : 2;
-    let pz = (typeof p.posZ === "number") ? p.posZ : 0;
-    const l = Math.hypot(dx, dy, dz);
-    if (l > 0.0001) {
-      const step = speed * sprint * dt;
-      px += (dx / l) * step;
-      py += (dy / l) * step;
-      pz += (dz / l) * step;
-    }
-
-    // §5.5.f-2 -- track player's WALKING direction (low-pass filtered
-    // 2D unit vector in XZ plane). Used by TiledTerrain forwardBias
-    // to shift the loaded disc in the direction the player is moving,
-    // NOT the direction they're looking. So turning your head doesn't
-    // reload chunks. The smoothing time constant (~0.7s) is also a
-    // natural form of hysteresis -- the bias direction only crosses
-    // a 45° quantum after the player has been moving that way for a
-    // while.
-    const horizMoveLen = Math.hypot(dx, dz);
-    if (horizMoveLen > 0.001) {
-      const ndx = dx / horizMoveLen, ndz = dz / horizMoveLen;
-      const tcFactor = Math.min(1, dt * 1.5);   // 1/τ ≈ 1.5 → τ ≈ 0.67s
-      const wdx0 = (typeof p.walkDirX === "number") ? p.walkDirX : ndx;
-      const wdz0 = (typeof p.walkDirZ === "number") ? p.walkDirZ : ndz;
-      p.walkDirX = wdx0 + (ndx - wdx0) * tcFactor;
-      p.walkDirZ = wdz0 + (ndz - wdz0) * tcFactor;
-    }
-    // (No update when stationary -- keep last walk direction so the
-    // disc stays put while the player pauses or looks around.)
-
-    // Walk mode: lock Y to terrain surface + eyeHeight, sampled
-    // from the patch's first TiledTerrain. Falls through (keeps
-    // computed py) when no terrain is wired.
-    if (walkMode) {
-      const groundY = _fpcSampleGroundY(px, pz);
-      if (groundY !== null) py = groundY + eyeH;
-    }
-
-    p.posX = px; p.posY = py; p.posZ = pz;
-    p.yaw  = yaw; p.pitch = pitch;
-    p.targetX = px + fx;
-    p.targetY = py + fy;
-    p.targetZ = pz + fz;
+    const walkMode = (typeof p.walkMode === "number") ? (p.walkMode >= 0.5) : true;
+    if (walkMode) _tickFPCameraWalk(node, p, dt, input, k);
+    else          _tickFPCameraFlight(node, p, dt, input, k);
   }
   input.mouseDx = 0;
   input.mouseDy = 0;
+}
+
+function _tickFPCameraWalk(node, p, dt, input, k) {
+  let yaw   = (typeof p.yaw   === "number") ? p.yaw   : 0;
+  let pitch = (typeof p.pitch === "number") ? p.pitch : 0;
+  const sens     = (typeof p.mouseSensitivity === "number") ? p.mouseSensitivity : 0.0025;
+  if (k && (k.has("KeyX") || k.has("KeyZ"))) {
+    const cur = (typeof p.walkSpeed === "number") ? p.walkSpeed : 12;
+    const rate = Math.pow(4, dt);
+    const factor = k.has("KeyX") ? rate : (1 / rate);
+    p.walkSpeed = Math.max(1, Math.min(50000, cur * factor));
+  }
+  const speed    = (typeof p.walkSpeed        === "number") ? p.walkSpeed        : 12;
+  const lookRate = (typeof p.lookSpeed        === "number") ? p.lookSpeed        : 2.0;
+  const eyeH     = (typeof p.eyeHeight        === "number") ? p.eyeHeight        : 1.7;
+
+  if (input.pointerLocked) {
+    yaw   -= input.mouseDx * sens;
+    pitch -= input.mouseDy * sens;
+  }
+  if (k.has("KeyJ")) yaw   += lookRate * dt;
+  if (k.has("KeyL")) yaw   -= lookRate * dt;
+  if (k.has("KeyI")) pitch += lookRate * dt;
+  if (k.has("KeyK")) pitch -= lookRate * dt;
+  const lim = Math.PI * 0.49;
+  if (pitch >  lim) pitch =  lim;
+  if (pitch < -lim) pitch = -lim;
+
+  const cy = Math.cos(yaw),   sy = Math.sin(yaw);
+  const cp = Math.cos(pitch), sp = Math.sin(pitch);
+  const fx = sy * cp, fy = sp, fz = cy * cp;
+  const rx = cy,      ry = 0,  rz = -sy;
+
+  let dx = 0, dz = 0;
+  const hfLen = Math.sqrt(fx * fx + fz * fz) || 1;
+  const hfx = fx / hfLen, hfz = fz / hfLen;
+  if (k.has("KeyW")) { dx += hfx; dz += hfz; }
+  if (k.has("KeyS")) { dx -= hfx; dz -= hfz; }
+  if (k.has("KeyD")) { dx += rx;  dz += rz;  }
+  if (k.has("KeyA")) { dx -= rx;  dz -= rz;  }
+  const sprint = (k.has("ShiftLeft") || k.has("ShiftRight")) ? 4 : 1;
+
+  let px = (typeof p.posX === "number") ? p.posX : 0;
+  let py = (typeof p.posY === "number") ? p.posY : 2;
+  let pz = (typeof p.posZ === "number") ? p.posZ : 0;
+  const l = Math.hypot(dx, 0, dz);
+  if (l > 0.0001) {
+    const step = speed * sprint * dt;
+    px += (dx / l) * step;
+    pz += (dz / l) * step;
+  }
+  const horizMoveLen = Math.hypot(dx, dz);
+  if (horizMoveLen > 0.001) {
+    const ndx = dx / horizMoveLen, ndz = dz / horizMoveLen;
+    const tcFactor = Math.min(1, dt * 1.5);
+    const wdx0 = (typeof p.walkDirX === "number") ? p.walkDirX : ndx;
+    const wdz0 = (typeof p.walkDirZ === "number") ? p.walkDirZ : ndz;
+    p.walkDirX = wdx0 + (ndx - wdx0) * tcFactor;
+    p.walkDirZ = wdz0 + (ndz - wdz0) * tcFactor;
+  }
+  const groundY = _fpcSampleGroundY(px, pz);
+  if (groundY !== null) py = groundY + eyeH;
+
+  p.posX = px; p.posY = py; p.posZ = pz;
+  p.yaw  = yaw; p.pitch = pitch;
+  p.targetX = px + fx;
+  p.targetY = py + fy;
+  p.targetZ = pz + fz;
+  p.upX = 0; p.upY = 1; p.upZ = 0;
+}
+
+/* Rodrigues rotation of vector v around unit axis (ax, ay, az) by
+ * angle a. Returns [vx', vy', vz'] in-place-safe (reads v first).
+ * When axis is perpendicular to v (the common case for our basis
+ * rotations) the formula simplifies, but we keep the general form. */
+function _rotAroundUnit(vx, vy, vz, ax, ay, az, a) {
+  const c = Math.cos(a), s = Math.sin(a);
+  const omc = 1 - c;
+  const d = ax*vx + ay*vy + az*vz;
+  const cx = ay*vz - az*vy;
+  const cy = az*vx - ax*vz;
+  const cz = ax*vy - ay*vx;
+  return [
+    vx*c + cx*s + ax*d*omc,
+    vy*c + cy*s + ay*d*omc,
+    vz*c + cz*s + az*d*omc
+  ];
+}
+
+function _tickFPCameraFlight(node, p, dt, input, k) {
+  const sens     = (typeof p.mouseSensitivity === "number") ? p.mouseSensitivity : 0.0025;
+  if (k && (k.has("KeyX") || k.has("KeyZ"))) {
+    const cur = (typeof p.walkSpeed === "number") ? p.walkSpeed : 12;
+    const rate = Math.pow(4, dt);
+    const factor = k.has("KeyX") ? rate : (1 / rate);
+    p.walkSpeed = Math.max(1, Math.min(50000, cur * factor));
+  }
+  const speed    = (typeof p.walkSpeed        === "number") ? p.walkSpeed        : 12;
+  const lookRate = (typeof p.lookSpeed        === "number") ? p.lookSpeed        : 2.0;
+
+  let px = (typeof p.posX === "number") ? p.posX : 0;
+  let py = (typeof p.posY === "number") ? p.posY : 2;
+  let pz = (typeof p.posZ === "number") ? p.posZ : 0;
+
+  // Build current basis (forward, up). If a meaningful target +
+  // upX/Y/Z exist on the params (set by the demo OR carried from
+  // the prior tick), use them directly -- they ARE the orientation.
+  // Otherwise derive from yaw/pitch + world up (first tick after
+  // entering flight mode from walk, or fresh node).
+  let fx, fy, fz, ux, uy, uz;
+  const tdx = (typeof p.targetX === "number" ? p.targetX : 0) - px;
+  const tdy = (typeof p.targetY === "number" ? p.targetY : 0) - py;
+  const tdz = (typeof p.targetZ === "number" ? p.targetZ : 1) - pz;
+  const tLen = Math.hypot(tdx, tdy, tdz);
+  const hasUp = (typeof p.upX === "number" && typeof p.upY === "number" && typeof p.upZ === "number")
+                && (Math.abs(p.upX) + Math.abs(p.upY) + Math.abs(p.upZ) > 1e-6);
+  if (tLen > 1e-6 && hasUp) {
+    fx = tdx / tLen; fy = tdy / tLen; fz = tdz / tLen;
+    const uLen = Math.hypot(p.upX, p.upY, p.upZ) || 1;
+    ux = p.upX / uLen; uy = p.upY / uLen; uz = p.upZ / uLen;
+  } else {
+    const yaw   = (typeof p.yaw   === "number") ? p.yaw   : 0;
+    const pitch = (typeof p.pitch === "number") ? p.pitch : 0;
+    const cy = Math.cos(yaw),   sy = Math.sin(yaw);
+    const cp = Math.cos(pitch), sp = Math.sin(pitch);
+    fx = sy * cp; fy = sp; fz = cy * cp;
+    ux = 0; uy = 1; uz = 0;
+  }
+  // Gram-Schmidt to enforce orthogonality up front.
+  {
+    const fl = Math.hypot(fx, fy, fz) || 1;
+    fx /= fl; fy /= fl; fz /= fl;
+    const fu = fx*ux + fy*uy + fz*uz;
+    ux -= fx * fu; uy -= fy * fu; uz -= fz * fu;
+    const ul = Math.hypot(ux, uy, uz);
+    if (ul < 1e-6) { ux = 0; uy = 1; uz = 0; }
+    else { ux /= ul; uy /= ul; uz /= ul; }
+  }
+  // Right = up × forward (right-handed; at yaw=0 with up=+Y gives +X).
+  let rx = uy*fz - uz*fy, ry = uz*fx - ux*fz, rz = ux*fy - uy*fx;
+
+  // Rotation deltas
+  let pitchD = 0, yawD = 0, rollD = 0;
+  if (input.pointerLocked) {
+    pitchD -= input.mouseDy * sens;
+    yawD   -= input.mouseDx * sens;
+  }
+  if (k.has("KeyI")) pitchD += lookRate * dt;
+  if (k.has("KeyK")) pitchD -= lookRate * dt;
+  if (k.has("KeyJ")) yawD   += lookRate * dt;
+  if (k.has("KeyL")) yawD   -= lookRate * dt;
+  if (k.has("KeyU")) rollD  += lookRate * dt;
+  if (k.has("KeyO")) rollD  -= lookRate * dt;
+
+  // Pitch: rotate forward + up around right.
+  if (pitchD !== 0) {
+    const r1 = _rotAroundUnit(fx, fy, fz, rx, ry, rz, pitchD);
+    fx = r1[0]; fy = r1[1]; fz = r1[2];
+    const r2 = _rotAroundUnit(ux, uy, uz, rx, ry, rz, pitchD);
+    ux = r2[0]; uy = r2[1]; uz = r2[2];
+  }
+  // Yaw: rotate forward + right around up.
+  if (yawD !== 0) {
+    const r1 = _rotAroundUnit(fx, fy, fz, ux, uy, uz, yawD);
+    fx = r1[0]; fy = r1[1]; fz = r1[2];
+    rx = uy*fz - uz*fy; ry = uz*fx - ux*fz; rz = ux*fy - uy*fx;
+  }
+  // Roll: rotate up + right around forward.
+  if (rollD !== 0) {
+    const r1 = _rotAroundUnit(ux, uy, uz, fx, fy, fz, rollD);
+    ux = r1[0]; uy = r1[1]; uz = r1[2];
+    rx = uy*fz - uz*fy; ry = uz*fx - ux*fz; rz = ux*fy - uy*fx;
+  }
+  // Re-normalize against drift.
+  {
+    const fl = Math.hypot(fx, fy, fz) || 1; fx/=fl; fy/=fl; fz/=fl;
+    const fu = fx*ux + fy*uy + fz*uz;
+    ux -= fx*fu; uy -= fy*fu; uz -= fz*fu;
+    const ul = Math.hypot(ux, uy, uz) || 1; ux/=ul; uy/=ul; uz/=ul;
+    rx = uy*fz - uz*fy; ry = uz*fx - ux*fz; rz = ux*fy - uy*fx;
+  }
+
+  // Movement: WASD along forward/right; Space/C along planet-radial.
+  let dx = 0, dy = 0, dz = 0;
+  if (k.has("KeyW")) { dx += fx; dy += fy; dz += fz; }
+  if (k.has("KeyS")) { dx -= fx; dy -= fy; dz -= fz; }
+  if (k.has("KeyD")) { dx += rx; dy += ry; dz += rz; }
+  if (k.has("KeyA")) { dx -= rx; dy -= ry; dz -= rz; }
+  const wantUp   = k.has("Space");
+  const wantDown = k.has("KeyC") || k.has("ControlLeft") || k.has("ControlRight");
+  if (wantUp || wantDown) {
+    const sign = wantUp ? 1 : -1;
+    const pUp = _planetRadialUp(px, py, pz);
+    if (pUp) { dx += sign*pUp[0]; dy += sign*pUp[1]; dz += sign*pUp[2]; }
+    else     { dy += sign; }
+  }
+  const sprint = (k.has("ShiftLeft") || k.has("ShiftRight")) ? 4 : 1;
+  const l = Math.hypot(dx, dy, dz);
+  if (l > 0.0001) {
+    const step = speed * sprint * dt;
+    px += (dx / l) * step;
+    py += (dy / l) * step;
+    pz += (dz / l) * step;
+  }
+
+  // Walk-dir tracking (used by TiledTerrain forwardBias; planet
+  // ignores it but harmless to keep updated for mixed patches).
+  const horizMoveLen = Math.hypot(dx, dz);
+  if (horizMoveLen > 0.001) {
+    const ndx = dx / horizMoveLen, ndz = dz / horizMoveLen;
+    const tcFactor = Math.min(1, dt * 1.5);
+    const wdx0 = (typeof p.walkDirX === "number") ? p.walkDirX : ndx;
+    const wdz0 = (typeof p.walkDirZ === "number") ? p.walkDirZ : ndz;
+    p.walkDirX = wdx0 + (ndx - wdx0) * tcFactor;
+    p.walkDirZ = wdz0 + (ndz - wdz0) * tcFactor;
+  }
+
+  p.posX = px; p.posY = py; p.posZ = pz;
+  p.targetX = px + fx;
+  p.targetY = py + fy;
+  p.targetZ = pz + fz;
+  p.upX = ux; p.upY = uy; p.upZ = uz;
+  // Derive yaw/pitch from forward for display continuity. Roll is
+  // implicit in the up vector and not extracted; switching back to
+  // walk mode flattens up to world +Y.
+  p.pitch = Math.asin(Math.max(-1, Math.min(1, fy)));
+  p.yaw   = Math.atan2(fx, fz);
 }
 
 /* Phase 7 §5.5.g -- Minimap HUD node renderer. Driven by the
