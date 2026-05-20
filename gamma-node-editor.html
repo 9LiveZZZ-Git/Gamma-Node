@@ -11001,7 +11001,9 @@ public:
       { n: "octaves",       t: "param" },
       { n: "curveAltLow",   t: "param" },
       { n: "curveAltHigh",  t: "param" },
-      { n: "planetRadius",  t: "param" }
+      { n: "planetRadius",  t: "param" },
+      { n: "visAltLow",     t: "param" },
+      { n: "visAltHigh",    t: "param" }
     ],
     outs: [{ n: "mesh", t: "mesh" }],
     params: {
@@ -11027,7 +11029,16 @@ public:
       // ~20km altitude), but the user can crank these back up.
       curveAltLow:    1000,
       curveAltHigh:   25000,
-      planetRadius:   6378000
+      planetRadius:   6378000,
+      // §planet-spec Phase 1.5 -- visibility gate. The impostor is a
+      // coarse low-poly mesh that's only useful as a far-distance
+      // "planet from above" backdrop. At low altitude it looks like
+      // a flat tiled plane stretching to the horizon and ruins the
+      // chunked-terrain view. fs_horizon discards every fragment
+      // below visAltLow; fades in over [visAltLow, visAltHigh].
+      // Default 60km..100km: invisible until orbital altitude.
+      visAltLow:      60000,
+      visAltHigh:     100000
     },
     methods: {},
     description: "Low-poly terrain impostor that extends visible coverage past TiledTerrain's chunked disc out to ~50km from the camera. Auto-detects the patch's TiledTerrain and samples the same noise (capped at `octaves`, no erosion) so big-shape silhouettes match the chunked disc at the inner-edge meeting line. Macro-tile camera-follow (default 10km) keeps the mesh roughly centered without per-frame rebuilds. Per-vertex altitude colors baked in so it renders unlit-vc with no material wire needed. `yBias` is a small downward offset (default -0.5m) so the chunked terrain wins the depth test in the overlap zone."
@@ -32838,7 +32849,13 @@ const _demos = [
         noiseFreqScale: 0.05,
         curveAltLow:    1000,
         curveAltHigh:   25000,
-        planetRadius:   6378000
+        planetRadius:   6378000,
+        // §planet-spec Phase 1.5 -- impostor only visible past 60km
+        // altitude (full visibility by 100km). Below that the
+        // chunked TiledTerrain disc + sky alone fill the view; the
+        // coarse impostor doesn't interfere with the ground view.
+        visAltLow:      60000,
+        visAltHigh:     100000
       });
       const clouds = makeNode("Clouds3D", 40, 680, {
         // §5.5.h-18 -- chunked cloud streaming with rounded tops AND
@@ -52878,10 +52895,21 @@ fn fs_horizon(in: VsOut) -> @location(0) vec4<f32> {
   let sunK     = max(0.0, uD.matParams.w);
 
   let camPos = uS.eye.xyz;
+
+  // §planet-spec Phase 1.5 -- altitude visibility gate. The
+  // impostor is coarse / tiled-looking and only useful as a far-
+  // distance backdrop. Hide it entirely below visAltLow; fade in
+  // over [visAltLow, visAltHigh]. band1.w = visAltLow,
+  // band2.x = visAltHigh.
+  let visAltLow  = uD.band1.w;
+  let visAltHigh = max(visAltLow + 1.0, uD.band2.x);
+  let altVis = smoothstep(visAltLow, visAltHigh, camPos.y);
+  if (altVis <= 0.001) { discard; }
+
   let dxz = in.worldPos.xz - camPos.xz;
   let r = length(dxz);
   if (r < innerR) { discard; }
-  let fadeIn = clamp((r - innerR) / fadeW, 0.0, 1.0);
+  let fadeIn = clamp((r - innerR) / fadeW, 0.0, 1.0) * altVis;
 
   let n = normalize(in.normal);
   let sunDir = uS.envSun.xyz;
@@ -54045,6 +54073,10 @@ function _meshCacheKey(node) {
         ? state.nodes.find(n => n && n.type === "TiledTerrain") : null;
       const ttp = (tt && tt.params) || {};
       const ip  = tt ? _findTiledIslandParams(tt) : null;
+      // §planet-spec Phase 1.5 -- visAltLow/visAltHigh DON'T need to
+      // be in the cache key (the mesh geometry is identical at any
+      // altitude; only the fragment shader's discard threshold
+      // changes, and that's a per-frame uniform).
       return "thr:" + [
         p.extent, p.subdivisions, p.tileSize, p.yBias, p.octaves, p.noiseFreqScale,
         tile.tx, tile.tz,
@@ -56475,11 +56507,16 @@ function _encodeScenePass(enc, entry) {
       // §5.5.h-25 -- planet curvature params for vs_horizon. Read
       // from the TerrainHorizon node's own params with sensible
       // defaults; band1.xyz = (altLow, altHigh, planetRadius).
+      // §planet-spec Phase 1.5 -- band1.w = visAltLow, band2.x =
+      // visAltHigh. fs_horizon discards fragments at camera Y below
+      // visAltLow and fades in over [visAltLow, visAltHigh].
       const hp = (m.node && m.node.params) || {};
-      inst.drawScratch[24] = (typeof hp.curveAltLow      === "number") ? hp.curveAltLow      : 2000;
-      inst.drawScratch[25] = (typeof hp.curveAltHigh     === "number") ? hp.curveAltHigh     : 8000;
-      inst.drawScratch[26] = (typeof hp.planetRadius     === "number") ? hp.planetRadius     : 200000;
-      inst.drawScratch[27] = 0;
+      inst.drawScratch[24] = (typeof hp.curveAltLow  === "number") ? hp.curveAltLow  : 2000;
+      inst.drawScratch[25] = (typeof hp.curveAltHigh === "number") ? hp.curveAltHigh : 8000;
+      inst.drawScratch[26] = (typeof hp.planetRadius === "number") ? hp.planetRadius : 200000;
+      inst.drawScratch[27] = (typeof hp.visAltLow    === "number") ? hp.visAltLow    : 60000;
+      inst.drawScratch[28] = (typeof hp.visAltHigh   === "number") ? hp.visAltHigh   : 100000;
+      inst.drawScratch[29] = 0; inst.drawScratch[30] = 0; inst.drawScratch[31] = 0;
     }
     // Phase 7 §5.5.c -- TerrainMaterial uses the extended band
     // slots [24..39] and reinterprets matParams as
