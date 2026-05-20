@@ -56177,6 +56177,224 @@ function _ensurePlanetMapCells(node) {
   return cells;
 }
 
+/* §planet-spec Phase 7.e -- biome system, ported from Azgaar's
+ * Fantasy Map Generator (ref-azgaar-fmg/src/modules/biomes.ts +
+ * public/main.js calculateTemperatures + generatePrecipitation).
+ *
+ * Pipeline:
+ *   1. Temperature: latitude-based sea-level temp (tropical /
+ *      mid-lat / polar gradients, Azgaar's constants) minus altitude
+ *      lapse (6.5°C / km, capped at a climate-realistic 9km peak so
+ *      heightScale exaggeration doesn't break the formula).
+ *   2. Precipitation: spherical wind-pass sim. Cells grouped into 5°
+ *      latitude bands, sorted by longitude, walked west→east with
+ *      Azgaar's getPrecipitation logic (humidity pickup over water,
+ *      orographic rainshadow on mountains, latitude-band modifier
+ *      table). Skips Azgaar's east-flowing winds for now -- one
+ *      direction gives ~90% of the realism.
+ *   3. Biome lookup: Azgaar's 5×26 biomesMatrix indexed by moisture
+ *      band (0..4) × temperature band (clamp(20 - T, 0, 25)).
+ *      Special cases: marine (h<seaLevel), glacier (T<-5°C),
+ *      hot desert (T≥25°C, no river, moisture<8), wetland
+ *      (high moisture at low altitude).
+ *
+ * Output: cells.temp (Float32), cells.prec (Float32), cells.biome
+ * (Uint8). Caller renders by biome color. */
+
+const PLANET_BIOMES_NAMES = [
+  "Marine", "Hot desert", "Cold desert", "Savanna", "Grassland",
+  "Tropical seasonal forest", "Temperate deciduous forest",
+  "Tropical rainforest", "Temperate rainforest", "Taiga",
+  "Tundra", "Glacier", "Wetland"
+];
+
+// Azgaar's hex colors parsed to [r,g,b] floats. Order matches getId().
+const PLANET_BIOMES_COLORS = [
+  [0.275, 0.431, 0.671],  // 0  Marine             #466eab
+  [0.984, 0.906, 0.624],  // 1  Hot desert         #fbe79f
+  [0.710, 0.722, 0.529],  // 2  Cold desert        #b5b887
+  [0.824, 0.816, 0.510],  // 3  Savanna            #d2d082
+  [0.784, 0.839, 0.561],  // 4  Grassland          #c8d68f
+  [0.714, 0.851, 0.365],  // 5  Trop seasonal      #b6d95d
+  [0.161, 0.737, 0.337],  // 6  Temperate deci     #29bc56
+  [0.490, 0.796, 0.208],  // 7  Tropical rainf     #7dcb35
+  [0.251, 0.612, 0.263],  // 8  Temperate rainf    #409c43
+  [0.294, 0.420, 0.196],  // 9  Taiga              #4b6b32
+  [0.588, 0.471, 0.294],  // 10 Tundra             #96784b
+  [0.835, 0.906, 0.922],  // 11 Glacier            #d5e7eb
+  [0.043, 0.569, 0.192]   // 12 Wetland            #0b9131
+];
+
+// Azgaar's biomesMatrix verbatim. rows = moisture band (0..4),
+// cols = temperature band (0..25; col = clamp(20 - T, 0, 25)).
+const PLANET_BIOMES_MATRIX = [
+  [1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,10],
+  [3,3,3,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,9,9,9,9,10,10,10],
+  [5,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,9,9,9,9,9,10,10,10],
+  [5,6,6,6,6,6,6,8,8,8,8,8,8,8,8,8,8,9,9,9,9,9,9,10,10,10],
+  [7,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,9,9,9,9,9,9,9,10,10]
+];
+
+function _planetBiomeId(temperature, moisture, h, seaLevel, hasRiver) {
+  if (h < seaLevel) return 0;                     // marine
+  if (temperature < -5) return 11;                // glacier
+  if (temperature >= 25 && !hasRiver && moisture < 8) return 1;  // hot desert
+  // Wetland: high moisture at low elevation (Azgaar's two-condition test).
+  if (temperature > -2) {
+    if (moisture > 40 && h < seaLevel + 0.05) return 12;
+    if (moisture > 24 && h > seaLevel + 0.05 && h < seaLevel + 0.4) return 12;
+  }
+  const moistBand = Math.min(Math.floor(moisture / 5), 4);
+  const tempBand = Math.max(0, Math.min(25, 20 - Math.floor(temperature)));
+  return PLANET_BIOMES_MATRIX[moistBand][tempBand];
+}
+
+/* Compute climate (temp, prec, biome) for every cell on the planet.
+ * One-shot; caller should cache via a key that mixes cells.elevations
+ * + seaLevel so painter edits trigger a re-compute. */
+function _planetClimate(cells, seaLevel) {
+  const N = cells.count;
+  if (!cells.temp || cells.temp.length !== N) cells.temp = new Float32Array(N);
+  if (!cells.prec || cells.prec.length !== N) cells.prec = new Float32Array(N);
+  if (!cells.biome || cells.biome.length !== N) cells.biome = new Uint8Array(N);
+
+  // --- Pass 1: temperature per cell (Azgaar calculateTemperatures). ---
+  // Earth-realistic constants (Azgaar's defaults: 27°C equator,
+  // -30°C N pole, -15°C S pole).
+  const T_EQ = 27, T_NP = -30, T_SP = -15;
+  const TROPIC_N = 16, TROPIC_S = -20, TROP_GRAD = 0.15;
+  const tempNT = T_EQ - TROPIC_N * TROP_GRAD;
+  const tempST = T_EQ + TROPIC_S * TROP_GRAD;
+  const northGrad = (tempNT - T_NP) / (90 - TROPIC_N);
+  const southGrad = (tempST - T_SP) / (90 + TROPIC_S);
+  // Climate-realistic max altitude in meters for the lapse rate --
+  // independent of PlanetMesh.heightScale so exaggerated relief
+  // doesn't make peaks read as -1000°C.
+  const CLIMATE_PEAK_M = 9000;
+  const LAPSE_PER_M = 6.5 / 1000;  // 6.5°C per km
+
+  for (let i = 0; i < N; i++) {
+    const y = cells.positions[i * 3 + 1];
+    const lat = Math.asin(Math.max(-1, Math.min(1, y))) * 180 / Math.PI;
+    let seaT;
+    if (lat <= 16 && lat >= -20) {
+      seaT = T_EQ - Math.abs(lat) * TROP_GRAD;
+    } else if (lat > 0) {
+      seaT = tempNT - (lat - TROPIC_N) * northGrad;
+    } else {
+      seaT = tempST + (lat - TROPIC_S) * southGrad;
+    }
+    const h = cells.elevations[i];
+    let altM = 0;
+    if (h > seaLevel) {
+      altM = CLIMATE_PEAK_M * (h - seaLevel) / Math.max(1e-6, 1 - seaLevel);
+    }
+    cells.temp[i] = seaT - altM * LAPSE_PER_M;
+  }
+
+  // --- Pass 2: precipitation (Azgaar generatePrecipitation, sphere). ---
+  // Group cells by 5° latitude band; within each band sort by lon;
+  // walk west→east with humidity transfer + orographic drop. Skips
+  // east-flowing winds for now -- one direction reads convincingly.
+  const BAND_DEG = 5;
+  const NUM_BANDS = Math.ceil(180 / BAND_DEG);
+  const bands = new Array(NUM_BANDS);
+  for (let b = 0; b < NUM_BANDS; b++) bands[b] = [];
+  const latCache = new Float32Array(N);
+  const lonCache = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    const x = cells.positions[i * 3 + 0];
+    const y = cells.positions[i * 3 + 1];
+    const z = cells.positions[i * 3 + 2];
+    const lat = Math.asin(Math.max(-1, Math.min(1, y))) * 180 / Math.PI;
+    const lon = Math.atan2(z, x) * 180 / Math.PI;
+    latCache[i] = lat;
+    lonCache[i] = lon;
+    const bandIdx = Math.min(NUM_BANDS - 1, Math.max(0, Math.floor((lat + 90) / BAND_DEG)));
+    bands[bandIdx].push(i);
+  }
+  // Azgaar's latitudeModifier — 18 bands of 5°, 0°→85+.
+  const LAT_MOD = [4, 2, 2, 2, 1, 1, 2, 2, 2, 2, 3, 3, 2, 2, 1, 1, 1, 0.5];
+  const MAX_PASS_H = 0.85;
+  // Modifier from Azgaar's pointsInput.dataset.cells / 10000 ** 0.25
+  // (we have N cells, scale to that).
+  const cellsMod = Math.pow(N / 10000, 0.25);
+  const modifier = cellsMod;  // precInput scaled is 1.0 default
+  for (let b = 0; b < NUM_BANDS; b++) {
+    const list = bands[b];
+    if (list.length === 0) continue;
+    // Sort by longitude ascending so we walk west→east.
+    list.sort(function(a, b) { return lonCache[a] - lonCache[b]; });
+    const latCenter = (b * BAND_DEG) - 90 + BAND_DEG * 0.5;
+    const absLat = Math.abs(latCenter);
+    const latBandIdx = Math.min(LAT_MOD.length - 1, Math.max(0, Math.floor((absLat - 1) / 5)));
+    const latMod = LAT_MOD[latBandIdx];
+    const maxPrec = Math.min(255, 120 * modifier * latMod);
+    let humidity = Math.max(0, maxPrec - cells.elevations[list[0]] * 100);
+    if (humidity <= 0) continue;
+    for (let k = 0; k < list.length; k++) {
+      const cidx = list[k];
+      const T = cells.temp[cidx];
+      if (T < -5) continue;  // permafrost: no flux
+      const h = cells.elevations[cidx];
+      if (h < seaLevel) {
+        // Water: pick up moisture, coastal drop on next-land
+        humidity = Math.min(humidity + 5 * modifier, maxPrec);
+        cells.prec[cidx] += 5 * modifier;
+        if (k + 1 < list.length && cells.elevations[list[k + 1]] >= seaLevel) {
+          cells.prec[list[k + 1]] += Math.max(humidity / 15, 1);
+        }
+        continue;
+      }
+      // Land: drop precipitation; orographic if next is higher.
+      const passable = h <= MAX_PASS_H;
+      let precip;
+      if (!passable) {
+        precip = humidity;
+      } else {
+        const normalLoss = Math.max(humidity / (10 * modifier), 1);
+        const nextH = (k + 1 < list.length) ? cells.elevations[list[k + 1]] : h;
+        const diff = Math.max(nextH - h, 0);
+        const mod = (nextH / 0.7) * (nextH / 0.7);
+        precip = Math.min(humidity, normalLoss + diff * mod * 100);
+      }
+      cells.prec[cidx] += precip;
+      const evap = precip > 1.5 ? 1 : 0;
+      humidity = passable ? Math.max(0, Math.min(humidity - precip + evap, maxPrec)) : 0;
+    }
+  }
+
+  // --- Pass 3: biome lookup. ---
+  for (let i = 0; i < N; i++) {
+    const moist = Math.min(255, cells.prec[i] + 4);  // Azgaar adds +4 from neighbor mean; we cheat
+    cells.biome[i] = _planetBiomeId(cells.temp[i], moist, cells.elevations[i], seaLevel, false);
+  }
+}
+
+function _ensurePlanetClimate(pmapNode, seaLevel) {
+  if (!pmapNode || !pmapNode._cells) return null;
+  const key = pmapNode._cellsKey + ":sea=" + seaLevel.toFixed(4);
+  if (pmapNode._climateKey === key && pmapNode._cells.biome) return pmapNode._cells;
+  const t0 = (typeof performance !== "undefined") ? performance.now() : 0;
+  _planetClimate(pmapNode._cells, seaLevel);
+  pmapNode._climateKey = key;
+  if (!Visual._planetClimateLogged) {
+    Visual._planetClimateLogged = true;
+    const dt = ((typeof performance !== "undefined") ? performance.now() : 0) - t0;
+    // Quick biome histogram for the log.
+    const hist = new Array(PLANET_BIOMES_NAMES.length).fill(0);
+    for (let i = 0; i < pmapNode._cells.count; i++) hist[pmapNode._cells.biome[i]]++;
+    const top = hist.map(function(c, i) { return { c, name: PLANET_BIOMES_NAMES[i] }; })
+      .filter(function(o) { return o.c > 0; })
+      .sort(function(a, b) { return b.c - a.c; })
+      .slice(0, 6)
+      .map(function(o) { return o.name + "=" + o.c; })
+      .join(" ");
+    console.log("[planet-mesh] climate computed in " + dt.toFixed(0) + "ms: " + top);
+  }
+  return pmapNode._cells;
+}
+
 /* §planet-spec Phase 7.d-templates -- verb primitives + stock recipes.
  * Mirrors Azgaar's heightmap-generator pattern (addHill, addRange,
  * smooth, etc.) ported to operate on our spherical cell graph instead
@@ -57190,6 +57408,13 @@ function _buildPlanetMesh(node) {
   }
   const tris = pmap._cellTris;
 
+  // §planet-spec Phase 7.e -- compute climate + biomes once per
+  // (cellsKey, seaLevel) combination. Painter edits to elevation
+  // currently DO NOT invalidate this cache (cellsKey is stable
+  // across the painter's elevation tweaks); add an explicit
+  // bump if/when sub-cell biome edits are needed.
+  _ensurePlanetClimate(pmap, seaLevel);
+
   // Build vertex array in three passes:
   //   Pass 1: compute displaced positions (cell radial + altitude).
   //   Pass 2: accumulate face normals (area-weighted) onto each
@@ -57290,20 +57515,34 @@ function _buildPlanetMesh(node) {
     }
     const radialDot = nx * (px - cxC) + ny * (py - cyC) + nz * (pz - czC);
     if (radialDot < 0) { nx = -nx; ny = -ny; nz = -nz; }
-    // Per-vertex elevation lookup: cell index for the first N
-    // vertices; mean of the two endpoint cells for subdivided
-    // edge vertices.
-    let h;
+    // Per-vertex elevation + biome lookup: cell index for the first
+    // N vertices; mean / blend of the two endpoint cells for
+    // subdivided edge vertices. When climate has been computed we
+    // color by biome (Azgaar palette); else fall back to the
+    // elevation-band gradient.
+    let h, baseCol;
     if (i < N) {
       h = cells.elevations[i];
+      if (cells.biome) {
+        baseCol = PLANET_BIOMES_COLORS[cells.biome[i]];
+      } else {
+        baseCol = _planetColorForHeight(h, seaLevel);
+      }
     } else if (edgeParents) {
       const a = edgeParents[(i - N) * 2 + 0];
       const b = edgeParents[(i - N) * 2 + 1];
       h = 0.5 * (cells.elevations[a] + cells.elevations[b]);
+      if (cells.biome) {
+        const cA = PLANET_BIOMES_COLORS[cells.biome[a]];
+        const cB = PLANET_BIOMES_COLORS[cells.biome[b]];
+        baseCol = [0.5*(cA[0]+cB[0]), 0.5*(cA[1]+cB[1]), 0.5*(cA[2]+cB[2])];
+      } else {
+        baseCol = _planetColorForHeight(h, seaLevel);
+      }
     } else {
       h = seaLevel;
+      baseCol = _planetColorForHeight(h, seaLevel);
     }
-    const baseCol = _planetColorForHeight(h, seaLevel);
     const lambert = Math.max(ambient, nx * sunX + ny * sunY + nz * sunZ);
     const base = i * 11;
     verts[base + 0] = px;
