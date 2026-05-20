@@ -10720,32 +10720,34 @@ public:
     cppType: "",
     kind: "mesh-gen",
     ins: [
-      { n: "radius",      t: "param" },
-      { n: "centerX",     t: "param" },
-      { n: "centerY",     t: "param" },
-      { n: "centerZ",     t: "param" },
-      { n: "segments",    t: "param" },
-      { n: "maxDepth",    t: "param" },
-      { n: "splitFactor", t: "param" },
-      { n: "heightScale", t: "param" },
-      { n: "seaLevel",    t: "param" },
-      { n: "seed",        t: "param" },
-      { n: "frequency",   t: "param" },
-      { n: "octaves",     t: "param" },
-      { n: "lacunarity",  t: "param" },
-      { n: "gain",        t: "param" },
-      { n: "ridges",      t: "param" }
+      { n: "radius",            t: "param" },
+      { n: "polarRadiusRatio",  t: "param" },
+      { n: "centerX",           t: "param" },
+      { n: "centerY",           t: "param" },
+      { n: "centerZ",           t: "param" },
+      { n: "segments",          t: "param" },
+      { n: "maxDepth",          t: "param" },
+      { n: "splitFactor",       t: "param" },
+      { n: "heightScale",       t: "param" },
+      { n: "seaLevel",          t: "param" },
+      { n: "seed",              t: "param" },
+      { n: "frequency",         t: "param" },
+      { n: "octaves",           t: "param" },
+      { n: "lacunarity",        t: "param" },
+      { n: "gain",              t: "param" },
+      { n: "ridges",            t: "param" }
     ],
     outs: [{ n: "mesh", t: "mesh" }],
     params: {
-      radius: 1000, centerX: 0, centerY: 0, centerZ: 0,
+      radius: 1000, polarRadiusRatio: 1.0,
+      centerX: 0, centerY: 0, centerZ: 0,
       segments: 16, maxDepth: 6, splitFactor: 5.0,
       heightScale: 0, seaLevel: 0.5,
       seed: 7.3, frequency: 1.0, octaves: 6,
       lacunarity: 2.0, gain: 0.5, ridges: 0
     },
     methods: {},
-    description: "Spherified-cube planet with per-face quadtree LOD (Phase 4.a-d of planet-spec). 6 cube faces, each adaptively subdivided into a quadtree of leaf chunks by camera distance with horizon-occlusion culling. Each leaf is a regular (segments+1)² grid in cube-face (u,v) coords, spherified + radially displaced by 3D fBm. params: radius, (centerX, centerY, centerZ) = planet center in world space (default origin; archipelago integration places it at (0, -R, 0) so the surface passes through the spawn). segments = per-chunk grid (default 16). maxDepth, splitFactor govern LOD aggressiveness. heightScale, seaLevel, seed, frequency, octaves, lacunarity, gain, ridges as in 4.b. Mesh rebuilds when the camera (relative to planet center) crosses a chunk-boundary quantum (~ radius / 2^maxDepth)."
+    description: "Spherified-cube planet with per-face quadtree LOD (Phase 4 of planet-spec). 6 cube faces, each adaptively subdivided into a quadtree of leaf chunks by camera distance with horizon-occlusion culling. Each leaf is a regular (segments+1)² grid in cube-face (u,v) coords, spherified + radially displaced by 3D fBm; vertex colors are Sun-Lambertian-shaded at build time for day/night terminator under unlit-vc. polarRadiusRatio (default 1.0 = perfect sphere; 0.9966 = WGS84 Earth oblate spheroid) squashes the Y axis post-spherify to mimic the equatorial bulge of a real rotating planet. (centerX, Y, Z) place the planet anywhere in world space. segments = per-chunk grid (default 16). maxDepth, splitFactor govern LOD aggressiveness. heightScale, seaLevel, seed, frequency, octaves, lacunarity, gain, ridges as in 4.b. Mesh rebuilds when the camera (relative to planet center) crosses a chunk-boundary quantum (~ radius / 2^maxDepth)."
   },
 
   Plane: {
@@ -32892,14 +32894,15 @@ const _demos = [
       // 0.45 = mild land bias.
       const PLANET_R = 6378000;
       const horizon = makeNode("Planet", 280, 680, {
-        radius:      PLANET_R,
-        centerX:     0,
-        centerY:     -PLANET_R - 5000,
-        centerZ:     0,
-        segments:    16,
-        maxDepth:    9,            // ≈ 25km per leaf at the camera-facing point
-        splitFactor: 5.0,
-        heightScale: 1000,
+        radius:           PLANET_R,
+        polarRadiusRatio: 0.9966,      // WGS84 Earth flattening (~21km bulge)
+        centerX:          0,
+        centerY:          -PLANET_R - 5000,
+        centerZ:          0,
+        segments:         16,
+        maxDepth:         9,           // ≈ 25km per leaf at the camera-facing point
+        splitFactor:      5.0,
+        heightScale:      1000,
         seaLevel:    0.50,
         seed:        7.3,
         frequency:   5e-7,
@@ -54322,7 +54325,8 @@ function _meshCacheKey(node) {
       const qy = Math.round((c.y - cyC) / quantum);
       const qz = Math.round((c.z - czC) / quantum);
       return "plt:" + [
-        p.radius, p.centerX, p.centerY, p.centerZ,
+        p.radius, p.polarRadiusRatio,
+        p.centerX, p.centerY, p.centerZ,
         p.segments, p.maxDepth, p.splitFactor,
         p.heightScale, p.seaLevel,
         p.seed, p.frequency, p.octaves, p.lacunarity, p.gain, p.ridges,
@@ -54653,6 +54657,18 @@ function _planetVisibleChunks(camPos, radius, heightScale, maxDepth, splitFactor
 function _buildPlanet(node) {
   const p = node.params || {};
   const r    = (typeof p.radius   === "number") ? p.radius   : 1000;
+  // §planet-spec Phase 4.g -- oblate spheroid. Earth's actual
+  // flattening f = (a-b)/a ≈ 1/298.257 → polarRadiusRatio b/a ≈
+  // 0.9966. Default 1.0 = perfect sphere (no behavior change). The
+  // Y axis gets multiplied by this ratio AFTER the spherify warp;
+  // the true ellipsoid surface normal (gradient of x²/a² + y²/b² +
+  // z²/a² = 1) is computed for Lambert shading + the normal slot,
+  // so per-vertex lighting is geometrically correct on the squashed
+  // spheroid. Chunk visibility (split + horizon cull) still treats
+  // the planet as a sphere -- the ~0.3% error is well inside the
+  // safety margins.
+  const polRatio = Math.max(0.5, Math.min(1.5, (typeof p.polarRadiusRatio === "number") ? p.polarRadiusRatio : 1.0));
+  const polRatio2 = polRatio * polRatio;
   const cxC  = (typeof p.centerX === "number") ? p.centerX : 0;
   const cyC  = (typeof p.centerY === "number") ? p.centerY : 0;
   const czC  = (typeof p.centerZ === "number") ? p.centerZ : 0;
@@ -54733,18 +54749,26 @@ function _buildPlanet(node) {
         }
         const baseCol = (hs !== 0) ? _planetColorForHeight(h, seaLevel) :
                                      [ux * 0.5 + 0.5, uy * 0.5 + 0.5, uz * 0.5 + 0.5];
-        // Lambertian: dot(normal, sunDir). Normal = vertex's unit
-        // direction from planet center = (ux, uy, uz). Clamp to
-        // [ambient, 1] so the night side stays visible against the
-        // black space sky rather than going opaque black.
-        const lambert = Math.max(ambient, ux * sunX + uy * sunY + uz * sunZ);
+        // §planet-spec Phase 4.g -- oblate ellipsoid normal. For the
+        // implicit surface x²/a² + y²/b² + z²/a² = 1 with a=R, b=R*
+        // polRatio, the gradient is (2x/a², 2y/b², 2z/a²) so the unit
+        // normal direction = (ux, uy/polRatio², uz) normalized. When
+        // polRatio = 1 this reduces to (ux, uy, uz) identically.
+        const nx = ux;
+        const ny = uy / polRatio2;
+        const nz = uz;
+        const ninv = 1 / Math.max(1e-12, Math.sqrt(nx*nx + ny*ny + nz*nz));
+        const nuX = nx * ninv, nuY = ny * ninv, nuZ = nz * ninv;
+        // Lambertian uses the true ellipsoid normal so per-pixel
+        // shading on a squashed planet is geometrically correct.
+        const lambert = Math.max(ambient, nuX * sunX + nuY * sunY + nuZ * sunZ);
         verts[vWrite++] = cxC + rad * ux;
-        verts[vWrite++] = cyC + rad * uy;
+        verts[vWrite++] = cyC + rad * uy * polRatio;
         verts[vWrite++] = czC + rad * uz;
         verts[vWrite++] = baseCol[0] * lambert;
         verts[vWrite++] = baseCol[1] * lambert;
         verts[vWrite++] = baseCol[2] * lambert;
-        verts[vWrite++] = ux; verts[vWrite++] = uy; verts[vWrite++] = uz;
+        verts[vWrite++] = nuX; verts[vWrite++] = nuY; verts[vWrite++] = nuZ;
         // UV: per-chunk 0..1. Multi-chunk UV atlasing isn't meaningful
         // here so we just give each chunk a fresh unit square.
         verts[vWrite++] = fx01; verts[vWrite++] = fy01;
