@@ -11030,15 +11030,14 @@ public:
       curveAltLow:    1000,
       curveAltHigh:   25000,
       planetRadius:   6378000,
-      // §planet-spec Phase 1.5 -- visibility gate. The impostor is a
-      // coarse low-poly mesh that's only useful as a far-distance
-      // "planet from above" backdrop. At low altitude it looks like
-      // a flat tiled plane stretching to the horizon and ruins the
-      // chunked-terrain view. fs_horizon discards every fragment
-      // below visAltLow; fades in over [visAltLow, visAltHigh].
-      // Default 60km..100km: invisible until orbital altitude.
-      visAltLow:      60000,
-      visAltHigh:     100000
+      // §planet-spec Phase 2 -- visibility gate retuned. fs_horizon
+      // now adds aerial perspective so the coarse impostor reads as
+      // hazy distance silhouettes at ground level instead of a flat
+      // tiled plane. Visibility starts at 200m altitude (basically
+      // always on except deep underground) and fully resolves by
+      // 25km (above haze, full planet-impostor look).
+      visAltLow:      200,
+      visAltHigh:     25000
     },
     methods: {},
     description: "Low-poly terrain impostor that extends visible coverage past TiledTerrain's chunked disc out to ~50km from the camera. Auto-detects the patch's TiledTerrain and samples the same noise (capped at `octaves`, no erosion) so big-shape silhouettes match the chunked disc at the inner-edge meeting line. Macro-tile camera-follow (default 10km) keeps the mesh roughly centered without per-frame rebuilds. Per-vertex altitude colors baked in so it renders unlit-vc with no material wire needed. `yBias` is a small downward offset (default -0.5m) so the chunked terrain wins the depth test in the overlap zone."
@@ -32850,12 +32849,12 @@ const _demos = [
         curveAltLow:    1000,
         curveAltHigh:   25000,
         planetRadius:   6378000,
-        // §planet-spec Phase 1.5 -- impostor only visible past 60km
-        // altitude (full visibility by 100km). Below that the
-        // chunked TiledTerrain disc + sky alone fill the view; the
-        // coarse impostor doesn't interfere with the ground view.
-        visAltLow:      60000,
-        visAltHigh:     100000
+        // §planet-spec Phase 2 -- visible from ground level as
+        // aerial-perspective silhouettes. fs_horizon's hazy-distance
+        // blend hides the tiled-plane look. Fully resolves into the
+        // planet-from-above shape by 25km altitude.
+        visAltLow:      200,
+        visAltHigh:     25000
       });
       const clouds = makeNode("Clouds3D", 40, 680, {
         // §5.5.h-18 -- chunked cloud streaming with rounded tops AND
@@ -53004,9 +53003,12 @@ fn fs_horizon(in: VsOut) -> @location(0) vec4<f32> {
   let camPos = uS.eye.xyz;
 
   // §planet-spec Phase 1.5 -- altitude visibility gate. The
-  // impostor is coarse / tiled-looking and only useful as a far-
-  // distance backdrop. Hide it entirely below visAltLow; fade in
-  // over [visAltLow, visAltHigh]. band1.w = visAltLow,
+  // impostor is coarse / tiled-looking, but at low altitude we WANT
+  // it visible as distant silhouettes (otherwise past the chunked
+  // terrain disc you see flat sky -- no sense of distance terrain).
+  // Aerial-perspective fog below blends the impostor toward the sky
+  // at distance, so its coarse appearance reads as hazy mountains
+  // on the horizon, not a tiled flat plane. band1.w = visAltLow,
   // band2.x = visAltHigh.
   let visAltLow  = uD.band1.w;
   let visAltHigh = max(visAltLow + 1.0, uD.band2.x);
@@ -53023,12 +53025,7 @@ fn fs_horizon(in: VsOut) -> @location(0) vec4<f32> {
   let sunDot = max(0.0, dot(n, sunDir)) * uS.envSun.w;
   let baseCol = in.color;
   let lit = baseCol * (ambientK + sunDot * sunK);
-  // Apply fog so the impostor blends to atmosphere color at the
-  // outer edge, matching how the chunked terrain reads at distance.
   let fogged = apply_fog(lit, in.worldPos);
-  // fadeIn ramps the impostor in over the band; the fade is done by
-  // alpha-blending against the sky color sampled inline (so we can
-  // output opaque + depth-write like the cloud shader).
   let viewDir = normalize(in.worldPos - camPos);
   let mode = u32(uS.envParams.x);
   var bgCol: vec3<f32>;
@@ -53039,7 +53036,21 @@ fn fs_horizon(in: VsOut) -> @location(0) vec4<f32> {
   } else {
     bgCol = fogged;
   }
-  let outRGB = mix(bgCol, fogged, fadeIn);
+  // §planet-spec Phase 2 stopgap -- aerial perspective. Distant
+  // impostor pixels fade toward the sky color in that direction,
+  // giving the "hazy distant mountains" look instead of a crisp
+  // tiled plane. Density tapers with camera altitude so the effect
+  // is strong at ground level (lots of atmosphere between you and
+  // the horizon) and weak from orbit (you'd see crisp Earth).
+  // Phase 4 cube-sphere will replace this with a real atmospheric
+  // scattering pass, but this is enough to make low-altitude
+  // distance reads as silhouettes.
+  let distFromCam = length(in.worldPos - camPos);
+  let camAlt = max(0.0, camPos.y);
+  let aerialDensity = 1.0 / (1.0 + camAlt / 30000.0);
+  let aerialFade = clamp(distFromCam * 0.000035 * aerialDensity, 0.0, 0.92);
+  let aerialed = mix(fogged, bgCol, aerialFade);
+  let outRGB = mix(bgCol, aerialed, fadeIn);
   return vec4<f32>(tonemap_aces(outRGB), 1.0);
 }
 
