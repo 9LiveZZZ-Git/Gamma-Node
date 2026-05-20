@@ -50656,6 +50656,98 @@ function _mat4LookAt(eye, target, up) {
   return m;
 }
 
+/* §planet-spec Phase 2 -- f64 lookAt + RTC compose helpers.
+ *
+ * f32 mantissa is 24 bits, so the representable step size at planet
+ * scale (camera near 6.378 Mm from world origin) is ~0.76 m. That's
+ * fatal for ground-level vertex detail. The fix is RTC (Relative-To-
+ * Center): every mesh declares an optional f64 `anchorF64`; the
+ * per-frame ModelView is composed as
+ *
+ *     mv_rtc = view * translate(anchorF64) * model_local
+ *
+ * in f64 (JS Number precision, 16 digits) and downcast to f32 only
+ * at the GPU upload boundary. The catastrophic subtraction
+ * (anchor - eye, both at Earth-radius magnitudes) happens in f64 so
+ * the result is a small camera-relative offset; vertex coords stay
+ * local (small) too, and f32 GPU math operates only on small numbers.
+ *
+ * THIS COMMIT IS SCAFFOLDING ONLY -- adds the helpers + returns
+ * `eyeF64` / `viewF64` from _evaluateCamera. No existing mesh uses
+ * anchorF64 yet; behavior is bit-identical until Phase 3 begins
+ * refactoring meshes to local coords + per-chunk anchors.
+ *
+ * Mesh convention (when Phase 3 lands):
+ *   mesh.anchorF64 = { x, y, z }       -- f64 world position of the
+ *                                         mesh's local origin.
+ *   mesh.transform = Float32Array(16)  -- model_local. Vertices in
+ *                                         the VBO are coords
+ *                                         RELATIVE to the anchor.
+ *   anchorF64 omitted / null           -- legacy absolute-world-coord
+ *                                         path (current behavior).
+ */
+function _mat4LookAtF64(eye, target, up) {
+  // Same math as _mat4LookAt but returns a plain JS Array(16) so the
+  // entries retain f64 precision -- Float32Array would downcast.
+  let zx = eye[0] - target[0];
+  let zy = eye[1] - target[1];
+  let zz = eye[2] - target[2];
+  let len = Math.hypot(zx, zy, zz);
+  if (len < 1e-6) { zx = 0; zy = 0; zz = 1; }
+  else            { zx /= len; zy /= len; zz /= len; }
+  let xx = up[1]*zz - up[2]*zy;
+  let xy = up[2]*zx - up[0]*zz;
+  let xz = up[0]*zy - up[1]*zx;
+  len = Math.hypot(xx, xy, xz);
+  if (len < 1e-6) { xx = 1; xy = 0; xz = 0; }
+  else            { xx /= len; xy /= len; xz /= len; }
+  const yx = zy*xz - zz*xy;
+  const yy = zz*xx - zx*xz;
+  const yz = zx*xy - zy*xx;
+  const m = new Array(16);
+  m[0]=xx; m[1]=yx; m[2]=zx;  m[3]=0;
+  m[4]=xy; m[5]=yy; m[6]=zy;  m[7]=0;
+  m[8]=xz; m[9]=yz; m[10]=zz; m[11]=0;
+  m[12] = -(xx*eye[0] + xy*eye[1] + xz*eye[2]);
+  m[13] = -(yx*eye[0] + yy*eye[1] + yz*eye[2]);
+  m[14] = -(zx*eye[0] + zy*eye[1] + zz*eye[2]);
+  m[15] = 1;
+  return m;
+}
+
+function _composeRtcModelView(viewF64, anchorF64, modelLocal) {
+  // §planet-spec Phase 2 -- compose mv_rtc = view * translate(anchor)
+  // * model_local in f64, downcast to Float32Array for upload.
+  //
+  //   viewF64   = plain JS Array(16) from _mat4LookAtF64
+  //   anchorF64 = { x, y, z }    OR null (treated as origin)
+  //   modelLocal = Float32Array(16) (the mesh's local transform; can
+  //                                  be reused legacy m.transform when
+  //                                  anchorF64 represents the world
+  //                                  origin and vertices are already
+  //                                  in world coords).
+  //
+  // view * translate(anchor): only the translation column changes.
+  // Columns 0..2 = view columns 0..2 (the rotation block is preserved).
+  // Column 3 = view * vec4(anchor.x, anchor.y, anchor.z, 1).
+  const ax = anchorF64 ? anchorF64.x : 0;
+  const ay = anchorF64 ? anchorF64.y : 0;
+  const az = anchorF64 ? anchorF64.z : 0;
+  const vt = new Array(16);
+  vt[0]  = viewF64[0];  vt[1]  = viewF64[1];  vt[2]  = viewF64[2];  vt[3]  = viewF64[3];
+  vt[4]  = viewF64[4];  vt[5]  = viewF64[5];  vt[6]  = viewF64[6];  vt[7]  = viewF64[7];
+  vt[8]  = viewF64[8];  vt[9]  = viewF64[9];  vt[10] = viewF64[10]; vt[11] = viewF64[11];
+  vt[12] = viewF64[0]*ax + viewF64[4]*ay + viewF64[8] *az + viewF64[12];
+  vt[13] = viewF64[1]*ax + viewF64[5]*ay + viewF64[9] *az + viewF64[13];
+  vt[14] = viewF64[2]*ax + viewF64[6]*ay + viewF64[10]*az + viewF64[14];
+  vt[15] = viewF64[3]*ax + viewF64[7]*ay + viewF64[11]*az + viewF64[15];
+  // vt * modelLocal -- final 4x4 multiply, still in f64.
+  const mv = new Array(16);
+  _mat4Multiply(mv, vt, modelLocal);
+  // Downcast to Float32Array at the very last moment.
+  return Float32Array.from(mv);
+}
+
 function _mat4Perspective(fovYRad, aspect, near, far) {
   // WebGPU clip space: z in [0,1].
   // §planet-spec Phase 1 -- reverse-Z. The near plane now maps to
@@ -50764,6 +50856,11 @@ function _evaluateCamera(cameraNode, fbW, fbH) {
   const mode = (typeof p.mode === "number") ? p.mode : 0;   // 0 = perspective, 1 = ortho
   const aspect = Math.max(0.01, fbW / Math.max(1, fbH));
   const view = _mat4LookAt([px, py, pz], [tx, ty, tz], [ux, uy, uz]);
+  // §planet-spec Phase 2 -- also retain the view matrix as plain
+  // JS Numbers (f64) so RTC-aware draws can compose ModelView in
+  // f64 before downcasting. Cheap (16 multiplies); same math as
+  // the f32 view, just no Float32Array downcast.
+  const viewF64 = _mat4LookAtF64([px, py, pz], [tx, ty, tz], [ux, uy, uz]);
   let proj;
   if (mode === 1) {
     // Ortho: scale fov-equivalent vertical half-height by 1 unit at
@@ -50824,6 +50921,13 @@ function _evaluateCamera(cameraNode, fbW, fbH) {
   planes[20] = r3x - r2x; planes[21] = r3y - r2y; planes[22] = r3z - r2z; planes[23] = r3w - r2w;
   return {
     view, proj, viewProj, eye: [px, py, pz],
+    // §planet-spec Phase 2 -- f64-precision sibling fields for RTC.
+    // `eye` (f32 array) stays for back-compat; `eyeF64` is the
+    // canonical world-space camera position consumers should pair
+    // with mesh.anchorF64 in _composeRtcModelView. `viewF64` is the
+    // matching view matrix in f64.
+    eyeF64: { x: px, y: py, z: pz },
+    viewF64,
     camRight:   [rx,  ry,  rz,  tanHalfFov * aspect],
     camUp:      [uxC, uyC, uzC, tanHalfFov],
     camForward: [fx,  fy,  fz,  (mode === 1) ? 1 : 0],
