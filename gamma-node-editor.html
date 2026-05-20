@@ -47204,14 +47204,30 @@ function _tickAltimeterNodes() {
   const ctx = canvas.getContext("2d");
   ctx.clearRect(0, 0, W, H);
 
+  const posX = (typeof cam.params.posX === "number") ? cam.params.posX : 0;
   const posY = (typeof cam.params.posY === "number") ? cam.params.posY : 0;
-  // Choose units based on magnitude so we don't show "12345m"
-  // when "12.3km" reads better. Switch at 1km.
+  const posZ = (typeof cam.params.posZ === "number") ? cam.params.posZ : 0;
+  // §planet-spec Phase 6+ -- if a Planet is in the patch, altitude is
+  // measured from the planet's local surface at the camera's lat/lon,
+  // not from world Y=0. _planetSurfaceYAt returns the radial world Y
+  // of the planet at (posX, posZ) accounting for curvature + height-
+  // field. For non-planet patches we fall back to plain posY.
+  let altMeters = posY;
+  if (state && Array.isArray(state.nodes)) {
+    const pl = state.nodes.find(n => n && n.type === "Planet");
+    if (pl && pl.params) {
+      const planet = _findPlanetForProjection();
+      if (planet) {
+        const surfY = _planetSurfaceYAt(posX, posZ, planet, pl.params);
+        altMeters = posY - surfY;
+      }
+    }
+  }
   let altStr;
-  if (Math.abs(posY) >= 1000) {
-    altStr = (posY / 1000).toFixed(posY >= 100000 ? 0 : 2) + " km";
+  if (Math.abs(altMeters) >= 1000) {
+    altStr = (altMeters / 1000).toFixed(altMeters >= 100000 ? 0 : 2) + " km";
   } else {
-    altStr = posY.toFixed(0) + " m";
+    altStr = altMeters.toFixed(0) + " m";
   }
 
   ctx.fillStyle = "rgba(255,255,255,0.65)";
@@ -54615,24 +54631,18 @@ function _meshCacheKey(node) {
     // TiledTerrain doesn't use _meshCacheKey -- _ensureTiledTerrainChunks
     // manages its own per-chunk cache keyed by (tileX, tileZ, lod).
     case "Water":         {
-      // §planet-spec Phase 6+ -- when a Planet is in the patch, Water
-      // is a subdivided mesh projected onto the sphere; key by Planet
-      // params + the camera quantum so the projected mesh rebuilds
-      // when the planet moves or the camera flies a long distance.
+      // §planet-spec Phase 6b -- with a Planet in the patch, Water is
+      // a static 6-face cube-sphere shell wrapping the planet at sea
+      // radius. Geometry depends only on Planet's center/radius/polRatio
+      // and the seaLevel offset -- NOT on the camera (the sphere
+      // wraps everything from any angle). No camera quantum needed.
       const planet = _findPlanetForProjection();
       if (planet) {
-        const quantum = planet.r / 1024;
-        const camera = _planetCameraPos({});
-        const qx = Math.round((camera.x - planet.cx) / quantum);
-        const qy = Math.round((camera.y - planet.cy) / quantum);
-        const qz = Math.round((camera.z - planet.cz) / quantum);
         return "water-sph:" + [
           p.seaLevel || 0,
-          planet.cx, planet.cy, planet.cz, planet.r, planet.polRatio,
-          qx, qy, qz
+          planet.cx, planet.cy, planet.cz, planet.r, planet.polRatio
         ].join(",");
       }
-      // Flat fallback: only seaLevel affects geometry of the 4-vert quad.
       return "water:" + (p.seaLevel || 0);
     }
     default:              return node.type;
@@ -56030,52 +56040,71 @@ function _buildWater(node) {
   // invisible.
   const planet = _findPlanetForProjection();
   if (planet) {
-    const segs = 64;                                      // 65² = 4225 verts
-    const half = Math.min(2000000, planet.r * 0.5);       // cap at half planet radius
-    const side = segs + 1;
-    // §planet-spec Phase 6+ -- center the water mesh on the camera XZ
-    // so it follows as you fly around the planet. Mesh cache key
-    // includes the camera quantum so this triggers a rebuild every
-    // planet.r/1024 ≈ 6km of camera movement.
-    const cam = _planetCameraPos({});
-    const cX = cam.x;
-    const cZ = cam.z;
-    const verts = new Float32Array(side * side * 11);
-    const indices = new Uint32Array(segs * segs * 6);
-    let vi = 0;
-    for (let iz = 0; iz <= segs; iz++) {
-      const fz = iz / segs;
-      const wz = cZ + (fz * 2 - 1) * half;
-      for (let ix = 0; ix <= segs; ix++) {
-        const fx = ix / segs;
-        const wx = cX + (fx * 2 - 1) * half;
-        const proj = _projectFlatToPlanet(wx, seaY, wz, planet);
-        const dx = proj[0] - planet.cx;
-        const dy = proj[1] - planet.cy;
-        const dz = proj[2] - planet.cz;
-        const nl = Math.sqrt(dx*dx + dy*dy + dz*dz) || 1;
-        verts[vi++] = proj[0];
-        verts[vi++] = proj[1];
-        verts[vi++] = proj[2];
-        verts[vi++] = 0.2; verts[vi++] = 0.4; verts[vi++] = 0.6;
-        // Normal: radial-outward from planet center (true ellipsoid
-        // normal differs slightly; for water this approximation is
-        // fine since fs_water perturbs the normal per-fragment anyway).
-        verts[vi++] = dx / nl;
-        verts[vi++] = dy / nl;
-        verts[vi++] = dz / nl;
-        verts[vi++] = wx; verts[vi++] = wz;
+    // §planet-spec Phase 6b -- Water as a 6-face cube-sphere SHELL
+    // wrapping the entire planet at sea radius. The prior flat-quad-
+    // projected mesh only covered a ~4Mm disc around the camera and
+    // left the back of the planet uncovered, so flying away from the
+    // spawn revealed Planet's flat blue ocean cells with no waves
+    // outside the disc. This emits 6 cube faces of (segs+1)² verts
+    // each, projected via the spherify warp; total ~6534 verts.
+    //
+    // fs_water computes waves + foam + Fresnel per-fragment, so per-
+    // vertex density doesn't affect wave detail. The vertices just
+    // define the underlying sphere surface, and 33-per-face is
+    // plenty for a smooth sphere shape from any altitude.
+    const segs = 32;
+    const N = segs + 1;
+    const vertsPerFace = N * N;
+    const trisPerFace = segs * segs * 2;
+    const verts = new Float32Array(6 * vertsPerFace * 11);
+    const indices = new Uint32Array(6 * trisPerFace * 3);
+    let vi = 0, ii = 0;
+    for (let f = 0; f < 6; f++) {
+      const face = _PLANET_FACES[f];
+      const nX = face.n[0], nY = face.n[1], nZ = face.n[2];
+      const tX = face.t[0], tY = face.t[1], tZ = face.t[2];
+      const bX = face.b[0], bY = face.b[1], bZ = face.b[2];
+      const vertBase = f * vertsPerFace;
+      for (let iy = 0; iy <= segs; iy++) {
+        const fy01 = iy / segs;
+        const v = fy01 * 2 - 1;
+        for (let ix = 0; ix <= segs; ix++) {
+          const fx01 = ix / segs;
+          const u = fx01 * 2 - 1;
+          const cx = nX + tX * u + bX * v;
+          const cy = nY + tY * u + bY * v;
+          const cz = nZ + tZ * u + bZ * v;
+          const cxx = cx * cx, cyy = cy * cy, czz = cz * cz;
+          const sx = cx * Math.sqrt(Math.max(0, 1 - cyy * 0.5 - czz * 0.5 + cyy * czz / 3));
+          const sy = cy * Math.sqrt(Math.max(0, 1 - cxx * 0.5 - czz * 0.5 + cxx * czz / 3));
+          const sz = cz * Math.sqrt(Math.max(0, 1 - cxx * 0.5 - cyy * 0.5 + cxx * cyy / 3));
+          const invLen = 1 / Math.max(1e-12, Math.sqrt(sx*sx + sy*sy + sz*sz));
+          const ux = sx * invLen, uy = sy * invLen, uz = sz * invLen;
+          // Position on the planet's sea-level ellipsoid + seaY offset
+          // along radial direction (lets the user raise water above
+          // the smooth-sphere surface if they want).
+          const px = planet.cx + planet.r * ux + seaY * ux;
+          const py = planet.cy + planet.r * uy * planet.polRatio + seaY * uy;
+          const pz = planet.cz + planet.r * uz + seaY * uz;
+          verts[vi++] = px;
+          verts[vi++] = py;
+          verts[vi++] = pz;
+          verts[vi++] = 0.2; verts[vi++] = 0.4; verts[vi++] = 0.6;
+          // Radial-outward normal -- correct for a sphere shell.
+          verts[vi++] = ux; verts[vi++] = uy; verts[vi++] = uz;
+          // World XZ as UV so fs_water reads world-space wave coords.
+          verts[vi++] = px; verts[vi++] = pz;
+        }
       }
-    }
-    let ii = 0;
-    for (let iz = 0; iz < segs; iz++) {
-      for (let ix = 0; ix < segs; ix++) {
-        const a = iz * side + ix;
-        const b = a + 1;
-        const c = a + side;
-        const d = c + 1;
-        indices[ii++] = a; indices[ii++] = c; indices[ii++] = b;
-        indices[ii++] = b; indices[ii++] = c; indices[ii++] = d;
+      for (let iy = 0; iy < segs; iy++) {
+        for (let ix = 0; ix < segs; ix++) {
+          const a = vertBase + iy * N + ix;
+          const b = a + 1;
+          const c = a + N;
+          const d = c + 1;
+          indices[ii++] = a; indices[ii++] = c; indices[ii++] = b;
+          indices[ii++] = b; indices[ii++] = c; indices[ii++] = d;
+        }
       }
     }
     return { verts, indices };
