@@ -33207,6 +33207,26 @@ const _demos = [
         mouseSensitivity: 0.0025, eyeHeight: 1.7
       });
 
+      // §planet-spec Phase 6+ (water) -- Water node auto-detects Planet
+      // and emits a 4000km × 4000km subdivided mesh (65² = 4225 verts)
+      // projected onto the sphere, centered on camera XZ. fs_water
+      // handles waves + foam + sky-Fresnel reflection. Beyond the
+      // water mesh's extent, Planet's own h<seaLevel ocean cells
+      // continue the surface at the same Y -- the boundary is invisible.
+      // seaLevel=0 matches Planet's pole surface (which sits at world
+      // Y=0 because Planet centerY = -R*polRatio).
+      const water = makeNode("Water", 40, 480, {
+        seaLevel: 0,
+        colorR: 0.10, colorG: 0.32, colorB: 0.48,
+        waveFreq: 0.012, waveSpeed: 0.6, waveAmp: 1.0,
+        fresnelStrength: 1.0,
+        skyR: 0.62, skyG: 0.78, skyB: 0.92,
+        foamWidth: 6,
+        shallowDepth: 40,
+        waveShoreFreq: 0.018,
+        foamR: 0.96, foamG: 0.97, foamB: 1.00
+      });
+
       const scn = makeNode("Scene", 760, 80, {
         clearR: 0.02, clearG: 0.03, clearB: 0.06
       });
@@ -33219,6 +33239,7 @@ const _demos = [
       const vo  = makeNode("VisualOutput", 1140, 80, { display: 0 });
 
       state.edges.push({ from: { node: planet, port: "mesh"   }, to: { node: scn, port: "mesh1" } });
+      state.edges.push({ from: { node: water,  port: "mesh"   }, to: { node: scn, port: "mesh2" } });
       state.edges.push({ from: { node: cam,    port: "camera" }, to: { node: scn, port: "camera" } });
       state.edges.push({ from: { node: sun,    port: "light"  }, to: { node: scn, port: "light1" } });
       state.edges.push({ from: { node: sky,    port: "env"    }, to: { node: scn, port: "environment" } });
@@ -54583,9 +54604,24 @@ function _meshCacheKey(node) {
     // TiledTerrain doesn't use _meshCacheKey -- _ensureTiledTerrainChunks
     // manages its own per-chunk cache keyed by (tileX, tileZ, lod).
     case "Water":         {
-      // Water mesh is a fixed 100km plane -- only seaLevel affects
-      // geometry. All other params (waves, color, fresnel) are
-      // shader uniforms and don't require a mesh rebuild.
+      // §planet-spec Phase 6+ -- when a Planet is in the patch, Water
+      // is a subdivided mesh projected onto the sphere; key by Planet
+      // params + the camera quantum so the projected mesh rebuilds
+      // when the planet moves or the camera flies a long distance.
+      const planet = _findPlanetForProjection();
+      if (planet) {
+        const quantum = planet.r / 1024;
+        const camera = _planetCameraPos({});
+        const qx = Math.round((camera.x - planet.cx) / quantum);
+        const qy = Math.round((camera.y - planet.cy) / quantum);
+        const qz = Math.round((camera.z - planet.cz) / quantum);
+        return "water-sph:" + [
+          p.seaLevel || 0,
+          planet.cx, planet.cy, planet.cz, planet.r, planet.polRatio,
+          qx, qy, qz
+        ].join(",");
+      }
+      // Flat fallback: only seaLevel affects geometry of the 4-vert quad.
       return "water:" + (p.seaLevel || 0);
     }
     default:              return node.type;
@@ -55795,14 +55831,70 @@ function _tiledTerrainLodSegments(dxAbs, dzAbs, radius, baseSegs) {
 function _buildWater(node) {
   const p = node.params || {};
   const seaY = (typeof p.seaLevel === "number") ? p.seaLevel : 0;
-  // §planet-spec Phase 2-batch -- huge extent so the water plane is
-  // still in view from altitudes up to ~100km. Proper fix is a
-  // planet-wrapped sphere of water in Phase 4; this is a 4-vert
-  // stopgap that costs nothing.
-  const half = 2000000;   // 2Mm half-extent -> 4000km plane
-  // Vertex layout: pos.xyz, color.rgb (unused for water), normal.xyz (+Y),
-  // uv.xy. Use world-XZ as UV so fragment shader can derive world-
-  // space wave coordinates without recomputing from pos.
+  // §planet-spec Phase 6+ -- when a Planet is in the patch, emit a
+  // SUBDIVIDED + sphere-projected water mesh so the ocean curves
+  // with the planet instead of stretching as a flat quad. The
+  // subdivision lets fs_water's existing per-fragment waves+foam+
+  // Fresnel run on a curved surface; the wave function reads world
+  // XZ which on a sphere is arc-distance-from-pole (correct near the
+  // spawn, mild distortion at the limb -- acceptable for an ocean
+  // shell). Beyond this mesh's extent, Planet's own h<seaLevel
+  // ocean-color cells take over at the same Y, so the boundary is
+  // invisible.
+  const planet = _findPlanetForProjection();
+  if (planet) {
+    const segs = 64;                                      // 65² = 4225 verts
+    const half = Math.min(2000000, planet.r * 0.5);       // cap at half planet radius
+    const side = segs + 1;
+    // §planet-spec Phase 6+ -- center the water mesh on the camera XZ
+    // so it follows as you fly around the planet. Mesh cache key
+    // includes the camera quantum so this triggers a rebuild every
+    // planet.r/1024 ≈ 6km of camera movement.
+    const cam = _planetCameraPos({});
+    const cX = cam.x;
+    const cZ = cam.z;
+    const verts = new Float32Array(side * side * 11);
+    const indices = new Uint32Array(segs * segs * 6);
+    let vi = 0;
+    for (let iz = 0; iz <= segs; iz++) {
+      const fz = iz / segs;
+      const wz = cZ + (fz * 2 - 1) * half;
+      for (let ix = 0; ix <= segs; ix++) {
+        const fx = ix / segs;
+        const wx = cX + (fx * 2 - 1) * half;
+        const proj = _projectFlatToPlanet(wx, seaY, wz, planet);
+        const dx = proj[0] - planet.cx;
+        const dy = proj[1] - planet.cy;
+        const dz = proj[2] - planet.cz;
+        const nl = Math.sqrt(dx*dx + dy*dy + dz*dz) || 1;
+        verts[vi++] = proj[0];
+        verts[vi++] = proj[1];
+        verts[vi++] = proj[2];
+        verts[vi++] = 0.2; verts[vi++] = 0.4; verts[vi++] = 0.6;
+        // Normal: radial-outward from planet center (true ellipsoid
+        // normal differs slightly; for water this approximation is
+        // fine since fs_water perturbs the normal per-fragment anyway).
+        verts[vi++] = dx / nl;
+        verts[vi++] = dy / nl;
+        verts[vi++] = dz / nl;
+        verts[vi++] = wx; verts[vi++] = wz;
+      }
+    }
+    let ii = 0;
+    for (let iz = 0; iz < segs; iz++) {
+      for (let ix = 0; ix < segs; ix++) {
+        const a = iz * side + ix;
+        const b = a + 1;
+        const c = a + side;
+        const d = c + 1;
+        indices[ii++] = a; indices[ii++] = c; indices[ii++] = b;
+        indices[ii++] = b; indices[ii++] = c; indices[ii++] = d;
+      }
+    }
+    return { verts, indices };
+  }
+  // Flat fallback (no Planet): the original 4-vert stopgap.
+  const half = 2000000;
   const verts = new Float32Array([
     -half, seaY, -half,   0.2, 0.4, 0.6,   0, 1, 0,   -half, -half,
      half, seaY, -half,   0.2, 0.4, 0.6,   0, 1, 0,    half, -half,
