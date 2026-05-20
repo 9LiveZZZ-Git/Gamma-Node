@@ -55020,7 +55020,7 @@ function _planetSpherify(cx, cy, cz) {
  * points). Result is "mostly correct" with occasional small holes
  * far from the camera. Spherical-Delaunay-via-stereographic would be
  * the rigorous fix; this is the simple approximation. */
-function _buildCellTriangulation(positions, neighbors, K, N) {
+function _buildCellTriangulation(positions, neighbors, K, N, hash) {
   // Proper spherical Delaunay triangulation in two passes:
   //
   //  Pass 1 -- Voronoi-edge test. For each candidate edge (i, j) in
@@ -55046,6 +55046,31 @@ function _buildCellTriangulation(positions, neighbors, K, N) {
   //  all-pairs approach produced.
 
   // ---- Pass 1: Voronoi adjacency lists ----
+  //
+  // Two-stage rejection per candidate edge (i, j):
+  //
+  //   Stage A -- angular-distance pre-filter. True Voronoi neighbors
+  //   on Fibonacci-distributed points are at distance ≤ ~3× the
+  //   typical cell spacing (worst case for Voronoi). Anything farther
+  //   is definitely not a Voronoi edge. Reject early.
+  //
+  //   Stage B -- empty-circle test at the spherical midpoint M.
+  //   Check cells in:
+  //     - i's K-nearest (catches close interlopers near i)
+  //     - j's K-nearest (catches close interlopers near j)
+  //     - 3³ spatial-hash buckets around M (catches interlopers near
+  //       M itself -- CRITICAL for any non-tiny edge, otherwise long
+  //       fake edges pass when their midpoint sits in a region not
+  //       in either endpoint's K-nearest)
+  //
+  // Prior bug: only checked i's & j's K-nearest. For a long edge,
+  // those neighbors all cluster near the endpoints, far from M, so
+  // they don't fail the test. The edge was accepted as Voronoi →
+  // spike-fin triangle. Spatial-hash-near-M fixes this.
+  const typicalAngular = Math.sqrt(4 * Math.PI / N);
+  const cosMaxEdge = Math.cos(3 * typicalAngular);  // reject edges with dot(i,j) < this
+  const slack = 1e-9;
+  const GRID = hash.GRID;
   const vAdj = new Array(N);
   for (let i = 0; i < N; i++) vAdj[i] = [];
   for (let i = 0; i < N; i++) {
@@ -55054,21 +55079,22 @@ function _buildCellTriangulation(positions, neighbors, K, N) {
     const iz = positions[i * 3 + 2];
     for (let k = 0; k < K; k++) {
       const j = neighbors[i * K + k];
-      if (j < 0 || j <= i) continue;          // dedup: process each pair once
+      if (j < 0 || j <= i) continue;
       const jx = positions[j * 3 + 0];
       const jy = positions[j * 3 + 1];
       const jz = positions[j * 3 + 2];
-      // Spherical midpoint M = normalize(i + j).
+      // Stage A: angular distance pre-filter.
+      const dotIJ = ix * jx + iy * jy + iz * jz;
+      if (dotIJ < cosMaxEdge) continue;
+      // Stage B: empty-circle test at the spherical midpoint M.
       let mx = ix + jx, my = iy + jy, mz = iz + jz;
       const ml = Math.sqrt(mx*mx + my*my + mz*mz);
-      if (ml < 1e-9) continue;                 // antipodal pair, skip
+      if (ml < 1e-9) continue;
       const mlinv = 1 / ml;
       mx *= mlinv; my *= mlinv; mz *= mlinv;
       const dotIM = ix * mx + iy * my + iz * mz;
-      // Eps: dotIM has float-precision noise; allow 1e-9 slack.
-      const slack = 1e-9;
       let isVoronoi = true;
-      // Check i's K-nearest (other than j).
+      // Check i's K-nearest.
       for (let k2 = 0; k2 < K; k2++) {
         const c = neighbors[i * K + k2];
         if (c < 0 || c === j) continue;
@@ -55076,13 +55102,36 @@ function _buildCellTriangulation(positions, neighbors, K, N) {
         if (dotCM > dotIM + slack) { isVoronoi = false; break; }
       }
       if (isVoronoi) {
-        // Check j's K-nearest too -- could be a cell that's closer to
-        // M but isn't in i's K-nearest.
+        // Check j's K-nearest.
         for (let k2 = 0; k2 < K; k2++) {
           const c = neighbors[j * K + k2];
           if (c < 0 || c === i) continue;
           const dotCM = positions[c*3]*mx + positions[c*3+1]*my + positions[c*3+2]*mz;
           if (dotCM > dotIM + slack) { isVoronoi = false; break; }
+        }
+      }
+      if (isVoronoi) {
+        // Check cells in 3³ spatial-hash buckets around M.
+        const mix = Math.max(0, Math.min(GRID - 1, Math.floor((mx + 1) * 0.5 * GRID)));
+        const miy = Math.max(0, Math.min(GRID - 1, Math.floor((my + 1) * 0.5 * GRID)));
+        const miz = Math.max(0, Math.min(GRID - 1, Math.floor((mz + 1) * 0.5 * GRID)));
+        outer: for (let dx = -1; dx <= 1; dx++) {
+          const bx = mix + dx; if (bx < 0 || bx >= GRID) continue;
+          for (let dy = -1; dy <= 1; dy++) {
+            const by = miy + dy; if (by < 0 || by >= GRID) continue;
+            for (let dz = -1; dz <= 1; dz++) {
+              const bz = miz + dz; if (bz < 0 || bz >= GRID) continue;
+              const bk = bx * GRID * GRID + by * GRID + bz;
+              const bucket = hash.buckets.get(bk);
+              if (!bucket) continue;
+              for (let b = 0; b < bucket.length; b++) {
+                const c = bucket[b];
+                if (c === i || c === j) continue;
+                const dotCM = positions[c*3]*mx + positions[c*3+1]*my + positions[c*3+2]*mz;
+                if (dotCM > dotIM + slack) { isVoronoi = false; break outer; }
+              }
+            }
+          }
         }
       }
       if (isVoronoi) {
@@ -56378,7 +56427,7 @@ function _buildPlanetMesh(node) {
   // edits, so the painter doesn't trigger re-triangulation).
   if (!pmap._cellTris || pmap._cellTrisKey !== pmap._cellsKey) {
     const t0 = performance.now();
-    pmap._cellTris = _buildCellTriangulation(cells.positions, neighbors, K, N);
+    pmap._cellTris = _buildCellTriangulation(cells.positions, neighbors, K, N, pmap._cellsHash);
     pmap._cellTrisKey = pmap._cellsKey;
     console.log("[planet-mesh] triangulated " + N + " cells into " + (pmap._cellTris.length / 3) + " triangles in " + (performance.now() - t0).toFixed(0) + "ms");
   }
