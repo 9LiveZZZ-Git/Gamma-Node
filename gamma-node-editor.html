@@ -54558,8 +54558,28 @@ const _PLANET_FACES = [
  * the rebuild cadence is governed by _meshCacheKey, which quantizes
  * the camera position to ~radius/2^maxDepth so we only rebuild when
  * the camera crosses a finest-level chunk boundary. */
-function _planetVisibleChunks(camPos, radius, maxDepth, splitFactor) {
+function _planetVisibleChunks(camPos, radius, heightScale, maxDepth, splitFactor) {
   const out = [];
+  // §planet-spec Phase 4.d -- horizon-occlusion cull. The visible cap
+  // of a sphere with center O, radius R from a camera at distance d
+  // is the set of points with dot(P/R, OC/d) > R/d -- i.e. inside the
+  // cone of half-angle arccos(R/d) around the OC axis. A chunk whose
+  // center direction has dot < R/d - safetyMargin is fully behind the
+  // horizon and is dropped (along with all of its would-be children).
+  // safetyMargin = chunkAngularHalfExtent + heightScale/R, so we don't
+  // drop chunks whose mountain peaks could poke above the local
+  // horizon, or whose corners extend past the center direction.
+  // Disabled (horizonDot = -2 = never cull) when the camera is inside
+  // the planet's elevated shell.
+  const cs2  = camPos.x*camPos.x + camPos.y*camPos.y + camPos.z*camPos.z;
+  const cMag = Math.sqrt(cs2);
+  const elevRadius = radius + Math.max(0, heightScale);
+  const camOutside = cMag > elevRadius * 1.001;
+  const camDX = camOutside ? camPos.x / cMag : 0;
+  const camDY = camOutside ? camPos.y / cMag : 0;
+  const camDZ = camOutside ? camPos.z / cMag : 0;
+  const horizonDot     = camOutside ? (radius / cMag) : -2;
+  const elevationSlack = camOutside ? (Math.max(0, heightScale) / Math.max(1e-6, radius)) : 0;
   function recurse(face, uMin, uMax, vMin, vMax, depth) {
     const uMid = (uMin + uMax) * 0.5;
     const vMid = (vMin + vMax) * 0.5;
@@ -54568,6 +54588,19 @@ function _planetVisibleChunks(camPos, radius, maxDepth, splitFactor) {
     const cy = f.n[1] + f.t[1] * uMid + f.b[1] * vMid;
     const cz = f.n[2] + f.t[2] * uMid + f.b[2] * vMid;
     const sph = _planetSpherify(cx, cy, cz);
+    // Conservative chunk angular half-extent: diagonal of (uMax-uMin)
+    // × (vMax-vMin) face square mapped to sphere arc. The 0.6 factor
+    // is sqrt(2)*π/8 rounded up to cover spherified warping near face
+    // corners. Children are subsets of their parent so culling at a
+    // parent depth is safe -- if the parent's furthest point is behind
+    // horizon, every child's furthest point is too.
+    const chunkArc = (uMax - uMin) * 0.6;
+    if (camOutside) {
+      const sphDot = sph[0]*camDX + sph[1]*camDY + sph[2]*camDZ;
+      if (sphDot < horizonDot - chunkArc - elevationSlack) {
+        return;
+      }
+    }
     const wx = sph[0] * radius, wy = sph[1] * radius, wz = sph[2] * radius;
     const dx = camPos.x - wx, dy = camPos.y - wy, dz = camPos.z - wz;
     const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
@@ -54617,7 +54650,7 @@ function _buildPlanet(node) {
     ridges:     (typeof p.ridges     === "number") ? p.ridges     : 0
   };
   const camPos = _planetCameraPos(node);
-  const chunks = _planetVisibleChunks(camPos, r, maxDepth, splitFactor);
+  const chunks = _planetVisibleChunks(camPos, r, hs, maxDepth, splitFactor);
   const vertsPerChunk = (segs + 1) * (segs + 1);
   const trisPerChunk  = segs * segs * 2;
   const verts   = new Float32Array(chunks.length * vertsPerChunk * 11);
