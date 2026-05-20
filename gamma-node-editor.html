@@ -54969,12 +54969,84 @@ function _planetMapCacheKey(node) {
   ].join(",");
 }
 
+/* §planet-spec Phase 7.b -- serialize / deserialize the cubemap as
+ * base64-encoded R16 unorm. 256² × 6 = 393k texels × 2 bytes = 786KB
+ * raw → ~1.05MB base64. Cubemap data lives in node.params.cubemapData
+ * (the patch's JSON), so save/reload round-trips the authored map.
+ * Use Uint16 normalized [0, 65535] -> [0, 1] (R16 unorm) -- 1/65535
+ * height resolution × 8km heightScale = 0.12m precision, way more
+ * than needed for visible terrain. */
+function _encodeCubemapBase64(cubemap) {
+  const res = cubemap.resolution;
+  const totalU16 = 6 * res * res;
+  const u16 = new Uint16Array(totalU16);
+  for (let f = 0; f < 6; f++) {
+    const data = cubemap.faces[f];
+    const base = f * res * res;
+    for (let i = 0; i < data.length; i++) {
+      const v = Math.max(0, Math.min(1, data[i]));
+      u16[base + i] = Math.round(v * 65535);
+    }
+  }
+  const u8 = new Uint8Array(u16.buffer, u16.byteOffset, u16.byteLength);
+  // Chunked btoa to avoid building a single multi-MB string in one
+  // String.fromCharCode call (some browsers cap arg count at ~64k).
+  const chunkSize = 32768;
+  let s = "";
+  for (let i = 0; i < u8.length; i += chunkSize) {
+    const end = Math.min(i + chunkSize, u8.length);
+    s += String.fromCharCode.apply(null, u8.subarray(i, end));
+  }
+  return btoa(s);
+}
+
+function _decodeCubemapBase64(b64, res) {
+  const s = atob(b64);
+  const u8 = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) u8[i] = s.charCodeAt(i);
+  const u16 = new Uint16Array(u8.buffer, u8.byteOffset, u8.byteLength / 2);
+  const faces = [];
+  const expected = 6 * res * res;
+  if (u16.length !== expected) {
+    console.warn("[planet-map] decoded cubemap size mismatch: got " + u16.length + " u16, expected " + expected + " for res " + res);
+    return null;
+  }
+  for (let f = 0; f < 6; f++) {
+    const data = new Float32Array(res * res);
+    const base = f * res * res;
+    for (let i = 0; i < res * res; i++) data[i] = u16[base + i] / 65535;
+    faces.push(data);
+  }
+  return { resolution: res, faces };
+}
+
 function _ensurePlanetMapCubemap(node) {
   if (!node || !node.params) return null;
   const key = _planetMapCacheKey(node);
   if (node._cubemap && node._cubemapKey === key) return node._cubemap;
   const p = node.params;
   const res = Math.max(16, Math.min(2048, Math.floor((typeof p.resolution === "number") ? p.resolution : 256)));
+
+  // §planet-spec Phase 7.b -- if the patch carries a baked cubemap
+  // that matches the current params, decode it instead of re-baking.
+  // Allows authored maps (Phase 7.d painter output) to survive save +
+  // reload. The cubemapKey tag in params is the same fingerprint the
+  // bake uses, so any param edit invalidates the saved data and we
+  // re-bake (overwriting the stale cubemapData on the next save).
+  if (typeof p.cubemapData === "string" && p.cubemapKey === key
+      && typeof p.cubemapDataRes === "number" && p.cubemapDataRes === res) {
+    const decoded = _decodeCubemapBase64(p.cubemapData, res);
+    if (decoded) {
+      node._cubemap = decoded;
+      node._cubemapKey = key;
+      if (!Visual._planetMapLoadLogged) {
+        Visual._planetMapLoadLogged = true;
+        console.log("[planet-map] loaded " + res + "² × 6 cubemap from patch (skipped re-bake)");
+      }
+      return node._cubemap;
+    }
+  }
+
   const noiseOcts = Math.max(1, Math.min(20, Math.floor((typeof p.octaves === "number") ? p.octaves : 6)));
   const noiseDef = {
     seed:       (typeof p.seed       === "number") ? p.seed       : 7.3,
@@ -55013,9 +55085,21 @@ function _ensurePlanetMapCubemap(node) {
   const dtMs = ((typeof performance !== "undefined") ? performance.now() : 0) - t0;
   node._cubemap = { resolution: res, faces };
   node._cubemapKey = key;
+  // §planet-spec Phase 7.b -- serialize the freshly-baked cubemap
+  // into node.params so a subsequent .gpatch save captures it and
+  // reload skips the bake. Re-bake on param change naturally
+  // overwrites cubemapData here (key tag invalidates the cached copy).
+  try {
+    p.cubemapData = _encodeCubemapBase64(node._cubemap);
+    p.cubemapDataRes = res;
+    p.cubemapKey = key;
+  } catch (err) {
+    console.warn("[planet-map] cubemap base64 encode failed:", err);
+  }
   if (!Visual._planetMapBakeLogged) {
     Visual._planetMapBakeLogged = true;
-    console.log("[planet-map] baked " + res + "² × 6 cubemap in " + dtMs.toFixed(1) + "ms");
+    console.log("[planet-map] baked " + res + "² × 6 cubemap in " + dtMs.toFixed(1) + "ms; serialized "
+                + (p.cubemapData ? Math.round(p.cubemapData.length / 1024) + "KB to params.cubemapData" : "(encode failed)"));
   }
   return node._cubemap;
 }
