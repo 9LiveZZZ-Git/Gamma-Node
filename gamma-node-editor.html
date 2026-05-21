@@ -52899,7 +52899,12 @@ fn fs_sky(in: SkyVsOut) -> @location(0) vec4<f32> {
     // The transition has a 10%-of-thickness fade band so crossing
     // the Karman line doesn't pop visually.
     if (uS.envPlanet.w > 0.0) {
-      col = sample_planet_atmosphere(uS.eye.xyz, dir)
+      // C.4 -- sky-view LUT replaces per-pixel atmosphere integration.
+      // One texture sample instead of 16x8 = 128 inner evaluations.
+      // Features (sun disk / moon / stars / Milky Way) stay per-pixel
+      // because they're point/line features that would alias through
+      // the 192x108 LUT resolution.
+      col = sample_skyview_lut(dir)
           + sample_procedural_sky_features(dir);
     } else {
       col = sample_procedural_sky(dir);
@@ -53471,8 +53476,11 @@ fn sample_env(dir: vec3<f32>) -> vec3<f32> {
     // wired use Tier B planet atmosphere (proper sky color from the
     // camera's altitude), else fall back to the legacy flat-ground
     // smooth sky. Features (disk/moon/stars) never go through IBL.
+    // C.4 -- now backed by the sky-view LUT (same precomputed
+    // atmosphere color as fs_sky), so IBL ambient on planet-aware
+    // surfaces stays consistent with the visible sky.
     if (uS.envPlanet.w > 0.0) {
-      return sample_planet_atmosphere(uS.eye.xyz, dir);
+      return sample_skyview_lut(dir);
     }
     return sample_procedural_sky_smooth(dir);
   }
@@ -53575,6 +53583,11 @@ struct PerDraw {
 @group(0) @binding(6) var atmTransmittanceLUT: texture_2d<f32>;
 @group(0) @binding(7) var atmMultiScatterLUT:  texture_2d<f32>;
 @group(0) @binding(8) var atmLutSampler:       sampler;
+// C.4 -- sky-view LUT: full-sphere precomputed atmospheric color for
+// the current camera position, indexed by (azimuth, elevation) in the
+// camera's planet-local frame. fs_sky samples this in one texture
+// fetch instead of running its own per-pixel atmosphere integral.
+@group(0) @binding(9) var atmSkyViewLUT:       texture_2d<f32>;
 
 // Sample the multi-scattering LUT. Axes match fs_lut_multiscatter:
 //   u = sunZenithCos in [-1, 1] mapped linearly to [0, 1]
@@ -53583,6 +53596,45 @@ fn sample_multiscatter_lut(cosSZ: f32, alt: f32, atmThickness: f32) -> vec3<f32>
   let u = clamp(cosSZ * 0.5 + 0.5, 0.0, 1.0);
   let v = sqrt(clamp(alt / max(atmThickness, 1.0), 0.0, 1.0));
   return textureSampleLevel(atmMultiScatterLUT, atmLutSampler, vec2<f32>(u, v), 0.0).rgb;
+}
+
+// C.4 -- sample the sky-view LUT for a world-space view direction.
+// Must match the (u, v) mapping used by fs_lut_skyview on the JS side.
+// Local frame: zenith = (eye - planetCenter), north reference = world
+// +Y projected to horizon plane (fallback +X near poles), east =
+// up x north. Output is the pre-integrated atmospheric in-scatter
+// for that direction including sun multiplier (in_scatter * sunI).
+fn sample_skyview_lut(dir: vec3<f32>) -> vec3<f32> {
+  let radial = uS.eye.xyz - uS.envPlanet.xyz;
+  let radialLen = length(radial);
+  if (radialLen < 1.0) { return vec3<f32>(0.0); }
+  let localUp = radial / radialLen;
+  var northRef = vec3<f32>(0.0, 1.0, 0.0);
+  if (abs(dot(localUp, northRef)) > 0.99) {
+    northRef = vec3<f32>(1.0, 0.0, 0.0);
+  }
+  let localNorth = normalize(northRef - dot(northRef, localUp) * localUp);
+  let localEast  = cross(localUp, localNorth);
+
+  let dotUp = clamp(dot(dir, localUp), -1.0, 1.0);
+  let elevation = asin(dotUp);
+  let horizonProj = dir - dotUp * localUp;
+  let horizonLen = max(length(horizonProj), 1e-6);
+  let horizon = horizonProj / horizonLen;
+  let cosAz = dot(horizon, localNorth);
+  let sinAz = dot(horizon, localEast);
+  let azimuth = atan2(sinAz, cosAz);
+
+  let u = (azimuth + 3.14159265359) / 6.28318530718;
+  var v: f32;
+  if (elevation >= 0.0) {
+    let t = sqrt(clamp(elevation / 1.5707963, 0.0, 1.0));
+    v = 0.5 + t * 0.5;
+  } else {
+    let t = sqrt(clamp(-elevation / 1.5707963, 0.0, 1.0));
+    v = 0.5 - t * 0.5;
+  }
+  return textureSampleLevel(atmSkyViewLUT, atmLutSampler, vec2<f32>(u, v), 0.0).rgb;
 }
 
 // Sprint 7.5.4.b -- world ray direction -> equirect UV. Standard
@@ -54929,7 +54981,11 @@ function _ensureMeshBindGroupLayout() {
       // (sample sites guard on uS.envPlanet.w > 0 before reading).
       { binding: 6, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d", multisampled: false } },
       { binding: 7, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d", multisampled: false } },
-      { binding: 8, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } }
+      { binding: 8, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+      // C.4 -- sky-view LUT. Camera-dependent precomputed atmosphere
+      // color in (azimuth, elevation) form so fs_sky becomes a single
+      // texture sample instead of per-pixel atmosphere integration.
+      { binding: 9, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d", multisampled: false } }
     ]
   });
   Visual.meshPipelineLayout = Visual.device.createPipelineLayout({
@@ -55438,6 +55494,10 @@ struct AtmParams {
   atm:    vec4<f32>,
   sun:    vec4<f32>,
   misc:   vec4<f32>,
+  // C.4 -- camera info for sky-view LUT. .xyz = world-space camera
+  // position; .w reserved (precomputed altitude if useful later).
+  // Transmittance + multi-scatter LUTs ignore this slot.
+  camera: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> uA: AtmParams;
 
@@ -55546,6 +55606,10 @@ fn fs_lut_transmittance(in: VsLutOut) -> @location(0) vec4<f32> {
   return vec4<f32>(T, 1.0);
 }
 
+@group(0) @binding(1) var ttex: texture_2d<f32>;
+@group(0) @binding(2) var mtex: texture_2d<f32>;
+@group(0) @binding(3) var tsamp: sampler;
+
 // Sample the transmittance LUT for an arbitrary (altitude,
 // viewZenithCos) pair. Matches the axis mapping used by
 // fs_lut_transmittance so the round-trip is exact (modulo bilinear
@@ -55560,8 +55624,16 @@ fn sample_transmittance_lut(
   return textureSampleLevel(T, S, vec2<f32>(u, v), 0.0).rgb;
 }
 
-@group(0) @binding(1) var ttex: texture_2d<f32>;
-@group(0) @binding(2) var tsamp: sampler;
+// C.4 -- helpers using the module-scope bindings (cleaner sample sites
+// in fs_lut_skyview where we sample both LUTs per ray sample).
+fn _lut_T(cosVZ: f32, alt: f32, atmThk: f32) -> vec3<f32> {
+  return sample_transmittance_lut(ttex, tsamp, cosVZ, alt, atmThk);
+}
+fn _lut_MS(cosSZ: f32, alt: f32, atmThk: f32) -> vec3<f32> {
+  let u = clamp(cosSZ * 0.5 + 0.5, 0.0, 1.0);
+  let v = sqrt(clamp(alt / max(atmThk, 1.0), 0.0, 1.0));
+  return textureSampleLevel(mtex, tsamp, vec2<f32>(u, v), 0.0).rgb;
+}
 
 // Multi-scattering LUT pixel. Computes the isotropic-bounce
 // contribution to in-scatter for a point at the given altitude with
@@ -55685,6 +55757,154 @@ fn fs_lut_multiscatter(in: VsLutOut) -> @location(0) vec4<f32> {
   let Lmulti = L / denom;
   return vec4<f32>(Lmulti, 1.0);
 }
+
+// C.4 -- Sky-view LUT pixel. The LUT encodes the integrated sky color
+// as seen from the CURRENT camera position, indexed by (azimuth,
+// elevation) in the camera's LOCAL frame (zenith-aligned with the
+// planet-radial direction; north reference = world +Y projected to
+// the horizon plane, falling back to +X near the poles).
+//
+// Per-pixel work:
+//   1. Decode uv -> (azimuth, elevation), with horizon-weighted v.
+//   2. Build the world-space ray direction.
+//   3. Ray-march atmosphere from the camera, sampling the precomputed
+//      transmittance + multi-scatter LUTs per step.
+//
+// 30 view samples + 2 LUT lookups each = much cheaper than the 16x8
+// double integral in the legacy per-pixel sky shader; fs_sky in the
+// mesh module then becomes one texture lookup.
+@fragment
+fn fs_lut_skyview(in: VsLutOut) -> @location(0) vec4<f32> {
+  let planetC = uA.planet.xyz;
+  let planetR = uA.planet.w;
+  let atmR    = uA.atm.x;
+  let scaleHR = uA.atm.y;
+  let scaleHM = uA.atm.z;
+  let sunI    = uA.atm.w;
+  let sunDir  = uA.sun.xyz;
+  let mieG    = uA.sun.w;
+  let turbidity = max(uA.misc.x, 0.5);
+  let eye     = uA.camera.xyz;
+
+  if (planetR <= 0.0 || atmR <= planetR) {
+    return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+  }
+
+  // Local frame.
+  let radial = eye - planetC;
+  let radialLen = length(radial);
+  if (radialLen < 1.0) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
+  let localUp = radial / radialLen;
+  var northRef = vec3<f32>(0.0, 1.0, 0.0);
+  if (abs(dot(localUp, northRef)) > 0.99) {
+    northRef = vec3<f32>(1.0, 0.0, 0.0);
+  }
+  let localNorth = normalize(northRef - dot(northRef, localUp) * localUp);
+  let localEast  = cross(localUp, localNorth);
+
+  // Decode uv -> (az, el). v=0.5 is the horizon; v>0.5 is above with
+  // sqrt remap (more resolution near horizon).
+  let azimuth = in.uv.x * 6.28318530718 - 3.14159265359;
+  var elevation: f32;
+  if (in.uv.y >= 0.5) {
+    let t = (in.uv.y - 0.5) * 2.0;
+    elevation = t * t * 1.5707963;
+  } else {
+    let t = (0.5 - in.uv.y) * 2.0;
+    elevation = -t * t * 1.5707963;
+  }
+  let cosEl = cos(elevation);
+  let sinEl = sin(elevation);
+  let sinAz = sin(azimuth);
+  let cosAz = cos(azimuth);
+  let dir = localEast * (sinAz * cosEl)
+          + localUp   *  sinEl
+          + localNorth * (cosAz * cosEl);
+
+  let atmThk = atmR - planetR;
+  let unitScale = ATM_EARTH_R / planetR;
+  let betaR = vec3<f32>(5.8e-6, 13.5e-6, 33.1e-6) * unitScale;
+  let betaM = vec3<f32>(21.0e-6) * unitScale * turbidity;
+
+  // Ray-atmosphere intersect (sphere; oblateness is < 0.4% and the LUT
+  // doesn't carry polRatio).
+  let oc = eye - planetC;
+  let b  = dot(oc, dir);
+  let cAtm = dot(oc, oc) - atmR * atmR;
+  let hAtm = b * b - cAtm;
+  if (hAtm < 0.0) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
+  let sAtm = sqrt(hAtm);
+  var t0 = max(-b - sAtm, 0.0);
+  var t1 = -b + sAtm;
+  let cGnd = dot(oc, oc) - planetR * planetR;
+  let hGnd = b * b - cGnd;
+  if (hGnd > 0.0) {
+    let tg = -b - sqrt(hGnd);
+    if (tg > 0.0 && tg < t1) { t1 = tg; }
+  }
+  let segLen = t1 - t0;
+  if (segLen <= 0.0) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
+
+  // Phase functions.
+  let cosTheta = dot(dir, sunDir);
+  let cos2 = cosTheta * cosTheta;
+  let phaseR = 0.0596831 * (1.0 + cos2);
+  let g = clamp(mieG, 0.0, 0.95);
+  let g2 = g * g;
+  let mDenom = pow(max(1.0 + g2 - 2.0 * g * cosTheta, 1e-4), 1.5);
+  let phaseM = 0.1193662 * (1.0 - g2) * (1.0 + cos2) / ((2.0 + g2) * mDenom);
+
+  let SAMPLES: i32 = 30;
+  let dt = segLen / 30.0;
+  var inScatter   = vec3<f32>(0.0);
+  var transmittance = vec3<f32>(1.0);
+
+  for (var i: i32 = 0; i < SAMPLES; i = i + 1) {
+    let t = t0 + (f32(i) + 0.5) * dt;
+    let p = eye + dir * t;
+    let pRadial = p - planetC;
+    let h = max(0.0, length(pRadial) - planetR);
+    let densR = exp(-h / scaleHR);
+    let densM = exp(-h / scaleHM);
+    let dTau  = (betaR * densR + betaM * 1.1 * densM) * dt;
+    let segT  = exp(-dTau);
+
+    // Sun ray from p.
+    let pUp = pRadial / max(length(pRadial), 1.0);
+    let cosVZsun = dot(pUp, sunDir);
+    let sunT = _lut_T(cosVZsun, h, atmThk);
+
+    // Sun shadowed by planet?
+    let bp = dot(pRadial, sunDir);
+    let cgp = dot(pRadial, pRadial) - planetR * planetR;
+    let hg = bp * bp - cgp;
+    var sunVis = 1.0;
+    if (hg > 0.0) {
+      let tg = -bp - sqrt(hg);
+      if (tg > 0.0) { sunVis = 0.0; }
+    }
+
+    // Single scatter from this sample.
+    let singleR = betaR * phaseR * densR;
+    let singleM = betaM * phaseM * densM;
+    let single = (singleR + singleM) * sunT * sunVis;
+
+    // Multi-scatter from this sample (scaled to match the consumer-side
+    // weighting we use in _atm_integrate's planet-aware path).
+    let ms = _lut_MS(cosVZsun, h, atmThk);
+    let scatter = betaR * densR + betaM * densM;
+    let MS_SCALE: f32 = 0.15;
+    let multi = ms * scatter * MS_SCALE;
+
+    let contrib = (single + multi) * transmittance * dt;
+    inScatter = inScatter + contrib;
+    transmittance = transmittance * segT;
+  }
+
+  // sunI absorbed into the returned in-scatter so fs_sky's sample is
+  // ready-to-use without further scaling.
+  return vec4<f32>(inScatter * sunI, 1.0);
+}
 `;
 
 function _ensureAtmosphereLUTs() {
@@ -55737,6 +55957,21 @@ function _ensureAtmosphereLUTs() {
       label: "atm-multiscatter-lut-view"
     });
   }
+  // C.4 -- Sky-view LUT. 192 x 108 covers the full sphere in
+  // (azimuth, elevation) with horizon-weighted v for finer sampling
+  // near the horizon where atmospheric detail is highest. Regenerated
+  // every frame in lock-step with the camera position.
+  if (!Visual.atmSkyViewLUT) {
+    Visual.atmSkyViewLUT = dev.createTexture({
+      label: "atm-skyview-lut-192x108",
+      size: [192, 108, 1],
+      format: "rgba16float",
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
+    });
+    Visual.atmSkyViewLUTView = Visual.atmSkyViewLUT.createView({
+      label: "atm-skyview-lut-view"
+    });
+  }
 
   if (!Visual.atmLutSampler) {
     Visual.atmLutSampler = dev.createSampler({
@@ -55749,10 +55984,10 @@ function _ensureAtmosphereLUTs() {
   if (!Visual.atmLutUniformBuffer) {
     Visual.atmLutUniformBuffer = dev.createBuffer({
       label: "atm-lut-uniforms",
-      size: 64,  // 4 * vec4<f32>
+      size: 80,  // 5 * vec4<f32> (C.4: added camera slot)
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
     });
-    Visual.atmLutScratch = new Float32Array(16);
+    Visual.atmLutScratch = new Float32Array(20);
   }
 
   if (!Visual.atmLutShaderModule) {
@@ -55766,20 +56001,22 @@ function _ensureAtmosphereLUTs() {
     }
   }
 
-  // Both LUT pipelines share a single BGL (uniform + texture + sampler)
-  // so the shader module can be a single compilation unit with both
-  // entry points. The transmittance entry point doesn't reference the
-  // texture/sampler bindings (it computes from scratch); WebGPU
-  // validates against REACHABLE bindings per entry point, so leaving
-  // them unused in fs_lut_transmittance is fine. For the bind group
-  // we still need a valid texture there -- a 1x1 default works.
+  // All three LUT pipelines share a single BGL:
+  //   0 = uniform buffer (planet + atm + sun + misc + camera)
+  //   1 = transmittance LUT texture (sampled by multi-scatter + sky-view)
+  //   2 = multi-scatter LUT texture (sampled by sky-view)
+  //   3 = linear/clamp sampler
+  // Bindings the entry-point doesn't reach (e.g. ttex/mtex in
+  // fs_lut_transmittance) are still required to be present in the
+  // bind group; we point them at the 1x1 default.
   if (!Visual.atmLutBGL) {
     Visual.atmLutBGL = dev.createBindGroupLayout({
       label: "atm-lut-bgl",
       entries: [
         { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d", multisampled: false } },
-        { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } }
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d", multisampled: false } },
+        { binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } }
       ]
     });
   }
@@ -55826,10 +56063,30 @@ function _ensureAtmosphereLUTs() {
       return null;
     }
   }
+  if (!Visual.atmSkyViewPipeline) {
+    try {
+      Visual.atmSkyViewPipeline = dev.createRenderPipeline({
+        label: "atm-skyview-pipeline",
+        layout: dev.createPipelineLayout({
+          label: "atm-lut-pl-sv",
+          bindGroupLayouts: [Visual.atmLutBGL]
+        }),
+        vertex:   { module: Visual.atmLutShaderModule, entryPoint: "vs_lut" },
+        fragment: {
+          module: Visual.atmLutShaderModule,
+          entryPoint: "fs_lut_skyview",
+          targets: [{ format: "rgba16float" }]
+        },
+        primitive: { topology: "triangle-list", cullMode: "none" }
+      });
+    } catch (e) {
+      console.warn("[atm-lut] sky-view pipeline failed:", e);
+      return null;
+    }
+  }
 
-  // Transmittance bind group binds the 1x1 default for the unused
-  // texture slot (the entry point doesn't read it). Multi-scatter
-  // bind group reads the freshly-written transmittance LUT.
+  // Bind groups: each LUT pipeline reads only the LUTs that came before
+  // it. The 1x1 default fills slots the entry point never reaches.
   if (!Visual.atmTransmittanceBindGroup) {
     Visual.atmTransmittanceBindGroup = dev.createBindGroup({
       label: "atm-transmittance-bg",
@@ -55837,7 +56094,8 @@ function _ensureAtmosphereLUTs() {
       entries: [
         { binding: 0, resource: { buffer: Visual.atmLutUniformBuffer } },
         { binding: 1, resource: Visual.atmLut1x1DefaultView },
-        { binding: 2, resource: Visual.atmLutSampler }
+        { binding: 2, resource: Visual.atmLut1x1DefaultView },
+        { binding: 3, resource: Visual.atmLutSampler }
       ]
     });
   }
@@ -55848,7 +56106,20 @@ function _ensureAtmosphereLUTs() {
       entries: [
         { binding: 0, resource: { buffer: Visual.atmLutUniformBuffer } },
         { binding: 1, resource: Visual.atmTransmittanceLUTView },
-        { binding: 2, resource: Visual.atmLutSampler }
+        { binding: 2, resource: Visual.atmLut1x1DefaultView },
+        { binding: 3, resource: Visual.atmLutSampler }
+      ]
+    });
+  }
+  if (!Visual.atmSkyViewBindGroup) {
+    Visual.atmSkyViewBindGroup = dev.createBindGroup({
+      label: "atm-skyview-bg",
+      layout: Visual.atmLutBGL,
+      entries: [
+        { binding: 0, resource: { buffer: Visual.atmLutUniformBuffer } },
+        { binding: 1, resource: Visual.atmTransmittanceLUTView },
+        { binding: 2, resource: Visual.atmMultiScatterLUTView },
+        { binding: 3, resource: Visual.atmLutSampler }
       ]
     });
   }
@@ -55862,7 +56133,7 @@ function _ensureAtmosphereLUTs() {
  * frame BEFORE any scene pass that might sample the LUTs. The same
  * LUTs are shared across all scenes in a frame -- the planet params
  * shouldn't change mid-frame, and the LUTs are camera-independent. */
-function _renderAtmosphereLUTs(enc, planetInfo) {
+function _renderAtmosphereLUTs(enc, planetInfo, cameraEye, sunDirOverride) {
   if (!_ensureAtmosphereLUTs()) return false;
   // Skip LUT regeneration when no planet is wired -- the BGL has the
   // 1x1 default bound at the mesh-pass binding and _atm_integrate
@@ -55881,33 +56152,32 @@ function _renderAtmosphereLUTs(enc, planetInfo) {
   const turbidity = (typeof planetInfo.turbidity === "number") ? planetInfo.turbidity : 1.3;
   const polRatio  = (typeof planetInfo.polRatio  === "number" && planetInfo.polRatio > 0)
     ? planetInfo.polRatio : 1.0;
-  const sunDir = (planetInfo.sunDir && planetInfo.sunDir.length >= 3)
-    ? planetInfo.sunDir : [0, 1, 0];
+  const sunDir = (sunDirOverride && sunDirOverride.length >= 3)
+    ? sunDirOverride
+    : ((planetInfo.sunDir && planetInfo.sunDir.length >= 3)
+        ? planetInfo.sunDir
+        : [0, 1, 0]);
+  const eye = (cameraEye && cameraEye.length >= 3) ? cameraEye : [0, 0, 0];
 
   const u = Visual.atmLutScratch;
-  // planet.xyz unused inside LUTs; pack center for completeness.
   u[0] = planetInfo.centerX || 0;
   u[1] = planetInfo.centerY || 0;
   u[2] = planetInfo.centerZ || 0;
   u[3] = planetR;
-  // atm: top radius, Rayleigh scale, Mie scale, sun irradiance.
   u[4] = atmTop;
   u[5] = scaleHR;
   u[6] = scaleHM;
   u[7] = sunI;
-  // sun.xyz unused by transmittance; multi-scatter LUT also doesn't
-  // use the world sun dir (synthesizes from cosSZ axis). Pack for
-  // diagnostic readback.
   u[8]  = sunDir[0]; u[9] = sunDir[1]; u[10] = sunDir[2];
-  // sun.w = mieG (forward-scatter anisotropy).
   u[11] = (typeof planetInfo.mieG === "number") ? planetInfo.mieG : 0.76;
-  // misc: turbidity, polRatio, LUT_WIDTH, LUT_HEIGHT.
   u[12] = turbidity;
   u[13] = polRatio;
   u[14] = 256;
   u[15] = 64;
+  // C.4 -- camera slot for sky-view LUT integration.
+  u[16] = eye[0]; u[17] = eye[1]; u[18] = eye[2]; u[19] = 0;
 
-  dev.queue.writeBuffer(Visual.atmLutUniformBuffer, 0, u.buffer, 0, 64);
+  dev.queue.writeBuffer(Visual.atmLutUniformBuffer, 0, u.buffer, 0, 80);
 
   // Transmittance LUT.
   {
@@ -55938,6 +56208,22 @@ function _renderAtmosphereLUTs(enc, planetInfo) {
     });
     pass.setPipeline(Visual.atmMultiScatterPipeline);
     pass.setBindGroup(0, Visual.atmMultiScatterBindGroup);
+    pass.draw(3, 1, 0, 0);
+    pass.end();
+  }
+  // Sky-view LUT (samples transmittance + multi-scatter LUTs).
+  if (Visual.atmSkyViewPipeline && Visual.atmSkyViewBindGroup) {
+    const pass = enc.beginRenderPass({
+      label: "atm-skyview-lut-pass",
+      colorAttachments: [{
+        view: Visual.atmSkyViewLUTView,
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        loadOp: "clear",
+        storeOp: "store"
+      }]
+    });
+    pass.setPipeline(Visual.atmSkyViewPipeline);
+    pass.setBindGroup(0, Visual.atmSkyViewBindGroup);
     pass.draw(3, 1, 0, 0);
     pass.end();
   }
@@ -62213,6 +62499,7 @@ function _ensureSceneInstance(sceneNode) {
     _ensureAtmosphereLUTs();
     const transmittanceView = Visual.atmTransmittanceLUTView || Visual.atmLut1x1DefaultView;
     const multiScatterView  = Visual.atmMultiScatterLUTView  || Visual.atmLut1x1DefaultView;
+    const skyViewView       = Visual.atmSkyViewLUTView       || Visual.atmLut1x1DefaultView;
     const makeBindGroup = (scratchView, parity) =>
       Visual.device.createBindGroup({
         label: "scene-bg-" + sceneNode.id + "-slot" + i + "-" + parity,
@@ -62226,7 +62513,8 @@ function _ensureSceneInstance(sceneNode) {
           { binding: 5, resource: Visual.envSampler },
           { binding: 6, resource: transmittanceView },
           { binding: 7, resource: multiScatterView },
-          { binding: 8, resource: Visual.atmLutSampler || Visual.envSampler }
+          { binding: 8, resource: Visual.atmLutSampler || Visual.envSampler },
+          { binding: 9, resource: skyViewView }
         ]
       });
     const bindGroupA = makeBindGroup(Visual.scratchArrayViewA, "a");
@@ -65804,17 +66092,39 @@ function renderVisualFrame() {
 
   const enc = Visual.device.createCommandEncoder({ label: "visual-frame" });
 
-  // Sprint 7.6.b-atm Tier-C.1 -- regenerate the atmosphere LUTs once
-  // per frame, before any scene pass. Both LUTs are camera-independent
-  // (transmittance is planet-relative; multi-scattering is sphere-
-  // averaged over directions), so a single per-frame compute is shared
-  // across every Scene in the patch. _findPlanetInfo is the same helper
-  // the per-scene buffer write uses, so the LUTs and uS.envPlanet stay
-  // in lock-step on planet center / radius / polRatio.
+  // Sprint 7.6.b-atm Tier-C.1+C.4 -- regenerate the atmosphere LUTs
+  // once per frame, before any scene pass. Transmittance + multi-
+  // scatter LUTs are camera-independent (planet-relative geometry);
+  // sky-view LUT IS camera-dependent (integrates atmosphere FROM the
+  // camera) so we need the camera position + sun direction.
+  //
+  // We pick the FIRST FPCamera/Camera in state.nodes and the FIRST
+  // Sun node for sun direction. Multi-camera setups would need a LUT
+  // per camera, but that's deferred (C.6); for now Foot-to-Orbit and
+  // most patches have a single camera.
   {
     const planetInfo = (typeof _findPlanetInfo === "function") ? _findPlanetInfo() : null;
     if (planetInfo && planetInfo.radius > 0) {
-      _renderAtmosphereLUTs(enc, planetInfo);
+      let camEye = null;
+      let sunDir = null;
+      if (state && Array.isArray(state.nodes)) {
+        for (const n of state.nodes) {
+          if (!n) continue;
+          if (!camEye && (n.type === "FPCamera" || n.type === "Camera")) {
+            const cp = _resolveNodeParams ? _resolveNodeParams(n) : (n.params || {});
+            camEye = [
+              (typeof cp.posX === "number") ? cp.posX : 0,
+              (typeof cp.posY === "number") ? cp.posY : 0,
+              (typeof cp.posZ === "number") ? cp.posZ : 5
+            ];
+          }
+        }
+      }
+      if (typeof _planetSunDir === "function") {
+        const sd = _planetSunDir();
+        if (sd && sd.length >= 3) sunDir = [sd[0], sd[1], sd[2]];
+      }
+      _renderAtmosphereLUTs(enc, planetInfo, camEye, sunDir);
     }
   }
 
