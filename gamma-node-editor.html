@@ -52865,28 +52865,18 @@ fn fs_sky(in: SkyVsOut) -> @location(0) vec4<f32> {
   let mode = u32(uS.envParams.x);
   var col: vec3<f32>;
   if (mode == 2u) {
-    // 2026-05-21 Sprint 7.6.a-atm v3 -- when a planet is wired,
-    // the SKY PASS renders only celestial features (sun, moon,
-    // stars, Milky Way) -- no atmospheric scattering color. All
-    // atmospheric appearance comes from aerial_perspective() applied
-    // to surface fragments in fs_unlit_vc / fs_phong:
-    //   * Limb glow emanates FROM the planet body (long tangent ray
-    //     through atmosphere -> bright in-scatter on grazing surface).
-    //   * Distant terrain reads blue (Rayleigh haze).
-    //   * Sky from surface is pure black + stars; the blue you see
-    //     looking up is the AIR between you and the zenith, which
-    //     has no surface to apply aerial perspective to.
-    //
-    // The previous v2 had double atmosphere: bright sky-pass glow
-    // AROUND the planet's silhouette plus aerial-perspective tint
-    // ON the planet body. User reported the sky-pass glow read as
-    // a disconnected halo. Stripping it leaves the atmosphere
-    // anchored entirely on the planet itself, where it belongs.
-    //
-    // For non-planet scenes we still use the legacy flat-ground
-    // procedural sky (smooth scattering + features).
+    // 2026-05-21 Sprint 7.6.a-atm v4 -- camera-altitude-gated
+    // scattering. sample_planet_atmosphere now returns 0 when the
+    // camera is above the atmosphere shell, so:
+    //   * From the SURFACE: full atmospheric scattering -> blue sky.
+    //   * From ORBIT: pure space -- limb glow visible only as
+    //     aerial_perspective on the planet body itself, no
+    //     disconnected halo around the silhouette.
+    // The transition has a 10%-of-thickness fade band so crossing
+    // the Karman line doesn't pop visually.
     if (uS.envPlanet.w > 0.0) {
-      col = sample_procedural_sky_features(dir);
+      col = sample_planet_atmosphere(uS.eye.xyz, dir)
+          + sample_procedural_sky_features(dir);
     } else {
       col = sample_procedural_sky(dir);
     }
@@ -53182,8 +53172,34 @@ fn _atm_integrate(rayOrigin: vec3<f32>, rayDir: vec3<f32>, maxDist: f32) -> vec3
 // PUBLIC: sky-pass usage. View ray runs to the atmosphere far side
 // (or ground intersection). Returns the in-scatter integrated along
 // the full view path -- this is the SKY COLOR for that direction.
+//
+// 2026-05-21 Sprint 7.6.a-atm v4 -- GATED by camera altitude. The
+// scattering is only rendered when the camera is INSIDE the
+// atmosphere shell (so surface-up reads as blue sky). Above the
+// shell, returns zero so the sky pass renders pure space (stars
+// only). This is the user-requested compromise:
+//   * surface view: blue sky restored (looking up = scattering)
+//   * orbital view: no disconnected halo (atmosphere visible
+//     only via aerial_perspective on the planet body)
+// Smooth fade band 95-110% of atmosphere thickness so the
+// transition isn't a hard pop at the Karman line.
 fn sample_planet_atmosphere(rayOrigin: vec3<f32>, rayDir: vec3<f32>) -> vec3<f32> {
-  return _atm_integrate(rayOrigin, rayDir, -1.0);
+  let planetC = uS.envPlanet.xyz;
+  let planetR = uS.envPlanet.w;
+  let atmR    = uS.envPlanetAtm.x;
+  if (planetR <= 0.0 || atmR <= planetR) {
+    return vec3<f32>(0.0);
+  }
+  let camRadial = length(rayOrigin - planetC);
+  // Inside atm (camRadial <= atmR): full scattering.
+  // Above atm by >10% thickness:  zero (pure-space sky).
+  // In the 0-10% above band:      smooth fadeout.
+  let atmThickness = atmR - planetR;
+  let fadeStart = atmR;
+  let fadeEnd   = atmR + atmThickness * 0.10;
+  let gate = 1.0 - smoothstep(fadeStart, fadeEnd, camRadial);
+  if (gate <= 0.001) { return vec3<f32>(0.0); }
+  return _atm_integrate(rayOrigin, rayDir, -1.0) * gate;
 }
 
 // PUBLIC: AERIAL PERSPECTIVE for a lit fragment. Caller passes the
