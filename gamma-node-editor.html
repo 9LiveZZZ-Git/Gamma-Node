@@ -57473,84 +57473,114 @@ function _planetPostDSL(cells, neighbors, K, seaLevel) {
  * back with { caps: [{lat, lon, radiusDeg, verbs}, ...] }. Each cap
  * runs the DSL against the cell graph. Post-DSL pipeline (smooth,
  * cleanup, remap) is identical to the old preset path. */
-const _PLANET_AI_SYSTEM_PROMPT = `You are a planet terrain designer. Generate a heightmap for a SPHERICAL planet (like Earth) from a user description.
+const _PLANET_AI_SYSTEM_PROMPT = `You are an expert procedural terrain designer for a SPHERICAL planet. Your job is to produce RICH, VARIED heightmaps -- not blobs. Output strict JSON describing a list of "caps" (continental regions on the sphere); each cap runs a DSL verb sequence that builds the continent.
 
-Output STRICT JSON (no commentary, no markdown fences):
+OUTPUT (no commentary, no markdown fences):
 {
   "caps": [
-    { "lat": 30.0, "lon": -50.0, "radiusDeg": 55, "verbs": "Hill 1 80-90 50-50 40-60\\nRange 1-2 30-50 5-15 25-75\\nMask 4 0 0 0" },
+    { "lat": 30.0, "lon": -50.0, "radiusDeg": 55, "verbs": "Hill ...\\n..." },
     ...
   ]
 }
 
-A "cap" is a circular continent region on the sphere.
-- lat: -90 (south pole) to +90 (north pole)
-- lon: -180 to +180 (east positive)
-- radiusDeg: 10 (small island) to 90 (full hemisphere). Earth's combined Eurasia-Africa ≈ 55°. Pacific-sized ocean = no cap.
-- verbs: newline-separated DSL string. x,y coordinates are 0-100% WITHIN the cap (50,50 = cap center). Heights are 0-100 (sea level = 20).
+CAP COORDS:
+- lat: -90..+90 (S to N). Tropical = 0±15, temperate = ±30..50, polar = ±60+.
+- lon: -180..+180 (E positive). SPREAD caps around the planet -- don't cluster them in one hemisphere.
+- radiusDeg: 8..90. Tiny island = 10. Australia = 30. Eurasia = 55. Pangaea = 85.
 
-VERBS (one per line, whitespace-separated args):
-- Hill count height x-range y-range          // BFS blob, peak in cap
-- Pit count height x-range y-range            // inverse hill
-- Range count height x-range y-range          // linear mountain ridge with sloped flanks
-- Trough count height x-range y-range         // linear valley
-- Strait count vertical|horizontal 0 0        // sea/sound through the cap
-- Smooth iterations 0 0 0                     // local average
-- Add value all|land|min-max 0 0              // additive shift, filtered
-- Multiply factor all|land|min-max 0 0
-- Mask power 0 0 0                            // edge-fade (positive) or center-fade (negative)
-- Invert probability 0 0 0                    // 0-1 chance to flip
+DSL VERBS -- one per line, 4 whitespace args (pad with "0" if a verb doesn't use them):
+- Hill <count> <height> <x-range> <y-range>      // BFS blob; sharp peak that fades outward
+- Pit <count> <depth> <x-range> <y-range>         // inverse hill (lowers terrain)
+- Range <count> <height> <x-range> <y-range>      // linear ridge with sloped flanks (mountain range)
+- Trough <count> <depth> <x-range> <y-range>      // inverse range (linear valley/rift)
+- Strait <count> <vertical|horizontal> 0 0        // sea-channel cut across the cap
+- Smooth <iterations> 0 0 0                       // local average (use sparingly, 1-3 iters)
+- Add <value> <all|land|min-max> 0 0              // additive shift filtered by elevation (value can be negative)
+- Multiply <factor> <all|land|min-max> 0 0        // elevation scale filtered
+- Mask <power> 0 0 0                              // central-plateau edge fade. Power 2-4 = soft, -2 = donut
+- Invert <prob> 0 0 0                             // 0-1 chance to flip 1-elevation; rare, last resort
 
-Ranges use "N" or "N-M" (random pick). Heights 30-50 = small hills, 60-80 = mountains, 80-100 = peaks.
+CONVENTIONS:
+- x, y are 0..100 PERCENTAGES within the cap. (50, 50) = cap center.
+- Ranges: "N" (single) or "N-M" (random pick per call).
+- Heights/depths are Azgaar's 0..100 scale where 20 = sea level. Spine ranges 60-80, hills 25-45, peaks 80-100, valleys 5-15.
 
-DESIGN GUIDANCE:
-- Each cap is ONE continent. Multiple caps = multiple continents. Place 1-5 caps based on user intent.
-- Always end with "Mask N 0 0 0" (N=2-4) for soft coastlines unless user wants hard edges.
-- Build land THEN carve detail: Hill/Range first, Trough/Pit/Strait later, Smooth between major operations.
-- For "earth-like": ~3 caps at varied latitudes (one near equator, one north, one south), radiusDeg 45-60.
-- For "supercontinent" / "pangea": 1 huge cap (radius 80-90) with multiple Hill operations spread across it.
-- For "archipelago": 3-5 caps with small radii (20-30) AND lots of small Hills (height 15-30).
-- For "Mediterranean": 1 mid-size cap, mountain ranges along the edges, central sea (Strait).
-- Match latitude to climate request: tropical = lat 0±15, temperate = ±30-50, polar = ±60+.
+DESIGN PHILOSOPHY -- AVOID BLOB-LOOKING OUTPUT:
+- Each rich continent uses 8-15 verb lines. A simple island uses 4-6. Don't be lazy.
+- Structure: 1 "skeleton" Hill peak 80+ early (defines continent center) → 5-10 mid Hills 20-40 spread (15-85 x 15-85) → 1-3 Range lines 40-60 for backbone → 1-3 Trough lines for valleys → optionally Pit for craters → Smooth 1-2 iters → Mask 2-4 to fade edges.
+- VARY HEIGHTS: don't make everything the same height. Bake elevation variation into the verb count and height range.
+- "Add -N land 0 0" with negative N (5-15) thins coastlines, creates inland seas. Useful for Mediterranean, archipelago, peninsula shapes.
+- "Multiply 0.85 land" pulls land toward sea -- use for sinking partial coastlines.
+- Distinct climates → distinct caps: polar cap at lat ±65+, equatorial belt at lat 0±10.
+- ALWAYS end with "Mask 2-4 0 0 0" unless user explicitly wants hard edges.
 
-EXAMPLE for "earth-like with 3 continents and central mountain ranges":
+EXAMPLES (use as design templates, not literal copies):
+
+"earth-like with 3 continents and central mountain ranges":
 {"caps":[
-  {"lat":35,"lon":-90,"radiusDeg":50,"verbs":"Hill 1 80-90 50-50 40-60\\nHill 5 30-50 20-80 30-70\\nRange 2-3 50-70 20-80 35-65\\nMultiply 0.7 land 0 0\\nMask 3 0 0 0"},
-  {"lat":10,"lon":20,"radiusDeg":55,"verbs":"Hill 1 80-90 40-60 40-60\\nHill 6 25-40 15-85 20-80\\nRange 1-2 40-60 30-70 30-70\\nTrough 2 20-30 30-70 30-70\\nMask 3 0 0 0"},
-  {"lat":-30,"lon":140,"radiusDeg":45,"verbs":"Hill 1 75-85 50-50 45-55\\nHill 4 25-35 20-80 25-75\\nRange 1 40-50 30-70 40-60\\nMask 4 0 0 0"}
+  {"lat":40,"lon":-95,"radiusDeg":55,"verbs":"Hill 1 85-90 50-50 45-55\\nHill 8-10 25-45 10-90 10-90\\nRange 2-3 60-75 30-70 30-70\\nRange 1 50-65 10-90 45-55\\nTrough 3 20-30 20-80 20-80\\nPit 4 15-25 15-85 15-85\\nSmooth 2 0 0 0\\nMask 3 0 0 0"},
+  {"lat":15,"lon":20,"radiusDeg":50,"verbs":"Hill 1 80-90 40-60 40-60\\nHill 6 30-50 15-85 20-80\\nRange 2 55-70 25-75 30-70\\nTrough 2 25-35 30-70 30-70\\nStrait 1 horizontal 0 0\\nMask 3 0 0 0"},
+  {"lat":-25,"lon":130,"radiusDeg":45,"verbs":"Hill 1 75-85 50-50 50-50\\nHill 5 25-40 20-80 25-75\\nRange 1-2 45-60 20-80 35-65\\nMultiply 0.85 land 0 0\\nMask 3 0 0 0"}
 ]}
 
-Respond with ONLY the JSON object, nothing else.`;
+"single pangaea supercontinent split by an inland sea":
+{"caps":[
+  {"lat":15,"lon":0,"radiusDeg":85,"verbs":"Hill 1 90-95 50-50 50-50\\nHill 10-12 30-50 15-85 15-85\\nRange 4-5 60-75 20-80 30-70\\nStrait 2 horizontal 0 0\\nStrait 1 vertical 0 0\\nTrough 4 25-35 30-70 30-70\\nPit 6 15-25 20-80 20-80\\nSmooth 1 0 0 0\\nMask 4 0 0 0"}
+]}
 
-async function _planetGenerateFromAI(prompt, cells, neighbors, K, seaLevel, lockedCenter, onStatus) {
-  const provider = PROVIDERS[aiSettings.provider];
-  if (!provider) throw new Error("no AI provider configured");
-  if (provider.requiresKey && !aiSettings.anthropicKey) {
-    throw new Error("API key required - set in AI Settings panel");
-  }
-  const t0 = performance.now();
-  onStatus && onStatus("calling " + (aiSettings.model || provider.defaultModel) + "…");
-  const response = await provider.call({
-    system: _PLANET_AI_SYSTEM_PROMPT,
-    user: prompt,
-    model: aiSettings.model || provider.defaultModel,
-    key: aiSettings.anthropicKey,
-    temperature: 0.8
-  });
-  // Strip code fences if the model added them.
-  let json = String(response).trim();
+"tropical archipelago, lots of small islands":
+{"caps":[
+  {"lat":5,"lon":-40,"radiusDeg":30,"verbs":"Hill 12 25-40 10-90 20-80\\nHill 8 15-25 20-80 30-70\\nAdd -8 land 0 0\\nSmooth 2 0 0 0\\nMask 2 0 0 0"},
+  {"lat":-2,"lon":110,"radiusDeg":25,"verbs":"Hill 10 30-45 15-85 15-85\\nHill 6 15-25 20-80 25-75\\nAdd -5 land 0 0\\nMask 2 0 0 0"},
+  {"lat":8,"lon":150,"radiusDeg":22,"verbs":"Hill 8 25-35 25-75 25-75\\nHill 5 12-20 20-80 20-80\\nAdd -7 land 0 0\\nMask 2 0 0 0"}
+]}
+
+"frozen polar continent with mountain spine":
+{"caps":[
+  {"lat":75,"lon":0,"radiusDeg":40,"verbs":"Hill 1 90-95 50-50 45-55\\nRange 3 65-80 25-75 35-65\\nHill 6 35-50 15-85 20-80\\nPit 4 20-30 20-80 20-80\\nMultiply 0.9 land 0 0\\nMask 3 0 0 0"}
+]}
+
+REJECT BLOB-ONLY OUTPUT. If you'd write only Hill + Mask, add a Range, a Trough or Pit, and more Hills first. Output ONLY the JSON object.`;
+
+const _PLANET_AI_AUDIT_SYSTEM_PROMPT = `You are auditing a planet map you previously produced. The attached image is a 2D equirect view of the rendered map (longitude on x, latitude on y, NORTH ON TOP, biome colors with blue ocean).
+
+You receive:
+1. The user's ORIGINAL REQUEST
+2. Your PREVIOUS JSON plan
+3. The RENDERED IMAGE of that plan
+
+Your job: revise the JSON to better match the user's request. Look for:
+- Continents that came out too small (Mask too aggressive, not enough Hill operations)
+- Single uniform-height landmasses (need more Range / variation)
+- Wrong locations (a "tropical" cap placed at the poles)
+- Missing features (user said "rivers and mountains" but no Range verbs in the plan)
+- Wrong continent count
+- Caps clustered in one hemisphere when they should be spread
+
+KEEP caps that look right; REWRITE verbs for caps that need fixing; ADD or REMOVE caps if the count is wrong. Same DSL, same JSON shape.
+
+Output ONLY the revised JSON object {"caps":[...]}, no commentary.`;
+
+function _parseAIPlan(rawResponse) {
+  let json = String(rawResponse).trim();
   json = json.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim();
+  // If the model wrapped the JSON in commentary, salvage the first {...} block.
+  const firstBrace = json.indexOf("{");
+  const lastBrace  = json.lastIndexOf("}");
+  if (firstBrace > 0 && lastBrace > firstBrace) json = json.slice(firstBrace, lastBrace + 1);
   let parsed;
   try { parsed = JSON.parse(json); }
-  catch (e) { throw new Error("model returned invalid JSON: " + e.message + "\n" + json.slice(0, 200)); }
+  catch (e) { throw new Error("model returned invalid JSON: " + e.message + "\n" + json.slice(0, 300)); }
   if (!parsed || !Array.isArray(parsed.caps)) throw new Error("response missing 'caps' array");
   if (parsed.caps.length === 0) throw new Error("response had 0 caps");
+  return parsed;
+}
 
-  onStatus && onStatus("applying " + parsed.caps.length + " continents…");
+function _applyAIPlan(plan, cells, neighbors, K, seaLevel, lockedCenter) {
   _planetVerbReset(cells);
   const powers = _planetTemplatePowers(cells.count);
-  for (let i = 0; i < parsed.caps.length; i++) {
-    const c = parsed.caps[i];
+  for (let i = 0; i < plan.caps.length; i++) {
+    const c = plan.caps[i];
     const radDeg = Math.max(8, Math.min(90, Number(c.radiusDeg) || 50));
     const radRad = radDeg * Math.PI / 180;
     let cap;
@@ -57564,10 +57594,92 @@ async function _planetGenerateFromAI(prompt, cells, neighbors, K, seaLevel, lock
     _planetRunDSL(String(c.verbs || ""), cells, neighbors, K, cap, powers);
   }
   _planetPostDSL(cells, neighbors, K, seaLevel);
+}
+
+async function _capturePainterPng(canvas) {
+  // Returns base64-encoded PNG of the painter's 2D equirect canvas.
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(async (blob) => {
+      if (!blob) { reject(new Error("canvas.toBlob returned null")); return; }
+      try {
+        const buf = await blob.arrayBuffer();
+        const u8 = new Uint8Array(buf);
+        let str = "";
+        for (let i = 0; i < u8.length; i++) str += String.fromCharCode(u8[i]);
+        resolve(btoa(str));
+      } catch (e) { reject(e); }
+    }, "image/png");
+  });
+}
+
+/* AI generation w/ optional vision-audit rounds.
+ *
+ * Round 0: send the user prompt → get plan → apply + render.
+ * Rounds 1..N: capture rendered painter PNG → send (prompt + previous
+ *              plan + image) → get revised plan → apply + render.
+ *
+ * Audit rounds catch issues the LLM can't anticipate from the prompt
+ * alone -- continents that shrank to nothing, wrong locations, missing
+ * features. Each round = 1 API call; the cost trades for quality.
+ * Vision-capable providers only (Anthropic + Gemma both support it). */
+async function _planetGenerateFromAI(prompt, cells, neighbors, K, seaLevel, lockedCenter, onStatus, painterCanvas, painterRerender, auditRounds) {
+  const provider = PROVIDERS[aiSettings.provider];
+  if (!provider) throw new Error("no AI provider configured");
+  if (provider.requiresKey && !aiSettings.anthropicKey) {
+    throw new Error("API key required - set in AI Settings panel");
+  }
+  const rounds = (typeof auditRounds === "number") ? Math.max(0, Math.min(3, auditRounds)) : 1;
+  const t0 = performance.now();
+
+  // --- Initial round ---
+  onStatus && onStatus("round 1/" + (rounds + 1) + ": calling " + (aiSettings.model || provider.defaultModel) + "…");
+  const initial = await provider.call({
+    system: _PLANET_AI_SYSTEM_PROMPT,
+    user: prompt,
+    model: aiSettings.model || provider.defaultModel,
+    key: aiSettings.anthropicKey,
+    temperature: 0.8
+  });
+  let plan = _parseAIPlan(initial);
+  onStatus && onStatus("round 1/" + (rounds + 1) + ": applying " + plan.caps.length + " caps…");
+  _applyAIPlan(plan, cells, neighbors, K, seaLevel, lockedCenter);
+  if (painterRerender) painterRerender();
+
+  // --- Audit rounds ---
+  for (let r = 0; r < rounds; r++) {
+    if (!painterCanvas || !provider.supportsImage) break;
+    const roundIdx = r + 2;
+    onStatus && onStatus("round " + roundIdx + "/" + (rounds + 1) + ": capturing view…");
+    let imageB64;
+    try { imageB64 = await _capturePainterPng(painterCanvas); }
+    catch (e) { console.warn("[planet-map] capture failed, skipping audit:", e); break; }
+    onStatus && onStatus("round " + roundIdx + "/" + (rounds + 1) + ": auditing with vision…");
+    const auditUser = "ORIGINAL REQUEST: " + prompt
+      + "\n\nPREVIOUS JSON PLAN: " + JSON.stringify(plan)
+      + "\n\nThe image shows the rendered result. Output a revised JSON plan that better matches the request.";
+    const auditResp = await provider.call({
+      system: _PLANET_AI_AUDIT_SYSTEM_PROMPT,
+      user: auditUser,
+      image: imageB64,
+      model: aiSettings.model || provider.defaultModel,
+      key: aiSettings.anthropicKey,
+      temperature: 0.6
+    });
+    let revised;
+    try { revised = _parseAIPlan(auditResp); }
+    catch (e) {
+      console.warn("[planet-map] audit round " + roundIdx + " returned invalid JSON, keeping previous plan:", e.message);
+      continue;
+    }
+    plan = revised;
+    onStatus && onStatus("round " + roundIdx + "/" + (rounds + 1) + ": applying " + plan.caps.length + " caps…");
+    _applyAIPlan(plan, cells, neighbors, K, seaLevel, lockedCenter);
+    if (painterRerender) painterRerender();
+  }
 
   const ms = Math.round(performance.now() - t0);
-  console.log("[planet-map] AI-generated map: " + parsed.caps.length + " caps in " + ms + "ms");
-  return { caps: parsed.caps.length, ms };
+  console.log("[planet-map] AI-generated map: " + plan.caps.length + " caps, " + (rounds + 1) + " round(s), " + ms + "ms");
+  return { caps: plan.caps.length, ms, rounds: rounds + 1 };
 }
 
 
@@ -70627,19 +70739,30 @@ function openPlanetMapEditor(nodeId) {
     aiGoBtn.textContent = "...";
     aiStatus.textContent = "asking " + aiSettings.provider + "…";
     try {
+      // Show biome view during generation so vision-audit gets the
+      // climate-colored image (matches what the LLM sees in examples).
+      const wasShowing = showClimate;
+      showClimate = true;
+      // Force climate to be computable for the audit render.
+      _ensurePlanetClimate(node, seaLevel);
+      _ensurePlanetRivers(node, seaLevel);
+      const repaint = () => {
+        node._cellsVersion = ((typeof node._cellsVersion === "number") ? node._cellsVersion : 0) + 1;
+        _ensurePlanetClimate(node, seaLevel);
+        _ensurePlanetRivers(node, seaLevel);
+        render();
+      };
       const stats = await _planetGenerateFromAI(
         prompt, cells, node._cellNeighbors, node._cellNeighborsK,
         seaLevel, lockedCenter,
-        s => { aiStatus.textContent = s; }
+        s => { aiStatus.textContent = s; },
+        canvas, repaint, 1   // 1 audit round = 2 total API calls
       );
       dirty = true;
-      node._cellsVersion = ((typeof node._cellsVersion === "number") ? node._cellsVersion : 0) + 1;
-      if (showClimate) {
-        _ensurePlanetClimate(node, seaLevel);
-        _ensurePlanetRivers(node, seaLevel);
-      }
+      showClimate = wasShowing;
+      climateBtn.textContent = showClimate ? "hide climate" : "show climate";
       render();
-      aiStatus.textContent = "done: " + stats.caps + " continents placed in " + stats.ms + "ms";
+      aiStatus.textContent = "done: " + stats.caps + " caps, " + stats.rounds + " round(s), " + stats.ms + "ms";
     } catch (err) {
       aiStatus.textContent = "error: " + (err.message || err);
       console.error("[planet-map] AI generation failed:", err);
