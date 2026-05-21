@@ -57522,68 +57522,9 @@ function _planetPostDSL(cells, neighbors, K, seaLevel, opts) {
  * cleanup, remap) is identical to the old preset path. */
 // _PLANET_AI_SYSTEM_PROMPT removed 2026-05-21 -- AI pipeline is now feature-only; landmass comes from GeoJSON import or brush.
 
-const _PLANET_AI_AUDIT_SYSTEM_PROMPT = `You are auditing a planet map you produced.
-
-CONTEXT: the image is an EQUIRECTANGULAR PROJECTION of a SPHERICAL planet -- a 2D rectangle (x = longitude -180..180, y = latitude +90..-90, NORTH ON TOP). Distorts near poles (Mercator stretching), wraps at the date line. Design for the sphere; polar stretching is projection distortion not a flaw.
-
-Biome colors: blue = ocean, white = glacier / snow / snow-capped mountains, grey-brown = mountain slopes, green = forest, tan = desert/savanna, dark green = wetland, brown = tundra.
-
-═══════════════════════════════════════════════════════════════════
-THE #1 RULE: AUDIT IS PURELY ADDITIVE. YOU MAY ADD, NEVER REMOVE.
-═══════════════════════════════════════════════════════════════════
-
-The previous plan has caps and verb lines. Your revised plan MUST contain ALL of them VERBATIM:
-- Every cap in the input MUST appear in the output (same lat / lon / radiusDeg).
-- Every verb line in each cap's verbs string MUST appear unchanged in the output's verbs string for that cap.
-- You may ADD new cap entries to the caps array.
-- You may APPEND new verb lines to existing caps. Append BEFORE the final Mask line (so Mask still runs last).
-- You may NOT delete verbs. You may NOT lower any Hill or Range height. You may NOT change radiusDeg to a smaller value.
-
-If a cap looks OK as-is, keep it untouched. If a cap is missing something, append the missing verbs. Output a strict SUPERSET of the input.
-
-═══════════════════════════════════════════════════════════════════
-
-You receive: (1) user's ORIGINAL REQUEST  (2) your PREVIOUS JSON plan  (3) the RENDERED IMAGE.
-
-WHAT TO LOOK FOR AND HOW TO ADD (priority order):
-
-1. CONTINENTS LOOK ROUND. Counter the cap-circle default by APPENDING:
-   - 4-6 Troughs at x "0-20" with y "0-100" (west coast bites)
-   - 4-6 Troughs at x "80-100" with y "0-100" (east coast bites)
-   - 3 Troughs at y "0-15" with x "25-75" (south coast)
-   - 3 Troughs at y "85-100" with x "25-75" (north coast)
-   - Each Trough at depth 15-22
-   - Plus ADD 1-2 new smaller caps overlapping the original (offset 20-40°, radiusDeg 25-40) to push out peninsulas
-   Append these BEFORE the final Mask. Don't touch existing verbs.
-
-2. CONTINENT IS TOO SMALL (looks like a dot or tiny island when user wanted Earth-scale).
-   ADD 2-3 more caps adjacent to the existing cap (offset 25-50°, radiusDeg 40-55 each). Each new cap gets its own verb sequence using the irregular-coast recipe from the system prompt.
-
-3. NO VISIBLE MOUNTAINS (no white peaks, no grey-brown slopes).
-   This audit IS pass 2 — pass 1 deliberately omitted mountains so you could add them now with awareness of the rendered landmass shape. For EACH cap that has visible land in the rendered image, APPEND interior detail (BEFORE any final Mask line):
-     Range 2-3 70-85 25-75 30-70   // 2-3 mountain spines in the cap interior
-     Hill 1 85-95 45-55 45-55      // single Mt-Everest-class peak at cap center
-     Hill 2 65-80 35-65 35-65      // secondary peaks flanking the main peak
-     Range 1-2 30-50 5-15 25-75    // coastal mountain at west edge (optional)
-     Range 1-2 30-50 85-95 25-75   // coastal mountain at east edge (optional)
-   KEEP all original landmass-shaping verbs (Hill cores, Multiply, Strait, Trough) -- those define the shape, do not touch.
-
-4. ALL-MOUNTAINS / NO PLAINS (land is uniformly high, no green).
-   APPEND to each cap: Hill count=10-12 height=22-38 x=10-90 y=10-90 (broad plains layer). The existing high Hills and Ranges STAY -- you're filling in the spaces between them with plains.
-
-5. MISSING FEATURE (user asked for archipelago / inland sea / etc. that's not visible).
-   ADD new caps (for archipelago, polar cap) OR append matching verbs (Strait for inland sea, Range for mountains).
-
-6. WRONG LOCATION (only fix this for clearly-wrong placements, e.g. user asked tropical and cap is at the pole).
-   This is the ONE case where you may CHANGE a cap's lat / lon. Don't delete the cap; relocate it.
-
-ELEVATION TARGETS (both plains AND mountains required):
-- 50-60% of land at heights 22-45 (plains)
-- 20-25% at 45-60 (hills)
-- 10-15% at 60-80 (mountains)
-- 5-10% at 80-100 (peaks)
-
-OUTPUT a strict superset JSON. ONLY the JSON object, no commentary. If the input had 3 caps with 8 verbs each, your output has AT LEAST those 3 caps with AT LEAST those 8 verbs each (in the original order), plus any additions.`;
+// AI audit machinery removed 2026-05-21 -- the editor's AI features for
+// planet maps were retired; landmass + features come from the brush,
+// GeoJSON import, or Azgaar full JSON import.
 
 function _parseAIPlan(rawResponse) {
   let json = String(rawResponse).trim();
@@ -57790,6 +57731,168 @@ async function _capturePainterPng(canvas) {
  * piecewise sealevel remap fires but the stamped binary mask is
  * preserved verbatim. Returns { landCells, totalCells, landFraction,
  * featuresProcessed, landFeatures, rasterMs, stampMs }. */
+/* §planet-spec Phase 7.f-azgaar -- AZGAAR FULL JSON STAMPER.
+ *
+ * Accepts an Azgaar Fantasy Map Generator FULL JSON export (the
+ * one you get from "Export -> Save as JSON" in FMG, NOT the Cells
+ * GeoJSON). Format (from FMG v1.122+):
+ *   - info: { width, height, ... }
+ *   - mapCoordinates: { latN, latS, lonW, lonE }   (pixel->lat/lon)
+ *   - pack.cells: [{ i, v, p, h, ... }]            (h is 0..100, sealevel=20)
+ *   - pack.vertices: [{ i, p }]                    (p is [px, py] pixel)
+ *
+ * For each pack.cells entry, reconstruct the polygon from its
+ * vertex IDs (cell.v -> vertices[id].p), convert pixel-space
+ * polygon to lat/lon via mapCoordinates, rasterize the polygon
+ * in a grayscale value encoding the cell's h.
+ *
+ * Politics (cultures, burgs, states, provinces, religions,
+ * markers, routes, zones) are deliberately IGNORED -- this only
+ * cares about height + biome.
+ *
+ * Detection: full JSON has `pack.cells` as an array of objects
+ * with .h .v .p properties. GeoJSON has `features` as an array
+ * of objects with .geometry / .properties. _planetStampLandmass
+ * below auto-dispatches based on top-level shape. */
+async function _planetStampAzgaarJSON(json, cells, neighbors, K, seaLevel, onStatus) {
+  if (!json || !json.pack || !Array.isArray(json.pack.cells) || !Array.isArray(json.pack.vertices)) {
+    throw new Error("input is not a valid Azgaar full JSON (missing pack.cells or pack.vertices)");
+  }
+  const cellsSrc = json.pack.cells;
+  const verts = json.pack.vertices;
+  const N = cells.count;
+  const info = json.info || {};
+  const mapCoords = json.mapCoordinates || {};
+  const W_src = info.width  || 1600;
+  const H_src = info.height || 800;
+  // mapCoords: latN (north edge lat) and latS (south edge lat); same
+  // for lon. Default to full sphere if not present.
+  const latN = (typeof mapCoords.latN === "number") ? mapCoords.latN : 90;
+  const latS = (typeof mapCoords.latS === "number") ? mapCoords.latS : -90;
+  const lonW = (typeof mapCoords.lonW === "number") ? mapCoords.lonW : -180;
+  const lonE = (typeof mapCoords.lonE === "number") ? mapCoords.lonE : 180;
+
+  onStatus && onStatus("rasterizing " + cellsSrc.length + " cells…");
+  const W = 2048, H = 1024;
+  const t0 = performance.now();
+  const canvas = document.createElement("canvas");
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, W, H);
+
+  // Convert pixel (px, py) in the source map to canvas pixel (cx, cy)
+  // in our 2048x1024 rasterizer:
+  //   1. pixel -> source lat/lon via mapCoordinates
+  //   2. lat/lon -> canvas pixel (full sphere, equirect)
+  function srcToCanvas(px, py) {
+    // Source pixel space: x=0 -> lonW, x=W_src -> lonE; y=0 -> latN, y=H_src -> latS.
+    const lon = lonW + (px / W_src) * (lonE - lonW);
+    const lat = latN - (py / H_src) * (latN - latS);
+    let lonC = ((lon + 180) % 360 + 360) % 360 - 180;
+    let latC = Math.max(-90, Math.min(90, lat));
+    return [(lonC + 180) / 360 * W, (90 - latC) / 180 * H];
+  }
+
+  // Azgaar h is 0..100 with sealevel at 20. Convert to grayscale:
+  //   ocean (h < 20):  grey 0..50   matches our GeoJSON decoder
+  //   land  (h >= 20): grey 53..255 matches our GeoJSON decoder
+  function azgaarHeightToGrey(h_int) {
+    if (h_int < 20) {
+      const t = h_int / 20;  // 0..1
+      return Math.round(t * 50);
+    } else {
+      const t = (h_int - 20) / 80;  // 0..1 as h goes 20..100
+      return 53 + Math.round(Math.max(0, Math.min(1, t)) * 202);
+    }
+  }
+
+  // Two-pass draw: ocean (h<20) first, land on top so any overlap
+  // resolves in favor of land. Within each pass, sort by h asc so
+  // bigger heights paint over smaller heights -- mountain peaks
+  // dominate their cells visually.
+  let landCount = 0, oceanCount = 0;
+  const oceanIdx = [], landIdx = [];
+  for (let i = 0; i < cellsSrc.length; i++) {
+    const c = cellsSrc[i];
+    if (!c || !Array.isArray(c.v) || c.v.length < 3) continue;
+    if (typeof c.h !== "number") continue;
+    if (c.h < 20) oceanIdx.push(i); else landIdx.push(i);
+  }
+  oceanIdx.sort((a, b) => cellsSrc[a].h - cellsSrc[b].h);
+  landIdx.sort((a, b) => cellsSrc[a].h - cellsSrc[b].h);
+
+  function drawCell(idx) {
+    const c = cellsSrc[idx];
+    const grey = azgaarHeightToGrey(c.h);
+    ctx.fillStyle = "rgb(" + grey + "," + grey + "," + grey + ")";
+    ctx.beginPath();
+    for (let j = 0; j < c.v.length; j++) {
+      const vid = c.v[j];
+      const v = verts[vid];
+      if (!v || !Array.isArray(v.p)) continue;
+      const [cx, cy] = srcToCanvas(v.p[0], v.p[1]);
+      if (j === 0) ctx.moveTo(cx, cy);
+      else         ctx.lineTo(cx, cy);
+    }
+    ctx.closePath();
+    ctx.fill();
+  }
+  for (const i of oceanIdx) { drawCell(i); oceanCount++; }
+  for (const i of landIdx)  { drawCell(i);  landCount++;  }
+  const rasterMs = performance.now() - t0;
+
+  // Stamp pixel -> cell elevation.
+  onStatus && onStatus("stamping " + N + " cells…");
+  const t1 = performance.now();
+  const img = ctx.getImageData(0, 0, W, H);
+  const data = img.data;
+  let landCells = 0;
+  for (let i = 0; i < N; i++) {
+    const x = cells.positions[i*3], y = cells.positions[i*3+1], z = cells.positions[i*3+2];
+    const lat = Math.asin(Math.max(-1, Math.min(1, y))) * 180 / Math.PI;
+    const lon = Math.atan2(z, x) * 180 / Math.PI;
+    let px = Math.floor((lon + 180) / 360 * W);
+    let py = Math.floor((90 - lat) / 180 * H);
+    if (px < 0) px = 0; else if (px >= W) px = W - 1;
+    if (py < 0) py = 0; else if (py >= H) py = H - 1;
+    const grey = data[(py * W + px) * 4];
+    let logical;
+    if (grey <= 51) {
+      logical = (grey / 50) * 0.196;
+    } else {
+      const t = (grey - 53) / 202;
+      logical = 0.208 + t * (1.0 - 0.208);
+    }
+    cells.elevations[i] = logical;
+    if (logical >= 0.20) landCells++;
+  }
+  const stampMs = performance.now() - t1;
+
+  _planetPostDSL(cells, neighbors, K, seaLevel, { skipCleanup: true, skipSmoothing: true });
+  if (cells.biome) cells.biome.fill(0);
+  if (cells.flux)  cells.flux.fill(0);
+  if (cells.riverId) cells.riverId.fill(-1);
+
+  return {
+    landCells, totalCells: N, landFraction: landCells / N,
+    featuresProcessed: cellsSrc.length,
+    landFeatures: landCount, oceanFeatures: oceanCount,
+    rasterMs: +rasterMs.toFixed(1), stampMs: +stampMs.toFixed(1),
+    format: "azgaar"
+  };
+}
+
+// Dispatcher -- auto-detect format and route to the right stamper.
+async function _planetStampLandmass(json, cells, neighbors, K, seaLevel, onStatus) {
+  if (json && json.pack && Array.isArray(json.pack.cells) && Array.isArray(json.pack.vertices)) {
+    return _planetStampAzgaarJSON(json, cells, neighbors, K, seaLevel, onStatus);
+  }
+  if (json && Array.isArray(json.features)) {
+    return _planetStampGeoJSON(json, cells, neighbors, K, seaLevel, onStatus);
+  }
+  throw new Error("unsupported file: expected an Azgaar FMG full JSON (.json with pack.cells) or a GeoJSON FeatureCollection (.geojson with features)");
+}
+
 async function _planetStampGeoJSON(geojson, cells, neighbors, K, seaLevel, onStatus) {
   if (!geojson || !Array.isArray(geojson.features)) {
     throw new Error("input must be a GeoJSON FeatureCollection with features array");
@@ -57934,114 +58037,7 @@ async function _planetStampGeoJSON(geojson, cells, neighbors, K, seaLevel, onSta
   };
 }
 
- /*
- * AI map generation. Audit rounds catch issues the LLM can't
- * anticipate from the prompt alone -- continents that shrank to
- * nothing, wrong locations, missing features. Each round = 1 API
- * call; the cost trades for quality. Vision-capable providers only
- * (Anthropic + Gemma both support it). */
-async function _planetGenerateFromAI(prompt, cells, neighbors, K, seaLevel, lockedCenter, onStatus, painterCanvas, painterRerender, keywordAudits, refKey, targetLand) {
-  // 2026-05-21 -- AI pipeline REDESIGNED as feature-only. The user
-  // establishes the landmass via the painter's GeoJSON import or the
-  // brush. The AI's only job here is to ADD FEATURES (mountains,
-  // deserts, ice caps, archipelagos, etc.) on top of that landmass.
-  //
-  // No landmass-generation pass. No baseline audit. No free-text
-  // prompt. Just N per-keyword passes, each emitting a JSON plan
-  // that runs ON TOP of existing cell elevations (skipReset:true).
-  // The `prompt` and `refKey` parameters are accepted for backward-
-  // compat but ignored.
-  const provider = PROVIDERS[aiSettings.provider];
-  if (!provider) throw new Error("no AI provider configured");
-  if (provider.requiresKey && !aiSettings.anthropicKey) {
-    throw new Error("API key required - set in AI Settings panel");
-  }
-  if (!provider.supportsImage) {
-    throw new Error("feature audits require a vision-capable provider (anthropic / gemma)");
-  }
-  const kwAudits = Array.isArray(keywordAudits) ? keywordAudits.filter(Boolean) : [];
-  if (kwAudits.length === 0) {
-    throw new Error("no feature chips selected -- pick at least one keyword chip before adding features");
-  }
-  const totalPasses = kwAudits.length;
-  const t0 = performance.now();
-
-  // Run each selected keyword audit sequentially. Each one:
-  //   1. captures the current painter view (existing landmass +
-  //      any features added so far)
-  //   2. optionally loads the keyword's reference image
-  //   3. calls the LLM with the keyword's audit prompt
-  //   4. applies the resulting plan with skipReset + skipCleanup
-  //      so existing elevations survive (and lockLand for features
-  //      that should preserve land/ocean boundaries)
-  for (let i = 0; i < kwAudits.length; i++) {
-    const kw = kwAudits[i];
-    const label = String(kw.label || "feature").replace(/^\+\s*/, "");
-    const roundIdx = i + 1;
-
-    onStatus && onStatus("round " + roundIdx + "/" + totalPasses + ": capturing (" + label + ")…");
-    let painterB64;
-    try { painterB64 = await _capturePainterPng(painterCanvas); }
-    catch (e) { console.warn("[planet-map] capture failed for '" + label + "':", e); continue; }
-
-    let refImage = null;
-    if (kw.refKey) {
-      try { refImage = await _loadPlanetReference(kw.refKey); }
-      catch (e) { /* missing ref is OK, audit runs text-only */ }
-    }
-    const images = [painterB64];
-    if (refImage) images.push(refImage);
-
-    onStatus && onStatus("round " + roundIdx + "/" + totalPasses + ": adding " + label + (refImage ? " (+ref)" : "") + "…");
-    const auditUser =
-      "FEATURE TO ADD: " + label + "\n\n"
-      + "The FIRST attached image is the CURRENT planet. Existing landmass is fixed -- you must NOT change which cells are land vs ocean. Your only job is to ADD this feature's elevation modifications on top of what's already there."
-      + (refImage ? " The SECOND attached image is a real-world reference for what this feature looks like." : "")
-      + "\n\nLook at where the EXISTING land is in the current image. Place your caps OVER LAND (or just offshore for archipelago / trench / volcanic-chain features). Cells that are currently OCEAN will remain ocean; cells that are LAND will remain land (the engine enforces this). Within those constraints, ADD your feature's verbs.\n\n"
-      + "Output ONLY a JSON object: { \"caps\": [ { \"lat\":..., \"lon\":..., \"radiusDeg\":..., \"verbs\": \"...\" }, ... ] }. No commentary, no markdown fences.";
-
-    let resp;
-    try {
-      resp = await provider.call({
-        system: kw.audit,
-        user: auditUser,
-        image: images,
-        model: aiSettings.model || provider.defaultModel,
-        key: aiSettings.anthropicKey,
-        temperature: 0.5,
-        maxTokens: 4096
-      });
-    } catch (e) {
-      console.warn("[planet-map] '" + label + "' provider call failed:", e);
-      continue;
-    }
-
-    let plan;
-    try { plan = _parseAIPlan(resp); }
-    catch (e) {
-      console.warn("[planet-map] '" + label + "' returned invalid JSON, skipping:", e.message);
-      continue;
-    }
-    if (!plan || !plan.caps || plan.caps.length === 0) continue;
-
-    onStatus && onStatus("round " + roundIdx + "/" + totalPasses + ": applying " + plan.caps.length + " caps for " + label + "…");
-    // skipReset: keep existing landmass elevations.
-    // lockLand:  features can modify land elevations but cannot flip
-    //            cells between land and ocean status.
-    // skipCleanup / skipSmoothing: preserve the stamped fractal coast.
-    _applyAIPlan(plan, cells, neighbors, K, seaLevel, lockedCenter, {
-      skipReset: true,
-      lockLand: true,
-      skipCleanup: true,
-      skipSmoothing: true
-    });
-    if (painterRerender) painterRerender();
-  }
-
-  const ms = Math.round(performance.now() - t0);
-  console.log("[planet-map] AI features added: " + kwAudits.length + " passes, " + ms + "ms");
-  return { caps: 0, ms, rounds: totalPasses };
-}
+// _planetGenerateFromAI removed 2026-05-21 -- AI feature pipeline retired.
 
 
 /* §planet-spec Phase 7.b -- serialize / deserialize the cubemap as
@@ -70843,85 +70839,10 @@ const PORT_TYPE_OPTS_OUT = ["audio", "param", "gate", "clock", "texture", "trans
  * affected area on the sphere is uniform regardless of latitude. */
 // §planet-spec Phase 7.f-ai -- preset and keyword tables hoisted to
 // module scope so the offline prompt-tester (tools/pmap-prompt-tester.html)
-// can read them via window.__PMAP. Presets shape the planet (landmass
-// count / size / placement); keywords add features on top. Earth's two
-// combined landmass clusters cover ~22% of the surface; all Earth land
-// ~29% -- the targetLand bands hint at this.
-// PMAP_AI_PRESETS dissolved 2026-05-21 -- the AI pipeline no longer
-// does landmass generation. Landmass comes from the user (GeoJSON
-// import or brush). The AI only adds FEATURES (see PMAP_AI_KEYWORDS).
-// Kept as an empty array for any code paths that still reference it.
-const PMAP_AI_PRESETS = [];
-
-// Feature chips. After 2026-05-21 redesign these are the ONLY AI-
-// driven knobs in the planet-map editor: the landmass comes from
-// the user (GeoJSON import or brush), and clicking chips + Add
-// Features asks the LLM to ADD each feature on top of the
-// existing landmass.
-//
-// Each audit's system prompt is now SELF-CONTAINED (no reference
-// to a 'previous plan'). The runtime wraps it with a user message
-// containing the current rendered image + an optional reference
-// image. The LLM emits a STANDALONE { "caps": [...] } plan that
-// gets applied with { skipReset, lockLand, skipCleanup,
-// skipSmoothing } so the landmass shape is preserved.
-const PMAP_AI_KEYWORDS = [
-  { label: "+ mountain ranges",
-    phrase: "tall mountain ranges with snow-capped peaks",
-    audit: "You are adding MOUNTAIN RANGES to an existing planet's landmass. Look at the current image -- the LAND is where you place mountains. Pick 1-3 of the LARGEST land regions visible.\n\nFor each, output a NEW cap with lat/lon centered ON that land region (not in the ocean), radiusDeg 25-45 to span the interior of the land. Verbs (Pikes-Peak-to-Colorado-Springs style: layered prominence, not one big dome):\n  Range 1 70-85 35-65 45-55     // main mountain spine\n  Range 2 50-65 35-65 38-48     // parallel sub-ridge\n  Range 2 50-65 35-65 52-62     // parallel sub-ridge other side\n  Hill 5 90-100 38-62 44-56     // isolated 5km-class peaks along crest\n  Hill 3 95-100 40-60 47-53     // ultra-summits\n  Trough 3 18-30 35-65 46-54    // longitudinal valleys between ridges\n  Hill 8 40-55 30-70 30-70      // foothills aprons\n\nOutput { \"caps\": [...] } only. No commentary." },
-
-  { label: "+ inland sea",
-    phrase: "central inland sea cutting through the continent",
-    audit: "You are adding an INLAND SEA to an existing planet's landmass. Look at the current image and find the LARGEST single land region. Place ONE cap centered INSIDE it (radiusDeg 25-40) with verbs that dig a basin in the cap interior:\n  Pit 1 -60 35-65 35-65         // deep central basin (the sea floor)\n  Pit 4 -30 30-70 30-70         // surrounding shallower water\n  Range 2 40-55 10-30 40-60     // west flanking shore mountains\n  Range 2 40-55 70-90 40-60     // east flanking shore mountains\n  Smooth 2 0 30-70 30-70        // soften basin floor\n\nThe Pit verbs will drop interior cells; lockLand restores cells that the engine considers OCEAN-becoming-land back to ocean, so the basin stays as inland water. Output { \"caps\": [...] } only." },
-
-  { label: "+ archipelago",
-    phrase: "scattered islands and small archipelago chains",
-    audit: "You are adding an ARCHIPELAGO of small islands. Look at the current image and find OCEAN regions (the blue/dark areas) near existing land. Output 3-6 NEW small caps in those ocean zones, radiusDeg 8-18, with verbs that build small isolated islands:\n  Hill 4 30-45 30-70 30-70      // small landmass core\n  Hill 2 60-75 40-60 40-60      // optional volcanic high peak\n  Add -10 land 0 0              // erode coastlines\n  Smooth 1 0 0 0\n\nVary lat by 5-15° between caps and lon by 8-20° to scatter the islands. Output { \"caps\": [...] } only -- the engine's lockLand will let ocean cells become land here because YOUR new caps overlap ocean regions that the verbs lift above sealevel." },
-
-  { label: "+ peninsulas",
-    phrase: "long peninsulas extending from coastlines",
-    audit: "You are adding PENINSULAS extending from existing land. Look at the current image and find LAND COASTS (the edge between blue ocean and the landmass). Output 2-4 NEW small caps positioned ON the coastline (overlapping both land and ocean), radiusDeg 10-20, with verbs:\n  Range 1 30-45 30-70 20-80     // central spine of the peninsula\n  Hill 4 20-35 25-75 25-75      // body fill\n  Add -8 land 0 0               // sharpen coast\n  Smooth 1 0 0 0\n\nOrient each peninsula by choosing cap centers ON the coastline so the peninsula extends from existing land into ocean. Output { \"caps\": [...] } only." },
-
-  { label: "+ polar ice cap",
-    phrase: "frozen polar ice cap covering high latitudes",
-    audit: "You are adding a POLAR ICE CAP at a high latitude (lat > 60° or < -60°). Place ONE big cap at lat 75 (or -75 -- pick the pole with LAND visible in the current image, or the south pole if neither has land). radiusDeg 35-50. Verbs:\n  Hill 1 25-35 0-100 35-65      // massive central dome (snow accumulation)\n  Hill 12 6-15 0-100 30-70      // secondary undulation\n  Range 2 65-80 25-75 40-60     // Transantarctic-style ice-mountain spine\n  Smooth 4 0 0-100 0-100        // glacier-flat surface\n\nOutput { \"caps\": [...] } only." },
-
-  { label: "+ tropical jungle",
-    phrase: "lush tropical lowlands in the equatorial belt",
-    audit: "You are designating EQUATORIAL TROPICAL LOWLAND zones (biome marker, not new elevation). Place 1-2 NEW caps over LAND at lat between -15 and +15. radiusDeg 25-40. Verbs flatten + smooth, no new mountains:\n  Smooth 3 0 10-90 30-70        // heavy smoothing -> flat lowland\n  Hill 25 3-8 10-90 30-70       // tiny humid-hill texture only\n  Add -5 60-100 0 0             // shave off any peaks in the zone\n\nDO NOT add tall verbs (no Range, no Hill > 30) -- jungle is LOW + FLAT. Output { \"caps\": [...] } only." },
-
-  { label: "+ desert plateau",
-    phrase: "broad arid plateau at mid-latitudes",
-    audit: "You are adding a DESERT PLATEAU on existing land at mid-latitude (lat ±20-35°). Place 1-2 NEW caps over LAND in that lat band. radiusDeg 20-35. Verbs build a broad flat-topped uplift:\n  Hill 1 35-45 25-75 25-75      // one broad plateau body\n  Smooth 3 0 25-75 25-75        // flatten the top\n  Hill 6 4-10 25-75 25-75       // sparse mesa bumps\n  Multiply 0.9 25-75 25-75      // damp residual relief\n\nOutput { \"caps\": [...] } only." },
-
-  { label: "+ river valleys",
-    phrase: "river valleys carving through the continents",
-    audit: "You are carving RIVER VALLEYS into existing land. Place 2-4 NEW caps over LAND, each radiusDeg 15-30, with shallow Trough verbs to carve dendritic gentle valleys:\n  Trough 1 -6 50-50 20-80       // main valley spine running interior to coast\n  Trough 3 -4 40-60 30-70       // tributaries\n  Pit 1 -3 50-50 75-85          // delta depression near coast\n  Smooth 3 0 30-70 20-80        // rivers don't have cliff walls\n\nLow depth magnitudes (-3 to -6) -- rivers are channels, not trenches. Output { \"caps\": [...] } only." },
-
-  { label: "+ coastal mountains",
-    phrase: "mountain ranges along the coastlines (like Norwegian fjords or the Cascades)",
-    audit: "You are adding COASTAL MOUNTAINS along existing land coasts. Place 1-3 NEW caps positioned so the cap CENTER is ON A COASTLINE (overlapping both land and ocean). radiusDeg 20-35. Verbs concentrate the range at the cap edge nearest the ocean:\n  Range 1 75-85 5-20 30-70      // main coastal ridge, x near cap edge\n  Hill 6 50-65 5-25 25-75       // ridge thickness biased to coast side\n  Hill 3 90-100 8-22 40-60      // stratovolcano cones\n  Trough 6 18-28 5-25 30-70     // fjord/glacial valley dissection\n  Hill 4 35-50 15-30 25-75      // interior foothills (gentler inland)\n  Pit 2 8-15 8-20 40-55         // caldera/crater lakes\n  Smooth 1 0 0-100 0-100\n\nOutput { \"caps\": [...] } only." },
-
-  { label: "+ volcanic chain",
-    phrase: "chain of volcanic islands or peaks in a curved arc (like Kamchatka or Hawaii)",
-    audit: "You are adding a VOLCANIC CHAIN of discrete cone peaks. Place 5-8 NEW small caps along a LINE or curved ARC -- vary lat by 5-10° and lon by 8-15° between adjacent caps. radiusDeg 8-16 (small -- each cap is one cone). Verbs build a single discrete cone per cap:\n  Hill 1 90-100 40-60 40-60     // discrete tall cone\n  Pit 1 30-50 45-55 45-55       // summit caldera\n  Hill 4 20-35 25-75 25-75      // gentle shield apron\n\nCaps can be placed in OCEAN to create island chains (Hawaiian-style) or ON LAND to create volcanic mountain ranges (Andean-style). Output { \"caps\": [...] } only." },
-
-  { label: "+ deep ocean trench",
-    phrase: "deep ocean trench running parallel to a coastline",
-    audit: "You are deepening a STRIP OF OCEAN parallel to existing land. Place 1-2 NEW thin caps in OCEAN, just offshore of a continental coast (cap CENTER in ocean, 3-8° offshore from coast). radiusDeg 6-12. Verbs:\n  Trough 1 -85 10-90 45-55      // deep ocean-bottom slot\n  Pit 4 -50 20-80 40-60         // secondary deepenings along the trench\n  Smooth 1 0 0-100 0-100\n\nThe trench should run roughly parallel to a nearby continent's coastline. Output { \"caps\": [...] } only." },
-
-  { label: "+ rift / divergent",
-    phrase: "linear rift valley between landmasses (like East African Rift or Mid-Atlantic Ridge)",
-    audit: "You are adding a RIFT VALLEY -- a thin linear depression. Place 1-2 NEW caps centered on the LINE between two land regions (or splitting one large land region). radiusDeg 15-25. Verbs:\n  Range 2 30-45 20-40 40-60     // west shoulder uplift (parallel ridge)\n  Range 2 30-45 60-80 40-60     // east shoulder uplift\n  Trough 1 -45 45-55 10-90      // deep central graben sliver\n  Pit 3 -20 40-60 30-70         // segmented rift lakes\n\nFor an ocean rift (Mid-Atlantic Ridge), place the cap in ocean between distant continents. For a continental rift (East African Rift), place it ON existing land. Output { \"caps\": [...] } only." },
-
-  { label: "+ rolling plains",
-    phrase: "broad rolling plains (like the Great Plains)",
-    audit: "You are adding ROLLING PLAINS on existing land -- broad gentle low relief, no new mountains. Place 1-3 NEW caps over LAND, ideally at mid-latitude (lat ±25-55°). radiusDeg 20-40. Verbs:\n  Smooth 1 0 0-100 0-100\n  Hill 40 5-12 10-90 10-90      // many tiny hills (prairie texture)\n  Hill 8 12-22 10-90 10-90      // a few prairie swells\n  Multiply 0.6 0-100 0-100      // damp existing high relief\n\nMultiply 0.6 partially LOWERS mountains inside the cap -- intentional, plains erase ruggedness. Output { \"caps\": [...] } only." },
-
-  { label: "+ rugged highlands",
-    phrase: "rugged highland regions with mixed peaks and valleys (like Tibetan Plateau)",
-    audit: "You are adding a RUGGED HIGHLAND PLATEAU. Place 1-2 NEW caps over LAND, radiusDeg 20-35. Verbs build an elevated plateau with internal complexity:\n  Hill 1 60-70 25-75 25-75      // broad plateau dome\n  Hill 12 55-70 30-70 30-70     // rolling plateau-surface relief\n  Hill 5 80-92 30-70 30-70      // residual massifs above plateau\n  Trough 4 25-35 25-75 25-75    // incised river gorges (NOT to baseline)\n  Hill 20 50-60 28-72 28-72     // fine-scale ruggedness\n  Smooth 2 0 0-100 0-100\n\nOutput { \"caps\": [...] } only." }
-];
+// PMAP_AI_PRESETS / PMAP_AI_KEYWORDS removed 2026-05-21 -- the AI
+// pipeline for planet maps was retired entirely. Landmass comes from
+// brush + GeoJSON / Azgaar full-JSON import; features come from the
+// brush mode picker (mountain / plain / valley / ridge / smooth).
 
 
 function openPlanetMapEditor(nodeId) {
@@ -70955,14 +70876,22 @@ function openPlanetMapEditor(nodeId) {
   const body = modal.querySelector("#pmap-body");
 
   // Canvas (equirect view of the planet's elevation, cells flat-shaded).
+  // Wrapped in a scroll container so it can be zoomed via CSS transform.
   const W = 720, H = 360;
+  const canvasWrap = document.createElement("div");
+  canvasWrap.style.cssText =
+    "width:720px;height:360px;overflow:auto;background:rgba(8,12,20,0.85);" +
+    "border:1px solid var(--border);border-radius:3px;display:block;margin-bottom:10px;" +
+    "scrollbar-width:thin;";
+  const canvasInner = document.createElement("div");
+  canvasInner.style.cssText = "width:720px;height:360px;transform-origin:0 0;";
   const canvas = document.createElement("canvas");
   canvas.width = W; canvas.height = H;
   canvas.style.cssText =
-    "width:720px;height:360px;background:rgba(8,12,20,0.85);" +
-    "border:1px solid var(--border);border-radius:3px;cursor:crosshair;" +
-    "image-rendering:pixelated;display:block;margin-bottom:10px;";
-  body.appendChild(canvas);
+    "width:720px;height:360px;cursor:crosshair;image-rendering:pixelated;display:block;";
+  canvasInner.appendChild(canvas);
+  canvasWrap.appendChild(canvasInner);
+  body.appendChild(canvasWrap);
   const ctx = canvas.getContext("2d");
 
   // Controls.
@@ -70981,55 +70910,22 @@ function openPlanetMapEditor(nodeId) {
     '<label title="raise to plain height (0.30) -- flattens mountains, lifts coast"><input type="radio" name="pmap-mode" value="plain"> plain</label>' +
     '<label title="carve into mountains toward valley height (0.22) without flipping to ocean"><input type="radio" name="pmap-mode" value="valley"> valley</label>' +
     '<label title="like mountain but center spikes higher than edges"><input type="radio" name="pmap-mode" value="ridge"> ridge</label>' +
+    '<span style="border-left:1px solid var(--border);height:18px;margin:0 2px;"></span>' +
+    '<button class="btn" id="pmap-undo" type="button" style="padding:3px 8px;" title="Undo last stroke (Ctrl+Z)">↶ undo</button>' +
+    '<button class="btn" id="pmap-redo" type="button" style="padding:3px 8px;" title="Redo (Ctrl+Y)">↷ redo</button>' +
+    '<span style="border-left:1px solid var(--border);height:18px;margin:0 2px;"></span>' +
+    '<button class="btn" id="pmap-zoom-out" type="button" style="padding:3px 8px;" title="Zoom out">−</button>' +
+    '<span id="pmap-zoom-v" style="display:inline-block;min-width:34px;text-align:center;">100%</span>' +
+    '<button class="btn" id="pmap-zoom-in" type="button" style="padding:3px 8px;" title="Zoom in">+</button>' +
+    '<button class="btn" id="pmap-zoom-fit" type="button" style="padding:3px 8px;" title="Fit (1:1)">fit</button>' +
+    '<span style="border-left:1px solid var(--border);height:18px;margin:0 2px;"></span>' +
     '<button class="btn" id="pmap-revert" type="button" style="padding:3px 10px;">revert</button>' +
     '<button class="btn" id="pmap-climate" type="button" style="padding:3px 10px;">show climate</button>' +
-    '<button class="btn" id="pmap-geojson" type="button" style="padding:3px 10px;" title="Import an Azgaar FMG Cells GeoJSON export to stamp its exact landmass onto this planet">import geojson</button>' +
+    '<button class="btn" id="pmap-geojson" type="button" style="padding:3px 10px;" title="Import an Azgaar FMG file (.geojson Cells export or full .json) to stamp its exact landmass + heights onto this planet">import azgaar</button>' +
     '<input type="file" id="pmap-geojson-file" accept=".geojson,.json,application/geo+json,application/json" style="display:none">';
   body.appendChild(ctrls);
 
-  // §planet-spec Phase 7.f-ai -- AI map generation via the wired LLM
-  // provider. Preset + keyword tables are hoisted above this function
-  // (so the offline prompt-tester at tools/pmap-prompt-tester.html
-  // can read them via window.__PMAP). The function references them
-  // via module-scope lookup. See the hoisted declarations.
-  const aiRow = document.createElement("div");
-  aiRow.style.cssText =
-    "display:flex;flex-direction:column;gap:6px;margin-top:8px;" +
-    "font-family:var(--font-mono);font-size:11px;color:var(--text-2);";
-  aiRow.innerHTML =
-    '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">' +
-      '<span style="color:var(--phosphor);">add features</span>' +
-      '<span style="color:var(--text-3);font-size:10px;">pick chips below, then click ADD FEATURES. landmass comes from the brush or geojson import; chips add detail on top.</span>' +
-      '<button class="btn" id="pmap-ai-go" type="button" style="padding:3px 12px;">add features</button>' +
-    '</div>' +
-    '<div id="pmap-ai-keywords" style="display:flex;flex-wrap:wrap;gap:4px;"></div>' +
-    '<span id="pmap-ai-status" style="color:var(--text-3);font-size:10px;min-height:14px;"></span>';
-  body.appendChild(aiRow);
-
-  // Keyword chips. Each click toggles the chip's "active" state and
-  // appends/removes its phrase in the prompt. Active chips drive
-  // per-keyword audit passes during generation.
-  const activeKeywords = new Set();  // strings (label) of currently-active chips
-  {
-    const chipBar = aiRow.querySelector("#pmap-ai-keywords");
-    const setChipStyle = (btn, active) => {
-      btn.style.cssText = "padding:2px 8px;font-size:10px;font-family:var(--font-mono);"
-        + (active ? "background:var(--phosphor);color:#000;border-color:var(--phosphor);" : "");
-    };
-    PMAP_AI_KEYWORDS.forEach(kw => {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.className = "btn";
-      b.textContent = kw.label;
-      setChipStyle(b, false);
-      b.addEventListener("click", () => {
-        const active = activeKeywords.has(kw.label);
-        if (active) { activeKeywords.delete(kw.label); setChipStyle(b, false); }
-        else        { activeKeywords.add(kw.label);    setChipStyle(b, true);  }
-      });
-      chipBar.appendChild(b);
-    });
-  }
+  // AI panel removed 2026-05-21 -- AI keyword features retired.
   const helpRow = document.createElement("div");
   helpRow.style.cssText =
     "font-family:var(--font-mono);font-size:10px;color:var(--text-3);margin-top:6px;line-height:1.5;";
@@ -71157,11 +71053,101 @@ function openPlanetMapEditor(nodeId) {
   modal.querySelectorAll('input[name="pmap-mode"]').forEach(r => {
     r.addEventListener("change", () => { if (r.checked) mode = r.value; });
   });
+
+  // Undo / redo stacks of Float32Array snapshots. Each "stroke"
+  // (pointerdown -> pointerup) or whole-canvas operation (revert,
+  // import) pushes ONE snapshot of cells.elevations to undoStack.
+  // Cap depth so memory doesn't blow up at large N.
+  const UNDO_MAX = 30;
+  const undoStack = [];
+  const redoStack = [];
+  function pushUndo() {
+    undoStack.push(new Float32Array(cells.elevations));
+    if (undoStack.length > UNDO_MAX) undoStack.shift();
+    redoStack.length = 0;  // any new edit clears the redo history
+    updateUndoUI();
+  }
+  function applySnapshot(snap) {
+    for (let i = 0; i < cells.elevations.length; i++) cells.elevations[i] = snap[i];
+    node._cellsVersion = ((typeof node._cellsVersion === "number") ? node._cellsVersion : 0) + 1;
+    dirty = true;
+    render();
+  }
+  function doUndo() {
+    if (undoStack.length === 0) return;
+    redoStack.push(new Float32Array(cells.elevations));
+    if (redoStack.length > UNDO_MAX) redoStack.shift();
+    applySnapshot(undoStack.pop());
+    updateUndoUI();
+  }
+  function doRedo() {
+    if (redoStack.length === 0) return;
+    undoStack.push(new Float32Array(cells.elevations));
+    if (undoStack.length > UNDO_MAX) undoStack.shift();
+    applySnapshot(redoStack.pop());
+    updateUndoUI();
+  }
+  const undoBtn = modal.querySelector("#pmap-undo");
+  const redoBtn = modal.querySelector("#pmap-redo");
+  function updateUndoUI() {
+    undoBtn.disabled = undoStack.length === 0;
+    redoBtn.disabled = redoStack.length === 0;
+    undoBtn.title = "Undo last stroke (Ctrl+Z) [" + undoStack.length + "]";
+    redoBtn.title = "Redo (Ctrl+Y) [" + redoStack.length + "]";
+  }
+  undoBtn.addEventListener("click", doUndo);
+  redoBtn.addEventListener("click", doRedo);
+  updateUndoUI();
+  // Keyboard shortcuts -- scoped to the modal so they don't interfere
+  // with other editor inputs. We attach to the modal-backdrop which
+  // has focus while the modal is open.
+  const kbHandler = (ev) => {
+    if (!document.body.contains(back)) return;
+    const k = ev.key.toLowerCase();
+    if ((ev.ctrlKey || ev.metaKey) && k === "z" && !ev.shiftKey) {
+      ev.preventDefault(); doUndo();
+    } else if ((ev.ctrlKey || ev.metaKey) && (k === "y" || (k === "z" && ev.shiftKey))) {
+      ev.preventDefault(); doRedo();
+    }
+  };
+  window.addEventListener("keydown", kbHandler);
+
+  // Zoom controls. The canvas lives inside canvasInner which we
+  // CSS-transform; canvasWrap is the scroll container. Pointer
+  // coordinate math uses getBoundingClientRect() which already
+  // accounts for the CSS scale.
+  const ZOOM_LEVELS = [1, 1.5, 2, 3, 4, 6, 8];
+  let zoomIdx = 0;
+  const zoomVSpan = modal.querySelector("#pmap-zoom-v");
+  function applyZoom() {
+    const z = ZOOM_LEVELS[zoomIdx];
+    canvasInner.style.transform = "scale(" + z + ")";
+    canvasInner.style.width  = (W * z) + "px";
+    canvasInner.style.height = (H * z) + "px";
+    zoomVSpan.textContent = Math.round(z * 100) + "%";
+  }
+  modal.querySelector("#pmap-zoom-in").addEventListener("click", () => {
+    if (zoomIdx < ZOOM_LEVELS.length - 1) { zoomIdx++; applyZoom(); }
+  });
+  modal.querySelector("#pmap-zoom-out").addEventListener("click", () => {
+    if (zoomIdx > 0) { zoomIdx--; applyZoom(); }
+  });
+  modal.querySelector("#pmap-zoom-fit").addEventListener("click", () => {
+    zoomIdx = 0; applyZoom();
+    canvasWrap.scrollLeft = 0; canvasWrap.scrollTop = 0;
+  });
+  // Wheel zoom on canvas: shift+wheel zooms; wheel alone scrolls.
+  canvasWrap.addEventListener("wheel", (ev) => {
+    if (!ev.shiftKey) return;
+    ev.preventDefault();
+    if (ev.deltaY < 0 && zoomIdx < ZOOM_LEVELS.length - 1) { zoomIdx++; applyZoom(); }
+    else if (ev.deltaY > 0 && zoomIdx > 0)                  { zoomIdx--; applyZoom(); }
+  }, { passive: false });
+
   modal.querySelector("#pmap-revert").addEventListener("click", () => {
+    pushUndo();
     for (let i = 0; i < cells.elevations.length; i++) cells.elevations[i] = elevSnapshot[i];
     dirty = true;
-    // Force river/climate recompute on next render -- bump version so
-    // the cached river/biome data tied to the OLD elevations is dropped.
     node._cellsVersion = ((typeof node._cellsVersion === "number") ? node._cellsVersion : 0) + 1;
     render();
   });
@@ -71201,7 +71187,8 @@ function openPlanetMapEditor(nodeId) {
     try {
       const text = await file.text();
       const geojson = JSON.parse(text);
-      const stats = await _planetStampGeoJSON(
+      pushUndo();  // snapshot pre-import so Ctrl+Z reverts
+      const stats = await _planetStampLandmass(
         geojson, cells, node._cellNeighbors, node._cellNeighborsK, seaLevel,
         (msg) => { geoBtn.textContent = msg.length > 22 ? msg.slice(0, 20) + "…" : msg; }
       );
@@ -71224,60 +71211,6 @@ function openPlanetMapEditor(nodeId) {
       geoBtn.disabled = false;
       // Reset the input so the same file can be picked again.
       geoFileIn.value = "";
-    }
-  });
-
-  // AI 'add features' wire-up.
-  const aiGoBtn  = modal.querySelector("#pmap-ai-go");
-  const aiStatus = modal.querySelector("#pmap-ai-status");
-
-  let aiBusy = false;
-  aiGoBtn.addEventListener("click", async () => {
-    if (aiBusy) return;
-    const activeKwObjs = PMAP_AI_KEYWORDS.filter(k => activeKeywords.has(k.label));
-    if (activeKwObjs.length === 0) { aiStatus.textContent = "pick at least one feature chip first"; return; }
-    // Verify there's existing landmass to add features to.
-    const lmPre = _planetMeasureLandmass(cells, seaLevel);
-    if (lmPre.landFraction < 0.005) {
-      aiStatus.textContent = "no landmass detected -- import a geojson or paint some land first";
-      return;
-    }
-    aiBusy = true;
-    aiGoBtn.disabled = true;
-    aiGoBtn.textContent = "...";
-    aiStatus.textContent = "asking " + aiSettings.provider + "…";
-    try {
-      // Use biome view during audits so the LLM sees colored land/ocean.
-      const wasShowing = showClimate;
-      showClimate = true;
-      _ensurePlanetClimate(node, seaLevel);
-      _ensurePlanetRivers(node, seaLevel);
-      const repaint = () => {
-        node._cellsVersion = ((typeof node._cellsVersion === "number") ? node._cellsVersion : 0) + 1;
-        _ensurePlanetClimate(node, seaLevel);
-        _ensurePlanetRivers(node, seaLevel);
-        render();
-      };
-      const stats = await _planetGenerateFromAI(
-        "", cells, node._cellNeighbors, node._cellNeighborsK,
-        seaLevel, lockedCenter,
-        s => { aiStatus.textContent = s; },
-        canvas, repaint, activeKwObjs, null, null
-      );
-      dirty = true;
-      showClimate = wasShowing;
-      climateBtn.textContent = showClimate ? "hide climate" : "show climate";
-      render();
-      const lm = _planetMeasureLandmass(cells, seaLevel);
-      const pct = (lm.landFraction * 100).toFixed(1);
-      aiStatus.textContent = "done: " + stats.rounds + " feature pass(es), " + stats.ms + "ms · land " + pct + "%";
-    } catch (err) {
-      aiStatus.textContent = "error: " + (err.message || err);
-      console.error("[planet-map] feature generation failed:", err);
-    } finally {
-      aiBusy = false;
-      aiGoBtn.disabled = false;
-      aiGoBtn.textContent = "add features";
     }
   });
 
@@ -71379,12 +71312,9 @@ function openPlanetMapEditor(nodeId) {
     const r = canvas.getBoundingClientRect();
     const px = Math.floor((ev.clientX - r.left) / r.width * W);
     const py = Math.floor((ev.clientY - r.top) / r.height * H);
-    // Shift-click locked-target removed 2026-05-21 with the AI
-    // landmass pass. Lock-target only made sense when the LLM was
-    // placing the FIRST cap of a generated continent; with no AI
-    // landmass round and GeoJSON-based input, there's nothing to
-    // lock to. Brush paints continue normally below.
     canvas.setPointerCapture(ev.pointerId);
+    // Snapshot BEFORE this stroke so Ctrl+Z restores the pre-stroke state.
+    pushUndo();
     painting = true;
     stamp(px, py);
   });
@@ -71425,6 +71355,7 @@ function openPlanetMapEditor(nodeId) {
       }
       pushHistory("planet-map-edit:apply");
     }
+    window.removeEventListener("keydown", kbHandler);
     back.remove();
   }
   modal.querySelector("#pmap-close").addEventListener("click", closeModal);
@@ -77175,18 +77106,12 @@ window.__PMAP = {
   buildCells: _buildFibonacciCells,
   buildHash: _buildCellSpatialHash,
   buildNeighbors: _buildCellNeighbors,
-  parsePlan: _parseAIPlan,
   applyPlan: _applyAIPlan,
   stampGeoJSON: _planetStampGeoJSON,
+  stampAzgaarJSON: _planetStampAzgaarJSON,
+  stampLandmass: _planetStampLandmass,
   measureLandmass: _planetMeasureLandmass,
-  loadReference: _loadPlanetReference,
   colorForHeight: _planetColorForHeight,
-  references: PMAP_AI_REFERENCES,
-  presets: PMAP_AI_PRESETS,
-  keywords: PMAP_AI_KEYWORDS,
-  auditPrompt: _PLANET_AI_AUDIT_SYSTEM_PROMPT,
-  providers: PROVIDERS,
-  getAiSettings: function () { return aiSettings; },
 };
 
 </script>

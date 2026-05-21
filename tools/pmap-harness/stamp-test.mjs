@@ -35,7 +35,7 @@ async function main() {
     page.on("pageerror", (err) => console.error("[page error]", err.message));
     page.on("console", (msg) => { if (msg.type() === "error" || msg.type() === "warning") console.error("[" + msg.type() + "]", msg.text()); });
     await page.goto("file:///" + EDITOR_PATH.replace(/\\/g, "/"), { waitUntil: "domcontentloaded" });
-    await page.waitForFunction(() => window.__PMAP && window.__PMAP.stampGeoJSON, { timeout: 20000 });
+    await page.waitForFunction(() => window.__PMAP && window.__PMAP.stampLandmass, { timeout: 20000 });
 
     const result = await page.evaluate(async (geoText, N) => {
       const P = window.__PMAP;
@@ -51,7 +51,7 @@ async function main() {
       try { geojson = JSON.parse(geoText); }
       catch (e) { return { error: "GeoJSON parse: " + e.message }; }
 
-      const stats = await P.stampGeoJSON(geojson, cells, neighbors, K, seaLevel, () => {});
+      const stats = await P.stampLandmass(geojson, cells, neighbors, K, seaLevel, () => {});
       // Elevation histogram so we can verify heights actually vary.
       let elevMin = Infinity, elevMax = -Infinity, sum = 0;
       const elevBuckets = { ocean: 0, sealevel: 0, low: 0, mid: 0, high: 0, peak: 0 };
