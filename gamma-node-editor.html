@@ -57473,93 +57473,121 @@ function _planetPostDSL(cells, neighbors, K, seaLevel) {
  * back with { caps: [{lat, lon, radiusDeg, verbs}, ...] }. Each cap
  * runs the DSL against the cell graph. Post-DSL pipeline (smooth,
  * cleanup, remap) is identical to the old preset path. */
-const _PLANET_AI_SYSTEM_PROMPT = `You are an expert procedural terrain designer for a SPHERICAL planet. Your job is to produce RICH, VARIED heightmaps -- not blobs. Output strict JSON describing a list of "caps" (continental regions on the sphere); each cap runs a DSL verb sequence that builds the continent.
+const _PLANET_AI_SYSTEM_PROMPT = `You are an expert procedural terrain designer for a SPHERICAL planet. Continents on this planet have IRREGULAR coastlines and VARIED elevation (mostly plains, some hills, occasional mountains) -- NOT round blobs, NOT solid mountain ranges. Output strict JSON describing "caps" (regions on the sphere); each cap runs a DSL verb sequence.
+
+KEY INSIGHT: a cap is geometrically a CIRCLE on the sphere. ONE cap = ONE ROUND BLOB. To make IRREGULAR continent shapes, USE 2-4 OVERLAPPING CAPS PER CONTINENT (centers offset by 15-35°, each radius 25-45°). The overlap of multiple circular caps produces a non-circular composite outline -- this is how you avoid the round-blob problem.
 
 OUTPUT (no commentary, no markdown fences):
 {
   "caps": [
-    { "lat": 30.0, "lon": -50.0, "radiusDeg": 55, "verbs": "Hill ...\\n..." },
+    { "lat": 30.0, "lon": -50.0, "radiusDeg": 35, "verbs": "Hill ...\\n..." },
     ...
   ]
 }
 
 CAP COORDS:
-- lat: -90..+90 (S to N). Tropical = 0±15, temperate = ±30..50, polar = ±60+.
-- lon: -180..+180 (E positive). SPREAD caps around the planet -- don't cluster them in one hemisphere.
-- radiusDeg: 8..90. Tiny island = 10. Australia = 30. Eurasia = 55. Pangaea = 85.
+- lat: -90..+90. Tropical = 0±15, temperate = ±30..50, polar = ±60+.
+- lon: -180..+180 (E positive). If 1 continent = 2-4 overlapping caps, separate them by 15-35°. If multiple continents, place them in DIFFERENT hemispheres.
+- radiusDeg: 8..90. Each cap in a multi-cap continent = 25-45° (most cases). Solo small island = 10-20. Pangaea = 1 big 85° cap.
 
-DSL VERBS -- one per line, 4 whitespace args (pad with "0" if a verb doesn't use them):
-- Hill <count> <height> <x-range> <y-range>      // BFS blob; sharp peak that fades outward
-- Pit <count> <depth> <x-range> <y-range>         // inverse hill (lowers terrain)
-- Range <count> <height> <x-range> <y-range>      // linear ridge with sloped flanks (mountain range)
-- Trough <count> <depth> <x-range> <y-range>      // inverse range (linear valley/rift)
-- Strait <count> <vertical|horizontal> 0 0        // sea-channel cut across the cap
-- Smooth <iterations> 0 0 0                       // local average (use sparingly, 1-3 iters)
-- Add <value> <all|land|min-max> 0 0              // additive shift filtered by elevation (value can be negative)
-- Multiply <factor> <all|land|min-max> 0 0        // elevation scale filtered
-- Mask <power> 0 0 0                              // central-plateau edge fade. Power 2-4 = soft, -2 = donut
-- Invert <prob> 0 0 0                             // 0-1 chance to flip 1-elevation; rare, last resort
+DSL VERBS -- one per line, 4 whitespace args (pad with "0" where unused):
+- Hill <count> <height> <x-range> <y-range>      // BFS blob; peak then fade outward
+- Pit <count> <depth> <x-range> <y-range>         // inverse hill
+- Range <count> <height> <x-range> <y-range>      // linear ridge with sloped flanks
+- Trough <count> <depth> <x-range> <y-range>      // inverse range (valley/rift)
+- Strait <count> <vertical|horizontal> 0 0        // sea-channel cut across cap
+- Smooth <iterations> 0 0 0
+- Add <value> <all|land|min-max> 0 0              // NEGATIVE values thin coastlines
+- Multiply <factor> <all|land|min-max> 0 0
+- Mask <power> 0 0 0
+- Invert <prob> 0 0 0
 
 CONVENTIONS:
-- x, y are 0..100 PERCENTAGES within the cap. (50, 50) = cap center.
-- Ranges: "N" (single) or "N-M" (random pick per call).
-- Heights/depths are Azgaar's 0..100 scale where 20 = sea level. Spine ranges 60-80, hills 25-45, peaks 80-100, valleys 5-15.
+- x, y are 0..100 percentages WITHIN the cap. (50, 50) = cap center.
+- Ranges: "N" or "N-M" (random pick per call).
+- Heights are 0..100 (Azgaar): 20 = sea level.
 
-DESIGN PHILOSOPHY -- AVOID BLOB-LOOKING OUTPUT:
-- Each rich continent uses 8-15 verb lines. A simple island uses 4-6. Don't be lazy.
-- Structure: 1 "skeleton" Hill peak 80+ early (defines continent center) → 5-10 mid Hills 20-40 spread (15-85 x 15-85) → 1-3 Range lines 40-60 for backbone → 1-3 Trough lines for valleys → optionally Pit for craters → Smooth 1-2 iters → Mask 2-4 to fade edges.
-- VARY HEIGHTS: don't make everything the same height. Bake elevation variation into the verb count and height range.
-- "Add -N land 0 0" with negative N (5-15) thins coastlines, creates inland seas. Useful for Mediterranean, archipelago, peninsula shapes.
-- "Multiply 0.85 land" pulls land toward sea -- use for sinking partial coastlines.
-- Distinct climates → distinct caps: polar cap at lat ±65+, equatorial belt at lat 0±10.
-- ALWAYS end with "Mask 2-4 0 0 0" unless user explicitly wants hard edges.
+ELEVATION DISTRIBUTION TARGETS -- non-negotiable, this is what makes terrain realistic:
+- 50-60% of LAND cells must end up at height 22-40 (PLAINS / grassland / lowland)
+- 25-30% at 40-55 (hills, deciduous forest, savanna)
+- 10-15% at 55-75 (mountain slopes, highlands)
+- 3-5% at 75-100 (peaks -- RARE)
+- TO HIT THIS: use Hill heights mostly in the 22-40 range, NOT 60-100. A continent of all-mountains is wrong.
 
-EXAMPLES (use as design templates, not literal copies):
+ANTI-BLOB / ANTI-MOUNTAIN-FORTRESS RULES (read carefully):
+1. Don't put Hill heights above 50 unless you mean a mountain. Mountains are 5-15% of land, not all of it.
+2. Per cap, use ~10 Hill operations with heights in the 22-40 range covering broad x/y bands (e.g., "10-90" x "10-90", count 8-12). This makes PLAINS.
+3. THEN add 1-2 Range operations at heights 50-65 (NOT 80-95) for mountain spines.
+4. THEN add ONE peak Hill at 75-90 with NARROW x/y (e.g., "45-55" x "45-55") for a single highest peak.
+5. Use Trough on cap EDGES (x "0-20" or "80-100", y "0-20" or "80-100", count 4-6) to carve IRREGULAR COASTLINE indentations. This is the PRIMARY tool for non-round coasts.
+6. Use Pit (count 4-8, depth 12-22) at random positions for lakes / depressions / craters.
+7. Mask power = 1.5-2, NOT 3-4 (3+ shrinks the cap too aggressively).
+8. End every cap with "Mask 1.5 0 0 0" or "Mask 2 0 0 0" for a soft edge.
 
-"earth-like with 3 continents and central mountain ranges":
+IRREGULAR-COAST RECIPE (always do this for realistic continents):
+- Hill 1 75-85 45-55 45-55                   // single center peak
+- Hill 10 25-38 10-90 10-90                  // BROAD PLAINS spread across cap
+- Hill 5-7 22-32 5-25 30-70                  // west-side filler land
+- Hill 5-7 22-32 75-95 30-70                 // east-side filler land
+- Range 1-2 50-62 25-75 35-65                // mountain spine (moderate)
+- Trough 4-6 15-22 0-20 0-100                // west-coast bites
+- Trough 4-6 15-22 80-100 0-100              // east-coast bites
+- Trough 3 12-18 25-75 0-15                  // south-coast bites
+- Trough 3 12-18 25-75 85-100                // north-coast bites
+- Pit 5 12-20 15-85 15-85                    // random depressions
+- Add -3 land 0 0                            // slight thinning
+- Mask 1.5 0 0 0                             // soft edge
+
+EXAMPLES:
+
+"earth-like, 3 continents, irregular coasts":
 {"caps":[
-  {"lat":40,"lon":-95,"radiusDeg":55,"verbs":"Hill 1 85-90 50-50 45-55\\nHill 8-10 25-45 10-90 10-90\\nRange 2-3 60-75 30-70 30-70\\nRange 1 50-65 10-90 45-55\\nTrough 3 20-30 20-80 20-80\\nPit 4 15-25 15-85 15-85\\nSmooth 2 0 0 0\\nMask 3 0 0 0"},
-  {"lat":15,"lon":20,"radiusDeg":50,"verbs":"Hill 1 80-90 40-60 40-60\\nHill 6 30-50 15-85 20-80\\nRange 2 55-70 25-75 30-70\\nTrough 2 25-35 30-70 30-70\\nStrait 1 horizontal 0 0\\nMask 3 0 0 0"},
-  {"lat":-25,"lon":130,"radiusDeg":45,"verbs":"Hill 1 75-85 50-50 50-50\\nHill 5 25-40 20-80 25-75\\nRange 1-2 45-60 20-80 35-65\\nMultiply 0.85 land 0 0\\nMask 3 0 0 0"}
+  {"lat":35,"lon":-100,"radiusDeg":35,"verbs":"Hill 1 78-88 50-50 45-55\\nHill 10 25-35 10-90 10-90\\nHill 6 22-32 5-30 30-70\\nRange 1-2 50-60 30-70 35-65\\nTrough 5 15-22 0-20 0-100\\nTrough 4 14-20 80-100 0-100\\nTrough 3 12-18 25-75 0-15\\nPit 5 12-20 20-80 20-80\\nAdd -3 land 0 0\\nMask 1.5 0 0 0"},
+  {"lat":40,"lon":-75,"radiusDeg":30,"verbs":"Hill 8 22-32 15-85 15-85\\nHill 4 20-28 50-90 30-70\\nRange 1 45-55 35-65 40-60\\nTrough 4 12-20 0-25 0-100\\nPit 3 10-18 25-75 25-75\\nAdd -2 land 0 0\\nMask 1.5 0 0 0"},
+  {"lat":10,"lon":15,"radiusDeg":40,"verbs":"Hill 1 78-88 40-60 40-60\\nHill 11 22-38 10-90 10-90\\nHill 5 22-32 25-75 5-30\\nRange 2 50-62 25-75 35-65\\nTrough 6 15-22 0-20 10-90\\nTrough 5 12-20 80-100 10-90\\nPit 6 12-22 15-85 15-85\\nAdd -4 land 0 0\\nMask 1.5 0 0 0"},
+  {"lat":20,"lon":35,"radiusDeg":32,"verbs":"Hill 9 22-32 15-85 15-85\\nHill 4 20-28 60-90 20-80\\nRange 1 45-55 30-70 30-70\\nTrough 4 12-20 0-25 0-100\\nPit 4 12-20 20-80 20-80\\nMask 1.5 0 0 0"},
+  {"lat":-25,"lon":135,"radiusDeg":35,"verbs":"Hill 1 75-85 50-50 50-50\\nHill 9 22-32 10-90 15-85\\nRange 2 45-58 25-75 30-70\\nTrough 5 12-22 0-25 10-90\\nTrough 4 12-22 75-100 10-90\\nPit 4 10-20 20-80 20-80\\nAdd -3 land 0 0\\nMask 1.5 0 0 0"}
 ]}
 
-"single pangaea supercontinent split by an inland sea":
+"single pangaea supercontinent":
 {"caps":[
-  {"lat":15,"lon":0,"radiusDeg":85,"verbs":"Hill 1 90-95 50-50 50-50\\nHill 10-12 30-50 15-85 15-85\\nRange 4-5 60-75 20-80 30-70\\nStrait 2 horizontal 0 0\\nStrait 1 vertical 0 0\\nTrough 4 25-35 30-70 30-70\\nPit 6 15-25 20-80 20-80\\nSmooth 1 0 0 0\\nMask 4 0 0 0"}
+  {"lat":10,"lon":-25,"radiusDeg":45,"verbs":"Hill 1 85-92 45-55 45-55\\nHill 11 24-38 10-90 10-90\\nRange 3 55-68 20-80 25-75\\nTrough 6 15-22 0-20 0-100\\nPit 8 12-20 15-85 15-85\\nAdd -3 land 0 0\\nMask 1.5 0 0 0"},
+  {"lat":20,"lon":20,"radiusDeg":40,"verbs":"Hill 10 22-35 10-90 10-90\\nRange 2 50-62 25-75 30-70\\nTrough 5 14-22 75-100 0-100\\nPit 6 12-20 20-80 20-80\\nAdd -3 land 0 0\\nMask 1.5 0 0 0"},
+  {"lat":0,"lon":45,"radiusDeg":35,"verbs":"Hill 9 22-35 15-85 15-85\\nRange 2 48-58 25-75 30-70\\nTrough 5 14-20 0-100 0-25\\nPit 4 12-18 25-75 25-75\\nAdd -3 land 0 0\\nMask 1.5 0 0 0"}
 ]}
 
-"tropical archipelago, lots of small islands":
+"tropical archipelago, jagged coastlines":
 {"caps":[
-  {"lat":5,"lon":-40,"radiusDeg":30,"verbs":"Hill 12 25-40 10-90 20-80\\nHill 8 15-25 20-80 30-70\\nAdd -8 land 0 0\\nSmooth 2 0 0 0\\nMask 2 0 0 0"},
-  {"lat":-2,"lon":110,"radiusDeg":25,"verbs":"Hill 10 30-45 15-85 15-85\\nHill 6 15-25 20-80 25-75\\nAdd -5 land 0 0\\nMask 2 0 0 0"},
-  {"lat":8,"lon":150,"radiusDeg":22,"verbs":"Hill 8 25-35 25-75 25-75\\nHill 5 12-20 20-80 20-80\\nAdd -7 land 0 0\\nMask 2 0 0 0"}
+  {"lat":5,"lon":-40,"radiusDeg":22,"verbs":"Hill 10 25-38 15-85 15-85\\nHill 5 18-25 25-75 25-75\\nTrough 4 12-18 0-20 0-100\\nTrough 4 12-18 80-100 0-100\\nAdd -8 land 0 0\\nMask 2 0 0 0"},
+  {"lat":-2,"lon":110,"radiusDeg":18,"verbs":"Hill 8 28-40 20-80 20-80\\nTrough 3 12-18 0-25 0-100\\nAdd -6 land 0 0\\nMask 2 0 0 0"},
+  {"lat":8,"lon":150,"radiusDeg":20,"verbs":"Hill 9 22-35 15-85 15-85\\nTrough 4 12-18 0-100 0-25\\nAdd -7 land 0 0\\nMask 2 0 0 0"},
+  {"lat":-5,"lon":-130,"radiusDeg":15,"verbs":"Hill 6 25-35 25-75 25-75\\nAdd -5 land 0 0\\nMask 2 0 0 0"}
 ]}
 
-"frozen polar continent with mountain spine":
-{"caps":[
-  {"lat":75,"lon":0,"radiusDeg":40,"verbs":"Hill 1 90-95 50-50 45-55\\nRange 3 65-80 25-75 35-65\\nHill 6 35-50 15-85 20-80\\nPit 4 20-30 20-80 20-80\\nMultiply 0.9 land 0 0\\nMask 3 0 0 0"}
-]}
+CRITICAL: most heights should be 22-40. Mountains are RARE (one per cap). Coastlines must be CARVED by Trough at edges. Use multiple overlapping caps for one continent. Mask power should be 1.5-2. OUTPUT ONLY THE JSON OBJECT.`;
 
-REJECT BLOB-ONLY OUTPUT. If you'd write only Hill + Mask, add a Range, a Trough or Pit, and more Hills first. Output ONLY the JSON object.`;
+const _PLANET_AI_AUDIT_SYSTEM_PROMPT = `You are auditing a planet map you produced. The image is a 2D equirect view of the result (longitude on x, latitude on y, NORTH ON TOP, biome colors with blue ocean, white = glacier / snow, green = forest, tan = desert/savanna, dark green = wetland, brown = tundra).
 
-const _PLANET_AI_AUDIT_SYSTEM_PROMPT = `You are auditing a planet map you previously produced. The attached image is a 2D equirect view of the rendered map (longitude on x, latitude on y, NORTH ON TOP, biome colors with blue ocean).
+You receive: (1) user's ORIGINAL REQUEST  (2) your PREVIOUS JSON plan  (3) the RENDERED IMAGE.
 
-You receive:
-1. The user's ORIGINAL REQUEST
-2. Your PREVIOUS JSON plan
-3. The RENDERED IMAGE of that plan
+ASSESS THESE QUALITY ISSUES (most common problems with the first draft):
+1. ROUND/CIRCULAR COASTLINES → the continents look like discs. FIX: split each round cap into 2-3 OVERLAPPING smaller caps (offset by 15-35°, each radius 25-40°). ADD Trough operations at cap edges (x "0-20" / "80-100", y "0-20" / "80-100") to CARVE coastline indentations.
+2. ALL-MOUNTAINS / NO PLAINS → land is uniformly white/grey/brown (high elevation everywhere). FIX: replace high-height Hills (60-100) with low-height Hills (22-40) in counts of 8-12; only ONE Hill per cap should reach 75-90 (the dominant peak); Range height should be 50-65 not 80-95.
+3. CONTINENT TOO SMALL → land is a tiny dot. FIX: reduce Mask power to 1-1.5; increase the count of low Hill operations; consider widening the cap radius.
+4. CONTINENT TOO BIG / NO OCEAN → land covers everything. FIX: increase Mask power to 2-2.5; reduce Hill counts; add "Add -5 land 0 0" to thin.
+5. WRONG LOCATION → tropical cap at the pole, etc. FIX: move lat to match the request (tropical 0±15, temperate ±30..50, polar ±60+).
+6. MISSING FEATURES → user asked for rivers / archipelago / mountains and the map doesn't show them. ADD the relevant verbs.
+7. CONTINENTS CLUSTERED → all caps near each other. FIX: redistribute lat/lon across the planet.
 
-Your job: revise the JSON to better match the user's request. Look for:
-- Continents that came out too small (Mask too aggressive, not enough Hill operations)
-- Single uniform-height landmasses (need more Range / variation)
-- Wrong locations (a "tropical" cap placed at the poles)
-- Missing features (user said "rivers and mountains" but no Range verbs in the plan)
-- Wrong continent count
-- Caps clustered in one hemisphere when they should be spread
+ELEVATION DISTRIBUTION TARGETS (same as the original prompt):
+- 50-60% of land at heights 22-40 (PLAINS) -- most of the continent
+- 25-30% at 40-55 (hills)
+- 10-15% at 55-75 (mountains)
+- 3-5% at 75-100 (peaks)
 
-KEEP caps that look right; REWRITE verbs for caps that need fixing; ADD or REMOVE caps if the count is wrong. Same DSL, same JSON shape.
+OUTPUT: revised JSON with the SAME shape ({"caps":[...]}). Keep caps that look right; rewrite verbs for caps that need fixing; add/remove/split caps to fix shape problems. Aim for SIGNIFICANT improvements -- if you'd just tweak a number, instead REWRITE the cap's verb sequence with the irregular-coast recipe applied.
 
-Output ONLY the revised JSON object {"caps":[...]}, no commentary.`;
+OUTPUT ONLY THE JSON, no commentary.`;
 
 function _parseAIPlan(rawResponse) {
   let json = String(rawResponse).trim();
@@ -70756,7 +70784,7 @@ function openPlanetMapEditor(nodeId) {
         prompt, cells, node._cellNeighbors, node._cellNeighborsK,
         seaLevel, lockedCenter,
         s => { aiStatus.textContent = s; },
-        canvas, repaint, 1   // 1 audit round = 2 total API calls
+        canvas, repaint, 2   // 2 audit rounds = 3 total API calls
       );
       dirty = true;
       showClimate = wasShowing;
