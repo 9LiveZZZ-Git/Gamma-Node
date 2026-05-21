@@ -52,6 +52,22 @@ async function main() {
       catch (e) { return { error: "GeoJSON parse: " + e.message }; }
 
       const stats = await P.stampGeoJSON(geojson, cells, neighbors, K, seaLevel, () => {});
+      // Elevation histogram so we can verify heights actually vary.
+      let elevMin = Infinity, elevMax = -Infinity, sum = 0;
+      const elevBuckets = { ocean: 0, sealevel: 0, low: 0, mid: 0, high: 0, peak: 0 };
+      for (let i = 0; i < cells.count; i++) {
+        const e = cells.elevations[i];
+        if (e < elevMin) elevMin = e;
+        if (e > elevMax) elevMax = e;
+        sum += e;
+        if (e < seaLevel * 0.5) elevBuckets.ocean++;
+        else if (e < seaLevel) elevBuckets.sealevel++;
+        else if (e < seaLevel + 0.1) elevBuckets.low++;
+        else if (e < seaLevel + 0.25) elevBuckets.mid++;
+        else if (e < seaLevel + 0.4) elevBuckets.high++;
+        else elevBuckets.peak++;
+      }
+      stats.elev = { min: +elevMin.toFixed(3), max: +elevMax.toFixed(3), mean: +(sum / cells.count).toFixed(3), buckets: elevBuckets };
 
       // Render to equirect canvas in LANDMASS mode (binary land/ocean).
       const W = 720, H = 360;

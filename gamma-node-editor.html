@@ -57797,67 +57797,97 @@ async function _planetStampGeoJSON(geojson, cells, neighbors, K, seaLevel, onSta
   const N = cells.count;
   onStatus && onStatus("rasterizing " + geojson.features.length + " features…");
 
-  // Step 1: rasterize land polygons to a binary canvas mask.
+  // Step 1: rasterize EVERY feature (land + ocean) to a GRAYSCALE
+  // canvas where the pixel value encodes the cell's Azgaar logical
+  // height (0..1 with sea level at 0.20):
+  //
+  //   Ocean cells (h_meters < 0 OR type === "ocean"):
+  //     0..50 in 0-255 grey  -->  0.00..0.196 in 0..1 logical
+  //   Land cells (h_meters > 0):
+  //     53..255 in 0-255 grey -->  0.208..1.000 in 0..1 logical
+  //
+  // Heights are linearly normalized against a 10000m reference
+  // (Earth-ish: Everest ~8848m, Mariana Trench ~-11034m). Caps
+  // beyond the reference saturate. Choice of 10000m gives a
+  // sensible distribution for Azgaar exports (whose max can
+  // reach 20000+m due to heightExponent inflation).
   const W = 2048, H = 1024;
   const t0 = performance.now();
   const canvas = document.createElement("canvas");
   canvas.width = W; canvas.height = H;
   const ctx = canvas.getContext("2d");
-  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, W, H);   // ocean = black
-  ctx.fillStyle = "#fff";                              // land  = white
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, W, H);   // ocean-floor default
+  const HEIGHT_REF = 10000;  // meters at which we saturate to 1.0 / 0.0
 
-  let landFeatures = 0;
+  function heightToGrey(h_m, isOcean) {
+    if (isOcean) {
+      // -HEIGHT_REF..0 maps to 0..50 grey (0.00..0.196 logical).
+      const t = Math.max(0, Math.min(1, (h_m + HEIGHT_REF) / HEIGHT_REF));
+      return Math.round(t * 50);
+    } else {
+      // 0..HEIGHT_REF maps to 53..255 grey (0.208..1.000 logical).
+      const t = Math.max(0, Math.min(1, h_m / HEIGHT_REF));
+      return 53 + Math.round(t * 202);
+    }
+  }
+
+  let landFeatures = 0, oceanFeatures = 0;
+  // Sort features so OCEAN features draw FIRST (they're the
+  // "background"), then LAND on top -- the ocean polygons may
+  // overlap land slightly due to coordinate rounding, and we want
+  // land to win.
+  const featsOcean = [];
+  const featsLand  = [];
   for (const feat of geojson.features) {
     if (!feat || !feat.geometry) continue;
     const props = feat.properties || {};
-    const h = props.height;
+    const h = (typeof props.height === "number") ? props.height : null;
     const t = props.type;
-    // Land if explicit height > 0, OR (no height && type != ocean).
-    let isLand;
-    if (typeof h === "number") isLand = h > 0;
-    else                       isLand = (t && t !== "ocean");
-    if (!isLand) continue;
-    landFeatures++;
-
-    const geom = feat.geometry;
-    const polys = (geom.type === "Polygon")      ? [geom.coordinates]
-                : (geom.type === "MultiPolygon") ? geom.coordinates
-                : null;
-    if (!polys) continue;
-
-    for (const poly of polys) {
-      // Outer ring + holes. We treat all rings as fills (path-fill
-      // even-odd handles holes automatically if the GeoJSON winding
-      // is correct).
-      ctx.beginPath();
-      for (const ring of poly) {
-        for (let i = 0; i < ring.length; i++) {
-          const pt = ring[i];
-          if (!Array.isArray(pt) || pt.length < 2) continue;
-          let lon = pt[0], lat = pt[1];
-          // Wrap lon to [-180, 180], clamp lat to [-90, 90].
-          lon = ((lon + 180) % 360 + 360) % 360 - 180;
-          if (lat < -90) lat = -90;
-          else if (lat > 90) lat = 90;
-          const px = (lon + 180) / 360 * W;
-          const py = (90 - lat) / 180 * H;
-          if (i === 0) ctx.moveTo(px, py);
-          else         ctx.lineTo(px, py);
+    const isOcean = (h !== null) ? h < 0 : (t === "ocean");
+    (isOcean ? featsOcean : featsLand).push({ feat, h, isOcean });
+  }
+  function drawFeats(list) {
+    for (const item of list) {
+      const { feat, h, isOcean } = item;
+      const hM = (h !== null) ? h : (isOcean ? -200 : 100);  // fallback if no height
+      const grey = heightToGrey(hM, isOcean);
+      ctx.fillStyle = "rgb(" + grey + "," + grey + "," + grey + ")";
+      if (isOcean) oceanFeatures++; else landFeatures++;
+      const geom = feat.geometry;
+      const polys = (geom.type === "Polygon")      ? [geom.coordinates]
+                  : (geom.type === "MultiPolygon") ? geom.coordinates
+                  : null;
+      if (!polys) continue;
+      for (const poly of polys) {
+        ctx.beginPath();
+        for (const ring of poly) {
+          for (let i = 0; i < ring.length; i++) {
+            const pt = ring[i];
+            if (!Array.isArray(pt) || pt.length < 2) continue;
+            let lon = pt[0], lat = pt[1];
+            lon = ((lon + 180) % 360 + 360) % 360 - 180;
+            if (lat < -90) lat = -90;
+            else if (lat > 90) lat = 90;
+            const px = (lon + 180) / 360 * W;
+            const py = (90 - lat) / 180 * H;
+            if (i === 0) ctx.moveTo(px, py);
+            else         ctx.lineTo(px, py);
+          }
+          ctx.closePath();
         }
-        ctx.closePath();
+        ctx.fill("evenodd");
       }
-      ctx.fill("evenodd");
     }
   }
+  drawFeats(featsOcean);
+  drawFeats(featsLand);
   const rasterMs = performance.now() - t0;
 
-  // Step 2: stamp the mask onto cell elevations.
+  // Step 2: stamp pixel grey -> cell elevation.
   onStatus && onStatus("stamping " + N + " cells…");
   const t1 = performance.now();
   const img = ctx.getImageData(0, 0, W, H);
   const data = img.data;
-  const LAND_ELEV = 0.30;   // Azgaar 0-1 logical scale; sea level = 0.20
-  const OCEAN_ELEV = 0.00;
   let landCells = 0;
   for (let i = 0; i < N; i++) {
     const x = cells.positions[i*3], y = cells.positions[i*3+1], z = cells.positions[i*3+2];
@@ -57867,20 +57897,27 @@ async function _planetStampGeoJSON(geojson, cells, neighbors, K, seaLevel, onSta
     let py = Math.floor((90 - lat) / 180 * H);
     if (px < 0) px = 0; else if (px >= W) px = W - 1;
     if (py < 0) py = 0; else if (py >= H) py = H - 1;
-    const r = data[(py * W + px) * 4];
-    if (r > 128) { cells.elevations[i] = LAND_ELEV; landCells++; }
-    else         { cells.elevations[i] = OCEAN_ELEV; }
+    const grey = data[(py * W + px) * 4];
+    // Decode grey -> Azgaar logical height (0..1, sealevel 0.20).
+    // grey 0..50  = 0.00..0.196 logical (ocean)
+    // grey 53..255 = 0.208..1.000 logical (land)
+    let logical;
+    if (grey <= 51) {
+      logical = (grey / 50) * 0.196;
+    } else {
+      const t = (grey - 53) / 202;
+      logical = 0.208 + t * (1.0 - 0.208);
+    }
+    cells.elevations[i] = logical;
+    if (logical >= 0.20) landCells++;
   }
   const stampMs = performance.now() - t1;
 
-  // Step 3: run postDSL JUST for the sealevel remap (skip cleanup +
-  // smoothing so the binary stamp is preserved). The remap converts
-  // Azgaar's 0..1 logical scale (sea level at 0.20) to the user's
-  // seaLevel param.
+  // Step 3: run postDSL JUST for the sealevel remap. Skip cleanup +
+  // smoothing so the height-stamped topography is preserved.
   _planetPostDSL(cells, neighbors, K, seaLevel, { skipCleanup: true, skipSmoothing: true });
 
-  // Invalidate climate / rivers if they were computed (caller decides
-  // whether to recompute via the climate toggle).
+  // Invalidate climate / rivers if they were computed.
   if (cells.biome) cells.biome.fill(0);
   if (cells.flux)  cells.flux.fill(0);
   if (cells.riverId) cells.riverId.fill(-1);
@@ -57891,6 +57928,7 @@ async function _planetStampGeoJSON(geojson, cells, neighbors, K, seaLevel, onSta
     landFraction: landCells / N,
     featuresProcessed: geojson.features.length,
     landFeatures,
+    oceanFeatures,
     rasterMs: +rasterMs.toFixed(1),
     stampMs: +stampMs.toFixed(1)
   };
@@ -70938,6 +70976,11 @@ function openPlanetMapEditor(nodeId) {
     '<label>strength&nbsp;<input type="range" id="pmap-str" min="1" max="100" value="25" step="1" style="vertical-align:middle"><span id="pmap-str-v" style="display:inline-block;min-width:30px;text-align:right">0.025</span></label>' +
     '<label><input type="radio" name="pmap-mode" value="raise" checked> raise</label>' +
     '<label><input type="radio" name="pmap-mode" value="lower"> lower</label>' +
+    '<label title="pull cells toward local average"><input type="radio" name="pmap-mode" value="smooth"> smooth</label>' +
+    '<label title="raise toward mountain height (0.85)"><input type="radio" name="pmap-mode" value="mountain"> mountain</label>' +
+    '<label title="raise to plain height (0.30) -- flattens mountains, lifts coast"><input type="radio" name="pmap-mode" value="plain"> plain</label>' +
+    '<label title="carve into mountains toward valley height (0.22) without flipping to ocean"><input type="radio" name="pmap-mode" value="valley"> valley</label>' +
+    '<label title="like mountain but center spikes higher than edges"><input type="radio" name="pmap-mode" value="ridge"> ridge</label>' +
     '<button class="btn" id="pmap-revert" type="button" style="padding:3px 10px;">revert</button>' +
     '<button class="btn" id="pmap-climate" type="button" style="padding:3px 10px;">show climate</button>' +
     '<button class="btn" id="pmap-geojson" type="button" style="padding:3px 10px;" title="Import an Azgaar FMG Cells GeoJSON export to stamp its exact landmass onto this planet">import geojson</button>' +
@@ -71239,6 +71282,12 @@ function openPlanetMapEditor(nodeId) {
   });
 
   // Apply one brush stamp at pixel (px, py).
+  // Brush modes -- each mode is its own elevation transform applied
+  // to cells under the brush (with smoothstep falloff from center).
+  // The seaLevel constant here matches Azgaar's 0..1 logical scale
+  // (sea level at 0.20) which the postDSL piecewise remap converts
+  // to the user's final seaLevel. Target heights are in the same
+  // scale so brushes work consistently across cell counts.
   function stamp(px, py) {
     const lat = Math.PI * 0.5 - ((py + 0.5) / H) * Math.PI;
     const lon = ((px + 0.5) / W) * (Math.PI * 2) - Math.PI;
@@ -71248,18 +71297,75 @@ function openPlanetMapEditor(nodeId) {
     const cz = clat * Math.cos(lon);
     const radRad = brushRadiusDeg * Math.PI / 180;
     const cosThresh = Math.cos(radRad);
-    const sign = (mode === "raise") ? 1 : -1;
-    // Brute-force over cells -- 10k dot products is trivial per stamp.
+
+    // Pass 1: collect cells inside the brush with their falloff weights.
+    // For modes that average or pull toward a target (smooth, mountain,
+    // plain, valley, ridge) we need to look at the full population
+    // before writing -- so a 2-pass approach (gather then apply).
+    const hits = []; // [{ i, weight }]
     for (let i = 0; i < cells.count; i++) {
       const ix = i * 3;
       const dot = cx * cells.positions[ix] + cy * cells.positions[ix + 1] + cz * cells.positions[ix + 2];
       if (dot < cosThresh) continue;
-      // Falloff: smoothstep from edge (dot=cosThresh, weight=0) to
-      // center (dot=1, weight=1) so brush edges don't show hard rings.
       const t = (dot - cosThresh) / Math.max(1e-6, 1 - cosThresh);
-      const fall = t * t * (3 - 2 * t);
-      const delta = sign * brushStrength * fall;
-      cells.elevations[i] = Math.max(0, Math.min(1, cells.elevations[i] + delta));
+      const fall = t * t * (3 - 2 * t);  // smoothstep
+      hits.push({ i, w: fall });
+    }
+    if (hits.length === 0) { dirty = true; render(); return; }
+
+    // Per-mode application.
+    if (mode === "raise" || mode === "lower") {
+      const sign = (mode === "raise") ? 1 : -1;
+      for (const h of hits) {
+        cells.elevations[h.i] = Math.max(0, Math.min(1, cells.elevations[h.i] + sign * brushStrength * h.w));
+      }
+    } else if (mode === "smooth") {
+      // Pull each hit toward the local average. Falloff scales the pull.
+      let sum = 0;
+      for (const h of hits) sum += cells.elevations[h.i];
+      const avg = sum / hits.length;
+      for (const h of hits) {
+        const cur = cells.elevations[h.i];
+        cells.elevations[h.i] = cur + (avg - cur) * brushStrength * 10 * h.w;
+      }
+    } else if (mode === "mountain") {
+      // Raise toward height 0.85 (mountain) with center bias.
+      const TARGET = 0.85;
+      for (const h of hits) {
+        const cur = cells.elevations[h.i];
+        if (cur >= TARGET) continue;
+        const pull = (TARGET - cur) * brushStrength * 4 * h.w;
+        cells.elevations[h.i] = Math.min(1, cur + pull);
+      }
+    } else if (mode === "plain") {
+      // Pull toward height 0.30 (slightly above sealevel). Lowers
+      // mountains, raises ocean cells just barely above water.
+      const TARGET = 0.30;
+      for (const h of hits) {
+        const cur = cells.elevations[h.i];
+        const pull = (TARGET - cur) * brushStrength * 4 * h.w;
+        cells.elevations[h.i] = Math.max(0, Math.min(1, cur + pull));
+      }
+    } else if (mode === "valley") {
+      // Pull toward height 0.22 (just barely above sealevel). Carves
+      // valleys into mountains without flipping land to ocean.
+      const TARGET = 0.22;
+      for (const h of hits) {
+        const cur = cells.elevations[h.i];
+        if (cur <= TARGET) continue;
+        const pull = (cur - TARGET) * brushStrength * 4 * h.w;
+        cells.elevations[h.i] = Math.max(0, cur - pull);
+      }
+    } else if (mode === "ridge") {
+      // Like mountain but more aggressive in the center, no effect at edges.
+      // Concentric falloff: cells nearer center get pulled to higher targets.
+      for (const h of hits) {
+        const target = 0.30 + 0.55 * h.w;  // 0.30 at edge, 0.85 at center
+        const cur = cells.elevations[h.i];
+        if (cur >= target) continue;
+        const pull = (target - cur) * brushStrength * 4;
+        cells.elevations[h.i] = Math.min(1, cur + pull);
+      }
     }
     dirty = true;
     render();
@@ -77078,7 +77184,6 @@ window.__PMAP = {
   references: PMAP_AI_REFERENCES,
   presets: PMAP_AI_PRESETS,
   keywords: PMAP_AI_KEYWORDS,
-  systemPrompt: _PLANET_AI_SYSTEM_PROMPT,
   auditPrompt: _PLANET_AI_AUDIT_SYSTEM_PROMPT,
   providers: PROVIDERS,
   getAiSettings: function () { return aiSettings; },
