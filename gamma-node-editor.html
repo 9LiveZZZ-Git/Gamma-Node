@@ -55854,60 +55854,92 @@ function _buildCellTriangulation(positions, neighbors, K, N, hash) {
     }
   }
 
-  // ---- Pass 2: 3-cycle enumeration on the Voronoi adjacency graph ----
+  // ---- Pass 2: azimuth-fan triangulation around each cell ----
   //
-  // For every triple (i, j, c) with i < j < c that's mutually
-  // Voronoi-adjacent (j ∈ vAdj[i], c ∈ vAdj[i], c ∈ vAdj[j]),
-  // emit triangle (i, j, c). The strict ordering guarantees each
-  // triangle emits exactly once. Voronoi adjacency is symmetric by
-  // construction (pass 1 pushes both i→j and j→i into vAdj), so
-  // this catches ALL Delaunay triangles -- including the ~0.16% the
-  // azimuth-fan approach missed (where 3 mutually-adjacent cells
-  // weren't azimuth-consecutive in the smallest vertex's fan).
+  // Replaces the older 3-cycle enumeration. 3-cycle only emits a
+  // triangle when all 3 edges already exist in vAdj, so quads /
+  // pentagons / hexagons (polygonal faces in the Voronoi graph
+  // where some "diagonal" edge failed the empty-circle test) show
+  // up as visible holes in the mesh. With jitter creating many
+  // near-cocircular configurations, this is a real loss (~18k
+  // missing triangles at N=240k).
   //
-  // Cost: O(N × avgDeg²). avgDeg ≈ 6 for Voronoi, so per-cell work
-  // is ~36 ops + |vAdj[j]| linear scan per candidate. At N=60k:
-  // ~2.2M outer ops × ~6 inner = 13M ops. Fast.
+  // Fan approach: for each cell i, sort vAdj[i] by azimuth around
+  // i (using world +Y as the north reference, +X near the poles).
+  // Emit a triangle for each consecutive pair (incl. wrap-around).
+  // Dedup via min/mid/max key so each triangle emits once across
+  // the three vertices that fan to it. This naturally triangulates
+  // any polygonal face -- a quad gets a fan from each vertex, after
+  // dedup we keep one valid split. Mathematically not pure Voronoi
+  // for those faces, but visually closes the holes.
+  const triKeys = new Set();
   const tris = [];
   for (let i = 0; i < N; i++) {
     const vNbrs = vAdj[i];
     const len = vNbrs.length;
-    if (len < 2) continue;
+    if (len < 3) continue;
     const ix = positions[i * 3 + 0];
     const iy = positions[i * 3 + 1];
     const iz = positions[i * 3 + 2];
-    for (let a = 0; a < len - 1; a++) {
-      const n1 = vNbrs[a];
-      if (n1 <= i) continue;
-      const vAdjN1 = vAdj[n1];
-      for (let b = a + 1; b < len; b++) {
-        const n2 = vNbrs[b];
-        // Require n2 > i so this triangle only emits from its smallest
-        // vertex's iteration. We do NOT require n2 > n1 -- vAdj is
-        // unsorted (Pass 1 pushes in encounter order), so n1 vs n2 can
-        // go either way; the outer (a < b) already dedups unordered
-        // pairs within this i's neighbor list.
-        if (n2 <= i) continue;
-        // Check n2 ∈ vAdj[n1] (n1 and n2 mutually Voronoi-adjacent).
-        let mutual = false;
-        for (let q = 0; q < vAdjN1.length; q++) {
-          if (vAdjN1[q] === n2) { mutual = true; break; }
-        }
-        if (!mutual) continue;
-        // CCW winding from outside.
-        const e01x = positions[n1*3]   - ix;
-        const e01y = positions[n1*3+1] - iy;
-        const e01z = positions[n1*3+2] - iz;
-        const e02x = positions[n2*3]   - ix;
-        const e02y = positions[n2*3+1] - iy;
-        const e02z = positions[n2*3+2] - iz;
-        const cxn = e01y * e02z - e01z * e02y;
-        const cyn = e01z * e02x - e01x * e02z;
-        const czn = e01x * e02y - e01y * e02x;
-        const outward = cxn * ix + cyn * iy + czn * iz;
-        if (outward >= 0) tris.push(i, n1, n2);
-        else              tris.push(i, n2, n1);
-      }
+    // Local tangent basis at cell i (north ref world +Y, fallback +X).
+    let nrx = 0, nry = 1, nrz = 0;
+    if (Math.abs(iy) > 0.95) { nrx = 1; nry = 0; nrz = 0; }
+    const nDotU = nrx*ix + nry*iy + nrz*iz;
+    let tnx = nrx - ix*nDotU, tny = nry - iy*nDotU, tnz = nrz - iz*nDotU;
+    const tnl = Math.hypot(tnx, tny, tnz) || 1;
+    tnx /= tnl; tny /= tnl; tnz /= tnl;
+    // east = up × north (right-handed tangent)
+    const tex = iy*tnz - iz*tny, tey = iz*tnx - ix*tnz, tez = ix*tny - iy*tnx;
+    // Compute azimuth per neighbor.
+    const azs = new Float32Array(len);
+    for (let q = 0; q < len; q++) {
+      const n = vNbrs[q];
+      const dx = positions[n*3]   - ix;
+      const dy = positions[n*3+1] - iy;
+      const dz = positions[n*3+2] - iz;
+      const dotE = dx*tex + dy*tey + dz*tez;
+      const dotN = dx*tnx + dy*tny + dz*tnz;
+      azs[q] = Math.atan2(dotE, dotN);
+    }
+    // Argsort by azimuth (small arrays, insertion sort).
+    const order = new Int32Array(len);
+    for (let q = 0; q < len; q++) order[q] = q;
+    for (let q = 1; q < len; q++) {
+      const t = order[q]; const ta = azs[t];
+      let p = q - 1;
+      while (p >= 0 && azs[order[p]] > ta) { order[p+1] = order[p]; p--; }
+      order[p+1] = t;
+    }
+    // Emit triangles (i, n_k, n_{k+1}) wrapping around.
+    for (let k = 0; k < len; k++) {
+      const a = vNbrs[order[k]];
+      const b = vNbrs[order[(k+1) % len]];
+      const v0 = i, v1 = a, v2 = b;
+      // Dedup key: sorted (min, mid, max).
+      let mn, md, mx;
+      if (v0 < v1) { if (v1 < v2) { mn=v0; md=v1; mx=v2; }
+                    else if (v0 < v2) { mn=v0; md=v2; mx=v1; }
+                    else              { mn=v2; md=v0; mx=v1; } }
+      else        { if (v0 < v2) { mn=v1; md=v0; mx=v2; }
+                    else if (v1 < v2) { mn=v1; md=v2; mx=v0; }
+                    else              { mn=v2; md=v1; mx=v0; } }
+      // Use BigInt key to avoid collisions at large N
+      const key = mn + "," + md + "," + mx;
+      if (triKeys.has(key)) continue;
+      triKeys.add(key);
+      // CCW winding from outside.
+      const e01x = positions[a*3]   - ix;
+      const e01y = positions[a*3+1] - iy;
+      const e01z = positions[a*3+2] - iz;
+      const e02x = positions[b*3]   - ix;
+      const e02y = positions[b*3+1] - iy;
+      const e02z = positions[b*3+2] - iz;
+      const cxn = e01y * e02z - e01z * e02y;
+      const cyn = e01z * e02x - e01x * e02z;
+      const czn = e01x * e02y - e01y * e02x;
+      const outward = cxn * ix + cyn * iy + czn * iz;
+      if (outward >= 0) tris.push(i, a, b);
+      else              tris.push(i, b, a);
     }
   }
   return new Uint32Array(tris);
