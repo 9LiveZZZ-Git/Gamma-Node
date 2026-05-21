@@ -55619,6 +55619,88 @@ function _buildCellTriangulation(positions, neighbors, K, N, hash) {
   }
   console.log("[planet-mesh] voronoi-edge stats: cands=" + candCount + " rejPre=" + rejPre + " rejI=" + rejI + " rejJ=" + rejJ + " rejM=" + rejM + " accepted=" + accepted);
 
+  // ---- Brute-force fallback for low-degree cells ----
+  // Some edges between cells where NEITHER cell is in the other's
+  // K-nearest get missed entirely (especially with cell jitter
+  // creating local density variations). For each cell with deg < 5
+  // after the main pass, brute-force-scan all N cells to find
+  // potential missing Voronoi neighbors. O(low_deg × N × K) for the
+  // empty-circle re-test, ~few seconds at N=240k -- worth it to
+  // close the hole-cluster.
+  {
+    const lowDegInit = [];
+    for (let i = 0; i < N; i++) if (vAdj[i].length < 5) lowDegInit.push(i);
+    const lowDegCount = lowDegInit.length;
+    let bfRecovered = 0;
+    if (lowDegCount > 0) {
+      const t0 = (typeof performance !== "undefined") ? performance.now() : 0;
+      const bfTopK = 30;  // examine the closest 30 cells for each low-deg cell
+      const bfCand = [];
+      for (let lc = 0; lc < lowDegInit.length; lc++) {
+        const i = lowDegInit[lc];
+        const ix = positions[i*3+0], iy = positions[i*3+1], iz = positions[i*3+2];
+        // Find true 30 nearest by brute scan.
+        bfCand.length = 0;
+        for (let j = 0; j < N; j++) {
+          if (j === i) continue;
+          const d = ix*positions[j*3] + iy*positions[j*3+1] + iz*positions[j*3+2];
+          if (d > cosMaxEdge) bfCand.push({ idx: j, dot: d });
+        }
+        bfCand.sort(function(a, b) { return b.dot - a.dot; });
+        const limit = Math.min(bfTopK, bfCand.length);
+        for (let q = 0; q < limit; q++) {
+          const j = bfCand[q].idx;
+          // Skip if edge already exists.
+          let already = false;
+          for (let kk = 0; kk < vAdj[i].length; kk++) {
+            if (vAdj[i][kk] === j) { already = true; break; }
+          }
+          if (already) continue;
+          // Empty-circle test against ALL cells (brute, expensive but
+          // bounded to the lowDegCount × bfTopK iterations).
+          const jx = positions[j*3+0], jy = positions[j*3+1], jz = positions[j*3+2];
+          let mx = ix + jx, my = iy + jy, mz = iz + jz;
+          const ml = Math.sqrt(mx*mx + my*my + mz*mz);
+          if (ml < 1e-9) continue;
+          const mlinv = 1 / ml;
+          mx *= mlinv; my *= mlinv; mz *= mlinv;
+          const dotIM = ix*mx + iy*my + iz*mz;
+          // Find any falsifier in N(i), N(j), and a SMALL local scan
+          // around M; same checks as Pass 1, just confirming.
+          let isVoronoi = true;
+          for (let k2 = 0; k2 < K && isVoronoi; k2++) {
+            const c = neighbors[i * K + k2];
+            if (c < 0 || c === j) continue;
+            const dotCM = positions[c*3]*mx + positions[c*3+1]*my + positions[c*3+2]*mz;
+            if (dotCM > dotIM + slack) isVoronoi = false;
+          }
+          for (let k2 = 0; k2 < K && isVoronoi; k2++) {
+            const c = neighbors[j * K + k2];
+            if (c < 0 || c === i) continue;
+            const dotCM = positions[c*3]*mx + positions[c*3+1]*my + positions[c*3+2]*mz;
+            if (dotCM > dotIM + slack) isVoronoi = false;
+          }
+          if (isVoronoi) {
+            // Brute falsifier search: scan all candidates for any closer cell to M
+            for (let q2 = 0; q2 < bfCand.length && isVoronoi; q2++) {
+              const c = bfCand[q2].idx;
+              if (c === j) continue;
+              const dotCM = positions[c*3]*mx + positions[c*3+1]*my + positions[c*3+2]*mz;
+              if (dotCM > dotIM + slack) isVoronoi = false;
+            }
+          }
+          if (isVoronoi) {
+            vAdj[i].push(j);
+            vAdj[j].push(i);
+            bfRecovered++;
+          }
+        }
+      }
+      const dt = ((typeof performance !== "undefined") ? performance.now() : 0) - t0;
+      console.log("[planet-mesh] brute-force fallback: " + lowDegCount + " low-deg cells scanned in " + dt.toFixed(0) + "ms, recovered " + bfRecovered + " edges");
+    }
+  }
+
   // ---- Degree-distribution diagnostic ----
   // Voronoi cells on a sphere should have avg degree (3N-6)*2/N ≈ 6.
   // Cells with degree < 5 are under-connected -> likely sources of
@@ -57368,6 +57450,29 @@ function _planetApplyTemplate(name, cells, neighbors, K, seaLevel, lockedCenter)
       cap = _makeRandomCap(radiusRad);
     }
     _planetRunDSL(dsl, cells, neighbors, K, cap, powers);
+  }
+  // Post-DSL gentle global smoothing. The user-visible "grainy
+  // continents with random water dots scattered through the land" is
+  // from individual cells dipping just below sea level after the
+  // template's multi-pass arithmetic. Two gentle smoothing iterations
+  // (alpha=0.3, drift toward neighborhood mean) close most of those
+  // single-cell anomalies without flattening mountains.
+  {
+    const N = cells.count;
+    const next = new Float32Array(N);
+    const alpha = 0.30;
+    for (let it = 0; it < 2; it++) {
+      for (let i = 0; i < N; i++) {
+        let sum = 0, cnt = 0;
+        for (let k = 0; k < K; k++) {
+          const ni = neighbors[i * K + k];
+          if (ni >= 0) { sum += cells.elevations[ni]; cnt++; }
+        }
+        const avg = (cnt > 0) ? sum / cnt : cells.elevations[i];
+        next[i] = cells.elevations[i] * (1 - alpha) + avg * alpha;
+      }
+      for (let i = 0; i < N; i++) cells.elevations[i] = next[i];
+    }
   }
   // Piecewise remap Azgaar's logical 0-1 (0.20 = sea level) → ours
   // (seaLevel arg). Anchors h=0 → 0, h=0.20 → seaLevel, h=1 → 1.
