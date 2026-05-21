@@ -56713,6 +56713,13 @@ function _planetVerbHill(cells, neighbors, K, count, heightRange) {
   // BFS from random seed with multiplicative-decay-along-edges. Each
   // step: nextDelta = currDelta ^ blobPower * jitter(0.9..1.1). When
   // delta drops below 0.01, propagation stops naturally.
+  //
+  // BUG-FIX (2026-05-21): Azgaar runs the exponent on the 0..100 raw
+  // scale where x^k DECAYS (k < 1, x > 1 → result < x). We store
+  // delta in 0..1, so a naive `Math.pow(delta[c], blobPower)` actually
+  // INCREASES the value (0.5^0.93 = 0.52, hop UPWARD), making
+  // propagation effectively unlimited and Hills fill the entire cap.
+  // The fix scales up before pow and back down after.
   const blobPower = 0.99;
   const N = cells.count;
   const delta = new Float32Array(N);
@@ -56730,7 +56737,7 @@ function _planetVerbHill(cells, neighbors, K, count, heightRange) {
       for (let q = 0; q < queue.length; q++) {
         const c = queue[q];
         const cd = delta[c];
-        const propagated = Math.pow(cd, blobPower);
+        const propagated = Math.pow(cd * 100, blobPower) / 100;
         if (propagated <= 0.01) continue;
         for (let k = 0; k < K; k++) {
           const n = neighbors[c * K + k];
@@ -56752,6 +56759,8 @@ function _planetVerbHill(cells, neighbors, K, count, heightRange) {
 }
 
 function _planetVerbPit(cells, neighbors, K, count, heightRange) {
+  // Same blob propagation as _planetVerbHill, applied as a SUBTRACTION
+  // to elevations (digs a pit). See bug-fix note in _planetVerbHill.
   const blobPower = 0.99;
   const N = cells.count;
   const delta = new Float32Array(N);
@@ -56768,7 +56777,7 @@ function _planetVerbPit(cells, neighbors, K, count, heightRange) {
       const next = [];
       for (let q = 0; q < queue.length; q++) {
         const c = queue[q];
-        const propagated = Math.pow(delta[c], blobPower);
+        const propagated = Math.pow(delta[c] * 100, blobPower) / 100;
         if (propagated <= 0.01) continue;
         for (let k = 0; k < K; k++) {
           const n = neighbors[c * K + k];
@@ -57060,6 +57069,11 @@ function _planetTemplatePowers(N) {
 // --- Verb implementations (cap-aware, cell-count-scaled decay) ---
 
 function _planetVerbHillXY(cells, neighbors, K, cap, count, heightRange, xRange, yRange, powers) {
+  // BUG-FIX (2026-05-21): see _planetVerbHill -- exponentiation must
+  // run in 0..100 scale so x^blobPower decays with k<1 (Azgaar's
+  // Uint8Array semantics). Storing delta in 0..1 and naively raising
+  // to k<1 INCREASES the value, so propagation runs forever and the
+  // BFS fills the entire cap.
   const N = cells.count;
   const blobPower = powers.blobPower;
   const mask = _capBBoxMask(cells, cap, xRange, yRange);
@@ -57080,7 +57094,7 @@ function _planetVerbHillXY(cells, neighbors, K, cap, count, heightRange, xRange,
       const next = [];
       for (let p = 0; p < q.length; p++) {
         const c = q[p];
-        const prop = Math.pow(delta[c], blobPower);
+        const prop = Math.pow(delta[c] * 100, blobPower) / 100;
         if (prop <= 0.01) continue;
         for (let k = 0; k < K; k++) {
           const n = neighbors[c*K+k];
@@ -57098,6 +57112,7 @@ function _planetVerbHillXY(cells, neighbors, K, cap, count, heightRange, xRange,
 }
 
 function _planetVerbPitXY(cells, neighbors, K, cap, count, heightRange, xRange, yRange, powers) {
+  // BUG-FIX (2026-05-21): same propagation fix as _planetVerbHillXY.
   const N = cells.count;
   const blobPower = powers.blobPower;
   const mask = _capBBoxMask(cells, cap, xRange, yRange);
@@ -57115,7 +57130,7 @@ function _planetVerbPitXY(cells, neighbors, K, cap, count, heightRange, xRange, 
       const next = [];
       for (let p = 0; p < q.length; p++) {
         const c = q[p];
-        const prop = Math.pow(delta[c], blobPower);
+        const prop = Math.pow(delta[c] * 100, blobPower) / 100;
         if (prop <= 0.01) continue;
         for (let k = 0; k < K; k++) {
           const n = neighbors[c*K+k];
@@ -57504,7 +57519,7 @@ OUTPUT (no commentary, no markdown fences):
 CAP COORDS:
 - lat: -90..+90. Tropical = 0±15, temperate = ±30..50, polar = ±60+.
 - lon: -180..+180 (E positive). Within ONE continent cluster, separate caps by 20-50° (so they overlap). Between continent clusters, separate by 90-180°.
-- radiusDeg: 8..90. Each cap in a multi-cap continent = 40-60° (was 25-45° — that was too small). Standalone small island = 10-20. Pangaea = single 85-90° cap.
+- radiusDeg: 8..90. Each cap in a multi-cap continent = 40-60° at low/mid latitude. For high-latitude caps (lat ≥ ±40°) use 55-70° — equirect projection compresses the angular area at high latitude, so a 50° radius cap at lat 60° covers roughly HALF the spherical area of the same radius at the equator. Without this compensation, multi-cap clusters at temperate/polar lats fail to overlap and the continent fragments into separate islands instead of merging into one mass. Standalone small island = 10-20. Pangaea = single 85-90° cap.
 
 DSL VERBS -- one per line, 4 whitespace args (pad with "0" where unused):
 - Hill <count> <height> <x-range> <y-range>      // BFS blob; peak fades outward
