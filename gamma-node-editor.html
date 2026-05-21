@@ -56399,29 +56399,65 @@ function _planetBiomeId(temperature, moisture, h, seaLevel, hasRiver) {
   return PLANET_BIOMES_MATRIX[moistBand][tempBand];
 }
 
+// Default climate configuration matching Azgaar's Configure World
+// panel. All temps in °C; precipPct is a percentage multiplier on
+// the base wind-sim humidity (113 = +13% wetter than the bare sim).
+// winds[] holds 6 entries in degrees (0=N, 90=E, 180=S, 270=W) for
+// the 6 latitude bands spanning 90°N..90°S in 30° steps -- the
+// climate code only uses the E/W component (sign of sin(deg)) to
+// pick walk direction per band.
+const _PLANET_CLIMATE_DEFAULTS = {
+  equatorC:    20,
+  northPoleC: -29,
+  southPoleC: -40,
+  precipPct:  113,
+  tropicNorth:  16,
+  tropicSouth: -20,
+  lapseRateC:  6.5,    // °C per km
+  peakAltM:    9000,   // climate-altitude saturation (independent of heightScale)
+  // 6 bands top-to-bottom (60-90°N, 30-60°N, 0-30°N, 0-30°S, 30-60°S, 60-90°S).
+  // Default values approximate Earth: polar easterlies, mid-lat
+  // westerlies, tropical easterlies (trade winds).
+  winds: [90, 270, 90, 90, 270, 90]
+};
+
+function _resolveClimateConfig(c) {
+  c = c || {};
+  const D = _PLANET_CLIMATE_DEFAULTS;
+  return {
+    equatorC:    (typeof c.equatorC === "number")    ? c.equatorC    : D.equatorC,
+    northPoleC:  (typeof c.northPoleC === "number")  ? c.northPoleC  : D.northPoleC,
+    southPoleC:  (typeof c.southPoleC === "number")  ? c.southPoleC  : D.southPoleC,
+    precipPct:   (typeof c.precipPct === "number")   ? c.precipPct   : D.precipPct,
+    tropicNorth: (typeof c.tropicNorth === "number") ? c.tropicNorth : D.tropicNorth,
+    tropicSouth: (typeof c.tropicSouth === "number") ? c.tropicSouth : D.tropicSouth,
+    lapseRateC:  (typeof c.lapseRateC === "number")  ? c.lapseRateC  : D.lapseRateC,
+    peakAltM:    (typeof c.peakAltM === "number")    ? c.peakAltM    : D.peakAltM,
+    winds:       Array.isArray(c.winds) && c.winds.length === 6 ? c.winds.slice() : D.winds.slice()
+  };
+}
+
 /* Compute climate (temp, prec, biome) for every cell on the planet.
  * One-shot; caller should cache via a key that mixes cells.elevations
- * + seaLevel so painter edits trigger a re-compute. */
-function _planetClimate(cells, seaLevel) {
+ * + seaLevel + climate-config so painter edits OR setting changes
+ * trigger a re-compute. */
+function _planetClimate(cells, seaLevel, climateOpts) {
+  const cfg = _resolveClimateConfig(climateOpts);
   const N = cells.count;
   if (!cells.temp || cells.temp.length !== N) cells.temp = new Float32Array(N);
   if (!cells.prec || cells.prec.length !== N) cells.prec = new Float32Array(N);
+  else cells.prec.fill(0);  // re-zero so reruns don't accumulate
   if (!cells.biome || cells.biome.length !== N) cells.biome = new Uint8Array(N);
 
   // --- Pass 1: temperature per cell (Azgaar calculateTemperatures). ---
-  // Earth-realistic constants (Azgaar's defaults: 27°C equator,
-  // -30°C N pole, -15°C S pole).
-  const T_EQ = 27, T_NP = -30, T_SP = -15;
-  const TROPIC_N = 16, TROPIC_S = -20, TROP_GRAD = 0.15;
+  const T_EQ = cfg.equatorC, T_NP = cfg.northPoleC, T_SP = cfg.southPoleC;
+  const TROPIC_N = cfg.tropicNorth, TROPIC_S = cfg.tropicSouth, TROP_GRAD = 0.15;
   const tempNT = T_EQ - TROPIC_N * TROP_GRAD;
   const tempST = T_EQ + TROPIC_S * TROP_GRAD;
   const northGrad = (tempNT - T_NP) / (90 - TROPIC_N);
   const southGrad = (tempST - T_SP) / (90 + TROPIC_S);
-  // Climate-realistic max altitude in meters for the lapse rate --
-  // independent of PlanetMesh.heightScale so exaggerated relief
-  // doesn't make peaks read as -1000°C.
-  const CLIMATE_PEAK_M = 9000;
-  const LAPSE_PER_M = 6.5 / 1000;  // 6.5°C per km
+  const CLIMATE_PEAK_M = cfg.peakAltM;
+  const LAPSE_PER_M = cfg.lapseRateC / 1000;
 
   for (let i = 0; i < N; i++) {
     const y = cells.positions[i * 3 + 1];
@@ -56467,15 +56503,38 @@ function _planetClimate(cells, seaLevel) {
   const LAT_MOD = [4, 2, 2, 2, 1, 1, 2, 2, 2, 2, 3, 3, 2, 2, 1, 1, 1, 0.5];
   const MAX_PASS_H = 0.85;
   // Modifier from Azgaar's pointsInput.dataset.cells / 10000 ** 0.25
-  // (we have N cells, scale to that).
+  // (we have N cells, scale to that). precipPct (config) multiplies
+  // the base humidity-budget (Azgaar's precInput, default 100%).
   const cellsMod = Math.pow(N / 10000, 0.25);
-  const modifier = cellsMod;  // precInput scaled is 1.0 default
+  const modifier = cellsMod * (cfg.precipPct / 100);
+  // Wind direction per latitude band. cfg.winds has 6 entries
+  // spanning 60-90°N, 30-60°N, 0-30°N, 0-30°S, 30-60°S, 60-90°S
+  // (top to bottom). We only use the E/W component to choose the
+  // walk direction across each 5° latitude band's cells.
+  function windEastward(latCenter) {
+    // Map latCenter (-90..90) to a band index 0..5.
+    // bands: 0=[60..90], 1=[30..60], 2=[0..30], 3=[-30..0], 4=[-60..-30], 5=[-90..-60]
+    let bi;
+    if (latCenter >=  60) bi = 0;
+    else if (latCenter >=  30) bi = 1;
+    else if (latCenter >=   0) bi = 2;
+    else if (latCenter >= -30) bi = 3;
+    else if (latCenter >= -60) bi = 4;
+    else                       bi = 5;
+    const deg = cfg.winds[bi] || 0;
+    // sin(deg in radians) -- positive = east-going, negative = west-going.
+    return Math.sin(deg * Math.PI / 180) >= 0;
+  }
   for (let b = 0; b < NUM_BANDS; b++) {
     const list = bands[b];
     if (list.length === 0) continue;
-    // Sort by longitude ascending so we walk west→east.
-    list.sort(function(a, b) { return lonCache[a] - lonCache[b]; });
     const latCenter = (b * BAND_DEG) - 90 + BAND_DEG * 0.5;
+    const eastward = windEastward(latCenter);
+    // Sort by longitude: ascending = walk W→E (easterly wind result),
+    // descending = walk E→W (westerly wind result). The walk direction
+    // is what determines where moisture COMES FROM in the sim.
+    if (eastward) list.sort(function(a, b) { return lonCache[a] - lonCache[b]; });
+    else          list.sort(function(a, b) { return lonCache[b] - lonCache[a]; });
     const absLat = Math.abs(latCenter);
     const latBandIdx = Math.min(LAT_MOD.length - 1, Math.max(0, Math.floor((absLat - 1) / 5)));
     const latMod = LAT_MOD[latBandIdx];
@@ -56674,13 +56733,17 @@ function _ensurePlanetClimate(pmapNode, seaLevel) {
   // §planet-spec Phase 7.e -- cellsVersion (bumped by the painter
   // on each edit) MUST be in the climate key so paintbrush changes
   // to cells.elevations propagate through temperature → precip →
-  // biome recomputation. Without it the mesh re-builds with stale
-  // biome data after every paint.
+  // biome recomputation. ALSO include the climate config so
+  // settings changes invalidate the cache.
   const ver = (typeof pmapNode._cellsVersion === "number") ? pmapNode._cellsVersion : 0;
-  const key = pmapNode._cellsKey + ":sea=" + seaLevel.toFixed(4) + ":v" + ver;
+  const cfg = _resolveClimateConfig(pmapNode.params && pmapNode.params.climate);
+  const climateKey = cfg.equatorC + "/" + cfg.northPoleC + "/" + cfg.southPoleC
+    + "/" + cfg.precipPct + "/" + cfg.tropicNorth + "/" + cfg.tropicSouth
+    + "/" + cfg.lapseRateC + "/" + cfg.peakAltM + "/" + cfg.winds.join(",");
+  const key = pmapNode._cellsKey + ":sea=" + seaLevel.toFixed(4) + ":v" + ver + ":c=" + climateKey;
   if (pmapNode._climateKey === key && pmapNode._cells.biome) return pmapNode._cells;
   const t0 = (typeof performance !== "undefined") ? performance.now() : 0;
-  _planetClimate(pmapNode._cells, seaLevel);
+  _planetClimate(pmapNode._cells, seaLevel, cfg);
   pmapNode._climateKey = key;
   const dt = ((typeof performance !== "undefined") ? performance.now() : 0) - t0;
   // Quick biome histogram for the log. Fires every recompute (not
@@ -70845,6 +70908,188 @@ const PORT_TYPE_OPTS_OUT = ["audio", "param", "gate", "clock", "texture", "trans
 // brush mode picker (mountain / plain / valley / ridge / smooth).
 
 
+/* §planet-spec Phase 7.e-climate -- Configure World modal. Mirrors
+ * Azgaar's Configure World panel functionally: equator / north pole
+ * / south pole temps, precipitation %, per-band wind direction.
+ * Styled with the editor's CRT/phosphor aesthetic. */
+function openClimateConfigModal(node, onApply) {
+  if (!node) return;
+  // Pull current config (merged with defaults). Sliders edit a
+  // local copy; commit on Apply.
+  const baseline = _resolveClimateConfig(node.params && node.params.climate);
+  const draft = JSON.parse(JSON.stringify(baseline));
+
+  // Remove any previous instance.
+  let prev = document.getElementById("climate-config-modal");
+  if (prev) prev.remove();
+  const back = document.createElement("div");
+  back.className = "modal-backdrop";
+  back.id = "climate-config-modal";
+  back.style.display = "flex";
+  back.style.zIndex = 80;
+  const modal = document.createElement("div");
+  modal.className = "modal";
+  modal.style.width = "520px";
+  modal.style.maxHeight = "90vh";
+  modal.style.overflowY = "auto";
+
+  // Wind band labels (top to bottom).
+  const BAND_LABELS = ["60-90°N (polar)", "30-60°N (temperate)", "0-30°N (tropical)",
+                       "0-30°S (tropical)", "30-60°S (temperate)", "60-90°S (polar)"];
+  // Cardinal directions: degrees (0=N, 90=E, 180=S, 270=W).
+  const WIND_DIRS = [
+    { deg: 0,   name: "N",  arrow: "↑" },
+    { deg: 45,  name: "NE", arrow: "↗" },
+    { deg: 90,  name: "E",  arrow: "→" },
+    { deg: 135, name: "SE", arrow: "↘" },
+    { deg: 180, name: "S",  arrow: "↓" },
+    { deg: 225, name: "SW", arrow: "↙" },
+    { deg: 270, name: "W",  arrow: "←" },
+    { deg: 315, name: "NW", arrow: "↖" }
+  ];
+
+  // Build a slider row: <label> [slider] [value-input] [unit]
+  function sliderRowHTML(id, label, val, min, max, step, unit, tooltip) {
+    return ''
+      + '<div class="climate-row" title="' + (tooltip || "") + '">'
+      + '  <label for="' + id + '">' + label + '</label>'
+      + '  <input type="range" id="' + id + '" min="' + min + '" max="' + max + '" step="' + step + '" value="' + val + '">'
+      + '  <input type="number" id="' + id + '-v" min="' + min + '" max="' + max + '" step="' + step + '" value="' + val + '">'
+      + '  <span class="climate-unit">' + unit + '</span>'
+      + '</div>';
+  }
+
+  let windRowsHTML = "";
+  for (let i = 0; i < 6; i++) {
+    windRowsHTML += '<div class="climate-wind-row">'
+      + '<span class="climate-band">' + BAND_LABELS[i] + '</span>'
+      + '<div class="climate-wind-buttons" data-band="' + i + '">';
+    for (const d of WIND_DIRS) {
+      windRowsHTML += '<button type="button" class="climate-wind-btn'
+        + (d.deg === draft.winds[i] ? " active" : "")
+        + '" data-band="' + i + '" data-deg="' + d.deg + '" title="' + d.name + '">' + d.arrow + '</button>';
+    }
+    windRowsHTML += '</div></div>';
+  }
+
+  modal.innerHTML = ''
+    + '<style>'
+    + '#climate-config-modal .modal-head { display:flex; align-items:center; justify-content:space-between; padding:10px 14px; border-bottom:1px solid var(--border); }'
+    + '#climate-config-modal .modal-title { font-family:var(--font-instr); letter-spacing:0.18em; color:var(--phosphor); text-transform:lowercase; font-size:13px; }'
+    + '#climate-config-modal .climate-body { padding:14px 18px; font-family:var(--font-mono); font-size:11px; color:var(--text-2); }'
+    + '#climate-config-modal .climate-section { font-family:var(--font-mono); color:var(--phosphor); font-size:10px; text-transform:uppercase; letter-spacing:0.1em; margin:14px 0 6px; padding-bottom:3px; border-bottom:1px dashed var(--border); }'
+    + '#climate-config-modal .climate-section:first-child { margin-top:0; }'
+    + '#climate-config-modal .climate-row { display:grid; grid-template-columns:130px 1fr 64px 30px; align-items:center; gap:8px; margin:5px 0; }'
+    + '#climate-config-modal .climate-row label { color:var(--text-2); }'
+    + '#climate-config-modal .climate-row input[type=range] { width:100%; }'
+    + '#climate-config-modal .climate-row input[type=number] { width:60px; background:var(--surface); color:var(--text); border:1px solid var(--border); padding:3px 5px; font-family:var(--font-mono); font-size:11px; border-radius:3px; }'
+    + '#climate-config-modal .climate-unit { color:var(--text-3); font-size:10px; text-align:left; }'
+    + '#climate-config-modal .climate-wind-row { display:grid; grid-template-columns:160px 1fr; align-items:center; gap:8px; margin:4px 0; }'
+    + '#climate-config-modal .climate-band { color:var(--text-2); font-size:11px; }'
+    + '#climate-config-modal .climate-wind-buttons { display:flex; gap:2px; }'
+    + '#climate-config-modal .climate-wind-btn { width:24px; height:24px; padding:0; background:var(--surface); color:var(--text-3); border:1px solid var(--border); border-radius:2px; font-family:var(--font-mono); font-size:14px; cursor:pointer; transition:all 0.1s; }'
+    + '#climate-config-modal .climate-wind-btn:hover { color:var(--text); border-color:var(--phosphor); }'
+    + '#climate-config-modal .climate-wind-btn.active { background:var(--phosphor); color:#000; border-color:var(--phosphor); }'
+    + '#climate-config-modal .climate-footer { display:flex; gap:8px; justify-content:space-between; padding:10px 14px; border-top:1px solid var(--border); }'
+    + '</style>'
+    + '<div class="modal-head">'
+    + '  <span class="modal-title">configure world / climate</span>'
+    + '  <button class="btn modal-x" id="climate-x" type="button">×</button>'
+    + '</div>'
+    + '<div class="climate-body">'
+    + '  <div class="climate-section">temperature</div>'
+    + sliderRowHTML("clim-eq",  "Equator",        draft.equatorC,    -10, 50, 1, "°C", "Sea-level temperature at the equator")
+    + sliderRowHTML("clim-np",  "North Pole",     draft.northPoleC,  -60, 30, 1, "°C", "Sea-level temperature at the north pole")
+    + sliderRowHTML("clim-sp",  "South Pole",     draft.southPoleC,  -60, 30, 1, "°C", "Sea-level temperature at the south pole")
+    + sliderRowHTML("clim-tn",  "Tropic N edge",  draft.tropicNorth,   0, 30, 1, "°lat", "Where the equatorial heat-belt ends going north (Earth ≈ 23°N)")
+    + sliderRowHTML("clim-ts",  "Tropic S edge",  draft.tropicSouth, -30,  0, 1, "°lat", "Where the equatorial heat-belt ends going south (Earth ≈ -23°S)")
+    + sliderRowHTML("clim-lapse", "Lapse rate",   draft.lapseRateC,    0, 12, 0.1, "°C/km", "How fast temperature drops with altitude (Earth ≈ 6.5°C/km)")
+    + sliderRowHTML("clim-peak",  "Peak altitude",draft.peakAltM,   1000, 20000, 100, "m",  "Altitude where the lapse rate saturates -- decouples climate from heightScale exaggeration")
+    + '  <div class="climate-section">precipitation</div>'
+    + sliderRowHTML("clim-prec", "Precipitation", draft.precipPct,  10, 300, 1, "%", "Global humidity multiplier on the wind-sim base budget")
+    + '  <div class="climate-section">winds (where wind is blowing TOWARD per band)</div>'
+    + windRowsHTML
+    + '</div>'
+    + '<div class="climate-footer">'
+    + '  <button class="btn" id="clim-defaults" type="button">restore defaults</button>'
+    + '  <div style="display:flex;gap:8px;">'
+    + '    <button class="btn" id="clim-cancel" type="button">cancel</button>'
+    + '    <button class="btn" id="clim-apply" type="button" style="background:var(--phosphor);color:#000;border-color:var(--phosphor);">apply</button>'
+    + '  </div>'
+    + '</div>';
+  back.appendChild(modal);
+  document.body.appendChild(back);
+
+  // Helper: wire a slider + number input pair to update draft[key].
+  function wireSliderPair(rangeId, key, parser) {
+    const r = modal.querySelector("#" + rangeId);
+    const n = modal.querySelector("#" + rangeId + "-v");
+    const p = parser || ((v) => +v);
+    r.addEventListener("input", () => { draft[key] = p(r.value); n.value = r.value; });
+    n.addEventListener("input", () => {
+      let v = p(n.value);
+      const min = parseFloat(r.min), max = parseFloat(r.max);
+      if (v < min) v = min; else if (v > max) v = max;
+      draft[key] = v;
+      r.value = v;
+    });
+  }
+  wireSliderPair("clim-eq",    "equatorC");
+  wireSliderPair("clim-np",    "northPoleC");
+  wireSliderPair("clim-sp",    "southPoleC");
+  wireSliderPair("clim-tn",    "tropicNorth");
+  wireSliderPair("clim-ts",    "tropicSouth");
+  wireSliderPair("clim-lapse", "lapseRateC", v => parseFloat(v));
+  wireSliderPair("clim-peak",  "peakAltM");
+  wireSliderPair("clim-prec",  "precipPct");
+
+  // Wire wind direction buttons -- one selected per band.
+  modal.querySelectorAll(".climate-wind-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const band = +btn.dataset.band;
+      const deg = +btn.dataset.deg;
+      draft.winds[band] = deg;
+      // Update active state for this band.
+      modal.querySelectorAll('.climate-wind-btn[data-band="' + band + '"]').forEach(b => {
+        if (+b.dataset.deg === deg) b.classList.add("active");
+        else                        b.classList.remove("active");
+      });
+    });
+  });
+
+  // Restore defaults: copy from _PLANET_CLIMATE_DEFAULTS into draft + UI.
+  modal.querySelector("#clim-defaults").addEventListener("click", () => {
+    const D = _PLANET_CLIMATE_DEFAULTS;
+    draft.equatorC = D.equatorC;        modal.querySelector("#clim-eq").value    = D.equatorC;    modal.querySelector("#clim-eq-v").value    = D.equatorC;
+    draft.northPoleC = D.northPoleC;    modal.querySelector("#clim-np").value    = D.northPoleC;  modal.querySelector("#clim-np-v").value    = D.northPoleC;
+    draft.southPoleC = D.southPoleC;    modal.querySelector("#clim-sp").value    = D.southPoleC;  modal.querySelector("#clim-sp-v").value    = D.southPoleC;
+    draft.tropicNorth = D.tropicNorth;  modal.querySelector("#clim-tn").value    = D.tropicNorth; modal.querySelector("#clim-tn-v").value    = D.tropicNorth;
+    draft.tropicSouth = D.tropicSouth;  modal.querySelector("#clim-ts").value    = D.tropicSouth; modal.querySelector("#clim-ts-v").value    = D.tropicSouth;
+    draft.lapseRateC = D.lapseRateC;    modal.querySelector("#clim-lapse").value = D.lapseRateC;  modal.querySelector("#clim-lapse-v").value = D.lapseRateC;
+    draft.peakAltM = D.peakAltM;        modal.querySelector("#clim-peak").value  = D.peakAltM;    modal.querySelector("#clim-peak-v").value  = D.peakAltM;
+    draft.precipPct = D.precipPct;      modal.querySelector("#clim-prec").value  = D.precipPct;   modal.querySelector("#clim-prec-v").value  = D.precipPct;
+    draft.winds = D.winds.slice();
+    modal.querySelectorAll(".climate-wind-btn").forEach(b => {
+      const band = +b.dataset.band;
+      const deg  = +b.dataset.deg;
+      if (deg === draft.winds[band]) b.classList.add("active");
+      else                           b.classList.remove("active");
+    });
+  });
+
+  function close() { back.remove(); }
+  modal.querySelector("#climate-x").addEventListener("click", close);
+  modal.querySelector("#clim-cancel").addEventListener("click", close);
+  modal.querySelector("#clim-apply").addEventListener("click", () => {
+    if (!node.params) node.params = {};
+    node.params.climate = draft;
+    if (typeof onApply === "function") onApply(draft);
+    close();
+  });
+  back.addEventListener("click", (ev) => { if (ev.target === back) close(); });
+}
+
+
 function openPlanetMapEditor(nodeId) {
   const node = state && state.nodes && state.nodes.find(n => n && n.id === nodeId);
   if (!node || node.type !== "PlanetMap") return;
@@ -70921,6 +71166,7 @@ function openPlanetMapEditor(nodeId) {
     '<span style="border-left:1px solid var(--border);height:18px;margin:0 2px;"></span>' +
     '<button class="btn" id="pmap-revert" type="button" style="padding:3px 10px;">revert</button>' +
     '<button class="btn" id="pmap-climate" type="button" style="padding:3px 10px;">show climate</button>' +
+    '<button class="btn" id="pmap-climate-config" type="button" style="padding:3px 10px;" title="Configure climate (equator/pole temperatures, precipitation, winds)">⚙ world</button>' +
     '<button class="btn" id="pmap-geojson" type="button" style="padding:3px 10px;" title="Import an Azgaar FMG file (.geojson Cells export or full .json) to stamp its exact landmass + heights onto this planet">import azgaar</button>' +
     '<input type="file" id="pmap-geojson-file" accept=".geojson,.json,application/geo+json,application/json" style="display:none">';
   body.appendChild(ctrls);
@@ -71169,6 +71415,23 @@ function openPlanetMapEditor(nodeId) {
       climateBtn.textContent = "show climate";
     }
     render();
+  });
+
+  // Configure World -- climate settings modal (Azgaar parity).
+  modal.querySelector("#pmap-climate-config").addEventListener("click", () => {
+    openClimateConfigModal(node, () => {
+      // Climate config changed; cache key now mismatches. Force a
+      // recompute + redraw + invalidate the cubemap so PlanetMesh
+      // picks up the new biomes on the next chunk rebuild.
+      node._climateKey = null;
+      if (showClimate) {
+        _ensurePlanetClimate(node, seaLevel);
+        _ensurePlanetRivers(node, seaLevel);
+        render();
+      }
+      dirty = true;
+      pushHistory("planet-map-edit:climate");
+    });
   });
 
   // Import GeoJSON: stamps an Azgaar FMG Cells GeoJSON's landmass
