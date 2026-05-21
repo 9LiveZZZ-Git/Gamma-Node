@@ -53064,7 +53064,14 @@ fn _atm_ray_sphere(origin: vec3<f32>, dir: vec3<f32>, center: vec3<f32>, r: f32)
   return vec2<f32>(-b - s, -b + s);
 }
 
-fn sample_planet_atmosphere(rayOrigin: vec3<f32>, rayDir: vec3<f32>) -> vec3<f32> {
+// Internal core: integrate Rayleigh+Mie in-scatter along [rayOrigin,
+// rayOrigin + rayDir*t1] segment, where t1 is automatically computed
+// as either atmosphere-shell exit OR ground intersection OR maxDist
+// (whichever is closest). maxDist < 0 means "no fragment limit"
+// (the sky-pass usage); maxDist >= 0 clips to that distance (the
+// aerial-perspective usage, where the fragment's surface stops the
+// view ray short of the planet's far atmosphere shell).
+fn _atm_integrate(rayOrigin: vec3<f32>, rayDir: vec3<f32>, maxDist: f32) -> vec3<f32> {
   let sunDir   = uS.envSun.xyz;
   let sunVis   = uS.envSun.w;
   let planetC  = uS.envPlanet.xyz;
@@ -53091,6 +53098,9 @@ fn sample_planet_atmosphere(rayOrigin: vec3<f32>, rayDir: vec3<f32>) -> vec3<f32
   // Clip to ground if the ray would otherwise pass through the planet.
   let groundHit = _atm_ray_sphere(rayOrigin, rayDir, planetC, planetR);
   if (groundHit.x > 0.0 && groundHit.x < t1) { t1 = groundHit.x; }
+  // Clip to fragment (aerial-perspective mode): when a surface is in
+  // front of the atmosphere far side, stop the integral at the surface.
+  if (maxDist >= 0.0 && maxDist < t1) { t1 = maxDist; }
 
   let segLen = t1 - t0;
   if (segLen <= 0.0) { return vec3<f32>(0.0); }
@@ -53152,6 +53162,37 @@ fn sample_planet_atmosphere(rayOrigin: vec3<f32>, rayDir: vec3<f32>) -> vec3<f32
   let result = sunI * sunVis * (betaR * phaseR * inScatterR
                               + betaM * phaseM * inScatterM);
   return max(result, vec3<f32>(0.0));
+}
+
+// PUBLIC: sky-pass usage. View ray runs to the atmosphere far side
+// (or ground intersection). Returns the in-scatter integrated along
+// the full view path -- this is the SKY COLOR for that direction.
+fn sample_planet_atmosphere(rayOrigin: vec3<f32>, rayDir: vec3<f32>) -> vec3<f32> {
+  return _atm_integrate(rayOrigin, rayDir, -1.0);
+}
+
+// PUBLIC: AERIAL PERSPECTIVE for a lit fragment. Caller passes the
+// camera world position and the fragment world position; this
+// integrates the atmosphere along the segment between them and
+// returns the in-scatter that should be ADDED to the fragment's
+// surface color. The further the fragment from the camera, the more
+// atmosphere is between them, and the bluer/brighter the haze.
+//
+// Result is purely additive: ground reads correctly when looking
+// at near surfaces (zero atmosphere between camera and ground),
+// becomes blue-tinted when looking at distant horizons (atmosphere
+// fills the segment), and reaches limb-glow brightness when looking
+// along a tangent (camera near surface, fragment also near surface,
+// LONG segment of upper atmosphere between -- this matches what
+// the sky pass renders for the corresponding view rays so the
+// planet body and the sky have a seamless atmospheric boundary
+// instead of a sharp silhouette).
+fn aerial_perspective(camPos: vec3<f32>, fragPos: vec3<f32>) -> vec3<f32> {
+  let v = fragPos - camPos;
+  let dist = length(v);
+  if (dist < 1.0) { return vec3<f32>(0.0); }
+  let dir = v / dist;
+  return _atm_integrate(camPos, dir, dist);
 }
 
 fn sample_procedural_sky_features(dir: vec3<f32>) -> vec3<f32> {
@@ -53563,8 +53604,21 @@ fn vs_terrain(in: VsIn) -> VsOut {
 // Legacy unlit-vertex-color fallback. Default fragment when no
 // material is wired on a mesh-gen primitive -- preserves the
 // "you get colors immediately" behavior from sprints a + b.
+//
+// 2026-05-21 Sprint 7.6.a-atm -- when a planet is wired
+// (envPlanet.w > 0) the planet's lit surface gets AERIAL
+// PERSPECTIVE applied: in-scatter from camera to fragment is
+// added to the surface color. This is what makes the planet
+// look like it has an ATMOSPHERE ON IT (blue haze near horizon,
+// gentle blue tint on distant ground, integrated limb glow that
+// flows from the planet body into the sky -- not a sharp
+// silhouette with separate sky-glow).
 @fragment
 fn fs_unlit_vc(in: VsOut) -> @location(0) vec4<f32> {
+  if (uS.envPlanet.w > 0.0) {
+    let col = in.color + aerial_perspective(uS.eye.xyz, in.worldPos);
+    return vec4<f32>(tonemap_aces(col), 1.0);
+  }
   return vec4<f32>(in.color, 1.0);
 }
 
@@ -53636,7 +53690,15 @@ fn fs_phong(in: VsOut) -> @location(0) vec4<f32> {
   }
   // 7.5.4.e -- fog + tonemap, matches fs_pbr.
   let fogged = apply_fog(lit, in.worldPos);
-  return vec4<f32>(tonemap_aces(fogged), 1.0);
+  // 2026-05-21 Sprint 7.6.a-atm -- aerial perspective. When a
+  // planet is wired, add the atmospheric in-scatter from camera to
+  // this fragment so distant surfaces gain blue haze and the limb
+  // glow integrates smoothly with the sky pass's atmosphere.
+  var withAtm = fogged;
+  if (uS.envPlanet.w > 0.0) {
+    withAtm = withAtm + aerial_perspective(uS.eye.xyz, in.worldPos);
+  }
+  return vec4<f32>(tonemap_aces(withAtm), 1.0);
 }
 
 // Phase 7 §5.5.h-3 -- terrain noise helpers, JS-mirror in WGSL.
