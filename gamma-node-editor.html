@@ -57681,33 +57681,63 @@ function _applyAIPlan(plan, cells, neighbors, K, seaLevel, lockedCenter) {
   _planetPostDSL(cells, neighbors, K, seaLevel);
 }
 
-/* Public CC BY-SA 4.0 equirect Earth heightmap (Wikimedia Commons).
- * 400px thumbnail = ~30-50KB PNG. Loaded once on demand, cached on
- * window.__planetEarthRefB64. Used as a "what real Earth's coastlines
- * and elevation variation look like" reference image attached to the
- * initial generation call when the user opts in (checkbox in the
- * painter). Audits use the painter's current view, NOT this. */
-const _PLANET_EARTH_REFERENCE_URL = "https://upload.wikimedia.org/wikipedia/commons/thumb/2/2b/World_elevation_map.png/400px-World_elevation_map.png";
+/* Per-preset / per-flavor reference images. Each entry maps a short
+ * key to {url, credit, sourcePage, appliesTo}. CORS-friendly
+ * Wikimedia thumbnails (400px ≈ 30-100 KB PNG). When the user picks a
+ * preset, the painter selects the matching ref and attaches it to the
+ * initial generation call as a style example for the LLM. All refs
+ * must be in EQUIRECTANGULAR projection so they match our painter. */
+const PMAP_AI_REFERENCES = {
+  earth: {
+    url: "https://upload.wikimedia.org/wikipedia/commons/thumb/2/2b/World_elevation_map.png/400px-World_elevation_map.png",
+    credit: "World elevation map by Avsa, CC BY-SA 4.0",
+    sourcePage: "https://commons.wikimedia.org/wiki/File:World_elevation_map.png",
+    appliesTo: "Earth-like, Pangaea, Mediterranean, archipelago, twin continents, continental drift, water world, ice world"
+  },
+  mars: {
+    url: "https://upload.wikimedia.org/wikipedia/commons/thumb/8/89/Mars_topography_%28MOLA_dataset%29.png/400px-Mars_topography_%28MOLA_dataset%29.png",
+    credit: "Mars MOLA topography by NASA Goddard SVS, Public Domain",
+    sourcePage: "https://commons.wikimedia.org/wiki/File:Mars_topography_(MOLA_dataset).png",
+    appliesTo: "Mars-like, volcanic arcs, arid planets"
+  }
+};
 
-async function _loadPlanetEarthReference() {
-  if (window.__planetEarthRefB64) return window.__planetEarthRefB64;
-  if (window.__planetEarthRefFailed) return null;
+const _planetRefCache = {};
+async function _loadPlanetReference(refKey) {
+  if (!refKey || !PMAP_AI_REFERENCES[refKey]) return null;
+  if (refKey in _planetRefCache) return _planetRefCache[refKey];
+  const def = PMAP_AI_REFERENCES[refKey];
   try {
-    const resp = await fetch(_PLANET_EARTH_REFERENCE_URL, { mode: "cors" });
+    const resp = await fetch(def.url, { mode: "cors" });
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     const blob = await resp.blob();
     const buf = await blob.arrayBuffer();
     const u8 = new Uint8Array(buf);
     let str = "";
     for (let i = 0; i < u8.length; i++) str += String.fromCharCode(u8[i]);
-    window.__planetEarthRefB64 = btoa(str);
-    console.log("[planet-map] Earth reference image loaded (" + Math.round(u8.length / 1024) + " KB)");
-    return window.__planetEarthRefB64;
+    const b64 = btoa(str);
+    _planetRefCache[refKey] = b64;
+    console.log("[planet-map] ref '" + refKey + "' loaded (" + Math.round(u8.length / 1024) + " KB)");
+    return b64;
   } catch (e) {
-    window.__planetEarthRefFailed = true;
-    console.warn("[planet-map] Earth reference fetch failed (likely CORS); continuing without reference:", e.message || e);
+    _planetRefCache[refKey] = null;
+    console.warn("[planet-map] ref '" + refKey + "' fetch failed (likely CORS):", e.message || e);
     return null;
   }
+}
+
+/* Landmass area measurement. Counts cells above sea level after
+ * cap-DSL run + post-DSL pipeline. Earth's two big landmass clusters
+ * (Americas + Eurasia-Africa) together cover ~22% of the planet
+ * surface; all Earth land is ~29%. We use 22-30% as the "Earth-like"
+ * target band; the AI prompt is told to design for it and the painter
+ * displays the resulting % in the status line. */
+function _planetMeasureLandmass(cells, seaLevel) {
+  const N = cells.count;
+  const sl = (typeof seaLevel === "number") ? seaLevel : 0.55;
+  let landCells = 0;
+  for (let i = 0; i < N; i++) if (cells.elevations[i] >= sl) landCells++;
+  return { landCells, totalCells: N, landFraction: landCells / N };
 }
 
 async function _capturePainterPng(canvas) {
@@ -57736,31 +57766,41 @@ async function _capturePainterPng(canvas) {
  * alone -- continents that shrank to nothing, wrong locations, missing
  * features. Each round = 1 API call; the cost trades for quality.
  * Vision-capable providers only (Anthropic + Gemma both support it). */
-async function _planetGenerateFromAI(prompt, cells, neighbors, K, seaLevel, lockedCenter, onStatus, painterCanvas, painterRerender, keywordAudits, useEarthRef) {
+async function _planetGenerateFromAI(prompt, cells, neighbors, K, seaLevel, lockedCenter, onStatus, painterCanvas, painterRerender, keywordAudits, refKey, targetLand) {
   const provider = PROVIDERS[aiSettings.provider];
   if (!provider) throw new Error("no AI provider configured");
   if (provider.requiresKey && !aiSettings.anthropicKey) {
     throw new Error("API key required - set in AI Settings panel");
   }
   const kwAudits = Array.isArray(keywordAudits) ? keywordAudits.slice(0, 4) : [];
-  // Total passes = 1 (initial) + 1 (baseline audit) + N (per-keyword
-  // audits). Worst-case = 6 calls when 4 keywords are active.
   const totalPasses = 2 + kwAudits.length;
   const t0 = performance.now();
 
+  // Land coverage target (from preset metadata): 22-30% for Earth-like,
+  // 5-15% for archipelagos, etc. Included in the prompt so the LLM
+  // sizes caps + Hill counts to match.
+  const tgtLo = Array.isArray(targetLand) ? targetLand[0] : 0.20;
+  const tgtHi = Array.isArray(targetLand) ? targetLand[1] : 0.32;
+  const tgtStr = (tgtLo * 100).toFixed(0) + "-" + (tgtHi * 100).toFixed(0) + "%";
+
   // --- Initial round ---
-  // Optionally include a real Earth heightmap reference image so the
-  // LLM sees what realistic continent shapes / coastline irregularity
-  // / elevation distribution look like in our same projection.
+  // Optional reference heightmap image attached for the LLM to learn
+  // realistic coastlines / elevation distribution from. The reference
+  // is preset-specific (e.g. Mars-like uses MOLA topography, Earth-
+  // like uses Wikimedia's elevation map).
   let initialImage = null;
-  if (useEarthRef) {
-    onStatus && onStatus("loading Earth reference image…");
-    initialImage = await _loadPlanetEarthReference();
+  if (refKey) {
+    onStatus && onStatus("loading '" + refKey + "' reference image…");
+    initialImage = await _loadPlanetReference(refKey);
   }
-  const initialUserPrompt = initialImage
-    ? "REFERENCE IMAGE ATTACHED: a real Earth heightmap in the SAME equirectangular projection you'll be generating. Use it as INSPIRATION for: (a) the level of detail in continent shapes (irregular coastlines, peninsulas, bays), (b) the elevation distribution (mostly low plains with occasional mountain ranges), (c) the size of continents relative to the planet, (d) how oceans / inland seas are distributed. DO NOT literally copy Earth -- the user's prompt below describes a DIFFERENT planet. Use Earth's heightmap as a style guide for realism, then design according to the user's prompt.\n\nUSER PROMPT: " + prompt
-    : prompt;
-  onStatus && onStatus("round 1/" + totalPasses + ": calling " + (aiSettings.model || provider.defaultModel) + (initialImage ? " w/ Earth ref" : "") + "…");
+  const refTag = initialImage ? " (ref: " + refKey + ")" : "";
+  const initialUserPrompt =
+    (initialImage
+      ? ("REFERENCE IMAGE ATTACHED: a real-world heightmap (" + refKey + ") in the SAME equirectangular projection you'll be generating. Use it as INSPIRATION for: (a) irregular coastline detail (peninsulas, bays), (b) elevation distribution (mostly low plains with occasional mountain ranges), (c) continent size relative to the planet, (d) ocean / inland sea layout. DO NOT literally copy it -- the user's prompt describes a DIFFERENT planet.\n\n")
+      : "")
+    + "TARGET LAND COVERAGE: " + tgtStr + " of the planet's surface (Earth's combined Americas + Eurasia-Africa landmasses ≈ 22% of Earth; all Earth land ≈ 29%). Size your caps + Hill counts so total land falls inside this band.\n\n"
+    + "USER PROMPT: " + prompt;
+  onStatus && onStatus("round 1/" + totalPasses + ": calling " + (aiSettings.model || provider.defaultModel) + refTag + "…");
   const initial = await provider.call({
     system: _PLANET_AI_SYSTEM_PROMPT,
     user: initialUserPrompt,
@@ -70737,19 +70777,35 @@ function openPlanetMapEditor(nodeId) {
   // provider. Preset dropdown fills the prompt with tested
   // descriptions; keyword chips append modifiers. User can edit
   // the prompt freely between picks.
+  // Each preset declares a `refKey` (which reference image to attach
+  // for the initial AI call) and a `targetLand` band (% of cells
+  // expected as land, used both as a prompt hint and as a status-line
+  // check after generation). Earth's two combined landmass clusters
+  // cover ~22% of the surface; all Earth land = ~29%.
   const PMAP_AI_PRESETS = [
-    { name: "(custom)", prompt: "" },
-    { name: "Earth-like (2 huge continents)", prompt: "earth-like planet with 2 huge continents -- one shaped like the Americas (Alaska to Patagonia, spanning lat 70N to 55S, lon -170 to -30, 4-5 overlapping caps with radius 45-55 each), and one shaped like Eurasia+Africa (Cape Town to Siberia, spanning lat 70N to 35S, lon -10 to 130, 4-5 overlapping caps with radius 50-60 each). Each continent has multiple mountain ranges with peaks reaching height 90-100 (Mt-Everest-class), broad plains covering most of the land, and irregular coastlines with peninsulas and bays" },
-    { name: "Earth-like (5 medium continents)", prompt: "earth-like world with 5 large continents of varied size and shape (each 3-5 overlapping caps spanning ~70° of arc), distributed across both hemispheres; each has at least one mountain range (Range height 70-85) and one peak (Hill height 85-95), broad central plains, and irregular coastlines with peninsulas and bays" },
-    { name: "Pangaea (one supercontinent)", prompt: "single pangaea supercontinent centered near the equator, ENORMOUS (5+ overlapping caps with radius 60-70 each, spanning ~140° of arc), split by a central inland sea running east-west, with multiple mountain ranges (height 75-90) and broad plains everywhere else" },
-    { name: "Tropical archipelago", prompt: "tropical archipelago: 6-8 small island chains scattered across the equatorial belt (lat -15 to +15), no major continents, just dense clusters of small islands (radius 15-25 each) with reef-like irregular outlines and a few volcanic peaks (height 70-85)" },
-    { name: "Mediterranean-style", prompt: "two large continents on either side of a central inland sea (Mediterranean-style), each continent 3-4 overlapping caps with radius 40-50, mountainous coastlines (Range height 70-85) along the sea, peninsulas extending into the water, broad plains inland" },
-    { name: "Ice world", prompt: "frozen planet with one large polar ice continent covering lat +55 to +90 (use 4-5 caps spanning the polar region), plus 2-3 small temperate island chains at lat ±20-30; very cold, mountain spines (height 75-90) along the polar coastline" },
-    { name: "Volcanic arcs", prompt: "young volcanic planet with chains of small volcanic islands running along curving arcs (tectonic fault lines); 3-4 island arc systems spread across the planet, each cap small (radius 15-25), each with sharp tall volcanic peaks (Hill height 85-100)" },
-    { name: "Mars-like", prompt: "arid planet with one large dusty continent in the southern hemisphere (lat -10 to -55), 4-5 overlapping caps spanning ~80° of arc, full of low plains (height 22-40) and a few isolated mountain ranges (Range height 70-85), plus a small polar ice cap at lat +75" },
-    { name: "Water world", prompt: "mostly ocean planet with only 2-3 small island archipelagos in the tropics; each archipelago is 4-6 tiny caps (radius 12-18) clustered, with mostly low-elevation atolls (height 25-40) and a few volcanic peaks (Hill height 80-90)" },
-    { name: "Twin continents", prompt: "two large continents on opposite sides of the planet (180 degrees apart in longitude), each 4-5 overlapping caps with radius 45-55, separated by deep ocean; each has a mountain spine running north-south (Range height 75-90), broad plains, irregular coastlines, and a polar cap" },
-    { name: "Continental drift", prompt: "two large continents pulling apart -- one in the western hemisphere, one in the eastern -- each 3-4 overlapping caps with radius 40-50, with matching coastline shapes facing each other, deep mid-ocean trough between them, inland mountain ranges (Range height 70-85)" }
+    { name: "(custom)", prompt: "", refKey: "earth", targetLand: [0.18, 0.35] },
+    { name: "Earth-like (2 huge continents)", refKey: "earth", targetLand: [0.20, 0.30],
+      prompt: "earth-like planet with 2 huge continents -- one shaped like the Americas (Alaska to Patagonia, spanning lat 70N to 55S, lon -170 to -30, 4-5 overlapping caps with radius 45-55 each), and one shaped like Eurasia+Africa (Cape Town to Siberia, spanning lat 70N to 35S, lon -10 to 130, 4-5 overlapping caps with radius 50-60 each). Each continent has multiple mountain ranges with peaks reaching height 90-100 (Mt-Everest-class), broad plains covering most of the land, and irregular coastlines with peninsulas and bays" },
+    { name: "Earth-like (5 medium continents)", refKey: "earth", targetLand: [0.22, 0.32],
+      prompt: "earth-like world with 5 large continents of varied size and shape (each 3-5 overlapping caps spanning ~70° of arc), distributed across both hemispheres; each has at least one mountain range (Range height 70-85) and one peak (Hill height 85-95), broad central plains, and irregular coastlines with peninsulas and bays" },
+    { name: "Pangaea (one supercontinent)", refKey: "earth", targetLand: [0.28, 0.40],
+      prompt: "single pangaea supercontinent centered near the equator, ENORMOUS (5+ overlapping caps with radius 60-70 each, spanning ~140° of arc), split by a central inland sea running east-west, with multiple mountain ranges (height 75-90) and broad plains everywhere else" },
+    { name: "Tropical archipelago", refKey: "earth", targetLand: [0.05, 0.12],
+      prompt: "tropical archipelago: 6-8 small island chains scattered across the equatorial belt (lat -15 to +15), no major continents, just dense clusters of small islands (radius 15-25 each) with reef-like irregular outlines and a few volcanic peaks (height 70-85)" },
+    { name: "Mediterranean-style", refKey: "earth", targetLand: [0.25, 0.40],
+      prompt: "two large continents on either side of a central inland sea (Mediterranean-style), each continent 3-4 overlapping caps with radius 40-50, mountainous coastlines (Range height 70-85) along the sea, peninsulas extending into the water, broad plains inland" },
+    { name: "Ice world", refKey: "earth", targetLand: [0.12, 0.22],
+      prompt: "frozen planet with one large polar ice continent covering lat +55 to +90 (use 4-5 caps spanning the polar region), plus 2-3 small temperate island chains at lat ±20-30; very cold, mountain spines (height 75-90) along the polar coastline" },
+    { name: "Volcanic arcs", refKey: "mars", targetLand: [0.06, 0.14],
+      prompt: "young volcanic planet with chains of small volcanic islands running along curving arcs (tectonic fault lines); 3-4 island arc systems spread across the planet, each cap small (radius 15-25), each with sharp tall volcanic peaks (Hill height 85-100)" },
+    { name: "Mars-like", refKey: "mars", targetLand: [0.25, 0.45],
+      prompt: "arid planet with one large dusty continent in the southern hemisphere (lat -10 to -55), 4-5 overlapping caps spanning ~80° of arc, full of low plains (height 22-40) and a few isolated mountain ranges (Range height 70-85), plus a small polar ice cap at lat +75" },
+    { name: "Water world", refKey: "earth", targetLand: [0.02, 0.08],
+      prompt: "mostly ocean planet with only 2-3 small island archipelagos in the tropics; each archipelago is 4-6 tiny caps (radius 12-18) clustered, with mostly low-elevation atolls (height 25-40) and a few volcanic peaks (Hill height 80-90)" },
+    { name: "Twin continents", refKey: "earth", targetLand: [0.20, 0.30],
+      prompt: "two large continents on opposite sides of the planet (180 degrees apart in longitude), each 4-5 overlapping caps with radius 45-55, separated by deep ocean; each has a mountain spine running north-south (Range height 75-90), broad plains, irregular coastlines, and a polar cap" },
+    { name: "Continental drift", refKey: "earth", targetLand: [0.18, 0.30],
+      prompt: "two large continents pulling apart -- one in the western hemisphere, one in the eastern -- each 3-4 overlapping caps with radius 40-50, with matching coastline shapes facing each other, deep mid-ocean trough between them, inland mountain ranges (Range height 70-85)" }
   ];
   // Each keyword has a label, the phrase it appends to the prompt,
   // and a focused audit instruction. When the user clicks a chip
@@ -70802,7 +70858,10 @@ function openPlanetMapEditor(nodeId) {
       '<button class="btn" id="pmap-ai-go" type="button" style="padding:3px 12px;">generate</button>' +
       '<button class="btn" id="pmap-clearlock" type="button" style="padding:3px 10px;display:none;">clear target</button>' +
     '</div>' +
-    '<label style="display:flex;align-items:center;gap:6px;font-size:10px;color:var(--text-3);"><input type="checkbox" id="pmap-ai-earthref" checked style="margin:0;">🌍 attach real Earth heightmap as style reference (Wikimedia CC BY-SA, fetched once)</label>' +
+    '<div style="display:flex;align-items:center;gap:6px;font-size:10px;color:var(--text-3);">' +
+      '<label style="display:flex;align-items:center;gap:6px;"><input type="checkbox" id="pmap-ai-useref" checked style="margin:0;">🌍 attach real-world heightmap reference</label>' +
+      '<button class="btn" id="pmap-ai-refinfo" type="button" style="padding:1px 6px;font-size:10px;" title="show reference image sources">ⓘ sources</button>' +
+    '</div>' +
     '<div id="pmap-ai-keywords" style="display:flex;flex-wrap:wrap;gap:4px;"></div>' +
     '<span id="pmap-lockinfo" style="color:var(--text-3);font-size:10px;">shift-click the map to lock the first continent\'s position. ai uses the wired provider (Settings → AI).</span>' +
     '<span id="pmap-ai-status" style="color:var(--text-3);font-size:10px;min-height:14px;"></span>';
@@ -70850,6 +70909,32 @@ function openPlanetMapEditor(nodeId) {
     const preset = PMAP_AI_PRESETS[idx];
     if (!preset) return;
     modal.querySelector("#pmap-ai-prompt").value = preset.prompt;
+  });
+
+  // Sources popup (info button).
+  modal.querySelector("#pmap-ai-refinfo").addEventListener("click", () => {
+    let html = "<div style='padding:10px 14px;'>";
+    html += "<div style='font-family:var(--font-mono);font-size:11px;color:var(--text-2);margin-bottom:8px;'>Reference heightmap sources (all CORS-friendly Wikimedia Commons thumbnails):</div>";
+    Object.keys(PMAP_AI_REFERENCES).forEach(k => {
+      const r = PMAP_AI_REFERENCES[k];
+      html += "<div style='margin-bottom:6px;font-family:var(--font-mono);font-size:10px;line-height:1.5;'>";
+      html += "<b style='color:var(--phosphor);'>" + k + "</b><br>";
+      html += "<span style='color:var(--text-2);'>" + r.credit + "</span><br>";
+      html += "<a href='" + r.sourcePage + "' target='_blank' rel='noopener' style='color:var(--phosphor);font-size:9px;'>source page</a><br>";
+      html += "<span style='color:var(--text-3);font-size:9px;'>applies to: " + r.appliesTo + "</span>";
+      html += "</div>";
+    });
+    html += "<div style='color:var(--text-3);font-size:9px;margin-top:8px;'>Each preset auto-picks the best ref. Audit rounds use the current painter view, not these refs.</div>";
+    html += "</div>";
+    const popup = document.createElement("div");
+    popup.className = "modal-backdrop";
+    popup.style.display = "flex";
+    popup.style.zIndex = 80;
+    popup.innerHTML = "<div class='modal' style='width:520px;max-height:70vh;overflow-y:auto;'>" +
+      "<div class='modal-head'><span class='modal-title' style='font-family:var(--font-instr);letter-spacing:0.18em;color:var(--phosphor);'>ai reference sources</span><button class='btn modal-x' id='pmap-refinfo-close' type='button'>×</button></div>" + html + "</div>";
+    document.body.appendChild(popup);
+    popup.querySelector("#pmap-refinfo-close").addEventListener("click", () => popup.remove());
+    popup.addEventListener("click", (ev) => { if (ev.target === popup) popup.remove(); });
   });
   const helpRow = document.createElement("div");
   helpRow.style.cssText =
@@ -71049,18 +71134,30 @@ function openPlanetMapEditor(nodeId) {
       // Gather the active keyword chips; each gets its own focused
       // audit pass after the baseline audit.
       const activeKwObjs = PMAP_AI_KEYWORDS.filter(k => activeKeywords.has(k.label));
-      const useEarthRef = !!modal.querySelector("#pmap-ai-earthref").checked;
+      const useRef = !!modal.querySelector("#pmap-ai-useref").checked;
+      // Pick the reference image keyed to the active preset, if any.
+      const presetIdx = +modal.querySelector("#pmap-ai-preset").value;
+      const activePreset = PMAP_AI_PRESETS[presetIdx] || PMAP_AI_PRESETS[0];
+      const refKey = useRef ? (activePreset.refKey || "earth") : null;
+      const targetLand = activePreset.targetLand || [0.18, 0.32];
       const stats = await _planetGenerateFromAI(
         prompt, cells, node._cellNeighbors, node._cellNeighborsK,
         seaLevel, lockedCenter,
         s => { aiStatus.textContent = s; },
-        canvas, repaint, activeKwObjs, useEarthRef
+        canvas, repaint, activeKwObjs, refKey, targetLand
       );
       dirty = true;
       showClimate = wasShowing;
       climateBtn.textContent = showClimate ? "hide climate" : "show climate";
       render();
-      aiStatus.textContent = "done: " + stats.caps + " caps, " + stats.rounds + " round(s), " + stats.ms + "ms";
+      // Land-coverage measurement.
+      const lm = _planetMeasureLandmass(cells, seaLevel);
+      const pct = (lm.landFraction * 100).toFixed(1);
+      const tgtLo = (targetLand[0] * 100).toFixed(0), tgtHi = (targetLand[1] * 100).toFixed(0);
+      const inBand = (lm.landFraction >= targetLand[0] && lm.landFraction <= targetLand[1]);
+      const marker = inBand ? "✓" : "⚠";
+      aiStatus.textContent = "done: " + stats.caps + " caps, " + stats.rounds + " rounds, " + stats.ms + "ms · land " + pct + "% " + marker + " (target " + tgtLo + "-" + tgtHi + "%)";
+      console.log("[planet-map] landmass: " + lm.landCells + "/" + lm.totalCells + " cells = " + pct + "% (target " + tgtLo + "-" + tgtHi + "%)");
     } catch (err) {
       aiStatus.textContent = "error: " + (err.message || err);
       console.error("[planet-map] AI generation failed:", err);
