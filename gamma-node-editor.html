@@ -57392,101 +57392,12 @@ function _planetRunDSL(template, cells, neighbors, K, cap, powers) {
   }
 }
 
-// Per-template cap layout. Trimmed to the three templates that look
-// like proper maps on our sphere: continents (3 Earth-like caps),
-// pangea (1 supercontinent), oldWorld (2 Eurasian-style caps).
-const PLANET_TEMPLATE_CAPS = {
-  continents: { count: 3, radiusDeg: 55 },
-  pangea:     { count: 1, radiusDeg: 90 },
-  oldWorld:   { count: 2, radiusDeg: 50 },
-  fractious:  { count: 3, radiusDeg: 50 }
-};
-
-// Source: ref-azgaar-fmg/public/config/heightmap-templates.js.
-// Verbatim DSL strings; _planetRunDSL parses + executes them against
-// our spherical cell graph + cap geometry.
-const PLANET_TEMPLATES_DSL = {
-  continents:`Hill 1 80-85 60-80 40-60
-    Hill 1 80-85 20-30 40-60
-    Hill 6-7 15-30 25-75 15-85
-    Multiply 0.6 land 0 0
-    Hill 8-10 5-10 15-85 20-80
-    Range 1-2 30-60 5-15 25-75
-    Range 1-2 30-60 80-95 25-75
-    Range 0-3 30-60 80-90 20-80
-    Strait 2 vertical 0 0
-    Strait 1 vertical 0 0
-    Smooth 3 0 0 0
-    Trough 3-4 15-20 15-85 20-80
-    Trough 3-4 5-10 45-55 45-55
-    Pit 3-4 10-20 15-85 20-80
-    Mask 4 0 0 0`,
-  pangea:`Hill 1-2 25-40 15-50 0-10
-    Hill 1-2 5-40 50-85 0-10
-    Hill 1-2 25-40 50-85 90-100
-    Hill 1-2 5-40 15-50 90-100
-    Hill 8-12 20-40 20-80 48-52
-    Smooth 2 0 0 0
-    Multiply 0.7 land 0 0
-    Trough 3-4 25-35 5-95 10-20
-    Trough 3-4 25-35 5-95 80-90
-    Range 5-6 30-40 10-90 35-65`,
-  oldWorld:`Range 3 70 15-85 20-80
-    Hill 2-3 50-70 15-45 20-80
-    Hill 2-3 50-70 65-85 20-80
-    Hill 4-6 20-25 15-85 20-80
-    Multiply 0.5 land 0 0
-    Smooth 2 0 0 0
-    Range 3-4 20-50 15-35 20-45
-    Range 2-4 20-50 65-85 45-80
-    Strait 3-7 vertical 0 0
-    Trough 6-8 20-50 15-85 45-65
-    Pit 5-6 20-30 10-90 10-90`,
-  fractious: `Hill 12-15 50-80 5-95 5-95
-    Mask -1.5 0 0 0
-    Mask 3 0 0 0
-    Add -20 30-100 0 0
-    Range 6-8 40-50 5-95 10-90`
-};
-
-// Names list (used by painter's dropdown).
-const PLANET_TEMPLATES = {};
-Object.keys(PLANET_TEMPLATES_DSL).forEach(function(name) {
-  PLANET_TEMPLATES[name] = true;
-});
-
-/* Apply a template to the cell graph. Each template's caps metadata
- * (PLANET_TEMPLATE_CAPS) controls how many continents to place and
- * how big each one is. If a `lockedCenter` is provided (lat/lon
- * degrees, set by clicking on the painter), the FIRST cap gets
- * placed there; the rest are random. Otherwise all caps are random.
- * After all caps run, the elevation field is piecewise-remapped from
- * Azgaar's logical scale (0.20 = sea level) to our [0, 1] with the
- * wired PlanetMesh's seaLevel. */
-function _planetApplyTemplate(name, cells, neighbors, K, seaLevel, lockedCenter) {
-  if (!PLANET_TEMPLATES_DSL[name]) {
-    console.warn("[planet-map] unknown template:", name);
-    return;
-  }
-  const t0 = performance.now();
-  _planetVerbReset(cells);
-  const meta = PLANET_TEMPLATE_CAPS[name] || { count: 1, radiusDeg: 30 };
-  const radiusRad = meta.radiusDeg * Math.PI / 180;
-  const dsl = PLANET_TEMPLATES_DSL[name];
-  const powers = _planetTemplatePowers(cells.count);
-  for (let i = 0; i < meta.count; i++) {
-    let cap;
-    if (i === 0 && lockedCenter && typeof lockedCenter.lat === "number" && typeof lockedCenter.lon === "number") {
-      cap = _makeCapAtLatLon(lockedCenter.lat, lockedCenter.lon, radiusRad);
-    } else {
-      cap = _makeRandomCap(radiusRad);
-    }
-    _planetRunDSL(dsl, cells, neighbors, K, cap, powers);
-  }
-  // Post-DSL gentle global smoothing. Two iterations of
-  //   e' = 0.7*e + 0.3*neighbor-mean
-  // closes most single-cell elevation anomalies (jitter / blob-edge
-  // noise) without flattening mountains.
+/* Post-DSL pipeline: gentle smoothing → coastline cleanup → piecewise
+ * remap. Shared by every path that mutates cells.elevations through
+ * the DSL (AI-generation path; future undo/redo restore; etc.). */
+function _planetPostDSL(cells, neighbors, K, seaLevel) {
+  // Gentle smoothing -- closes single-cell anomalies without
+  // flattening mountains.
   {
     const N = cells.count;
     const next = new Float32Array(N);
@@ -57504,26 +57415,15 @@ function _planetApplyTemplate(name, cells, neighbors, K, seaLevel, lockedCenter)
       for (let i = 0; i < N; i++) cells.elevations[i] = next[i];
     }
   }
-
-  // Coastline cleanup (morphological "open" on land regions).
-  // After smoothing, isolated cells still sit just below sea level
-  // (Azgaar's 0.20) inside otherwise-land areas -- they render as
-  // marine biome (blue) within continents, looking like random
-  // "lakes" the user noticed on the world map. Two passes:
-  //   1. Cells below SL surrounded by mostly land → bump just above
-  //   2. Cells above SL surrounded by mostly ocean → drop just below
-  // Threshold of 4/K land or ocean neighbors keeps the cleanup
-  // conservative (preserves real coastlines, only fills speckle).
+  // Coastline cleanup (morphological "open" on land + ocean).
   {
     const N = cells.count;
     const AZ_SL = 0.20;
     let bumped = 0, dropped = 0;
-    // Pass 1: fill land speckle (below-SL cells inside land).
     const flagL = new Uint8Array(N);
     for (let i = 0; i < N; i++) {
       const e = cells.elevations[i];
-      if (e >= AZ_SL) continue;
-      if (e < AZ_SL - 0.10) continue;  // deep ocean, leave alone
+      if (e >= AZ_SL || e < AZ_SL - 0.10) continue;
       let landCount = 0, totalNbr = 0;
       for (let k = 0; k < K; k++) {
         const ni = neighbors[i * K + k];
@@ -57531,19 +57431,13 @@ function _planetApplyTemplate(name, cells, neighbors, K, seaLevel, lockedCenter)
         totalNbr++;
         if (cells.elevations[ni] >= AZ_SL) landCount++;
       }
-      if (totalNbr > 0 && landCount >= Math.max(4, Math.floor(totalNbr * 0.55))) {
-        flagL[i] = 1;
-      }
+      if (totalNbr > 0 && landCount >= Math.max(4, Math.floor(totalNbr * 0.55))) flagL[i] = 1;
     }
-    for (let i = 0; i < N; i++) {
-      if (flagL[i]) { cells.elevations[i] = AZ_SL + 0.02; bumped++; }
-    }
-    // Pass 2: drop ocean speckle (above-SL cells in deep ocean).
+    for (let i = 0; i < N; i++) if (flagL[i]) { cells.elevations[i] = AZ_SL + 0.02; bumped++; }
     const flagO = new Uint8Array(N);
     for (let i = 0; i < N; i++) {
       const e = cells.elevations[i];
-      if (e < AZ_SL) continue;
-      if (e > AZ_SL + 0.10) continue;  // real land, leave alone
+      if (e < AZ_SL || e > AZ_SL + 0.10) continue;
       let oceanCount = 0, totalNbr = 0;
       for (let k = 0; k < K; k++) {
         const ni = neighbors[i * K + k];
@@ -57551,19 +57445,14 @@ function _planetApplyTemplate(name, cells, neighbors, K, seaLevel, lockedCenter)
         totalNbr++;
         if (cells.elevations[ni] < AZ_SL) oceanCount++;
       }
-      if (totalNbr > 0 && oceanCount >= Math.max(4, Math.floor(totalNbr * 0.55))) {
-        flagO[i] = 1;
-      }
+      if (totalNbr > 0 && oceanCount >= Math.max(4, Math.floor(totalNbr * 0.55))) flagO[i] = 1;
     }
-    for (let i = 0; i < N; i++) {
-      if (flagO[i]) { cells.elevations[i] = AZ_SL - 0.02; dropped++; }
-    }
+    for (let i = 0; i < N; i++) if (flagO[i]) { cells.elevations[i] = AZ_SL - 0.02; dropped++; }
     if (bumped + dropped > 0) {
       console.log("[planet-map] coastline cleanup: bumped " + bumped + " lake cells, dropped " + dropped + " ocean-speck cells");
     }
   }
-  // Piecewise remap Azgaar's logical 0-1 (0.20 = sea level) → ours
-  // (seaLevel arg). Anchors h=0 → 0, h=0.20 → seaLevel, h=1 → 1.
+  // Piecewise remap Azgaar's logical 0-1 (0.20 = sea level) → ours.
   const sl = (typeof seaLevel === "number") ? seaLevel : 0.55;
   if (Math.abs(sl - 0.20) > 1e-6) {
     const AZ_SL = 0.20;
@@ -57576,10 +57465,111 @@ function _planetApplyTemplate(name, cells, neighbors, K, seaLevel, lockedCenter)
       cells.elevations[i] = Math.max(0, Math.min(1, e));
     }
   }
-  console.log("[planet-map] applied template '" + name + "' in " + (performance.now() - t0).toFixed(0)
-    + "ms (" + meta.count + " caps × " + meta.radiusDeg + "° radius, sea=" + sl.toFixed(2)
-    + ", blobPower=" + powers.blobPower.toFixed(4) + ", linePower=" + powers.linePower.toFixed(3) + ")");
 }
+
+/* AI map generation. Sends the user's prompt to the configured LLM
+ * provider (PROVIDERS[aiSettings.provider]) along with a system
+ * prompt that explains our DSL + cap geometry, then expects JSON
+ * back with { caps: [{lat, lon, radiusDeg, verbs}, ...] }. Each cap
+ * runs the DSL against the cell graph. Post-DSL pipeline (smooth,
+ * cleanup, remap) is identical to the old preset path. */
+const _PLANET_AI_SYSTEM_PROMPT = `You are a planet terrain designer. Generate a heightmap for a SPHERICAL planet (like Earth) from a user description.
+
+Output STRICT JSON (no commentary, no markdown fences):
+{
+  "caps": [
+    { "lat": 30.0, "lon": -50.0, "radiusDeg": 55, "verbs": "Hill 1 80-90 50-50 40-60\\nRange 1-2 30-50 5-15 25-75\\nMask 4 0 0 0" },
+    ...
+  ]
+}
+
+A "cap" is a circular continent region on the sphere.
+- lat: -90 (south pole) to +90 (north pole)
+- lon: -180 to +180 (east positive)
+- radiusDeg: 10 (small island) to 90 (full hemisphere). Earth's combined Eurasia-Africa ≈ 55°. Pacific-sized ocean = no cap.
+- verbs: newline-separated DSL string. x,y coordinates are 0-100% WITHIN the cap (50,50 = cap center). Heights are 0-100 (sea level = 20).
+
+VERBS (one per line, whitespace-separated args):
+- Hill count height x-range y-range          // BFS blob, peak in cap
+- Pit count height x-range y-range            // inverse hill
+- Range count height x-range y-range          // linear mountain ridge with sloped flanks
+- Trough count height x-range y-range         // linear valley
+- Strait count vertical|horizontal 0 0        // sea/sound through the cap
+- Smooth iterations 0 0 0                     // local average
+- Add value all|land|min-max 0 0              // additive shift, filtered
+- Multiply factor all|land|min-max 0 0
+- Mask power 0 0 0                            // edge-fade (positive) or center-fade (negative)
+- Invert probability 0 0 0                    // 0-1 chance to flip
+
+Ranges use "N" or "N-M" (random pick). Heights 30-50 = small hills, 60-80 = mountains, 80-100 = peaks.
+
+DESIGN GUIDANCE:
+- Each cap is ONE continent. Multiple caps = multiple continents. Place 1-5 caps based on user intent.
+- Always end with "Mask N 0 0 0" (N=2-4) for soft coastlines unless user wants hard edges.
+- Build land THEN carve detail: Hill/Range first, Trough/Pit/Strait later, Smooth between major operations.
+- For "earth-like": ~3 caps at varied latitudes (one near equator, one north, one south), radiusDeg 45-60.
+- For "supercontinent" / "pangea": 1 huge cap (radius 80-90) with multiple Hill operations spread across it.
+- For "archipelago": 3-5 caps with small radii (20-30) AND lots of small Hills (height 15-30).
+- For "Mediterranean": 1 mid-size cap, mountain ranges along the edges, central sea (Strait).
+- Match latitude to climate request: tropical = lat 0±15, temperate = ±30-50, polar = ±60+.
+
+EXAMPLE for "earth-like with 3 continents and central mountain ranges":
+{"caps":[
+  {"lat":35,"lon":-90,"radiusDeg":50,"verbs":"Hill 1 80-90 50-50 40-60\\nHill 5 30-50 20-80 30-70\\nRange 2-3 50-70 20-80 35-65\\nMultiply 0.7 land 0 0\\nMask 3 0 0 0"},
+  {"lat":10,"lon":20,"radiusDeg":55,"verbs":"Hill 1 80-90 40-60 40-60\\nHill 6 25-40 15-85 20-80\\nRange 1-2 40-60 30-70 30-70\\nTrough 2 20-30 30-70 30-70\\nMask 3 0 0 0"},
+  {"lat":-30,"lon":140,"radiusDeg":45,"verbs":"Hill 1 75-85 50-50 45-55\\nHill 4 25-35 20-80 25-75\\nRange 1 40-50 30-70 40-60\\nMask 4 0 0 0"}
+]}
+
+Respond with ONLY the JSON object, nothing else.`;
+
+async function _planetGenerateFromAI(prompt, cells, neighbors, K, seaLevel, lockedCenter, onStatus) {
+  const provider = PROVIDERS[aiSettings.provider];
+  if (!provider) throw new Error("no AI provider configured");
+  if (provider.requiresKey && !aiSettings.anthropicKey) {
+    throw new Error("API key required - set in AI Settings panel");
+  }
+  const t0 = performance.now();
+  onStatus && onStatus("calling " + (aiSettings.model || provider.defaultModel) + "…");
+  const response = await provider.call({
+    system: _PLANET_AI_SYSTEM_PROMPT,
+    user: prompt,
+    model: aiSettings.model || provider.defaultModel,
+    key: aiSettings.anthropicKey,
+    temperature: 0.8
+  });
+  // Strip code fences if the model added them.
+  let json = String(response).trim();
+  json = json.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim();
+  let parsed;
+  try { parsed = JSON.parse(json); }
+  catch (e) { throw new Error("model returned invalid JSON: " + e.message + "\n" + json.slice(0, 200)); }
+  if (!parsed || !Array.isArray(parsed.caps)) throw new Error("response missing 'caps' array");
+  if (parsed.caps.length === 0) throw new Error("response had 0 caps");
+
+  onStatus && onStatus("applying " + parsed.caps.length + " continents…");
+  _planetVerbReset(cells);
+  const powers = _planetTemplatePowers(cells.count);
+  for (let i = 0; i < parsed.caps.length; i++) {
+    const c = parsed.caps[i];
+    const radDeg = Math.max(8, Math.min(90, Number(c.radiusDeg) || 50));
+    const radRad = radDeg * Math.PI / 180;
+    let cap;
+    if (i === 0 && lockedCenter && typeof lockedCenter.lat === "number") {
+      cap = _makeCapAtLatLon(lockedCenter.lat, lockedCenter.lon, radRad);
+    } else {
+      const lat = Math.max(-89, Math.min(89, Number(c.lat) || 0));
+      const lon = ((Number(c.lon) || 0) + 540) % 360 - 180;
+      cap = _makeCapAtLatLon(lat, lon, radRad);
+    }
+    _planetRunDSL(String(c.verbs || ""), cells, neighbors, K, cap, powers);
+  }
+  _planetPostDSL(cells, neighbors, K, seaLevel);
+
+  const ms = Math.round(performance.now() - t0);
+  console.log("[planet-map] AI-generated map: " + parsed.caps.length + " caps in " + ms + "ms");
+  return { caps: parsed.caps.length, ms };
+}
+
 
 /* §planet-spec Phase 7.b -- serialize / deserialize the cubemap as
  * base64-encoded R16 unorm. 256² × 6 = 393k texels × 2 bytes = 786KB
@@ -70434,21 +70424,27 @@ function openPlanetMapEditor(nodeId) {
     '<button class="btn" id="pmap-climate" type="button" style="padding:3px 10px;">show climate</button>';
   body.appendChild(ctrls);
 
-  // §planet-spec Phase 7.d-templates -- Template dropdown + Re-roll.
-  // Apply runs the named template's verb sequence with fresh random
-  // seeds; cells are overwritten + canvas re-rendered.
-  const tplRow = document.createElement("div");
-  tplRow.style.cssText =
-    "display:flex;align-items:center;gap:10px;margin-top:8px;flex-wrap:wrap;" +
+  // §planet-spec Phase 7.f-ai -- AI map generation via the wired LLM
+  // provider. User types a description ("earth-like with 3 continents,
+  // Mediterranean climate"); we send it to Claude with a system prompt
+  // explaining the DSL + cap geometry, parse JSON back, apply caps.
+  // The hardcoded preset templates are gone -- AI is the new way.
+  const aiRow = document.createElement("div");
+  aiRow.style.cssText =
+    "display:flex;flex-direction:column;gap:6px;margin-top:8px;" +
     "font-family:var(--font-mono);font-size:11px;color:var(--text-2);";
-  const tplNames = Object.keys(PLANET_TEMPLATES);
-  const tplOptions = tplNames.map(n => '<option value="' + n + '">' + n + '</option>').join("");
-  tplRow.innerHTML =
-    '<label>template&nbsp;<select id="pmap-tpl" style="background:var(--surface);color:var(--text);border:1px solid var(--border);padding:3px 6px;font-family:var(--font-mono);font-size:11px;">' + tplOptions + '</select></label>' +
-    '<button class="btn" id="pmap-roll" type="button" style="padding:3px 10px;">re-roll</button>' +
-    '<button class="btn" id="pmap-clearlock" type="button" style="padding:3px 10px;display:none;">clear target</button>' +
-    '<span id="pmap-lockinfo" style="color:var(--text-3);font-size:10px;">re-roll places continents randomly. shift-click the map to lock the first continent’s position; click again to move it.</span>';
-  body.appendChild(tplRow);
+  aiRow.innerHTML =
+    '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">' +
+      '<label style="flex:1;display:flex;align-items:center;gap:6px;">' +
+        '<span>describe map</span>' +
+        '<input type="text" id="pmap-ai-prompt" placeholder="e.g. earth-like with 3 continents and central mountain ranges" style="flex:1;background:var(--surface);color:var(--text);border:1px solid var(--border);padding:4px 8px;font-family:var(--font-mono);font-size:11px;border-radius:3px;">' +
+      '</label>' +
+      '<button class="btn" id="pmap-ai-go" type="button" style="padding:3px 12px;">generate</button>' +
+      '<button class="btn" id="pmap-clearlock" type="button" style="padding:3px 10px;display:none;">clear target</button>' +
+    '</div>' +
+    '<span id="pmap-lockinfo" style="color:var(--text-3);font-size:10px;">shift-click the map to lock where the first continent lands. uses the wired AI provider (Settings → AI).</span>' +
+    '<span id="pmap-ai-status" style="color:var(--text-3);font-size:10px;min-height:14px;"></span>';
+  body.appendChild(aiRow);
   const helpRow = document.createElement("div");
   helpRow.style.cssText =
     "font-family:var(--font-mono);font-size:10px;color:var(--text-3);margin-top:6px;line-height:1.5;";
@@ -70604,30 +70600,54 @@ function openPlanetMapEditor(nodeId) {
     render();
   });
 
-  // Template dropdown + re-roll wire-up.
-  const tplSel = modal.querySelector("#pmap-tpl");
+  // AI generate + lock-target wire-up.
   const lockInfo = modal.querySelector("#pmap-lockinfo");
   const clearLockBtn = modal.querySelector("#pmap-clearlock");
+  const aiPromptIn = modal.querySelector("#pmap-ai-prompt");
+  const aiGoBtn    = modal.querySelector("#pmap-ai-go");
+  const aiStatus   = modal.querySelector("#pmap-ai-status");
   function updateLockInfo() {
     if (lockedCenter) {
-      lockInfo.textContent = "first continent locked at lat " + lockedCenter.lat.toFixed(1) + "° lon " + lockedCenter.lon.toFixed(1) + "°. re-roll places it here.";
+      lockInfo.textContent = "first continent locked at lat " + lockedCenter.lat.toFixed(1) + "° lon " + lockedCenter.lon.toFixed(1) + "°. generate places it here.";
       clearLockBtn.style.display = "";
     } else {
-      lockInfo.textContent = "re-roll places continents randomly. shift-click the map to lock the first continent’s position.";
+      lockInfo.textContent = "shift-click the map to lock where the first continent lands. uses the wired AI provider (Settings → AI).";
       clearLockBtn.style.display = "none";
     }
   }
   clearLockBtn.addEventListener("click", () => { lockedCenter = null; updateLockInfo(); render(); });
-  modal.querySelector("#pmap-roll").addEventListener("click", () => {
-    const name = tplSel.value;
-    _planetApplyTemplate(name, cells, node._cellNeighbors, node._cellNeighborsK, seaLevel, lockedCenter);
-    dirty = true;
-    node._cellsVersion = ((typeof node._cellsVersion === "number") ? node._cellsVersion : 0) + 1;
-    if (showClimate) {
-      _ensurePlanetClimate(node, seaLevel);
-      _ensurePlanetRivers(node, seaLevel);
+
+  let aiBusy = false;
+  aiGoBtn.addEventListener("click", async () => {
+    if (aiBusy) return;
+    const prompt = aiPromptIn.value.trim();
+    if (!prompt) { aiStatus.textContent = "type a description first"; return; }
+    aiBusy = true;
+    aiGoBtn.disabled = true;
+    aiGoBtn.textContent = "...";
+    aiStatus.textContent = "asking " + aiSettings.provider + "…";
+    try {
+      const stats = await _planetGenerateFromAI(
+        prompt, cells, node._cellNeighbors, node._cellNeighborsK,
+        seaLevel, lockedCenter,
+        s => { aiStatus.textContent = s; }
+      );
+      dirty = true;
+      node._cellsVersion = ((typeof node._cellsVersion === "number") ? node._cellsVersion : 0) + 1;
+      if (showClimate) {
+        _ensurePlanetClimate(node, seaLevel);
+        _ensurePlanetRivers(node, seaLevel);
+      }
+      render();
+      aiStatus.textContent = "done: " + stats.caps + " continents placed in " + stats.ms + "ms";
+    } catch (err) {
+      aiStatus.textContent = "error: " + (err.message || err);
+      console.error("[planet-map] AI generation failed:", err);
+    } finally {
+      aiBusy = false;
+      aiGoBtn.disabled = false;
+      aiGoBtn.textContent = "generate";
     }
-    render();
   });
 
   // Apply one brush stamp at pixel (px, py).
