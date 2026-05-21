@@ -31,7 +31,9 @@ function parseArgs(argv) {
     else if (k === "--out")  args.out = argv[++i];
     else if (k === "--cells")    args.cells = +argv[++i];
     else if (k === "--sealevel") args.sealevel = +argv[++i];
-    else if (k === "--landmass") args.mode = "landmass";
+    else if (k === "--landmass") { args.mode = "landmass"; args.skipCleanup = true; }
+    else if (k === "--no-cleanup") args.skipCleanup = true;
+    else if (k === "--cleanup")    args.skipCleanup = false;
   }
   if (!args.plan || !args.out) {
     console.error("usage: node render.mjs --plan <path> --out <path.png> [--cells N] [--sealevel S] [--landmass]");
@@ -64,7 +66,7 @@ async function main() {
     // runs the export at the very end, so this signals load is done).
     await page.waitForFunction(() => typeof window.__PMAP === "object" && window.__PMAP && typeof window.__PMAP.buildCells === "function", { timeout: 20000 });
 
-    const result = await page.evaluate(async (planText, N, seaLevel, mode) => {
+    const result = await page.evaluate(async (planText, N, seaLevel, mode, skipCleanup) => {
       const P = window.__PMAP;
       // Default noise + jitter values match the editor's PlanetMap node defaults.
       const noiseDef = { seed: 7.3, frequency: 1.0, octaves: 6, effectiveOctavesF: 6, lacunarity: 2.0, gain: 0.5, ridges: 0 };
@@ -84,7 +86,9 @@ async function main() {
       let plan;
       try { plan = P.parsePlan(planText); }
       catch (e) { return { error: "parsePlan failed: " + e.message }; }
-      P.applyPlan(plan, cells, neighbors, K, seaLevel, null);
+      // Default behavior matches the editor (cleanup ON). The landmass
+      // pass and --no-cleanup turn it off so Strait cuts survive.
+      P.applyPlan(plan, cells, neighbors, K, seaLevel, null, skipCleanup ? { skipCleanup: true } : undefined);
       const t2 = performance.now();
 
       // Equirect render: lat (90..-90 top-to-bottom) on Y, lon (-180..+180) on X.
@@ -195,7 +199,7 @@ async function main() {
           verbCount: String(c.verbs || "").split("\n").filter(s => s.trim()).length
         }))
       };
-    }, planRawForLLM, args.cells, args.sealevel, args.mode);
+    }, planRawForLLM, args.cells, args.sealevel, args.mode, !!args.skipCleanup);
 
     if (result.error) {
       console.error("[render] " + result.error);

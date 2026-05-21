@@ -57225,32 +57225,36 @@ function _planetVerbRangeXY(cells, neighbors, K, cap, count, heightRange, xRange
   }
 }
 
-// Strait cuts a finite line WITHIN the cap. "vertical" = a line along
-// the cap's local v-axis (north-south), "horizontal" = along the
-// cap's local u-axis (east-west). Width ~5% of the cap's diameter.
+// Strait cuts a sea channel WITHIN the cap. "vertical" = north-south,
+// "horizontal" = east-west. Width ~7% of the cap radius at center,
+// fading to 0 at the edges. Depth is EXPONENTIAL (heights[i] **= exp)
+// matching Azgaar's addStrait (heightmap-generator.ts:428) -- a cell
+// at 0.80 becomes 0.41 (≈half), 0.50 becomes 0.20 (sealevel), 0.30
+// becomes 0.10 (ocean). This is much more aggressive than the
+// previous fixed -0.15 subtract, which left mid-elevation cells well
+// above sealevel and never actually carved a sea channel.
+//
+// 2026-05-21 fix: prior implementation used a fixed subtract that
+// never cut through Hill-core regions even with cleanup disabled.
 function _planetVerbStrait(cells, neighbors, K, cap, count, orientation) {
   const N = cells.count;
   for (let r = 0; r < count; r++) {
-    // Pick a random offset along the perpendicular axis within the
-    // cap's range so straits aren't all centered.
-    const offset = (Math.random() - 0.5) * 0.8;  // ±40% of cap radius
-    const width = 0.10;  // cap-radius units
+    const offset = (Math.random() - 0.5) * 0.7;   // ±35% off-center
+    const width = 0.14;                            // cap-radius units (was 0.10)
     for (let i = 0; i < N; i++) {
       const proj = _capProject(cells, i, cap);
       if (!proj.inCap) continue;
-      // proj.x/y are in [0, 100]; convert to [-1, 1].
       const lx = (proj.x - 50) / 50;
       const ly = (50 - proj.y) / 50;
-      let d;
-      if (orientation === "vertical") {
-        d = Math.abs(lx - offset);
-      } else {
-        d = Math.abs(ly - offset);
-      }
-      if (d < width) {
-        const t = 1 - d / width;
-        cells.elevations[i] = Math.max(0, cells.elevations[i] - 0.15 * t);
-      }
+      const d = (orientation === "vertical") ? Math.abs(lx - offset) : Math.abs(ly - offset);
+      if (d >= width) continue;
+      const t = 1 - d / width;                    // 1 at center, 0 at edge
+      // Center exp = 0.80 (deep cut), edge exp = 1.0 (no change).
+      const exp = 0.80 + 0.20 * (1 - t);
+      const h100 = cells.elevations[i] * 100;
+      if (h100 <= 0) continue;
+      const newH = Math.pow(h100, exp) / 100;
+      cells.elevations[i] = Math.max(0, Math.min(1, newH));
     }
   }
 }
@@ -57423,10 +57427,25 @@ function _planetRunDSL(template, cells, neighbors, K, cap, powers) {
 /* Post-DSL pipeline: gentle smoothing → coastline cleanup → piecewise
  * remap. Shared by every path that mutates cells.elevations through
  * the DSL (AI-generation path; future undo/redo restore; etc.). */
-function _planetPostDSL(cells, neighbors, K, seaLevel) {
+function _planetPostDSL(cells, neighbors, K, seaLevel, opts) {
+  // opts (all optional):
+  //   skipSmoothing: boolean -- skip the 2-iteration alpha=0.30 averaging pass
+  //   skipCleanup:   boolean -- skip the morphological coastline open
+  //                             (use this for the LANDMASS-FIRST pass to
+  //                             preserve fractal Strait cuts + 1-cell bays;
+  //                             the cleanup's 55% land-neighbor threshold
+  //                             otherwise re-fills any sea channel narrower
+  //                             than ~half the neighbor radius)
+  //   landNbrThreshold: number in [0..1] -- overrides the 0.55 default if
+  //                                          you want to tune cleanup
+  //                                          aggressiveness without disabling
+  const skipSmoothing = !!(opts && opts.skipSmoothing);
+  const skipCleanup   = !!(opts && opts.skipCleanup);
+  const threshold     = (opts && typeof opts.landNbrThreshold === "number")
+    ? opts.landNbrThreshold : 0.55;
   // Gentle smoothing -- closes single-cell anomalies without
   // flattening mountains.
-  {
+  if (!skipSmoothing) {
     const N = cells.count;
     const next = new Float32Array(N);
     const alpha = 0.30;
@@ -57444,7 +57463,7 @@ function _planetPostDSL(cells, neighbors, K, seaLevel) {
     }
   }
   // Coastline cleanup (morphological "open" on land + ocean).
-  {
+  if (!skipCleanup) {
     const N = cells.count;
     const AZ_SL = 0.20;
     let bumped = 0, dropped = 0;
@@ -57459,7 +57478,7 @@ function _planetPostDSL(cells, neighbors, K, seaLevel) {
         totalNbr++;
         if (cells.elevations[ni] >= AZ_SL) landCount++;
       }
-      if (totalNbr > 0 && landCount >= Math.max(4, Math.floor(totalNbr * 0.55))) flagL[i] = 1;
+      if (totalNbr > 0 && landCount >= Math.max(4, Math.floor(totalNbr * threshold))) flagL[i] = 1;
     }
     for (let i = 0; i < N; i++) if (flagL[i]) { cells.elevations[i] = AZ_SL + 0.02; bumped++; }
     const flagO = new Uint8Array(N);
@@ -57473,7 +57492,7 @@ function _planetPostDSL(cells, neighbors, K, seaLevel) {
         totalNbr++;
         if (cells.elevations[ni] < AZ_SL) oceanCount++;
       }
-      if (totalNbr > 0 && oceanCount >= Math.max(4, Math.floor(totalNbr * 0.55))) flagO[i] = 1;
+      if (totalNbr > 0 && oceanCount >= Math.max(4, Math.floor(totalNbr * threshold))) flagO[i] = 1;
     }
     for (let i = 0; i < N; i++) if (flagO[i]) { cells.elevations[i] = AZ_SL - 0.02; dropped++; }
     if (bumped + dropped > 0) {
@@ -57709,7 +57728,12 @@ function _parseAIPlan(rawResponse) {
   return parsed;
 }
 
-function _applyAIPlan(plan, cells, neighbors, K, seaLevel, lockedCenter) {
+function _applyAIPlan(plan, cells, neighbors, K, seaLevel, lockedCenter, opts) {
+  // opts forwarded to _planetPostDSL. The LANDMASS-FIRST pass should
+  // set { skipCleanup: true } so the morphological coastline open
+  // doesn't fill in Strait cuts and bays. Default = full cleanup
+  // (the audit / detail passes use this to clean up artifacts from
+  // new mountain / peak verbs).
   _planetVerbReset(cells);
   const powers = _planetTemplatePowers(cells.count);
   for (let i = 0; i < plan.caps.length; i++) {
@@ -57726,7 +57750,7 @@ function _applyAIPlan(plan, cells, neighbors, K, seaLevel, lockedCenter) {
     }
     _planetRunDSL(String(c.verbs || ""), cells, neighbors, K, cap, powers);
   }
-  _planetPostDSL(cells, neighbors, K, seaLevel);
+  _planetPostDSL(cells, neighbors, K, seaLevel, opts);
 }
 
 /* Per-preset / per-flavor reference images. Each entry maps a short
@@ -57970,7 +57994,12 @@ async function _planetGenerateFromAI(prompt, cells, neighbors, K, seaLevel, lock
   });
   let plan = _parseAIPlan(initial);
   onStatus && onStatus("round 1/" + totalPasses + ": applying " + plan.caps.length + " caps…");
-  _applyAIPlan(plan, cells, neighbors, K, seaLevel, lockedCenter);
+  // Pass 1 = LANDMASS-FIRST: skipCleanup preserves the prompt's Strait
+  // cuts + small bays. The morphological cleanup would otherwise fill
+  // 1-cell-wide sea channels back to land and turn the fractal coast
+  // into a single supercontinent. Audit passes below use default
+  // cleanup so detail additions (mountains, peaks) get smoothed.
+  _applyAIPlan(plan, cells, neighbors, K, seaLevel, lockedCenter, { skipCleanup: true });
   if (painterRerender) painterRerender();
 
   // Helper to run one audit pass with a specific system prompt + label.
