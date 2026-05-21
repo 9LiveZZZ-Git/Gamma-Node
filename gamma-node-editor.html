@@ -41151,7 +41151,7 @@ const PROVIDERS = {
     requiresKey: true,
     supportsImage: true,
     supportsAudio: false,   // Whisper isn't routed through this path
-    async call({ system, user, model, key, onToken, image, audio, temperature }) {
+    async call({ system, user, model, key, onToken, image, audio, temperature, maxTokens }) {
       if (audio) throw new Error("Anthropic provider does not handle audio input. Use Gemma for voice.");
 
       const userContent = image
@@ -41163,7 +41163,7 @@ const PROVIDERS = {
 
       const body = {
         model: model || "claude-sonnet-4-5",
-        max_tokens: 2048,
+        max_tokens: (typeof maxTokens === "number" && maxTokens > 0) ? maxTokens : 2048,
         system,
         messages: [{ role: "user", content: userContent }],
         stream: !!onToken
@@ -57683,64 +57683,79 @@ async function _capturePainterPng(canvas) {
  * alone -- continents that shrank to nothing, wrong locations, missing
  * features. Each round = 1 API call; the cost trades for quality.
  * Vision-capable providers only (Anthropic + Gemma both support it). */
-async function _planetGenerateFromAI(prompt, cells, neighbors, K, seaLevel, lockedCenter, onStatus, painterCanvas, painterRerender, auditRounds) {
+async function _planetGenerateFromAI(prompt, cells, neighbors, K, seaLevel, lockedCenter, onStatus, painterCanvas, painterRerender, keywordAudits) {
   const provider = PROVIDERS[aiSettings.provider];
   if (!provider) throw new Error("no AI provider configured");
   if (provider.requiresKey && !aiSettings.anthropicKey) {
     throw new Error("API key required - set in AI Settings panel");
   }
-  const rounds = (typeof auditRounds === "number") ? Math.max(0, Math.min(3, auditRounds)) : 1;
+  const kwAudits = Array.isArray(keywordAudits) ? keywordAudits.slice(0, 4) : [];
+  // Total passes = 1 (initial) + 1 (baseline audit) + N (per-keyword
+  // audits). Worst-case = 6 calls when 4 keywords are active.
+  const totalPasses = 2 + kwAudits.length;
   const t0 = performance.now();
 
   // --- Initial round ---
-  onStatus && onStatus("round 1/" + (rounds + 1) + ": calling " + (aiSettings.model || provider.defaultModel) + "…");
+  onStatus && onStatus("round 1/" + totalPasses + ": calling " + (aiSettings.model || provider.defaultModel) + "…");
   const initial = await provider.call({
     system: _PLANET_AI_SYSTEM_PROMPT,
     user: prompt,
     model: aiSettings.model || provider.defaultModel,
     key: aiSettings.anthropicKey,
-    temperature: 0.8
+    temperature: 0.8,
+    maxTokens: 8192
   });
   let plan = _parseAIPlan(initial);
-  onStatus && onStatus("round 1/" + (rounds + 1) + ": applying " + plan.caps.length + " caps…");
+  onStatus && onStatus("round 1/" + totalPasses + ": applying " + plan.caps.length + " caps…");
   _applyAIPlan(plan, cells, neighbors, K, seaLevel, lockedCenter);
   if (painterRerender) painterRerender();
 
-  // --- Audit rounds ---
-  for (let r = 0; r < rounds; r++) {
-    if (!painterCanvas || !provider.supportsImage) break;
-    const roundIdx = r + 2;
-    onStatus && onStatus("round " + roundIdx + "/" + (rounds + 1) + ": capturing view…");
+  // Helper to run one audit pass with a specific system prompt + label.
+  async function runAudit(roundIdx, label, systemPrompt, userPrefix) {
+    if (!painterCanvas || !provider.supportsImage) return;
+    onStatus && onStatus("round " + roundIdx + "/" + totalPasses + ": capturing view (" + label + ")…");
     let imageB64;
     try { imageB64 = await _capturePainterPng(painterCanvas); }
-    catch (e) { console.warn("[planet-map] capture failed, skipping audit:", e); break; }
-    onStatus && onStatus("round " + roundIdx + "/" + (rounds + 1) + ": auditing with vision…");
-    const auditUser = "ORIGINAL REQUEST: " + prompt
+    catch (e) { console.warn("[planet-map] capture failed, skipping audit:", e); return; }
+    onStatus && onStatus("round " + roundIdx + "/" + totalPasses + ": auditing (" + label + ")…");
+    const auditUser = (userPrefix || "")
+      + "\n\nORIGINAL REQUEST: " + prompt
       + "\n\nPREVIOUS JSON PLAN: " + JSON.stringify(plan)
-      + "\n\nThe image shows the rendered result. Output a revised JSON plan that better matches the request.";
+      + "\n\nThe image shows the rendered result. Output a revised JSON plan.";
     const auditResp = await provider.call({
-      system: _PLANET_AI_AUDIT_SYSTEM_PROMPT,
+      system: systemPrompt,
       user: auditUser,
       image: imageB64,
       model: aiSettings.model || provider.defaultModel,
       key: aiSettings.anthropicKey,
-      temperature: 0.6
+      temperature: 0.6,
+      maxTokens: 8192
     });
     let revised;
     try { revised = _parseAIPlan(auditResp); }
     catch (e) {
-      console.warn("[planet-map] audit round " + roundIdx + " returned invalid JSON, keeping previous plan:", e.message);
-      continue;
+      console.warn("[planet-map] audit '" + label + "' returned invalid JSON, keeping previous plan:", e.message);
+      return;
     }
     plan = revised;
-    onStatus && onStatus("round " + roundIdx + "/" + (rounds + 1) + ": applying " + plan.caps.length + " caps…");
+    onStatus && onStatus("round " + roundIdx + "/" + totalPasses + ": applying " + plan.caps.length + " caps (" + label + ")…");
     _applyAIPlan(plan, cells, neighbors, K, seaLevel, lockedCenter);
     if (painterRerender) painterRerender();
   }
 
+  // --- Baseline audit (overall quality check) ---
+  await runAudit(2, "baseline", _PLANET_AI_AUDIT_SYSTEM_PROMPT, null);
+
+  // --- Per-keyword audits (one pass each, focused on a single feature) ---
+  for (let i = 0; i < kwAudits.length; i++) {
+    const kw = kwAudits[i];
+    const lbl = kw.label.replace(/^\+\s*/, "");
+    await runAudit(3 + i, lbl, kw.audit, "FOCUSED AUDIT KEYWORD: " + lbl);
+  }
+
   const ms = Math.round(performance.now() - t0);
-  console.log("[planet-map] AI-generated map: " + plan.caps.length + " caps, " + (rounds + 1) + " round(s), " + ms + "ms");
-  return { caps: plan.caps.length, ms, rounds: rounds + 1 };
+  console.log("[planet-map] AI-generated map: " + plan.caps.length + " caps, " + totalPasses + " passes, " + ms + "ms");
+  return { caps: plan.caps.length, ms, rounds: totalPasses };
 }
 
 
@@ -70615,11 +70630,37 @@ function openPlanetMapEditor(nodeId) {
     { name: "Twin continents", prompt: "two large continents on opposite sides of the planet (180 degrees apart in longitude), each 4-5 overlapping caps with radius 45-55, separated by deep ocean; each has a mountain spine running north-south (Range height 75-90), broad plains, irregular coastlines, and a polar cap" },
     { name: "Continental drift", prompt: "two large continents pulling apart -- one in the western hemisphere, one in the eastern -- each 3-4 overlapping caps with radius 40-50, with matching coastline shapes facing each other, deep mid-ocean trough between them, inland mountain ranges (Range height 70-85)" }
   ];
+  // Each keyword has a label, the phrase it appends to the prompt,
+  // and a focused audit instruction. When the user clicks a chip
+  // and then generates, we run ONE extra targeted audit pass per
+  // active keyword to specifically verify that feature is present.
   const PMAP_AI_KEYWORDS = [
-    "+ mountain ranges", "+ inland sea", "+ archipelago", "+ peninsulas",
-    "+ polar ice cap", "+ tropical jungle", "+ desert plateau",
-    "+ river valleys", "+ coastal mountains", "+ volcanic chain",
-    "+ deep ocean trench", "+ rolling plains", "+ rugged highlands"
+    { label: "+ mountain ranges",  phrase: "tall mountain ranges with snow-capped peaks (Range height 75-90, Hill peaks 85-100)",
+      audit: "Focus EXCLUSIVELY on mountain ranges. Look for linear high-elevation features (white peaks, grey-brown slopes). Does every continent have at least one VISIBLE mountain range? If not, ADD `Range 2-3 75-90 25-75 30-70` and `Hill 1 88-100 50-50 50-50` to each cap that's missing them. KEEP heights ≥75 -- the user explicitly asked for tall mountains. Output revised JSON." },
+    { label: "+ inland sea",       phrase: "central inland sea cutting through the continent",
+      audit: "Focus EXCLUSIVELY on inland seas. Look for an enclosed body of blue water inside a continent. If not present, add `Strait 1 horizontal 0 0` or `Strait 1 vertical 0 0` to the largest cap, plus `Trough 2 18-25 30-70 40-60` to carve the basin. Output revised JSON." },
+    { label: "+ archipelago",      phrase: "scattered islands and small archipelago chains",
+      audit: "Focus EXCLUSIVELY on archipelago. Are there scattered small islands separate from the main continents? If not, ADD 3-5 new caps with radius 12-22, height 25-40, around the existing continents. Output revised JSON." },
+    { label: "+ peninsulas",       phrase: "long peninsulas extending from the coastlines",
+      audit: "Focus EXCLUSIVELY on peninsulas. Look for narrow land protrusions extending into the ocean. If absent, ADD smaller caps (radius 15-25) overlapping the EDGES of existing larger caps (offset by 25-40° from existing cap centers) to create peninsular protrusions. Output revised JSON." },
+    { label: "+ polar ice cap",    phrase: "frozen polar ice cap covering high latitudes",
+      audit: "Focus EXCLUSIVELY on polar ice. Look for white (glacier) regions near the top or bottom of the map (lat > 60° or < -60°). If absent, ADD a cap at lat 75-85 (or -75 to -85), radiusDeg 35-45, with verbs `Hill 8 30-45 15-85 15-85\\nRange 2 70-85 25-75 30-70\\nMask 1.5 0 0 0`. Output revised JSON." },
+    { label: "+ tropical jungle",  phrase: "lush tropical jungle in the equatorial belt",
+      audit: "Focus EXCLUSIVELY on tropical zones. Continents at lat 0±15° should be present and have lots of land (jungle = warm + moist = green biomes). If equatorial land is missing, ADD a tropical cap at lat 0-10°, radiusDeg 35-45, with broad land coverage. Output revised JSON." },
+    { label: "+ desert plateau",   phrase: "large arid desert plateau at mid-latitudes",
+      audit: "Focus EXCLUSIVELY on desert plateaus. Look for tan/yellow biome cells indicating deserts (typically at lat ±20-35°, dry trade wind belt). If absent, ADD a flat-elevation cap (Hill counts at uniform 35-45 heights) at lat 25-30° or -25 to -30°. Output revised JSON." },
+    { label: "+ river valleys",    phrase: "river valleys carving through the continents",
+      audit: "Focus EXCLUSIVELY on river valleys. Rivers form where there's elevation gradient -- mountain ranges next to lowlands. Verify each continent has a mountain range AND adjacent lowlands (height 22-35). If not, ADD `Range 1 70-85` followed by `Hill 4 25-35 15-85 15-85` adjacent to the range. Output revised JSON." },
+    { label: "+ coastal mountains",phrase: "mountain ranges along the coastlines",
+      audit: "Focus EXCLUSIVELY on coastal mountains. Mountain ranges should be at cap EDGES (x in 0-25 or 75-100) not the center. If existing Range verbs are at x 30-70, MOVE them to x 0-25 or 75-100. ADD `Range 2 75-90 5-20 25-75` and `Range 2 75-90 80-95 25-75` to each cap. Output revised JSON." },
+    { label: "+ volcanic chain",   phrase: "chain of volcanic islands or peaks in a curved arc",
+      audit: "Focus EXCLUSIVELY on volcanic chains. Look for a CURVED arrangement of small high-elevation islands. If absent, ADD 4-6 small caps (radius 10-18) arranged in a curving arc across 30-60° of lon, each with `Hill 1 90-100 50-50 50-50` for a sharp peak. Output revised JSON." },
+    { label: "+ deep ocean trench",phrase: "deep ocean trench running parallel to a coastline",
+      audit: "Focus EXCLUSIVELY on ocean trenches. Trenches are deep ocean regions parallel to continents. In our system they're implicit (cells outside caps stay at elevation 0 = deep ocean). Verify there's at least 30° of empty ocean between caps. If continents are too packed, INCREASE separation between caps. Output revised JSON." },
+    { label: "+ rolling plains",   phrase: "broad rolling plains covering most of the land",
+      audit: "Focus EXCLUSIVELY on plains. Most of each continent should be height 22-40 (grassland / lowland biomes). If land is uniformly high (white/grey), ADD `Hill 12-15 22-35 10-90 10-90` to each cap to fill in plains, but KEEP existing Range and peak Hills. Output revised JSON." },
+    { label: "+ rugged highlands", phrase: "rugged highland regions with peaks and valleys mixed",
+      audit: "Focus EXCLUSIVELY on highlands. A 'rugged' look means HIGH variance: many high peaks AND deep valleys close together. ADD `Hill 8 60-80 20-80 20-80` and `Pit 8 15-25 20-80 20-80` interleaved to each cap, creating peak/valley alternation. Output revised JSON." }
   ];
 
   const aiRow = document.createElement("div");
@@ -70645,20 +70686,37 @@ function openPlanetMapEditor(nodeId) {
     '<span id="pmap-ai-status" style="color:var(--text-3);font-size:10px;min-height:14px;"></span>';
   body.appendChild(aiRow);
 
-  // Keyword chips: append to the prompt on click.
+  // Keyword chips. Each click toggles the chip's "active" state and
+  // appends/removes its phrase in the prompt. Active chips drive
+  // per-keyword audit passes during generation.
+  const activeKeywords = new Set();  // strings (label) of currently-active chips
   {
     const chipBar = aiRow.querySelector("#pmap-ai-keywords");
+    const setChipStyle = (btn, active) => {
+      btn.style.cssText = "padding:2px 8px;font-size:10px;font-family:var(--font-mono);"
+        + (active ? "background:var(--phosphor);color:#000;border-color:var(--phosphor);" : "");
+    };
     PMAP_AI_KEYWORDS.forEach(kw => {
       const b = document.createElement("button");
       b.type = "button";
       b.className = "btn";
-      b.textContent = kw;
-      b.style.cssText = "padding:2px 8px;font-size:10px;font-family:var(--font-mono);";
+      b.textContent = kw.label;
+      setChipStyle(b, false);
       b.addEventListener("click", () => {
         const promptIn = modal.querySelector("#pmap-ai-prompt");
-        const cur = promptIn.value.trim();
-        const phrase = kw.replace(/^\+\s*/, "");
-        promptIn.value = cur ? (cur + ", " + phrase) : phrase;
+        const active = activeKeywords.has(kw.label);
+        if (active) {
+          activeKeywords.delete(kw.label);
+          setChipStyle(b, false);
+          // Remove the phrase from the prompt if it's present.
+          const re = new RegExp(",?\\s*" + kw.phrase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
+          promptIn.value = promptIn.value.replace(re, "").replace(/^,\s*/, "").trim();
+        } else {
+          activeKeywords.add(kw.label);
+          setChipStyle(b, true);
+          const cur = promptIn.value.trim();
+          promptIn.value = cur ? (cur + ", " + kw.phrase) : kw.phrase;
+        }
         promptIn.focus();
       });
       chipBar.appendChild(b);
@@ -70866,11 +70924,14 @@ function openPlanetMapEditor(nodeId) {
         _ensurePlanetRivers(node, seaLevel);
         render();
       };
+      // Gather the active keyword chips; each gets its own focused
+      // audit pass after the baseline audit.
+      const activeKwObjs = PMAP_AI_KEYWORDS.filter(k => activeKeywords.has(k.label));
       const stats = await _planetGenerateFromAI(
         prompt, cells, node._cellNeighbors, node._cellNeighborsK,
         seaLevel, lockedCenter,
         s => { aiStatus.textContent = s; },
-        canvas, repaint, 2   // 2 audit rounds = 3 total API calls
+        canvas, repaint, activeKwObjs
       );
       dirty = true;
       showClimate = wasShowing;
