@@ -57520,140 +57520,7 @@ function _planetPostDSL(cells, neighbors, K, seaLevel, opts) {
  * back with { caps: [{lat, lon, radiusDeg, verbs}, ...] }. Each cap
  * runs the DSL against the cell graph. Post-DSL pipeline (smooth,
  * cleanup, remap) is identical to the old preset path. */
-const _PLANET_AI_SYSTEM_PROMPT = `You are designing the LANDMASS SHAPE of a fictional planet. This is PASS 1 of a multi-pass pipeline: your only job is to define WHERE LAND IS vs WHERE OCEAN IS. Subsequent audit passes will add mountains, peaks, biomes, and features. DO NOT add Range verbs or peak Hills (heights 70+) in this pass -- those belong to pass 2.
-
-The reference image (when attached) shows the TARGET landmass style: binary land / ocean, highly fractal coastlines, multiple distinct landmasses with bays + isthmuses + offshore islands. These are Azgaar Fantasy Map Generator outputs and represent the BEST CASE for what our DSL can produce. Match that level of irregularity.
-
-The map will be rendered on a globe; users see the result as an EQUIRECTANGULAR PROJECTION (2D rectangle where x = longitude -180..180, y = latitude +90..-90, NORTH ON TOP). The rectangle stretches near the poles (Mercator-style distortion), wraps left-to-right across the date line, and is NOT what the planet actually looks like in 3D -- design for the SPHERE, not for the rectangular framing.
-
-DESIGN PHILOSOPHY (distilled from Azgaar's continents / oldWorld / archipelago templates -- these are proven to produce fractal landmass output):
-
-1. **ONE BIG CANVAS CAP + a few small offshore caps.** Azgaar templates work on a single rectangle; ours works the same way on ONE near-sphere-sized cap (radius 85-89°). This single cap is the canvas where most verbs paint. THEN add 2-5 small caps (radius 12-25°) at scattered lat/lon for offshore islands and archipelagos. DO NOT use 5-10 medium caps trying to compose a shape — that produces isolated blobs at cap centers, NOT a fractal continent.
-
-2. **TWO BIG HILLS PLACE LANDMASS CORES.** Inside the canvas cap, two Hills at height 80-85 placed at DIFFERENT x positions (e.g. x=20-30 and x=60-80) seed the major landmass cores. Their BFS blobs become the continents.
-
-3. **MULTIPLY 0.5-0.6 land SHRINKS COASTLINES.** After Hills, multiply existing land elevations by 0.5-0.6. Coastal cells (just above sea level) drop to ocean, sharpening + irregularizing the coast. This is the #1 missing tool in naive prompts -- without Multiply the coastline stays smooth.
-
-4. **STRAIT verbs CUT SEA CHANNELS.** Use Strait 2-3 vertical and/or Strait 1-2 horizontal inside the canvas cap to slice the landmass into pieces. This is how you get two-continent layouts from a single canvas. Each Strait carves a sea lane perpendicular to its orientation.
-
-5. **MANY TINY HILLS + scattered TROUGH/PIT add fractal detail.** Hill 8-12 at height 5-15 (NOT 25-40) spread across the canvas adds coastal noise and tiny offshore islands. Trough 4-8 at depth 15-25 scattered broadly carve bays. Pit 4-6 at depth 10-25 makes inland lakes.
-
-6. **NO MASK or Mask 0-1.** A strong Mask (power 2+) forces the canvas cap into a perfect circle by zeroing the outer ring. Skip Mask entirely, or use power 0.5-1. The natural shape comes from the verbs, not the cap boundary.
-
-7. **NO RANGE verbs above height 30.** Range verbs are for MOUNTAINS, which belong to pass 2 (the audit). In this landmass pass, the ONLY allowed Range is height 20-30 for LOW elongated ridges that create peninsula/isthmus shapes (Azgaar's "isthmus" template trick).
-
-8. **NO HILL above height 30 except the two cores.** The two cores at height 80-85 ARE the only high points. Everything else is height 5-30 (lowlands). Mountain peaks (height 70+) get added in pass 2.
-
-THINK FRACTAL: the reference images (Azgaar outputs) have coastline detail at THREE scales -- (a) the overall continent silhouette ~50-100°, (b) bays + peninsulas ~10-30°, (c) tiny offshore islands + speckle ~2-5°. Hit all three with the right verb mix.
-
-CAP GEOMETRY: ONE canvas cap (radius 85-89°, centered near lat 0 lon 0) holds 90%+ of the planet's surface. ALL the shape-making verbs go inside this one cap. Then 0-5 additional small caps (radius 10-25°) for offshore islands ONLY — DO NOT try to compose a continent shape from multiple medium caps.
-
-CONTINENT COUNT comes from STRAIT verbs INSIDE the canvas cap, not from multiple caps. Want one supercontinent? Zero or one Strait. Two continents? 2-3 vertical Straits to slice the canvas. Archipelago feel? Heavy Multiply (0.4) + many small Hills + lots of Trough.
-
-EARTH-SCALE SIZE REFERENCE -- the canvas cap covers the WHOLE planet, so:
-- 100% land coverage = full canvas filled, no Multiply / Trough / Strait
-- ~30% land coverage (Earth) = Multiply 0.5-0.6 land + 4-6 Troughs + 1-2 Straits
-- ~10% land coverage = Multiply 0.3-0.4 land + 8-12 Troughs + 3+ Straits
-- ~5% land (archipelago / water world) = Multiply 0.2 + 10+ Troughs + many small offshore caps
-
-OUTPUT (no commentary, no markdown fences):
-{
-  "caps": [
-    { "lat": 30.0, "lon": -50.0, "radiusDeg": 50, "verbs": "Hill ...\\n..." },
-    ...
-  ]
-}
-
-CAP COORDS:
-- The CANVAS CAP: lat=0, lon=0, radiusDeg=89 (the whole planet). All shape-defining verbs go here.
-- OFFSHORE CAPS (optional, 0-5 of them): radiusDeg 10-25, lat -60..+60, lon scattered (don't cluster near the canvas's busy zones). Each is a small island or archipelago cluster.
-
-DSL VERBS -- one per line, 4 whitespace args (pad with "0" where unused):
-- Hill <count> <height> <x-range> <y-range>      // BFS blob; peak fades outward
-- Pit <count> <depth> <x-range> <y-range>         // inverse hill (carves a basin)
-- Range <count> <height> <x-range> <y-range>      // linear ridge -- LOW heights only in pass 1 (mountains added in pass 2)
-- Trough <count> <depth> <x-range> <y-range>      // linear valley (cuts a bay)
-- Strait <count> <vertical|horizontal> 0 0        // sea channel. STRONG -- each Strait drops mid-elevation cells by ~half (h^0.8). count=1 ≈ one decent channel; count=3+ over-fragments. Use 1-2 for continent separation.
-- Smooth <iterations> 0 0 0
-- Add <value> <all|land|min-max> 0 0              // uniform lift / drop
-- Multiply <factor> <all|land|min-max> 0 0        // CRITICAL for coastline shaping
-- Mask <power> 0 0 0                              // AVOID in pass 1 (forces circle)
-- Invert <prob> 0 0 0
-
-CONVENTIONS:
-- x, y are 0..100 percentages WITHIN the cap. (50, 50) = cap center, (0, 50) = west edge, etc.
-- Heights are 0..100. Sea level is 20.
-- Heights stack ADDITIVELY: Hills + Multiply + Trough compose.
-
-PASS 1 HEIGHT BUDGET (this pass ONLY — mountains arrive in pass 2):
-- 2 BIG CORES at height 80-85 (these are the seed hills, NOT mountains -- they'll be flattened by Multiply)
-- Filler Hills at height 5-30 (lowlands)
-- Range / peak Hills at height 70+ are FORBIDDEN in this pass — leave space for pass 2
-
-CANVAS CAP BUILD ORDER (the proven Azgaar 'continents' recipe -- copy this skeleton, adjust):
-1.  Hill 1 80-85 60-75 40-60        // landmass CORE A (eastern)
-2.  Hill 1 80-85 25-40 40-60        // landmass CORE B (western)
-3.  Hill 7-9 18-32 25-75 15-85      // broad medium fill between cores
-4.  Multiply 0.55-0.65 land 0 0     // CRITICAL: shrinks coastlines, sharpens shape
-5.  Hill 10-14 5-12 10-90 15-85     // many tiny hills (fractal coast noise + offshore specks)
-6.  Range 1-3 20-30 5-15 25-75      // LOW elongated land at west edge (peninsula seed)
-7.  Range 1-3 20-30 85-95 25-75     // LOW elongated land at east edge
-8.  Strait 1-2 vertical 0 0         // CUT the landmass into multiple continents (count=1 = one channel, count=2 = two; STRONG verb, don't over-use)
-9.  Strait 0-1 horizontal 0 0       // optional second-axis cut
-10. Smooth 2-3 0 0 0                // smoothing pass
-11. Trough 4-6 15-25 15-85 20-80    // bays scattered across canvas
-12. Trough 3-5 8-15 40-60 40-60     // central interior bays (lakes-in-the-making)
-13. Pit 4-6 10-25 15-85 15-85       // inland lakes / basins
-14. Multiply 0.65-0.85 land 0 0     // OPTIONAL second shrink for more ocean
-
-OFFSHORE CAP BUILD ORDER (each small island cap):
-1.  Hill 2-4 25-40 25-75 25-75      // small landmass seed
-2.  Multiply 0.6-0.8 land 0 0       // shrink to irregular shape
-3.  Trough 2-3 12-20 0-100 0-100    // coastal bites
-4.  Smooth 1 0 0 0
-
-ANTI-PATTERNS (don't do these):
-- Multiple medium-radius caps (radius 35-60°) trying to compose a continent shape → produces isolated blobs at cap centers, NOT a fractal continent. Use ONE big canvas cap instead.
-- Mask power > 1 on the canvas cap → forces it into a perfect circle, hiding the fractal verbs.
-- Range or Hill above height 30 in pass 1 → these are MOUNTAINS, which belong to pass 2.
-- Skipping Multiply → coastlines stay smooth + circular. Multiply IS the coastline-shaping verb.
-- Less than 2 Strait verbs → one giant supercontinent, no continent separation.
-
-EXAMPLES (proven Azgaar-template-derived plans, calibrated to hit 22-30% land):
-
-"earth-like 2 continents" (~28% land, verified at N=12000):
-{"caps":[
-  {"lat":0,"lon":0,"radiusDeg":89,"verbs":"Hill 1 80-85 60-75 40-60\\nHill 1 80-85 25-40 40-60\\nHill 8 18-30 25-75 15-85\\nMultiply 0.45 land 0 0\\nHill 12 5-10 10-90 15-85\\nRange 2 22-30 5-15 25-75\\nRange 2 22-30 85-95 25-75\\nStrait 3 vertical 0 0\\nSmooth 3 0 0 0\\nTrough 8 18-25 15-85 20-80\\nTrough 5 12-18 40-60 40-60\\nPit 6 15-22 15-85 15-85\\nMultiply 0.85 land 0 0"},
-  {"lat":35,"lon":-140,"radiusDeg":18,"verbs":"Hill 3 28-40 30-70 30-70\\nMultiply 0.7 land 0 0\\nTrough 2 12-20 0-100 0-100\\nSmooth 1 0 0 0"},
-  {"lat":-25,"lon":150,"radiusDeg":15,"verbs":"Hill 2 25-35 30-70 30-70\\nMultiply 0.7 land 0 0\\nTrough 2 10-18 0-100 0-100"}
-]}
-
-"old world supercontinent" (Eurasia+Africa style with archipelago middle, ~27% land, verified):
-{"caps":[
-  {"lat":0,"lon":0,"radiusDeg":89,"verbs":"Hill 2 75-85 15-45 30-70\\nHill 2 75-85 55-85 30-70\\nHill 6 20-28 15-85 20-80\\nMultiply 0.7 land 0 0\\nSmooth 2 0 0 0\\nRange 3 25-30 15-35 20-45\\nRange 2 25-30 65-85 45-80\\nStrait 1 vertical 0 0\\nTrough 7 20-28 15-85 45-65\\nPit 5 18-25 15-85 15-85"}
-]}
-
-"pangaea single supercontinent":
-{"caps":[
-  {"lat":0,"lon":0,"radiusDeg":89,"verbs":"Hill 1 85-90 45-55 40-60\\nHill 10 25-40 20-80 20-80\\nMultiply 0.7 land 0 0\\nHill 12 8-15 10-90 15-85\\nStrait 1 horizontal 0 0\\nSmooth 2 0 0 0\\nTrough 4 18-25 15-85 0-15\\nTrough 4 18-25 15-85 85-100\\nTrough 3 10-15 30-70 30-70\\nPit 5 12-20 15-85 15-85"}
-]}
-
-"tropical archipelago":
-{"caps":[
-  {"lat":0,"lon":0,"radiusDeg":89,"verbs":"Add 8 all 0 0\\nHill 5 25-35 20-80 25-75\\nHill 2 20-30 10-30 20-80\\nHill 2 20-30 60-90 20-80\\nMultiply 0.4 land 0 0\\nSmooth 2 0 0 0\\nTrough 12 20-30 5-95 5-95\\nStrait 3 vertical 0 0\\nStrait 2 horizontal 0 0\\nMultiply 0.7 land 0 0"},
-  {"lat":20,"lon":-100,"radiusDeg":12,"verbs":"Hill 3 25-35 30-70 30-70\\nMultiply 0.6 land 0 0\\nTrough 2 10-18 0-100 0-100"},
-  {"lat":-15,"lon":100,"radiusDeg":15,"verbs":"Hill 3 28-38 30-70 30-70\\nMultiply 0.6 land 0 0\\nTrough 3 12-20 0-100 0-100"}
-]}
-
-CRITICAL FOR PASS 1:
-- ONE big canvas cap (radius 85-89°) with the heavy verb stack
-- NO Mask on the canvas cap (or Mask power 0-1 max)
-- NO Range/Hill above height 30 (those are pass 2's job)
-- Multiply 0.5-0.7 land at LEAST once (more for less land coverage)
-- 2-3 Strait verbs to separate continents
-- 0-5 small offshore caps for islands
-
-OUTPUT ONLY THE JSON OBJECT.`;
+// _PLANET_AI_SYSTEM_PROMPT removed 2026-05-21 -- AI pipeline is now feature-only; landmass comes from GeoJSON import or brush.
 
 const _PLANET_AI_AUDIT_SYSTEM_PROMPT = `You are auditing a planet map you produced.
 
@@ -57734,12 +57601,29 @@ function _parseAIPlan(rawResponse) {
 }
 
 function _applyAIPlan(plan, cells, neighbors, K, seaLevel, lockedCenter, opts) {
-  // opts forwarded to _planetPostDSL. The LANDMASS-FIRST pass should
-  // set { skipCleanup: true } so the morphological coastline open
-  // doesn't fill in Strait cuts and bays. Default = full cleanup
-  // (the audit / detail passes use this to clean up artifacts from
-  // new mountain / peak verbs).
-  _planetVerbReset(cells);
+  // opts:
+  //   skipReset    -- don't zero elevations before applying the plan.
+  //                   Use this for feature audits that build ON TOP of
+  //                   an existing landmass (stamped GeoJSON, hand-
+  //                   painted, or previous feature additions).
+  //   lockLand     -- snapshot land vs ocean BEFORE applying verbs;
+  //                   after applying, restore any cell whose land/ocean
+  //                   status flipped to its pre-application value. Use
+  //                   this to prevent feature audits from accidentally
+  //                   creating or destroying landmass.
+  //   skipCleanup  -- forwarded to _planetPostDSL; preserves fractal
+  //                   coast / Strait cuts.
+  //   skipSmoothing -- forwarded to _planetPostDSL.
+  opts = opts || {};
+  // Snapshot land/ocean status BEFORE applying if lockLand requested.
+  let preLandMask = null;
+  if (opts.lockLand) {
+    preLandMask = new Uint8Array(cells.count);
+    for (let i = 0; i < cells.count; i++) {
+      preLandMask[i] = cells.elevations[i] >= seaLevel ? 1 : 0;
+    }
+  }
+  if (!opts.skipReset) _planetVerbReset(cells);
   const powers = _planetTemplatePowers(cells.count);
   for (let i = 0; i < plan.caps.length; i++) {
     const c = plan.caps[i];
@@ -57754,6 +57638,21 @@ function _applyAIPlan(plan, cells, neighbors, K, seaLevel, lockedCenter, opts) {
       cap = _makeCapAtLatLon(lat, lon, radRad);
     }
     _planetRunDSL(String(c.verbs || ""), cells, neighbors, K, cap, powers);
+  }
+  // lockLand: restore the pre-application land/ocean status. A cell
+  // that was OCEAN gets its elevation pulled below seaLevel (clamp to
+  // seaLevel - 0.02); a cell that was LAND gets pushed above (clamp
+  // to seaLevel + 0.02 if it would otherwise be below). The cell's
+  // ABSOLUTE elevation is preserved if the lock direction agrees with
+  // what the verbs produced -- only flips are corrected.
+  if (preLandMask) {
+    for (let i = 0; i < cells.count; i++) {
+      const wasLand = preLandMask[i] === 1;
+      const e = cells.elevations[i];
+      const isLand = e >= seaLevel;
+      if (wasLand && !isLand)      cells.elevations[i] = seaLevel + 0.02;
+      else if (!wasLand && isLand) cells.elevations[i] = seaLevel - 0.02;
+    }
   }
   _planetPostDSL(cells, neighbors, K, seaLevel, opts);
 }
@@ -57800,130 +57699,6 @@ const PMAP_AI_REFERENCES = {
     sourcePage: "https://github.com/Azgaar/Fantasy-Map-Generator",
     appliesTo: "Mediterranean, volcanic arcs presets -- two-cluster layout with inland features"
   },
-
-  // --- Whole-planet biome references (Wikipedia Commons CC-licensed,
-  //     used by audit / detail passes that add biomes + mountains) ---
-  earth: {
-    url: "https://upload.wikimedia.org/wikipedia/commons/thumb/2/2b/World_elevation_map.png/1280px-World_elevation_map.png",
-    credit: "World elevation map by Avsa, CC BY-SA 4.0",
-    sourcePage: "https://commons.wikimedia.org/wiki/File:World_elevation_map.png",
-    appliesTo: "Earth-like detail-pass reference"
-  },
-  mars: {
-    url: "https://upload.wikimedia.org/wikipedia/commons/thumb/8/89/Mars_topography_%28MOLA_dataset%29.png/1280px-Mars_topography_%28MOLA_dataset%29.png",
-    credit: "Mars MOLA topography by NASA Goddard SVS, Public Domain",
-    sourcePage: "https://commons.wikimedia.org/wiki/File:Mars_topography_(MOLA_dataset).png",
-    appliesTo: "Mars-like, volcanic arcs"
-  },
-  pangaea: {
-    url: "https://upload.wikimedia.org/wikipedia/commons/thumb/5/53/Pangaea_continents.png/1280px-Pangaea_continents.png",
-    credit: "Pangaea continents by Kieff, CC BY-SA 3.0",
-    sourcePage: "https://commons.wikimedia.org/wiki/File:Pangaea_continents.png",
-    appliesTo: "Pangaea preset"
-  },
-  archipelagoMap: {
-    url: "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3e/Equirectangular-projection-topographic-world.jpg/1280px-Equirectangular-projection-topographic-world.jpg",
-    credit: "Equirectangular topographic world by Gundan, CC BY-SA 4.0",
-    sourcePage: "https://commons.wikimedia.org/wiki/File:Equirectangular-projection-topographic-world.jpg",
-    appliesTo: "Tropical archipelago preset"
-  },
-  mediterraneanMap: {
-    url: "https://upload.wikimedia.org/wikipedia/commons/thumb/2/2c/Mediterranean_Relief.jpg/1280px-Mediterranean_Relief.jpg",
-    credit: "Mediterranean Relief, CIA / U.S. Government, Public Domain",
-    sourcePage: "https://commons.wikimedia.org/wiki/File:Mediterranean_Relief.jpg",
-    appliesTo: "Mediterranean preset"
-  },
-  antarcticGlobe: {
-    url: "https://upload.wikimedia.org/wikipedia/commons/thumb/4/4b/Antarctica_satellite_globe.jpg/1280px-Antarctica_satellite_globe.jpg",
-    credit: "Antarctica satellite globe by NASA, Public Domain",
-    sourcePage: "https://commons.wikimedia.org/wiki/File:Antarctica_satellite_globe.jpg",
-    appliesTo: "Ice world preset"
-  },
-  pacificCentered: {
-    url: "https://upload.wikimedia.org/wikipedia/commons/thumb/c/c2/World_centred_on_the_Pacific_Ocean_locator_map.svg/1280px-World_centred_on_the_Pacific_Ocean_locator_map.svg.png",
-    credit: "Pacific-centered world map, CC BY 4.0",
-    sourcePage: "https://commons.wikimedia.org/wiki/File:World_centred_on_the_Pacific_Ocean_locator_map.svg",
-    appliesTo: "Water world preset"
-  },
-  // --- Regional close-ups (used by keyword chips) ---
-  himalayas: {
-    url: "https://upload.wikimedia.org/wikipedia/commons/thumb/5/58/Himalayas_Map.png/1280px-Himalayas_Map.png",
-    credit: "Himalayas relief map by Sven Manguard, Public Domain",
-    sourcePage: "https://commons.wikimedia.org/wiki/File:Himalayas_Map.png",
-    appliesTo: "mountain ranges keyword"
-  },
-  medBathymetry: {
-    url: "https://upload.wikimedia.org/wikipedia/commons/thumb/f/f9/Mediterranean_Sea_Bathymetry_map.svg/1280px-Mediterranean_Sea_Bathymetry_map.svg.png",
-    credit: "Mediterranean Sea bathymetry by Ikonact, CC BY-SA 4.0",
-    sourcePage: "https://commons.wikimedia.org/wiki/File:Mediterranean_Sea_Bathymetry_map.svg",
-    appliesTo: "inland sea keyword"
-  },
-  javaArchipelago: {
-    url: "https://upload.wikimedia.org/wikipedia/commons/thumb/c/c1/Indonesia_Java_relief_location_map.png/1280px-Indonesia_Java_relief_location_map.png",
-    credit: "Java archipelago relief by RXerself, CC BY-SA 4.0",
-    sourcePage: "https://commons.wikimedia.org/wiki/File:Indonesia_Java_relief_location_map.png",
-    appliesTo: "archipelago keyword"
-  },
-  italyPeninsula: {
-    url: "https://upload.wikimedia.org/wikipedia/commons/thumb/e/e7/Italy_topographic_map-blank_relief_only.svg/1280px-Italy_topographic_map-blank_relief_only.svg.png",
-    credit: "Italian peninsula relief by T8612, CC BY-SA 4.0",
-    sourcePage: "https://commons.wikimedia.org/wiki/File:Italy_topographic_map-blank_relief_only.svg",
-    appliesTo: "peninsulas keyword"
-  },
-  antarcticaSvg: {
-    url: "https://upload.wikimedia.org/wikipedia/commons/thumb/c/c0/Antarctica.svg/1280px-Antarctica.svg.png",
-    credit: "Antarctica topographic overview by NASA LIMA, Public Domain",
-    sourcePage: "https://commons.wikimedia.org/wiki/File:Antarctica.svg",
-    appliesTo: "polar ice cap keyword"
-  },
-  amazon: {
-    url: "https://upload.wikimedia.org/wikipedia/commons/thumb/f/f6/Amazon_rainforest.jpg/1280px-Amazon_rainforest.jpg",
-    credit: "Amazon Basin Blue Marble composite by Pfly (NASA imagery), Public Domain",
-    sourcePage: "https://commons.wikimedia.org/wiki/File:Amazon_rainforest.jpg",
-    appliesTo: "tropical jungle keyword"
-  },
-  sahara: {
-    url: "https://upload.wikimedia.org/wikipedia/commons/thumb/c/c1/Saharan_topographic_elements_map.png/1280px-Saharan_topographic_elements_map.png",
-    credit: "Saharan topographic elements, CC BY-SA 3.0",
-    sourcePage: "https://commons.wikimedia.org/wiki/File:Saharan_topographic_elements_map.png",
-    appliesTo: "desert plateau keyword"
-  },
-  nileRiver: {
-    url: "https://upload.wikimedia.org/wikipedia/commons/thumb/d/de/Nile_River_and_delta_from_orbit.jpg/1280px-Nile_River_and_delta_from_orbit.jpg",
-    credit: "Nile River and delta MODIS/Terra by NASA, Public Domain",
-    sourcePage: "https://commons.wikimedia.org/wiki/File:Nile_River_and_delta_from_orbit.jpg",
-    appliesTo: "river valleys keyword"
-  },
-  scandinavia: {
-    url: "https://upload.wikimedia.org/wikipedia/commons/thumb/8/8b/Topographic_map_of_Scandinavia_de.png/1280px-Topographic_map_of_Scandinavia_de.png",
-    credit: "Scandinavia topographic map by Juetho, CC BY-SA 3.0",
-    sourcePage: "https://commons.wikimedia.org/wiki/File:Topographic_map_of_Scandinavia_de.png",
-    appliesTo: "coastal mountains keyword (Norwegian fjords)"
-  },
-  kamchatka: {
-    url: "https://upload.wikimedia.org/wikipedia/commons/thumb/0/00/Kamchatka_peninsula_topo.jpg/1280px-Kamchatka_peninsula_topo.jpg",
-    credit: "Kamchatka shaded relief by NASA/JPL (PIA03374), Public Domain",
-    sourcePage: "https://commons.wikimedia.org/wiki/File:Kamchatka_peninsula_topo.jpg",
-    appliesTo: "volcanic chain keyword"
-  },
-  marianaTrench: {
-    url: "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a3/Mariana_trench.png/1280px-Mariana_trench.png",
-    credit: "Mariana Trench SRTM bathymetry by Astrobob.tk, CC BY-SA 4.0",
-    sourcePage: "https://commons.wikimedia.org/wiki/File:Mariana_trench.png",
-    appliesTo: "deep ocean trench keyword"
-  },
-  greatPlains: {
-    url: "https://upload.wikimedia.org/wikipedia/commons/thumb/8/85/Map_of_the_Great_Plains.png/1280px-Map_of_the_Great_Plains.png",
-    credit: "US Great Plains map by TheDarthEgg, Public Domain",
-    sourcePage: "https://commons.wikimedia.org/wiki/File:Map_of_the_Great_Plains.png",
-    appliesTo: "rolling plains keyword"
-  },
-  tibetanPlateau: {
-    url: "https://upload.wikimedia.org/wikipedia/commons/thumb/f/f6/Topografic_map_of_Tibetan_Plateau.png/1280px-Topografic_map_of_Tibetan_Plateau.png",
-    credit: "Tibetan Plateau topographic map by demis.nl, Public Domain",
-    sourcePage: "https://commons.wikimedia.org/wiki/File:Topografic_map_of_Tibetan_Plateau.png",
-    appliesTo: "rugged highlands keyword"
-  }
 };
 
 const _planetRefCache = {};
@@ -58128,186 +57903,106 @@ async function _planetStampGeoJSON(geojson, cells, neighbors, K, seaLevel, onSta
  * call; the cost trades for quality. Vision-capable providers only
  * (Anthropic + Gemma both support it). */
 async function _planetGenerateFromAI(prompt, cells, neighbors, K, seaLevel, lockedCenter, onStatus, painterCanvas, painterRerender, keywordAudits, refKey, targetLand) {
+  // 2026-05-21 -- AI pipeline REDESIGNED as feature-only. The user
+  // establishes the landmass via the painter's GeoJSON import or the
+  // brush. The AI's only job here is to ADD FEATURES (mountains,
+  // deserts, ice caps, archipelagos, etc.) on top of that landmass.
+  //
+  // No landmass-generation pass. No baseline audit. No free-text
+  // prompt. Just N per-keyword passes, each emitting a JSON plan
+  // that runs ON TOP of existing cell elevations (skipReset:true).
+  // The `prompt` and `refKey` parameters are accepted for backward-
+  // compat but ignored.
   const provider = PROVIDERS[aiSettings.provider];
   if (!provider) throw new Error("no AI provider configured");
   if (provider.requiresKey && !aiSettings.anthropicKey) {
     throw new Error("API key required - set in AI Settings panel");
   }
-  const kwAudits = Array.isArray(keywordAudits) ? keywordAudits.slice(0, 4) : [];
-  const totalPasses = 1 + kwAudits.length;
+  if (!provider.supportsImage) {
+    throw new Error("feature audits require a vision-capable provider (anthropic / gemma)");
+  }
+  const kwAudits = Array.isArray(keywordAudits) ? keywordAudits.filter(Boolean) : [];
+  if (kwAudits.length === 0) {
+    throw new Error("no feature chips selected -- pick at least one keyword chip before adding features");
+  }
+  const totalPasses = kwAudits.length;
   const t0 = performance.now();
 
-  // Land coverage target (from preset metadata): 22-30% for Earth-like,
-  // 5-15% for archipelagos, etc. Included in the prompt so the LLM
-  // sizes caps + Hill counts to match.
-  const tgtLo = Array.isArray(targetLand) ? targetLand[0] : 0.20;
-  const tgtHi = Array.isArray(targetLand) ? targetLand[1] : 0.32;
-  const tgtStr = (tgtLo * 100).toFixed(0) + "-" + (tgtHi * 100).toFixed(0) + "%";
+  // Run each selected keyword audit sequentially. Each one:
+  //   1. captures the current painter view (existing landmass +
+  //      any features added so far)
+  //   2. optionally loads the keyword's reference image
+  //   3. calls the LLM with the keyword's audit prompt
+  //   4. applies the resulting plan with skipReset + skipCleanup
+  //      so existing elevations survive (and lockLand for features
+  //      that should preserve land/ocean boundaries)
+  for (let i = 0; i < kwAudits.length; i++) {
+    const kw = kwAudits[i];
+    const label = String(kw.label || "feature").replace(/^\+\s*/, "");
+    const roundIdx = i + 1;
 
-  // --- Initial round ---
-  // Optional reference heightmap image attached for the LLM to learn
-  // realistic coastlines / elevation distribution from. The reference
-  // is preset-specific (e.g. Mars-like uses MOLA topography, Earth-
-  // like uses Wikimedia's elevation map).
-  let initialImage = null;
-  if (refKey) {
-    onStatus && onStatus("loading '" + refKey + "' reference image…");
-    initialImage = await _loadPlanetReference(refKey);
-  }
-  const refTag = initialImage ? " (ref: " + refKey + ")" : "";
-  const initialUserPrompt =
-    (initialImage
-      ? ("REFERENCE IMAGE ATTACHED ('" + refKey + "'): a real-world heightmap / topographic image. STUDY THIS IMAGE CAREFULLY -- it is the BEST AVAILABLE EXAMPLE of what good output for this preset looks like.\n\nADHERE TO IT for:\n - COASTLINE IRREGULARITY: every continent in the reference has bays, peninsulas, capes, fjords. Your continents must too -- carve them with Trough operations at cap edges.\n - ELEVATION DISTRIBUTION: notice how MOST of the reference is mid-elevation (greens / tans = plains), with NARROW high-elevation ridges (browns / whites = mountains) and isolated highest peaks. Match that ratio (50-60% plains, 10-15% mountains, 5% peaks).\n - CONTINENT POSITIONING: note where land sits relative to lat / lon. If the reference shows continents at certain latitudes (e.g. tropical jungle near equator, ice cap at pole), respect that.\n - SCALE: the reference shows what 'continent-size' looks like in equirect. Match it.\n\nDO NOT literally copy the reference's continents (the user's prompt describes a DIFFERENT planet) -- but DO MATCH ITS LEVEL OF DETAIL, irregular outlines, mountain-vs-plains ratio, and continent scale.\n\n")
-      : "")
-    + "TARGET LAND COVERAGE: " + tgtStr + " of the planet's surface (reference: Earth's combined Americas + Eurasia-Africa = ~22%, all Earth land = ~29%). Size your caps + Hill counts so the FINAL land fraction lands in this band. After we render your plan we'll measure it and tell you the actual % -- treat the band as a hard requirement, not a suggestion.\n\n"
-    + "USER PROMPT: " + prompt;
-  onStatus && onStatus("round 1/" + totalPasses + ": calling " + (aiSettings.model || provider.defaultModel) + refTag + "…");
-  const initial = await provider.call({
-    system: _PLANET_AI_SYSTEM_PROMPT,
-    user: initialUserPrompt,
-    image: initialImage,
-    model: aiSettings.model || provider.defaultModel,
-    key: aiSettings.anthropicKey,
-    temperature: 0.8,
-    maxTokens: 8192
-  });
-  let plan = _parseAIPlan(initial);
-  onStatus && onStatus("round 1/" + totalPasses + ": applying " + plan.caps.length + " caps…");
-  // Pass 1 = LANDMASS-FIRST: skipCleanup preserves the prompt's Strait
-  // cuts + small bays. The morphological cleanup would otherwise fill
-  // 1-cell-wide sea channels back to land and turn the fractal coast
-  // into a single supercontinent. Audit passes below use default
-  // cleanup so detail additions (mountains, peaks) get smoothed.
-  _applyAIPlan(plan, cells, neighbors, K, seaLevel, lockedCenter, { skipCleanup: true });
-  if (painterRerender) painterRerender();
-
-  // Helper to run one audit pass with a specific system prompt + label.
-  // Optionally accepts a keyword-specific reference image (e.g. the
-  // Himalayas for the mountain-ranges audit) attached AFTER the
-  // current painter view so the model can compare the two.
-  async function runAudit(roundIdx, label, systemPrompt, userPrefix, extraRefKey) {
-    if (!painterCanvas || !provider.supportsImage) return;
-    onStatus && onStatus("round " + roundIdx + "/" + totalPasses + ": capturing view (" + label + ")…");
+    onStatus && onStatus("round " + roundIdx + "/" + totalPasses + ": capturing (" + label + ")…");
     let painterB64;
     try { painterB64 = await _capturePainterPng(painterCanvas); }
-    catch (e) { console.warn("[planet-map] capture failed, skipping audit:", e); return; }
-    let extraImage = null;
-    if (extraRefKey) {
-      extraImage = await _loadPlanetReference(extraRefKey);
+    catch (e) { console.warn("[planet-map] capture failed for '" + label + "':", e); continue; }
+
+    let refImage = null;
+    if (kw.refKey) {
+      try { refImage = await _loadPlanetReference(kw.refKey); }
+      catch (e) { /* missing ref is OK, audit runs text-only */ }
     }
     const images = [painterB64];
-    if (extraImage) images.push(extraImage);
-    onStatus && onStatus("round " + roundIdx + "/" + totalPasses + ": auditing (" + label + (extraImage ? " + ref" : "") + ")…");
-    const auditUser = (userPrefix || "")
-      + "\n\nORIGINAL REQUEST: " + prompt
-      + "\n\nPREVIOUS JSON PLAN: " + JSON.stringify(plan)
-      + "\n\nThe FIRST attached image is the current rendered result."
-      + (extraImage ? " The SECOND attached image is a real-world reference for this audit's focus -- match its level of detail and feature density." : "")
-      + " Output a revised JSON plan that is a STRICT SUPERSET of the previous plan (every cap and verb preserved, additions appended).";
-    const auditResp = await provider.call({
-      system: systemPrompt,
-      user: auditUser,
-      image: images,
-      model: aiSettings.model || provider.defaultModel,
-      key: aiSettings.anthropicKey,
-      temperature: 0.6,
-      maxTokens: 8192
-    });
-    let revised;
-    try { revised = _parseAIPlan(auditResp); }
+    if (refImage) images.push(refImage);
+
+    onStatus && onStatus("round " + roundIdx + "/" + totalPasses + ": adding " + label + (refImage ? " (+ref)" : "") + "…");
+    const auditUser =
+      "FEATURE TO ADD: " + label + "\n\n"
+      + "The FIRST attached image is the CURRENT planet. Existing landmass is fixed -- you must NOT change which cells are land vs ocean. Your only job is to ADD this feature's elevation modifications on top of what's already there."
+      + (refImage ? " The SECOND attached image is a real-world reference for what this feature looks like." : "")
+      + "\n\nLook at where the EXISTING land is in the current image. Place your caps OVER LAND (or just offshore for archipelago / trench / volcanic-chain features). Cells that are currently OCEAN will remain ocean; cells that are LAND will remain land (the engine enforces this). Within those constraints, ADD your feature's verbs.\n\n"
+      + "Output ONLY a JSON object: { \"caps\": [ { \"lat\":..., \"lon\":..., \"radiusDeg\":..., \"verbs\": \"...\" }, ... ] }. No commentary, no markdown fences.";
+
+    let resp;
+    try {
+      resp = await provider.call({
+        system: kw.audit,
+        user: auditUser,
+        image: images,
+        model: aiSettings.model || provider.defaultModel,
+        key: aiSettings.anthropicKey,
+        temperature: 0.5,
+        maxTokens: 4096
+      });
+    } catch (e) {
+      console.warn("[planet-map] '" + label + "' provider call failed:", e);
+      continue;
+    }
+
+    let plan;
+    try { plan = _parseAIPlan(resp); }
     catch (e) {
-      console.warn("[planet-map] audit '" + label + "' returned invalid JSON, keeping previous plan:", e.message);
-      return;
+      console.warn("[planet-map] '" + label + "' returned invalid JSON, skipping:", e.message);
+      continue;
     }
-    // Enforce additivity at the code level: the revised plan must
-    // not LOSE any cap or verb from the previous plan. If the model
-    // dropped something, merge it back. This is the safety net for
-    // the "audit removes content" failure mode.
-    const mergedCaps = [];
-    const usedRevised = new Set();
-    function capKey(c) { return Math.round(c.lat) + "," + Math.round(c.lon); }
-    // For each previous cap, find the revised cap nearest to it (same
-    // lat/lon within 25°) and merge verbs. If no near match, keep the
-    // previous cap untouched.
-    for (let pi = 0; pi < plan.caps.length; pi++) {
-      const prev = plan.caps[pi];
-      let bestRi = -1, bestD = Infinity;
-      for (let ri = 0; ri < revised.caps.length; ri++) {
-        if (usedRevised.has(ri)) continue;
-        const r = revised.caps[ri];
-        const d = Math.abs((r.lat || 0) - (prev.lat || 0)) + Math.abs((r.lon || 0) - (prev.lon || 0));
-        if (d < bestD) { bestD = d; bestRi = ri; }
-      }
-      if (bestRi >= 0 && bestD < 25) {
-        // Merge: keep prev's lat/lon/radius (use the larger radius),
-        // concatenate verbs from prev THEN revised (prev's verbs run
-        // first so heights aren't overridden by later operations).
-        const r = revised.caps[bestRi];
-        usedRevised.add(bestRi);
-        const prevVerbs = String(prev.verbs || "").split("\n").map(s => s.trim()).filter(s => s);
-        const revVerbs  = String(r.verbs   || "").split("\n").map(s => s.trim()).filter(s => s);
-        // Dedup: skip verb lines already present in prev to avoid
-        // double-applying the same operations.
-        const prevSet = new Set(prevVerbs);
-        const merged = prevVerbs.slice();
-        // Insert revised verbs BEFORE any final Mask in prev (so Mask runs last).
-        let maskIdx = -1;
-        for (let m = merged.length - 1; m >= 0; m--) { if (/^Mask\b/i.test(merged[m])) { maskIdx = m; break; } }
-        const insertAt = (maskIdx >= 0) ? maskIdx : merged.length;
-        for (let q = 0; q < revVerbs.length; q++) {
-          const v = revVerbs[q];
-          if (prevSet.has(v)) continue;
-          if (/^Mask\b/i.test(v) && maskIdx >= 0) continue;   // skip duplicate Mask
-          merged.splice(insertAt, 0, v);
-        }
-        mergedCaps.push({
-          lat: prev.lat,
-          lon: prev.lon,
-          radiusDeg: Math.max(Number(prev.radiusDeg) || 30, Number(r.radiusDeg) || 30),
-          verbs: merged.join("\n")
-        });
-      } else {
-        // No close-enough revised cap; keep the previous one as-is.
-        mergedCaps.push(prev);
-      }
-    }
-    // Append any revised caps that didn't match any previous (= NEW caps).
-    for (let ri = 0; ri < revised.caps.length; ri++) {
-      if (!usedRevised.has(ri)) mergedCaps.push(revised.caps[ri]);
-    }
-    plan = { caps: mergedCaps };
-    onStatus && onStatus("round " + roundIdx + "/" + totalPasses + ": applying " + plan.caps.length + " caps (" + label + ")…");
-    // skipCleanup: true throughout the AI pipeline. _applyAIPlan resets
-    // elevations + reapplies ALL caps' verbs from scratch each call, so
-    // the audit round would otherwise re-run cleanup on the WHOLE plan
-    // (including the landmass-shaping Strait/Trough verbs from round 1)
-    // and close the fractal coast back to a blob. The morphological
-    // cleanup is for the user's hand-painted brush strokes, not for
-    // AI-generated plans whose verbs intentionally produce thin features.
-    _applyAIPlan(plan, cells, neighbors, K, seaLevel, lockedCenter, { skipCleanup: true });
+    if (!plan || !plan.caps || plan.caps.length === 0) continue;
+
+    onStatus && onStatus("round " + roundIdx + "/" + totalPasses + ": applying " + plan.caps.length + " caps for " + label + "…");
+    // skipReset: keep existing landmass elevations.
+    // lockLand:  features can modify land elevations but cannot flip
+    //            cells between land and ocean status.
+    // skipCleanup / skipSmoothing: preserve the stamped fractal coast.
+    _applyAIPlan(plan, cells, neighbors, K, seaLevel, lockedCenter, {
+      skipReset: true,
+      lockLand: true,
+      skipCleanup: true,
+      skipSmoothing: true
+    });
     if (painterRerender) painterRerender();
   }
 
-  // Baseline audit DISABLED 2026-05-21 -- pass 1 (landmass) now uses
-  // skipCleanup so its output is intentionally fragile (thin Strait
-  // cuts, fractal coast). The baseline audit's LLM call was either
-  // (a) refusing to add mountains because the rendered image was
-  // black/blue-only landmass, or (b) emitting verb stacks that
-  // overrode the carefully-tuned landmass shape. Pass 1 + keyword
-  // audits (which run only when the user explicitly picks chips)
-  // is the new default. If you need mountains, paint them in or
-  // add a keyword chip.
-
-  // --- Per-keyword audits (one pass each, focused on a single feature) ---
-  for (let i = 0; i < kwAudits.length; i++) {
-    const kw = kwAudits[i];
-    const lbl = kw.label.replace(/^\+\s*/, "");
-    await runAudit(2 + i, lbl, kw.audit, "FOCUSED AUDIT KEYWORD: " + lbl, kw.refKey);
-  }
-
   const ms = Math.round(performance.now() - t0);
-  console.log("[planet-map] AI-generated map: " + plan.caps.length + " caps, " + totalPasses + " passes, " + ms + "ms");
-  return { caps: plan.caps.length, ms, rounds: totalPasses };
+  console.log("[planet-map] AI features added: " + kwAudits.length + " passes, " + ms + "ms");
+  return { caps: 0, ms, rounds: totalPasses };
 }
 
 
@@ -71114,100 +70809,82 @@ const PORT_TYPE_OPTS_OUT = ["audio", "param", "gate", "clock", "texture", "trans
 // count / size / placement); keywords add features on top. Earth's two
 // combined landmass clusters cover ~22% of the surface; all Earth land
 // ~29% -- the targetLand bands hint at this.
-// Presets describe the WORLD TYPE (what kind of planet). The HOW
-// (one canvas cap + offshore caps + Azgaar-style verbs) is handled
-// by the system prompt's worked examples and build-order template.
-// Keep preset prompts SHORT -- the system prompt has the recipes.
-const PMAP_AI_PRESETS = [
-  { name: "(custom)", prompt: "", refKey: "landmassTwoContinents", targetLand: [0.18, 0.35] },
-  { name: "Earth-like (2 continents)", refKey: "landmassTwoContinents", targetLand: [0.22, 0.32],
-    prompt: "Two distinct continents separated by a sea channel, ~28% land. Follow the system prompt's 'earth-like 2 continents' worked example -- one canvas cap with two Hill cores + Strait + Trough." },
-  { name: "Earth-like (5 continents)", refKey: "landmassMultiContinent", targetLand: [0.22, 0.32],
-    prompt: "Five medium landmasses scattered across the canvas. Use 2 Strait vertical + 1 Strait horizontal in the canvas cap to fragment a single landmass into multiple pieces; add 2-3 offshore caps for the smaller continents. ~25% land." },
-  { name: "Pangaea (one supercontinent)", refKey: "landmassPangaea", targetLand: [0.28, 0.40],
-    prompt: "One huge supercontinent, ~32% land. Follow the system prompt's 'pangaea' worked example -- canvas cap with one Hill core + minimal Strait + Trough at the poles." },
-  { name: "Old World (Eurasia+Africa shape)", refKey: "landmassOldWorld", targetLand: [0.22, 0.32],
-    prompt: "Elongated supercontinent with archipelago strip down the middle. Follow the system prompt's 'old world supercontinent' worked example -- two Hill cores at west and east + Trough cluster in the central y-band creating broken-up middle." },
-  { name: "Mediterranean-style", refKey: "landmassFragmented", targetLand: [0.22, 0.35],
-    prompt: "Two landmasses surrounding a central inland sea. Use 1 Strait horizontal in the middle of the canvas cap to create the inland sea, plus Hill cores on either side. ~28% land." },
-  { name: "Ice world", refKey: "landmassPangaea", targetLand: [0.12, 0.22],
-    prompt: "One polar continent at high latitude + scattered temperate islands. Use canvas cap with Hill core shifted to y=80-95 (north polar), plus 2-3 small offshore caps near equator. Heavy Multiply to drop land coverage to ~15%." },
-  { name: "Volcanic arcs (island chains)", refKey: "landmassFragmented", targetLand: [0.06, 0.14],
-    prompt: "Scattered small island arcs, ~10% land. Canvas cap with Multiply 0.3 land + heavy Trough + 1 Strait, plus 4-6 small offshore caps arranged in curved chains for the volcanic arcs." },
-  { name: "Mars-like (one dry continent)", refKey: "landmassPangaea", targetLand: [0.25, 0.45],
-    prompt: "One large dusty continent in the southern hemisphere + small polar cap. Canvas cap with Hill core at y=20-40 (south) + 1 small polar offshore cap at lat +75. ~35% land." },
-  { name: "Water world (mostly ocean)", refKey: "landmassFragmented", targetLand: [0.04, 0.10],
-    prompt: "Mostly ocean with 2-3 small archipelagos, ~7% land. Follow the system prompt's 'tropical archipelago' worked example -- canvas cap with Add 8 + heavy Multiply 0.35 + many Troughs + Straits, plus 2-3 offshore island caps." },
-  { name: "Twin continents (opposite hemispheres)", refKey: "landmassTwoContinents", targetLand: [0.20, 0.30],
-    prompt: "Two landmasses 180° apart in longitude. Canvas cap with two Hill cores at far-apart x positions (x=10-25 and x=75-90) + Strait 2 vertical between them to ensure separation. ~25% land." },
-  { name: "Continental drift", refKey: "landmassMultiContinent", targetLand: [0.18, 0.30],
-    prompt: "Two landmasses pulling apart with a deep central rift. Canvas cap with two Hill cores closer together (x=30-45 and x=55-70) + Strait 1 vertical right between them + Trough 6+ in the central rift zone. ~25% land." }
-];
+// PMAP_AI_PRESETS dissolved 2026-05-21 -- the AI pipeline no longer
+// does landmass generation. Landmass comes from the user (GeoJSON
+// import or brush). The AI only adds FEATURES (see PMAP_AI_KEYWORDS).
+// Kept as an empty array for any code paths that still reference it.
+const PMAP_AI_PRESETS = [];
 
-// Each keyword is a FEATURE that attaches to existing landmasses
-// (presets shape the world; keywords add detail). Each entry encodes
-// explicit geomorphology: LOCATION, SHAPE, PROMINENCE, VERB PATTERN.
-// The audit prompts instruct the LLM to analyze the previous JSON
-// plan before placing additions (so plains go leeward of existing
-// Ranges, peninsulas extend from existing coastlines, rifts slot
-// between existing caps). Output must remain a strict superset.
+// Feature chips. After 2026-05-21 redesign these are the ONLY AI-
+// driven knobs in the planet-map editor: the landmass comes from
+// the user (GeoJSON import or brush), and clicking chips + Add
+// Features asks the LLM to ADD each feature on top of the
+// existing landmass.
+//
+// Each audit's system prompt is now SELF-CONTAINED (no reference
+// to a 'previous plan'). The runtime wraps it with a user message
+// containing the current rendered image + an optional reference
+// image. The LLM emits a STANDALONE { "caps": [...] } plan that
+// gets applied with { skipReset, lockLand, skipCleanup,
+// skipSmoothing } so the landmass shape is preserved.
 const PMAP_AI_KEYWORDS = [
-  { label: "+ mountain ranges",  refKey: "himalayas",
-    phrase: "tall mountain ranges with snow-capped peaks (Range height 75-90, Hill peaks 85-100)",
-    audit: "Focused audit: MOUNTAIN RANGES. Reference image: Himalayas relief.\n\nGEOGRAPHY: linear-to-arcuate spine 1500-3000 km long, with 2-4 PARALLEL sub-ridges separated by longitudinal valleys, plus isolated higher peaks every 100-300 km along the crest. NOT a smooth dome.\n\nLAYERED PROMINENCE (like Pikes Peak to Colorado Springs -- a spiky path of varying prominence, not one big average raise):\n - Main spine at height 70-85\n - Parallel sub-ridges at 50-65\n - Isolated higher peaks at 90-100 spaced irregularly along the crest\n - Longitudinal valleys between sub-ridges at 18-30\n - Foothill scatter on aprons at 35-50\n\nAPPEND ONLY. For each cap MISSING this layered profile, APPEND BEFORE the final Mask:\n  Range 1 70-85 35-65 45-55\n  Range 2 50-65 35-65 38-48\n  Range 2 50-65 35-65 52-62\n  Hill 5 90-100 38-62 44-56\n  Hill 3 95-100 40-60 47-53\n  Trough 3 18-30 35-65 46-54\n  Hill 8 40-55 30-70 30-70\n  Smooth 1 0 0-100 0-100\n\nKeep every existing Range / Hill / height value. The output JSON is a strict superset." },
+  { label: "+ mountain ranges",
+    phrase: "tall mountain ranges with snow-capped peaks",
+    audit: "You are adding MOUNTAIN RANGES to an existing planet's landmass. Look at the current image -- the LAND is where you place mountains. Pick 1-3 of the LARGEST land regions visible.\n\nFor each, output a NEW cap with lat/lon centered ON that land region (not in the ocean), radiusDeg 25-45 to span the interior of the land. Verbs (Pikes-Peak-to-Colorado-Springs style: layered prominence, not one big dome):\n  Range 1 70-85 35-65 45-55     // main mountain spine\n  Range 2 50-65 35-65 38-48     // parallel sub-ridge\n  Range 2 50-65 35-65 52-62     // parallel sub-ridge other side\n  Hill 5 90-100 38-62 44-56     // isolated 5km-class peaks along crest\n  Hill 3 95-100 40-60 47-53     // ultra-summits\n  Trough 3 18-30 35-65 46-54    // longitudinal valleys between ridges\n  Hill 8 40-55 30-70 30-70      // foothills aprons\n\nOutput { \"caps\": [...] } only. No commentary." },
 
-  { label: "+ inland sea",       refKey: "medBathymetry",
-    phrase: "central inland sea cutting through the continent (like the Mediterranean)",
-    audit: "Focused audit: INLAND SEAS. Reference image: Mediterranean bathymetry.\n\nGEOGRAPHY: ENCLOSED basin INSIDE an existing large cap (or straddling 2-3 overlapping caps), surrounded by land on most sides. Center is OFFSET from cap center (eccentric). Aspect ratio 1:1 to 3:1. Surrounded by a ring of MODERATE uplift (Caucasus/Alps), NOT high peaks everywhere -- one or two sides drop lower (drainage gaps).\n\nAPPEND ONLY. Identify the largest existing cap. APPEND BEFORE its final Mask:\n  Range 2 40-55 10-30 40-60        # west flanking belt\n  Range 2 40-55 70-90 40-60        # east flanking belt (asymmetric prominence)\n  Pit 1 -60 35-65 35-65            # deep eccentric basin (the sea floor)\n  Smooth 2 0 30-70 30-70           # soften basin floor\n  Strait 1 horizontal 50 10-25     # narrow outlet (Gibraltar/Bosphorus analog)\n\nExisting verbs / heights untouched. Output is a strict superset of input." },
+  { label: "+ inland sea",
+    phrase: "central inland sea cutting through the continent",
+    audit: "You are adding an INLAND SEA to an existing planet's landmass. Look at the current image and find the LARGEST single land region. Place ONE cap centered INSIDE it (radiusDeg 25-40) with verbs that dig a basin in the cap interior:\n  Pit 1 -60 35-65 35-65         // deep central basin (the sea floor)\n  Pit 4 -30 30-70 30-70         // surrounding shallower water\n  Range 2 40-55 10-30 40-60     // west flanking shore mountains\n  Range 2 40-55 70-90 40-60     // east flanking shore mountains\n  Smooth 2 0 30-70 30-70        // soften basin floor\n\nThe Pit verbs will drop interior cells; lockLand restores cells that the engine considers OCEAN-becoming-land back to ocean, so the basin stays as inland water. Output { \"caps\": [...] } only." },
 
-  { label: "+ archipelago",      refKey: "javaArchipelago",
-    phrase: "scattered islands and small archipelago chains (like Indonesia)",
-    audit: "Focused audit: ARCHIPELAGO. Reference image: Java + neighboring islands.\n\nGEOGRAPHY: scattered SMALL caps in clusters, NOT one big landmass. Two valid placements: (a) BACK-ARC behind existing coastal mountains (50-200 km offshore from a coastal Range), or (b) tropical equatorial belt independent of continents.\n\nAPPEND ONLY. If no scattered small islands separate from main continents, ADD 3-6 NEW small caps with radiusDeg 12-22. Spread lon by 8-20° between adjacent caps, optionally vary lat by 5-10° (gentle arc curvature). Each new island cap's verbs:\n  Hill 6 25-38 20-80 20-80\n  Hill 2 60-75 40-60 40-60         # occasional volcanic core\n  Add -6 land 0 0\n  Mask 2 0 0 0\n\nExisting caps untouched. Output includes all previous caps + the new islands." },
+  { label: "+ archipelago",
+    phrase: "scattered islands and small archipelago chains",
+    audit: "You are adding an ARCHIPELAGO of small islands. Look at the current image and find OCEAN regions (the blue/dark areas) near existing land. Output 3-6 NEW small caps in those ocean zones, radiusDeg 8-18, with verbs that build small isolated islands:\n  Hill 4 30-45 30-70 30-70      // small landmass core\n  Hill 2 60-75 40-60 40-60      // optional volcanic high peak\n  Add -10 land 0 0              // erode coastlines\n  Smooth 1 0 0 0\n\nVary lat by 5-15° between caps and lon by 8-20° to scatter the islands. Output { \"caps\": [...] } only -- the engine's lockLand will let ocean cells become land here because YOUR new caps overlap ocean regions that the verbs lift above sealevel." },
 
-  { label: "+ peninsulas",       refKey: "italyPeninsula",
-    phrase: "long peninsulas extending from the coastlines (like Italy)",
-    audit: "Focused audit: PENINSULAS. Reference image: Italian peninsula relief.\n\nGEOGRAPHY: ELONGATED narrow strip (long axis ≥3× short axis) EXTENDING FROM an existing continent's coastline. NOT a free-floating cap -- the peninsula must geographically attach. Typical: 5-15° long, 1-4° wide. Usually has a central ridge (spine) running the length.\n\nAPPEND ONLY. ANALYZE the existing plan: find a large cap and pick a point ON its edge (offset 25-35° from cap center). ADD a NEW narrow cap centered there, radiusDeg 8-15, long axis pointing away from the parent continent. Verbs:\n  Range 1 12-25 30-70 20-80        # central spine running long axis\n  Hill 6 8-22 20-80 20-80          # body fill (narrow because cap is small)\n  Smooth 1 0 0-100 0-100           # coastal smoothing\n  Mask 1.5 0 0 0\n\nExisting caps untouched." },
+  { label: "+ peninsulas",
+    phrase: "long peninsulas extending from coastlines",
+    audit: "You are adding PENINSULAS extending from existing land. Look at the current image and find LAND COASTS (the edge between blue ocean and the landmass). Output 2-4 NEW small caps positioned ON the coastline (overlapping both land and ocean), radiusDeg 10-20, with verbs:\n  Range 1 30-45 30-70 20-80     // central spine of the peninsula\n  Hill 4 20-35 25-75 25-75      // body fill\n  Add -8 land 0 0               // sharpen coast\n  Smooth 1 0 0 0\n\nOrient each peninsula by choosing cap centers ON the coastline so the peninsula extends from existing land into ocean. Output { \"caps\": [...] } only." },
 
-  { label: "+ polar ice cap",    refKey: "antarcticaSvg",
-    phrase: "frozen polar ice cap covering high latitudes (like Antarctica)",
-    audit: "Focused audit: POLAR ICE. Reference image: Antarctica overview.\n\nGEOGRAPHY: high latitude > 60° or < -60°. Broad DOME (high center, tapering edges), spans the FULL longitudinal sweep at that latitude. May overlay existing land (Antarctica) or sit as floating shelf over ocean (Arctic).\n\nAPPEND ONLY. If no ice presence at high latitudes, ADD a NEW polar cap at lat 75 or -75, radiusDeg 35-50 (so it sweeps the pole). Verbs target the polar y-band:\n  Hill 1 25-35 0-100 35-65         # one massive dome (Hill falloff = center-weighted)\n  Hill 12 6-15 0-100 30-70         # secondary undulation\n  Range 2 65-80 25-75 40-60        # Transantarctic-style spine\n  Smooth 4 0 0-100 0-100           # glacier-flat surface\n  Mask 1.5 0 0 0\n\nExisting caps untouched." },
+  { label: "+ polar ice cap",
+    phrase: "frozen polar ice cap covering high latitudes",
+    audit: "You are adding a POLAR ICE CAP at a high latitude (lat > 60° or < -60°). Place ONE big cap at lat 75 (or -75 -- pick the pole with LAND visible in the current image, or the south pole if neither has land). radiusDeg 35-50. Verbs:\n  Hill 1 25-35 0-100 35-65      // massive central dome (snow accumulation)\n  Hill 12 6-15 0-100 30-70      // secondary undulation\n  Range 2 65-80 25-75 40-60     // Transantarctic-style ice-mountain spine\n  Smooth 4 0 0-100 0-100        // glacier-flat surface\n\nOutput { \"caps\": [...] } only." },
 
-  { label: "+ tropical jungle",  refKey: "amazon",
-    phrase: "lush tropical jungle in the equatorial belt (like the Amazon)",
-    audit: "Focused audit: TROPICAL ZONES. Reference image: Amazon Basin from orbit.\n\nGEOGRAPHY: equatorial belt lat 0±15°. This is a BIOME ZONE, not a height feature -- the contract is LOW elevation with LOW variance (humid lowland), NOT new mountains. If land already exists in the equatorial band, the audit's job is to FLATTEN+SMOOTH it; if no equatorial land exists, ADD a broad low-elevation cap there.\n\nAPPEND ONLY. ANALYZE existing plan: check whether caps overlap lat 0±15°. If YES, APPEND BEFORE the largest equatorial cap's final Mask:\n  Smooth 2 0 0-100 35-65           # heavy smoothing -> flat lowland\n  Hill 25 3-8 0-100 35-65          # tiny humid-hill texture only\nIf NO equatorial land exists, ADD a NEW cap at lat 0-10°, radiusDeg 35-50, verbs:\n  Hill 11 24-38 10-90 10-90\n  Hill 1 60-75 30-70 30-70         # occasional Andean foothill\n  Trough 5 12-20 0-20 0-100        # river-valley network\n  Smooth 2 0 0-100 0-100\n  Mask 1.5 0 0 0\n\nDo NOT add tall mountains in jungle zones -- jungle is LOW + FLAT." },
+  { label: "+ tropical jungle",
+    phrase: "lush tropical lowlands in the equatorial belt",
+    audit: "You are designating EQUATORIAL TROPICAL LOWLAND zones (biome marker, not new elevation). Place 1-2 NEW caps over LAND at lat between -15 and +15. radiusDeg 25-40. Verbs flatten + smooth, no new mountains:\n  Smooth 3 0 10-90 30-70        // heavy smoothing -> flat lowland\n  Hill 25 3-8 10-90 30-70       // tiny humid-hill texture only\n  Add -5 60-100 0 0             // shave off any peaks in the zone\n\nDO NOT add tall verbs (no Range, no Hill > 30) -- jungle is LOW + FLAT. Output { \"caps\": [...] } only." },
 
-  { label: "+ desert plateau",   refKey: "sahara",
-    phrase: "large arid desert plateau at mid-latitudes (like the Sahara)",
-    audit: "Focused audit: DESERT PLATEAU. Reference image: Saharan topography.\n\nGEOGRAPHY: horse latitudes (lat ±20-30°). LEEWARD of an existing mountain range (rain-shadow), OR deep continental interior far from coast. Shape: broad elevated TABLELAND -- high mean elevation but LOW variance, sharp edges, flat top. NOT a Range, NOT a dome.\n\nAPPEND ONLY. ANALYZE existing plan: find Range verbs whose y-range falls in mid-latitudes (lat 20-30° -> cap-y roughly 25-40 OR 60-75 if equator=50). Place the plateau LEEWARD (shifted +25% in x from those Ranges). If no qualifying Range exists, place at any x with existing land in the mid-lat band.\n\nAPPEND BEFORE the host cap's final Mask:\n  Hill 1 35-45 PLAT_X0-PLAT_X1 PLAT_Y0-PLAT_Y1  # one big broad uplift = plateau body\n  Smooth 3 0 PLAT_X0-PLAT_X1 PLAT_Y0-PLAT_Y1    # flatten the top heavily\n  Hill 6 4-10 PLAT_X0-PLAT_X1 PLAT_Y0-PLAT_Y1   # sparse mesa bumps\n  Multiply 0.9 PLAT_X0-PLAT_X1 PLAT_Y0-PLAT_Y1\n\n(substitute PLAT_X / PLAT_Y with concrete numbers based on the existing Range you found). Existing caps untouched." },
+  { label: "+ desert plateau",
+    phrase: "broad arid plateau at mid-latitudes",
+    audit: "You are adding a DESERT PLATEAU on existing land at mid-latitude (lat ±20-35°). Place 1-2 NEW caps over LAND in that lat band. radiusDeg 20-35. Verbs build a broad flat-topped uplift:\n  Hill 1 35-45 25-75 25-75      // one broad plateau body\n  Smooth 3 0 25-75 25-75        // flatten the top\n  Hill 6 4-10 25-75 25-75       // sparse mesa bumps\n  Multiply 0.9 25-75 25-75      // damp residual relief\n\nOutput { \"caps\": [...] } only." },
 
-  { label: "+ river valleys",    refKey: "nileRiver",
-    phrase: "river valleys carving through the continents (like the Nile)",
-    audit: "Focused audit: RIVER VALLEYS. Reference image: Nile River and delta.\n\nGEOGRAPHY: Rivers CARVE from a Range (headwaters) to a coast (delta), entirely WITHIN one cap. Need elevation gradient between two existing features. Shape: BRANCHING dendritic, narrow, GENTLE gradient -- NOT a deep trench. Widens + shallows toward mouth.\n\nAPPEND ONLY. ANALYZE existing plan: for each cap that has BOTH a Range verb AND extends to its edge (= coast), APPEND BEFORE its final Mask:\n  Trough 1 -5 to -8 50-50 20-80    # gentle main valley spanning interior to edge\n  Trough 3 -3 to -5 40-60 30-70    # tributaries (shorter, scattered)\n  Pit 1 -2 to -4 50-50 75-85       # delta depression near coast\n  Smooth 3 0 30-70 20-80           # rivers don't have cliff walls\n\nCrucially LOW depth magnitudes (-2 to -8), NOT trench-deep. Don't add valleys to caps without an existing Range." },
+  { label: "+ river valleys",
+    phrase: "river valleys carving through the continents",
+    audit: "You are carving RIVER VALLEYS into existing land. Place 2-4 NEW caps over LAND, each radiusDeg 15-30, with shallow Trough verbs to carve dendritic gentle valleys:\n  Trough 1 -6 50-50 20-80       // main valley spine running interior to coast\n  Trough 3 -4 40-60 30-70       // tributaries\n  Pit 1 -3 50-50 75-85          // delta depression near coast\n  Smooth 3 0 30-70 20-80        // rivers don't have cliff walls\n\nLow depth magnitudes (-3 to -6) -- rivers are channels, not trenches. Output { \"caps\": [...] } only." },
 
-  { label: "+ coastal mountains",refKey: "scandinavia",
-    phrase: "mountain ranges along the coastlines (like the Norwegian fjords)",
-    audit: "Focused audit: COASTAL MOUNTAINS. Reference image: Scandinavia topography.\n\nGEOGRAPHY: within 50-150 km of an existing coast (= cap edge, x 0-20 or 80-100). ASYMMETRIC -- steep seaward escarpment, gentler interior slope. Dissected by FJORDS / glacial valleys perpendicular to the spine. Isolated stratovolcanoes poking 30-50% above ridgeline.\n\nAPPEND ONLY. For each existing cap, APPEND BEFORE its final Mask (choose west OR east coast based on where existing land mass faces ocean):\n  Range 1 75-85 5-20 30-70          # main coastal ridge, x near cap edge\n  Hill 6 50-65 5-25 25-75           # ridge thickness, biased to coast side\n  Hill 3 90-100 8-22 40-60          # stratovolcano cones poking up\n  Trough 6 18-28 5-25 30-70         # fjord/glacial valley dissection\n  Hill 4 35-50 15-30 25-75          # interior foothills (asymmetric: gentler inland)\n  Pit 2 8-15 8-20 40-55             # caldera/crater lakes on volcanic peaks\n  Smooth 1 0 0-100 0-100\n\nKEEP all existing Range / Hill verbs unchanged. Mirror for x 80-95 if continent has two coasts." },
+  { label: "+ coastal mountains",
+    phrase: "mountain ranges along the coastlines (like Norwegian fjords or the Cascades)",
+    audit: "You are adding COASTAL MOUNTAINS along existing land coasts. Place 1-3 NEW caps positioned so the cap CENTER is ON A COASTLINE (overlapping both land and ocean). radiusDeg 20-35. Verbs concentrate the range at the cap edge nearest the ocean:\n  Range 1 75-85 5-20 30-70      // main coastal ridge, x near cap edge\n  Hill 6 50-65 5-25 25-75       // ridge thickness biased to coast side\n  Hill 3 90-100 8-22 40-60      // stratovolcano cones\n  Trough 6 18-28 5-25 30-70     // fjord/glacial valley dissection\n  Hill 4 35-50 15-30 25-75      // interior foothills (gentler inland)\n  Pit 2 8-15 8-20 40-55         // caldera/crater lakes\n  Smooth 1 0 0-100 0-100\n\nOutput { \"caps\": [...] } only." },
 
-  { label: "+ volcanic chain",   refKey: "kamchatka",
-    phrase: "chain of volcanic islands or peaks in a curved arc (like Kamchatka)",
-    audit: "Focused audit: VOLCANIC CHAINS. Reference image: Kamchatka shaded relief.\n\nGEOGRAPHY: STRING of DISCRETE isolated cones along a line or arc. Cones are NOT connected by a ridge (unlike Range mountains). Two flavors: HOT-SPOT (straight line, like Hawaii) or ARC (curved, parallel to a subduction trench, like Aleutians). Spacing 50-200 km between cones. Cones are TALL relative to their surroundings (90-100 height rising from 0-15 baseline).\n\nAPPEND ONLY. If no curved arrangement of small isolated high peaks, ADD 5-8 NEW small caps (radiusDeg 10-18) arranged along a line or arc. For an arc: vary lat by 5-10° per cap and lon by 8-15° per cap (total arc 30-60° lon, slight curvature). Each volcanic cap's verbs:\n  Hill 1 90-100 40-60 40-60        # discrete tall cone in center of cap\n  Pit 1 30-50 45-55 45-55          # summit caldera on the cone\n  Hill 4 20-35 25-75 25-75         # gentle shield apron around cone\n  Mask 1.5 0 0 0\n\nDO NOT add a Range -- discrete cones, not a ridge. Existing caps untouched." },
+  { label: "+ volcanic chain",
+    phrase: "chain of volcanic islands or peaks in a curved arc (like Kamchatka or Hawaii)",
+    audit: "You are adding a VOLCANIC CHAIN of discrete cone peaks. Place 5-8 NEW small caps along a LINE or curved ARC -- vary lat by 5-10° and lon by 8-15° between adjacent caps. radiusDeg 8-16 (small -- each cap is one cone). Verbs build a single discrete cone per cap:\n  Hill 1 90-100 40-60 40-60     // discrete tall cone\n  Pit 1 30-50 45-55 45-55       // summit caldera\n  Hill 4 20-35 25-75 25-75      // gentle shield apron\n\nCaps can be placed in OCEAN to create island chains (Hawaiian-style) or ON LAND to create volcanic mountain ranges (Andean-style). Output { \"caps\": [...] } only." },
 
-  { label: "+ deep ocean trench",refKey: "marianaTrench",
-    phrase: "deep ocean trench running parallel to a coastline (like the Mariana Trench)",
-    audit: "Focused audit: OCEAN TRENCHES. Reference image: Mariana Trench bathymetry.\n\nGEOGRAPHY: long THIN SLIVER (aspect ratio 10:1 to 30:1), 15-40° long and 1-3° wide. Hugs the OUTER EDGE of an existing continental cap, 2-5° offshore, PARALLEL to the coastline. Always paired with a parallel VOLCANIC ARC on the continental edge (without the arc, it's not a subduction trench).\n\nAPPEND ONLY. ADD a new THIN ELONGATE cap tangent to an existing continental cap's ocean side, radiusDeg 3-6, oriented along the host coastline. Inside it:\n  Trough 1 -85 10-90 45-55         # deepest sliver, dead-center along long axis\n  Smooth 1 0 0-100 0-100\n  Mask 2 0 0 0\n\nTHEN, in the PARENT continental cap (the one the trench hugs), APPEND near the shared border BEFORE its final Mask to enforce the parallel arc pairing:\n  Range 3 60-80 0-15 20-80         # parallel volcanic arc on coast side\n  Hill 4 85-100 5-20 30-70         # isolated volcanic cones along the arc\n\nExisting verbs untouched. Output is a strict superset." },
+  { label: "+ deep ocean trench",
+    phrase: "deep ocean trench running parallel to a coastline",
+    audit: "You are deepening a STRIP OF OCEAN parallel to existing land. Place 1-2 NEW thin caps in OCEAN, just offshore of a continental coast (cap CENTER in ocean, 3-8° offshore from coast). radiusDeg 6-12. Verbs:\n  Trough 1 -85 10-90 45-55      // deep ocean-bottom slot\n  Pit 4 -50 20-80 40-60         // secondary deepenings along the trench\n  Smooth 1 0 0-100 0-100\n\nThe trench should run roughly parallel to a nearby continent's coastline. Output { \"caps\": [...] } only." },
 
   { label: "+ rift / divergent",
-    phrase: "linear rift valley between landmasses (like the East African Rift or Mid-Atlantic Ridge)",
-    audit: "Focused audit: RIFTS. Rifts live in the MEDIAN BETWEEN landmasses (divergent boundaries) and are razor-thin slivers, often segmented. They are NOT random Pits -- they have specific geometry.\n\nGEOGRAPHY: 20-60° long, 0.5-2° wide. Two valid placements:\n  (a) BETWEEN two existing cap clusters (compute midpoint of the two largest caps' centers).\n  (b) SPLITTING through a single large cap (like East African Rift bisecting Africa).\nFlanking SHOULDER UPLIFTS are diagnostic (parallel ridges on both sides of the central graben).\n\nAPPEND ONLY. ANALYZE existing plan to find the two largest caps. Compute their midpoint. ADD a NEW elongate cap at that midpoint, radiusDeg 15-25, long axis ALONG the midpoint-connecting line. Verbs:\n  Range 2 30-45 20-40 40-60        # west shoulder uplift\n  Range 2 30-45 60-80 40-60        # east shoulder uplift\n  Trough 1 -45 45-55 10-90         # deep central graben sliver\n  Strait 1 vertical 50 0           # flood floor for an OCEAN rift; OMIT for a dry continental rift\n  Mask 2 0 0 0\n\nExisting caps untouched." },
+    phrase: "linear rift valley between landmasses (like East African Rift or Mid-Atlantic Ridge)",
+    audit: "You are adding a RIFT VALLEY -- a thin linear depression. Place 1-2 NEW caps centered on the LINE between two land regions (or splitting one large land region). radiusDeg 15-25. Verbs:\n  Range 2 30-45 20-40 40-60     // west shoulder uplift (parallel ridge)\n  Range 2 30-45 60-80 40-60     // east shoulder uplift\n  Trough 1 -45 45-55 10-90      // deep central graben sliver\n  Pit 3 -20 40-60 30-70         // segmented rift lakes\n\nFor an ocean rift (Mid-Atlantic Ridge), place the cap in ocean between distant continents. For a continental rift (East African Rift), place it ON existing land. Output { \"caps\": [...] } only." },
 
-  { label: "+ rolling plains",   refKey: "greatPlains",
-    phrase: "broad rolling plains covering most of the land (like the Great Plains)",
-    audit: "Focused audit: ROLLING PLAINS. Reference image: US Great Plains.\n\nGEOGRAPHY: mid-latitudes (lat ±30-55°). ALWAYS ADJACENT TO an existing mountain range (leeward / rain-shadow side). NOT placed randomly. The plain extends 15-30° AWAY from the mountain front in the prevailing-wind (leeward) direction. Continent interior, gently downsloping piedmont -> distal plain.\n\nAPPEND ONLY. ANALYZE existing plan: for each existing Range verb at x-range (rx0..rx1) y-range (ry0..ry1), the plains belt is:\n  plain_x0 = rx1 + 5\n  plain_x1 = min(rx1 + 30, 95)\n  plain_y0 = ry0\n  plain_y1 = ry1\n\nAPPEND to the host cap BEFORE its final Mask:\n  Smooth 1 0 plain_x0-plain_x1 plain_y0-plain_y1\n  Hill 40 5-12 plain_x0-plain_x1 plain_y0-plain_y1    # many tiny hills, low height\n  Hill 8 12-22 plain_x0-plain_x1 plain_y0-plain_y1    # a few prairie swells\n  Multiply 0.6 plain_x0-plain_x1 plain_y0-plain_y1    # damp overall relief\n\n(substitute the literal numbers from the existing Range you analyzed). If NO Range verbs exist in the previous plan, do NOTHING -- plains require mountains to be adjacent to. KEEP all existing high-elevation verbs." },
+  { label: "+ rolling plains",
+    phrase: "broad rolling plains (like the Great Plains)",
+    audit: "You are adding ROLLING PLAINS on existing land -- broad gentle low relief, no new mountains. Place 1-3 NEW caps over LAND, ideally at mid-latitude (lat ±25-55°). radiusDeg 20-40. Verbs:\n  Smooth 1 0 0-100 0-100\n  Hill 40 5-12 10-90 10-90      // many tiny hills (prairie texture)\n  Hill 8 12-22 10-90 10-90      // a few prairie swells\n  Multiply 0.6 0-100 0-100      // damp existing high relief\n\nMultiply 0.6 partially LOWERS mountains inside the cap -- intentional, plains erase ruggedness. Output { \"caps\": [...] } only." },
 
-  { label: "+ rugged highlands", refKey: "tibetanPlateau",
-    phrase: "rugged highland regions with peaks and valleys mixed (like Tibetan Plateau)",
-    audit: "Focused audit: RUGGED HIGHLANDS. Reference image: Tibetan Plateau topography.\n\nGEOGRAPHY: broad ELEVATED PLATEAU with rolling internal relief (NOT a linear spine, NOT a single dome). Roughly equidimensional (500-2500 km across, NOT linear). Elevated baseline + scattered higher massifs + deep INCISED gorges (cutting back down but NOT to sea level).\n\nLAYERED PROFILE:\n - Broad plateau dome at height 60 (Hill 1 single large mound)\n - Rolling plateau-surface relief at 50-65\n - Residual higher massifs at 75-90\n - Incised river gorges down to 25-35 (NOT zero)\n - Fine-scale ruggedness on top\n\nAPPEND ONLY. For each existing cap representing land, APPEND BEFORE its final Mask:\n  Hill 1 60-70 25-75 25-75          # broad plateau dome (one big mound)\n  Hill 12 55-70 30-70 30-70         # rolling plateau-surface relief\n  Hill 5 80-92 30-70 30-70          # residual higher massifs\n  Trough 4 25-35 25-75 25-75        # incised river gorges (DO NOT reach baseline)\n  Hill 20 50-60 28-72 28-72         # fine-scale ruggedness\n  Smooth 2 0 0-100 0-100\n\nKEEP all existing verbs unchanged. Output is a strict superset." }
+  { label: "+ rugged highlands",
+    phrase: "rugged highland regions with mixed peaks and valleys (like Tibetan Plateau)",
+    audit: "You are adding a RUGGED HIGHLAND PLATEAU. Place 1-2 NEW caps over LAND, radiusDeg 20-35. Verbs build an elevated plateau with internal complexity:\n  Hill 1 60-70 25-75 25-75      // broad plateau dome\n  Hill 12 55-70 30-70 30-70     // rolling plateau-surface relief\n  Hill 5 80-92 30-70 30-70      // residual massifs above plateau\n  Trough 4 25-35 25-75 25-75    // incised river gorges (NOT to baseline)\n  Hill 20 50-60 28-72 28-72     // fine-scale ruggedness\n  Smooth 2 0 0-100 0-100\n\nOutput { \"caps\": [...] } only." }
 ];
+
 
 function openPlanetMapEditor(nodeId) {
   const node = state && state.nodes && state.nodes.find(n => n && n.id === nodeId);
@@ -71276,26 +70953,13 @@ function openPlanetMapEditor(nodeId) {
   aiRow.style.cssText =
     "display:flex;flex-direction:column;gap:6px;margin-top:8px;" +
     "font-family:var(--font-mono);font-size:11px;color:var(--text-2);";
-  const presetOpts = PMAP_AI_PRESETS.map((p, i) => '<option value="' + i + '">' + p.name + '</option>').join("");
   aiRow.innerHTML =
     '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">' +
-      '<label style="display:flex;align-items:center;gap:6px;">' +
-        '<span>preset</span>' +
-        '<select id="pmap-ai-preset" style="background:var(--surface);color:var(--text);border:1px solid var(--border);padding:3px 6px;font-family:var(--font-mono);font-size:11px;border-radius:3px;">' + presetOpts + '</select>' +
-      '</label>' +
-      '<label style="flex:1;display:flex;align-items:center;gap:6px;min-width:240px;">' +
-        '<span>describe</span>' +
-        '<input type="text" id="pmap-ai-prompt" placeholder="describe the planet, or pick a preset" style="flex:1;background:var(--surface);color:var(--text);border:1px solid var(--border);padding:4px 8px;font-family:var(--font-mono);font-size:11px;border-radius:3px;">' +
-      '</label>' +
-      '<button class="btn" id="pmap-ai-go" type="button" style="padding:3px 12px;">generate</button>' +
-      '<button class="btn" id="pmap-clearlock" type="button" style="padding:3px 10px;display:none;">clear target</button>' +
-    '</div>' +
-    '<div style="display:flex;align-items:center;gap:6px;font-size:10px;color:var(--text-3);">' +
-      '<label style="display:flex;align-items:center;gap:6px;"><input type="checkbox" id="pmap-ai-useref" checked style="margin:0;">🌍 attach real-world heightmap reference</label>' +
-      '<button class="btn" id="pmap-ai-refinfo" type="button" style="padding:1px 6px;font-size:10px;" title="show reference image sources">ⓘ sources</button>' +
+      '<span style="color:var(--phosphor);">add features</span>' +
+      '<span style="color:var(--text-3);font-size:10px;">pick chips below, then click ADD FEATURES. landmass comes from the brush or geojson import; chips add detail on top.</span>' +
+      '<button class="btn" id="pmap-ai-go" type="button" style="padding:3px 12px;">add features</button>' +
     '</div>' +
     '<div id="pmap-ai-keywords" style="display:flex;flex-wrap:wrap;gap:4px;"></div>' +
-    '<span id="pmap-lockinfo" style="color:var(--text-3);font-size:10px;">shift-click the map to lock the first continent\'s position. ai uses the wired provider (Settings → AI).</span>' +
     '<span id="pmap-ai-status" style="color:var(--text-3);font-size:10px;min-height:14px;"></span>';
   body.appendChild(aiRow);
 
@@ -71316,58 +70980,13 @@ function openPlanetMapEditor(nodeId) {
       b.textContent = kw.label;
       setChipStyle(b, false);
       b.addEventListener("click", () => {
-        const promptIn = modal.querySelector("#pmap-ai-prompt");
         const active = activeKeywords.has(kw.label);
-        if (active) {
-          activeKeywords.delete(kw.label);
-          setChipStyle(b, false);
-          // Remove the phrase from the prompt if it's present.
-          const re = new RegExp(",?\\s*" + kw.phrase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
-          promptIn.value = promptIn.value.replace(re, "").replace(/^,\s*/, "").trim();
-        } else {
-          activeKeywords.add(kw.label);
-          setChipStyle(b, true);
-          const cur = promptIn.value.trim();
-          promptIn.value = cur ? (cur + ", " + kw.phrase) : kw.phrase;
-        }
-        promptIn.focus();
+        if (active) { activeKeywords.delete(kw.label); setChipStyle(b, false); }
+        else        { activeKeywords.add(kw.label);    setChipStyle(b, true);  }
       });
       chipBar.appendChild(b);
     });
   }
-  // Preset dropdown fills the prompt field.
-  modal.querySelector("#pmap-ai-preset").addEventListener("change", (ev) => {
-    const idx = +ev.target.value;
-    const preset = PMAP_AI_PRESETS[idx];
-    if (!preset) return;
-    modal.querySelector("#pmap-ai-prompt").value = preset.prompt;
-  });
-
-  // Sources popup (info button).
-  modal.querySelector("#pmap-ai-refinfo").addEventListener("click", () => {
-    let html = "<div style='padding:10px 14px;'>";
-    html += "<div style='font-family:var(--font-mono);font-size:11px;color:var(--text-2);margin-bottom:8px;'>Reference heightmap sources (all CORS-friendly Wikimedia Commons thumbnails):</div>";
-    Object.keys(PMAP_AI_REFERENCES).forEach(k => {
-      const r = PMAP_AI_REFERENCES[k];
-      html += "<div style='margin-bottom:6px;font-family:var(--font-mono);font-size:10px;line-height:1.5;'>";
-      html += "<b style='color:var(--phosphor);'>" + k + "</b><br>";
-      html += "<span style='color:var(--text-2);'>" + r.credit + "</span><br>";
-      html += "<a href='" + r.sourcePage + "' target='_blank' rel='noopener' style='color:var(--phosphor);font-size:9px;'>source page</a><br>";
-      html += "<span style='color:var(--text-3);font-size:9px;'>applies to: " + r.appliesTo + "</span>";
-      html += "</div>";
-    });
-    html += "<div style='color:var(--text-3);font-size:9px;margin-top:8px;'>Each preset auto-picks the best ref. Audit rounds use the current painter view, not these refs.</div>";
-    html += "</div>";
-    const popup = document.createElement("div");
-    popup.className = "modal-backdrop";
-    popup.style.display = "flex";
-    popup.style.zIndex = 80;
-    popup.innerHTML = "<div class='modal' style='width:520px;max-height:70vh;overflow-y:auto;'>" +
-      "<div class='modal-head'><span class='modal-title' style='font-family:var(--font-instr);letter-spacing:0.18em;color:var(--phosphor);'>ai reference sources</span><button class='btn modal-x' id='pmap-refinfo-close' type='button'>×</button></div>" + html + "</div>";
-    document.body.appendChild(popup);
-    popup.querySelector("#pmap-refinfo-close").addEventListener("click", () => popup.remove());
-    popup.addEventListener("click", (ev) => { if (ev.target === popup) popup.remove(); });
-  });
   const helpRow = document.createElement("div");
   helpRow.style.cssText =
     "font-family:var(--font-mono);font-size:10px;color:var(--text-3);margin-top:6px;line-height:1.5;";
@@ -71565,38 +71184,29 @@ function openPlanetMapEditor(nodeId) {
     }
   });
 
-  // AI generate + lock-target wire-up.
-  const lockInfo = modal.querySelector("#pmap-lockinfo");
-  const clearLockBtn = modal.querySelector("#pmap-clearlock");
-  const aiPromptIn = modal.querySelector("#pmap-ai-prompt");
-  const aiGoBtn    = modal.querySelector("#pmap-ai-go");
-  const aiStatus   = modal.querySelector("#pmap-ai-status");
-  function updateLockInfo() {
-    if (lockedCenter) {
-      lockInfo.textContent = "first continent locked at lat " + lockedCenter.lat.toFixed(1) + "° lon " + lockedCenter.lon.toFixed(1) + "°. generate places it here.";
-      clearLockBtn.style.display = "";
-    } else {
-      lockInfo.textContent = "shift-click the map to lock where the first continent lands. uses the wired AI provider (Settings → AI).";
-      clearLockBtn.style.display = "none";
-    }
-  }
-  clearLockBtn.addEventListener("click", () => { lockedCenter = null; updateLockInfo(); render(); });
+  // AI 'add features' wire-up.
+  const aiGoBtn  = modal.querySelector("#pmap-ai-go");
+  const aiStatus = modal.querySelector("#pmap-ai-status");
 
   let aiBusy = false;
   aiGoBtn.addEventListener("click", async () => {
     if (aiBusy) return;
-    const prompt = aiPromptIn.value.trim();
-    if (!prompt) { aiStatus.textContent = "type a description first"; return; }
+    const activeKwObjs = PMAP_AI_KEYWORDS.filter(k => activeKeywords.has(k.label));
+    if (activeKwObjs.length === 0) { aiStatus.textContent = "pick at least one feature chip first"; return; }
+    // Verify there's existing landmass to add features to.
+    const lmPre = _planetMeasureLandmass(cells, seaLevel);
+    if (lmPre.landFraction < 0.005) {
+      aiStatus.textContent = "no landmass detected -- import a geojson or paint some land first";
+      return;
+    }
     aiBusy = true;
     aiGoBtn.disabled = true;
     aiGoBtn.textContent = "...";
     aiStatus.textContent = "asking " + aiSettings.provider + "…";
     try {
-      // Show biome view during generation so vision-audit gets the
-      // climate-colored image (matches what the LLM sees in examples).
+      // Use biome view during audits so the LLM sees colored land/ocean.
       const wasShowing = showClimate;
       showClimate = true;
-      // Force climate to be computable for the audit render.
       _ensurePlanetClimate(node, seaLevel);
       _ensurePlanetRivers(node, seaLevel);
       const repaint = () => {
@@ -71605,40 +71215,26 @@ function openPlanetMapEditor(nodeId) {
         _ensurePlanetRivers(node, seaLevel);
         render();
       };
-      // Gather the active keyword chips; each gets its own focused
-      // audit pass after the baseline audit.
-      const activeKwObjs = PMAP_AI_KEYWORDS.filter(k => activeKeywords.has(k.label));
-      const useRef = !!modal.querySelector("#pmap-ai-useref").checked;
-      // Pick the reference image keyed to the active preset, if any.
-      const presetIdx = +modal.querySelector("#pmap-ai-preset").value;
-      const activePreset = PMAP_AI_PRESETS[presetIdx] || PMAP_AI_PRESETS[0];
-      const refKey = useRef ? (activePreset.refKey || "earth") : null;
-      const targetLand = activePreset.targetLand || [0.18, 0.32];
       const stats = await _planetGenerateFromAI(
-        prompt, cells, node._cellNeighbors, node._cellNeighborsK,
+        "", cells, node._cellNeighbors, node._cellNeighborsK,
         seaLevel, lockedCenter,
         s => { aiStatus.textContent = s; },
-        canvas, repaint, activeKwObjs, refKey, targetLand
+        canvas, repaint, activeKwObjs, null, null
       );
       dirty = true;
       showClimate = wasShowing;
       climateBtn.textContent = showClimate ? "hide climate" : "show climate";
       render();
-      // Land-coverage measurement.
       const lm = _planetMeasureLandmass(cells, seaLevel);
       const pct = (lm.landFraction * 100).toFixed(1);
-      const tgtLo = (targetLand[0] * 100).toFixed(0), tgtHi = (targetLand[1] * 100).toFixed(0);
-      const inBand = (lm.landFraction >= targetLand[0] && lm.landFraction <= targetLand[1]);
-      const marker = inBand ? "✓" : "⚠";
-      aiStatus.textContent = "done: " + stats.caps + " caps, " + stats.rounds + " rounds, " + stats.ms + "ms · land " + pct + "% " + marker + " (target " + tgtLo + "-" + tgtHi + "%)";
-      console.log("[planet-map] landmass: " + lm.landCells + "/" + lm.totalCells + " cells = " + pct + "% (target " + tgtLo + "-" + tgtHi + "%)");
+      aiStatus.textContent = "done: " + stats.rounds + " feature pass(es), " + stats.ms + "ms · land " + pct + "%";
     } catch (err) {
       aiStatus.textContent = "error: " + (err.message || err);
-      console.error("[planet-map] AI generation failed:", err);
+      console.error("[planet-map] feature generation failed:", err);
     } finally {
       aiBusy = false;
       aiGoBtn.disabled = false;
-      aiGoBtn.textContent = "generate";
+      aiGoBtn.textContent = "add features";
     }
   });
 
@@ -71677,14 +71273,11 @@ function openPlanetMapEditor(nodeId) {
     const r = canvas.getBoundingClientRect();
     const px = Math.floor((ev.clientX - r.left) / r.width * W);
     const py = Math.floor((ev.clientY - r.top) / r.height * H);
-    if (ev.shiftKey) {
-      const lat = 90 - ((py + 0.5) / H) * 180;
-      const lon = ((px + 0.5) / W) * 360 - 180;
-      lockedCenter = { lat, lon };
-      updateLockInfo();
-      render();
-      return;
-    }
+    // Shift-click locked-target removed 2026-05-21 with the AI
+    // landmass pass. Lock-target only made sense when the LLM was
+    // placing the FIRST cap of a generated continent; with no AI
+    // landmass round and GeoJSON-based input, there's nothing to
+    // lock to. Brush paints continue normally below.
     canvas.setPointerCapture(ev.pointerId);
     painting = true;
     stamp(px, py);
