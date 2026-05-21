@@ -52666,6 +52666,15 @@ struct PerScene {
   //   envPlanetAtm.w  = sun radiance multiplier (calibrated ~22 for Earth)
   envPlanet:    vec4<f32>,
   envPlanetAtm: vec4<f32>,
+  // Sprint 7.6.b-atm Tier-C.0+ -- planet geometry. The planet is
+  // rendered as an oblate spheroid (Y axis scaled by polRatio),
+  // so the atmosphere must intersect/sample against the SAME
+  // ellipsoid shape rather than a sphere. envPlanetGeom.x carries
+  // the polRatio; remaining slots reserved for future expansion
+  // (e.g. axial-tilt quaternion when planets get rotation).
+  //   envPlanetGeom.x = polRatio (1.0 = perfect sphere)
+  //   envPlanetGeom.yzw = reserved
+  envPlanetGeom: vec4<f32>,
 };
 
 // Sprint 7.5.4.e -- ACES filmic tonemap. Maps HDR (values > 1) into
@@ -53072,6 +53081,36 @@ struct AtmResult {
   transmittance: vec3<f32>
 };
 
+// Ray-ELLIPSOID intersection (oblate spheroid with Y-axis scaled by
+// polRatio). The planet renders with Y compressed by polRatio (the
+// Earth's WGS84 ratio = 0.9966); to align the atmosphere shell with
+// the actual rendered planet shape, intersect against the matching
+// ellipsoid instead of a sphere.
+//
+// Trick: scale the ray's Y by 1/polRatio. In that scaled space the
+// ellipsoid is a unit sphere of radius r, and t parameters transfer
+// 1:1 with the unscaled ray (because we scale both origin and dir
+// by the same factor, the t parameter still indexes the original
+// world-space position along the ray). Standard quadratic from
+// |O + t*D|² = r², but using the general form because the scaled
+// direction is no longer unit-length.
+fn _atm_ray_ellipsoid(origin: vec3<f32>, dir: vec3<f32>, center: vec3<f32>, r: f32, polRatio: f32) -> vec2<f32> {
+  let invPol = 1.0 / max(polRatio, 1e-6);
+  let scale  = vec3<f32>(1.0, invPol, 1.0);
+  let oc = (origin - center) * scale;
+  let dd = dir * scale;
+  let A = dot(dd, dd);
+  let B = dot(oc, dd);
+  let C = dot(oc, oc) - r * r;
+  let h = B * B - A * C;
+  if (h < 0.0) { return vec2<f32>(0.0, -1.0); }
+  let s = sqrt(h);
+  let invA = 1.0 / max(A, 1e-12);
+  return vec2<f32>((-B - s) * invA, (-B + s) * invA);
+}
+
+// Backward-compat sphere intersection. Equivalent to ellipsoid with
+// polRatio=1 -- some non-atmospheric callers may still use this.
 fn _atm_ray_sphere(origin: vec3<f32>, dir: vec3<f32>, center: vec3<f32>, r: f32) -> vec2<f32> {
   let oc = origin - center;
   let b = dot(oc, dir);
@@ -53104,17 +53143,21 @@ fn _atm_integrate(rayOrigin: vec3<f32>, rayDir: vec3<f32>, maxDist: f32) -> AtmR
     return AtmResult(vec3<f32>(0.0), vec3<f32>(1.0));
   }
 
+  // Tier C.0+ -- pull polRatio so atmosphere and planet match shape.
+  let polRatio = max(0.5, min(2.0, uS.envPlanetGeom.x));
+  let invPol = 1.0 / polRatio;
+
   let unitScale = ATM_EARTH_R / planetR;
   let betaR = vec3<f32>(5.8e-6, 13.5e-6, 33.1e-6) * unitScale;
   let betaM = vec3<f32>(21.0e-6) * unitScale * turbidity;
 
-  let atmHit = _atm_ray_sphere(rayOrigin, rayDir, planetC, atmR);
+  let atmHit = _atm_ray_ellipsoid(rayOrigin, rayDir, planetC, atmR, polRatio);
   if (atmHit.y < 0.0) { return AtmResult(vec3<f32>(0.0), vec3<f32>(1.0)); }
   var t0 = max(atmHit.x, 0.0);
   var t1 = atmHit.y;
 
   // Clip to ground if the ray would otherwise pass through the planet.
-  let groundHit = _atm_ray_sphere(rayOrigin, rayDir, planetC, planetR);
+  let groundHit = _atm_ray_ellipsoid(rayOrigin, rayDir, planetC, planetR, polRatio);
   if (groundHit.x > 0.0 && groundHit.x < t1) { t1 = groundHit.x; }
   // Clip to fragment (aerial-perspective mode): when a surface is in
   // front of the atmosphere far side, stop the integral at the surface.
@@ -53130,10 +53173,19 @@ fn _atm_integrate(rayOrigin: vec3<f32>, rayDir: vec3<f32>, maxDist: f32) -> AtmR
   var opticalDepthR = 0.0;
   var opticalDepthM = 0.0;
 
+  // Altitude above ellipsoid surface: scale Y by 1/polRatio to bring
+  // the planet into a unit-sphere shape, compute (|p_scaled| - r), then
+  // approximate altitude in world units. Exact altitude-above-ellipsoid
+  // is more complex (closest-point calculation), but for atmospheric
+  // density purposes this approximation is accurate enough -- the
+  // density curve is exponential so small errors in altitude have
+  // tiny effect.
+  let scaleAxes = vec3<f32>(1.0, invPol, 1.0);
+
   for (var i: i32 = 0; i < NUM_SAMPLES; i = i + 1) {
     let t = t0 + (f32(i) + 0.5) * dt;
     let p = rayOrigin + rayDir * t;
-    let h = max(0.0, length(p - planetC) - planetR);
+    let h = max(0.0, length((p - planetC) * scaleAxes) - planetR);
 
     let densityR = exp(-h / scaleHR) * dt;
     let densityM = exp(-h / scaleHM) * dt;
@@ -53141,10 +53193,10 @@ fn _atm_integrate(rayOrigin: vec3<f32>, rayDir: vec3<f32>, maxDist: f32) -> AtmR
     opticalDepthM = opticalDepthM + densityM;
 
     // Sun-ray segment from p outward (uS.envSun is direction TO sun).
-    let sunHit = _atm_ray_sphere(p, sunDir, planetC, atmR);
+    let sunHit = _atm_ray_ellipsoid(p, sunDir, planetC, atmR, polRatio);
     if (sunHit.y < 0.0) { continue; }
     // Skip samples where the sun is blocked by the planet itself.
-    let sunGround = _atm_ray_sphere(p, sunDir, planetC, planetR);
+    let sunGround = _atm_ray_ellipsoid(p, sunDir, planetC, planetR, polRatio);
     if (sunGround.x > 0.0 && sunGround.x < sunHit.y) { continue; }
 
     let sunSegLen = sunHit.y;
@@ -53155,7 +53207,7 @@ fn _atm_integrate(rayOrigin: vec3<f32>, rayDir: vec3<f32>, maxDist: f32) -> AtmR
     for (var j: i32 = 0; j < SUN_SAMPLES; j = j + 1) {
       let ts = (f32(j) + 0.5) * dtSun;
       let ps = p + sunDir * ts;
-      let hs = max(0.0, length(ps - planetC) - planetR);
+      let hs = max(0.0, length((ps - planetC) * scaleAxes) - planetR);
       sunDepthR = sunDepthR + exp(-hs / scaleHR) * dtSun;
       sunDepthM = sunDepthM + exp(-hs / scaleHM) * dtSun;
     }
@@ -61427,9 +61479,11 @@ function _ensureSceneInstance(sceneNode) {
   // Sprint 7.5.4.d/e grew 480 -> 528 for cloud + fog data.
   // Sprint 7.6.a-atm grew 528 -> 560 for envPlanet + envPlanetAtm
   // (Tier B planet-aware atmospheric scattering).
+  // Sprint 7.6.b-atm grew 560 -> 576 for envPlanetGeom (oblate
+  // spheroid polarRadiusRatio so atmosphere matches planet shape).
   const perSceneBuffer = Visual.device.createBuffer({
     label: "scene-perscene-" + sceneNode.id,
-    size: 560,
+    size: 576,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
   });
   // Sprint 7.5.3c bug fix -- queue.writeBuffer ordering. All
@@ -61508,7 +61562,7 @@ function _ensureSceneInstance(sceneNode) {
   inst = {
     perSceneBuffer,
     slots,
-    sceneScratch: new Float32Array(140),  // 560 bytes (sprint 7.6.a-atm -- + envPlanet + envPlanetAtm)
+    sceneScratch: new Float32Array(144),  // 576 bytes (sprint 7.6.b-atm -- + envPlanetGeom)
     // v0.3.123 -- 40 floats / 160 B for TerrainMaterial band slots.
     // v0.3.126 §5.5.c-3 -- bumped 40 → 48 / 192 B; slots [40..43]
     // are vsParams (vertex-shader displacement params for
@@ -61767,6 +61821,8 @@ function _encodeScenePass(enc, entry) {
     const scaleHR = planetR * 0.001334;           // 8500m on Earth-scale
     const scaleHM = planetR * 0.000188;           // 1200m on Earth-scale
     const sunI    = 22.0;
+    const polRatio = (typeof planetInfo.polRatio === "number" && planetInfo.polRatio > 0)
+      ? planetInfo.polRatio : 1.0;
     inst.sceneScratch[132] = planetInfo.centerX;
     inst.sceneScratch[133] = planetInfo.centerY;
     inst.sceneScratch[134] = planetInfo.centerZ;
@@ -61775,14 +61831,20 @@ function _encodeScenePass(enc, entry) {
     inst.sceneScratch[137] = scaleHR;
     inst.sceneScratch[138] = scaleHM;
     inst.sceneScratch[139] = sunI;
+    inst.sceneScratch[140] = polRatio;
+    inst.sceneScratch[141] = 0;
+    inst.sceneScratch[142] = 0;
+    inst.sceneScratch[143] = 0;
   } else {
     inst.sceneScratch[132] = 0; inst.sceneScratch[133] = 0;
     inst.sceneScratch[134] = 0; inst.sceneScratch[135] = 0;
     inst.sceneScratch[136] = 0; inst.sceneScratch[137] = 0;
     inst.sceneScratch[138] = 0; inst.sceneScratch[139] = 0;
+    inst.sceneScratch[140] = 1.0;  // polRatio default = 1 (sphere)
+    inst.sceneScratch[141] = 0; inst.sceneScratch[142] = 0; inst.sceneScratch[143] = 0;
   }
 
-  Visual.device.queue.writeBuffer(inst.perSceneBuffer, 0, inst.sceneScratch.buffer, 0, 560);
+  Visual.device.queue.writeBuffer(inst.perSceneBuffer, 0, inst.sceneScratch.buffer, 0, 576);
 
   // Per-draw loop. Each mesh writes to its OWN per-slot buffer +
   // binds its OWN bind group, so multi-mesh draws work correctly
