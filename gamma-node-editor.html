@@ -10771,20 +10771,21 @@ public:
       { n: "octaves",    t: "param" },
       { n: "lacunarity", t: "param" },
       { n: "gain",       t: "param" },
-      { n: "ridges",     t: "param" }
+      { n: "ridges",     t: "param" },
+      { n: "jitter",     t: "param" }
     ],
     outs: [{ n: "heightmap", t: "heightmap" }],
     params: {
-      // Defaults bumped for immediate quality. The virtualized mip-chain
-      // + cell-graph density LOD (memory:planetmap-virtualized-mip) is
-      // the proper fix for 16k+ resolution; these defaults are the
-      // best we can do statically.
-      // resolution 512² × 6 = 1.5M texels (~3MB R16 = ~4MB base64 in .gpatch).
-      // cellCount 30k = ~130km arc per cell at Earth scale.
       resolution: 512,
       cellCount: 30000,
       seed: 7.3, frequency: 1.0, octaves: 6,
-      lacunarity: 2.0, gain: 0.5, ridges: 0
+      lacunarity: 2.0, gain: 0.5, ridges: 0,
+      // jitter (0..1) perturbs each Fibonacci cell position by a
+      // fraction of typical cell spacing so the Voronoi boundaries
+      // (mountain ridges, coastlines) get organic irregular shapes
+      // instead of the regular spiral pattern. 0 = pure Fibonacci.
+      // 0.4 = roughly Azgaar's relaxed-Voronoi feel.
+      jitter: 0.4
     },
     methods: {},
     description: "Phase 7.a-c of planet-spec -- baked cubemap heightfield for a Planet, backed by a cell graph. cellCount (default 10000) spherical-Fibonacci points are seeded on the unit sphere; each cell holds {elevation, biome, plateId}. The cubemap (resolution per face, default 256 → 256² × 6 = 393k texels) is baked via nearest-cell lookup per texel. Initial elevation = 3D fBm sampled at the cell's position, so the bake's macro shape matches the procedural fBm at low frequencies but loses sub-cell detail (visible voronoi pattern at close range until Phase 7.e adds biome-masked detail noise on top). Wire this node's heightmap output to a Planet's heightmap input. Foundation for the Phase 7.d painter -- brush strokes edit cell elevations and the cubemap re-bakes automatically. cubemapData (base64 R16 unorm) persists in .gpatch so authored maps survive save/reload."
@@ -33319,7 +33320,8 @@ const _demos = [
         octaves:    7,
         lacunarity: 2.0,
         gain:       0.5,
-        ridges:     0.55
+        ridges:     0.55,
+        jitter:     0.4                  // perturb Fibonacci positions for organic Voronoi boundaries
       });
 
       const scn = makeNode("Scene", 760, 80, {
@@ -55881,21 +55883,39 @@ function _planetMapCacheKey(node) {
  * floats, elevations Float32Array of N, biomes Uint8Array of N,
  * plateIds Int16Array of N) for cache-friendly iteration and easy
  * serialization. Phase 7.d painter mutates `elevations` directly. */
-function _buildFibonacciCells(N, noiseDef) {
+function _buildFibonacciCells(N, noiseDef, jitter) {
   const positions = new Float32Array(N * 3);
   const elevations = new Float32Array(N);
   const biomes = new Uint8Array(N);                    // 0 = ocean placeholder
   const plateIds = new Int16Array(N);                  // -1 = unassigned
   const phi = Math.PI * (3 - Math.sqrt(5));            // golden angle
+  // Jitter scales with typical cell spacing on a unit sphere
+  // (~ 2/sqrt(N) Euclidean for uniform-area sampling). jitter ∈ [0, 1]
+  // where 1 ≈ one full cell spacing. The deterministic seed
+  // (noiseDef.seed) drives a small LCG so re-rolls with the same
+  // seed produce the same jittered layout.
+  const jitterAmt = (typeof jitter === "number" ? Math.max(0, Math.min(1, jitter)) : 0) * 2.0 / Math.sqrt(Math.max(1, N));
+  let s = ((noiseDef && typeof noiseDef.seed === "number") ? Math.floor(noiseDef.seed * 65537) : 1) | 0;
+  if (s === 0) s = 1;
+  const rng = function() {
+    // 32-bit LCG, output in [0, 1)
+    s = (Math.imul(s, 1664525) + 1013904223) | 0;
+    return ((s >>> 0) / 4294967296);
+  };
   for (let i = 0; i < N; i++) {
-    // Standard sphere-Fibonacci: y sweeps -1..1, radius = sqrt(1-y²),
-    // azimuth = i*phi. Produces near-uniform spacing without pole
-    // pinching (vs the equirect-grid pole singularity).
-    const y = 1 - 2 * i / Math.max(1, N - 1);
-    const r = Math.sqrt(Math.max(0, 1 - y * y));
+    const y0 = 1 - 2 * i / Math.max(1, N - 1);
+    const r = Math.sqrt(Math.max(0, 1 - y0 * y0));
     const theta = phi * i;
-    const x = Math.cos(theta) * r;
-    const z = Math.sin(theta) * r;
+    let x = Math.cos(theta) * r;
+    let y = y0;
+    let z = Math.sin(theta) * r;
+    if (jitterAmt > 0) {
+      x += (rng() - 0.5) * jitterAmt;
+      y += (rng() - 0.5) * jitterAmt;
+      z += (rng() - 0.5) * jitterAmt;
+      const inv = 1 / Math.sqrt(x*x + y*y + z*z);
+      x *= inv; y *= inv; z *= inv;
+    }
     positions[i * 3 + 0] = x;
     positions[i * 3 + 1] = y;
     positions[i * 3 + 2] = z;
@@ -56054,7 +56074,7 @@ function _planetMapCellsKey(node) {
   const p = node.params || {};
   return [
     p.cellCount, p.seed, p.frequency, p.octaves,
-    p.lacunarity, p.gain, p.ridges
+    p.lacunarity, p.gain, p.ridges, p.jitter
   ].join(",");
 }
 
@@ -56141,7 +56161,7 @@ function _ensurePlanetMapCells(node) {
   const key = _planetMapCellsKey(node);
   if (node._cells && node._cellsKey === key) return node._cells;
   const p = node.params;
-  const N = Math.max(100, Math.min(100000, Math.floor((typeof p.cellCount === "number") ? p.cellCount : 10000)));
+  const N = Math.max(100, Math.min(1000000, Math.floor((typeof p.cellCount === "number") ? p.cellCount : 10000)));
   const noiseOcts = Math.max(1, Math.min(20, Math.floor((typeof p.octaves === "number") ? p.octaves : 6)));
   const noiseDef = {
     seed:       (typeof p.seed       === "number") ? p.seed       : 7.3,
@@ -56152,8 +56172,9 @@ function _ensurePlanetMapCells(node) {
     gain:       (typeof p.gain       === "number") ? p.gain       : 0.5,
     ridges:     (typeof p.ridges     === "number") ? p.ridges     : 0
   };
+  const jitter = (typeof p.jitter === "number") ? p.jitter : 0;
   const t0 = (typeof performance !== "undefined") ? performance.now() : 0;
-  const cells = _buildFibonacciCells(N, noiseDef);
+  const cells = _buildFibonacciCells(N, noiseDef, jitter);
   const hash = _buildCellSpatialHash(cells);
   // K=12 (was 10, was 6). Voronoi cells on a sphere typically have
   // 5-8 true neighbors but the spherical Delaunay test inspects all
@@ -57233,21 +57254,23 @@ function _planetRunDSL(template, cells, neighbors, K, cap, powers) {
 // 1 tiny cap, pangea = 1 huge cap, archipelago = many scattered
 // caps. Templates are still tweakable per-name; tuning these values
 // is the main knob for "how does my planet look".
+// Per-template cap layout. Radii tuned so a SINGLE cap of the
+// "continents" / "oldWorld" / "fractious" / "mediterranean" /
+// "isthmus" sizes covers roughly Earth's Eurasia-Africa-Asia
+// combined landmass (~110° wide × 100° tall = ~55° radius cap).
+// volcano and atoll keep small radii because those archetypes are
+// definitionally small landforms.
 const PLANET_TEMPLATE_CAPS = {
   volcano:       { count: 1, radiusDeg: 10 },
-  highIsland:    { count: 1, radiusDeg: 18 },
-  lowIsland:     { count: 1, radiusDeg: 22 },
-  continents:    { count: 3, radiusDeg: 38 },
-  archipelago:   { count: 6, radiusDeg: 25 },
-  atoll:         { count: 1, radiusDeg: 7 },
-  mediterranean: { count: 1, radiusDeg: 35 },
-  peninsula:     { count: 2, radiusDeg: 26 },
-  pangea:        { count: 1, radiusDeg: 85 },
-  isthmus:       { count: 1, radiusDeg: 45 },
-  shattered:     { count: 8, radiusDeg: 20 },
-  taklamakan:    { count: 1, radiusDeg: 30 },
-  oldWorld:      { count: 2, radiusDeg: 36 },
-  fractious:     { count: 4, radiusDeg: 28 }
+  continents:    { count: 3, radiusDeg: 55 },
+  archipelago:   { count: 4, radiusDeg: 45 },
+  atoll:         { count: 1, radiusDeg: 8  },
+  mediterranean: { count: 1, radiusDeg: 55 },
+  peninsula:     { count: 2, radiusDeg: 45 },
+  pangea:        { count: 1, radiusDeg: 90 },
+  isthmus:       { count: 1, radiusDeg: 60 },
+  oldWorld:      { count: 2, radiusDeg: 50 },
+  fractious:     { count: 3, radiusDeg: 50 }
 };
 
 /* §planet-spec Phase 7.d/templates -- the 14 stock Azgaar templates,
@@ -57263,33 +57286,7 @@ const PLANET_TEMPLATES_DSL = {
     Hill 1 35-55 75-80 25-75
     Hill 0.5 20-25 10-15 20-25
     Mask 3 0 0 0`,
-  highIsland: `Hill 1 90-100 65-75 47-53
-    Add 7 all 0 0
-    Hill 5-6 20-30 25-55 45-55
-    Range 1 40-50 45-55 45-55
-    Multiply 0.8 land 0 0
-    Mask 3 0 0 0
-    Smooth 2 0 0 0
-    Trough 2-3 20-30 20-30 20-30
-    Trough 2-3 20-30 60-80 70-80
-    Hill 1 10-15 60-60 50-50
-    Hill 1.5 13-16 15-20 20-75
-    Range 1.5 30-40 15-85 30-40
-    Range 1.5 30-40 15-85 60-70
-    Pit 3-5 10-30 15-85 20-80`,
-  lowIsland: `Hill 1 90-99 60-80 45-55
-    Hill 1-2 20-30 10-30 10-90
-    Smooth 2 0 0 0
-    Hill 6-7 25-35 20-70 30-70
-    Range 1 40-50 45-55 45-55
-    Trough 2-3 20-30 15-85 20-30
-    Trough 2-3 20-30 15-85 70-80
-    Hill 1.5 10-15 5-15 20-80
-    Hill 1 10-15 85-95 70-80
-    Pit 5-7 15-25 15-85 20-80
-    Multiply 0.4 20-100 0 0
-    Mask 4 0 0 0`,
-  continents: `Hill 1 80-85 60-80 40-60
+  continents:`Hill 1 80-85 60-80 40-60
     Hill 1 80-85 20-30 40-60
     Hill 6-7 15-30 25-75 15-85
     Multiply 0.6 land 0 0
@@ -57361,17 +57358,7 @@ const PLANET_TEMPLATES_DSL = {
     Trough 4-8 15-30 50-90 60-80
     Trough 4-8 15-30 70-100 80-100
     Invert 0.25 x 0 0`,
-  shattered: `Hill 8 35-40 15-85 30-70
-    Trough 10-20 40-50 5-95 5-95
-    Range 5-7 30-40 10-90 20-80
-    Pit 12-20 30-40 15-85 20-80`,
-  taklamakan: `Hill 1-3 20-30 30-70 30-70
-    Hill 2-4 60-85 0-5 0-100
-    Hill 2-4 60-85 95-100 0-100
-    Hill 3-4 60-85 20-80 0-5
-    Hill 3-4 60-85 20-80 95-100
-    Smooth 3 0 0 0`,
-  oldWorld: `Range 3 70 15-85 20-80
+  oldWorld:`Range 3 70 15-85 20-80
     Hill 2-3 50-70 15-45 20-80
     Hill 2-3 50-70 65-85 20-80
     Hill 4-6 20-25 15-85 20-80
