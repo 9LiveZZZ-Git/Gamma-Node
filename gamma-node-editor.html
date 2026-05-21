@@ -56389,11 +56389,14 @@ function _planetBiomeId(temperature, moisture, h, seaLevel, hasRiver) {
   if (h < seaLevel) return 0;                     // marine
   if (temperature < -5) return 11;                // glacier
   if (temperature >= 25 && !hasRiver && moisture < 8) return 1;  // hot desert
-  // Wetland: high moisture at low elevation (Azgaar's two-condition test).
-  if (temperature > -2) {
-    if (moisture > 40 && h < seaLevel + 0.05) return 12;
-    if (moisture > 24 && h > seaLevel + 0.05 && h < seaLevel + 0.4) return 12;
-  }
+  // Wetland (biome 12) classification REMOVED 2026-05-21. The
+  // moisture > threshold + low elevation rule produced single-cell
+  // wetland speckles ("waterholes everywhere") wherever the precip
+  // sim happened to deposit a humid spot. Lakes are now produced by
+  // the depression-fill detector in _planetRivers (cells.lake mask),
+  // which is geographically meaningful (closed basins) and biomes
+  // around lakes get their normal biome from the temp/moisture
+  // matrix below.
   const moistBand = Math.min(Math.floor(moisture / 5), 4);
   const tempBand = Math.max(0, Math.min(25, 20 - Math.floor(temperature)));
   return PLANET_BIOMES_MATRIX[moistBand][tempBand];
@@ -56633,6 +56636,38 @@ function _planetRivers(cells, neighbors, K, seaLevel) {
     if (changed === 0) break;
   }
 
+  // Pass 1.5: lake detection. Cells whose original elevation was
+  // raised >0.003 by the depression-fill above were inside CLOSED
+  // BASINS. cells.lake[i] = 1 means this cell is a lake.
+  //
+  // Two-step filter to reject rasterization-noise single-cell pits:
+  //   (a) Candidate set: depression-raised cells above threshold.
+  //   (b) Pruning: require each candidate to have >=1 lake-cell
+  //       neighbor. Isolated 1-cell pits get pruned -- real lakes
+  //       always span multiple cells at our resolution (60k cells
+  //       = ~0.5° per cell = ~55km on Earth; a 1-cell lake would
+  //       be 55km wide, plausible BUT also matches stamp speckle
+  //       so we err toward dropping them).
+  const LAKE_DELTA = 0.003;
+  const lake = new Uint8Array(N);
+  const candidate = new Uint8Array(N);
+  for (let i = 0; i < N; i++) {
+    if (cells.elevations[i] < seaLevel) continue;
+    if (filledH[i] - cells.elevations[i] > LAKE_DELTA) candidate[i] = 1;
+  }
+  let lakeCells = 0;
+  for (let i = 0; i < N; i++) {
+    if (!candidate[i]) continue;
+    let hasLakeNeighbor = false;
+    for (let k = 0; k < K; k++) {
+      const j = neighbors[i * K + k];
+      if (j >= 0 && candidate[j]) { hasLakeNeighbor = true; break; }
+    }
+    if (hasLakeNeighbor) { lake[i] = 1; lakeCells++; }
+  }
+  cells.lake = lake;
+  cells.lakeCells = lakeCells;
+
   // Pass 2: flow direction per cell.
   const flowDir = new Int32Array(N).fill(-1);
   for (let i = 0; i < N; i++) {
@@ -56722,9 +56757,10 @@ function _ensurePlanetRivers(pmapNode, seaLevel) {
   const stats = _planetRivers(pmapNode._cells, pmapNode._cellNeighbors, pmapNode._cellNeighborsK, seaLevel);
   pmapNode._riversKey = key;
   const dt = ((typeof performance !== "undefined") ? performance.now() : 0) - t0;
+  const lakeCount = pmapNode._cells.lakeCells || 0;
   console.log("[planet-mesh] rivers computed in " + dt.toFixed(0) + "ms (v" + ver + "): "
-    + stats.riverCount + " rivers across "
-    + stats.riverCells + " cells (depression-fill " + stats.depressionIters + " iters)");
+    + stats.riverCount + " rivers / " + stats.riverCells + " river-cells / "
+    + lakeCount + " lake-cells (depression-fill " + stats.depressionIters + " iters)");
   return pmapNode._cells;
 }
 
@@ -57935,6 +57971,7 @@ async function _planetStampAzgaarJSON(json, cells, neighbors, K, seaLevel, onSta
   if (cells.biome) cells.biome.fill(0);
   if (cells.flux)  cells.flux.fill(0);
   if (cells.riverId) cells.riverId.fill(-1);
+  if (cells.lake) cells.lake.fill(0);
 
   return {
     landCells, totalCells: N, landFraction: landCells / N,
@@ -58087,6 +58124,7 @@ async function _planetStampGeoJSON(geojson, cells, neighbors, K, seaLevel, onSta
   if (cells.biome) cells.biome.fill(0);
   if (cells.flux)  cells.flux.fill(0);
   if (cells.riverId) cells.riverId.fill(-1);
+  if (cells.lake) cells.lake.fill(0);
 
   return {
     landCells,
@@ -59029,6 +59067,8 @@ function _buildPlanetMesh(node) {
     const RIVER_BIG    = [0.15, 0.32, 0.62];
     let h, baseCol;
     const colorForCell = function(idx, elev) {
+      // Closed-basin lake (from _planetRivers depression-fill) -> marine blue.
+      if (cells.lake && cells.lake[idx]) return PLANET_BIOMES_COLORS[0];
       if (cells.riverId && cells.riverId[idx] >= 0 && cells.flux && elev >= seaLevel) {
         // Map flux to blue intensity: larger river = darker, more saturated.
         const flx = cells.flux[idx];
@@ -71238,11 +71278,15 @@ function openPlanetMapEditor(nodeId) {
     const data = imageData.data;
     const haveBiome = showClimate && cells.biome;
     const haveRivers = showClimate && cells.riverId && cells.flux;
+    const haveLakes  = showClimate && cells.lake;
     for (let i = 0; i < W * H; i++) {
       const cellIdx = pixelToCell[i];
       const elev = cells.elevations[cellIdx];
       let c;
-      if (haveRivers && cells.riverId[cellIdx] >= 0 && elev >= seaLevel) {
+      if (haveLakes && cells.lake[cellIdx]) {
+        // Closed-basin lake -- marine blue, just like ocean.
+        c = PLANET_BIOMES_COLORS[0];
+      } else if (haveRivers && cells.riverId[cellIdx] >= 0 && elev >= seaLevel) {
         const flx = cells.flux[cellIdx];
         const t = Math.min(1, Math.max(0, (flx - 30) / 200));
         c = [
