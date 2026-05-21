@@ -41154,11 +41154,12 @@ const PROVIDERS = {
     async call({ system, user, model, key, onToken, image, audio, temperature, maxTokens }) {
       if (audio) throw new Error("Anthropic provider does not handle audio input. Use Gemma for voice.");
 
-      const userContent = image
-        ? [
-            { type: "image", source: { type: "base64", media_type: "image/png", data: image } },
-            { type: "text",  text: user }
-          ]
+      // image can be a single base64 string OR an array of base64
+      // strings for multi-image input (e.g., reference + current view).
+      const imageList = Array.isArray(image) ? image.filter(s => s) : (image ? [image] : []);
+      const userContent = (imageList.length > 0)
+        ? imageList.map(b => ({ type: "image", source: { type: "base64", media_type: "image/png", data: b } }))
+            .concat([{ type: "text", text: user }])
         : user;
 
       const body = {
@@ -57680,6 +57681,35 @@ function _applyAIPlan(plan, cells, neighbors, K, seaLevel, lockedCenter) {
   _planetPostDSL(cells, neighbors, K, seaLevel);
 }
 
+/* Public CC BY-SA 4.0 equirect Earth heightmap (Wikimedia Commons).
+ * 400px thumbnail = ~30-50KB PNG. Loaded once on demand, cached on
+ * window.__planetEarthRefB64. Used as a "what real Earth's coastlines
+ * and elevation variation look like" reference image attached to the
+ * initial generation call when the user opts in (checkbox in the
+ * painter). Audits use the painter's current view, NOT this. */
+const _PLANET_EARTH_REFERENCE_URL = "https://upload.wikimedia.org/wikipedia/commons/thumb/2/2b/World_elevation_map.png/400px-World_elevation_map.png";
+
+async function _loadPlanetEarthReference() {
+  if (window.__planetEarthRefB64) return window.__planetEarthRefB64;
+  if (window.__planetEarthRefFailed) return null;
+  try {
+    const resp = await fetch(_PLANET_EARTH_REFERENCE_URL, { mode: "cors" });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const blob = await resp.blob();
+    const buf = await blob.arrayBuffer();
+    const u8 = new Uint8Array(buf);
+    let str = "";
+    for (let i = 0; i < u8.length; i++) str += String.fromCharCode(u8[i]);
+    window.__planetEarthRefB64 = btoa(str);
+    console.log("[planet-map] Earth reference image loaded (" + Math.round(u8.length / 1024) + " KB)");
+    return window.__planetEarthRefB64;
+  } catch (e) {
+    window.__planetEarthRefFailed = true;
+    console.warn("[planet-map] Earth reference fetch failed (likely CORS); continuing without reference:", e.message || e);
+    return null;
+  }
+}
+
 async function _capturePainterPng(canvas) {
   // Returns base64-encoded PNG of the painter's 2D equirect canvas.
   return new Promise((resolve, reject) => {
@@ -57706,7 +57736,7 @@ async function _capturePainterPng(canvas) {
  * alone -- continents that shrank to nothing, wrong locations, missing
  * features. Each round = 1 API call; the cost trades for quality.
  * Vision-capable providers only (Anthropic + Gemma both support it). */
-async function _planetGenerateFromAI(prompt, cells, neighbors, K, seaLevel, lockedCenter, onStatus, painterCanvas, painterRerender, keywordAudits) {
+async function _planetGenerateFromAI(prompt, cells, neighbors, K, seaLevel, lockedCenter, onStatus, painterCanvas, painterRerender, keywordAudits, useEarthRef) {
   const provider = PROVIDERS[aiSettings.provider];
   if (!provider) throw new Error("no AI provider configured");
   if (provider.requiresKey && !aiSettings.anthropicKey) {
@@ -57719,10 +57749,22 @@ async function _planetGenerateFromAI(prompt, cells, neighbors, K, seaLevel, lock
   const t0 = performance.now();
 
   // --- Initial round ---
-  onStatus && onStatus("round 1/" + totalPasses + ": calling " + (aiSettings.model || provider.defaultModel) + "…");
+  // Optionally include a real Earth heightmap reference image so the
+  // LLM sees what realistic continent shapes / coastline irregularity
+  // / elevation distribution look like in our same projection.
+  let initialImage = null;
+  if (useEarthRef) {
+    onStatus && onStatus("loading Earth reference image…");
+    initialImage = await _loadPlanetEarthReference();
+  }
+  const initialUserPrompt = initialImage
+    ? "REFERENCE IMAGE ATTACHED: a real Earth heightmap in the SAME equirectangular projection you'll be generating. Use it as INSPIRATION for: (a) the level of detail in continent shapes (irregular coastlines, peninsulas, bays), (b) the elevation distribution (mostly low plains with occasional mountain ranges), (c) the size of continents relative to the planet, (d) how oceans / inland seas are distributed. DO NOT literally copy Earth -- the user's prompt below describes a DIFFERENT planet. Use Earth's heightmap as a style guide for realism, then design according to the user's prompt.\n\nUSER PROMPT: " + prompt
+    : prompt;
+  onStatus && onStatus("round 1/" + totalPasses + ": calling " + (aiSettings.model || provider.defaultModel) + (initialImage ? " w/ Earth ref" : "") + "…");
   const initial = await provider.call({
     system: _PLANET_AI_SYSTEM_PROMPT,
-    user: prompt,
+    user: initialUserPrompt,
+    image: initialImage,
     model: aiSettings.model || provider.defaultModel,
     key: aiSettings.anthropicKey,
     temperature: 0.8,
@@ -70760,6 +70802,7 @@ function openPlanetMapEditor(nodeId) {
       '<button class="btn" id="pmap-ai-go" type="button" style="padding:3px 12px;">generate</button>' +
       '<button class="btn" id="pmap-clearlock" type="button" style="padding:3px 10px;display:none;">clear target</button>' +
     '</div>' +
+    '<label style="display:flex;align-items:center;gap:6px;font-size:10px;color:var(--text-3);"><input type="checkbox" id="pmap-ai-earthref" checked style="margin:0;">🌍 attach real Earth heightmap as style reference (Wikimedia CC BY-SA, fetched once)</label>' +
     '<div id="pmap-ai-keywords" style="display:flex;flex-wrap:wrap;gap:4px;"></div>' +
     '<span id="pmap-lockinfo" style="color:var(--text-3);font-size:10px;">shift-click the map to lock the first continent\'s position. ai uses the wired provider (Settings → AI).</span>' +
     '<span id="pmap-ai-status" style="color:var(--text-3);font-size:10px;min-height:14px;"></span>';
@@ -71006,11 +71049,12 @@ function openPlanetMapEditor(nodeId) {
       // Gather the active keyword chips; each gets its own focused
       // audit pass after the baseline audit.
       const activeKwObjs = PMAP_AI_KEYWORDS.filter(k => activeKeywords.has(k.label));
+      const useEarthRef = !!modal.querySelector("#pmap-ai-earthref").checked;
       const stats = await _planetGenerateFromAI(
         prompt, cells, node._cellNeighbors, node._cellNeighborsK,
         seaLevel, lockedCenter,
         s => { aiStatus.textContent = s; },
-        canvas, repaint, activeKwObjs
+        canvas, repaint, activeKwObjs, useEarthRef
       );
       dirty = true;
       showClimate = wasShowing;
