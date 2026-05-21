@@ -57483,12 +57483,10 @@ function _planetApplyTemplate(name, cells, neighbors, K, seaLevel, lockedCenter)
     }
     _planetRunDSL(dsl, cells, neighbors, K, cap, powers);
   }
-  // Post-DSL gentle global smoothing. The user-visible "grainy
-  // continents with random water dots scattered through the land" is
-  // from individual cells dipping just below sea level after the
-  // template's multi-pass arithmetic. Two gentle smoothing iterations
-  // (alpha=0.3, drift toward neighborhood mean) close most of those
-  // single-cell anomalies without flattening mountains.
+  // Post-DSL gentle global smoothing. Two iterations of
+  //   e' = 0.7*e + 0.3*neighbor-mean
+  // closes most single-cell elevation anomalies (jitter / blob-edge
+  // noise) without flattening mountains.
   {
     const N = cells.count;
     const next = new Float32Array(N);
@@ -57504,6 +57502,64 @@ function _planetApplyTemplate(name, cells, neighbors, K, seaLevel, lockedCenter)
         next[i] = cells.elevations[i] * (1 - alpha) + avg * alpha;
       }
       for (let i = 0; i < N; i++) cells.elevations[i] = next[i];
+    }
+  }
+
+  // Coastline cleanup (morphological "open" on land regions).
+  // After smoothing, isolated cells still sit just below sea level
+  // (Azgaar's 0.20) inside otherwise-land areas -- they render as
+  // marine biome (blue) within continents, looking like random
+  // "lakes" the user noticed on the world map. Two passes:
+  //   1. Cells below SL surrounded by mostly land → bump just above
+  //   2. Cells above SL surrounded by mostly ocean → drop just below
+  // Threshold of 4/K land or ocean neighbors keeps the cleanup
+  // conservative (preserves real coastlines, only fills speckle).
+  {
+    const N = cells.count;
+    const AZ_SL = 0.20;
+    let bumped = 0, dropped = 0;
+    // Pass 1: fill land speckle (below-SL cells inside land).
+    const flagL = new Uint8Array(N);
+    for (let i = 0; i < N; i++) {
+      const e = cells.elevations[i];
+      if (e >= AZ_SL) continue;
+      if (e < AZ_SL - 0.10) continue;  // deep ocean, leave alone
+      let landCount = 0, totalNbr = 0;
+      for (let k = 0; k < K; k++) {
+        const ni = neighbors[i * K + k];
+        if (ni < 0) continue;
+        totalNbr++;
+        if (cells.elevations[ni] >= AZ_SL) landCount++;
+      }
+      if (totalNbr > 0 && landCount >= Math.max(4, Math.floor(totalNbr * 0.55))) {
+        flagL[i] = 1;
+      }
+    }
+    for (let i = 0; i < N; i++) {
+      if (flagL[i]) { cells.elevations[i] = AZ_SL + 0.02; bumped++; }
+    }
+    // Pass 2: drop ocean speckle (above-SL cells in deep ocean).
+    const flagO = new Uint8Array(N);
+    for (let i = 0; i < N; i++) {
+      const e = cells.elevations[i];
+      if (e < AZ_SL) continue;
+      if (e > AZ_SL + 0.10) continue;  // real land, leave alone
+      let oceanCount = 0, totalNbr = 0;
+      for (let k = 0; k < K; k++) {
+        const ni = neighbors[i * K + k];
+        if (ni < 0) continue;
+        totalNbr++;
+        if (cells.elevations[ni] < AZ_SL) oceanCount++;
+      }
+      if (totalNbr > 0 && oceanCount >= Math.max(4, Math.floor(totalNbr * 0.55))) {
+        flagO[i] = 1;
+      }
+    }
+    for (let i = 0; i < N; i++) {
+      if (flagO[i]) { cells.elevations[i] = AZ_SL - 0.02; dropped++; }
+    }
+    if (bumped + dropped > 0) {
+      console.log("[planet-map] coastline cleanup: bumped " + bumped + " lake cells, dropped " + dropped + " ocean-speck cells");
     }
   }
   // Piecewise remap Azgaar's logical 0-1 (0.20 = sea level) → ours
