@@ -24,16 +24,18 @@ const REPO_ROOT = resolve(__dirname, "..", "..");
 const EDITOR_PATH = resolve(REPO_ROOT, "gamma-node-editor.html");
 
 function parseArgs(argv) {
-  const args = { cells: 4000, sealevel: 0.5 };
+  const args = { cells: 4000, sealevel: 0.5, mode: "biome" };
   for (let i = 2; i < argv.length; i++) {
     const k = argv[i];
     if (k === "--plan")      args.plan = argv[++i];
     else if (k === "--out")  args.out = argv[++i];
     else if (k === "--cells")    args.cells = +argv[++i];
     else if (k === "--sealevel") args.sealevel = +argv[++i];
+    else if (k === "--landmass") args.mode = "landmass";
   }
   if (!args.plan || !args.out) {
-    console.error("usage: node render.mjs --plan <path> --out <path.png> [--cells N] [--sealevel S]");
+    console.error("usage: node render.mjs --plan <path> --out <path.png> [--cells N] [--sealevel S] [--landmass]");
+    console.error("  --landmass  binary land/ocean render (matches Azgaar style) instead of biome colors");
     process.exit(2);
   }
   return args;
@@ -62,7 +64,7 @@ async function main() {
     // runs the export at the very end, so this signals load is done).
     await page.waitForFunction(() => typeof window.__PMAP === "object" && window.__PMAP && typeof window.__PMAP.buildCells === "function", { timeout: 20000 });
 
-    const result = await page.evaluate(async (planText, N, seaLevel) => {
+    const result = await page.evaluate(async (planText, N, seaLevel, mode) => {
       const P = window.__PMAP;
       // Default noise + jitter values match the editor's PlanetMap node defaults.
       const noiseDef = { seed: 7.3, frequency: 1.0, octaves: 6, effectiveOctavesF: 6, lacunarity: 2.0, gain: 0.5, ridges: 0 };
@@ -138,11 +140,22 @@ async function main() {
           const uz = Math.sin(lonR) * cosLat;
           const cidx = nearestCellDot(ux, cy, uz);
           const elev = cells.elevations[cidx];
-          const c = P.colorForHeight(elev, seaLevel);
+          let r, g, b;
+          if (mode === "landmass") {
+            // Binary land/ocean -- match Azgaar's heightmap-editor render
+            // (light-blue/white land on dark-navy ocean) so visual
+            // comparisons against the user's Fantasy Heightmaps are
+            // like-for-like.
+            if (elev >= seaLevel) { r = 0.92; g = 0.96; b = 0.99; }
+            else                  { r = 0.05; g = 0.13; b = 0.30; }
+          } else {
+            const c = P.colorForHeight(elev, seaLevel);
+            r = c[0]; g = c[1]; b = c[2];
+          }
           const k = (py * W + px) * 4;
-          data[k    ] = Math.max(0, Math.min(255, Math.round(c[0] * 255)));
-          data[k + 1] = Math.max(0, Math.min(255, Math.round(c[1] * 255)));
-          data[k + 2] = Math.max(0, Math.min(255, Math.round(c[2] * 255)));
+          data[k    ] = Math.max(0, Math.min(255, Math.round(r * 255)));
+          data[k + 1] = Math.max(0, Math.min(255, Math.round(g * 255)));
+          data[k + 2] = Math.max(0, Math.min(255, Math.round(b * 255)));
           data[k + 3] = 255;
         }
       }
@@ -182,7 +195,7 @@ async function main() {
           verbCount: String(c.verbs || "").split("\n").filter(s => s.trim()).length
         }))
       };
-    }, planRawForLLM, args.cells, args.sealevel);
+    }, planRawForLLM, args.cells, args.sealevel, args.mode);
 
     if (result.error) {
       console.error("[render] " + result.error);
