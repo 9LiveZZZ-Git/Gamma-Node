@@ -57985,11 +57985,148 @@ async function _capturePainterPng(canvas) {
  * Round 0: send the user prompt → get plan → apply + render.
  * Rounds 1..N: capture rendered painter PNG → send (prompt + previous
  *              plan + image) → get revised plan → apply + render.
+/* §planet-spec Phase 7.f-geo -- GeoJSON LANDMASS STAMPER.
  *
- * Audit rounds catch issues the LLM can't anticipate from the prompt
- * alone -- continents that shrank to nothing, wrong locations, missing
- * features. Each round = 1 API call; the cost trades for quality.
- * Vision-capable providers only (Anthropic + Gemma both support it). */
+ * Accepts an Azgaar FMG Cells GeoJSON export (FeatureCollection of
+ * Voronoi cell polygons in [lon, lat] degrees with properties.height
+ * + properties.type), rasterizes the LAND polygons to a binary mask,
+ * then stamps the mask onto our spherical cell graph.
+ *
+ * This is the deterministic alternative to AI generation: drop in
+ * any GeoJSON (Earth, Azgaar export, hand-authored polygons) and
+ * the cell graph's elevations are set to exactly that landmass shape.
+ *
+ * Land detection rules:
+ *   1. properties.height is a number > 0 (Azgaar exports in meters
+ *      OR the 0-100 logical scale -- both have negative = ocean)
+ *   2. properties.type !== "ocean" (fallback when no height)
+ *   3. All other features default to ocean
+ *
+ * Coordinate handling:
+ *   - lon clamped/wrapped to [-180, 180]
+ *   - lat clamped to [-90, 90] (Azgaar exports sometimes exceed
+ *     this slightly due to pixel-to-degree scaling artifacts)
+ *
+ * Resolution: 2048x1024 rasterization gives 0.18° resolution -- finer
+ * than our N=60k cell graph's per-cell angular extent (~1.3°) so the
+ * stamp's fidelity is bound by cell density, not raster resolution.
+ *
+ * After stamping, runs postDSL with skipCleanup+skipSmoothing so the
+ * piecewise sealevel remap fires but the stamped binary mask is
+ * preserved verbatim. Returns { landCells, totalCells, landFraction,
+ * featuresProcessed, landFeatures, rasterMs, stampMs }. */
+async function _planetStampGeoJSON(geojson, cells, neighbors, K, seaLevel, onStatus) {
+  if (!geojson || !Array.isArray(geojson.features)) {
+    throw new Error("input must be a GeoJSON FeatureCollection with features array");
+  }
+  const N = cells.count;
+  onStatus && onStatus("rasterizing " + geojson.features.length + " features…");
+
+  // Step 1: rasterize land polygons to a binary canvas mask.
+  const W = 2048, H = 1024;
+  const t0 = performance.now();
+  const canvas = document.createElement("canvas");
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, W, H);   // ocean = black
+  ctx.fillStyle = "#fff";                              // land  = white
+
+  let landFeatures = 0;
+  for (const feat of geojson.features) {
+    if (!feat || !feat.geometry) continue;
+    const props = feat.properties || {};
+    const h = props.height;
+    const t = props.type;
+    // Land if explicit height > 0, OR (no height && type != ocean).
+    let isLand;
+    if (typeof h === "number") isLand = h > 0;
+    else                       isLand = (t && t !== "ocean");
+    if (!isLand) continue;
+    landFeatures++;
+
+    const geom = feat.geometry;
+    const polys = (geom.type === "Polygon")      ? [geom.coordinates]
+                : (geom.type === "MultiPolygon") ? geom.coordinates
+                : null;
+    if (!polys) continue;
+
+    for (const poly of polys) {
+      // Outer ring + holes. We treat all rings as fills (path-fill
+      // even-odd handles holes automatically if the GeoJSON winding
+      // is correct).
+      ctx.beginPath();
+      for (const ring of poly) {
+        for (let i = 0; i < ring.length; i++) {
+          const pt = ring[i];
+          if (!Array.isArray(pt) || pt.length < 2) continue;
+          let lon = pt[0], lat = pt[1];
+          // Wrap lon to [-180, 180], clamp lat to [-90, 90].
+          lon = ((lon + 180) % 360 + 360) % 360 - 180;
+          if (lat < -90) lat = -90;
+          else if (lat > 90) lat = 90;
+          const px = (lon + 180) / 360 * W;
+          const py = (90 - lat) / 180 * H;
+          if (i === 0) ctx.moveTo(px, py);
+          else         ctx.lineTo(px, py);
+        }
+        ctx.closePath();
+      }
+      ctx.fill("evenodd");
+    }
+  }
+  const rasterMs = performance.now() - t0;
+
+  // Step 2: stamp the mask onto cell elevations.
+  onStatus && onStatus("stamping " + N + " cells…");
+  const t1 = performance.now();
+  const img = ctx.getImageData(0, 0, W, H);
+  const data = img.data;
+  const LAND_ELEV = 0.30;   // Azgaar 0-1 logical scale; sea level = 0.20
+  const OCEAN_ELEV = 0.00;
+  let landCells = 0;
+  for (let i = 0; i < N; i++) {
+    const x = cells.positions[i*3], y = cells.positions[i*3+1], z = cells.positions[i*3+2];
+    const lat = Math.asin(Math.max(-1, Math.min(1, y))) * 180 / Math.PI;
+    const lon = Math.atan2(z, x) * 180 / Math.PI;
+    let px = Math.floor((lon + 180) / 360 * W);
+    let py = Math.floor((90 - lat) / 180 * H);
+    if (px < 0) px = 0; else if (px >= W) px = W - 1;
+    if (py < 0) py = 0; else if (py >= H) py = H - 1;
+    const r = data[(py * W + px) * 4];
+    if (r > 128) { cells.elevations[i] = LAND_ELEV; landCells++; }
+    else         { cells.elevations[i] = OCEAN_ELEV; }
+  }
+  const stampMs = performance.now() - t1;
+
+  // Step 3: run postDSL JUST for the sealevel remap (skip cleanup +
+  // smoothing so the binary stamp is preserved). The remap converts
+  // Azgaar's 0..1 logical scale (sea level at 0.20) to the user's
+  // seaLevel param.
+  _planetPostDSL(cells, neighbors, K, seaLevel, { skipCleanup: true, skipSmoothing: true });
+
+  // Invalidate climate / rivers if they were computed (caller decides
+  // whether to recompute via the climate toggle).
+  if (cells.biome) cells.biome.fill(0);
+  if (cells.flux)  cells.flux.fill(0);
+  if (cells.riverId) cells.riverId.fill(-1);
+
+  return {
+    landCells,
+    totalCells: N,
+    landFraction: landCells / N,
+    featuresProcessed: geojson.features.length,
+    landFeatures,
+    rasterMs: +rasterMs.toFixed(1),
+    stampMs: +stampMs.toFixed(1)
+  };
+}
+
+ /*
+ * AI map generation. Audit rounds catch issues the LLM can't
+ * anticipate from the prompt alone -- continents that shrank to
+ * nothing, wrong locations, missing features. Each round = 1 API
+ * call; the cost trades for quality. Vision-capable providers only
+ * (Anthropic + Gemma both support it). */
 async function _planetGenerateFromAI(prompt, cells, neighbors, K, seaLevel, lockedCenter, onStatus, painterCanvas, painterRerender, keywordAudits, refKey, targetLand) {
   const provider = PROVIDERS[aiSettings.provider];
   if (!provider) throw new Error("no AI provider configured");
@@ -57997,7 +58134,7 @@ async function _planetGenerateFromAI(prompt, cells, neighbors, K, seaLevel, lock
     throw new Error("API key required - set in AI Settings panel");
   }
   const kwAudits = Array.isArray(keywordAudits) ? keywordAudits.slice(0, 4) : [];
-  const totalPasses = 2 + kwAudits.length;
+  const totalPasses = 1 + kwAudits.length;
   const t0 = performance.now();
 
   // Land coverage target (from preset metadata): 22-30% for Earth-like,
@@ -58151,14 +58288,21 @@ async function _planetGenerateFromAI(prompt, cells, neighbors, K, seaLevel, lock
     if (painterRerender) painterRerender();
   }
 
-  // --- Baseline audit (overall quality check) ---
-  await runAudit(2, "baseline", _PLANET_AI_AUDIT_SYSTEM_PROMPT, null);
+  // Baseline audit DISABLED 2026-05-21 -- pass 1 (landmass) now uses
+  // skipCleanup so its output is intentionally fragile (thin Strait
+  // cuts, fractal coast). The baseline audit's LLM call was either
+  // (a) refusing to add mountains because the rendered image was
+  // black/blue-only landmass, or (b) emitting verb stacks that
+  // overrode the carefully-tuned landmass shape. Pass 1 + keyword
+  // audits (which run only when the user explicitly picks chips)
+  // is the new default. If you need mountains, paint them in or
+  // add a keyword chip.
 
   // --- Per-keyword audits (one pass each, focused on a single feature) ---
   for (let i = 0; i < kwAudits.length; i++) {
     const kw = kwAudits[i];
     const lbl = kw.label.replace(/^\+\s*/, "");
-    await runAudit(3 + i, lbl, kw.audit, "FOCUSED AUDIT KEYWORD: " + lbl, kw.refKey);
+    await runAudit(2 + i, lbl, kw.audit, "FOCUSED AUDIT KEYWORD: " + lbl, kw.refKey);
   }
 
   const ms = Math.round(performance.now() - t0);
@@ -71118,7 +71262,9 @@ function openPlanetMapEditor(nodeId) {
     '<label><input type="radio" name="pmap-mode" value="raise" checked> raise</label>' +
     '<label><input type="radio" name="pmap-mode" value="lower"> lower</label>' +
     '<button class="btn" id="pmap-revert" type="button" style="padding:3px 10px;">revert</button>' +
-    '<button class="btn" id="pmap-climate" type="button" style="padding:3px 10px;">show climate</button>';
+    '<button class="btn" id="pmap-climate" type="button" style="padding:3px 10px;">show climate</button>' +
+    '<button class="btn" id="pmap-geojson" type="button" style="padding:3px 10px;" title="Import an Azgaar FMG Cells GeoJSON export to stamp its exact landmass onto this planet">import geojson</button>' +
+    '<input type="file" id="pmap-geojson-file" accept=".geojson,.json,application/geo+json,application/json" style="display:none">';
   body.appendChild(ctrls);
 
   // §planet-spec Phase 7.f-ai -- AI map generation via the wired LLM
@@ -71375,6 +71521,47 @@ function openPlanetMapEditor(nodeId) {
       climateBtn.textContent = "show climate";
     }
     render();
+  });
+
+  // Import GeoJSON: stamps an Azgaar FMG Cells GeoJSON's landmass
+  // onto this planet's cell graph. Deterministic alternative to AI
+  // generation -- the dropped file's land polygons become this
+  // planet's landmass shape exactly.
+  const geoBtn = modal.querySelector("#pmap-geojson");
+  const geoFileIn = modal.querySelector("#pmap-geojson-file");
+  geoBtn.addEventListener("click", () => geoFileIn.click());
+  geoFileIn.addEventListener("change", async (ev) => {
+    const file = ev.target.files && ev.target.files[0];
+    if (!file) return;
+    geoBtn.disabled = true;
+    const origLabel = geoBtn.textContent;
+    geoBtn.textContent = "...";
+    try {
+      const text = await file.text();
+      const geojson = JSON.parse(text);
+      const stats = await _planetStampGeoJSON(geojson, cells, neighbors, K, seaLevel, (msg) => {
+        geoBtn.textContent = msg.length > 22 ? msg.slice(0, 20) + "…" : msg;
+      });
+      dirty = true;
+      // Invalidate climate / rivers cache, then redraw.
+      node._cellsVersion = ((typeof node._cellsVersion === "number") ? node._cellsVersion : 0) + 1;
+      render();
+      console.log("[planet-map] stamped GeoJSON: "
+        + stats.landFeatures + "/" + stats.featuresProcessed + " land features, "
+        + (stats.landFraction * 100).toFixed(1) + "% land, "
+        + "raster=" + stats.rasterMs + "ms stamp=" + stats.stampMs + "ms");
+      geoBtn.textContent = "stamped " + (stats.landFraction * 100).toFixed(0) + "% land";
+      setTimeout(() => { geoBtn.textContent = origLabel; }, 3000);
+    } catch (e) {
+      console.error("[planet-map] geojson import failed:", e);
+      geoBtn.textContent = "error";
+      alert("GeoJSON import failed: " + e.message);
+      setTimeout(() => { geoBtn.textContent = origLabel; }, 3000);
+    } finally {
+      geoBtn.disabled = false;
+      // Reset the input so the same file can be picked again.
+      geoFileIn.value = "";
+    }
   });
 
   // AI generate + lock-target wire-up.
@@ -77290,6 +77477,7 @@ window.__PMAP = {
   buildNeighbors: _buildCellNeighbors,
   parsePlan: _parseAIPlan,
   applyPlan: _applyAIPlan,
+  stampGeoJSON: _planetStampGeoJSON,
   measureLandmass: _planetMeasureLandmass,
   loadReference: _loadPlanetReference,
   colorForHeight: _planetColorForHeight,
