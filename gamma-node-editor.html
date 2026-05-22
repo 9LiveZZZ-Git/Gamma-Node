@@ -52786,16 +52786,91 @@ fn _detail_octaves(altitude_m: f32) -> f32 {
   return 10.0;
 }
 
+// === Phase 8 sprint 8-2: per-biome detail params + noise shapes ===
+// (spec: docs/PLANET-SCALE-TERRAIN.md §8.3 + §8.6)
+//
+// Per-biome packed parameter table. Each biome takes 2 vec4 rows
+// indexed as BIOME_DETAIL_PARAMS[biomeId * 2 + 0] / [+1]:
+//   row 0: (amplitude_m, baseFreq, roughness, lacunarity)
+//   row 1: (shape_id, warpStrength, warpFreq, _)
+// shape_id values match _noise_apply_shape's enum:
+//   0 = fbm       (signed [-1, 1])
+//   1 = ridged    (sharp ridges, mostly-positive [0, 1])
+//   2 = billowed  (round bumps, [0, 1])
+//   3 = dunes     (ridged + anisotropic warp -- warp still TODO)
+//   4 = cracks    (inverted ridged, [-1, 0])
+// Biome ID order matches PLANET_BIOMES_NAMES in the JS module.
+const BIOME_DETAIL_PARAMS: array<vec4<f32>, 26> = array<vec4<f32>, 26>(
+  // 0 Marine -- no surface detail (water); zero amplitude disables it.
+  vec4<f32>(0.0, 0.001, 0.5, 2.0),   vec4<f32>(0.0, 0.0, 0.0, 0.0),
+  // 1 Hot desert -- dune ridges, mild domain warp aligned with wind.
+  vec4<f32>(4.0, 0.0010, 0.55, 2.0), vec4<f32>(3.0, 0.4, 0.0005, 0.0),
+  // 2 Cold desert
+  vec4<f32>(2.5, 0.0010, 0.55, 2.0), vec4<f32>(3.0, 0.3, 0.0005, 0.0),
+  // 3 Savanna -- gentle rolling fbm.
+  vec4<f32>(1.5, 0.0008, 0.50, 2.0), vec4<f32>(0.0, 0.0, 0.0, 0.0),
+  // 4 Grassland -- subtle plains, fbm.
+  vec4<f32>(1.0, 0.0005, 0.50, 2.0), vec4<f32>(0.0, 0.0, 0.0, 0.0),
+  // 5 Tropical seasonal forest -- moderate fbm canopy.
+  vec4<f32>(2.0, 0.0012, 0.50, 2.0), vec4<f32>(0.0, 0.0, 0.0, 0.0),
+  // 6 Temperate deciduous forest
+  vec4<f32>(2.0, 0.0010, 0.50, 2.0), vec4<f32>(0.0, 0.0, 0.0, 0.0),
+  // 7 Tropical rainforest -- bumpier canopy.
+  vec4<f32>(3.0, 0.0015, 0.50, 2.0), vec4<f32>(0.0, 0.0, 0.0, 0.0),
+  // 8 Temperate rainforest
+  vec4<f32>(2.5, 0.0012, 0.50, 2.0), vec4<f32>(0.0, 0.0, 0.0, 0.0),
+  // 9 Taiga -- forested mountains; ridged for hint of relief.
+  vec4<f32>(2.5, 0.0014, 0.55, 2.0), vec4<f32>(1.0, 0.0, 0.0, 0.0),
+  // 10 Tundra -- gentle fbm.
+  vec4<f32>(1.5, 0.0010, 0.50, 2.0), vec4<f32>(0.0, 0.0, 0.0, 0.0),
+  // 11 Glacier -- ice cracks (inverted ridged crevasses).
+  vec4<f32>(1.5, 0.0008, 0.50, 2.0), vec4<f32>(4.0, 0.0, 0.0, 0.0),
+  // 12 Wetland -- very subtle, mostly flat.
+  vec4<f32>(0.5, 0.0005, 0.50, 2.0), vec4<f32>(0.0, 0.0, 0.0, 0.0)
+);
+
+// Apply a per-octave noise shape to a signed [-1, 1] noise sample.
+fn _noise_apply_shape(n: f32, shape: u32) -> f32 {
+  if (shape == 1u) {
+    // Ridged: (1 - |n|)^2. Sharp ridges, [0, 1] range.
+    let r = 1.0 - abs(n);
+    return r * r;
+  }
+  if (shape == 2u) {
+    // Billowed: |n|. Round bumps, [0, 1] range.
+    return abs(n);
+  }
+  if (shape == 3u) {
+    // Dunes: same as ridged for now; the anisotropic domain warp
+    // (sprint 8-3 polish) will operate on worldPos before fbm.
+    let r = 1.0 - abs(n);
+    return r * r;
+  }
+  if (shape == 4u) {
+    // Cracks: inverted ridged for negative-going crevasses, [-1, 0].
+    let r = 1.0 - abs(n);
+    return -r * r;
+  }
+  // shape == 0 fbm (default) -- pass through.
+  return n;
+}
+
 // detail_noise(worldPos, biomeId, maxOctave): deterministic biome-
-// styled fBm. Returns approximately [-1, 1] (clamped depending on
-// octave sum). Sprint 8-1 ignores biomeId; sprint 8-2 wires it
-// through a per-biome parameter LUT (amplitude / frequency / shape).
+// styled fBm. Sprint 8-2 -- now reads per-biome amplitude / freq /
+// shape from BIOME_DETAIL_PARAMS instead of using a single default.
 fn detail_noise(worldPos: vec3<f32>, biomeId: u32, maxOctave: u32) -> f32 {
-  // Defaults calibrated for Earth-scale planets. Base frequency
-  // wavelength = 1km at octave 0; lacunarity 2 halves it each octave.
-  let baseFreq: f32   = 0.001;
-  let lacunarity: f32 = 2.0;
-  let roughness: f32  = 0.5;
+  // Clamp biomeId to the table; any out-of-range value falls back
+  // to grassland-like defaults.
+  let bId = min(biomeId, 12u);
+  let row0 = BIOME_DETAIL_PARAMS[bId * 2u + 0u];
+  let row1 = BIOME_DETAIL_PARAMS[bId * 2u + 1u];
+  let amplitude  = row0.x;
+  let baseFreq   = row0.y;
+  let roughness  = row0.z;
+  let lacunarity = row0.w;
+  let shape: u32 = u32(row1.x + 0.5);
+
+  if (amplitude <= 0.0 || maxOctave == 0u) { return 0.0; }
 
   var sum: f32  = 0.0;
   var freq: f32 = baseFreq;
@@ -52803,27 +52878,29 @@ fn detail_noise(worldPos: vec3<f32>, biomeId: u32, maxOctave: u32) -> f32 {
   var ampSum: f32 = 0.0;
   for (var k: u32 = 0u; k < maxOctave; k = k + 1u) {
     // Per-octave offset = deterministic seed depending ONLY on k.
-    // This is what makes the sum LOD-stable: octave k contributes
-    // the SAME value at the same worldPos regardless of maxOctave,
-    // so flying down just adds octaves k+1, k+2, ... on top of the
-    // already-accumulated lower octaves.
+    // LOD-stable: octave k contributes the same value at the same
+    // worldPos regardless of maxOctave.
     let offset = vec3<f32>(
       f32(k) * 13.37,
       f32(k) * 7.91,
       f32(k) * 23.45
     );
     let p = worldPos * freq + offset;
-    let n = _value_noise_3d(p) * 2.0 - 1.0;  // [-1, 1]
-    sum    = sum    + amp * n;
+    let nRaw = _value_noise_3d(p) * 2.0 - 1.0;  // [-1, 1]
+    let nShaped = _noise_apply_shape(nRaw, shape);
+    sum    = sum    + amp * nShaped;
     ampSum = ampSum + amp;
     freq = freq * lacunarity;
     amp  = amp  * roughness;
   }
-  // Normalize by the sum of amplitudes used; for roughness < 1 this
-  // converges to 1 / (1 - roughness) but we'd rather use the actual
-  // partial sum so partial-octave evaluations are scaled correctly.
   if (ampSum < 1e-6) { return 0.0; }
-  return sum / ampSum;
+  // Final amplitude scaling via biome's amplitude. The /ampSum
+  // normalizes the fbm sum to roughly the shape's natural range, then
+  // amplitude * 0.01 converts meters-of-feature to the [0..1] color-
+  // modulation scale used by the brightness visualization in
+  // fs_unlit_vc. (Vertex displacement in sprint 8-3 will multiply
+  // by amplitude directly.)
+  return (sum / ampSum) * amplitude * 0.01;
 }
 
 // Sample clouds for a given world view direction. Returns vec4
@@ -54086,21 +54163,30 @@ fn fs_unlit_vc(in: VsOut) -> @location(0) vec4<f32> {
     // wash-out (warm sunset hue on distant ground) until C.6 splits
     // the transmittance into a second LUT.
     let ap = sample_aerial_perspective_lut(uS.eye.xyz, in.worldPos);
-    // === Phase 8 sprint 8-1: detail-noise visualization ===
-    // (spec: docs/PLANET-SCALE-TERRAIN.md §8.2)
-    // Modulate base surface color by deterministic detail noise so
-    // the planet body shows fine-scale variation as the camera
-    // descends. Octave count auto-scales with altitude per §8.4.
-    // Brightness modulation only (no normal perturbation, no vertex
-    // displacement) -- those are sprints 8-3 and 8-5. The +/-15%
-    // modulation reads as a subtle "rocky / weathered" texture that
-    // emerges progressively at lower altitudes.
+    // === Phase 8 sprint 8-2: biome-aware detail-noise visualization ===
+    // (spec: docs/PLANET-SCALE-TERRAIN.md §8.3 + §8.6)
+    // Sprint 8-1 modulated by a single default-biome noise; sprint
+    // 8-2 routes the per-vertex biome ID (baked into uv.x by the
+    // PlanetMesh build) through the BIOME_DETAIL_PARAMS table for
+    // per-biome amplitude / frequency / noise shape (fbm vs ridged
+    // vs dunes vs cracks). Octave count still auto-scales with
+    // altitude per §8.4.
+    //
+    // round() of the interpolated uv.x means ~95% of fragments get
+    // the correct integer biome; ~5% at cell-cell boundaries get
+    // whichever biome rounded-to-nearest. Sprint 8-3 will add a
+    // proper @interpolate(flat) attribute alongside the vertex
+    // displacement work.
     let _altitude_m = max(0.0, length(uS.eye.xyz - uS.envPlanet.xyz) - uS.envPlanet.w);
     let _max_oct    = u32(_detail_octaves(_altitude_m));
     var color = in.color;
     if (_max_oct > 0u) {
-      let n = detail_noise(in.worldPos, 0u, _max_oct);
-      color = color * (1.0 + n * 0.15);
+      let bId = u32(clamp(round(in.uv.x), 0.0, 12.0));
+      let n = detail_noise(in.worldPos, bId, _max_oct);
+      // 5.0 multiplier converts detail_noise's meters-scaled output
+      // (amplitude * 0.01) into a perceptible brightness modulation
+      // (up to ~20% for hot desert / glacier biomes, ~5% for plains).
+      color = color * (1.0 + n * 5.0);
     }
     let col = color * ap.transmittance + ap.inScatter;
     return vec4<f32>(tonemap_aces(col), 1.0);
@@ -60701,9 +60787,23 @@ function _buildPlanetMesh(node) {
       if (cells.biome) return PLANET_BIOMES_COLORS[cells.biome[idx]];
       return _planetColorForHeight(elev, seaLevel);
     };
+    // Phase 8 sprint 8-2: bake biome ID into vertex's UV.x so the
+    // fragment shader can route per-biome detail-noise parameters
+    // (amplitude / frequency / shape) via BIOME_DETAIL_PARAMS. Edge
+    // verts inherit from one parent; the fragment uses round() so
+    // ~95% of fragments land on the correct integer biome (cell-cell
+    // boundary fragments may snap to either neighbor).
+    const biomeForCell = function(idx, elev) {
+      if (cells.lake && cells.lake[idx]) return 0;
+      if (cells.riverId && cells.riverId[idx] >= 0 && cells.flux && elev >= seaLevel) return 0;
+      if (cells.biome) return cells.biome[idx];
+      return 0;
+    };
+    let biomeId = 0;
     if (i < N) {
       h = cells.elevations[i];
       baseCol = colorForCell(i, h);
+      biomeId = biomeForCell(i, h);
     } else if (edgeParents) {
       const a = edgeParents[(i - N) * 2 + 0];
       const b = edgeParents[(i - N) * 2 + 1];
@@ -60711,6 +60811,7 @@ function _buildPlanetMesh(node) {
       const cA = colorForCell(a, cells.elevations[a]);
       const cB = colorForCell(b, cells.elevations[b]);
       baseCol = [0.5*(cA[0]+cB[0]), 0.5*(cA[1]+cB[1]), 0.5*(cA[2]+cB[2])];
+      biomeId = biomeForCell(a, cells.elevations[a]);
     } else {
       h = seaLevel;
       baseCol = _planetColorForHeight(h, seaLevel);
@@ -60726,7 +60827,7 @@ function _buildPlanetMesh(node) {
     verts[base + 6] = nx;
     verts[base + 7] = ny;
     verts[base + 8] = nz;
-    verts[base + 9] = 0;
+    verts[base + 9] = biomeId;
     verts[base + 10] = 0;
   }
   if (!Visual._planetMeshBuiltLogged) {
