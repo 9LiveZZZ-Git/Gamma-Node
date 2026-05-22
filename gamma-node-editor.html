@@ -10846,11 +10846,16 @@ public:
       textureMix:   1.0,
       displacementScale: 500.0,
       detailPatchEnabled: 1,
-      detailPatchSize:     3000,
-      detailPatchGridDim:  96,
+      // Sprint 8-7c -- bigger default patch (8km) and ~10x
+      // displacement so the surface relief reads even on hot-desert
+      // / glacier biomes where per-biome amplitude is just a few
+      // meters. User can dial back via the PlanetMap "biomes" tab
+      // (rough/amp sliders) or these per-PlanetMesh knobs.
+      detailPatchSize:     8000,
+      detailPatchGridDim:  128,
       detailPatchBiomeId:  4,
-      detailPatchDispScale: 1.0,
-      detailPatchMaxAlt:   5000
+      detailPatchDispScale: 10.0,
+      detailPatchMaxAlt:   10000
     },
     methods: {},
     description: "Phase 7.d-azgaar of planet-spec -- direct cell-mesh planet, mirrors Azgaar's 3D scene mode (one mesh vertex per cell, triangles between mutually-adjacent cells). NO chunking, NO cubemap intermediate. Wire a PlanetMap's heightmap output; each cell becomes one vertex at unit_direction * (R + cell.h * heightScale * altitudeFactor) with color from _planetColorForHeight. Triangulation is built once from the cell-graph K-neighbor table (~120k triangles at cellCount=30000). subdivide=1 applies one Loop subdivision pass (Azgaar `loopSubdivision.modify(geometry, 1)` equivalent) -- 4× triangle count, smooths cell-faceting between mountains, gives the rounded terrain look from Azgaar's 3D scene. Best for orbit views; foot-level detail not provided (~130km per cell at Earth scale)."
@@ -54229,23 +54234,45 @@ fn vs_main(in: VsIn) -> VsOut {
 //   2. Convert (u, v) -> tangent offsets in meters using patchSize.
 //   3. Place the patch vertex on the planet surface at (camera under
 //      point + tangent offsets), then radial-project onto the actual
-//      surface sphere.
+//      OBLATE SPHEROID surface (sprint 8-7c -- the previous "project
+//      onto sphere" version floated the patch above the planet at
+//      non-equator latitudes because polRatio compresses the planet's
+//      Y axis by ~0.34% / ~22km at the poles).
 //   4. Apply detail_noise_height displacement along radial.
-//   5. Fade alpha (via vertex color) to zero above maxAltitude so
-//      orbital views don't show the patch at all.
+//
+// Biome colors are baked in as a WGSL const array so the vertex
+// shader can output the proper biome color directly (sprint 8-7c --
+// the previous gray-with-alpha-fade hack made the patch read as a
+// flat gray square instead of biome-tinted terrain).
 //
 // Per-draw uniforms (vsParams):
 //   x = patchSize (meters)
 //   y = biomeId (encoded as f32, rounded)
 //   z = displacementScale
-//   w = maxAltitude (meters; patch fades 0 -> 1 over the bottom 30%
-//                    of this range and disappears above it)
+//   w = maxAltitude (meters; encoder skips the draw above this)
+const _PLANET_BIOME_COLORS_VS: array<vec3<f32>, 13> = array<vec3<f32>, 13>(
+  vec3<f32>(0.275, 0.431, 0.671),  // 0 Marine
+  vec3<f32>(0.984, 0.906, 0.624),  // 1 Hot desert
+  vec3<f32>(0.710, 0.722, 0.529),  // 2 Cold desert
+  vec3<f32>(0.824, 0.816, 0.510),  // 3 Savanna
+  vec3<f32>(0.784, 0.839, 0.561),  // 4 Grassland
+  vec3<f32>(0.714, 0.851, 0.365),  // 5 Tropical seasonal forest
+  vec3<f32>(0.161, 0.737, 0.337),  // 6 Temperate deciduous forest
+  vec3<f32>(0.490, 0.796, 0.208),  // 7 Tropical rainforest
+  vec3<f32>(0.251, 0.612, 0.263),  // 8 Temperate rainforest
+  vec3<f32>(0.376, 0.529, 0.310),  // 9 Taiga
+  vec3<f32>(0.561, 0.580, 0.486),  // 10 Tundra
+  vec3<f32>(0.835, 0.906, 0.922),  // 11 Glacier
+  vec3<f32>(0.227, 0.471, 0.337)   // 12 Wetland
+);
+
 @vertex
 fn vs_planet_detail(in: VsIn) -> VsOut {
   var out: VsOut;
   let uv = in.pos.xy;  // grid coord [0, 1]
   let planetC = uS.envPlanet.xyz;
   let planetR = uS.envPlanet.w;
+  let polRatio = max(0.5, min(2.0, uS.envPlanetGeom.x));
 
   // Camera radial / under-camera surface point.
   let radialFromCam = uS.eye.xyz - planetC;
@@ -54266,14 +54293,23 @@ fn vs_planet_detail(in: VsIn) -> VsOut {
   let patchSize = max(uD.vsParams.x, 1.0);
   let offsetEast  = (uv.x - 0.5) * patchSize;
   let offsetNorth = (uv.y - 0.5) * patchSize;
-  let cameraUnder = planetC + camUp * planetR;
+  // The camera-under point on the OBLATE SPHEROID (not sphere) -- same
+  // direction as camUp, but the spheroid radius depends on direction.
+  let cuY2 = camUp.y * camUp.y;
+  let invPr2 = 1.0 / (polRatio * polRatio);
+  let camRadiusOnSpheroid = planetR / sqrt(1.0 - cuY2 + cuY2 * invPr2);
+  let cameraUnder = planetC + camUp * camRadiusOnSpheroid;
   let tangentPos  = cameraUnder + localEast * offsetEast + localNorth * offsetNorth;
 
-  // Radial-project onto the actual planet sphere so the patch
-  // curves with the planet rather than sitting on a flat tangent
-  // plane (matters once patchSize approaches a few km).
+  // Project onto the OBLATE SPHEROID (sprint 8-7c fix). For a point
+  // along direction d at distance t from planet center, the spheroid
+  // intersection is t = planetR / sqrt(dx² + dy²/pr² + dz²).
   let projDir = normalize(tangentPos - planetC);
-  var surfacePos = planetC + projDir * planetR;
+  let pdx2 = projDir.x * projDir.x;
+  let pdy2 = projDir.y * projDir.y;
+  let pdz2 = projDir.z * projDir.z;
+  let surfaceR = planetR / sqrt(pdx2 + pdy2 * invPr2 + pdz2);
+  var surfacePos = planetC + projDir * surfaceR;
 
   // Detail noise displacement.
   let biomeId = u32(clamp(uD.vsParams.y + 0.5, 0.0, 12.0));
@@ -54283,23 +54319,23 @@ fn vs_planet_detail(in: VsIn) -> VsOut {
     dispH = detail_noise_height(surfacePos, biomeId, octF);
   }
   let dispScale = uD.vsParams.z;
-  // +1m bias along the radial so this fragment wins against the
-  // coarse PlanetMesh in z-buffer ties; the bump is invisible.
-  surfacePos = surfacePos + projDir * (dispH * dispScale + 1.0);
+  // +5m bias along the radial so this fragment wins against the
+  // coarse PlanetMesh in z-buffer ties; the bump is invisible from
+  // orbital distances and trivially small from a meter away too.
+  surfacePos = surfacePos + projDir * (dispH * dispScale + 5.0);
 
-  // Altitude fade: full opacity below maxAltitude * 0.7, fade out
-  // to 0 above maxAltitude. The fade goes through the color alpha
-  // channel which fs_unlit_vc multiplies in below.
-  let maxAlt = max(uD.vsParams.w, 1.0);
-  let alpha = 1.0 - smoothstep(maxAlt * 0.7, maxAlt, camAlt);
+  // Biome color + simple Lambert lighting against the sun direction.
+  // Matches the JS-side baked lighting in _buildPlanetMesh so the
+  // patch reads at the same illumination as the surrounding coarse
+  // mesh.
+  let biomeColor = _PLANET_BIOME_COLORS_VS[biomeId];
+  let sunDir = uS.envSun.xyz;
+  let ambient = 0.18;
+  let lambert = max(ambient, dot(projDir, sunDir));
 
   out.worldPos = surfacePos;
   out.pos = uS.viewProj * vec4<f32>(surfacePos, 1.0);
-  // Color stub: the biome's vertex color is fetched per-fragment via
-  // the biome ID in uv.x (matching the PlanetMesh convention from
-  // sprint 8-2). White here is multiplied by the biome color in
-  // fs_unlit_vc through the standard pipeline.
-  out.color = vec3<f32>(alpha, alpha, alpha);
+  out.color = biomeColor * lambert;
   out.normal = projDir;
   out.uv = vec2<f32>(f32(biomeId), 0.0);
   return out;
@@ -63919,6 +63955,27 @@ function _encodeScenePass(enc, entry) {
   for (let i = 0; i < meshes.length && i < inst.slots.length; i++) {
     const m = meshes[i];
     const slot = inst.slots[i];
+    // Sprint 8-7c -- LOD gate for the synthesized planet detail
+    // patch. Skip the draw entirely when the camera is above the
+    // patch's maxAltitude; the patch's altitude-fade in the vertex
+    // shader was previously rendering it as a gray scaled square
+    // instead of becoming invisible.
+    if (m.isPlanetDetailPatch) {
+      const pp = (m.node && m.node.params) || {};
+      const maxAlt = (typeof pp.detailPatchMaxAlt === "number") ? pp.detailPatchMaxAlt : 5000;
+      const cx = inst.sceneScratch[132];
+      const cy = inst.sceneScratch[133];
+      const cz = inst.sceneScratch[134];
+      const pR = inst.sceneScratch[135];
+      if (pR > 0) {
+        const dx = camera.eye[0] - cx;
+        const dy = camera.eye[1] - cy;
+        const dz = camera.eye[2] - cz;
+        const camDist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+        const camAlt  = Math.max(0, camDist - pR);
+        if (camAlt > maxAlt) continue;
+      }
+    }
     const buf = _ensureMeshBuffers(m);
     // §5.5.e-6 -- TiledTerrain returns buf.tiledChunks (per-chunk
     // VBOs) instead of a single buf.vertexBuffer. Both shapes are
