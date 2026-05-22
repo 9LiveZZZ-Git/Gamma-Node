@@ -53378,18 +53378,22 @@ fn sample_aerial_perspective_lut(camPos: vec3<f32>, fragPos: vec3<f32>) -> AtmRe
   let altitude = max(0.0, radialDist - planetR);
   let horizonDist = sqrt(altitude * (2.0 * planetR + altitude));
   let maxDist = max(atmThk * 8.0, horizonDist + atmThk * 4.0);
-  let layerF = 31.0 * sqrt(clamp(dist / max(maxDist, 1.0), 0.0, 1.0));
-  let layerA = i32(clamp(floor(layerF), 0.0, 31.0));
-  let layerB = min(layerA + 1, 31);
+  // C.7 -- 64 layers (was 32) so adjacent-layer transitions are
+  // closer together in depth and the ring-banding artifact is finer.
+  let layerF = 63.0 * sqrt(clamp(dist / max(maxDist, 1.0), 0.0, 1.0));
+  let layerA = i32(clamp(floor(layerF), 0.0, 63.0));
+  let layerB = min(layerA + 1, 63);
   let frac = layerF - f32(layerA);
 
-  let a = textureSampleLevel(atmAerialLUT, atmLutSampler, uv, layerA, 0.0);
-  let b = textureSampleLevel(atmAerialLUT, atmLutSampler, uv, layerB, 0.0);
-  let ap = mix(a, b, frac);
+  let aS = textureSampleLevel(atmAerialLUT, atmLutSampler, uv, layerA, 0.0);
+  let bS = textureSampleLevel(atmAerialLUT, atmLutSampler, uv, layerB, 0.0);
+  let apScatter = mix(aS, bS, frac);
+  // C.7 -- per-channel transmittance LUT, interpolated the same way.
+  let aT = textureSampleLevel(atmAerialTransLUT, atmLutSampler, uv, layerA, 0.0);
+  let bT = textureSampleLevel(atmAerialTransLUT, atmLutSampler, uv, layerB, 0.0);
+  let apTrans = mix(aT, bT, frac);
 
-  // Mono transmittance gets broadcast to RGB so callers can drop in
-  // the LUT-based AtmResult without changing their math.
-  return AtmResult(ap.rgb, vec3<f32>(ap.a));
+  return AtmResult(apScatter.rgb, apTrans.rgb);
 }
 
 fn sample_procedural_sky_features(dir: vec3<f32>) -> vec3<f32> {
@@ -53637,11 +53641,11 @@ struct PerDraw {
 // fetch instead of running its own per-pixel atmosphere integral.
 @group(0) @binding(9) var atmSkyViewLUT:       texture_2d<f32>;
 // C.5 -- aerial-perspective LUT: 32-layer 2D-array of (clip_x,
-// clip_y, depth) precomputed atmosphere in-scatter + transmittance
-// for a surface visible at that screen position and depth. RGB =
-// in-scatter; A = mono transmittance. Replaces the per-pixel
-// _atm_integrate call in fs_unlit_vc / fs_phong's aerial_perspective.
-@group(0) @binding(10) var atmAerialLUT: texture_2d_array<f32>;
+// clip_y, depth) precomputed atmosphere in-scatter. RGB = in-scatter.
+// C.7 -- per-channel transmittance LUT (companion to atmAerialLUT,
+// same shape). RGB = transmittance; A unused.
+@group(0) @binding(10) var atmAerialLUT:      texture_2d_array<f32>;
+@group(0) @binding(11) var atmAerialTransLUT: texture_2d_array<f32>;
 
 // Sample the multi-scattering LUT. Axes match fs_lut_multiscatter:
 //   u = sunZenithCos in [-1, 1] mapped linearly to [0, 1]
@@ -55064,7 +55068,13 @@ function _ensureMeshBindGroupLayout() {
       // layer is a depth slice of the camera's view frustum;
       // sampled by surface shaders to get distance-dependent
       // atmospheric tint without per-pixel integration.
-      { binding: 10, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d-array", multisampled: false } }
+      { binding: 10, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d-array", multisampled: false } },
+      // C.7 -- per-channel transmittance companion to the aerial
+      // perspective LUT. Same shape (128x128 x 32 layers), RGB =
+      // transmittance, A = unused. Sampled alongside the in-scatter
+      // LUT in sample_aerial_perspective_lut for warm-tint distant
+      // ground (wavelength-dependent extinction).
+      { binding: 11, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d-array", multisampled: false } }
     ]
   });
   Visual.meshPipelineLayout = Visual.device.createPipelineLayout({
@@ -55965,18 +55975,29 @@ fn fs_lut_skyview(in: VsLutOut) -> @location(0) vec4<f32> {
   let mDenom = pow(max(1.0 + g2 - 2.0 * g * cosTheta, 1e-4), 1.5);
   let phaseM = 0.1193662 * (1.0 - g2) * (1.0 + cos2) / ((2.0 + g2) * mDenom);
 
-  // 2026-05-22 -- bump 30 -> 48 samples. With exponential atmospheric
-  // density and a 100km Earth-scale shell, 30 samples spread along a
-  // long tangent chord (~1000km worst case) alias the density curve
-  // hard; the more samples, the smoother the LUT contents change as
-  // camera position moves through the chord-geometry transition.
-  let SAMPLES: i32 = 48;
-  let dt = segLen / f32(SAMPLES);
+  // C.7 -- importance sampling. Match the aerial-perspective LUT's
+  // approach: concentrate samples near the end of the segment closest
+  // to the planet ground (densest atmosphere). Bump 48 -> 64 samples
+  // alongside the remap.
+  let h_at_t0 = max(0.0, length(eye + dir * t0 - planetC) - planetR);
+  let h_at_t1 = max(0.0, length(eye + dir * t1 - planetC) - planetR);
+  let concAtEnd: f32 = select(0.0, 1.0, h_at_t0 > h_at_t1);
+
+  let SAMPLES: i32 = 64;
+  let invN = 1.0 / f32(SAMPLES);
   var inScatter   = vec3<f32>(0.0);
   var transmittance = vec3<f32>(1.0);
 
   for (var i: i32 = 0; i < SAMPLES; i = i + 1) {
-    let t = t0 + (f32(i) + 0.5) * dt;
+    let u = (f32(i) + 0.5) * invN;
+    let gLow  = u * u;
+    let gHigh = 1.0 - (1.0 - u) * (1.0 - u);
+    let dgLow  = 2.0 * u;
+    let dgHigh = 2.0 * (1.0 - u);
+    let uMapped = mix(gLow,  gHigh,  concAtEnd);
+    let dgScale = mix(dgLow, dgHigh, concAtEnd);
+    let t  = t0 + segLen * uMapped;
+    let dt = segLen * dgScale * invN;
     let p = eye + dir * t;
     let pRadial = p - planetC;
     let h = max(0.0, length(pRadial) - planetR);
@@ -56035,13 +56056,17 @@ fn fs_lut_skyview(in: VsLutOut) -> @location(0) vec4<f32> {
 //      distance, sampling transmittance + multi-scatter LUTs per step.
 //   5. Output RGB = in-scatter, A = mono transmittance.
 //
-// Mono transmittance is a known Hillaire 2020 simplification (loses
-// the per-channel wavelength-dependent extinction that gives the
-// "warm distant ground" sunset look); the surface shader still gets
-// useful aerial perspective, and C.6 can swap in a per-channel
-// transmittance LUT if needed.
+// C.7 -- per-channel transmittance LUT (second render target). The
+// previous mono transmittance simplification lost the wavelength-
+// dependent extinction that gives the "warm distant ground" sunset
+// look; with two LUTs we keep RGB transmittance separately.
+struct AerialOut {
+  @location(0) inScatter:    vec4<f32>,
+  @location(1) transmittance: vec4<f32>,
+};
+
 @fragment
-fn fs_lut_aerial(in: VsLutOut) -> @location(0) vec4<f32> {
+fn fs_lut_aerial(in: VsLutOut) -> AerialOut {
   let planetC = uA.planet.xyz;
   let planetR = uA.planet.w;
   let atmR    = uA.atm.x;
@@ -56053,8 +56078,14 @@ fn fs_lut_aerial(in: VsLutOut) -> @location(0) vec4<f32> {
   let turbidity = max(uA.misc.x, 0.5);
   let eye     = uA.camera.xyz;
 
+  // C.7 default-return helper. Used in early-out paths where we
+  // still need to write both render targets to a well-defined value.
+  var defOut: AerialOut;
+  defOut.inScatter    = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+  defOut.transmittance = vec4<f32>(1.0, 1.0, 1.0, 1.0);
+
   if (planetR <= 0.0 || atmR <= planetR) {
-    return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    return defOut;
   }
 
   // Decode (clip_x, clip_y) from uv; vs_lut's uv = (clipx*0.5+0.5,
@@ -56080,7 +56111,7 @@ fn fs_lut_aerial(in: VsLutOut) -> @location(0) vec4<f32> {
   let dir = normalize(pdir);
 
   // Layer 0 has distance=0 -> trivial result.
-  if (distance < 1.0) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
+  if (distance < 1.0) { return defOut; }
 
   // Ray-atmosphere intersect; clip the integration to (a) the
   // requested distance, (b) the atmosphere far shell, and (c) the
@@ -56089,7 +56120,7 @@ fn fs_lut_aerial(in: VsLutOut) -> @location(0) vec4<f32> {
   let b  = dot(oc, dir);
   let cAtm = dot(oc, oc) - atmR * atmR;
   let hAtm = b * b - cAtm;
-  if (hAtm < 0.0) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
+  if (hAtm < 0.0) { return defOut; }
   let sAtm = sqrt(hAtm);
   var t0 = max(-b - sAtm, 0.0);
   var t1 = min(-b + sAtm, distance);
@@ -56100,7 +56131,7 @@ fn fs_lut_aerial(in: VsLutOut) -> @location(0) vec4<f32> {
     if (tg > 0.0 && tg < t1) { t1 = tg; }
   }
   let segLen = t1 - t0;
-  if (segLen <= 0.0) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
+  if (segLen <= 0.0) { return defOut; }
 
   // Phase functions.
   let cosTheta = dot(dir, sunDir);
@@ -56116,18 +56147,42 @@ fn fs_lut_aerial(in: VsLutOut) -> @location(0) vec4<f32> {
   let betaR = vec3<f32>(5.8e-6, 13.5e-6, 33.1e-6) * unitScale;
   let betaM = vec3<f32>(21.0e-6) * unitScale * turbidity;
 
-  // 2026-05-22 -- bumped 16 -> 32 samples. With per-sample LUT
-  // lookups (transmittance + multi-scatter) the work per ray sample
-  // is light; the moiré "ripples" the user reported on descent are
-  // largely sample-vs-density aliasing as ray geometry varies across
-  // adjacent LUT voxels. More samples smooth that out.
-  let SAMPLES: i32 = 32;
-  let dt = segLen / f32(SAMPLES);
+  // C.7 -- importance sampling. The dominant aliasing source in the
+  // earlier uniform-stepped integrator was sample positions sliding
+  // through the exponential density curve as the ray geometry shifted
+  // between adjacent LUT voxels. We address it on two fronts:
+  //   (a) Bump to 64 samples.
+  //   (b) Endpoint-concentrated non-linear stepping: figure out which
+  //       end of the segment is closest to the ground (the densest
+  //       atmosphere region) and concentrate samples there using a
+  //       quadratic remap. Density is exp(-h/H) so the dense end
+  //       contributes orders of magnitude more to the integral; a
+  //       1/u^2 spacing approximates equal-optical-depth sampling
+  //       without the cost of solving the inverse CDF per pixel.
+  let h_at_t0 = max(0.0, length(eye + dir * t0 - planetC) - planetR);
+  let h_at_t1 = max(0.0, length(eye + dir * t1 - planetC) - planetR);
+  // 1 if t1 is closer to planet (looking down -> concentrate at t1),
+  // 0 if t0 is closer (looking up from inside atmosphere).
+  let concAtEnd: f32 = select(0.0, 1.0, h_at_t0 > h_at_t1);
+
+  let SAMPLES: i32 = 64;
+  let invN = 1.0 / f32(SAMPLES);
   var inScatter = vec3<f32>(0.0);
   var trans     = vec3<f32>(1.0);
 
   for (var i: i32 = 0; i < SAMPLES; i = i + 1) {
-    let t = t0 + (f32(i) + 0.5) * dt;
+    let u = (f32(i) + 0.5) * invN;
+    // Quadratic remap: g(u) = u^2 (samples near t0) OR g(u) =
+    // 1-(1-u)^2 (samples near t1). dg/du is the local step weight.
+    let gLow  = u * u;
+    let gHigh = 1.0 - (1.0 - u) * (1.0 - u);
+    let dgLow  = 2.0 * u;
+    let dgHigh = 2.0 * (1.0 - u);
+    let uMapped = mix(gLow,  gHigh,  concAtEnd);
+    let dgScale = mix(dgLow, dgHigh, concAtEnd);
+    let t  = t0 + segLen * uMapped;
+    let dt = segLen * dgScale * invN;
+
     let p = eye + dir * t;
     let pRadial = p - planetC;
     let h = max(0.0, length(pRadial) - planetR);
@@ -56159,8 +56214,13 @@ fn fs_lut_aerial(in: VsLutOut) -> @location(0) vec4<f32> {
     trans = trans * segT;
   }
 
-  let transMono = dot(trans, vec3<f32>(0.299, 0.587, 0.114));
-  return vec4<f32>(inScatter * sunI, transMono);
+  // C.7 -- per-channel transmittance in the second render target; the
+  // mesh-side sampler reads both LUTs and applies wavelength-dependent
+  // extinction (warm red tint on distant ground).
+  var outV: AerialOut;
+  outV.inScatter    = vec4<f32>(inScatter * sunI, 1.0);
+  outV.transmittance = vec4<f32>(trans, 1.0);
+  return outV;
 }
 `;
 
@@ -56237,21 +56297,20 @@ function _ensureAtmosphereLUTs() {
       label: "atm-skyview-lut-view"
     });
   }
-  // C.5 -- aerial-perspective LUT. 2D-array texture (32 layers, each
-  // 128x128) so the surface shader can sample (clip_x, clip_y, depth)
-  // with hardware bilinear filtering on x/y and manual lerp across
-  // layers in WGSL. RGB = in-scatter, A = mono transmittance.
+  // C.5 + C.7 -- aerial-perspective LUTs. Pair of 2D-array textures
+  // (64 depth layers, each 128x128). RGB = in-scatter / transmittance.
   // Per-layer views are kept for rendering one Z-slice per pass.
   //
-  // 2026-05-22 bump 32x32 -> 64x64 -> 128x128: orbital descent showed
-  // concentric "ripples" expanding outward from screen center as the
-  // per-voxel integration result shifted faster than bilinear
-  // filtering between LUT cells could smooth. 4x more cells (per
-  // step) halves the aliasing wavelength in screen space.
+  // 2026-05-22 bumped 32 -> 64 layers. The previous 32 layers showed
+  // visible concentric "rings" centered at the camera nadir: distance
+  // varies smoothly across the screen, but with only 32 layers each
+  // covered ~3% of the depth range, and adjacent layers' integrated
+  // values differed enough that bilinear interpolation between them
+  // read as bands. 64 layers halves the band width.
   if (!Visual.atmAerialLUT) {
     Visual.atmAerialLUT = dev.createTexture({
-      label: "atm-aerial-lut-128x128x32",
-      size: [128, 128, 32],
+      label: "atm-aerial-lut-128x128x64",
+      size: [128, 128, 64],
       dimension: "2d",
       format: "rgba16float",
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
@@ -56260,12 +56319,36 @@ function _ensureAtmosphereLUTs() {
       label: "atm-aerial-lut-array-view",
       dimension: "2d-array",
       baseArrayLayer: 0,
-      arrayLayerCount: 32
+      arrayLayerCount: 64
     });
     Visual.atmAerialLUTLayerViews = [];
-    for (let i = 0; i < 32; i++) {
+    for (let i = 0; i < 64; i++) {
       Visual.atmAerialLUTLayerViews.push(Visual.atmAerialLUT.createView({
         label: "atm-aerial-lut-layer-" + i,
+        dimension: "2d",
+        baseArrayLayer: i,
+        arrayLayerCount: 1
+      }));
+    }
+  }
+  if (!Visual.atmAerialTransLUT) {
+    Visual.atmAerialTransLUT = dev.createTexture({
+      label: "atm-aerial-trans-lut-128x128x64",
+      size: [128, 128, 64],
+      dimension: "2d",
+      format: "rgba16float",
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
+    });
+    Visual.atmAerialTransLUTArrayView = Visual.atmAerialTransLUT.createView({
+      label: "atm-aerial-trans-lut-array-view",
+      dimension: "2d-array",
+      baseArrayLayer: 0,
+      arrayLayerCount: 64
+    });
+    Visual.atmAerialTransLUTLayerViews = [];
+    for (let i = 0; i < 64; i++) {
+      Visual.atmAerialTransLUTLayerViews.push(Visual.atmAerialTransLUT.createView({
+        label: "atm-aerial-trans-lut-layer-" + i,
         dimension: "2d",
         baseArrayLayer: i,
         arrayLayerCount: 1
@@ -56290,14 +56373,14 @@ function _ensureAtmosphereLUTs() {
     });
     Visual.atmLutScratch = new Float32Array(32);
   }
-  // C.5 -- aerial-perspective slice buffer. 32 slots of 256 bytes
-  // each (WebGPU minimum dynamic-offset alignment); only the first
-  // 16 bytes of each slot are used (sliceIdx, sliceCount, maxDist,
-  // _). Populated ONCE at init; sliceCount + maxDist could change
-  // per-frame if we make max distance camera-altitude aware (C.6).
+  // C.5 + C.7 -- aerial-perspective slice buffer. 64 slots of 256
+  // bytes each (WebGPU minimum dynamic-offset alignment); only the
+  // first 16 bytes of each slot are used (sliceIdx, sliceCount,
+  // maxDist, _). Populated ONCE at init; maxDist is updated per
+  // frame for altitude-aware coverage.
   if (!Visual.atmAerialSliceBuffer) {
     const SLICE_STRIDE = 256;
-    const NUM_SLICES = 32;
+    const NUM_SLICES = 64;
     Visual.atmAerialSliceStride = SLICE_STRIDE;
     Visual.atmAerialNumSlices = NUM_SLICES;
     Visual.atmAerialSliceBuffer = dev.createBuffer({
@@ -56306,13 +56389,11 @@ function _ensureAtmosphereLUTs() {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
     });
     Visual.atmAerialSliceScratch = new Float32Array(NUM_SLICES * SLICE_STRIDE / 4);
-    // maxDist is set per-frame in _renderAtmosphereLUTs; sliceIdx +
-    // sliceCount are static.
     for (let i = 0; i < NUM_SLICES; i++) {
       const f0 = (i * SLICE_STRIDE) / 4;
       Visual.atmAerialSliceScratch[f0 + 0] = i;
       Visual.atmAerialSliceScratch[f0 + 1] = NUM_SLICES;
-      Visual.atmAerialSliceScratch[f0 + 2] = 0;  // maxDist filled later
+      Visual.atmAerialSliceScratch[f0 + 2] = 0;
       Visual.atmAerialSliceScratch[f0 + 3] = 0;
     }
   }
@@ -56484,7 +56565,14 @@ function _ensureAtmosphereLUTs() {
         fragment: {
           module: Visual.atmLutShaderModule,
           entryPoint: "fs_lut_aerial",
-          targets: [{ format: "rgba16float" }]
+          // C.7 -- dual render targets: @location(0) = in-scatter,
+          // @location(1) = per-channel transmittance. Each render
+          // pass attaches both layer views and the fragment writes
+          // both atomically.
+          targets: [
+            { format: "rgba16float" },
+            { format: "rgba16float" }
+          ]
         },
         primitive: { topology: "triangle-list", cullMode: "none" }
       });
@@ -56637,21 +56725,31 @@ function _renderAtmosphereLUTs(enc, planetInfo, camera, sunDirOverride) {
     pass.end();
   }
 
-  // C.5 -- aerial perspective LUT: 32 passes, one per Z-slice. Each
-  // pass binds group 0 = atmSkyViewBindGroup (shared common +
-  // transmittance/multi-scatter LUT bindings), and group 1 = aerial
-  // slice bind group with dynamic offset selecting which slice.
+  // C.5 + C.7 -- aerial perspective LUT: 32 passes, one per Z-slice.
+  // Each pass writes BOTH the in-scatter LUT (location 0) and the
+  // per-channel transmittance LUT (location 1). Bind group 0 carries
+  // the shared atmosphere uniforms + the transmittance / multi-scatter
+  // LUTs that this pass reads at every sample; bind group 1 selects
+  // which Z-slice via dynamic offset.
   if (Visual.atmAerialPipeline && Visual.atmAerialSliceBindGroup &&
-      Visual.atmAerialLUTLayerViews) {
+      Visual.atmAerialLUTLayerViews && Visual.atmAerialTransLUTLayerViews) {
     for (let s = 0; s < numSlices; s++) {
       const pass = enc.beginRenderPass({
         label: "atm-aerial-lut-pass-" + s,
-        colorAttachments: [{
-          view: Visual.atmAerialLUTLayerViews[s],
-          clearValue: { r: 0, g: 0, b: 0, a: 1 },
-          loadOp: "clear",
-          storeOp: "store"
-        }]
+        colorAttachments: [
+          {
+            view: Visual.atmAerialLUTLayerViews[s],
+            clearValue: { r: 0, g: 0, b: 0, a: 1 },
+            loadOp: "clear",
+            storeOp: "store"
+          },
+          {
+            view: Visual.atmAerialTransLUTLayerViews[s],
+            clearValue: { r: 1, g: 1, b: 1, a: 1 },
+            loadOp: "clear",
+            storeOp: "store"
+          }
+        ]
       });
       pass.setPipeline(Visual.atmAerialPipeline);
       pass.setBindGroup(0, Visual.atmSkyViewBindGroup);
@@ -62934,6 +63032,7 @@ function _ensureSceneInstance(sceneNode) {
     const multiScatterView  = Visual.atmMultiScatterLUTView  || Visual.atmLut1x1DefaultView;
     const skyViewView       = Visual.atmSkyViewLUTView       || Visual.atmLut1x1DefaultView;
     const aerialView        = Visual.atmAerialLUTArrayView;
+    const aerialTransView   = Visual.atmAerialTransLUTArrayView;
     const makeBindGroup = (scratchView, parity) =>
       Visual.device.createBindGroup({
         label: "scene-bg-" + sceneNode.id + "-slot" + i + "-" + parity,
@@ -62949,7 +63048,8 @@ function _ensureSceneInstance(sceneNode) {
           { binding: 7, resource: multiScatterView },
           { binding: 8, resource: Visual.atmLutSampler || Visual.envSampler },
           { binding: 9, resource: skyViewView },
-          { binding: 10, resource: aerialView }
+          { binding: 10, resource: aerialView },
+          { binding: 11, resource: aerialTransView }
         ]
       });
     const bindGroupA = makeBindGroup(Visual.scratchArrayViewA, "a");
