@@ -10815,6 +10815,12 @@ public:
       // be added later if the unified knob proves too coarse.
       { n: "textureScale",      t: "param" },
       { n: "textureMix",        t: "param" },
+      // Phase 8 sprint 8-6: per-vertex detail-noise displacement scale.
+      // detail_noise_height returns meters keyed to the biome's amp;
+      // displacementScale multiplies that. Default 1.0 = use biome amp
+      // as-is; bump higher (200-1000) to amplify mountains into the
+      // kilometer range that breaks orbital silhouette.
+      { n: "displacementScale", t: "param" },
       { n: "heightmap",         t: "heightmap" },
       { n: "landTexture",       t: "texture" },
       { n: "waterTexture",      t: "texture" }
@@ -10826,7 +10832,8 @@ public:
       heightScale: 0, seaLevel: 0.5,
       subdivide: 0,
       textureScale: 0.001,
-      textureMix:   1.0
+      textureMix:   1.0,
+      displacementScale: 500.0
     },
     methods: {},
     description: "Phase 7.d-azgaar of planet-spec -- direct cell-mesh planet, mirrors Azgaar's 3D scene mode (one mesh vertex per cell, triangles between mutually-adjacent cells). NO chunking, NO cubemap intermediate. Wire a PlanetMap's heightmap output; each cell becomes one vertex at unit_direction * (R + cell.h * heightScale * altitudeFactor) with color from _planetColorForHeight. Triangulation is built once from the cell-graph K-neighbor table (~120k triangles at cellCount=30000). subdivide=1 applies one Loop subdivision pass (Azgaar `loopSubdivision.modify(geometry, 1)` equivalent) -- 4× triangle count, smooths cell-faceting between mountains, gives the rounded terrain look from Azgaar's 3D scene. Best for orbit views; foot-level detail not provided (~130km per cell at Earth scale)."
@@ -52946,9 +52953,15 @@ fn detail_noise(worldPos: vec3<f32>, biomeId: u32, maxOctave: u32) -> f32 {
   // normalizes the fbm sum to roughly the shape's natural range, then
   // amplitude * 0.01 converts meters-of-feature to the [0..1] color-
   // modulation scale used by the brightness visualization in
-  // fs_unlit_vc. (Vertex displacement in sprint 8-3 will multiply
-  // by amplitude directly.)
+  // fs_unlit_vc. (Vertex displacement uses detail_noise_height which
+  // strips the 0.01 to recover meters.)
   return (sum / ampSum) * amplitude * 0.01;
+}
+
+// Phase 8 sprint 8-6: meters-scaled detail noise for vertex displacement.
+// Strips the 0.01 color-modulation scale to recover real meters.
+fn detail_noise_height(worldPos: vec3<f32>, biomeId: u32, maxOctave: u32) -> f32 {
+  return detail_noise(worldPos, biomeId, maxOctave) * 100.0;
 }
 
 // Sample clouds for a given world view direction. Returns vec4
@@ -54076,7 +54089,38 @@ struct VsOut {
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
   var out: VsOut;
-  let world  = uD.model * vec4<f32>(in.pos, 1.0);
+  var localPos = in.pos;
+
+  // === Phase 8 sprint 8-6: planet-aware vertex displacement ===
+  // (spec: docs/PLANET-SCALE-TERRAIN.md §8.5 part a)
+  // The encoder sets uD.vsParams.z = 1.0 for PlanetMesh draws (and 0
+  // elsewhere) so we can selectively displace planet vertices without
+  // affecting other meshes in the same scene. Displacement is along
+  // the radial direction (outward from planet center), magnitude
+  // proportional to the biome's amplitude * detail_noise output.
+  // Octaves auto-scale with camera altitude per _detail_octaves.
+  //
+  // For the planet mesh the model matrix is identity, so local-space
+  // pos already equals world-space pos -- the displacement is
+  // applied directly to in.pos before the model transform.
+  if (uD.vsParams.z > 0.5 && uS.envPlanet.w > 0.0) {
+    let radialVec = localPos - uS.envPlanet.xyz;
+    let radialLen = length(radialVec);
+    let radialDir = radialVec / max(radialLen, 1.0);
+    let camAlt = max(0.0, length(uS.eye.xyz - uS.envPlanet.xyz) - uS.envPlanet.w);
+    let octaves = u32(_detail_octaves(camAlt));
+    if (octaves > 0u) {
+      let bId = u32(clamp(round(in.uv.x), 0.0, 12.0));
+      let dispH = detail_noise_height(localPos, bId, octaves);
+      // uD.vsParams.x carries an optional displacement-scale multiplier
+      // (PlanetMesh.params.displacementScale, default 1.0). Lets the
+      // user crank up vertex relief without changing biome amplitudes.
+      let dispScale = max(0.0, uD.vsParams.x);
+      localPos = localPos + radialDir * (dispH * dispScale);
+    }
+  }
+
+  let world  = uD.model * vec4<f32>(localPos, 1.0);
   out.worldPos = world.xyz;
   out.pos    = uS.viewProj * world;
   out.color  = in.color;
@@ -63963,6 +64007,17 @@ function _encodeScenePass(enc, entry) {
       inst.drawScratch[41] = 0;
       inst.drawScratch[42] = 0;
       inst.drawScratch[43] = 0;
+    }
+    // Phase 8 sprint 8-6 -- PlanetMesh vertex-displacement flag.
+    // vsParams.x = displacementScale (param), .z = 1.0 marker that
+    // tells vs_main "this is a planet vertex, apply detail-noise
+    // displacement". Other meshes leave vsParams.z = 0 so the
+    // displacement branch in vs_main is skipped for them.
+    if (m.node && m.node.type === "PlanetMesh") {
+      const ptp = m.node.params || {};
+      const dispScale = (typeof ptp.displacementScale === "number") ? ptp.displacementScale : 500.0;
+      inst.drawScratch[40] = dispScale;  // vsParams.x
+      inst.drawScratch[42] = 1.0;        // vsParams.z (planet flag)
     }
     // Phase 8 sprint 8-3b -- PlanetMesh texture layer resolution.
     // Slots [60..63] map to PerDraw.planetExtra.xyzw = (landLayer,
