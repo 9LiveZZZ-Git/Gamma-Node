@@ -52722,6 +52722,110 @@ fn _fbm(p: vec2<f32>) -> f32 {
   return v;
 }
 
+// === Phase 8 sprint 8-1: deterministic detail-noise foundation ===
+// (spec: docs/PLANET-SCALE-TERRAIN.md §8.2)
+//
+// 3D value noise + FBM with per-octave deterministic seeds. Same world
+// coordinate always yields the same result for the same octave index,
+// regardless of LOD level or camera distance, so flying down toward
+// the surface is purely ADDITIVE -- low-LOD octaves stay identical
+// when more octaves are layered on.
+//
+// The biomeId parameter on detail_noise is reserved (sprint 8-2 will
+// route it through a per-biome parameter LUT). For sprint 8-1 every
+// biome uses the same default amplitude / frequency / shape.
+//
+// LOC budget per the spec: ~200 WGSL for §8.2. This implementation
+// is ~80 LOC -- compact because we ride on the existing _hash21
+// infrastructure shape.
+fn _hash13(p: vec3<f32>) -> f32 {
+  // 3D position -> [0, 1] hash. Single-sine hash is fine for value
+  // noise; lattice scale of (127.1, 311.7, 74.7) matches the planet-
+  // map's existing convention so debugging across the codebase reads
+  // consistently. Multiply by a large prime to spread the output.
+  return fract(sin(dot(p, vec3<f32>(127.1, 311.7, 74.7))) * 43758.5453);
+}
+
+fn _value_noise_3d(p: vec3<f32>) -> f32 {
+  let i = floor(p);
+  let f = fract(p);
+  // Smoothstep interpolation in each axis for C1 continuity.
+  let u = f * f * (3.0 - 2.0 * f);
+  let c000 = _hash13(i);
+  let c100 = _hash13(i + vec3<f32>(1.0, 0.0, 0.0));
+  let c010 = _hash13(i + vec3<f32>(0.0, 1.0, 0.0));
+  let c110 = _hash13(i + vec3<f32>(1.0, 1.0, 0.0));
+  let c001 = _hash13(i + vec3<f32>(0.0, 0.0, 1.0));
+  let c101 = _hash13(i + vec3<f32>(1.0, 0.0, 1.0));
+  let c011 = _hash13(i + vec3<f32>(0.0, 1.0, 1.0));
+  let c111 = _hash13(i + vec3<f32>(1.0, 1.0, 1.0));
+  let x00 = mix(c000, c100, u.x);
+  let x10 = mix(c010, c110, u.x);
+  let x01 = mix(c001, c101, u.x);
+  let x11 = mix(c011, c111, u.x);
+  let y0  = mix(x00, x10, u.y);
+  let y1  = mix(x01, x11, u.y);
+  return mix(y0, y1, u.z);  // [0, 1]
+}
+
+// Map camera altitude to detail octave count. Spec values, §8.4:
+//   > 100km  : 0  (orbital -- base cubemap only)
+//    10-100km: 2  (1km features)
+//     1-10km : 4  (100m features)
+//   100m-1km : 6  (10m features)
+//    10-100m: 8  (1m features)
+//        <10m: 10 (0.1m pebbles)
+// Returns the SOFT octave count (a float so callers can crossfade
+// between octave bands; sprint 8-1 just floors it).
+fn _detail_octaves(altitude_m: f32) -> f32 {
+  if (altitude_m > 100000.0) { return 0.0; }
+  if (altitude_m > 10000.0)  { return 2.0; }
+  if (altitude_m > 1000.0)   { return 4.0; }
+  if (altitude_m > 100.0)    { return 6.0; }
+  if (altitude_m > 10.0)     { return 8.0; }
+  return 10.0;
+}
+
+// detail_noise(worldPos, biomeId, maxOctave): deterministic biome-
+// styled fBm. Returns approximately [-1, 1] (clamped depending on
+// octave sum). Sprint 8-1 ignores biomeId; sprint 8-2 wires it
+// through a per-biome parameter LUT (amplitude / frequency / shape).
+fn detail_noise(worldPos: vec3<f32>, biomeId: u32, maxOctave: u32) -> f32 {
+  // Defaults calibrated for Earth-scale planets. Base frequency
+  // wavelength = 1km at octave 0; lacunarity 2 halves it each octave.
+  let baseFreq: f32   = 0.001;
+  let lacunarity: f32 = 2.0;
+  let roughness: f32  = 0.5;
+
+  var sum: f32  = 0.0;
+  var freq: f32 = baseFreq;
+  var amp: f32  = 1.0;
+  var ampSum: f32 = 0.0;
+  for (var k: u32 = 0u; k < maxOctave; k = k + 1u) {
+    // Per-octave offset = deterministic seed depending ONLY on k.
+    // This is what makes the sum LOD-stable: octave k contributes
+    // the SAME value at the same worldPos regardless of maxOctave,
+    // so flying down just adds octaves k+1, k+2, ... on top of the
+    // already-accumulated lower octaves.
+    let offset = vec3<f32>(
+      f32(k) * 13.37,
+      f32(k) * 7.91,
+      f32(k) * 23.45
+    );
+    let p = worldPos * freq + offset;
+    let n = _value_noise_3d(p) * 2.0 - 1.0;  // [-1, 1]
+    sum    = sum    + amp * n;
+    ampSum = ampSum + amp;
+    freq = freq * lacunarity;
+    amp  = amp  * roughness;
+  }
+  // Normalize by the sum of amplitudes used; for roughness < 1 this
+  // converges to 1 / (1 - roughness) but we'd rather use the actual
+  // partial sum so partial-octave evaluations are scaled correctly.
+  if (ampSum < 1e-6) { return 0.0; }
+  return sum / ampSum;
+}
+
 // Sample clouds for a given world view direction. Returns vec4
 // where rgb = lit cloud color and a = coverage alpha (0 = no
 // cloud, 1 = fully opaque). Only meaningful for upward view dirs
@@ -53982,7 +54086,23 @@ fn fs_unlit_vc(in: VsOut) -> @location(0) vec4<f32> {
     // wash-out (warm sunset hue on distant ground) until C.6 splits
     // the transmittance into a second LUT.
     let ap = sample_aerial_perspective_lut(uS.eye.xyz, in.worldPos);
-    let col = in.color * ap.transmittance + ap.inScatter;
+    // === Phase 8 sprint 8-1: detail-noise visualization ===
+    // (spec: docs/PLANET-SCALE-TERRAIN.md §8.2)
+    // Modulate base surface color by deterministic detail noise so
+    // the planet body shows fine-scale variation as the camera
+    // descends. Octave count auto-scales with altitude per §8.4.
+    // Brightness modulation only (no normal perturbation, no vertex
+    // displacement) -- those are sprints 8-3 and 8-5. The +/-15%
+    // modulation reads as a subtle "rocky / weathered" texture that
+    // emerges progressively at lower altitudes.
+    let _altitude_m = max(0.0, length(uS.eye.xyz - uS.envPlanet.xyz) - uS.envPlanet.w);
+    let _max_oct    = u32(_detail_octaves(_altitude_m));
+    var color = in.color;
+    if (_max_oct > 0u) {
+      let n = detail_noise(in.worldPos, 0u, _max_oct);
+      color = color * (1.0 + n * 0.15);
+    }
+    let col = color * ap.transmittance + ap.inScatter;
     return vec4<f32>(tonemap_aces(col), 1.0);
   }
   return vec4<f32>(in.color, 1.0);
