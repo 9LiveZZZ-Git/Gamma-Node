@@ -53592,10 +53592,13 @@ struct PerDraw {
 // Sample the multi-scattering LUT. Axes match fs_lut_multiscatter:
 //   u = sunZenithCos in [-1, 1] mapped linearly to [0, 1]
 //   v = sqrt(altitude / atmThickness) in [0, 1]
+// 2026-05-22 fix: v inverted -- LUT is written with high-altitude
+// at the top row (UV.v=0) because NDC.y=+1 maps to pixel.y=0 in
+// WebGPU framebuffer convention.
 fn sample_multiscatter_lut(cosSZ: f32, alt: f32, atmThickness: f32) -> vec3<f32> {
   let u = clamp(cosSZ * 0.5 + 0.5, 0.0, 1.0);
   let v = sqrt(clamp(alt / max(atmThickness, 1.0), 0.0, 1.0));
-  return textureSampleLevel(atmMultiScatterLUT, atmLutSampler, vec2<f32>(u, v), 0.0).rgb;
+  return textureSampleLevel(atmMultiScatterLUT, atmLutSampler, vec2<f32>(u, 1.0 - v), 0.0).rgb;
 }
 
 // C.4 -- sample the sky-view LUT for a world-space view direction.
@@ -53634,7 +53637,12 @@ fn sample_skyview_lut(dir: vec3<f32>) -> vec3<f32> {
     let t = sqrt(clamp(-elevation / 1.5707963, 0.0, 1.0));
     v = 0.5 - t * 0.5;
   }
-  return textureSampleLevel(atmSkyViewLUT, atmLutSampler, vec2<f32>(u, v), 0.0).rgb;
+  // 2026-05-22 fix: flip v -- LUT is written with v>=0.5 (above
+  // horizon / zenith) at NDC.y>=0 which lands at the TOP of the
+  // texture (UV.v=0). Without this flip the entire sky is mirrored
+  // across the horizon (atmosphere comes from below, space gap at
+  // 100km altitude).
+  return textureSampleLevel(atmSkyViewLUT, atmLutSampler, vec2<f32>(u, 1.0 - v), 0.0).rgb;
 }
 
 // Sprint 7.5.4.b -- world ray direction -> equirect UV. Standard
@@ -55615,13 +55623,18 @@ fn fs_lut_transmittance(in: VsLutOut) -> @location(0) vec4<f32> {
 // fs_lut_transmittance so the round-trip is exact (modulo bilinear
 // filtering). The LUT is sampled with clamp-to-edge so out-of-range
 // queries fall back to the nearest valid value.
+//
+// 2026-05-22 fix: WebGPU NDC.y=+1 maps to framebuffer pixel.y=0 (top),
+// but sampler UV.v=0 ALSO maps to pixel.y=0. So NDC.y and UV.v are
+// INVERSE-related. The LUT is written with high-altitude / zenith at
+// the top row (UV.v=0); to read it back we must invert v.
 fn sample_transmittance_lut(
   T: texture_2d<f32>, S: sampler,
   cosVZ: f32, alt: f32, atmThickness: f32,
 ) -> vec3<f32> {
   let u = sqrt(clamp(cosVZ * 0.5 + 0.5, 0.0, 1.0));
   let v = sqrt(clamp(alt / max(atmThickness, 1.0), 0.0, 1.0));
-  return textureSampleLevel(T, S, vec2<f32>(u, v), 0.0).rgb;
+  return textureSampleLevel(T, S, vec2<f32>(u, 1.0 - v), 0.0).rgb;
 }
 
 // C.4 -- helpers using the module-scope bindings (cleaner sample sites
@@ -55632,7 +55645,7 @@ fn _lut_T(cosVZ: f32, alt: f32, atmThk: f32) -> vec3<f32> {
 fn _lut_MS(cosSZ: f32, alt: f32, atmThk: f32) -> vec3<f32> {
   let u = clamp(cosSZ * 0.5 + 0.5, 0.0, 1.0);
   let v = sqrt(clamp(alt / max(atmThk, 1.0), 0.0, 1.0));
-  return textureSampleLevel(mtex, tsamp, vec2<f32>(u, v), 0.0).rgb;
+  return textureSampleLevel(mtex, tsamp, vec2<f32>(u, 1.0 - v), 0.0).rgb;
 }
 
 // Multi-scattering LUT pixel. Computes the isotropic-bounce
