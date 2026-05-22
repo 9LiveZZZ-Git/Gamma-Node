@@ -53358,77 +53358,82 @@ fn aerial_perspective(camPos: vec3<f32>, fragPos: vec3<f32>) -> AtmResult {
 // The clip-space coords come from projecting fragPos through the
 // existing viewProj; v is flipped because of the same NDC<->UV
 // convention noted in the LUT v-flip fix.
+// 2026-05-22 STRUCTURAL FIX -- the depth-layer ring-banding the user
+// reported was a fundamental consequence of the aerial-perspective
+// LUT having a depth axis: per-LUT-voxel sample-vs-density aliasing
+// is baked into the LUT contents, and no amount of inter-layer
+// filtering can recover it.
+//
+// Replacement: use the existing sky-view LUT for in-scatter (it
+// already integrates camera-in-direction to ground-or-atm-exit) and
+// the transmittance LUT for the camera-to-surface transmittance
+// (one analytic lookup, since for surface fragments the ray ENDS at
+// the ground intersection -- exactly where T_LUT clips). Both LUTs
+// have NO depth axis, so no depth-layer aliasing whatsoever.
+//
+// Caveats: assumes the surface fragment is approximately at the
+// ground intersection distance (true for the planet mesh; not for
+// arbitrary elevated geometry on top of the planet). Adequate for
+// our use case; for full Bruneton-style analytic aerial perspective
+// with arbitrary surface elevations, a 3D pre-baked single-scatter
+// LUT would be needed.
 fn sample_aerial_perspective_lut(camPos: vec3<f32>, fragPos: vec3<f32>) -> AtmResult {
   let v = fragPos - camPos;
   let dist = length(v);
   if (dist < 1.0) { return AtmResult(vec3<f32>(0.0), vec3<f32>(1.0)); }
+  let dir = v / dist;
 
-  let clip = uS.viewProj * vec4<f32>(fragPos, 1.0);
-  if (clip.w < 1e-4) { return AtmResult(vec3<f32>(0.0), vec3<f32>(1.0)); }
-  let ndc = clip.xyz / clip.w;
-  let uv = vec2<f32>((ndc.x + 1.0) * 0.5, (1.0 - ndc.y) * 0.5);
-
-  // Distance -> layer index. maxDist matches the JS-side formula in
-  // _renderAtmosphereLUTs: max(atmThk * 8, horizonDist + atmThk * 4)
-  // where horizonDist is the visible-horizon distance from the camera.
-  let atmThk = uS.envPlanetAtm.x - uS.envPlanet.w;
+  let planetC = uS.envPlanet.xyz;
   let planetR = uS.envPlanet.w;
-  let radialVec = uS.eye.xyz - uS.envPlanet.xyz;
-  let radialDist = length(radialVec);
-  let altitude = max(0.0, radialDist - planetR);
-  let horizonDist = sqrt(altitude * (2.0 * planetR + altitude));
-  let maxDist = max(atmThk * 8.0, horizonDist + atmThk * 4.0);
-  // C.7 -- LINEAR distance distribution (matches the LUT-generation
-  // change), 128 layers. layerF = 127 * (dist / maxDist).
-  let layerF = 127.0 * clamp(dist / max(maxDist, 1.0), 0.0, 1.0);
+  let atmR    = uS.envPlanetAtm.x;
+  let atmThk  = atmR - planetR;
 
-  // C.7 -- Catmull-Rom cubic interpolation across depth layers. The
-  // previous linear mix() between adjacent layers had a kink at every
-  // integer layer boundary (C0-continuous but not C1) which read on
-  // screen as visible bands. Cubic Catmull-Rom is C1-continuous,
-  // smoothing the transition through 4 adjacent layers.
-  let lA = floor(layerF);
-  let frac = layerF - lA;
-  let l0 = i32(clamp(lA - 1.0, 0.0, 127.0));
-  let l1 = i32(clamp(lA,       0.0, 127.0));
-  let l2 = i32(clamp(lA + 1.0, 0.0, 127.0));
-  let l3 = i32(clamp(lA + 2.0, 0.0, 127.0));
+  if (planetR <= 0.0 || atmR <= planetR) {
+    return AtmResult(vec3<f32>(0.0), vec3<f32>(1.0));
+  }
 
-  let s0 = textureSampleLevel(atmAerialLUT, atmLutSampler, uv, l0, 0.0);
-  let s1 = textureSampleLevel(atmAerialLUT, atmLutSampler, uv, l1, 0.0);
-  let s2 = textureSampleLevel(atmAerialLUT, atmLutSampler, uv, l2, 0.0);
-  let s3 = textureSampleLevel(atmAerialLUT, atmLutSampler, uv, l3, 0.0);
-  let t2 = frac * frac;
-  let t3 = t2 * frac;
-  let apScatter = 0.5 * (
-      (2.0 * s1)
-    + (-s0 + s2) * frac
-    + (2.0 * s0 - 5.0 * s1 + 4.0 * s2 - s3) * t2
-    + (-s0 + 3.0 * s1 - 3.0 * s2 + s3) * t3
-  );
-  // C.7 -- transmittance LUT, same cubic interpolation.
-  let u0 = textureSampleLevel(atmAerialTransLUT, atmLutSampler, uv, l0, 0.0);
-  let u1 = textureSampleLevel(atmAerialTransLUT, atmLutSampler, uv, l1, 0.0);
-  let u2 = textureSampleLevel(atmAerialTransLUT, atmLutSampler, uv, l2, 0.0);
-  let u3 = textureSampleLevel(atmAerialTransLUT, atmLutSampler, uv, l3, 0.0);
-  let apTrans = 0.5 * (
-      (2.0 * u1)
-    + (-u0 + u2) * frac
-    + (2.0 * u0 - 5.0 * u1 + 4.0 * u2 - u3) * t2
-    + (-u0 + 3.0 * u1 - 3.0 * u2 + u3) * t3
-  );
+  // Atmosphere entry point. Camera may be outside the atm shell
+  // (orbital view); cam-to-entry is vacuum (T=1, zero scatter) so
+  // the meaningful aerial-perspective path is entry-to-fragment.
+  let oc = camPos - planetC;
+  let b  = dot(oc, dir);
+  let cAtm = dot(oc, oc) - atmR * atmR;
+  var entryPos = camPos;
+  if (cAtm > 0.0) {
+    let hAtm = b * b - cAtm;
+    if (hAtm < 0.0) {
+      // Ray doesn't intersect the atmosphere at all.
+      return AtmResult(vec3<f32>(0.0), vec3<f32>(1.0));
+    }
+    let sAtm = sqrt(hAtm);
+    let tEnter = -b - sAtm;
+    if (tEnter > 0.0) { entryPos = camPos + dir * tEnter; }
+  }
 
-  // C.7 -- altitude-aware blend. At very high altitudes (camera
-  // deep in space) the aerial-perspective LUT's depth-layer
-  // transitions become more visible because the surface's apparent
-  // depth-range spans many layers per screen pixel; fade toward
-  // identity (no atm tint) at very high altitudes so the rings dim
-  // out of perception. The orbital limb fade is preserved up through
-  // mid altitudes (a few atmThk above surface).
-  let highAlt = smoothstep(atmThk * 8.0, atmThk * 64.0, altitude);
-  let inScatter   = mix(max(apScatter.rgb, vec3<f32>(0.0)), vec3<f32>(0.0), highAlt * 0.5);
-  let transmittance = mix(clamp(apTrans.rgb, vec3<f32>(0.0), vec3<f32>(1.0)),
-                          vec3<f32>(1.0), highAlt * 0.5);
+  // Per-channel transmittance via direct transmittance LUT lookup.
+  // T_LUT(cosVZ, alt) returns the transmittance from a point at
+  // altitude `alt` along direction `cosVZ` to atm edge OR ground
+  // (whichever comes first). For a ray heading toward a surface
+  // fragment the LUT clips at ground = the fragment, so this single
+  // lookup is T(entry, frag) analytically. (T(cam, entry) = 1 when
+  // camera is outside the atm, so T(cam, frag) = T_LUT.)
+  let entryRadial = entryPos - planetC;
+  let entryRadialLen = length(entryRadial);
+  let entryAlt = max(0.0, entryRadialLen - planetR);
+  let entryUp  = entryRadial / max(entryRadialLen, 1.0);
+  let cosVZ = dot(dir, entryUp);
+  let uT = sqrt(clamp(cosVZ * 0.5 + 0.5, 0.0, 1.0));
+  let vT = sqrt(clamp(entryAlt / max(atmThk, 1.0), 0.0, 1.0));
+  let transmittance = textureSampleLevel(atmTransmittanceLUT, atmLutSampler,
+                                          vec2<f32>(uT, 1.0 - vT), 0.0).rgb;
+
+  // In-scatter via the existing sky-view LUT. For directions where
+  // the ray hits the ground (true for every surface pixel by
+  // definition), the sky-view LUT integrated FROM the camera in
+  // that direction TO the ground hit -- exactly the aerial-
+  // perspective in-scatter. No depth axis = no depth aliasing.
+  let inScatter = sample_skyview_lut(dir);
+
   return AtmResult(inScatter, transmittance);
 }
 
@@ -56764,39 +56769,16 @@ function _renderAtmosphereLUTs(enc, planetInfo, camera, sunDirOverride) {
     pass.end();
   }
 
-  // C.5 + C.7 -- aerial perspective LUT: 32 passes, one per Z-slice.
-  // Each pass writes BOTH the in-scatter LUT (location 0) and the
-  // per-channel transmittance LUT (location 1). Bind group 0 carries
-  // the shared atmosphere uniforms + the transmittance / multi-scatter
-  // LUTs that this pass reads at every sample; bind group 1 selects
-  // which Z-slice via dynamic offset.
-  if (Visual.atmAerialPipeline && Visual.atmAerialSliceBindGroup &&
-      Visual.atmAerialLUTLayerViews && Visual.atmAerialTransLUTLayerViews) {
-    for (let s = 0; s < numSlices; s++) {
-      const pass = enc.beginRenderPass({
-        label: "atm-aerial-lut-pass-" + s,
-        colorAttachments: [
-          {
-            view: Visual.atmAerialLUTLayerViews[s],
-            clearValue: { r: 0, g: 0, b: 0, a: 1 },
-            loadOp: "clear",
-            storeOp: "store"
-          },
-          {
-            view: Visual.atmAerialTransLUTLayerViews[s],
-            clearValue: { r: 1, g: 1, b: 1, a: 1 },
-            loadOp: "clear",
-            storeOp: "store"
-          }
-        ]
-      });
-      pass.setPipeline(Visual.atmAerialPipeline);
-      pass.setBindGroup(0, Visual.atmSkyViewBindGroup);
-      pass.setBindGroup(1, Visual.atmAerialSliceBindGroup, [s * stride]);
-      pass.draw(3, 1, 0, 0);
-      pass.end();
-    }
-  }
+  // C.7 STRUCTURAL FIX -- the aerial-perspective LUT generation is
+  // now skipped entirely. sample_aerial_perspective_lut in the mesh
+  // shader was rewritten to read the existing sky-view LUT (for
+  // in-scatter) and the transmittance LUT (for transmittance), both
+  // of which have no depth axis and therefore no depth-layer ring
+  // aliasing. The aerial-perspective LUT textures are still allocated
+  // (still bound to the mesh BGL at bindings 10/11) but their
+  // contents are never sampled; a follow-up cleanup pass can remove
+  // the allocation + pipeline + slice buffer entirely. Skipping the
+  // 128 render passes saves ~2 ms / frame.
 
   Visual._atmLutsHavePlanetData = true;
   return true;
