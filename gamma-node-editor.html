@@ -10839,6 +10839,36 @@ public:
     description: "Phase 7.d-azgaar of planet-spec -- direct cell-mesh planet, mirrors Azgaar's 3D scene mode (one mesh vertex per cell, triangles between mutually-adjacent cells). NO chunking, NO cubemap intermediate. Wire a PlanetMap's heightmap output; each cell becomes one vertex at unit_direction * (R + cell.h * heightScale * altitudeFactor) with color from _planetColorForHeight. Triangulation is built once from the cell-graph K-neighbor table (~120k triangles at cellCount=30000). subdivide=1 applies one Loop subdivision pass (Azgaar `loopSubdivision.modify(geometry, 1)` equivalent) -- 4× triangle count, smooths cell-faceting between mountains, gives the rounded terrain look from Azgaar's 3D scene. Best for orbit views; foot-level detail not provided (~130km per cell at Earth scale)."
   },
 
+  // Phase 8 sprint 8-7: camera-anchored fine detail patch. Static
+  // (u, v) grid mesh that the vertex shader recenters under the camera
+  // each frame and displaces by detail_noise. Overlays the coarse
+  // PlanetMesh near the viewer so foot-level terrain has visible
+  // shape (the coarse mesh's ~65km-per-triangle resolution is way
+  // too coarse for human-scale relief). Renders into the same pass
+  // as PlanetMesh; depth-test sorts the two surfaces.
+  PlanetDetailPatch: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "mesh-gen",
+    ins: [
+      { n: "patchSize",  t: "param" },
+      { n: "gridDim",    t: "param" },
+      { n: "biomeId",    t: "param" },
+      { n: "displacementScale", t: "param" },
+      { n: "maxAltitude", t: "param" }
+    ],
+    outs: [{ n: "mesh", t: "mesh" }],
+    params: {
+      patchSize:  2000,   // 2km square
+      gridDim:    96,     // 96 × 96 verts = ~9.2k verts
+      biomeId:    4,      // grassland default
+      displacementScale: 1.0,
+      maxAltitude: 5000   // fade out above 5km altitude
+    },
+    methods: {},
+    description: "Phase 8 sprint 8-7: camera-anchored fine detail mesh. A static (u, v) grid that vs_planet_detail transforms each frame into the planet's local tangent plane under the camera, then displaces by detail_noise_height (using biomeId param to pick noise params). Sits ON TOP of the coarse PlanetMesh in the same scene; depth-test orders them. Render fades out above maxAltitude (no need for fine detail when the whole planet is on screen). Adjust patchSize for how far the detail extends; gridDim for resolution (96 = ~9k verts = 25fps overhead; lower for slower devices)."
+  },
+
   Plane: {
     category: "Visual", color: COLOR.visual, header: null,
     cppType: "",
@@ -33364,8 +33394,22 @@ const _demos = [
       });
       const vo  = makeNode("VisualOutput", 1140, 80, { display: 0 });
 
+      // Phase 8 sprint 8-7: camera-anchored fine-detail mesh patch.
+      // Provides foot-level terrain shape that the coarse PlanetMesh
+      // (one vertex per cell, ~65km per triangle) can't deliver.
+      // Fades out above maxAltitude (5km) so orbital views aren't
+      // affected.
+      const dpatch = makeNode("PlanetDetailPatch", 260, 200, {
+        patchSize: 3000,           // 3km square
+        gridDim: 96,
+        biomeId: 4,                // grassland default
+        displacementScale: 1.0,
+        maxAltitude: 5000
+      });
+
       state.edges.push({ from: { node: pmap,   port: "heightmap" }, to: { node: planet, port: "heightmap" } });
       state.edges.push({ from: { node: planet, port: "mesh"   }, to: { node: scn, port: "mesh1" } });
+      state.edges.push({ from: { node: dpatch, port: "mesh"   }, to: { node: scn, port: "mesh2" } });
       state.edges.push({ from: { node: cam,    port: "camera" }, to: { node: scn, port: "camera" } });
       state.edges.push({ from: { node: sun,    port: "light"  }, to: { node: scn, port: "light1" } });
       state.edges.push({ from: { node: sky,    port: "env"    }, to: { node: scn, port: "environment" } });
@@ -54174,6 +54218,92 @@ fn vs_main(in: VsIn) -> VsOut {
   return out;
 }
 
+// === Phase 8 sprint 8-7: vs_planet_detail (camera-anchored patch) ===
+// (spec: docs/PLANET-SCALE-TERRAIN.md §8.7)
+//
+// Input vertex carries (u, v) grid coords in pos.xy (range [0, 1]).
+// Vertex shader rebuilds world position every frame:
+//   1. Compute the camera's local tangent frame on the planet
+//      (radial up, projected-world-Y north, east = up × north).
+//   2. Convert (u, v) -> tangent offsets in meters using patchSize.
+//   3. Place the patch vertex on the planet surface at (camera under
+//      point + tangent offsets), then radial-project onto the actual
+//      surface sphere.
+//   4. Apply detail_noise_height displacement along radial.
+//   5. Fade alpha (via vertex color) to zero above maxAltitude so
+//      orbital views don't show the patch at all.
+//
+// Per-draw uniforms (vsParams):
+//   x = patchSize (meters)
+//   y = biomeId (encoded as f32, rounded)
+//   z = displacementScale
+//   w = maxAltitude (meters; patch fades 0 -> 1 over the bottom 30%
+//                    of this range and disappears above it)
+@vertex
+fn vs_planet_detail(in: VsIn) -> VsOut {
+  var out: VsOut;
+  let uv = in.pos.xy;  // grid coord [0, 1]
+  let planetC = uS.envPlanet.xyz;
+  let planetR = uS.envPlanet.w;
+
+  // Camera radial / under-camera surface point.
+  let radialFromCam = uS.eye.xyz - planetC;
+  let radialLen = max(length(radialFromCam), planetR + 1.0);
+  let camUp = radialFromCam / radialLen;
+  let camAlt = max(0.0, radialLen - planetR);
+
+  // Local tangent frame: north = world +Y projected to horizon plane;
+  // fallback to +X near the planet poles. east = up x north.
+  var northRef = vec3<f32>(0.0, 1.0, 0.0);
+  if (abs(dot(camUp, northRef)) > 0.99) {
+    northRef = vec3<f32>(1.0, 0.0, 0.0);
+  }
+  let localNorth = normalize(northRef - camUp * dot(northRef, camUp));
+  let localEast  = cross(camUp, localNorth);
+
+  // Tangent-plane offset from camera-under point.
+  let patchSize = max(uD.vsParams.x, 1.0);
+  let offsetEast  = (uv.x - 0.5) * patchSize;
+  let offsetNorth = (uv.y - 0.5) * patchSize;
+  let cameraUnder = planetC + camUp * planetR;
+  let tangentPos  = cameraUnder + localEast * offsetEast + localNorth * offsetNorth;
+
+  // Radial-project onto the actual planet sphere so the patch
+  // curves with the planet rather than sitting on a flat tangent
+  // plane (matters once patchSize approaches a few km).
+  let projDir = normalize(tangentPos - planetC);
+  var surfacePos = planetC + projDir * planetR;
+
+  // Detail noise displacement.
+  let biomeId = u32(clamp(uD.vsParams.y + 0.5, 0.0, 12.0));
+  let octF = _detail_octaves(camAlt);
+  var dispH = 0.0;
+  if (octF > 0.0) {
+    dispH = detail_noise_height(surfacePos, biomeId, octF);
+  }
+  let dispScale = uD.vsParams.z;
+  // +1m bias along the radial so this fragment wins against the
+  // coarse PlanetMesh in z-buffer ties; the bump is invisible.
+  surfacePos = surfacePos + projDir * (dispH * dispScale + 1.0);
+
+  // Altitude fade: full opacity below maxAltitude * 0.7, fade out
+  // to 0 above maxAltitude. The fade goes through the color alpha
+  // channel which fs_unlit_vc multiplies in below.
+  let maxAlt = max(uD.vsParams.w, 1.0);
+  let alpha = 1.0 - smoothstep(maxAlt * 0.7, maxAlt, camAlt);
+
+  out.worldPos = surfacePos;
+  out.pos = uS.viewProj * vec4<f32>(surfacePos, 1.0);
+  // Color stub: the biome's vertex color is fetched per-fragment via
+  // the biome ID in uv.x (matching the PlanetMesh convention from
+  // sprint 8-2). White here is multiplied by the biome color in
+  // fs_unlit_vc through the standard pipeline.
+  out.color = vec3<f32>(alpha, alpha, alpha);
+  out.normal = projDir;
+  out.uv = vec2<f32>(f32(biomeId), 0.0);
+  return out;
+}
+
 // Phase 7 §5.5.h-25 -- vs_horizon. Same VsOut shape as vs_main, but
 // applies a planet-curvature Y warp to each vertex based on the
 // camera's altitude. At low altitude the warp factor is 0 (flat
@@ -55809,16 +55939,19 @@ function _applyHdriToEnvTexture(hdri, urlForLabel) {
   }
 }
 
-function _ensureMeshPipeline(materialType, sampleCount, displaced) {
+function _ensureMeshPipeline(materialType, sampleCount, displaced, vsVariant) {
   if (!Number.isFinite(sampleCount) || sampleCount < 1) sampleCount = 1;
   // Sprint 7.5.3c -- pipeline cache keyed by material type AND
   // sample count. v0.3.126 §5.5.c-3 -- added a third axis,
   // `displaced` (boolean), for the GPU heightmap-displacement
   // vertex shader. When true, the pipeline uses vs_terrain
-  // instead of vs_main; same fragment entry. Doubles cache
-  // capacity but stays cheap (first build is the only cost).
+  // instead of vs_main; same fragment entry.
+  // Phase 8 sprint 8-7 -- fourth axis, vsVariant (string), for
+  // alternate vertex shaders (currently "planet_detail" -> the
+  // camera-anchored detail patch). null/undefined = default vs_main.
   if (!materialType) materialType = "unlit-vc";
-  const key = materialType + "-" + (displaced ? "d" : "s") + "-" + sampleCount + "x";
+  const variantTag = vsVariant ? ("-" + vsVariant) : "";
+  const key = materialType + "-" + (displaced ? "d" : "s") + "-" + sampleCount + "x" + variantTag;
   if (Visual.meshPipelineCache.has(key)) {
     return Visual.meshPipelineCache.get(key);
   }
@@ -55877,9 +56010,10 @@ function _ensureMeshPipeline(materialType, sampleCount, displaced) {
   // true. Same VsOut interface so any fragment shader works on top.
   // §5.5.h-25 -- horizon material gets vs_horizon for planet-
   // curvature blend.
-  const vsEntry = (materialType === "horizon") ? "vs_horizon"
-                : displaced                    ? "vs_terrain"
-                :                                "vs_main";
+  const vsEntry = (vsVariant === "planet_detail") ? "vs_planet_detail"
+                : (materialType === "horizon")    ? "vs_horizon"
+                : displaced                       ? "vs_terrain"
+                :                                   "vs_main";
   let pipeline;
   try {
     pipeline = Visual.device.createRenderPipeline({
@@ -57108,6 +57242,11 @@ function _meshCacheKey(node) {
         pmKey
       ].join(",");
     }
+    case "PlanetDetailPatch": {
+      // Mesh is static (camera-relative transform happens in the
+      // vertex shader); rebuild only if the grid dimension changes.
+      return "pdpatch:" + (p.gridDim || 96);
+    }
     case "Plane":         return "pln:" + [p.width, p.depth].join(",");
     case "Torus":         return "tor:" + [p.majorRadius, p.minorRadius, p.majorSlices, p.minorSlices].join(",");
     case "Cylinder":      return "cyl:" + [p.radius, p.height, p.slices].join(",");
@@ -57185,6 +57324,7 @@ function _buildMeshData(node) {
     case "Sphere":        return _buildSphere(node);
     case "Planet":        return _buildPlanet(node);
     case "PlanetMesh":    return _buildPlanetMesh(node);
+    case "PlanetDetailPatch": return _buildPlanetDetailPatch(node);
     case "Plane":         return _buildPlane(node);
     case "Torus":         return _buildTorus(node);
     case "Cylinder":      return _buildCylinder(node);
@@ -61181,6 +61321,56 @@ function _buildPlanetMesh(node) {
   return { verts, indices: outTris };
 }
 
+// Phase 8 sprint 8-7: PlanetDetailPatch -- static (u, v) grid mesh.
+// vs_planet_detail transforms each vertex into the camera's local
+// tangent plane every frame, projects onto the planet surface, and
+// displaces by detail_noise_height. The output position is in WORLD
+// space; the static grid stored here is just a parameter space.
+//
+// Vertex layout matches the standard interleaved 11-float format
+// (pos.xyz, color.rgb, normal.xyz, uv.xy) so existing pipelines
+// can consume it without VsIn changes. We pack the (u, v) grid coord
+// into pos.xy and leave pos.z = 0; the vertex shader treats this as
+// the grid parameter, not a world position.
+function _buildPlanetDetailPatch(node) {
+  const p = node.params || {};
+  const N = Math.max(2, Math.min(256, (typeof p.gridDim === "number") ? Math.floor(p.gridDim) : 96));
+  const vCount = N * N;
+  const triCount = (N - 1) * (N - 1) * 2;
+  const verts = new Float32Array(vCount * 11);
+  const indices = new Uint32Array(triCount * 3);
+  for (let j = 0; j < N; j++) {
+    for (let i = 0; i < N; i++) {
+      const u = i / (N - 1);
+      const v = j / (N - 1);
+      const off = (j * N + i) * 11;
+      verts[off + 0] = u;        // grid x in [0, 1]
+      verts[off + 1] = v;        // grid y in [0, 1]
+      verts[off + 2] = 0;        // unused (vertex shader rebuilds world pos)
+      verts[off + 3] = 1;        // color placeholder (overwritten in vs)
+      verts[off + 4] = 1;
+      verts[off + 5] = 1;
+      verts[off + 6] = 0;        // normal placeholder
+      verts[off + 7] = 1;
+      verts[off + 8] = 0;
+      verts[off + 9] = 0;        // uv.x (biome ID will be set in vs from per-draw)
+      verts[off + 10] = 0;
+    }
+  }
+  let t = 0;
+  for (let j = 0; j < N - 1; j++) {
+    for (let i = 0; i < N - 1; i++) {
+      const v00 = j * N + i;
+      const v10 = j * N + (i + 1);
+      const v01 = (j + 1) * N + i;
+      const v11 = (j + 1) * N + (i + 1);
+      indices[t++] = v00; indices[t++] = v10; indices[t++] = v11;
+      indices[t++] = v00; indices[t++] = v11; indices[t++] = v01;
+    }
+  }
+  return { verts, indices };
+}
+
 
 /* Plane -- flat quad in the XZ plane, +Y normal. 4 verts, 6 indices.
  * Colored by a soft cyan-to-violet gradient by U coord so even the
@@ -63751,9 +63941,11 @@ function _encodeScenePass(enc, entry) {
       );
     }
     const useDisplaced = !!(isTerrainGen && hmWire && hmWire.from);
-    const pipelineKeyStr = matType + (useDisplaced ? "+d" : "");
+    // Phase 8 sprint 8-7: PlanetDetailPatch uses vs_planet_detail.
+    const vsVariant = (m.node && m.node.type === "PlanetDetailPatch") ? "planet_detail" : null;
+    const pipelineKeyStr = matType + (useDisplaced ? "+d" : "") + (vsVariant ? ("+" + vsVariant) : "");
     if (pipelineKeyStr !== curMaterialType) {
-      const pipeline = _ensureMeshPipeline(matType, sampleCount, useDisplaced);
+      const pipeline = _ensureMeshPipeline(matType, sampleCount, useDisplaced, vsVariant);
       if (!pipeline) continue;
       pass.setPipeline(pipeline);
       curMaterialType = pipelineKeyStr;
@@ -64062,6 +64254,16 @@ function _encodeScenePass(enc, entry) {
       const dispScale = (typeof ptp.displacementScale === "number") ? ptp.displacementScale : 500.0;
       inst.drawScratch[40] = dispScale;  // vsParams.x
       inst.drawScratch[42] = 1.0;        // vsParams.z (planet flag)
+    }
+    // Phase 8 sprint 8-7 -- PlanetDetailPatch per-draw uniforms.
+    // vs_planet_detail reads vsParams.xyzw = (patchSize, biomeId,
+    // displacementScale, maxAltitude).
+    if (m.node && m.node.type === "PlanetDetailPatch") {
+      const dpp = m.node.params || {};
+      inst.drawScratch[40] = (typeof dpp.patchSize === "number")  ? dpp.patchSize  : 2000.0;
+      inst.drawScratch[41] = (typeof dpp.biomeId === "number")    ? dpp.biomeId    : 4.0;
+      inst.drawScratch[42] = (typeof dpp.displacementScale === "number") ? dpp.displacementScale : 1.0;
+      inst.drawScratch[43] = (typeof dpp.maxAltitude === "number") ? dpp.maxAltitude : 5000.0;
     }
     // Phase 8 sprint 8-3b -- PlanetMesh texture layer resolution.
     // Slots [60..63] map to PerDraw.planetExtra.xyzw = (landLayer,
