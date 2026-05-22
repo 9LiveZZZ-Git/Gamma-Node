@@ -53378,22 +53378,58 @@ fn sample_aerial_perspective_lut(camPos: vec3<f32>, fragPos: vec3<f32>) -> AtmRe
   let altitude = max(0.0, radialDist - planetR);
   let horizonDist = sqrt(altitude * (2.0 * planetR + altitude));
   let maxDist = max(atmThk * 8.0, horizonDist + atmThk * 4.0);
-  // C.7 -- 64 layers (was 32) so adjacent-layer transitions are
-  // closer together in depth and the ring-banding artifact is finer.
-  let layerF = 63.0 * sqrt(clamp(dist / max(maxDist, 1.0), 0.0, 1.0));
-  let layerA = i32(clamp(floor(layerF), 0.0, 63.0));
-  let layerB = min(layerA + 1, 63);
-  let frac = layerF - f32(layerA);
+  // C.7 -- LINEAR distance distribution (matches the LUT-generation
+  // change), 128 layers. layerF = 127 * (dist / maxDist).
+  let layerF = 127.0 * clamp(dist / max(maxDist, 1.0), 0.0, 1.0);
 
-  let aS = textureSampleLevel(atmAerialLUT, atmLutSampler, uv, layerA, 0.0);
-  let bS = textureSampleLevel(atmAerialLUT, atmLutSampler, uv, layerB, 0.0);
-  let apScatter = mix(aS, bS, frac);
-  // C.7 -- per-channel transmittance LUT, interpolated the same way.
-  let aT = textureSampleLevel(atmAerialTransLUT, atmLutSampler, uv, layerA, 0.0);
-  let bT = textureSampleLevel(atmAerialTransLUT, atmLutSampler, uv, layerB, 0.0);
-  let apTrans = mix(aT, bT, frac);
+  // C.7 -- Catmull-Rom cubic interpolation across depth layers. The
+  // previous linear mix() between adjacent layers had a kink at every
+  // integer layer boundary (C0-continuous but not C1) which read on
+  // screen as visible bands. Cubic Catmull-Rom is C1-continuous,
+  // smoothing the transition through 4 adjacent layers.
+  let lA = floor(layerF);
+  let frac = layerF - lA;
+  let l0 = i32(clamp(lA - 1.0, 0.0, 127.0));
+  let l1 = i32(clamp(lA,       0.0, 127.0));
+  let l2 = i32(clamp(lA + 1.0, 0.0, 127.0));
+  let l3 = i32(clamp(lA + 2.0, 0.0, 127.0));
 
-  return AtmResult(apScatter.rgb, apTrans.rgb);
+  let s0 = textureSampleLevel(atmAerialLUT, atmLutSampler, uv, l0, 0.0);
+  let s1 = textureSampleLevel(atmAerialLUT, atmLutSampler, uv, l1, 0.0);
+  let s2 = textureSampleLevel(atmAerialLUT, atmLutSampler, uv, l2, 0.0);
+  let s3 = textureSampleLevel(atmAerialLUT, atmLutSampler, uv, l3, 0.0);
+  let t2 = frac * frac;
+  let t3 = t2 * frac;
+  let apScatter = 0.5 * (
+      (2.0 * s1)
+    + (-s0 + s2) * frac
+    + (2.0 * s0 - 5.0 * s1 + 4.0 * s2 - s3) * t2
+    + (-s0 + 3.0 * s1 - 3.0 * s2 + s3) * t3
+  );
+  // C.7 -- transmittance LUT, same cubic interpolation.
+  let u0 = textureSampleLevel(atmAerialTransLUT, atmLutSampler, uv, l0, 0.0);
+  let u1 = textureSampleLevel(atmAerialTransLUT, atmLutSampler, uv, l1, 0.0);
+  let u2 = textureSampleLevel(atmAerialTransLUT, atmLutSampler, uv, l2, 0.0);
+  let u3 = textureSampleLevel(atmAerialTransLUT, atmLutSampler, uv, l3, 0.0);
+  let apTrans = 0.5 * (
+      (2.0 * u1)
+    + (-u0 + u2) * frac
+    + (2.0 * u0 - 5.0 * u1 + 4.0 * u2 - u3) * t2
+    + (-u0 + 3.0 * u1 - 3.0 * u2 + u3) * t3
+  );
+
+  // C.7 -- altitude-aware blend. At very high altitudes (camera
+  // deep in space) the aerial-perspective LUT's depth-layer
+  // transitions become more visible because the surface's apparent
+  // depth-range spans many layers per screen pixel; fade toward
+  // identity (no atm tint) at very high altitudes so the rings dim
+  // out of perception. The orbital limb fade is preserved up through
+  // mid altitudes (a few atmThk above surface).
+  let highAlt = smoothstep(atmThk * 8.0, atmThk * 64.0, altitude);
+  let inScatter   = mix(max(apScatter.rgb, vec3<f32>(0.0)), vec3<f32>(0.0), highAlt * 0.5);
+  let transmittance = mix(clamp(apTrans.rgb, vec3<f32>(0.0), vec3<f32>(1.0)),
+                          vec3<f32>(1.0), highAlt * 0.5);
+  return AtmResult(inScatter, transmittance);
 }
 
 fn sample_procedural_sky_features(dir: vec3<f32>) -> vec3<f32> {
@@ -56093,14 +56129,16 @@ fn fs_lut_aerial(in: VsLutOut) -> AerialOut {
   let clip_x = in.uv.x * 2.0 - 1.0;
   let clip_y = in.uv.y * 2.0 - 1.0;
 
-  // Decode distance from the slice index. Quadratic distribution
-  // (more layers near the camera) since aerial perspective changes
-  // fastest in the close-distance regime.
+  // C.7 -- LINEAR distance distribution (was quadratic). Quadratic
+  // concentrated layers near the camera, which wasted ~30% of the
+  // layers on close-distance bins where there are no surfaces at
+  // orbital altitudes. Linear gives uniform per-layer spacing and
+  // covers the visible-horizon distance with finer per-layer steps.
   let sliceIdx   = uASlice.data.x;
   let sliceCount = uASlice.data.y;
   let maxDist    = uASlice.data.z;
   let tSlice = sliceIdx / max(sliceCount - 1.0, 1.0);
-  let distance = maxDist * tSlice * tSlice;
+  let distance = maxDist * tSlice;
 
   // World-space ray direction from camera basis.
   let tanFovAspect = uA.camRight.w;
@@ -56298,19 +56336,20 @@ function _ensureAtmosphereLUTs() {
     });
   }
   // C.5 + C.7 -- aerial-perspective LUTs. Pair of 2D-array textures
-  // (64 depth layers, each 128x128). RGB = in-scatter / transmittance.
+  // (128 depth layers, each 256x256). RGB = in-scatter / transmittance.
   // Per-layer views are kept for rendering one Z-slice per pass.
   //
-  // 2026-05-22 bumped 32 -> 64 layers. The previous 32 layers showed
-  // visible concentric "rings" centered at the camera nadir: distance
-  // varies smoothly across the screen, but with only 32 layers each
-  // covered ~3% of the depth range, and adjacent layers' integrated
-  // values differed enough that bilinear interpolation between them
-  // read as bands. 64 layers halves the band width.
+  // 2026-05-22 bumped 32 -> 64 -> 128 layers, 128x128 -> 256x256:
+  // ring-banding scales inversely with layer count + clip-space
+  // resolution + smoothness of the inter-layer interpolation. With
+  // 4x the depth slices and 4x the xy cells AND cubic interpolation
+  // on the consumer side, banding should drop substantially. Memory
+  // is 256*256*128*8 = 64 MB per LUT (128 MB total for both);
+  // per-frame LUT generation ~2 ms on modern GPUs.
   if (!Visual.atmAerialLUT) {
     Visual.atmAerialLUT = dev.createTexture({
-      label: "atm-aerial-lut-128x128x64",
-      size: [128, 128, 64],
+      label: "atm-aerial-lut-256x256x128",
+      size: [256, 256, 128],
       dimension: "2d",
       format: "rgba16float",
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
@@ -56319,10 +56358,10 @@ function _ensureAtmosphereLUTs() {
       label: "atm-aerial-lut-array-view",
       dimension: "2d-array",
       baseArrayLayer: 0,
-      arrayLayerCount: 64
+      arrayLayerCount: 128
     });
     Visual.atmAerialLUTLayerViews = [];
-    for (let i = 0; i < 64; i++) {
+    for (let i = 0; i < 128; i++) {
       Visual.atmAerialLUTLayerViews.push(Visual.atmAerialLUT.createView({
         label: "atm-aerial-lut-layer-" + i,
         dimension: "2d",
@@ -56333,8 +56372,8 @@ function _ensureAtmosphereLUTs() {
   }
   if (!Visual.atmAerialTransLUT) {
     Visual.atmAerialTransLUT = dev.createTexture({
-      label: "atm-aerial-trans-lut-128x128x64",
-      size: [128, 128, 64],
+      label: "atm-aerial-trans-lut-256x256x128",
+      size: [256, 256, 128],
       dimension: "2d",
       format: "rgba16float",
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
@@ -56343,10 +56382,10 @@ function _ensureAtmosphereLUTs() {
       label: "atm-aerial-trans-lut-array-view",
       dimension: "2d-array",
       baseArrayLayer: 0,
-      arrayLayerCount: 64
+      arrayLayerCount: 128
     });
     Visual.atmAerialTransLUTLayerViews = [];
-    for (let i = 0; i < 64; i++) {
+    for (let i = 0; i < 128; i++) {
       Visual.atmAerialTransLUTLayerViews.push(Visual.atmAerialTransLUT.createView({
         label: "atm-aerial-trans-lut-layer-" + i,
         dimension: "2d",
@@ -56373,14 +56412,14 @@ function _ensureAtmosphereLUTs() {
     });
     Visual.atmLutScratch = new Float32Array(32);
   }
-  // C.5 + C.7 -- aerial-perspective slice buffer. 64 slots of 256
+  // C.5 + C.7 -- aerial-perspective slice buffer. 128 slots of 256
   // bytes each (WebGPU minimum dynamic-offset alignment); only the
   // first 16 bytes of each slot are used (sliceIdx, sliceCount,
   // maxDist, _). Populated ONCE at init; maxDist is updated per
   // frame for altitude-aware coverage.
   if (!Visual.atmAerialSliceBuffer) {
     const SLICE_STRIDE = 256;
-    const NUM_SLICES = 64;
+    const NUM_SLICES = 128;
     Visual.atmAerialSliceStride = SLICE_STRIDE;
     Visual.atmAerialNumSlices = NUM_SLICES;
     Visual.atmAerialSliceBuffer = dev.createBuffer({
