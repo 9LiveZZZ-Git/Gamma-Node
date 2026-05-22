@@ -52690,6 +52690,22 @@ struct PerScene {
   //   envPlanetGeom.x = polRatio (1.0 = perfect sphere)
   //   envPlanetGeom.yzw = reserved
   envPlanetGeom: vec4<f32>,
+  // Sprint 8-4 -- per-biome detail-noise parameters editable via the
+  // PlanetMap modal's Biomes tab. 13 biomes x 2 vec4 each:
+  //   biomeParams[k*2 + 0] = (amplitude_m, baseFreq, roughness, lacunarity)
+  //   biomeParams[k*2 + 1] = (shape, warpStrength, warpFreq, textureStyleId)
+  // shape enum: 0 fbm, 1 ridged, 2 billowed, 3 dunes, 4 cracks.
+  // textureStyleId enum:
+  //   0 = none (biome color only),
+  //   1 = rock (ridged gray overlay),
+  //   2 = sand (dune-like warm overlay),
+  //   3 = grass (fbm green overlay),
+  //   4 = snow (fbm white sparkle),
+  //   5 = ice (cracked cyan overlay),
+  //   6 = dirt (brown patches).
+  // JS packs from PlanetMap.node.params.biomes[] each frame; defaults
+  // mirror what the previous WGSL const BIOME_DETAIL_PARAMS held.
+  biomeParams: array<vec4<f32>, 26>,
 };
 
 // Sprint 7.5.4.e -- ACES filmic tonemap. Maps HDR (values > 1) into
@@ -52804,45 +52820,63 @@ fn _detail_octaves(altitude_m: f32) -> f32 {
 // === Phase 8 sprint 8-2: per-biome detail params + noise shapes ===
 // (spec: docs/PLANET-SCALE-TERRAIN.md §8.3 + §8.6)
 //
-// Per-biome packed parameter table. Each biome takes 2 vec4 rows
-// indexed as BIOME_DETAIL_PARAMS[biomeId * 2 + 0] / [+1]:
-//   row 0: (amplitude_m, baseFreq, roughness, lacunarity)
-//   row 1: (shape_id, warpStrength, warpFreq, _)
-// shape_id values match _noise_apply_shape's enum:
-//   0 = fbm       (signed [-1, 1])
-//   1 = ridged    (sharp ridges, mostly-positive [0, 1])
-//   2 = billowed  (round bumps, [0, 1])
-//   3 = dunes     (ridged + anisotropic warp -- warp still TODO)
-//   4 = cracks    (inverted ridged, [-1, 0])
-// Biome ID order matches PLANET_BIOMES_NAMES in the JS module.
-const BIOME_DETAIL_PARAMS: array<vec4<f32>, 26> = array<vec4<f32>, 26>(
-  // 0 Marine -- no surface detail (water); zero amplitude disables it.
-  vec4<f32>(0.0, 0.001, 0.5, 2.0),   vec4<f32>(0.0, 0.0, 0.0, 0.0),
-  // 1 Hot desert -- dune ridges, mild domain warp aligned with wind.
-  vec4<f32>(4.0, 0.0010, 0.55, 2.0), vec4<f32>(3.0, 0.4, 0.0005, 0.0),
-  // 2 Cold desert
-  vec4<f32>(2.5, 0.0010, 0.55, 2.0), vec4<f32>(3.0, 0.3, 0.0005, 0.0),
-  // 3 Savanna -- gentle rolling fbm.
-  vec4<f32>(1.5, 0.0008, 0.50, 2.0), vec4<f32>(0.0, 0.0, 0.0, 0.0),
-  // 4 Grassland -- subtle plains, fbm.
-  vec4<f32>(1.0, 0.0005, 0.50, 2.0), vec4<f32>(0.0, 0.0, 0.0, 0.0),
-  // 5 Tropical seasonal forest -- moderate fbm canopy.
-  vec4<f32>(2.0, 0.0012, 0.50, 2.0), vec4<f32>(0.0, 0.0, 0.0, 0.0),
-  // 6 Temperate deciduous forest
-  vec4<f32>(2.0, 0.0010, 0.50, 2.0), vec4<f32>(0.0, 0.0, 0.0, 0.0),
-  // 7 Tropical rainforest -- bumpier canopy.
-  vec4<f32>(3.0, 0.0015, 0.50, 2.0), vec4<f32>(0.0, 0.0, 0.0, 0.0),
-  // 8 Temperate rainforest
-  vec4<f32>(2.5, 0.0012, 0.50, 2.0), vec4<f32>(0.0, 0.0, 0.0, 0.0),
-  // 9 Taiga -- forested mountains; ridged for hint of relief.
-  vec4<f32>(2.5, 0.0014, 0.55, 2.0), vec4<f32>(1.0, 0.0, 0.0, 0.0),
-  // 10 Tundra -- gentle fbm.
-  vec4<f32>(1.5, 0.0010, 0.50, 2.0), vec4<f32>(0.0, 0.0, 0.0, 0.0),
-  // 11 Glacier -- ice cracks (inverted ridged crevasses).
-  vec4<f32>(1.5, 0.0008, 0.50, 2.0), vec4<f32>(4.0, 0.0, 0.0, 0.0),
-  // 12 Wetland -- very subtle, mostly flat.
-  vec4<f32>(0.5, 0.0005, 0.50, 2.0), vec4<f32>(0.0, 0.0, 0.0, 0.0)
-);
+// 2026-05-22 sprint 8-4: BIOME_DETAIL_PARAMS moved from a WGSL const
+// to a runtime uniform (uS.biomeParams[]) so the PlanetMap modal's
+// Biomes tab can edit them without WGSL recompiles. Indexing is the
+// same: biomeId * 2 + 0 = (amp, freq, roughness, lacunarity),
+// biomeId * 2 + 1 = (shape, warpStrength, warpFreq, textureStyleId).
+
+// === Sprint 8-4: built-in procedural biome texture styles ===
+// Per-biome textureStyleId selects one of these built-in overlays;
+// the overlay is multiplied into the biome's base color so the
+// biome's hue still tints through the texture. Wired landTexture
+// (PlanetMesh.landTexture) takes priority over the style if both
+// are set.
+fn _biome_texture_style(worldPos: vec3<f32>, styleId: u32) -> vec3<f32> {
+  let scale = 0.001;
+  let p = worldPos * scale;
+  if (styleId == 1u) {
+    // Rock: ridged value-noise gives broken-cliff look. Gray-ish.
+    let n = _value_noise_3d(p);
+    let r = 1.0 - abs(n * 2.0 - 1.0);
+    let v = r * r * 0.7 + 0.3;
+    return vec3<f32>(v, v * 0.95, v * 0.88);
+  }
+  if (styleId == 2u) {
+    // Sand: low-freq fbm + warm-yellow tint, dune-direction biased.
+    let n = _value_noise_3d(p * 0.5);
+    let v = n * 0.5 + 0.6;
+    return vec3<f32>(v * 1.08, v * 0.96, v * 0.72);
+  }
+  if (styleId == 3u) {
+    // Grass: medium-freq fbm + green tint, slightly darker patches.
+    let n = _value_noise_3d(p * 1.5);
+    let v = 0.45 + n * 0.45;
+    return vec3<f32>(v * 0.78, v * 1.04, v * 0.62);
+  }
+  if (styleId == 4u) {
+    // Snow: white with high-freq sparkle.
+    let n = _value_noise_3d(p * 3.0);
+    let v = 0.85 + n * 0.15;
+    return vec3<f32>(v, v, v * 1.02);
+  }
+  if (styleId == 5u) {
+    // Ice: cracked (inverted ridged) cyan; the cracks read as
+    // darker veins through a lighter base.
+    let n = _value_noise_3d(p);
+    let r = 1.0 - abs(n * 2.0 - 1.0);
+    let v = 0.55 + (1.0 - r * r) * 0.4;
+    return vec3<f32>(v * 0.92, v * 1.02, v * 1.08);
+  }
+  if (styleId == 6u) {
+    // Dirt: low-freq blotches in brown.
+    let n = _value_noise_3d(p * 0.8);
+    let v = 0.45 + n * 0.4;
+    return vec3<f32>(v * 0.95, v * 0.78, v * 0.58);
+  }
+  // 0 (or unknown): no overlay, identity multiplier.
+  return vec3<f32>(1.0);
+}
 
 // Apply a per-octave noise shape to a signed [-1, 1] noise sample.
 fn _noise_apply_shape(n: f32, shape: u32) -> f32 {
@@ -52871,14 +52905,13 @@ fn _noise_apply_shape(n: f32, shape: u32) -> f32 {
 }
 
 // detail_noise(worldPos, biomeId, maxOctave): deterministic biome-
-// styled fBm. Sprint 8-2 -- now reads per-biome amplitude / freq /
-// shape from BIOME_DETAIL_PARAMS instead of using a single default.
+// styled fBm. Reads per-biome amplitude / freq / shape from
+// uS.biomeParams[] uniform (sprint 8-4) -- editable via the
+// PlanetMap modal's Biomes tab.
 fn detail_noise(worldPos: vec3<f32>, biomeId: u32, maxOctave: u32) -> f32 {
-  // Clamp biomeId to the table; any out-of-range value falls back
-  // to grassland-like defaults.
   let bId = min(biomeId, 12u);
-  let row0 = BIOME_DETAIL_PARAMS[bId * 2u + 0u];
-  let row1 = BIOME_DETAIL_PARAMS[bId * 2u + 1u];
+  let row0 = uS.biomeParams[bId * 2u + 0u];
+  let row1 = uS.biomeParams[bId * 2u + 1u];
   let amplitude  = row0.x;
   let baseFreq   = row0.y;
   let roughness  = row0.z;
@@ -54260,6 +54293,16 @@ fn fs_unlit_vc(in: VsOut) -> @location(0) vec4<f32> {
         // detail layer rather than a hard override).
         let tinted = tex.rgb * color * 2.0;
         color = mix(color, tinted, texMix);
+      } else {
+        // Sprint 8-4: no wired texture -> apply the built-in
+        // procedural texture style assigned to this biome (PlanetMap
+        // editor tab dropdown). textureStyleId == 0 returns identity
+        // (no overlay).
+        let styleId = u32(uS.biomeParams[bId * 2u + 1u].w);
+        if (styleId > 0u) {
+          let texCol = _biome_texture_style(in.worldPos, styleId);
+          color = color * texCol * 1.7;
+        }
       }
 
       if (_max_oct > 0u) {
@@ -58169,6 +58212,34 @@ const PLANET_BIOMES_NAMES = [
   "Tropical seasonal forest", "Temperate deciduous forest",
   "Tropical rainforest", "Temperate rainforest", "Taiga",
   "Tundra", "Glacier", "Wetland"
+];
+
+// Phase 8 sprint 8-4 -- per-biome detail-noise defaults.
+// One row per biome (13). Each row:
+//   [amp_m, baseFreq, roughness, lacunarity,
+//    shape, warpStrength, warpFreq, textureStyleId]
+// shape:           0=fbm 1=ridged 2=billowed 3=dunes 4=cracks
+// textureStyleId:  0=none 1=rock 2=sand 3=grass 4=snow 5=ice 6=dirt
+const PLANET_BIOME_DETAIL_DEFAULTS = [
+  [0.0, 0.0010, 0.50, 2.0, 0.0, 0.0,    0.0,    0.0],  // 0 Marine
+  [4.0, 0.0010, 0.55, 2.0, 3.0, 0.4,    0.0005, 2.0],  // 1 Hot desert (sand)
+  [2.5, 0.0010, 0.55, 2.0, 3.0, 0.3,    0.0005, 6.0],  // 2 Cold desert (dirt)
+  [1.5, 0.0008, 0.50, 2.0, 0.0, 0.0,    0.0,    6.0],  // 3 Savanna (dirt)
+  [1.0, 0.0005, 0.50, 2.0, 0.0, 0.0,    0.0,    3.0],  // 4 Grassland (grass)
+  [2.0, 0.0012, 0.50, 2.0, 0.0, 0.0,    0.0,    3.0],  // 5 Trop seasonal forest (grass)
+  [2.0, 0.0010, 0.50, 2.0, 0.0, 0.0,    0.0,    3.0],  // 6 Temp deci forest (grass)
+  [3.0, 0.0015, 0.50, 2.0, 0.0, 0.0,    0.0,    3.0],  // 7 Trop rainforest (grass)
+  [2.5, 0.0012, 0.50, 2.0, 0.0, 0.0,    0.0,    3.0],  // 8 Temp rainforest (grass)
+  [2.5, 0.0014, 0.55, 2.0, 1.0, 0.0,    0.0,    1.0],  // 9 Taiga (rock)
+  [1.5, 0.0010, 0.50, 2.0, 0.0, 0.0,    0.0,    6.0],  // 10 Tundra (dirt)
+  [1.5, 0.0008, 0.50, 2.0, 4.0, 0.0,    0.0,    4.0],  // 11 Glacier (snow + cracks)
+  [0.5, 0.0005, 0.50, 2.0, 0.0, 0.0,    0.0,    3.0]   // 12 Wetland (grass)
+];
+const PLANET_BIOME_TEX_STYLES = [
+  "none", "rock", "sand", "grass", "snow", "ice", "dirt"
+];
+const PLANET_BIOME_SHAPES = [
+  "fbm", "ridged", "billowed", "dunes", "cracks"
 ];
 
 // Azgaar's hex colors parsed to [r,g,b] floats. Order matches getId().
@@ -62975,9 +63046,13 @@ function _ensureSceneInstance(sceneNode) {
   // (Tier B planet-aware atmospheric scattering).
   // Sprint 7.6.b-atm grew 560 -> 576 for envPlanetGeom (oblate
   // spheroid polarRadiusRatio so atmosphere matches planet shape).
+  // Sprint 8-4 grew 576 -> 992 for biomeParams (13 biomes x 2 vec4
+  // each = 416 bytes, appended after envPlanetGeom). Lets the
+  // PlanetMap editor tab tweak biome detail-noise params at runtime
+  // without WGSL recompiles.
   const perSceneBuffer = Visual.device.createBuffer({
     label: "scene-perscene-" + sceneNode.id,
-    size: 576,
+    size: 992,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
   });
   // Sprint 7.5.3c bug fix -- queue.writeBuffer ordering. All
@@ -63068,7 +63143,7 @@ function _ensureSceneInstance(sceneNode) {
   inst = {
     perSceneBuffer,
     slots,
-    sceneScratch: new Float32Array(144),  // 576 bytes (sprint 7.6.b-atm -- + envPlanetGeom)
+    sceneScratch: new Float32Array(248),  // 992 bytes (sprint 8-4 -- + biomeParams[26])
     // v0.3.123 -- 40 floats / 160 B for TerrainMaterial band slots.
     // v0.3.126 §5.5.c-3 -- bumped 40 → 48 / 192 B; slots [40..43]
     // are vsParams (vertex-shader displacement params for
@@ -63389,7 +63464,29 @@ function _encodeScenePass(enc, entry) {
     inst.sceneScratch[141] = 0; inst.sceneScratch[142] = 0; inst.sceneScratch[143] = 0;
   }
 
-  Visual.device.queue.writeBuffer(inst.perSceneBuffer, 0, inst.sceneScratch.buffer, 0, 576);
+  // Sprint 8-4 -- biome detail-noise params at scratch slots [144..247]
+  // (= bytes 576..991 = uS.biomeParams[26]). 13 biomes x 8 floats each:
+  //   [amp, freq, roughness, lacunarity, shape, warpStrength, warpFreq, textureStyleId]
+  // Defaults mirror what the previous WGSL const held; PlanetMap's
+  // node.params.biomes overrides each row when the user edits.
+  const biomeParamsBase = 144;
+  for (let bk = 0; bk < 13; bk++) {
+    const def = PLANET_BIOME_DETAIL_DEFAULTS[bk];
+    const ov  = (planetInfo && planetInfo.mapNode && planetInfo.mapNode.params &&
+                 Array.isArray(planetInfo.mapNode.params.biomes) &&
+                 planetInfo.mapNode.params.biomes[bk]) || null;
+    const off = biomeParamsBase + bk * 8;
+    inst.sceneScratch[off + 0] = (ov && typeof ov.amp === "number") ? ov.amp : def[0];
+    inst.sceneScratch[off + 1] = (ov && typeof ov.freq === "number") ? ov.freq : def[1];
+    inst.sceneScratch[off + 2] = (ov && typeof ov.roughness === "number") ? ov.roughness : def[2];
+    inst.sceneScratch[off + 3] = (ov && typeof ov.lacunarity === "number") ? ov.lacunarity : def[3];
+    inst.sceneScratch[off + 4] = (ov && typeof ov.shape === "number") ? ov.shape : def[4];
+    inst.sceneScratch[off + 5] = (ov && typeof ov.warpStrength === "number") ? ov.warpStrength : def[5];
+    inst.sceneScratch[off + 6] = (ov && typeof ov.warpFreq === "number") ? ov.warpFreq : def[6];
+    inst.sceneScratch[off + 7] = (ov && typeof ov.textureStyleId === "number") ? ov.textureStyleId : def[7];
+  }
+
+  Visual.device.queue.writeBuffer(inst.perSceneBuffer, 0, inst.sceneScratch.buffer, 0, 992);
 
   // Per-draw loop. Each mesh writes to its OWN per-slot buffer +
   // binds its OWN bind group, so multi-mesh draws work correctly
@@ -73172,6 +73269,36 @@ function openPlanetMapEditor(nodeId) {
   document.body.appendChild(back);
   const body = modal.querySelector("#pmap-body");
 
+  // Sprint 8-4 -- tab system. The existing painter UI (canvas + brush
+  // controls + help) lives in #pmap-tab-painter. A new #pmap-tab-biomes
+  // panel exposes per-biome detail-noise + texture-style controls
+  // editable at runtime via uS.biomeParams.
+  const tabBar = document.createElement("div");
+  tabBar.style.cssText =
+    "display:flex;gap:6px;border-bottom:1px solid var(--border);" +
+    "margin-bottom:10px;padding-bottom:6px;";
+  tabBar.innerHTML =
+    '<button class="btn" id="pmap-tabbtn-painter" type="button" data-tab="painter" style="padding:4px 14px;border-color:var(--phosphor)">painter</button>' +
+    '<button class="btn" id="pmap-tabbtn-biomes"  type="button" data-tab="biomes"  style="padding:4px 14px;">biomes</button>';
+  body.appendChild(tabBar);
+  const painterPanel = document.createElement("div");
+  painterPanel.id = "pmap-tab-painter";
+  body.appendChild(painterPanel);
+  const biomesPanel = document.createElement("div");
+  biomesPanel.id = "pmap-tab-biomes";
+  biomesPanel.style.display = "none";
+  body.appendChild(biomesPanel);
+  tabBar.addEventListener("click", function(ev) {
+    const btn = ev.target.closest("button[data-tab]");
+    if (!btn) return;
+    const which = btn.dataset.tab;
+    painterPanel.style.display = (which === "painter") ? "block" : "none";
+    biomesPanel.style.display  = (which === "biomes")  ? "block" : "none";
+    tabBar.querySelectorAll("button[data-tab]").forEach(b => {
+      b.style.borderColor = (b === btn) ? "var(--phosphor)" : "";
+    });
+  });
+
   // Canvas (equirect view of the planet's elevation, cells flat-shaded).
   // Wrapped in a scroll container so it can be zoomed via CSS transform.
   const W = 720, H = 360;
@@ -73188,7 +73315,7 @@ function openPlanetMapEditor(nodeId) {
     "width:720px;height:360px;cursor:crosshair;image-rendering:pixelated;display:block;";
   canvasInner.appendChild(canvas);
   canvasWrap.appendChild(canvasInner);
-  body.appendChild(canvasWrap);
+  painterPanel.appendChild(canvasWrap);
   const ctx = canvas.getContext("2d");
 
   // Controls.
@@ -73221,7 +73348,7 @@ function openPlanetMapEditor(nodeId) {
     '<button class="btn" id="pmap-climate-config" type="button" style="padding:3px 10px;" title="Configure climate (equator/pole temperatures, precipitation, winds)">⚙ world</button>' +
     '<button class="btn" id="pmap-geojson" type="button" style="padding:3px 10px;" title="Import an Azgaar FMG file (.geojson Cells export or full .json) to stamp its exact landmass + heights onto this planet">import azgaar</button>' +
     '<input type="file" id="pmap-geojson-file" accept=".geojson,.json,application/geo+json,application/json" style="display:none">';
-  body.appendChild(ctrls);
+  painterPanel.appendChild(ctrls);
 
   // AI panel removed 2026-05-21 -- AI keyword features retired.
   const helpRow = document.createElement("div");
@@ -73231,7 +73358,82 @@ function openPlanetMapEditor(nodeId) {
     "drag on the canvas to paint. brush radius is in degrees of arc on the sphere " +
     "(equator: 1° ≈ 111km on earth). closing the modal bakes the modified cells " +
     "into the cubemap; the planet picks up the change on the next chunk rebuild.";
-  body.appendChild(helpRow);
+  painterPanel.appendChild(helpRow);
+
+  // === Biomes tab content (Sprint 8-4) ===
+  // 13 biome rows. Each row: color swatch, name, sliders for the
+  // detail-noise params (amp/freq/roughness), a shape dropdown, and a
+  // texture-style dropdown. Edits are persisted on node.params.biomes[k]
+  // and picked up by the renderer next frame (the per-scene buffer
+  // pack reads PlanetMap.node.params.biomes).
+  const biomesHelp = document.createElement("div");
+  biomesHelp.style.cssText =
+    "font-family:var(--font-mono);font-size:10px;color:var(--text-3);" +
+    "line-height:1.5;margin-bottom:10px;";
+  biomesHelp.innerHTML =
+    "per-biome detail noise + procedural texture style. amp = max " +
+    "feature height (meters), freq = base wavelength (cycles/m at " +
+    "octave 0), shape = which non-linearity (ridged / billowed / dunes " +
+    "/ cracks), texture = built-in procedural overlay. wired " +
+    "PlanetMesh.landTexture overrides texture style when present.";
+  biomesPanel.appendChild(biomesHelp);
+  const biomesTable = document.createElement("div");
+  biomesTable.style.cssText =
+    "font-family:var(--font-mono);font-size:10px;color:var(--text-2);";
+  biomesPanel.appendChild(biomesTable);
+
+  // Ensure node.params.biomes is initialized as an array so edits
+  // have somewhere to land. We don't pre-populate with defaults --
+  // missing fields fall back to PLANET_BIOME_DETAIL_DEFAULTS in the
+  // renderer pack.
+  if (!Array.isArray(node.params.biomes)) node.params.biomes = [];
+
+  for (let bk = 0; bk < PLANET_BIOMES_NAMES.length; bk++) {
+    const bName = PLANET_BIOMES_NAMES[bk];
+    const bCol  = PLANET_BIOMES_COLORS[bk];
+    const def   = PLANET_BIOME_DETAIL_DEFAULTS[bk];
+    const cur   = node.params.biomes[bk] || {};
+    const get = function(field, defIdx) {
+      return (cur && typeof cur[field] === "number") ? cur[field] : def[defIdx];
+    };
+    const row = document.createElement("div");
+    row.style.cssText =
+      "display:flex;align-items:center;gap:8px;padding:5px 4px;" +
+      "border-bottom:1px solid rgba(255,255,255,0.06);";
+    const swatchRGB = "rgb(" + Math.round(bCol[0]*255) + "," +
+                              Math.round(bCol[1]*255) + "," +
+                              Math.round(bCol[2]*255) + ")";
+    const shapeOptions = PLANET_BIOME_SHAPES.map((s, i) =>
+      '<option value="' + i + '"' + (Number(get('shape', 4)) === i ? ' selected' : '') + '>' + s + '</option>'
+    ).join("");
+    const texOptions = PLANET_BIOME_TEX_STYLES.map((s, i) =>
+      '<option value="' + i + '"' + (Number(get('textureStyleId', 7)) === i ? ' selected' : '') + '>' + s + '</option>'
+    ).join("");
+    row.innerHTML =
+      '<span style="background:' + swatchRGB + ';width:14px;height:14px;border:1px solid rgba(255,255,255,0.2);border-radius:2px;flex:0 0 auto;"></span>' +
+      '<span style="flex:0 0 160px;color:var(--text-2);">' + bName + '</span>' +
+      '<label style="flex:0 0 auto;">amp&nbsp;<input type="number" data-biome="' + bk + '" data-field="amp" step="0.1" min="0" value="' + get('amp', 0) + '" style="width:48px;background:rgba(0,0,0,0.4);color:var(--phosphor);border:1px solid var(--border);padding:2px 4px;font-family:inherit;font-size:10px"></label>' +
+      '<label style="flex:0 0 auto;">freq&nbsp;<input type="number" data-biome="' + bk + '" data-field="freq" step="0.0001" min="0" value="' + get('freq', 1) + '" style="width:74px;background:rgba(0,0,0,0.4);color:var(--phosphor);border:1px solid var(--border);padding:2px 4px;font-family:inherit;font-size:10px"></label>' +
+      '<label style="flex:0 0 auto;">rough&nbsp;<input type="number" data-biome="' + bk + '" data-field="roughness" step="0.05" min="0" max="1" value="' + get('roughness', 2) + '" style="width:48px;background:rgba(0,0,0,0.4);color:var(--phosphor);border:1px solid var(--border);padding:2px 4px;font-family:inherit;font-size:10px"></label>' +
+      '<label style="flex:0 0 auto;">shape&nbsp;<select data-biome="' + bk + '" data-field="shape" style="background:rgba(0,0,0,0.4);color:var(--phosphor);border:1px solid var(--border);padding:2px 4px;font-family:inherit;font-size:10px">' + shapeOptions + '</select></label>' +
+      '<label style="flex:0 0 auto;">texture&nbsp;<select data-biome="' + bk + '" data-field="textureStyleId" style="background:rgba(0,0,0,0.4);color:var(--phosphor);border:1px solid var(--border);padding:2px 4px;font-family:inherit;font-size:10px">' + texOptions + '</select></label>';
+    biomesTable.appendChild(row);
+  }
+
+  function _onBiomeFieldChange(ev) {
+    const tg = ev.target;
+    const bk = tg && tg.dataset && tg.dataset.biome;
+    if (bk === undefined || bk === null) return;
+    const idx = parseInt(bk, 10);
+    if (!Array.isArray(node.params.biomes)) node.params.biomes = [];
+    if (!node.params.biomes[idx]) node.params.biomes[idx] = {};
+    const field = tg.dataset.field;
+    const val = parseFloat(tg.value);
+    if (!Number.isFinite(val)) return;
+    node.params.biomes[idx][field] = val;
+  }
+  biomesTable.addEventListener("input",  _onBiomeFieldChange);
+  biomesTable.addEventListener("change", _onBiomeFieldChange);
 
   // Locked continent target (shift-click on the map). When set, the
   // next re-roll places the template's first cap here.
