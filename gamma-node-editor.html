@@ -10821,6 +10821,17 @@ public:
       // as-is; bump higher (200-1000) to amplify mountains into the
       // kilometer range that breaks orbital silhouette.
       { n: "displacementScale", t: "param" },
+      // Phase 8 sprint 8-7b: detail-patch params live on PlanetMesh
+      // itself now (sprint 8-7 had them on a separate PlanetDetailPatch
+      // node, which was an awkward extra graph wiring step). The patch
+      // is auto-rendered alongside the coarse PlanetMesh when
+      // detailPatchEnabled is true (default).
+      { n: "detailPatchEnabled",  t: "param" },
+      { n: "detailPatchSize",     t: "param" },
+      { n: "detailPatchGridDim",  t: "param" },
+      { n: "detailPatchBiomeId",  t: "param" },
+      { n: "detailPatchDispScale", t: "param" },
+      { n: "detailPatchMaxAlt",   t: "param" },
       { n: "heightmap",         t: "heightmap" },
       { n: "landTexture",       t: "texture" },
       { n: "waterTexture",      t: "texture" }
@@ -10833,40 +10844,16 @@ public:
       subdivide: 0,
       textureScale: 0.001,
       textureMix:   1.0,
-      displacementScale: 500.0
+      displacementScale: 500.0,
+      detailPatchEnabled: 1,
+      detailPatchSize:     3000,
+      detailPatchGridDim:  96,
+      detailPatchBiomeId:  4,
+      detailPatchDispScale: 1.0,
+      detailPatchMaxAlt:   5000
     },
     methods: {},
     description: "Phase 7.d-azgaar of planet-spec -- direct cell-mesh planet, mirrors Azgaar's 3D scene mode (one mesh vertex per cell, triangles between mutually-adjacent cells). NO chunking, NO cubemap intermediate. Wire a PlanetMap's heightmap output; each cell becomes one vertex at unit_direction * (R + cell.h * heightScale * altitudeFactor) with color from _planetColorForHeight. Triangulation is built once from the cell-graph K-neighbor table (~120k triangles at cellCount=30000). subdivide=1 applies one Loop subdivision pass (Azgaar `loopSubdivision.modify(geometry, 1)` equivalent) -- 4× triangle count, smooths cell-faceting between mountains, gives the rounded terrain look from Azgaar's 3D scene. Best for orbit views; foot-level detail not provided (~130km per cell at Earth scale)."
-  },
-
-  // Phase 8 sprint 8-7: camera-anchored fine detail patch. Static
-  // (u, v) grid mesh that the vertex shader recenters under the camera
-  // each frame and displaces by detail_noise. Overlays the coarse
-  // PlanetMesh near the viewer so foot-level terrain has visible
-  // shape (the coarse mesh's ~65km-per-triangle resolution is way
-  // too coarse for human-scale relief). Renders into the same pass
-  // as PlanetMesh; depth-test sorts the two surfaces.
-  PlanetDetailPatch: {
-    category: "Visual", color: COLOR.visual, header: null,
-    cppType: "",
-    kind: "mesh-gen",
-    ins: [
-      { n: "patchSize",  t: "param" },
-      { n: "gridDim",    t: "param" },
-      { n: "biomeId",    t: "param" },
-      { n: "displacementScale", t: "param" },
-      { n: "maxAltitude", t: "param" }
-    ],
-    outs: [{ n: "mesh", t: "mesh" }],
-    params: {
-      patchSize:  2000,   // 2km square
-      gridDim:    96,     // 96 × 96 verts = ~9.2k verts
-      biomeId:    4,      // grassland default
-      displacementScale: 1.0,
-      maxAltitude: 5000   // fade out above 5km altitude
-    },
-    methods: {},
-    description: "Phase 8 sprint 8-7: camera-anchored fine detail mesh. A static (u, v) grid that vs_planet_detail transforms each frame into the planet's local tangent plane under the camera, then displaces by detail_noise_height (using biomeId param to pick noise params). Sits ON TOP of the coarse PlanetMesh in the same scene; depth-test orders them. Render fades out above maxAltitude (no need for fine detail when the whole planet is on screen). Adjust patchSize for how far the detail extends; gridDim for resolution (96 = ~9k verts = 25fps overhead; lower for slower devices)."
   },
 
   Plane: {
@@ -33394,22 +33381,14 @@ const _demos = [
       });
       const vo  = makeNode("VisualOutput", 1140, 80, { display: 0 });
 
-      // Phase 8 sprint 8-7: camera-anchored fine-detail mesh patch.
-      // Provides foot-level terrain shape that the coarse PlanetMesh
-      // (one vertex per cell, ~65km per triangle) can't deliver.
-      // Fades out above maxAltitude (5km) so orbital views aren't
-      // affected.
-      const dpatch = makeNode("PlanetDetailPatch", 260, 200, {
-        patchSize: 3000,           // 3km square
-        gridDim: 96,
-        biomeId: 4,                // grassland default
-        displacementScale: 1.0,
-        maxAltitude: 5000
-      });
+      // Phase 8 sprint 8-7b: the camera-anchored fine-detail patch
+      // is now folded into PlanetMesh (auto-rendered alongside the
+      // coarse mesh). Sprint 8-7's separate PlanetDetailPatch node
+      // was awkward extra graph wiring; users only need to enable
+      // / configure via PlanetMesh.detailPatch* params now.
 
       state.edges.push({ from: { node: pmap,   port: "heightmap" }, to: { node: planet, port: "heightmap" } });
       state.edges.push({ from: { node: planet, port: "mesh"   }, to: { node: scn, port: "mesh1" } });
-      state.edges.push({ from: { node: dpatch, port: "mesh"   }, to: { node: scn, port: "mesh2" } });
       state.edges.push({ from: { node: cam,    port: "camera" }, to: { node: scn, port: "camera" } });
       state.edges.push({ from: { node: sun,    port: "light"  }, to: { node: scn, port: "light1" } });
       state.edges.push({ from: { node: sky,    port: "env"    }, to: { node: scn, port: "environment" } });
@@ -52175,7 +52154,29 @@ function _resolveSceneMeshes(sceneNode) {
     );
     if (!wire || !wire.from) continue;
     const resolved = _walkMeshChain(wire.from.node, _mat4Identity(), null, 0);
-    if (resolved) meshes.push(resolved);
+    if (!resolved) continue;
+    meshes.push(resolved);
+
+    // Phase 8 sprint 8-7b: when the resolved leaf is a PlanetMesh,
+    // also synthesize a "detail patch" mesh entry beside it. The
+    // patch entry borrows the PlanetMesh node's params (now hosting
+    // the detail-patch knobs directly) so the user doesn't need to
+    // wire a separate node.
+    if (resolved.node && resolved.node.type === "PlanetMesh") {
+      const pp = resolved.node.params || {};
+      const enabled = (typeof pp.detailPatchEnabled === "number")
+        ? pp.detailPatchEnabled >= 0.5
+        : true;
+      if (enabled) {
+        meshes.push({
+          node: resolved.node,
+          def: resolved.def,
+          transform: resolved.transform,
+          material: resolved.material,
+          isPlanetDetailPatch: true
+        });
+      }
+    }
   }
   return meshes;
 }
@@ -57032,6 +57033,16 @@ function _renderAtmosphereLUTs(enc, planetInfo, camera, sunDirOverride) {
  * version counter set when relevant params mutate). */
 function _ensureMeshBuffers(meshEntry) {
   const node = meshEntry.node;
+  // Phase 8 sprint 8-7b: synthesized detail-patch entries (added by
+  // _resolveSceneMeshes when a PlanetMesh is in the scene) share the
+  // PlanetMesh node but use a static (u, v) grid buffer cached
+  // globally per gridDim.
+  if (meshEntry.isPlanetDetailPatch) {
+    const gridDim = Math.max(2, Math.min(256, Math.floor(
+      (node.params && node.params.detailPatchGridDim) || 96
+    )));
+    return _ensurePlanetDetailPatchBuffer(gridDim);
+  }
   // §5.5.e-6 -- TiledTerrain uses incremental per-chunk streaming
   // (own VBO+IBO per chunk, dropped/built individually as the camera
   // disc shifts). Route to the dedicated path so the monolithic
@@ -57242,11 +57253,6 @@ function _meshCacheKey(node) {
         pmKey
       ].join(",");
     }
-    case "PlanetDetailPatch": {
-      // Mesh is static (camera-relative transform happens in the
-      // vertex shader); rebuild only if the grid dimension changes.
-      return "pdpatch:" + (p.gridDim || 96);
-    }
     case "Plane":         return "pln:" + [p.width, p.depth].join(",");
     case "Torus":         return "tor:" + [p.majorRadius, p.minorRadius, p.majorSlices, p.minorSlices].join(",");
     case "Cylinder":      return "cyl:" + [p.radius, p.height, p.slices].join(",");
@@ -57324,7 +57330,6 @@ function _buildMeshData(node) {
     case "Sphere":        return _buildSphere(node);
     case "Planet":        return _buildPlanet(node);
     case "PlanetMesh":    return _buildPlanetMesh(node);
-    case "PlanetDetailPatch": return _buildPlanetDetailPatch(node);
     case "Plane":         return _buildPlane(node);
     case "Torus":         return _buildTorus(node);
     case "Cylinder":      return _buildCylinder(node);
@@ -61332,9 +61337,21 @@ function _buildPlanetMesh(node) {
 // can consume it without VsIn changes. We pack the (u, v) grid coord
 // into pos.xy and leave pos.z = 0; the vertex shader treats this as
 // the grid parameter, not a world position.
-function _buildPlanetDetailPatch(node) {
-  const p = node.params || {};
-  const N = Math.max(2, Math.min(256, (typeof p.gridDim === "number") ? Math.floor(p.gridDim) : 96));
+// Builds the static (u, v) grid mesh used by the planet detail
+// patch. Sprint 8-7b refactor: callable directly with a gridDim
+// (used by _ensurePlanetDetailPatchBuffer's per-gridDim cache); the
+// `node` argument is left optional for backward compat.
+function _buildPlanetDetailPatch(nodeOrGridDim) {
+  let N;
+  if (typeof nodeOrGridDim === "number") {
+    N = nodeOrGridDim;
+  } else {
+    const p = (nodeOrGridDim && nodeOrGridDim.params) || {};
+    N = (typeof p.detailPatchGridDim === "number") ? p.detailPatchGridDim
+      : (typeof p.gridDim === "number") ? p.gridDim
+      : 96;
+  }
+  N = Math.max(2, Math.min(256, Math.floor(N)));
   const vCount = N * N;
   const triCount = (N - 1) * (N - 1) * 2;
   const verts = new Float32Array(vCount * 11);
@@ -61369,6 +61386,48 @@ function _buildPlanetDetailPatch(node) {
     }
   }
   return { verts, indices };
+}
+
+// Phase 8 sprint 8-7b -- per-gridDim GPU buffer cache for the detail
+// patch. Same shape as the standard meshBufferCache entries (vertex
+// buffer + index buffer + counts + aabb) so the encoder can treat
+// the patch like any other mesh.
+function _ensurePlanetDetailPatchBuffer(gridDim) {
+  if (!Visual._planetDetailPatchBufCache) {
+    Visual._planetDetailPatchBufCache = new Map();
+  }
+  const key = "g" + gridDim;
+  let buf = Visual._planetDetailPatchBufCache.get(key);
+  if (buf) return buf;
+  if (!Visual.device) return null;
+  const { verts, indices } = _buildPlanetDetailPatch(gridDim);
+  const vbo = Visual.device.createBuffer({
+    label: "planet-detail-patch-vbo-" + gridDim,
+    size: verts.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST
+  });
+  Visual.device.queue.writeBuffer(vbo, 0, verts.buffer, verts.byteOffset, verts.byteLength);
+  const ibo = Visual.device.createBuffer({
+    label: "planet-detail-patch-ibo-" + gridDim,
+    size: indices.byteLength,
+    usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST
+  });
+  Visual.device.queue.writeBuffer(ibo, 0, indices.buffer, indices.byteOffset, indices.byteLength);
+  // AABB is the unit (u, v) box. Vertex shader transforms it
+  // into planet world space per-frame; frustum culling uses a
+  // generous loose bound since the per-frame transform is dynamic.
+  // We disable culling for the patch by feeding a huge AABB.
+  const big = 1e9;
+  buf = {
+    vertexBuffer: vbo,
+    indexBuffer: ibo,
+    vertexCount: verts.length / 11,
+    indexCount:  indices.length,
+    aabbMin: new Float32Array([-big, -big, -big]),
+    aabbMax: new Float32Array([ big,  big,  big])
+  };
+  Visual._planetDetailPatchBufCache.set(key, buf);
+  return buf;
 }
 
 
@@ -63941,8 +64000,11 @@ function _encodeScenePass(enc, entry) {
       );
     }
     const useDisplaced = !!(isTerrainGen && hmWire && hmWire.from);
-    // Phase 8 sprint 8-7: PlanetDetailPatch uses vs_planet_detail.
-    const vsVariant = (m.node && m.node.type === "PlanetDetailPatch") ? "planet_detail" : null;
+    // Phase 8 sprint 8-7b: synthesized detail-patch entries use
+    // vs_planet_detail. Flag set by _resolveSceneMeshes alongside
+    // PlanetMesh; the node still points to the PlanetMesh for
+    // param access.
+    const vsVariant = m.isPlanetDetailPatch ? "planet_detail" : null;
     const pipelineKeyStr = matType + (useDisplaced ? "+d" : "") + (vsVariant ? ("+" + vsVariant) : "");
     if (pipelineKeyStr !== curMaterialType) {
       const pipeline = _ensureMeshPipeline(matType, sampleCount, useDisplaced, vsVariant);
@@ -64247,23 +64309,23 @@ function _encodeScenePass(enc, entry) {
     // Phase 8 sprint 8-6 -- PlanetMesh vertex-displacement flag.
     // vsParams.x = displacementScale (param), .z = 1.0 marker that
     // tells vs_main "this is a planet vertex, apply detail-noise
-    // displacement". Other meshes leave vsParams.z = 0 so the
-    // displacement branch in vs_main is skipped for them.
-    if (m.node && m.node.type === "PlanetMesh") {
+    // displacement". Skip for the synthesized detail-patch entry
+    // (it uses vs_planet_detail and packs different vsParams below).
+    if (m.node && m.node.type === "PlanetMesh" && !m.isPlanetDetailPatch) {
       const ptp = m.node.params || {};
       const dispScale = (typeof ptp.displacementScale === "number") ? ptp.displacementScale : 500.0;
       inst.drawScratch[40] = dispScale;  // vsParams.x
       inst.drawScratch[42] = 1.0;        // vsParams.z (planet flag)
     }
-    // Phase 8 sprint 8-7 -- PlanetDetailPatch per-draw uniforms.
-    // vs_planet_detail reads vsParams.xyzw = (patchSize, biomeId,
-    // displacementScale, maxAltitude).
-    if (m.node && m.node.type === "PlanetDetailPatch") {
-      const dpp = m.node.params || {};
-      inst.drawScratch[40] = (typeof dpp.patchSize === "number")  ? dpp.patchSize  : 2000.0;
-      inst.drawScratch[41] = (typeof dpp.biomeId === "number")    ? dpp.biomeId    : 4.0;
-      inst.drawScratch[42] = (typeof dpp.displacementScale === "number") ? dpp.displacementScale : 1.0;
-      inst.drawScratch[43] = (typeof dpp.maxAltitude === "number") ? dpp.maxAltitude : 5000.0;
+    // Phase 8 sprint 8-7b -- synthesized planet detail-patch
+    // per-draw uniforms. Reads detailPatch* params from the
+    // PlanetMesh node that the patch is attached to.
+    if (m.isPlanetDetailPatch) {
+      const dpp = (m.node && m.node.params) || {};
+      inst.drawScratch[40] = (typeof dpp.detailPatchSize     === "number") ? dpp.detailPatchSize     : 3000.0;
+      inst.drawScratch[41] = (typeof dpp.detailPatchBiomeId  === "number") ? dpp.detailPatchBiomeId  : 4.0;
+      inst.drawScratch[42] = (typeof dpp.detailPatchDispScale === "number") ? dpp.detailPatchDispScale : 1.0;
+      inst.drawScratch[43] = (typeof dpp.detailPatchMaxAlt   === "number") ? dpp.detailPatchMaxAlt   : 5000.0;
     }
     // Phase 8 sprint 8-3b -- PlanetMesh texture layer resolution.
     // Slots [60..63] map to PerDraw.planetExtra.xyzw = (landLayer,
