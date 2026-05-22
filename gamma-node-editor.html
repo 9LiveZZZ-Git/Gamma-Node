@@ -52813,15 +52813,21 @@ fn _value_noise_3d(p: vec3<f32>) -> f32 {
 //   100m-1km : 6  (10m features)
 //    10-100m: 8  (1m features)
 //        <10m: 10 (0.1m pebbles)
-// Returns the SOFT octave count (a float so callers can crossfade
-// between octave bands; sprint 8-1 just floors it).
+// Sprint 8-6 follow-up (closes the 8.4 spec): smooth crossfade
+// between bands in log2(altitude) space so descending through a
+// boundary doesn't suddenly pop a new octave in. The fractional
+// part of the return value is the in-progress next octave's
+// amplitude (detail_noise consumes it as a per-octave amp scale).
 fn _detail_octaves(altitude_m: f32) -> f32 {
-  if (altitude_m > 100000.0) { return 0.0; }
-  if (altitude_m > 10000.0)  { return 2.0; }
-  if (altitude_m > 1000.0)   { return 4.0; }
-  if (altitude_m > 100.0)    { return 6.0; }
-  if (altitude_m > 10.0)     { return 8.0; }
-  return 10.0;
+  let logAlt = log2(max(altitude_m, 1.0));
+  // log2 thresholds: 10m=3.32, 100m=6.64, 1km=9.97, 10km=13.29, 100km=16.61.
+  // octaves at each: 10, 8, 6, 4, 2, 0 (descending).
+  if (logAlt <= 3.32)  { return 10.0; }
+  if (logAlt <= 6.64)  { return 10.0 - (logAlt -  3.32) / 3.32 * 2.0; }
+  if (logAlt <= 9.97)  { return  8.0 - (logAlt -  6.64) / 3.33 * 2.0; }
+  if (logAlt <= 13.29) { return  6.0 - (logAlt -  9.97) / 3.32 * 2.0; }
+  if (logAlt <= 16.61) { return  4.0 - (logAlt - 13.29) / 3.32 * 4.0; }
+  return 0.0;
 }
 
 // === Phase 8 sprint 8-2: per-biome detail params + noise shapes ===
@@ -52911,11 +52917,17 @@ fn _noise_apply_shape(n: f32, shape: u32) -> f32 {
   return n;
 }
 
-// detail_noise(worldPos, biomeId, maxOctave): deterministic biome-
+// detail_noise(worldPos, biomeId, maxOctaveF): deterministic biome-
 // styled fBm. Reads per-biome amplitude / freq / shape from
 // uS.biomeParams[] uniform (sprint 8-4) -- editable via the
 // PlanetMap modal's Biomes tab.
-fn detail_noise(worldPos: vec3<f32>, biomeId: u32, maxOctave: u32) -> f32 {
+//
+// 8.4 crossfade: maxOctaveF is a FLOAT. The integer part is the
+// number of fully-summed octaves; the fractional part scales the
+// final partial octave. _detail_octaves returns this continuously
+// so descending through an altitude band smoothly ramps in the
+// new octave instead of popping it.
+fn detail_noise(worldPos: vec3<f32>, biomeId: u32, maxOctaveF: f32) -> f32 {
   let bId = min(biomeId, 12u);
   let row0 = uS.biomeParams[bId * 2u + 0u];
   let row1 = uS.biomeParams[bId * 2u + 1u];
@@ -52924,27 +52936,59 @@ fn detail_noise(worldPos: vec3<f32>, biomeId: u32, maxOctave: u32) -> f32 {
   let roughness  = row0.z;
   let lacunarity = row0.w;
   let shape: u32 = u32(row1.x + 0.5);
+  let warpStrength = row1.y;
+  let warpFreq     = row1.z;
 
-  if (amplitude <= 0.0 || maxOctave == 0u) { return 0.0; }
+  if (amplitude <= 0.0 || maxOctaveF <= 0.0) { return 0.0; }
+
+  // 8.6 follow-up: dunes shape gets an anisotropic domain warp so
+  // crests align like real wind-built dunes. Other shapes pass
+  // worldPos through unchanged.
+  var samplePos = worldPos;
+  if (shape == 3u && warpStrength > 0.0) {
+    let radial = samplePos - uS.envPlanet.xyz;
+    let radialLen = length(radial);
+    let radialDir = select(vec3<f32>(0.0, 1.0, 0.0), radial / max(radialLen, 1.0), radialLen > 0.5);
+    var crestRef = vec3<f32>(0.0, 1.0, 0.0);
+    if (abs(dot(radialDir, crestRef)) > 0.99) {
+      crestRef = vec3<f32>(1.0, 0.0, 0.0);
+    }
+    let crest = normalize(crestRef - radialDir * dot(crestRef, radialDir));
+    let warpN = _value_noise_3d(samplePos * max(warpFreq, 1e-7)) * 2.0 - 1.0;
+    // 50m of warp at warpStrength=1 is enough to give dunes a
+    // smooth crest curve at orbital scale; scaled by per-biome
+    // strength so the user can dial it.
+    samplePos = samplePos + crest * (warpN * warpStrength * 50.0);
+  }
+
+  let maxFullOct = u32(floor(maxOctaveF));
+  let lastFrac   = maxOctaveF - f32(maxFullOct);
+  let totalOctaves = maxFullOct + select(0u, 1u, lastFrac > 0.001);
 
   var sum: f32  = 0.0;
   var freq: f32 = baseFreq;
   var amp: f32  = 1.0;
   var ampSum: f32 = 0.0;
-  for (var k: u32 = 0u; k < maxOctave; k = k + 1u) {
+  for (var k: u32 = 0u; k < totalOctaves; k = k + 1u) {
     // Per-octave offset = deterministic seed depending ONLY on k.
     // LOD-stable: octave k contributes the same value at the same
-    // worldPos regardless of maxOctave.
+    // worldPos regardless of maxOctaveF.
     let offset = vec3<f32>(
       f32(k) * 13.37,
       f32(k) * 7.91,
       f32(k) * 23.45
     );
-    let p = worldPos * freq + offset;
+    let p = samplePos * freq + offset;
     let nRaw = _value_noise_3d(p) * 2.0 - 1.0;  // [-1, 1]
     let nShaped = _noise_apply_shape(nRaw, shape);
-    sum    = sum    + amp * nShaped;
-    ampSum = ampSum + amp;
+    // 8.4 crossfade: scale the last partial octave by lastFrac so
+    // its contribution ramps 0->1 across the band boundary.
+    var ampThis = amp;
+    if (k == maxFullOct && lastFrac > 0.001 && lastFrac < 0.999) {
+      ampThis = amp * lastFrac;
+    }
+    sum    = sum    + ampThis * nShaped;
+    ampSum = ampSum + ampThis;
     freq = freq * lacunarity;
     amp  = amp  * roughness;
   }
@@ -52960,8 +53004,8 @@ fn detail_noise(worldPos: vec3<f32>, biomeId: u32, maxOctave: u32) -> f32 {
 
 // Phase 8 sprint 8-6: meters-scaled detail noise for vertex displacement.
 // Strips the 0.01 color-modulation scale to recover real meters.
-fn detail_noise_height(worldPos: vec3<f32>, biomeId: u32, maxOctave: u32) -> f32 {
-  return detail_noise(worldPos, biomeId, maxOctave) * 100.0;
+fn detail_noise_height(worldPos: vec3<f32>, biomeId: u32, maxOctaveF: f32) -> f32 {
+  return detail_noise(worldPos, biomeId, maxOctaveF) * 100.0;
 }
 
 // Sample clouds for a given world view direction. Returns vec4
@@ -54108,10 +54152,10 @@ fn vs_main(in: VsIn) -> VsOut {
     let radialLen = length(radialVec);
     let radialDir = radialVec / max(radialLen, 1.0);
     let camAlt = max(0.0, length(uS.eye.xyz - uS.envPlanet.xyz) - uS.envPlanet.w);
-    let octaves = u32(_detail_octaves(camAlt));
-    if (octaves > 0u) {
+    let octavesF = _detail_octaves(camAlt);
+    if (octavesF > 0.0) {
       let bId = u32(clamp(round(in.uv.x), 0.0, 12.0));
-      let dispH = detail_noise_height(localPos, bId, octaves);
+      let dispH = detail_noise_height(localPos, bId, octavesF);
       // uD.vsParams.x carries an optional displacement-scale multiplier
       // (PlanetMesh.params.displacementScale, default 1.0). Lets the
       // user crank up vertex relief without changing biome amplitudes.
@@ -54278,7 +54322,7 @@ fn fs_unlit_vc(in: VsOut) -> @location(0) vec4<f32> {
     //     adds real-time bump lighting on top of the baked Lambert.
     let bId = u32(clamp(round(in.uv.x), 0.0, 12.0));
     let _altitude_m = max(0.0, length(uS.eye.xyz - uS.envPlanet.xyz) - uS.envPlanet.w);
-    let _max_oct    = u32(_detail_octaves(_altitude_m));
+    let _max_oct    = _detail_octaves(_altitude_m);
     var color = in.color;
 
     let texScale = uD.planetExtra.z;
@@ -54349,7 +54393,7 @@ fn fs_unlit_vc(in: VsOut) -> @location(0) vec4<f32> {
         }
       }
 
-      if (_max_oct > 0u) {
+      if (_max_oct > 0.0) {
         let n = detail_noise(in.worldPos, bId, _max_oct);
         color = color * (1.0 + n * 5.0);
 
@@ -54357,7 +54401,7 @@ fn fs_unlit_vc(in: VsOut) -> @location(0) vec4<f32> {
         // detail_noise. Limit to 4 octaves for the gradient (lower
         // octaves dominate the slope; higher octaves add fine but
         // computationally expensive variation).
-        let bump_oct = min(_max_oct, 4u);
+        let bump_oct = min(_max_oct, 4.0);
         let eps = 50.0;
         let dx = detail_noise(in.worldPos + vec3<f32>(eps, 0.0, 0.0), bId, bump_oct)
                - detail_noise(in.worldPos - vec3<f32>(eps, 0.0, 0.0), bId, bump_oct);
