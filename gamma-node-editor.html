@@ -10804,14 +10804,29 @@ public:
       { n: "heightScale",       t: "param" },
       { n: "seaLevel",          t: "param" },
       { n: "subdivide",         t: "param" },
-      { n: "heightmap",         t: "heightmap" }
+      // Phase 8 sprint 8-3b -- texture inputs. When wired, the planet
+      // body fragments sample triplanar from these textures (mixed
+      // with the baked biome / water shading). When unwired, the
+      // existing biome colors + procedural water shading apply.
+      // textureScale = inverse world distance per repeat (0.001 =
+      // 1km between repeats for Earth-scale planets). textureMix =
+      // strength of the texture (0 = pure biome, 1 = pure texture).
+      // Shared between land + water for now; per-side parameters can
+      // be added later if the unified knob proves too coarse.
+      { n: "textureScale",      t: "param" },
+      { n: "textureMix",        t: "param" },
+      { n: "heightmap",         t: "heightmap" },
+      { n: "landTexture",       t: "texture" },
+      { n: "waterTexture",      t: "texture" }
     ],
     outs: [{ n: "mesh", t: "mesh" }],
     params: {
       radius: 1000, polarRadiusRatio: 1.0,
       centerX: 0, centerY: 0, centerZ: 0,
       heightScale: 0, seaLevel: 0.5,
-      subdivide: 0
+      subdivide: 0,
+      textureScale: 0.001,
+      textureMix:   1.0
     },
     methods: {},
     description: "Phase 7.d-azgaar of planet-spec -- direct cell-mesh planet, mirrors Azgaar's 3D scene mode (one mesh vertex per cell, triangles between mutually-adjacent cells). NO chunking, NO cubemap intermediate. Wire a PlanetMap's heightmap output; each cell becomes one vertex at unit_direction * (R + cell.h * heightScale * altitudeFactor) with color from _planetColorForHeight. Triangulation is built once from the cell-graph K-neighbor table (~120k triangles at cellCount=30000). subdivide=1 applies one Loop subdivision pass (Azgaar `loopSubdivision.modify(geometry, 1)` equivalent) -- 4× triangle count, smooths cell-faceting between mountains, gives the rounded terrain look from Azgaar's 3D scene. Best for orbit views; foot-level detail not provided (~130km per cell at Earth scale)."
@@ -53849,6 +53864,13 @@ struct PerDraw {
   // ray and sample cloud density; if a cloud is overhead the water
   // pixel is shadowed. Other material shaders ignore.
   cloudExtra:   vec4<f32>,
+  // Phase 8 sprint 8-3b -- PlanetMesh texture inputs.
+  //   planetExtra.x = land texture layer (-1 = no land texture wired)
+  //   planetExtra.y = water texture layer (-1 = no water texture wired)
+  //   planetExtra.z = textureScale (inverse world units per repeat)
+  //   planetExtra.w = textureMix (0 = pure biome, 1 = pure texture)
+  // Read only by fs_unlit_vc's planet-aware branch.
+  planetExtra:  vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> uS: PerScene;
 @group(0) @binding(1) var<uniform> uD: PerDraw;
@@ -54182,6 +54204,8 @@ fn fs_unlit_vc(in: VsOut) -> @location(0) vec4<f32> {
     let _max_oct    = u32(_detail_octaves(_altitude_m));
     var color = in.color;
 
+    let texScale = uD.planetExtra.z;
+    let texMix   = uD.planetExtra.w;
     if (bId == 0u) {
       // Marine cell -- water shading. Schlick Fresnel weighted mix
       // between deep-blue subsurface and the sky-view LUT reflected
@@ -54198,7 +54222,17 @@ fn fs_unlit_vc(in: VsOut) -> @location(0) vec4<f32> {
       let skyRefl = sample_skyview_lut(reflectDir);
       // Deep-blue base. Slightly darker than the flat biome blue so
       // the Fresnel-mixed reflection reads more strongly.
-      let waterBase = vec3<f32>(0.04, 0.14, 0.24);
+      var waterBase = vec3<f32>(0.04, 0.14, 0.24);
+      // Phase 8 sprint 8-3b: if a waterTexture is wired, mix it into
+      // the subsurface base before Fresnel. texMix controls strength;
+      // texture is triplanar-sampled in world space.
+      let waterTexLayer = i32(uD.planetExtra.y);
+      if (waterTexLayer >= 0) {
+        let tex = triplanar_sample_array(srcTexture, srcSampler,
+                    u32(waterTexLayer), in.worldPos, surfN,
+                    texScale, 4.0);
+        waterBase = mix(waterBase, tex.rgb, texMix);
+      }
       color = mix(waterBase, skyRefl, clamp(reflectance, 0.0, 1.0));
     } else {
       // Land biome. Two-tier procedural texturing:
@@ -54212,6 +54246,21 @@ fn fs_unlit_vc(in: VsOut) -> @location(0) vec4<f32> {
       // for actual bump lighting (sprint 8-3 part b).
       let macroN = _value_noise_3d(in.worldPos * 0.00001) * 2.0 - 1.0;
       color = color * (1.0 + macroN * 0.15);
+      // Phase 8 sprint 8-3b: if a landTexture is wired, mix triplanar
+      // sample into the biome-colored base. texMix=1.0 fully replaces
+      // the biome color; lower values keep some biome tint.
+      let surfN = normalize(in.normal);
+      let landTexLayer = i32(uD.planetExtra.x);
+      if (landTexLayer >= 0) {
+        let tex = triplanar_sample_array(srcTexture, srcSampler,
+                    u32(landTexLayer), in.worldPos, surfN,
+                    texScale, 4.0);
+        // Modulate the texture by the biome color so biome identity
+        // still shows through (texture acts as a multiplicative
+        // detail layer rather than a hard override).
+        let tinted = tex.rgb * color * 2.0;
+        color = mix(color, tinted, texMix);
+      }
 
       if (_max_oct > 0u) {
         let n = detail_noise(in.worldPos, bId, _max_oct);
@@ -63741,6 +63790,41 @@ function _encodeScenePass(enc, entry) {
       inst.drawScratch[41] = 0;
       inst.drawScratch[42] = 0;
       inst.drawScratch[43] = 0;
+    }
+    // Phase 8 sprint 8-3b -- PlanetMesh texture layer resolution.
+    // Slots [60..63] map to PerDraw.planetExtra.xyzw = (landLayer,
+    // waterLayer, textureScale, textureMix). Default to "no
+    // texture" (-1) so unwired planet draws keep the existing biome
+    // / water shading. When the PlanetMesh node has landTexture or
+    // waterTexture wires, the upstream's scratch slot is resolved
+    // via the same render-plan lookup ShaderMat uses.
+    inst.drawScratch[60] = -1;
+    inst.drawScratch[61] = -1;
+    inst.drawScratch[62] = 0.001;
+    inst.drawScratch[63] = 0.0;
+    if (m.node && m.node.type === "PlanetMesh") {
+      const ptp = m.node.params || {};
+      const planMap = Visual._currentRenderPlan;
+      const landWire = state && Array.isArray(state.edges) && state.edges.find(e =>
+        e && e.to && e.to.node === m.node.id && e.to.port === "landTexture"
+      );
+      if (landWire && landWire.from) {
+        const upstreamEntry = planMap && planMap.get(landWire.from.node + "@" + entry.consumerVO.id);
+        if (upstreamEntry && upstreamEntry.isScratch) {
+          inst.drawScratch[60] = upstreamEntry.layerIdx;
+        }
+      }
+      const waterWire = state && Array.isArray(state.edges) && state.edges.find(e =>
+        e && e.to && e.to.node === m.node.id && e.to.port === "waterTexture"
+      );
+      if (waterWire && waterWire.from) {
+        const upstreamEntry = planMap && planMap.get(waterWire.from.node + "@" + entry.consumerVO.id);
+        if (upstreamEntry && upstreamEntry.isScratch) {
+          inst.drawScratch[61] = upstreamEntry.layerIdx;
+        }
+      }
+      inst.drawScratch[62] = (typeof ptp.textureScale === "number") ? ptp.textureScale : 0.001;
+      inst.drawScratch[63] = (typeof ptp.textureMix   === "number") ? ptp.textureMix   : 1.0;
     }
     Visual.device.queue.writeBuffer(slot.perDrawBuffer, 0, inst.drawScratch.buffer, 0, 256);
     // v0.3.120 -- pick the bind group whose binding 2 is OPPOSITE
