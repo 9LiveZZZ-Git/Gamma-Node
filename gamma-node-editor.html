@@ -54163,31 +54163,91 @@ fn fs_unlit_vc(in: VsOut) -> @location(0) vec4<f32> {
     // wash-out (warm sunset hue on distant ground) until C.6 splits
     // the transmittance into a second LUT.
     let ap = sample_aerial_perspective_lut(uS.eye.xyz, in.worldPos);
-    // === Phase 8 sprint 8-2: biome-aware detail-noise visualization ===
-    // (spec: docs/PLANET-SCALE-TERRAIN.md §8.3 + §8.6)
-    // Sprint 8-1 modulated by a single default-biome noise; sprint
-    // 8-2 routes the per-vertex biome ID (baked into uv.x by the
-    // PlanetMesh build) through the BIOME_DETAIL_PARAMS table for
-    // per-biome amplitude / frequency / noise shape (fbm vs ridged
-    // vs dunes vs cracks). Octave count still auto-scales with
-    // altitude per §8.4.
+    // === Phase 8 sprint 8-3 + extras ===
+    // (spec: docs/PLANET-SCALE-TERRAIN.md §8.5 fragment-path)
     //
-    // round() of the interpolated uv.x means ~95% of fragments get
-    // the correct integer biome; ~5% at cell-cell boundaries get
-    // whichever biome rounded-to-nearest. Sprint 8-3 will add a
-    // proper @interpolate(flat) attribute alongside the vertex
-    // displacement work.
+    // Per-biome rendering:
+    //   * Marine (bId == 0) -- water shading via Fresnel-mixed sky
+    //     reflection (sample_skyview_lut on the reflection vector)
+    //     over a deep-blue base; sprint 8-3 polish replaces the flat
+    //     biome-color blue that read as "painted on" with a real
+    //     reflective surface.
+    //   * Land biomes -- macro-scale color variation (~100km
+    //     patches, visible from orbit) breaks up the flat biome
+    //     palette; per-biome detail_noise brightness modulation as
+    //     before; normal perturbation from the detail_noise gradient
+    //     adds real-time bump lighting on top of the baked Lambert.
+    let bId = u32(clamp(round(in.uv.x), 0.0, 12.0));
     let _altitude_m = max(0.0, length(uS.eye.xyz - uS.envPlanet.xyz) - uS.envPlanet.w);
     let _max_oct    = u32(_detail_octaves(_altitude_m));
     var color = in.color;
-    if (_max_oct > 0u) {
-      let bId = u32(clamp(round(in.uv.x), 0.0, 12.0));
-      let n = detail_noise(in.worldPos, bId, _max_oct);
-      // 5.0 multiplier converts detail_noise's meters-scaled output
-      // (amplitude * 0.01) into a perceptible brightness modulation
-      // (up to ~20% for hot desert / glacier biomes, ~5% for plains).
-      color = color * (1.0 + n * 5.0);
+
+    if (bId == 0u) {
+      // Marine cell -- water shading. Schlick Fresnel weighted mix
+      // between deep-blue subsurface and the sky-view LUT reflected
+      // through the surface normal. At normal incidence we read
+      // ~2% reflectance (water IOR ~1.33); at grazing angles the
+      // Fresnel term ramps to 1.0 and the surface acts like a mirror.
+      let surfN = normalize(in.normal);
+      let viewDir = normalize(uS.eye.xyz - in.worldPos);
+      let cosVN = max(dot(viewDir, surfN), 0.0);
+      let fresnel = pow(1.0 - cosVN, 5.0);
+      let f0 = 0.02;
+      let reflectance = f0 + (1.0 - f0) * fresnel;
+      let reflectDir = reflect(-viewDir, surfN);
+      let skyRefl = sample_skyview_lut(reflectDir);
+      // Deep-blue base. Slightly darker than the flat biome blue so
+      // the Fresnel-mixed reflection reads more strongly.
+      let waterBase = vec3<f32>(0.04, 0.14, 0.24);
+      color = mix(waterBase, skyRefl, clamp(reflectance, 0.0, 1.0));
+    } else {
+      // Land biome. Two-tier procedural texturing:
+      //   1. Macro patches (very low-freq noise) -- visible from
+      //      orbit, breaks up the otherwise-flat biome color into
+      //      naturalistic patches at ~100km scale.
+      //   2. Detail noise (sprint 8-2) -- brightness modulation
+      //      based on per-biome amp / freq / shape, gated on
+      //      altitude-derived octave count.
+      // Plus the new: normal perturbation from detail_noise gradient
+      // for actual bump lighting (sprint 8-3 part b).
+      let macroN = _value_noise_3d(in.worldPos * 0.00001) * 2.0 - 1.0;
+      color = color * (1.0 + macroN * 0.15);
+
+      if (_max_oct > 0u) {
+        let n = detail_noise(in.worldPos, bId, _max_oct);
+        color = color * (1.0 + n * 5.0);
+
+        // Normal perturbation via central-difference gradient of
+        // detail_noise. Limit to 4 octaves for the gradient (lower
+        // octaves dominate the slope; higher octaves add fine but
+        // computationally expensive variation).
+        let bump_oct = min(_max_oct, 4u);
+        let eps = 50.0;
+        let dx = detail_noise(in.worldPos + vec3<f32>(eps, 0.0, 0.0), bId, bump_oct)
+               - detail_noise(in.worldPos - vec3<f32>(eps, 0.0, 0.0), bId, bump_oct);
+        let dy = detail_noise(in.worldPos + vec3<f32>(0.0, eps, 0.0), bId, bump_oct)
+               - detail_noise(in.worldPos - vec3<f32>(0.0, eps, 0.0), bId, bump_oct);
+        let dz = detail_noise(in.worldPos + vec3<f32>(0.0, 0.0, eps), bId, bump_oct)
+               - detail_noise(in.worldPos - vec3<f32>(0.0, 0.0, eps), bId, bump_oct);
+        let grad = vec3<f32>(dx, dy, dz) / (2.0 * eps);
+
+        let surfN = normalize(in.normal);
+        let grad_tangent = grad - surfN * dot(grad, surfN);
+        let BUMP_STRENGTH: f32 = 5000.0;
+        let perturbed = normalize(surfN - grad_tangent * BUMP_STRENGTH);
+
+        // Delta-Lambert: how much MORE lit (or shadowed) the
+        // perturbed surface is vs the flat base. Multiplied by sun
+        // visibility so night-side gets no bump effect.
+        let sunDir = uS.envSun.xyz;
+        let sunVis = uS.envSun.w;
+        let base_l = max(0.0, dot(surfN, sunDir));
+        let bump_l = max(0.0, dot(perturbed, sunDir));
+        let bump_factor = (bump_l - base_l) * sunVis;
+        color = color * (1.0 + bump_factor * 1.5);
+      }
     }
+
     let col = color * ap.transmittance + ap.inScatter;
     return vec4<f32>(tonemap_aces(col), 1.0);
   }
