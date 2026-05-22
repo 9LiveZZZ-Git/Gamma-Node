@@ -47031,6 +47031,9 @@ function _findPlanetInfo() {
     polRatio:    (typeof pr.polarRadiusRatio === "number") ? pr.polarRadiusRatio : 1,
     heightScale: (typeof pr.heightScale === "number") ? pr.heightScale : 0,
     seaLevel:    (typeof pr.seaLevel === "number") ? pr.seaLevel : 0,
+    // Sprint 8-8c: vs_main multiplies the detail-noise displacement
+    // by this. _planetMeshSurfacePos uses it to mirror the shader.
+    dispScale:   (typeof pr.displacementScale === "number") ? pr.displacementScale : 0,
     // PlanetMap-bearing node for heightmap sampling. May not have
     // built its cells yet -- callers check pMap._cells before using.
     mapNode:     pMap
@@ -47050,11 +47053,71 @@ function _planetRadialUp(px, py, pz) {
   return [dx / r, dy / r, dz / r];
 }
 
+/* Sprint 8-8c -- JS port of the WGSL _value_noise_3d / detail_noise_
+ * height pair. Used by _planetMeshSurfacePos to model the per-vertex
+ * displacement vs_main applies to PlanetMesh draws, so collision and
+ * walk-mode see the rendered (displaced) surface, not the smooth
+ * cell-elevation surface. Without this the camera floats / sinks by
+ * up to (biome amp * displacementScale) meters relative to the mesh. */
+function _planetHash13(x, y, z) {
+  const k = Math.sin(x * 127.1 + y * 311.7 + z * 74.7) * 43758.5453;
+  return k - Math.floor(k);
+}
+function _planetValueNoise3D(x, y, z) {
+  const ix = Math.floor(x), iy = Math.floor(y), iz = Math.floor(z);
+  const fx = x - ix, fy = y - iy, fz = z - iz;
+  const ux = fx * fx * (3 - 2 * fx);
+  const uy = fy * fy * (3 - 2 * fy);
+  const uz = fz * fz * (3 - 2 * fz);
+  const c000 = _planetHash13(ix,     iy,     iz    );
+  const c100 = _planetHash13(ix + 1, iy,     iz    );
+  const c010 = _planetHash13(ix,     iy + 1, iz    );
+  const c110 = _planetHash13(ix + 1, iy + 1, iz    );
+  const c001 = _planetHash13(ix,     iy,     iz + 1);
+  const c101 = _planetHash13(ix + 1, iy,     iz + 1);
+  const c011 = _planetHash13(ix,     iy + 1, iz + 1);
+  const c111 = _planetHash13(ix + 1, iy + 1, iz + 1);
+  const x00 = c000 + (c100 - c000) * ux;
+  const x10 = c010 + (c110 - c010) * ux;
+  const x01 = c001 + (c101 - c001) * ux;
+  const x11 = c011 + (c111 - c011) * ux;
+  const y0 = x00 + (x10 - x00) * uy;
+  const y1 = x01 + (x11 - x01) * uy;
+  return y0 + (y1 - y0) * uz;
+}
+function _planetDetailNoiseHeight(wx, wy, wz, biomeId, biomeOverride) {
+  if (biomeId < 0 || biomeId > 12) return 0;
+  if (typeof PLANET_BIOME_DETAIL_DEFAULTS === "undefined") return 0;
+  const def = (biomeOverride && biomeOverride[biomeId]) || PLANET_BIOME_DETAIL_DEFAULTS[biomeId];
+  if (!def) return 0;
+  const amplitude = def[0], baseFreq = def[1], roughness = def[2];
+  const lacunarity = def[3], shape = def[4] | 0;
+  if (amplitude <= 0) return 0;
+  let sum = 0, ampSum = 0, freq = baseFreq, amp = 1;
+  for (let kk = 0; kk < 6; kk++) {
+    const ox = kk * 13.37, oy = kk * 7.91, oz = kk * 23.45;
+    let n = _planetValueNoise3D(wx * freq + ox, wy * freq + oy, wz * freq + oz) * 2 - 1;
+    if (shape === 1 || shape === 3) { const r = 1 - Math.abs(n); n = r * r; }
+    else if (shape === 2) { n = Math.abs(n); }
+    else if (shape === 4) { const r = 1 - Math.abs(n); n = -r * r; }
+    sum += amp * n;
+    ampSum += amp;
+    freq *= lacunarity;
+    amp *= roughness;
+  }
+  if (ampSum < 1e-6) return 0;
+  return (sum / ampSum) * amplitude;
+}
+
 /* Sprint 8-8 -- given a world-space position (wx, wy, wz), find the
  * planet-surface point directly beneath it (along the planet-radial)
  * with full PlanetMesh fidelity: polRatio-corrected unit-sphere
- * direction, PlanetMap cell lookup for elevation, and the same
- * (R + alt, R*pr + alt, R + alt) vertex formula _buildPlanetMesh uses.
+ * direction, PlanetMap cell lookup for elevation, the same
+ * (R + alt, R*pr + alt, R + alt) vertex formula _buildPlanetMesh
+ * uses, AND the per-vertex detail-noise displacement vs_main applies
+ * along world radial (sprint 8-8c -- without this the rendered mesh
+ * sat up to amp*displacementScale meters above the cell-level surface
+ * and the camera ended up under the terrain on landing).
  * Returns { x, y, z, altitude, biomeId, cellIdx } or null when no
  * planet is wired or its PlanetMap hasn't built cells yet.
  *
@@ -47080,10 +47143,36 @@ function _planetMeshSurfacePos(wx, wy, wz, pl) {
       if (pmap._cells.biome) biomeId = pmap._cells.biome[cellIdx];
     }
   }
+  // Cell-base vertex position (matches _buildPlanetMesh).
+  const baseX = cx + ux * (R + alt);
+  const baseY = cy + uy * (R * pr + alt);
+  const baseZ = cz + uz * (R + alt);
+  // Sprint 8-8c: add the per-vertex displacement vs_main applies.
+  // Shader: localPos += radialDir * (detail_noise_height * dispScale),
+  // where radialDir is normalize(vertex - center) (WORLD radial, not
+  // unit-sphere). Mirror that exactly so callers see the rendered
+  // surface.
+  let totalDisp = 0;
+  if (biomeId >= 0 && pl.dispScale > 0) {
+    const bX = baseX - cx, bY = baseY - cy, bZ = baseZ - cz;
+    const bLen = Math.hypot(bX, bY, bZ) || 1;
+    const rdX = bX / bLen, rdY = bY / bLen, rdZ = bZ / bLen;
+    const biomeOverride = (pmap && pmap._biomeParams) || null;
+    const dispH = _planetDetailNoiseHeight(baseX, baseY, baseZ, biomeId, biomeOverride);
+    totalDisp = dispH * pl.dispScale;
+    return {
+      x: baseX + rdX * totalDisp,
+      y: baseY + rdY * totalDisp,
+      z: baseZ + rdZ * totalDisp,
+      altitude: alt + totalDisp,
+      biomeId: biomeId,
+      cellIdx: cellIdx
+    };
+  }
   return {
-    x: cx + ux * (R + alt),
-    y: cy + uy * (R * pr + alt),
-    z: cz + uz * (R + alt),
+    x: baseX,
+    y: baseY,
+    z: baseZ,
     altitude: alt,
     biomeId: biomeId,
     cellIdx: cellIdx
@@ -47136,8 +47225,6 @@ function _tickFPCameras(dt) {
 }
 
 function _tickFPCameraWalk(node, p, dt, input, k) {
-  let yaw   = (typeof p.yaw   === "number") ? p.yaw   : 0;
-  let pitch = (typeof p.pitch === "number") ? p.pitch : 0;
   const sens     = (typeof p.mouseSensitivity === "number") ? p.mouseSensitivity : 0.0025;
   if (k && (k.has("KeyX") || k.has("KeyZ"))) {
     const cur = (typeof p.walkSpeed === "number") ? p.walkSpeed : 12;
@@ -47149,67 +47236,142 @@ function _tickFPCameraWalk(node, p, dt, input, k) {
   const lookRate = (typeof p.lookSpeed        === "number") ? p.lookSpeed        : 2.0;
   const eyeH     = (typeof p.eyeHeight        === "number") ? p.eyeHeight        : 1.7;
 
-  if (input.pointerLocked) {
-    yaw   -= input.mouseDx * sens;
-    pitch -= input.mouseDy * sens;
-  }
-  if (k.has("KeyJ")) yaw   += lookRate * dt;
-  if (k.has("KeyL")) yaw   -= lookRate * dt;
-  if (k.has("KeyI")) pitch += lookRate * dt;
-  if (k.has("KeyK")) pitch -= lookRate * dt;
-  const lim = Math.PI * 0.49;
-  if (pitch >  lim) pitch =  lim;
-  if (pitch < -lim) pitch = -lim;
-
-  const cy = Math.cos(yaw),   sy = Math.sin(yaw);
-  const cp = Math.cos(pitch), sp = Math.sin(pitch);
-  const fx = sy * cp, fy = sp, fz = cy * cp;
-  const rx = cy,      ry = 0,  rz = -sy;
-
-  let dx = 0, dz = 0;
-  const hfLen = Math.sqrt(fx * fx + fz * fz) || 1;
-  const hfx = fx / hfLen, hfz = fz / hfLen;
-  if (k.has("KeyW")) { dx += hfx; dz += hfz; }
-  if (k.has("KeyS")) { dx -= hfx; dz -= hfz; }
-  if (k.has("KeyD")) { dx += rx;  dz += rz;  }
-  if (k.has("KeyA")) { dx -= rx;  dz -= rz;  }
-  const sprint = (k.has("ShiftLeft") || k.has("ShiftRight")) ? 4 : 1;
-
   let px = (typeof p.posX === "number") ? p.posX : 0;
   let py = (typeof p.posY === "number") ? p.posY : 2;
   let pz = (typeof p.posZ === "number") ? p.posZ : 0;
-  const l = Math.hypot(dx, 0, dz);
+
+  // === Sprint 8-8c: tangent-plane basis when on a planet ===
+  // World yaw/pitch Euler angles don't work at non-pole latitudes --
+  // the camera's "up" rotates with planet position, so mouse-look has
+  // to be defined relative to the LOCAL up (radial). We store forward
+  // as a 3D vector (re-derived from targetXYZ if it survives the
+  // tick) and rotate it around the local up / right just like flight
+  // mode does. Flat-terrain patches still use the Euler path so
+  // legacy demos behave the same.
+  const _walkPL = _findPlanetInfo();
+  const _walkOnPlanet = _walkPL && state.nodes.some(n => n && n.type === "PlanetMesh");
+
+  let upX, upY, upZ;
+  if (_walkOnPlanet) {
+    const rdx = px - _walkPL.centerX, rdy = py - _walkPL.centerY, rdz = pz - _walkPL.centerZ;
+    const rLen = Math.hypot(rdx, rdy, rdz) || 1;
+    upX = rdx / rLen; upY = rdy / rLen; upZ = rdz / rLen;
+  } else {
+    upX = 0; upY = 1; upZ = 0;
+  }
+
+  // Bring in the previous tick's forward (set via targetXYZ at the
+  // end of last frame, by either walk OR flight). Fall back to a
+  // yaw/pitch-derived forward if no target exists yet.
+  let fx, fy, fz;
+  const tdx = (typeof p.targetX === "number" ? p.targetX : 0) - px;
+  const tdy = (typeof p.targetY === "number" ? p.targetY : 0) - py;
+  const tdz = (typeof p.targetZ === "number" ? p.targetZ : 1) - pz;
+  const tLen = Math.hypot(tdx, tdy, tdz);
+  if (tLen > 1e-6) {
+    fx = tdx / tLen; fy = tdy / tLen; fz = tdz / tLen;
+  } else {
+    const yaw0 = (typeof p.yaw === "number") ? p.yaw : 0;
+    const pitch0 = (typeof p.pitch === "number") ? p.pitch : 0;
+    const cy0 = Math.cos(yaw0), sy0 = Math.sin(yaw0);
+    const cp0 = Math.cos(pitch0), sp0 = Math.sin(pitch0);
+    fx = sy0 * cp0; fy = sp0; fz = cy0 * cp0;
+  }
+
+  // Mouse / key look deltas.
+  let yawD = 0, pitchD = 0;
+  if (input.pointerLocked) {
+    yawD   -= input.mouseDx * sens;
+    pitchD -= input.mouseDy * sens;
+  }
+  if (k.has("KeyJ")) yawD   += lookRate * dt;
+  if (k.has("KeyL")) yawD   -= lookRate * dt;
+  if (k.has("KeyI")) pitchD += lookRate * dt;
+  if (k.has("KeyK")) pitchD -= lookRate * dt;
+
+  // Build initial tangent-plane right vector: project forward onto
+  // tangent plane and take its 90deg rotation around up.
+  let fdu = fx*upX + fy*upY + fz*upZ;
+  let fhX = fx - upX * fdu, fhY = fy - upY * fdu, fhZ = fz - upZ * fdu;
+  let fhLen = Math.hypot(fhX, fhY, fhZ);
+  if (fhLen < 1e-6) {
+    // Forward is nearly parallel to up -- pick an arbitrary tangent.
+    const refX = Math.abs(upX) < 0.9 ? 1 : 0;
+    const refY = Math.abs(upX) < 0.9 ? 0 : 1;
+    fhX = refX - upX * (refX*upX + refY*upY);
+    fhY = refY - upY * (refX*upX + refY*upY);
+    fhZ = 0    - upZ * (refX*upX + refY*upY);
+    fhLen = Math.hypot(fhX, fhY, fhZ) || 1;
+  }
+  fhX /= fhLen; fhY /= fhLen; fhZ /= fhLen;
+  // right = forward_h x up (matches flight-mode sign so D = right).
+  let rX = fhY*upZ - fhZ*upY;
+  let rY = fhZ*upX - fhX*upZ;
+  let rZ = fhX*upY - fhY*upX;
+
+  // Apply yaw around UP, then pitch around RIGHT.
+  if (yawD !== 0) {
+    const r1 = _rotAroundUnit(fx, fy, fz, upX, upY, upZ, yawD);
+    fx = r1[0]; fy = r1[1]; fz = r1[2];
+    fdu = fx*upX + fy*upY + fz*upZ;
+    fhX = fx - upX * fdu; fhY = fy - upY * fdu; fhZ = fz - upZ * fdu;
+    fhLen = Math.hypot(fhX, fhY, fhZ) || 1;
+    fhX /= fhLen; fhY /= fhLen; fhZ /= fhLen;
+    rX = fhY*upZ - fhZ*upY; rY = fhZ*upX - fhX*upZ; rZ = fhX*upY - fhY*upX;
+  }
+  if (pitchD !== 0) {
+    const r2 = _rotAroundUnit(fx, fy, fz, rX, rY, rZ, pitchD);
+    fx = r2[0]; fy = r2[1]; fz = r2[2];
+  }
+  // Pitch clamp: cap |sin(angle between forward and tangent)| at
+  // sin(88deg) so the camera never goes fully vertical.
+  const limSin = Math.sin(Math.PI * 0.49);
+  const sinP = fx*upX + fy*upY + fz*upZ;
+  if (Math.abs(sinP) > limSin) {
+    const tgtSin = (sinP > 0) ? limSin : -limSin;
+    const tgtCos = Math.sqrt(Math.max(0, 1 - tgtSin * tgtSin));
+    fdu = fx*upX + fy*upY + fz*upZ;
+    const hX = fx - upX * fdu, hY = fy - upY * fdu, hZ = fz - upZ * fdu;
+    const hLen = Math.hypot(hX, hY, hZ) || 1;
+    fx = hX / hLen * tgtCos + upX * tgtSin;
+    fy = hY / hLen * tgtCos + upY * tgtSin;
+    fz = hZ / hLen * tgtCos + upZ * tgtSin;
+  }
+  // Re-derive horiz + right after pitch clamp.
+  fdu = fx*upX + fy*upY + fz*upZ;
+  fhX = fx - upX * fdu; fhY = fy - upY * fdu; fhZ = fz - upZ * fdu;
+  fhLen = Math.hypot(fhX, fhY, fhZ) || 1;
+  fhX /= fhLen; fhY /= fhLen; fhZ /= fhLen;
+  rX = fhY*upZ - fhZ*upY; rY = fhZ*upX - fhX*upZ; rZ = fhX*upY - fhY*upX;
+
+  // Movement on the tangent plane.
+  let dx = 0, dy = 0, dz = 0;
+  if (k.has("KeyW")) { dx += fhX; dy += fhY; dz += fhZ; }
+  if (k.has("KeyS")) { dx -= fhX; dy -= fhY; dz -= fhZ; }
+  if (k.has("KeyD")) { dx += rX;  dy += rY;  dz += rZ;  }
+  if (k.has("KeyA")) { dx -= rX;  dy -= rY;  dz -= rZ;  }
+  const sprint = (k.has("ShiftLeft") || k.has("ShiftRight")) ? 4 : 1;
+  const l = Math.hypot(dx, dy, dz);
   if (l > 0.0001) {
     const step = speed * sprint * dt;
     px += (dx / l) * step;
+    py += (dy / l) * step;
     pz += (dz / l) * step;
   }
-  const horizMoveLen = Math.hypot(dx, dz);
-  if (horizMoveLen > 0.001) {
-    const ndx = dx / horizMoveLen, ndz = dz / horizMoveLen;
-    const tcFactor = Math.min(1, dt * 1.5);
-    const wdx0 = (typeof p.walkDirX === "number") ? p.walkDirX : ndx;
-    const wdz0 = (typeof p.walkDirZ === "number") ? p.walkDirZ : ndz;
-    p.walkDirX = wdx0 + (ndx - wdx0) * tcFactor;
-    p.walkDirZ = wdz0 + (ndz - wdz0) * tcFactor;
-  }
-  // Sprint 8-8: PlanetMesh walk mode snaps the FULL 3D position to
-  // (surface + radial * eyeHeight). For a sphere, just lifting Y is
-  // wrong away from the spawn pole -- the camera would float or sink
-  // depending on latitude. For flat terrain (no PlanetMesh) we keep
-  // the legacy XZ-locked behavior.
-  let walkUpX = 0, walkUpY = 1, walkUpZ = 0;
-  const _walkPL = _findPlanetInfo();
-  const _walkOnPlanet = _walkPL && state.nodes.some(n => n && n.type === "PlanetMesh");
+
+  // Snap to ground.
   if (_walkOnPlanet) {
     const surf = _planetMeshSurfacePos(px, py, pz, _walkPL);
     if (surf) {
+      // Re-derive up at the new position (we moved along a flat
+      // tangent plane but the planet is curved, so the radial just
+      // rotated slightly).
       const rdx = px - _walkPL.centerX, rdy = py - _walkPL.centerY, rdz = pz - _walkPL.centerZ;
       const rLen = Math.hypot(rdx, rdy, rdz) || 1;
-      walkUpX = rdx / rLen; walkUpY = rdy / rLen; walkUpZ = rdz / rLen;
-      px = surf.x + walkUpX * eyeH;
-      py = surf.y + walkUpY * eyeH;
-      pz = surf.z + walkUpZ * eyeH;
+      upX = rdx / rLen; upY = rdy / rLen; upZ = rdz / rLen;
+      px = surf.x + upX * eyeH;
+      py = surf.y + upY * eyeH;
+      pz = surf.z + upZ * eyeH;
     }
   } else {
     const groundY = _fpcSampleGroundY(px, pz, py);
@@ -47217,11 +47379,15 @@ function _tickFPCameraWalk(node, p, dt, input, k) {
   }
 
   p.posX = px; p.posY = py; p.posZ = pz;
-  p.yaw  = yaw; p.pitch = pitch;
+  // Derive yaw/pitch from forward in the LOCAL frame so HUD and the
+  // walk<->flight transition keep working. pitch = angle of forward
+  // above tangent plane.
+  p.pitch = Math.asin(Math.max(-1, Math.min(1, fx*upX + fy*upY + fz*upZ)));
+  p.yaw   = Math.atan2(fx, fz);  // approximate; only used for HUD
   p.targetX = px + fx;
   p.targetY = py + fy;
   p.targetZ = pz + fz;
-  p.upX = walkUpX; p.upY = walkUpY; p.upZ = walkUpZ;
+  p.upX = upX; p.upY = upY; p.upZ = upZ;
 }
 
 /* Rodrigues rotation of vector v around unit axis (ax, ay, az) by
