@@ -54319,10 +54319,25 @@ fn vs_planet_detail(in: VsIn) -> VsOut {
     dispH = detail_noise_height(surfacePos, biomeId, octF);
   }
   let dispScale = uD.vsParams.z;
-  // +5m bias along the radial so this fragment wins against the
-  // coarse PlanetMesh in z-buffer ties; the bump is invisible from
-  // orbital distances and trivially small from a meter away too.
-  surfacePos = surfacePos + projDir * (dispH * dispScale + 5.0);
+  // Sprint 8-7d:
+  //  * uD.baseColor.w carries the macro-elevation under the camera
+  //    (JS samples PlanetMap.cells at the camera's lat/lon each
+  //    frame). Adding it to the radial offset places the patch at
+  //    the same altitude as the surrounding PlanetMesh terrain
+  //    instead of bare sea level -- fixes the "patch floats below
+  //    me when I'm on a mountain" / "patch floats above me when I'm
+  //    in a basin" complaint.
+  //  * Displacement is clamped >= 0 (positive-only) so the patch
+  //    never sinks below the radial baseline. Half-negative noise
+  //    used to make the patch lose the depth-test against the
+  //    coarse mesh at displaced-down vertices, producing a "polka
+  //    dot" artifact.
+  let macroElev = uD.baseColor.w;
+  let positiveH = max(dispH, 0.0) * dispScale;
+  // +2m floor: tiny constant bias to win the depth-test against the
+  // coarse PlanetMesh in flat regions where macroElev and positiveH
+  // are both zero.
+  surfacePos = surfacePos + projDir * (macroElev + positiveH + 2.0);
 
   // Biome color + simple Lambert lighting against the sun direction.
   // Matches the JS-side baked lighting in _buildPlanetMesh so the
@@ -64380,9 +64395,61 @@ function _encodeScenePass(enc, entry) {
     if (m.isPlanetDetailPatch) {
       const dpp = (m.node && m.node.params) || {};
       inst.drawScratch[40] = (typeof dpp.detailPatchSize     === "number") ? dpp.detailPatchSize     : 3000.0;
-      inst.drawScratch[41] = (typeof dpp.detailPatchBiomeId  === "number") ? dpp.detailPatchBiomeId  : 4.0;
+      let patchBiomeId      = (typeof dpp.detailPatchBiomeId  === "number") ? dpp.detailPatchBiomeId  : 4.0;
       inst.drawScratch[42] = (typeof dpp.detailPatchDispScale === "number") ? dpp.detailPatchDispScale : 1.0;
       inst.drawScratch[43] = (typeof dpp.detailPatchMaxAlt   === "number") ? dpp.detailPatchMaxAlt   : 5000.0;
+
+      // Sprint 8-7d -- per-frame macro-elevation + biome lookup
+      // for the camera's location. We find the PlanetMap node wired
+      // to PlanetMesh, project the camera direction onto the cell
+      // graph, and look up that cell's elevation + biome. Pass both
+      // to the vertex shader so the patch sits at the local terrain
+      // altitude (instead of bare sea level) and uses the camera's
+      // actual local biome.
+      let macroElev = 0.0;
+      if (state && Array.isArray(state.edges) && state.nodes) {
+        const planetMesh = m.node;
+        const hmWire = state.edges.find(e =>
+          e && e.to && e.to.node === planetMesh.id && e.to.port === "heightmap"
+        );
+        if (hmWire && hmWire.from) {
+          const pmap = state.nodes.find(n => n && n.id === hmWire.from.node && n.type === "PlanetMap");
+          if (pmap && pmap._cells && pmap._cellsHash) {
+            const cx = inst.sceneScratch[132];
+            const cy = inst.sceneScratch[133];
+            const cz = inst.sceneScratch[134];
+            const pR = inst.sceneScratch[135];
+            const polRatio = inst.sceneScratch[140] || 1;
+            const ex = camera.eye[0] - cx;
+            const ey = camera.eye[1] - cy;
+            const ez = camera.eye[2] - cz;
+            // Unit-sphere direction (cells live on a unit sphere; the
+            // cubemap's Y has already absorbed polRatio). Normalize
+            // after pulling Y back to the unit-sphere frame.
+            const eyUnit = (polRatio > 0) ? ey / polRatio : ey;
+            const len = Math.hypot(ex, eyUnit, ez) || 1;
+            const ux = ex / len, uy = eyUnit / len, uz = ez / len;
+            const cellIdx = _findNearestCell(pmap._cells, pmap._cellsHash, ux, uy, uz);
+            if (cellIdx >= 0) {
+              const elev    = pmap._cells.elevations[cellIdx] || 0;
+              const seaLevel = (typeof (planetMesh.params || {}).seaLevel === "number") ? planetMesh.params.seaLevel : 0.5;
+              const hs       = (typeof (planetMesh.params || {}).heightScale === "number") ? planetMesh.params.heightScale : 0;
+              if (elev > seaLevel && hs > 0) {
+                macroElev = hs * (elev - seaLevel) / Math.max(1e-6, 1 - seaLevel);
+              }
+              if (pmap._cells.biome && pmap._cells.biome[cellIdx] !== undefined) {
+                patchBiomeId = pmap._cells.biome[cellIdx];
+              }
+            }
+          }
+        }
+      }
+      inst.drawScratch[41] = patchBiomeId;
+      // baseColor.w (slot 19) repurposed as macro elevation for the
+      // patch draw. The vertex shader adds this to the surface radial
+      // position so the patch lines up with the PlanetMesh's macro
+      // terrain instead of sitting at bare sea level under the camera.
+      inst.drawScratch[19] = macroElev;
     }
     // Phase 8 sprint 8-3b -- PlanetMesh texture layer resolution.
     // Slots [60..63] map to PerDraw.planetExtra.xyzw = (landLayer,
