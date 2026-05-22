@@ -53368,10 +53368,16 @@ fn sample_aerial_perspective_lut(camPos: vec3<f32>, fragPos: vec3<f32>) -> AtmRe
   let ndc = clip.xyz / clip.w;
   let uv = vec2<f32>((ndc.x + 1.0) * 0.5, (1.0 - ndc.y) * 0.5);
 
-  // Distance -> layer index. maxDist is atmThickness * 8 (matches the
-  // JS-side _renderAtmosphereLUTs pack).
+  // Distance -> layer index. maxDist matches the JS-side formula in
+  // _renderAtmosphereLUTs: max(atmThk * 8, horizonDist + atmThk * 4)
+  // where horizonDist is the visible-horizon distance from the camera.
   let atmThk = uS.envPlanetAtm.x - uS.envPlanet.w;
-  let maxDist = atmThk * 8.0;
+  let planetR = uS.envPlanet.w;
+  let radialVec = uS.eye.xyz - uS.envPlanet.xyz;
+  let radialDist = length(radialVec);
+  let altitude = max(0.0, radialDist - planetR);
+  let horizonDist = sqrt(altitude * (2.0 * planetR + altitude));
+  let maxDist = max(atmThk * 8.0, horizonDist + atmThk * 4.0);
   let layerF = 31.0 * sqrt(clamp(dist / max(maxDist, 1.0), 0.0, 1.0));
   let layerA = i32(clamp(floor(layerF), 0.0, 31.0));
   let layerB = min(layerA + 1, 31);
@@ -53676,20 +53682,25 @@ fn sample_skyview_lut(dir: vec3<f32>) -> vec3<f32> {
   let sinAz = dot(horizon, localEast);
   let azimuth = atan2(sinAz, cosAz);
 
+  // C.6 -- limb-aware v. v=0.5 is the planet's limb (matches the
+  // LUT-generation re-parameterization), with sqrt remap putting the
+  // bulk of the LUT v-resolution right at the limb regardless of
+  // altitude.
+  let planetR = uS.envPlanet.w;
+  let sinBeta  = clamp(planetR / max(radialLen, planetR + 1.0), 0.0, 1.0);
+  let limbElev = asin(sinBeta) - 1.5707963;
+
   let u = (azimuth + 3.14159265359) / 6.28318530718;
   var v: f32;
-  if (elevation >= 0.0) {
-    let t = sqrt(clamp(elevation / 1.5707963, 0.0, 1.0));
+  if (elevation > limbElev) {
+    let t = sqrt(clamp((elevation - limbElev) / max(1.5707963 - limbElev, 1e-4), 0.0, 1.0));
     v = 0.5 + t * 0.5;
   } else {
-    let t = sqrt(clamp(-elevation / 1.5707963, 0.0, 1.0));
+    let t = sqrt(clamp((limbElev - elevation) / max(limbElev + 1.5707963, 1e-4), 0.0, 1.0));
     v = 0.5 - t * 0.5;
   }
-  // 2026-05-22 fix: flip v -- LUT is written with v>=0.5 (above
-  // horizon / zenith) at NDC.y>=0 which lands at the TOP of the
-  // texture (UV.v=0). Without this flip the entire sky is mirrored
-  // across the horizon (atmosphere comes from below, space gap at
-  // 100km altitude).
+  // Flip v for NDC<->UV convention (LUT writes "v>=0.5 = above limb"
+  // at NDC.y>=0 which lands at the TOP of the texture, UV.v=0).
   return textureSampleLevel(atmSkyViewLUT, atmLutSampler, vec2<f32>(u, 1.0 - v), 0.0).rgb;
 }
 
@@ -55894,16 +55905,24 @@ fn fs_lut_skyview(in: VsLutOut) -> @location(0) vec4<f32> {
   let localNorth = normalize(northRef - dot(northRef, localUp) * localUp);
   let localEast  = cross(localUp, localNorth);
 
-  // Decode uv -> (az, el). v=0.5 is the horizon; v>0.5 is above with
-  // sqrt remap (more resolution near horizon).
+  // C.6 -- limb-aware v-axis. The "limb" is the angle (below horizon)
+  // where the planet's silhouette sits from the camera; for a surface
+  // observer it coincides with the horizon (limb=0), for orbit it
+  // approaches -π/2 (nadir). Putting v=0.5 at the limb keeps maximum
+  // resolution at the visible planet edge at every altitude, which
+  // fixes the every-50km pulsing the prior horizon-anchored mapping
+  // showed. Above the limb is sky, below is planet body.
+  let sinBeta  = clamp(planetR / max(radialLen, planetR + 1.0), 0.0, 1.0);
+  let limbElev = asin(sinBeta) - 1.5707963;  // in [-π/2, 0]
+
   let azimuth = in.uv.x * 6.28318530718 - 3.14159265359;
   var elevation: f32;
   if (in.uv.y >= 0.5) {
     let t = (in.uv.y - 0.5) * 2.0;
-    elevation = t * t * 1.5707963;
+    elevation = limbElev + (1.5707963 - limbElev) * t * t;
   } else {
     let t = (0.5 - in.uv.y) * 2.0;
-    elevation = -t * t * 1.5707963;
+    elevation = limbElev - (limbElev + 1.5707963) * t * t;
   }
   let cosEl = cos(elevation);
   let sinEl = sin(elevation);
@@ -56219,20 +56238,20 @@ function _ensureAtmosphereLUTs() {
     });
   }
   // C.5 -- aerial-perspective LUT. 2D-array texture (32 layers, each
-  // 64x64) so the surface shader can sample (clip_x, clip_y, depth)
+  // 128x128) so the surface shader can sample (clip_x, clip_y, depth)
   // with hardware bilinear filtering on x/y and manual lerp across
   // layers in WGSL. RGB = in-scatter, A = mono transmittance.
   // Per-layer views are kept for rendering one Z-slice per pass.
   //
-  // 2026-05-22 bump 32x32 -> 64x64: the prior resolution showed
-  // visible concentric "ripples" expanding outward as the camera
-  // descended (per-pixel content shifting faster than bilinear
-  // filtering could smooth). Doubling resolution shrinks the
-  // aliasing-pattern wavelength by 2x in screen space.
+  // 2026-05-22 bump 32x32 -> 64x64 -> 128x128: orbital descent showed
+  // concentric "ripples" expanding outward from screen center as the
+  // per-voxel integration result shifted faster than bilinear
+  // filtering between LUT cells could smooth. 4x more cells (per
+  // step) halves the aliasing wavelength in screen space.
   if (!Visual.atmAerialLUT) {
     Visual.atmAerialLUT = dev.createTexture({
-      label: "atm-aerial-lut-64x64x32",
-      size: [64, 64, 32],
+      label: "atm-aerial-lut-128x128x32",
+      size: [128, 128, 32],
       dimension: "2d",
       format: "rgba16float",
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
@@ -56516,12 +56535,22 @@ function _renderAtmosphereLUTs(enc, planetInfo, camera, sunDirOverride) {
   const camU     = (camera && camera.camUp)      ? camera.camUp      : [0, 1, 0, 1];
   const camF     = (camera && camera.camForward) ? camera.camForward : [0, 0, -1, 0];
 
-  // Aerial-perspective max distance: 8 atmosphere thicknesses, which
-  // covers nearly all aerial-perspective scenarios (surface up to mid
-  // orbital views). C.6 may make this altitude-aware so the LUT keeps
-  // resolution where it matters when the camera is in deep space.
+  // Aerial-perspective max distance. C.6 -- altitude-aware: covers
+  // the visible-horizon distance (sqrt(2*R*h + h²), the furthest
+  // surface point the camera can see) with a few atmospheric
+  // thicknesses of buffer. At surface, falls back to 8 atmThk
+  // (~800km on Earth). The mesh-side sample_aerial_perspective_lut
+  // recomputes the same formula from uS.eye + uS.envPlanet so the
+  // JS-side max_dist and shader-side max_dist always agree.
   const atmThk = atmTop - planetR;
-  const maxDist = atmThk * 8.0;
+  const cx = planetInfo.centerX || 0;
+  const cy = planetInfo.centerY || 0;
+  const cz = planetInfo.centerZ || 0;
+  const dx = eye[0] - cx, dy = eye[1] - cy, dz = eye[2] - cz;
+  const radialDist = Math.hypot(dx, dy, dz);
+  const altitude = Math.max(0, radialDist - planetR);
+  const horizonDist = Math.sqrt(altitude * (2 * planetR + altitude));
+  const maxDist = Math.max(atmThk * 8.0, horizonDist + atmThk * 4.0);
 
   const u = Visual.atmLutScratch;
   u[0] = planetInfo.centerX || 0;
