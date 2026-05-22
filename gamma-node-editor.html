@@ -58242,6 +58242,82 @@ const PLANET_BIOME_SHAPES = [
   "fbm", "ridged", "billowed", "dunes", "cracks"
 ];
 
+// Phase 8 sprint 8-5 -- thumbnail generation for the texture browser.
+// CPU port of the WGSL _biome_texture_style math; doesn't need to be
+// pixel-identical (it's a preview), just recognizable per style.
+function _planetBiomeStyleHash2D(x, y) {
+  const k = Math.sin(x * 127.1 + y * 311.7) * 43758.5453;
+  return k - Math.floor(k);
+}
+function _planetBiomeStyleNoise2D(x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const xf = x - xi, yf = y - yi;
+  const u = xf * xf * (3 - 2 * xf);
+  const v = yf * yf * (3 - 2 * yf);
+  const a = _planetBiomeStyleHash2D(xi,     yi);
+  const b = _planetBiomeStyleHash2D(xi + 1, yi);
+  const c = _planetBiomeStyleHash2D(xi,     yi + 1);
+  const d = _planetBiomeStyleHash2D(xi + 1, yi + 1);
+  return (a * (1 - u) + b * u) * (1 - v) + (c * (1 - u) + d * u) * v;
+}
+function _planetBiomeStyleThumbnail(styleId, size) {
+  const W = size || 56;
+  const canvas = document.createElement("canvas");
+  canvas.width = W; canvas.height = W;
+  const ctx = canvas.getContext("2d");
+  const img = ctx.createImageData(W, W);
+  for (let y = 0; y < W; y++) {
+    for (let x = 0; x < W; x++) {
+      const px = x / W * 6;
+      const py = y / W * 6;
+      const n  = _planetBiomeStyleNoise2D(px, py);
+      let r = 0.5, g = 0.5, b = 0.5;
+      if (styleId === 1) {
+        const ridged = 1 - Math.abs(n * 2 - 1);
+        const v = ridged * ridged * 0.7 + 0.3;
+        r = v;       g = v * 0.95;  b = v * 0.88;
+      } else if (styleId === 2) {
+        const nv = _planetBiomeStyleNoise2D(px * 0.5, py * 0.5);
+        const v = nv * 0.5 + 0.6;
+        r = v * 1.08; g = v * 0.96; b = v * 0.72;
+      } else if (styleId === 3) {
+        const nv = _planetBiomeStyleNoise2D(px * 1.5, py * 1.5);
+        const v = 0.45 + nv * 0.45;
+        r = v * 0.78; g = v * 1.04; b = v * 0.62;
+      } else if (styleId === 4) {
+        const nv = _planetBiomeStyleNoise2D(px * 3, py * 3);
+        const v = 0.85 + nv * 0.15;
+        r = v;        g = v;        b = v * 1.02;
+      } else if (styleId === 5) {
+        const ridged = 1 - Math.abs(n * 2 - 1);
+        const v = 0.55 + (1 - ridged * ridged) * 0.4;
+        r = v * 0.92; g = v * 1.02; b = v * 1.08;
+      } else if (styleId === 6) {
+        const nv = _planetBiomeStyleNoise2D(px * 0.8, py * 0.8);
+        const v = 0.45 + nv * 0.4;
+        r = v * 0.95; g = v * 0.78; b = v * 0.58;
+      } else {
+        r = g = b = 0.4;
+      }
+      const k = (y * W + x) * 4;
+      img.data[k    ] = Math.max(0, Math.min(255, Math.round(r * 255)));
+      img.data[k + 1] = Math.max(0, Math.min(255, Math.round(g * 255)));
+      img.data[k + 2] = Math.max(0, Math.min(255, Math.round(b * 255)));
+      img.data[k + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  return canvas.toDataURL();
+}
+const _planetBiomeStyleThumbCache = new Map();
+function _planetBiomeStyleGetThumbnail(styleId) {
+  const key = "s" + styleId;
+  if (!_planetBiomeStyleThumbCache.has(key)) {
+    _planetBiomeStyleThumbCache.set(key, _planetBiomeStyleThumbnail(styleId, 56));
+  }
+  return _planetBiomeStyleThumbCache.get(key);
+}
+
 // Azgaar's hex colors parsed to [r,g,b] floats. Order matches getId().
 const PLANET_BIOMES_COLORS = [
   [0.275, 0.431, 0.671],  // 0  Marine             #466eab
@@ -73360,80 +73436,191 @@ function openPlanetMapEditor(nodeId) {
     "into the cubemap; the planet picks up the change on the next chunk rebuild.";
   painterPanel.appendChild(helpRow);
 
-  // === Biomes tab content (Sprint 8-4) ===
-  // 13 biome rows. Each row: color swatch, name, sliders for the
-  // detail-noise params (amp/freq/roughness), a shape dropdown, and a
-  // texture-style dropdown. Edits are persisted on node.params.biomes[k]
-  // and picked up by the renderer next frame (the per-scene buffer
-  // pack reads PlanetMap.node.params.biomes).
+  // === Biomes tab content (Sprint 8-4 row layout, redesigned in 8-5 ===
+  // Sprint 8-5: replace the dense 13-row layout with a two-column
+  // "asset browser" pattern. Left column = biome list (one row per
+  // biome, selectable). Right column = the selected biome's params
+  // (amp / freq / roughness / shape) PLUS a thumbnail grid showing
+  // available procedural texture styles. Click a thumbnail to assign
+  // it to the current biome.
+
+  if (!Array.isArray(node.params.biomes)) node.params.biomes = [];
+
   const biomesHelp = document.createElement("div");
   biomesHelp.style.cssText =
     "font-family:var(--font-mono);font-size:10px;color:var(--text-3);" +
     "line-height:1.5;margin-bottom:10px;";
   biomesHelp.innerHTML =
-    "per-biome detail noise + procedural texture style. amp = max " +
-    "feature height (meters), freq = base wavelength (cycles/m at " +
-    "octave 0), shape = which non-linearity (ridged / billowed / dunes " +
-    "/ cracks), texture = built-in procedural overlay. wired " +
-    "PlanetMesh.landTexture overrides texture style when present.";
+    "left -- pick a biome. right -- tweak its detail noise + click a " +
+    "texture thumbnail to assign. all edits live-update the planet via " +
+    "uS.biomeParams. wired PlanetMesh.landTexture still overrides the " +
+    "per-biome texture style when present.";
   biomesPanel.appendChild(biomesHelp);
-  const biomesTable = document.createElement("div");
-  biomesTable.style.cssText =
-    "font-family:var(--font-mono);font-size:10px;color:var(--text-2);";
-  biomesPanel.appendChild(biomesTable);
 
-  // Ensure node.params.biomes is initialized as an array so edits
-  // have somewhere to land. We don't pre-populate with defaults --
-  // missing fields fall back to PLANET_BIOME_DETAIL_DEFAULTS in the
-  // renderer pack.
-  if (!Array.isArray(node.params.biomes)) node.params.biomes = [];
+  const browserWrap = document.createElement("div");
+  browserWrap.style.cssText = "display:flex;gap:12px;align-items:flex-start;";
+  biomesPanel.appendChild(browserWrap);
+  const biomeListCol = document.createElement("div");
+  biomeListCol.style.cssText =
+    "flex:0 0 200px;display:flex;flex-direction:column;gap:2px;" +
+    "max-height:520px;overflow:auto;padding-right:4px;" +
+    "scrollbar-width:thin;";
+  browserWrap.appendChild(biomeListCol);
+  const editorCol = document.createElement("div");
+  editorCol.style.cssText =
+    "flex:1;display:flex;flex-direction:column;gap:10px;min-width:0;";
+  browserWrap.appendChild(editorCol);
 
-  for (let bk = 0; bk < PLANET_BIOMES_NAMES.length; bk++) {
+  let selectedBiomeIdx = 1;  // start on Hot desert (Marine has no surface detail)
+
+  function _getBiomeFieldValue(bk, field, defIdx) {
+    const cur = node.params.biomes[bk] || {};
+    if (cur && typeof cur[field] === "number") return cur[field];
+    return PLANET_BIOME_DETAIL_DEFAULTS[bk][defIdx];
+  }
+  function _setBiomeField(bk, field, val) {
+    if (!Array.isArray(node.params.biomes)) node.params.biomes = [];
+    if (!node.params.biomes[bk]) node.params.biomes[bk] = {};
+    node.params.biomes[bk][field] = val;
+  }
+
+  function _renderBiomeList() {
+    biomeListCol.innerHTML = "";
+    for (let bk = 0; bk < PLANET_BIOMES_NAMES.length; bk++) {
+      const bName = PLANET_BIOMES_NAMES[bk];
+      const bCol  = PLANET_BIOMES_COLORS[bk];
+      const styleId = Number(_getBiomeFieldValue(bk, "textureStyleId", 7));
+      const isSelected = (bk === selectedBiomeIdx);
+      const row = document.createElement("button");
+      row.type = "button";
+      row.dataset.biome = bk;
+      row.style.cssText =
+        "display:flex;align-items:center;gap:8px;padding:6px 8px;" +
+        "background:" + (isSelected ? "rgba(120,255,180,0.10)" : "rgba(0,0,0,0.30)") + ";" +
+        "border:1px solid " + (isSelected ? "var(--phosphor)" : "var(--border)") + ";" +
+        "border-radius:3px;cursor:pointer;text-align:left;" +
+        "font-family:var(--font-mono);font-size:11px;" +
+        "color:" + (isSelected ? "var(--phosphor)" : "var(--text-2)") + ";";
+      const swatchRGB = "rgb(" + Math.round(bCol[0]*255) + "," +
+                                Math.round(bCol[1]*255) + "," +
+                                Math.round(bCol[2]*255) + ")";
+      const styleName = PLANET_BIOME_TEX_STYLES[styleId] || "?";
+      row.innerHTML =
+        '<span style="background:' + swatchRGB + ';width:12px;height:12px;border:1px solid rgba(255,255,255,0.25);border-radius:2px;flex:0 0 auto;"></span>' +
+        '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + bName + '</span>' +
+        '<span style="flex:0 0 auto;font-size:9px;color:var(--text-3);">' + styleName + '</span>';
+      row.addEventListener("click", function() {
+        selectedBiomeIdx = bk;
+        _renderBiomeList();
+        _renderEditorColumn();
+      });
+      biomeListCol.appendChild(row);
+    }
+  }
+
+  function _renderEditorColumn() {
+    const bk = selectedBiomeIdx;
     const bName = PLANET_BIOMES_NAMES[bk];
     const bCol  = PLANET_BIOMES_COLORS[bk];
     const def   = PLANET_BIOME_DETAIL_DEFAULTS[bk];
-    const cur   = node.params.biomes[bk] || {};
-    const get = function(field, defIdx) {
-      return (cur && typeof cur[field] === "number") ? cur[field] : def[defIdx];
-    };
-    const row = document.createElement("div");
-    row.style.cssText =
-      "display:flex;align-items:center;gap:8px;padding:5px 4px;" +
-      "border-bottom:1px solid rgba(255,255,255,0.06);";
+
+    editorCol.innerHTML = "";
+
+    // Header
+    const head = document.createElement("div");
+    head.style.cssText =
+      "display:flex;align-items:center;gap:10px;padding-bottom:6px;" +
+      "border-bottom:1px solid var(--border);";
     const swatchRGB = "rgb(" + Math.round(bCol[0]*255) + "," +
                               Math.round(bCol[1]*255) + "," +
                               Math.round(bCol[2]*255) + ")";
-    const shapeOptions = PLANET_BIOME_SHAPES.map((s, i) =>
-      '<option value="' + i + '"' + (Number(get('shape', 4)) === i ? ' selected' : '') + '>' + s + '</option>'
-    ).join("");
-    const texOptions = PLANET_BIOME_TEX_STYLES.map((s, i) =>
-      '<option value="' + i + '"' + (Number(get('textureStyleId', 7)) === i ? ' selected' : '') + '>' + s + '</option>'
-    ).join("");
-    row.innerHTML =
-      '<span style="background:' + swatchRGB + ';width:14px;height:14px;border:1px solid rgba(255,255,255,0.2);border-radius:2px;flex:0 0 auto;"></span>' +
-      '<span style="flex:0 0 160px;color:var(--text-2);">' + bName + '</span>' +
-      '<label style="flex:0 0 auto;">amp&nbsp;<input type="number" data-biome="' + bk + '" data-field="amp" step="0.1" min="0" value="' + get('amp', 0) + '" style="width:48px;background:rgba(0,0,0,0.4);color:var(--phosphor);border:1px solid var(--border);padding:2px 4px;font-family:inherit;font-size:10px"></label>' +
-      '<label style="flex:0 0 auto;">freq&nbsp;<input type="number" data-biome="' + bk + '" data-field="freq" step="0.0001" min="0" value="' + get('freq', 1) + '" style="width:74px;background:rgba(0,0,0,0.4);color:var(--phosphor);border:1px solid var(--border);padding:2px 4px;font-family:inherit;font-size:10px"></label>' +
-      '<label style="flex:0 0 auto;">rough&nbsp;<input type="number" data-biome="' + bk + '" data-field="roughness" step="0.05" min="0" max="1" value="' + get('roughness', 2) + '" style="width:48px;background:rgba(0,0,0,0.4);color:var(--phosphor);border:1px solid var(--border);padding:2px 4px;font-family:inherit;font-size:10px"></label>' +
-      '<label style="flex:0 0 auto;">shape&nbsp;<select data-biome="' + bk + '" data-field="shape" style="background:rgba(0,0,0,0.4);color:var(--phosphor);border:1px solid var(--border);padding:2px 4px;font-family:inherit;font-size:10px">' + shapeOptions + '</select></label>' +
-      '<label style="flex:0 0 auto;">texture&nbsp;<select data-biome="' + bk + '" data-field="textureStyleId" style="background:rgba(0,0,0,0.4);color:var(--phosphor);border:1px solid var(--border);padding:2px 4px;font-family:inherit;font-size:10px">' + texOptions + '</select></label>';
-    biomesTable.appendChild(row);
+    head.innerHTML =
+      '<span style="background:' + swatchRGB + ';width:18px;height:18px;border:1px solid rgba(255,255,255,0.3);border-radius:2px;"></span>' +
+      '<span style="font-family:var(--font-instr);font-size:13px;color:var(--phosphor);letter-spacing:0.10em;">' + bName + '</span>';
+    editorCol.appendChild(head);
+
+    // Detail-noise params section
+    const paramsSec = document.createElement("div");
+    paramsSec.style.cssText =
+      "display:flex;flex-wrap:wrap;gap:10px;align-items:center;" +
+      "font-family:var(--font-mono);font-size:10px;color:var(--text-2);";
+    const get  = function(field, defIdx) { return _getBiomeFieldValue(bk, field, defIdx); };
+    const shapeOpts = PLANET_BIOME_SHAPES.map(function(s, i) {
+      return '<option value="' + i + '"' + (Number(get("shape", 4)) === i ? " selected" : "") + '>' + s + '</option>';
+    }).join("");
+    paramsSec.innerHTML =
+      '<label>amp <input type="number" data-field="amp" step="0.1" min="0" value="' + get("amp", 0) + '" style="width:54px;background:rgba(0,0,0,0.4);color:var(--phosphor);border:1px solid var(--border);padding:2px 4px;font-family:inherit;font-size:10px"></label>' +
+      '<label>freq <input type="number" data-field="freq" step="0.0001" min="0" value="' + get("freq", 1) + '" style="width:78px;background:rgba(0,0,0,0.4);color:var(--phosphor);border:1px solid var(--border);padding:2px 4px;font-family:inherit;font-size:10px"></label>' +
+      '<label>rough <input type="number" data-field="roughness" step="0.05" min="0" max="1" value="' + get("roughness", 2) + '" style="width:54px;background:rgba(0,0,0,0.4);color:var(--phosphor);border:1px solid var(--border);padding:2px 4px;font-family:inherit;font-size:10px"></label>' +
+      '<label>shape <select data-field="shape" style="background:rgba(0,0,0,0.4);color:var(--phosphor);border:1px solid var(--border);padding:2px 4px;font-family:inherit;font-size:10px">' + shapeOpts + '</select></label>' +
+      '<button class="btn" type="button" data-field="reset" style="padding:3px 10px;">reset to default</button>';
+    paramsSec.addEventListener("input",  function(ev) {
+      const t = ev.target;
+      if (!t.dataset.field || t.dataset.field === "reset") return;
+      const val = parseFloat(t.value);
+      if (!Number.isFinite(val)) return;
+      _setBiomeField(bk, t.dataset.field, val);
+    });
+    paramsSec.addEventListener("change", function(ev) {
+      const t = ev.target;
+      if (!t.dataset.field || t.dataset.field === "reset") return;
+      const val = parseFloat(t.value);
+      if (!Number.isFinite(val)) return;
+      _setBiomeField(bk, t.dataset.field, val);
+    });
+    paramsSec.addEventListener("click", function(ev) {
+      const t = ev.target.closest("[data-field='reset']");
+      if (!t) return;
+      if (Array.isArray(node.params.biomes)) node.params.biomes[bk] = {};
+      _renderEditorColumn();
+      _renderBiomeList();
+    });
+    editorCol.appendChild(paramsSec);
+
+    // Texture browser
+    const texHead = document.createElement("div");
+    texHead.style.cssText =
+      "font-family:var(--font-mono);font-size:10px;color:var(--text-3);" +
+      "letter-spacing:0.10em;margin-top:4px;";
+    texHead.textContent = "TEXTURE";
+    editorCol.appendChild(texHead);
+
+    const texGrid = document.createElement("div");
+    texGrid.style.cssText =
+      "display:grid;grid-template-columns:repeat(auto-fill,minmax(70px,1fr));" +
+      "gap:6px;max-height:300px;overflow:auto;padding:4px;" +
+      "border:1px solid var(--border);background:rgba(0,0,0,0.30);";
+    const currentStyleId = Number(get("textureStyleId", 7));
+    for (let sk = 0; sk < PLANET_BIOME_TEX_STYLES.length; sk++) {
+      const isCurrent = (sk === currentStyleId);
+      const tile = document.createElement("button");
+      tile.type = "button";
+      tile.dataset.style = sk;
+      tile.style.cssText =
+        "display:flex;flex-direction:column;align-items:center;" +
+        "gap:3px;padding:4px;cursor:pointer;" +
+        "background:" + (isCurrent ? "rgba(120,255,180,0.15)" : "rgba(0,0,0,0.2)") + ";" +
+        "border:1px solid " + (isCurrent ? "var(--phosphor)" : "var(--border)") + ";" +
+        "border-radius:3px;font-family:var(--font-mono);font-size:10px;" +
+        "color:" + (isCurrent ? "var(--phosphor)" : "var(--text-2)") + ";";
+      const thumbStr = (sk === 0) ? null : _planetBiomeStyleGetThumbnail(sk);
+      const thumbInner = thumbStr
+        ? '<img src="' + thumbStr + '" width="56" height="56" style="display:block;image-rendering:pixelated;border:1px solid rgba(255,255,255,0.1);">'
+        : '<div style="width:56px;height:56px;background:repeating-linear-gradient(45deg, rgba(255,255,255,0.05), rgba(255,255,255,0.05) 5px, rgba(255,255,255,0.10) 5px, rgba(255,255,255,0.10) 10px);border:1px solid rgba(255,255,255,0.1);display:flex;align-items:center;justify-content:center;color:var(--text-3);font-size:10px;">none</div>';
+      tile.innerHTML = thumbInner +
+        '<span>' + PLANET_BIOME_TEX_STYLES[sk] + '</span>';
+      tile.addEventListener("click", function() {
+        _setBiomeField(bk, "textureStyleId", sk);
+        _renderEditorColumn();
+        _renderBiomeList();
+      });
+      texGrid.appendChild(tile);
+    }
+    editorCol.appendChild(texGrid);
   }
 
-  function _onBiomeFieldChange(ev) {
-    const tg = ev.target;
-    const bk = tg && tg.dataset && tg.dataset.biome;
-    if (bk === undefined || bk === null) return;
-    const idx = parseInt(bk, 10);
-    if (!Array.isArray(node.params.biomes)) node.params.biomes = [];
-    if (!node.params.biomes[idx]) node.params.biomes[idx] = {};
-    const field = tg.dataset.field;
-    const val = parseFloat(tg.value);
-    if (!Number.isFinite(val)) return;
-    node.params.biomes[idx][field] = val;
-  }
-  biomesTable.addEventListener("input",  _onBiomeFieldChange);
-  biomesTable.addEventListener("change", _onBiomeFieldChange);
+  _renderBiomeList();
+  _renderEditorColumn();
 
   // Locked continent target (shift-click on the map). When set, the
   // next re-roll places the template's first cap here.
