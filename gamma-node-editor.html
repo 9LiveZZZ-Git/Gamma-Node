@@ -47403,46 +47403,31 @@ function _planetMeshSurfacePos(wx, wy, wz, pl) {
   let alt = 0, biomeId = -1, cellIdx = -1;
   const pmap = pl.mapNode;
   if (pmap && pmap._cells && pmap._cellsHash) {
+    // Sprint 10-1d: sample the SAME cubemap the chunk builder
+    // samples (instead of nearest-cell raw elevation). Now the
+    // collision surface tracks the rendered macro elevation
+    // exactly -- no more "camera walks on a smoother floor than
+    // the visible mesh" or vice-versa. Biome ID still comes from
+    // nearest-cell (categorical, no point blending).
     cellIdx = _findNearestCell(pmap._cells, pmap._cellsHash, ux, uy, uz);
-    if (cellIdx >= 0) {
-      const e = pmap._cells.elevations[cellIdx];
-      if (e > pl.seaLevel && pl.heightScale > 0) {
-        alt = pl.heightScale * (e - pl.seaLevel) / Math.max(1e-6, 1 - pl.seaLevel);
-      }
-      if (pmap._cells.biome) biomeId = pmap._cells.biome[cellIdx];
+    if (cellIdx >= 0 && pmap._cells.biome) biomeId = pmap._cells.biome[cellIdx];
+    const cubemap = (typeof _ensurePlanetMapCubemap === "function") ? _ensurePlanetMapCubemap(pmap) : null;
+    const e = cubemap
+      ? _samplePlanetMapCubemap(cubemap, ux, uy, uz)
+      : ((cellIdx >= 0) ? pmap._cells.elevations[cellIdx] : 0);
+    if (e > pl.seaLevel && pl.heightScale > 0) {
+      alt = pl.heightScale * (e - pl.seaLevel) / Math.max(1e-6, 1 - pl.seaLevel);
     }
   }
   // Cell-base vertex position (matches _buildPlanetMesh).
   const baseX = cx + ux * (R + alt);
   const baseY = cy + uy * (R * pr + alt);
   const baseZ = cz + uz * (R + alt);
-  // Sprint 8-8c: add the per-vertex displacement vs_main applies.
-  // Shader: localPos += radialDir * (detail_noise_height * dispScale),
-  // where radialDir is normalize(vertex - center) (WORLD radial, not
-  // unit-sphere). Mirror that exactly so callers see the rendered
-  // surface.
-  let totalDisp = 0;
-  if (biomeId >= 0 && pl.dispScale > 0) {
-    const bX = baseX - cx, bY = baseY - cy, bZ = baseZ - cz;
-    const bLen = Math.hypot(bX, bY, bZ) || 1;
-    const rdX = bX / bLen, rdY = bY / bLen, rdZ = bZ / bLen;
-    const biomeOverride = (pmap && pmap._biomeParams) || null;
-    // Sprint 9-6: 10 octaves matches the Nyquist octave count at
-    // the deepest LOD (maxDepth=16-20 chunks). Without this the
-    // collision surface sits ~30 m below the rendered chunks --
-    // camera walks on a smoother floor while bumps poke through
-    // around it.
-    const dispH = _planetDetailNoiseHeight(baseX, baseY, baseZ, biomeId, biomeOverride, 10);
-    totalDisp = dispH * pl.dispScale;
-    return {
-      x: baseX + rdX * totalDisp,
-      y: baseY + rdY * totalDisp,
-      z: baseZ + rdZ * totalDisp,
-      altitude: alt + totalDisp,
-      biomeId: biomeId,
-      cellIdx: cellIdx
-    };
-  }
+  // Sprint 10-1d: per-vertex detail-noise displacement removed
+  // along with the rendering-path noise. Collision now tracks the
+  // cubemap-baked macro elevation exactly. When 10-4 brings noise
+  // back as gated amplification, this helper will need a matching
+  // amplification path so collision and rendering stay in sync.
   return {
     x: baseX,
     y: baseY,
@@ -62051,6 +62036,20 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
       // ~5x faster per vertex. Sets up 10-2 (hydraulic erosion
       // runs on this same cubemap) and 10-3 (continuous climate
       // fields are derived from the eroded cubemap).
+      // Sprint 10-1d: per-vertex detail-noise displacement REMOVED.
+      // Was producing the uniformly-speckled noise pattern visible
+      // at both orbit + ground in playtest. The full Phase 10 plan
+      // puts noise BACK in 10-4 as amplification gated by slope +
+      // drainage from 10-2's hydraulic erosion, not as unconditional
+      // displacement on top of macro. Until then the chunk altitude
+      // is JUST the cubemap-baked macro elevation (10-1a/b output
+      // with ridge enhancement), and the surface reads as flat-
+      // shaded sphere with macro continents and ridge mountains.
+      // That's the correct intermediate state -- erosion (10-2)
+      // carves rivers into this, climate (10-3) drives biome color,
+      // and amplification (10-4) adds detail noise back ONLY where
+      // it makes physical sense (mountain flanks, dunes, river
+      // banks).
       const cellIdx = _findNearestCell(cells, pmap._cellsHash, ux, uy, uz);
       const elev = _planetCubemap
         ? _samplePlanetMapCubemap(_planetCubemap, ux, uy, uz)
@@ -62059,21 +62058,6 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
       if (elev > seaLevel && hs !== 0) {
         altitude = hs * (elev - seaLevel) / Math.max(1e-6, 1 - seaLevel);
       }
-      const biomeRow = (pmap && pmap._biomeParams && pmap._biomeParams[cellIdx >= 0 && cells.biome ? cells.biome[cellIdx] : 0])
-                     || PLANET_BIOME_DETAIL_DEFAULTS[cellIdx >= 0 && cells.biome ? cells.biome[cellIdx] : 0]
-                     || PLANET_BIOME_DETAIL_DEFAULTS[4];
-      const _f0 = biomeRow[1] || 0.001;
-      const _dxLeaf = chunkEdgeM / Math.max(1, segs);
-      const _nyqOct = Math.max(1, Math.min(10, Math.log2(1 / Math.max(1e-9, 2 * _f0 * _dxLeaf))));
-      let _detailH = 0;
-      if (elev > seaLevel && hs !== 0) {
-        const _bid = cellIdx >= 0 && cells.biome ? cells.biome[cellIdx] : 0;
-        const _biomeOverride = (pmap && pmap._biomeParams) || null;
-        // World-space coords for noise sampling + per-chunk offset
-        // for anti-recurrence (sprint 9-6).
-        _detailH = _planetDetailNoiseHeight(cxC + r * ux, cyC + r * uy * polRatio, czC + r * uz, _bid, _biomeOverride, _nyqOct, _chunkOffset);
-      }
-      altitude += _detailH;
       // Sprint 9-3: VBO holds vertices RELATIVE to the planet's
       // center (anchorF64). The per-frame mv_rtc model matrix
       // re-adds the anchor in f64-composed view space so the GPU
@@ -62110,19 +62094,12 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
         blendG = blendG * (1 + tintG);
         blendB = blendB * (1 + tintB);
       }
-      // Sprint 9-6: color breakup noise. Low-frequency value noise
-      // (~200m wavelength) modulates the base color by ±12%. Kills
-      // "uniform green" within a biome -- the color subtly varies
-      // like real terrain (lichens, dust, sun-bleached patches).
-      const _cbN = _planetValueNoise3D(
-        (cxC + r * ux) * 0.005 + _chunkOffset[0] * 0.1,
-        (cyC + r * uy * polRatio) * 0.005 + _chunkOffset[1] * 0.1,
-        (czC + r * uz) * 0.005 + _chunkOffset[2] * 0.1
-      );
-      const _cbMod = 1 + (_cbN * 2 - 1) * 0.12;
-      blendR = Math.max(0, Math.min(1.5, blendR * _cbMod));
-      blendG = Math.max(0, Math.min(1.5, blendG * _cbMod));
-      blendB = Math.max(0, Math.min(1.5, blendB * _cbMod));
+      // Sprint 10-1d: color breakup noise REMOVED along with the
+      // noise terrain displacement. Per-cell hash tint above gives
+      // enough adjacent-cell variation without overlaying value
+      // noise. Phase 10 climate field (10-3) is the proper way to
+      // get smooth color variation -- temperature + moisture +
+      // slope drive color directly, not random noise modulation.
       const baseCol = [blendR, blendG, blendB];
       const biomeId = (cellIdx >= 0) ? biomeForCell(cellIdx, elev) : 0;
       // Smooth oblate-spheroid radial; used as a fallback for
@@ -75381,35 +75358,18 @@ function openPlanetMapEditor(nodeId) {
   document.body.appendChild(back);
   const body = modal.querySelector("#pmap-body");
 
-  // Sprint 8-4 -- tab system. The existing painter UI (canvas + brush
-  // controls + help) lives in #pmap-tab-painter. A new #pmap-tab-biomes
-  // panel exposes per-biome detail-noise + texture-style controls
-  // editable at runtime via uS.biomeParams.
-  const tabBar = document.createElement("div");
-  tabBar.style.cssText =
-    "display:flex;gap:6px;border-bottom:1px solid var(--border);" +
-    "margin-bottom:10px;padding-bottom:6px;";
-  tabBar.innerHTML =
-    '<button class="btn" id="pmap-tabbtn-painter" type="button" data-tab="painter" style="padding:4px 14px;border-color:var(--phosphor)">painter</button>' +
-    '<button class="btn" id="pmap-tabbtn-biomes"  type="button" data-tab="biomes"  style="padding:4px 14px;">biomes</button>';
-  body.appendChild(tabBar);
+  // Sprint 10-1d: tab system removed. Sprint 8-4's biomes-tab
+  // exposed the per-biome detail-noise editor (amp / freq / shape
+  // / texture style), but Phase 10 retires per-vertex detail noise
+  // entirely -- terrain comes from the cubemap-baked tectonic
+  // heightmap + hydraulic erosion + climate-derived biome color,
+  // not from per-biome procedural noise. The biome editor served
+  // an architecture we're moving past, so the whole tab is gone.
+  // The painter (canvas + brush + help) is now the modal's only
+  // content, appended directly to body.
   const painterPanel = document.createElement("div");
   painterPanel.id = "pmap-tab-painter";
   body.appendChild(painterPanel);
-  const biomesPanel = document.createElement("div");
-  biomesPanel.id = "pmap-tab-biomes";
-  biomesPanel.style.display = "none";
-  body.appendChild(biomesPanel);
-  tabBar.addEventListener("click", function(ev) {
-    const btn = ev.target.closest("button[data-tab]");
-    if (!btn) return;
-    const which = btn.dataset.tab;
-    painterPanel.style.display = (which === "painter") ? "block" : "none";
-    biomesPanel.style.display  = (which === "biomes")  ? "block" : "none";
-    tabBar.querySelectorAll("button[data-tab]").forEach(b => {
-      b.style.borderColor = (b === btn) ? "var(--phosphor)" : "";
-    });
-  });
 
   // Canvas (equirect view of the planet's elevation, cells flat-shaded).
   // Wrapped in a scroll container so it can be zoomed via CSS transform.
@@ -75472,191 +75432,13 @@ function openPlanetMapEditor(nodeId) {
     "into the cubemap; the planet picks up the change on the next chunk rebuild.";
   painterPanel.appendChild(helpRow);
 
-  // === Biomes tab content (Sprint 8-4 row layout, redesigned in 8-5 ===
-  // Sprint 8-5: replace the dense 13-row layout with a two-column
-  // "asset browser" pattern. Left column = biome list (one row per
-  // biome, selectable). Right column = the selected biome's params
-  // (amp / freq / roughness / shape) PLUS a thumbnail grid showing
-  // available procedural texture styles. Click a thumbnail to assign
-  // it to the current biome.
-
-  if (!Array.isArray(node.params.biomes)) node.params.biomes = [];
-
-  const biomesHelp = document.createElement("div");
-  biomesHelp.style.cssText =
-    "font-family:var(--font-mono);font-size:10px;color:var(--text-3);" +
-    "line-height:1.5;margin-bottom:10px;";
-  biomesHelp.innerHTML =
-    "left -- pick a biome. right -- tweak its detail noise + click a " +
-    "texture thumbnail to assign. all edits live-update the planet via " +
-    "uS.biomeParams. wired PlanetMesh.landTexture still overrides the " +
-    "per-biome texture style when present.";
-  biomesPanel.appendChild(biomesHelp);
-
-  const browserWrap = document.createElement("div");
-  browserWrap.style.cssText = "display:flex;gap:12px;align-items:flex-start;";
-  biomesPanel.appendChild(browserWrap);
-  const biomeListCol = document.createElement("div");
-  biomeListCol.style.cssText =
-    "flex:0 0 200px;display:flex;flex-direction:column;gap:2px;" +
-    "max-height:520px;overflow:auto;padding-right:4px;" +
-    "scrollbar-width:thin;";
-  browserWrap.appendChild(biomeListCol);
-  const editorCol = document.createElement("div");
-  editorCol.style.cssText =
-    "flex:1;display:flex;flex-direction:column;gap:10px;min-width:0;";
-  browserWrap.appendChild(editorCol);
-
-  let selectedBiomeIdx = 1;  // start on Hot desert (Marine has no surface detail)
-
-  function _getBiomeFieldValue(bk, field, defIdx) {
-    const cur = node.params.biomes[bk] || {};
-    if (cur && typeof cur[field] === "number") return cur[field];
-    return PLANET_BIOME_DETAIL_DEFAULTS[bk][defIdx];
-  }
-  function _setBiomeField(bk, field, val) {
-    if (!Array.isArray(node.params.biomes)) node.params.biomes = [];
-    if (!node.params.biomes[bk]) node.params.biomes[bk] = {};
-    node.params.biomes[bk][field] = val;
-  }
-
-  function _renderBiomeList() {
-    biomeListCol.innerHTML = "";
-    for (let bk = 0; bk < PLANET_BIOMES_NAMES.length; bk++) {
-      const bName = PLANET_BIOMES_NAMES[bk];
-      const bCol  = PLANET_BIOMES_COLORS[bk];
-      const styleId = Number(_getBiomeFieldValue(bk, "textureStyleId", 7));
-      const isSelected = (bk === selectedBiomeIdx);
-      const row = document.createElement("button");
-      row.type = "button";
-      row.dataset.biome = bk;
-      row.style.cssText =
-        "display:flex;align-items:center;gap:8px;padding:6px 8px;" +
-        "background:" + (isSelected ? "rgba(120,255,180,0.10)" : "rgba(0,0,0,0.30)") + ";" +
-        "border:1px solid " + (isSelected ? "var(--phosphor)" : "var(--border)") + ";" +
-        "border-radius:3px;cursor:pointer;text-align:left;" +
-        "font-family:var(--font-mono);font-size:11px;" +
-        "color:" + (isSelected ? "var(--phosphor)" : "var(--text-2)") + ";";
-      const swatchRGB = "rgb(" + Math.round(bCol[0]*255) + "," +
-                                Math.round(bCol[1]*255) + "," +
-                                Math.round(bCol[2]*255) + ")";
-      const styleName = PLANET_BIOME_TEX_STYLES[styleId] || "?";
-      row.innerHTML =
-        '<span style="background:' + swatchRGB + ';width:12px;height:12px;border:1px solid rgba(255,255,255,0.25);border-radius:2px;flex:0 0 auto;"></span>' +
-        '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + bName + '</span>' +
-        '<span style="flex:0 0 auto;font-size:9px;color:var(--text-3);">' + styleName + '</span>';
-      row.addEventListener("click", function() {
-        selectedBiomeIdx = bk;
-        _renderBiomeList();
-        _renderEditorColumn();
-      });
-      biomeListCol.appendChild(row);
-    }
-  }
-
-  function _renderEditorColumn() {
-    const bk = selectedBiomeIdx;
-    const bName = PLANET_BIOMES_NAMES[bk];
-    const bCol  = PLANET_BIOMES_COLORS[bk];
-    const def   = PLANET_BIOME_DETAIL_DEFAULTS[bk];
-
-    editorCol.innerHTML = "";
-
-    // Header
-    const head = document.createElement("div");
-    head.style.cssText =
-      "display:flex;align-items:center;gap:10px;padding-bottom:6px;" +
-      "border-bottom:1px solid var(--border);";
-    const swatchRGB = "rgb(" + Math.round(bCol[0]*255) + "," +
-                              Math.round(bCol[1]*255) + "," +
-                              Math.round(bCol[2]*255) + ")";
-    head.innerHTML =
-      '<span style="background:' + swatchRGB + ';width:18px;height:18px;border:1px solid rgba(255,255,255,0.3);border-radius:2px;"></span>' +
-      '<span style="font-family:var(--font-instr);font-size:13px;color:var(--phosphor);letter-spacing:0.10em;">' + bName + '</span>';
-    editorCol.appendChild(head);
-
-    // Detail-noise params section
-    const paramsSec = document.createElement("div");
-    paramsSec.style.cssText =
-      "display:flex;flex-wrap:wrap;gap:10px;align-items:center;" +
-      "font-family:var(--font-mono);font-size:10px;color:var(--text-2);";
-    const get  = function(field, defIdx) { return _getBiomeFieldValue(bk, field, defIdx); };
-    const shapeOpts = PLANET_BIOME_SHAPES.map(function(s, i) {
-      return '<option value="' + i + '"' + (Number(get("shape", 4)) === i ? " selected" : "") + '>' + s + '</option>';
-    }).join("");
-    paramsSec.innerHTML =
-      '<label>amp <input type="number" data-field="amp" step="0.1" min="0" value="' + get("amp", 0) + '" style="width:54px;background:rgba(0,0,0,0.4);color:var(--phosphor);border:1px solid var(--border);padding:2px 4px;font-family:inherit;font-size:10px"></label>' +
-      '<label>freq <input type="number" data-field="freq" step="0.0001" min="0" value="' + get("freq", 1) + '" style="width:78px;background:rgba(0,0,0,0.4);color:var(--phosphor);border:1px solid var(--border);padding:2px 4px;font-family:inherit;font-size:10px"></label>' +
-      '<label>rough <input type="number" data-field="roughness" step="0.05" min="0" max="1" value="' + get("roughness", 2) + '" style="width:54px;background:rgba(0,0,0,0.4);color:var(--phosphor);border:1px solid var(--border);padding:2px 4px;font-family:inherit;font-size:10px"></label>' +
-      '<label>shape <select data-field="shape" style="background:rgba(0,0,0,0.4);color:var(--phosphor);border:1px solid var(--border);padding:2px 4px;font-family:inherit;font-size:10px">' + shapeOpts + '</select></label>' +
-      '<button class="btn" type="button" data-field="reset" style="padding:3px 10px;">reset to default</button>';
-    paramsSec.addEventListener("input",  function(ev) {
-      const t = ev.target;
-      if (!t.dataset.field || t.dataset.field === "reset") return;
-      const val = parseFloat(t.value);
-      if (!Number.isFinite(val)) return;
-      _setBiomeField(bk, t.dataset.field, val);
-    });
-    paramsSec.addEventListener("change", function(ev) {
-      const t = ev.target;
-      if (!t.dataset.field || t.dataset.field === "reset") return;
-      const val = parseFloat(t.value);
-      if (!Number.isFinite(val)) return;
-      _setBiomeField(bk, t.dataset.field, val);
-    });
-    paramsSec.addEventListener("click", function(ev) {
-      const t = ev.target.closest("[data-field='reset']");
-      if (!t) return;
-      if (Array.isArray(node.params.biomes)) node.params.biomes[bk] = {};
-      _renderEditorColumn();
-      _renderBiomeList();
-    });
-    editorCol.appendChild(paramsSec);
-
-    // Texture browser
-    const texHead = document.createElement("div");
-    texHead.style.cssText =
-      "font-family:var(--font-mono);font-size:10px;color:var(--text-3);" +
-      "letter-spacing:0.10em;margin-top:4px;";
-    texHead.textContent = "TEXTURE";
-    editorCol.appendChild(texHead);
-
-    const texGrid = document.createElement("div");
-    texGrid.style.cssText =
-      "display:grid;grid-template-columns:repeat(auto-fill,minmax(70px,1fr));" +
-      "gap:6px;max-height:300px;overflow:auto;padding:4px;" +
-      "border:1px solid var(--border);background:rgba(0,0,0,0.30);";
-    const currentStyleId = Number(get("textureStyleId", 7));
-    for (let sk = 0; sk < PLANET_BIOME_TEX_STYLES.length; sk++) {
-      const isCurrent = (sk === currentStyleId);
-      const tile = document.createElement("button");
-      tile.type = "button";
-      tile.dataset.style = sk;
-      tile.style.cssText =
-        "display:flex;flex-direction:column;align-items:center;" +
-        "gap:3px;padding:4px;cursor:pointer;" +
-        "background:" + (isCurrent ? "rgba(120,255,180,0.15)" : "rgba(0,0,0,0.2)") + ";" +
-        "border:1px solid " + (isCurrent ? "var(--phosphor)" : "var(--border)") + ";" +
-        "border-radius:3px;font-family:var(--font-mono);font-size:10px;" +
-        "color:" + (isCurrent ? "var(--phosphor)" : "var(--text-2)") + ";";
-      const thumbStr = (sk === 0) ? null : _planetBiomeStyleGetThumbnail(sk);
-      const thumbInner = thumbStr
-        ? '<img src="' + thumbStr + '" width="56" height="56" style="display:block;image-rendering:pixelated;border:1px solid rgba(255,255,255,0.1);">'
-        : '<div style="width:56px;height:56px;background:repeating-linear-gradient(45deg, rgba(255,255,255,0.05), rgba(255,255,255,0.05) 5px, rgba(255,255,255,0.10) 5px, rgba(255,255,255,0.10) 10px);border:1px solid rgba(255,255,255,0.1);display:flex;align-items:center;justify-content:center;color:var(--text-3);font-size:10px;">none</div>';
-      tile.innerHTML = thumbInner +
-        '<span>' + PLANET_BIOME_TEX_STYLES[sk] + '</span>';
-      tile.addEventListener("click", function() {
-        _setBiomeField(bk, "textureStyleId", sk);
-        _renderEditorColumn();
-        _renderBiomeList();
-      });
-      texGrid.appendChild(tile);
-    }
-    editorCol.appendChild(texGrid);
-  }
-
-  _renderBiomeList();
-  _renderEditorColumn();
+  // Sprint 10-1d: Biomes tab content (per-biome detail noise editor
+  // + texture browser) removed. Phase 10 doesn't run per-vertex
+  // detail noise -- terrain comes from cubemap + hydraulic erosion
+  // (10-2) + continuous climate (10-3), and biome color is derived
+  // per-fragment from temperature+moisture+slope (10-4). The per-
+  // biome amp/freq/shape sliders + texture-style picker were
+  // editing parameters that the renderer no longer consumes.
 
   // Locked continent target (shift-click on the map). When set, the
   // next re-roll places the template's first cap here.
