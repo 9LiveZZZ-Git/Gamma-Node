@@ -53043,6 +53043,13 @@ struct PerScene {
   // JS packs from PlanetMap.node.params.biomes[] each frame; defaults
   // mirror what the previous WGSL const BIOME_DETAIL_PARAMS held.
   biomeParams: array<vec4<f32>, 26>,
+  // Sprint 9-3 -- projection-only matrix (no view). Paired with a
+  // per-draw mv_rtc (view * translate(anchorF64) composed in f64)
+  // for vs_planet_cdlod, so the catastrophic (anchor - camera)
+  // subtraction happens in f64 on CPU before the f32 GPU upload.
+  // Other variants still use uS.viewProj + uD.model with absolute
+  // world vertices -- behavior unchanged for them.
+  proj: mat4x4<f32>,
 };
 
 // Sprint 7.5.4.e -- ACES filmic tonemap. Maps HDR (values > 1) into
@@ -54670,26 +54677,41 @@ struct VsInCDLOD {
 @vertex
 fn vs_planet_cdlod(in: VsInCDLOD) -> VsOut {
   var out: VsOut;
-  let highWorld4 = uD.model * vec4<f32>(in.pos,    1.0);
-  let lowWorld4  = uD.model * vec4<f32>(in.lowPos, 1.0);
-  let highPos = highWorld4.xyz;
-  let lowPos  = lowWorld4.xyz;
+  // Sprint 9-3: uD.model carries mv_rtc = view * translate(anchorF64),
+  // composed JS-side in f64 so the catastrophic (anchor - camera)
+  // subtraction happens before f32 downcast. in.pos is anchor-relative
+  // (small magnitude) so uD.model * in.pos yields a VIEW-SPACE position
+  // directly. Distance to camera = length(viewSpacePos) since rotation
+  // preserves length. Output projection uses proj-only (uS.proj).
+  let highView4 = uD.model * vec4<f32>(in.pos,    1.0);
+  let lowView4  = uD.model * vec4<f32>(in.lowPos, 1.0);
+  let highPos = highView4.xyz;
+  let lowPos  = lowView4.xyz;
 
-  let camPos = uS.eye.xyz;
-  let dist = distance(highPos, camPos);
+  let dist = length(highPos);  // world distance to camera (rotation-invariant)
   let morphLow = in.uv.y;
-  // morphLow > 0 only for interior chunk verts; skirt verts pass 0
-  // here so they never morph (they're already at the spheroid
-  // surface, no parent geometry to morph toward).
   var morph: f32 = 0.0;
   if (morphLow > 0.0) {
     morph = clamp((dist - morphLow) / morphLow * 2.0 - 1.0, 0.0, 1.0);
   }
   let morphedPos = mix(highPos, lowPos, morph);
 
+  // For the fragment shader's worldPos input (used by atmosphere,
+  // lighting, etc.), reconstruct world coords by adding camera back:
+  // worldPos = inv(view) * viewSpacePos ≈ camera + R^T * viewSpacePos.
+  // For now we pass viewSpacePos as worldPos; only fs_unlit_vc reads
+  // worldPos and it doesn't use it for shading-critical math. If a
+  // future shader needs true world coords here, undo the rotation
+  // explicitly.
   out.worldPos = morphedPos;
-  out.pos = uS.viewProj * vec4<f32>(morphedPos, 1.0);
+  out.pos = uS.proj * vec4<f32>(morphedPos, 1.0);
   out.color = in.color;
+  // Normal: uD.model carries view * translate, so it includes the
+  // view rotation. For the normal (a direction, w=0), the translation
+  // doesn't apply; the rotation rotates it into view space. That's
+  // fine for Lambert math against uS.envSun (world-space sun, but
+  // since lambert is baked per-vertex JS-side anyway this is just
+  // descriptive metadata).
   let n4 = uD.model * vec4<f32>(in.normal, 0.0);
   out.normal = normalize(n4.xyz);
   out.uv = in.uv;
@@ -61539,9 +61561,16 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
       if (elev > seaLevel && hs !== 0) {
         altitude = hs * (elev - seaLevel) / Math.max(1e-6, 1 - seaLevel);
       }
-      const px = cxC + r * ux           + altitude * ux;
-      const py = cyC + r * uy * polRatio + altitude * uy;
-      const pz = czC + r * uz           + altitude * uz;
+      // Sprint 9-3: VBO holds vertices RELATIVE to the planet's
+      // center (anchorF64). The per-frame mv_rtc model matrix
+      // re-adds the anchor in f64-composed view space so the GPU
+      // never sees the absolute world coordinate at Earth radius.
+      // For frustum culling the AABB still needs to be in WORLD
+      // coords (the cam frustum planes are world-space), so the
+      // AABB tracking adds the center back below.
+      const px = r * ux           + altitude * ux;
+      const py = r * uy * polRatio + altitude * uy;
+      const pz = r * uz           + altitude * uz;
       const baseCol = (cellIdx >= 0) ? colorForCell(cellIdx, elev) : _planetColorForHeight(elev, seaLevel);
       const biomeId = (cellIdx >= 0) ? biomeForCell(cellIdx, elev) : 0;
       const nxn = ux;
@@ -61551,9 +61580,11 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
       const nuX = nxn * ninv, nuY = nyn * ninv, nuZ = nzn * ninv;
       const lambert = Math.max(ambient, nuX * sunX + nuY * sunY + nuZ * sunZ);
 
-      if (px < minX) minX = px; if (px > maxX) maxX = px;
-      if (py < minY) minY = py; if (py > maxY) maxY = py;
-      if (pz < minZ) minZ = pz; if (pz > maxZ) maxZ = pz;
+      // World-space AABB for frustum cull (add the anchor back).
+      const wpx = px + cxC, wpy = py + cyC, wpz = pz + czC;
+      if (wpx < minX) minX = wpx; if (wpx > maxX) maxX = wpx;
+      if (wpy < minY) minY = wpy; if (wpy > maxY) maxY = wpy;
+      if (wpz < minZ) minZ = wpz; if (wpz > maxZ) maxZ = wpz;
 
       const gi = iy * N + ix;
       highPosX[gi] = px;
@@ -61651,9 +61682,10 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
     if (skirtVertOf[gi] >= 0) return skirtVertOf[gi];
     const ux = edgeDirs[gi*3+0], uy = edgeDirs[gi*3+1], uz = edgeDirs[gi*3+2];
     const skirtDrop = -r * 0.0005;
-    const px = cxC + (r + skirtDrop) * ux;
-    const py = cyC + (r + skirtDrop) * uy * polRatio;
-    const pz = czC + (r + skirtDrop) * uz;
+    // Sprint 9-3: skirt position planet-center-relative too.
+    const px = (r + skirtDrop) * ux;
+    const py = (r + skirtDrop) * uy * polRatio;
+    const pz = (r + skirtDrop) * uz;
     // 14-float vertex (CDLOD layout). morphLow = 0 disables morph
     // on skirt verts (they're spheroid-anchored, no parent geometry
     // to morph toward); lowPos = highPos for same reason.
@@ -61671,9 +61703,11 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
     verts[vWrite++] = px;       // lowPos = highPos for skirts
     verts[vWrite++] = py;
     verts[vWrite++] = pz;
-    if (px < minX) minX = px; if (px > maxX) maxX = px;
-    if (py < minY) minY = py; if (py > maxY) maxY = py;
-    if (pz < minZ) minZ = pz; if (pz > maxZ) maxZ = pz;
+    // World-space AABB tracking for skirt verts.
+    const wpx = px + cxC, wpy = py + cyC, wpz = pz + czC;
+    if (wpx < minX) minX = wpx; if (wpx > maxX) maxX = wpx;
+    if (wpy < minY) minY = wpy; if (wpy > maxY) maxY = wpy;
+    if (wpz < minZ) minZ = wpz; if (wpz > maxZ) maxZ = wpz;
     skirtVertOf[gi] = skirtIdx;
     return skirtIdx++;
   }
@@ -61723,7 +61757,13 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
     face: info.face,
     depth: info.depth,
     ix: info.ix,
-    iy: info.iy
+    iy: info.iy,
+    // Sprint 9-3 -- chunk's anchor in f64 world coords. Used by the
+    // encoder to compose mv_rtc per draw via _composeRtcModelView.
+    // For now all chunks of a PlanetMesh share the planet center
+    // (single per-mesh anchor); future 9-3b swaps in per-chunk
+    // centroids for sub-meter precision near the surface.
+    anchorF64: { x: cxC, y: cyC, z: czC }
   };
 }
 
@@ -64382,9 +64422,12 @@ function _ensureSceneInstance(sceneNode) {
   // each = 416 bytes, appended after envPlanetGeom). Lets the
   // PlanetMap editor tab tweak biome detail-noise params at runtime
   // without WGSL recompiles.
+  // Sprint 9-3 grew 992 -> 1056 for proj (projection-only matrix,
+  // 64 bytes appended at end). Read by vs_planet_cdlod which uses
+  // the per-draw mv_rtc model matrix; other variants ignore it.
   const perSceneBuffer = Visual.device.createBuffer({
     label: "scene-perscene-" + sceneNode.id,
-    size: 992,
+    size: 1056,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
   });
   // Sprint 7.5.3c bug fix -- queue.writeBuffer ordering. All
@@ -64475,7 +64518,7 @@ function _ensureSceneInstance(sceneNode) {
   inst = {
     perSceneBuffer,
     slots,
-    sceneScratch: new Float32Array(248),  // 992 bytes (sprint 8-4 -- + biomeParams[26])
+    sceneScratch: new Float32Array(264),  // 1056 bytes (sprint 9-3 -- + proj matrix at end)
     // v0.3.123 -- 40 floats / 160 B for TerrainMaterial band slots.
     // v0.3.126 §5.5.c-3 -- bumped 40 → 48 / 192 B; slots [40..43]
     // are vsParams (vertex-shader displacement params for
@@ -64818,7 +64861,10 @@ function _encodeScenePass(enc, entry) {
     inst.sceneScratch[off + 7] = (ov && typeof ov.textureStyleId === "number") ? ov.textureStyleId : def[7];
   }
 
-  Visual.device.queue.writeBuffer(inst.perSceneBuffer, 0, inst.sceneScratch.buffer, 0, 992);
+  // Sprint 9-3: write proj at the trailing slot (float index 248,
+  // byte offset 992). Read by vs_planet_cdlod; other shaders ignore.
+  inst.sceneScratch.set(camera.proj, 248);
+  Visual.device.queue.writeBuffer(inst.perSceneBuffer, 0, inst.sceneScratch.buffer, 0, 1056);
 
   // Per-draw loop. Each mesh writes to its OWN per-slot buffer +
   // binds its OWN bind group, so multi-mesh draws work correctly
@@ -64962,7 +65008,19 @@ function _encodeScenePass(enc, entry) {
       curMaterialType = pipelineKeyStr;
     }
     // Write model + material into THIS slot's per-draw buffer.
-    inst.drawScratch.set(m.transform, 0);
+    // Sprint 9-3: PlanetMesh chunks use mv_rtc (view * translate(anchor)
+    // composed JS-side in f64) instead of m.transform. The chunk's
+    // anchorF64 lives on each tiledChunks entry; for now all chunks
+    // of a PlanetMesh share the planet-center anchor so we read the
+    // first chunk's anchor and compose mv_rtc once per mesh. Per-chunk
+    // dynamic-offset upload (true foot-level f32 precision) is 9-3b.
+    if (vsVariant === "planet_cdlod" && buf && buf.tiledChunks && buf.tiledChunks.length > 0 && camera.viewF64) {
+      const anchor = buf.tiledChunks[0].anchorF64 || { x: 0, y: 0, z: 0 };
+      const mvRtc = _composeRtcModelView(camera.viewF64, anchor, m.transform || _mat4Identity());
+      inst.drawScratch.set(mvRtc, 0);
+    } else {
+      inst.drawScratch.set(m.transform, 0);
+    }
     let mp = (m.material && m.material.params) || {};
     // §5.5.h -- Water packs its own params from m.node (mesh-gen
     // doubles as material since Water bakes the shader in).
