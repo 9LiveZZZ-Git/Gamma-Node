@@ -10776,22 +10776,20 @@ public:
     ],
     outs: [{ n: "heightmap", t: "heightmap" }],
     params: {
+      // Sprint 10-5a: source toggle. "earth" = bake from hardcoded
+      // continent + mountain-range geometry (recognizable Earth);
+      // "custom" = bake from the cell graph (Azgaar / hand-paint).
+      // Earth is the default now -- new patches show Africa, Eurasia,
+      // Andes, Himalayas, etc. out of the box. 10-5b will swap the
+      // hardcoded geometry for real DEM data fetched at runtime.
+      source: "earth",
       resolution: 512,
       cellCount: 30000,
       seed: 7.3, frequency: 1.0, octaves: 6,
       lacunarity: 2.0, gain: 0.5,
-      // Sprint 10-1c: ridges 0 -> 1 so the default map produces
-      // ridged-multifractal noise (mountain spines) instead of plain
-      // fbm (blob hills). Combined with the 10-1b ridge-enhancement
-      // pass, this gives every new PlanetMap visible mountain ranges
-      // out of the box. User can switch back to fbm via the node
-      // params or Azgaar template apply.
+      // Sprint 10-1c: ridges 0 -> 1 ridged-multifractal for custom
+      // mode. Earth mode ignores these noise params entirely.
       ridges: 1,
-      // jitter (0..1) perturbs each Fibonacci cell position by a
-      // fraction of typical cell spacing so the Voronoi boundaries
-      // (mountain ridges, coastlines) get organic irregular shapes
-      // instead of the regular spiral pattern. 0 = pure Fibonacci.
-      // 0.4 = roughly Azgaar's relaxed-Voronoi feel.
       jitter: 0.4
     },
     methods: {},
@@ -58790,14 +58788,16 @@ function _planetMapCacheKey(node) {
   // each time a brush stroke mutates cells.elevations.
   // Sprint 10-1b -- "p10b" invalidated pre-Phase-10 bakes.
   // Sprint 10-2 -- "p10c" invalidates the 10-1b bakes too so the
-  // new hydraulic-erosion pass runs (rivers, drainage, carved
-  // valleys -- not present in p10b cubemaps).
+  // hydraulic-erosion pass runs (rivers, drainage, carved valleys).
+  // Sprint 10-5a -- "p10e" + source tag invalidates again so the
+  // Earth/custom-mode toggle is reflected. Mode change re-bakes.
   const ver = (typeof node._cellsVersion === "number") ? node._cellsVersion : 0;
+  const src = (typeof p.source === "string") ? p.source : "earth";
   return [
     p.resolution, p.cellCount,
     p.seed, p.frequency, p.octaves,
     p.lacunarity, p.gain, p.ridges,
-    "v" + ver, "p10c"
+    "v" + ver, "p10e", "src=" + src
   ].join(",");
 }
 
@@ -61193,6 +61193,159 @@ function _decodeCubemapBase64(b64, res) {
   return { resolution: res, faces };
 }
 
+/* Sprint 10-5a -- programmatic Earth cubemap. Replaces the
+ * Azgaar fbm-on-cells baseline (blob continents) with hardcoded
+ * Earth geometry: 15 named continents/islands as rotated ellipses,
+ * 8 named mountain ranges as polyline ridges. The bake produces
+ * a 6×N² cubemap of elevations in [0, 1] where 0.5 = sea level.
+ * 10-1b ridge enhancement + 10-2 erosion run on top so the
+ * coastlines + drainage networks emerge from real-Earth-shaped
+ * geometry. Sprint 10-5b will swap the hardcoded geometry for an
+ * actual ETOPO1/GEBCO DEM fetch; the rest of the pipeline stays
+ * identical.
+ *
+ * Continent ellipses: each entry is (lat, lon, halfWidth°,
+ * halfHeight°, rotation°, baseElev). Land if rotated-ellipse
+ * distance < 1.
+ * Ridge polylines: each entry is a list of lat/lon points + a
+ * cross-section width + an elevation boost. Closest-point on
+ * each segment determines how much boost a query point gets.
+ * Boost only applies on land so mid-ocean ridges don't appear. */
+const _EARTH_CONTINENTS = [
+  { name: "Africa",       lat:    5, lon:   20, hw: 35, hh: 35, rot:   5, base: 0.62 },
+  { name: "Eurasia",      lat:   50, lon:   80, hw: 90, hh: 25, rot:   0, base: 0.62 },
+  { name: "S Asia",       lat:   18, lon:   95, hw: 30, hh: 18, rot:  10, base: 0.60 },
+  { name: "Arabia",       lat:   23, lon:   45, hw: 12, hh: 12, rot:  10, base: 0.60 },
+  { name: "N America",    lat:   45, lon: -100, hw: 40, hh: 30, rot:   0, base: 0.62 },
+  { name: "Cent America", lat:   18, lon:  -90, hw: 12, hh:  8, rot:  20, base: 0.58 },
+  { name: "S America",    lat:  -20, lon:  -62, hw: 18, hh: 30, rot:  10, base: 0.62 },
+  { name: "Australia",    lat:  -25, lon:  135, hw: 20, hh: 12, rot:   0, base: 0.60 },
+  { name: "Antarctica",   lat:  -85, lon:    0, hw:180, hh: 12, rot:   0, base: 0.68 },
+  { name: "Greenland",    lat:   75, lon:  -40, hw: 18, hh: 12, rot:   0, base: 0.70 },
+  { name: "Indonesia",    lat:   -3, lon:  115, hw: 18, hh:  6, rot:   0, base: 0.58 },
+  { name: "Madagascar",   lat:  -20, lon:   47, hw:  3, hh: 10, rot:  10, base: 0.60 },
+  { name: "UK + Ireland", lat:   55, lon:   -3, hw:  4, hh:  6, rot:   0, base: 0.58 },
+  { name: "Japan",        lat:   37, lon:  138, hw:  3, hh:  9, rot:  20, base: 0.58 },
+  { name: "New Zealand",  lat:  -42, lon:  173, hw:  3, hh:  8, rot:  10, base: 0.58 },
+];
+
+const _EARTH_RIDGES = [
+  { name: "Himalayas",   width: 4, boost: 0.30, pts: [
+    {lat:36, lon:71}, {lat:33, lon:78}, {lat:30, lon:84}, {lat:28, lon:92}
+  ]},
+  { name: "Andes",       width: 3, boost: 0.28, pts: [
+    {lat: 10, lon:-73}, {lat:  0, lon:-78}, {lat:-15, lon:-72},
+    {lat:-30, lon:-70}, {lat:-45, lon:-72}, {lat:-52, lon:-73}
+  ]},
+  { name: "Rockies",     width: 4, boost: 0.22, pts: [
+    {lat:65, lon:-145}, {lat:55, lon:-128}, {lat:45, lon:-115},
+    {lat:38, lon:-110}, {lat:32, lon:-106}
+  ]},
+  { name: "Alpine belt", width: 3, boost: 0.20, pts: [
+    {lat:44, lon: -4}, {lat:45, lon:  7}, {lat:47, lon: 14},
+    {lat:42, lon: 28}, {lat:42, lon: 44}, {lat:37, lon: 53}
+  ]},
+  { name: "Urals",       width: 2, boost: 0.15, pts: [
+    {lat:68, lon:65}, {lat:60, lon:60}, {lat:52, lon:58}
+  ]},
+  { name: "Atlas",       width: 2, boost: 0.15, pts: [
+    {lat:33, lon:-7}, {lat:32, lon: 1}, {lat:30, lon: 8}
+  ]},
+  { name: "GreatDivide", width: 2, boost: 0.12, pts: [
+    {lat:-15, lon:145}, {lat:-25, lon:150}, {lat:-35, lon:148}
+  ]},
+  { name: "Scandes",     width: 2, boost: 0.14, pts: [
+    {lat:70, lon:22}, {lat:65, lon:14}, {lat:60, lon: 9}
+  ]},
+];
+
+function _earthElevationAt(lat, lon) {
+  // 1) Test against every continent ellipse. Highest land wins.
+  let landMax = 0.30;     // deep-ocean baseline
+  for (let i = 0; i < _EARTH_CONTINENTS.length; i++) {
+    const c = _EARTH_CONTINENTS[i];
+    let dlon = lon - c.lon;
+    while (dlon >  180) dlon -= 360;
+    while (dlon < -180) dlon += 360;
+    const dlat = lat - c.lat;
+    const cosLat = Math.cos(c.lat * Math.PI / 180);
+    const dlonScaled = dlon * cosLat;
+    const cr = Math.cos(c.rot * Math.PI / 180);
+    const sr = Math.sin(c.rot * Math.PI / 180);
+    const ex =  cr * dlonScaled + sr * dlat;
+    const ey = -sr * dlonScaled + cr * dlat;
+    const d2 = (ex / c.hw) * (ex / c.hw) + (ey / c.hh) * (ey / c.hh);
+    if (d2 < 1) {
+      const falloff = Math.pow(1 - d2, 0.4);
+      const elev = c.base + falloff * 0.05;
+      if (elev > landMax) landMax = elev;
+    }
+  }
+  // 2) Mountain-ridge boost. Closest point on each ridge polyline.
+  let ridgeBoost = 0;
+  for (let i = 0; i < _EARTH_RIDGES.length; i++) {
+    const r = _EARTH_RIDGES[i];
+    let bestDist = 1e9;
+    for (let j = 0; j < r.pts.length - 1; j++) {
+      const a = r.pts[j], b = r.pts[j + 1];
+      const cosLatMid = Math.cos((a.lat + b.lat) * 0.5 * Math.PI / 180);
+      let aLon = a.lon, bLon = b.lon, qLon = lon;
+      while (qLon - aLon >  180) qLon -= 360;
+      while (qLon - aLon < -180) qLon += 360;
+      while (bLon - aLon >  180) bLon -= 360;
+      while (bLon - aLon < -180) bLon += 360;
+      const ax = aLon * cosLatMid, ay = a.lat;
+      const bx = bLon * cosLatMid, by = b.lat;
+      const px = qLon * cosLatMid, py = lat;
+      const segLen2 = (bx - ax) * (bx - ax) + (by - ay) * (by - ay);
+      let t = ((px - ax) * (bx - ax) + (py - ay) * (by - ay)) / Math.max(1e-9, segLen2);
+      t = Math.max(0, Math.min(1, t));
+      const cx = ax + t * (bx - ax);
+      const cy = ay + t * (by - ay);
+      const d = Math.hypot(px - cx, py - cy);
+      if (d < bestDist) bestDist = d;
+    }
+    if (bestDist < r.width) {
+      const w = Math.max(0, 1 - bestDist / r.width);
+      ridgeBoost = Math.max(ridgeBoost, w * w * r.boost);
+    }
+  }
+  if (landMax > 0.5) landMax += ridgeBoost;
+  return Math.max(0, Math.min(1, landMax));
+}
+
+function _buildEarthCubemap(resolution) {
+  const res = Math.max(16, Math.min(2048, Math.floor(resolution || 512)));
+  const faces = [];
+  for (let f = 0; f < 6; f++) {
+    const face = _PLANET_FACES[f];
+    const nX = face.n[0], nY = face.n[1], nZ = face.n[2];
+    const tX = face.t[0], tY = face.t[1], tZ = face.t[2];
+    const bX = face.b[0], bY = face.b[1], bZ = face.b[2];
+    const data = new Float32Array(res * res);
+    for (let iy = 0; iy < res; iy++) {
+      const v = ((iy + 0.5) / res) * 2 - 1;
+      for (let ix = 0; ix < res; ix++) {
+        const u = ((ix + 0.5) / res) * 2 - 1;
+        const cx = nX + tX * u + bX * v;
+        const cy = nY + tY * u + bY * v;
+        const cz = nZ + tZ * u + bZ * v;
+        const cxx = cx*cx, cyy = cy*cy, czz = cz*cz;
+        const sx = cx * Math.sqrt(Math.max(0, 1 - cyy*0.5 - czz*0.5 + cyy*czz/3));
+        const sy = cy * Math.sqrt(Math.max(0, 1 - cxx*0.5 - czz*0.5 + cxx*czz/3));
+        const sz = cz * Math.sqrt(Math.max(0, 1 - cxx*0.5 - cyy*0.5 + cxx*cyy/3));
+        const invLen = 1 / Math.max(1e-12, Math.sqrt(sx*sx + sy*sy + sz*sz));
+        const ux = sx * invLen, uy = sy * invLen, uz = sz * invLen;
+        const latDeg = Math.asin(Math.max(-1, Math.min(1, uy))) * 180 / Math.PI;
+        const lonDeg = Math.atan2(uz, ux) * 180 / Math.PI;
+        data[iy * res + ix] = _earthElevationAt(latDeg, lonDeg);
+      }
+    }
+    faces.push(data);
+  }
+  return { resolution: res, faces };
+}
+
 /* Sprint 10-2 -- hydraulic erosion via Sebastian Lague's droplet
  * algorithm (Inria HAL inria-00402079 / "Coding Adventure:
  * Hydraulic Erosion" YouTube). For each face: spawn N random
@@ -61342,6 +61495,41 @@ function _erodeFaceHydraulic(face, drainage, res, seaLevel, params) {
   }
 }
 
+/* Sprint 10-5a -- the custom-source cubemap bake (formerly inlined in
+ * _ensurePlanetMapCubemap). Bakes a 6×res² cubemap by sampling the
+ * IDW-blended cell-graph elevation at each texel, with the ridge-
+ * boost applied in-place. Used when PlanetMap.source === "custom"
+ * (hand-painted maps); the "earth" source uses _buildEarthCubemap
+ * instead. */
+function _buildCustomCellCubemap(node, cells, hash, ridgeBoost, res) {
+  const faces = [];
+  for (let f = 0; f < 6; f++) {
+    const face = _PLANET_FACES[f];
+    const nX = face.n[0], nY = face.n[1], nZ = face.n[2];
+    const tX = face.t[0], tY = face.t[1], tZ = face.t[2];
+    const bX = face.b[0], bY = face.b[1], bZ = face.b[2];
+    const data = new Float32Array(res * res);
+    for (let iy = 0; iy < res; iy++) {
+      const v = ((iy + 0.5) / res) * 2 - 1;
+      for (let ix = 0; ix < res; ix++) {
+        const u = ((ix + 0.5) / res) * 2 - 1;
+        const cx = nX + tX * u + bX * v;
+        const cy = nY + tY * u + bY * v;
+        const cz = nZ + tZ * u + bZ * v;
+        const cxx = cx*cx, cyy = cy*cy, czz = cz*cz;
+        const sx = cx * Math.sqrt(Math.max(0, 1 - cyy*0.5 - czz*0.5 + cyy*czz/3));
+        const sy = cy * Math.sqrt(Math.max(0, 1 - cxx*0.5 - czz*0.5 + cxx*czz/3));
+        const sz = cz * Math.sqrt(Math.max(0, 1 - cxx*0.5 - cyy*0.5 + cxx*cyy/3));
+        const invLen = 1 / Math.max(1e-12, Math.sqrt(sx*sx + sy*sy + sz*sz));
+        const ux = sx * invLen, uy = sy * invLen, uz = sz * invLen;
+        data[iy * res + ix] = _samplePlanetCellsIDWBoosted(cells, hash, ridgeBoost, ux, uy, uz);
+      }
+    }
+    faces.push(data);
+  }
+  return faces;
+}
+
 function _ensurePlanetMapCubemap(node) {
   if (!node || !node.params) return null;
   const key = _planetMapCacheKey(node);
@@ -61369,77 +61557,57 @@ function _ensurePlanetMapCubemap(node) {
     }
   }
 
-  // §planet-spec Phase 7.c -- bake reads from the cell graph (nearest-
-  // cell lookup per texel) instead of running fBm directly. Cell
-  // elevations are themselves fBm-sampled at cell positions, so the
-  // bake reproduces the procedural macro shape at the cells' angular
-  // resolution. Sub-cell detail (~225km/cell at N=10k on Earth) is
-  // lost as a visible voronoi pattern until Phase 7.e adds biome-
-  // masked detail noise on top. The Phase 7.d painter will edit
-  // cell.elevations directly; the bake here will then reflect those
-  // edits with no other code change.
-  const cells = _ensurePlanetMapCells(node);
-  const hash = node._cellsHash;
-  // Sprint 10-1b: ridge enhancement runs once per cellsKey, cached
-  // on the node. Provides a per-cell additive elevation boost that
-  // amplifies linear ridges (mountain chains) and leaves isolated
-  // peaks/lowlands alone. Baked into the cubemap below so the
-  // chunk builder samples the enhanced surface.
-  if (!node._ridgeBoost || node._ridgeBoostKey !== key) {
-    const tR = (typeof performance !== "undefined") ? performance.now() : 0;
-    if (node._cellNeighbors && typeof node._cellNeighborsK === "number") {
-      node._ridgeBoost = _planetEnhanceRidges(cells, node._cellNeighbors, node._cellNeighborsK);
-    } else {
-      node._ridgeBoost = new Float32Array(cells.count);
+  // Sprint 10-5a: programmatic Earth path. When PlanetMap.source is
+  // "earth" (default), bake the cubemap from hardcoded continent +
+  // ridge geometry instead of the cell graph. Skips the cells-build
+  // (which Azgaar/fbm fills with blob continents) entirely. 10-2
+  // erosion + drainage tracking still run on this Earth cubemap so
+  // river valleys + fractal coastlines emerge from real-Earth shape.
+  // source = "custom" falls through to the cell-graph bake for users
+  // who want hand-painted maps.
+  const source = (typeof p.source === "string") ? p.source : "earth";
+  let faces;
+  let cells = null;       // only built in "custom" branch
+  let hash = null;
+  let ridgeBoost = null;
+  let t0 = (typeof performance !== "undefined") ? performance.now() : 0;
+  if (source === "earth") {
+    const eTo = (typeof performance !== "undefined") ? performance.now() : 0;
+    const earthCubemap = _buildEarthCubemap(res);
+    faces = earthCubemap.faces;
+    if (!Visual._planetEarthBakeLogged) {
+      Visual._planetEarthBakeLogged = true;
+      const dt = ((typeof performance !== "undefined") ? performance.now() : 0) - eTo;
+      console.log("[planet-map] baked Earth cubemap (" + res + "² × 6 faces, "
+                  + _EARTH_CONTINENTS.length + " continents + "
+                  + _EARTH_RIDGES.length + " ridges) in " + dt.toFixed(0) + "ms");
     }
-    node._ridgeBoostKey = key;
-    if (!Visual._planetRidgeLogged) {
-      Visual._planetRidgeLogged = true;
-      let ridgeCellCount = 0;
-      let maxBoost = 0;
-      for (let i = 0; i < cells.count; i++) {
-        if (node._ridgeBoost[i] > 0) {
-          ridgeCellCount++;
-          if (node._ridgeBoost[i] > maxBoost) maxBoost = node._ridgeBoost[i];
+  } else {
+    // Custom source: existing cell-graph bake path.
+    cells = _ensurePlanetMapCells(node);
+    hash = node._cellsHash;
+    if (!node._ridgeBoost || node._ridgeBoostKey !== key) {
+      const tR = (typeof performance !== "undefined") ? performance.now() : 0;
+      if (node._cellNeighbors && typeof node._cellNeighborsK === "number") {
+        node._ridgeBoost = _planetEnhanceRidges(cells, node._cellNeighbors, node._cellNeighborsK);
+      } else {
+        node._ridgeBoost = new Float32Array(cells.count);
+      }
+      node._ridgeBoostKey = key;
+      if (!Visual._planetRidgeLogged) {
+        Visual._planetRidgeLogged = true;
+        let ridgeCellCount = 0, maxBoost = 0;
+        for (let i = 0; i < cells.count; i++) {
+          if (node._ridgeBoost[i] > 0) { ridgeCellCount++; if (node._ridgeBoost[i] > maxBoost) maxBoost = node._ridgeBoost[i]; }
         }
-      }
-      const tdR = ((typeof performance !== "undefined") ? performance.now() : 0) - tR;
-      console.log("[planet-map] ridge boost: " + ridgeCellCount + "/" + cells.count + " cells boosted (max +" + maxBoost.toFixed(3) + ") in " + tdR.toFixed(1) + "ms");
-    }
-  }
-  const ridgeBoost = node._ridgeBoost;
-  const faces = [];
-  const t0 = (typeof performance !== "undefined") ? performance.now() : 0;
-  for (let f = 0; f < 6; f++) {
-    const face = _PLANET_FACES[f];
-    const nX = face.n[0], nY = face.n[1], nZ = face.n[2];
-    const tX = face.t[0], tY = face.t[1], tZ = face.t[2];
-    const bX = face.b[0], bY = face.b[1], bZ = face.b[2];
-    const data = new Float32Array(res * res);
-    for (let iy = 0; iy < res; iy++) {
-      const v = ((iy + 0.5) / res) * 2 - 1;
-      for (let ix = 0; ix < res; ix++) {
-        const u = ((ix + 0.5) / res) * 2 - 1;
-        const cx = nX + tX * u + bX * v;
-        const cy = nY + tY * u + bY * v;
-        const cz = nZ + tZ * u + bZ * v;
-        const cxx = cx*cx, cyy = cy*cy, czz = cz*cz;
-        const sx = cx * Math.sqrt(Math.max(0, 1 - cyy*0.5 - czz*0.5 + cyy*czz/3));
-        const sy = cy * Math.sqrt(Math.max(0, 1 - cxx*0.5 - czz*0.5 + cxx*czz/3));
-        const sz = cz * Math.sqrt(Math.max(0, 1 - cxx*0.5 - cyy*0.5 + cxx*cyy/3));
-        const invLen = 1 / Math.max(1e-12, Math.sqrt(sx*sx + sy*sy + sz*sz));
-        const ux = sx * invLen, uy = sy * invLen, uz = sz * invLen;
-        // §planet-spec Phase 7.d+ -- IDW interpolation between 3 nearest
-        // cells (smooth surface) instead of nearest-cell flat shading.
-        // Sprint 10-1b: uses the boosted variant so the bake inherits
-        // the tectonic ridge enhancement (linear mountain spines get
-        // amplified relative to isolated peaks). Chunk builder reads
-        // from this cubemap and never sees the raw cell field.
-        data[iy * res + ix] = _samplePlanetCellsIDWBoosted(cells, hash, ridgeBoost, ux, uy, uz);
+        const tdR = ((typeof performance !== "undefined") ? performance.now() : 0) - tR;
+        console.log("[planet-map] ridge boost: " + ridgeCellCount + "/" + cells.count + " cells boosted (max +" + maxBoost.toFixed(3) + ") in " + tdR.toFixed(1) + "ms");
       }
     }
-    faces.push(data);
+    ridgeBoost = node._ridgeBoost;
+    faces = _buildCustomCellCubemap(node, cells, hash, ridgeBoost, res);
   }
+
   const dtMs = ((typeof performance !== "undefined") ? performance.now() : 0) - t0;
 
   // Sprint 10-2: hydraulic erosion pass. Operates on each face in-
