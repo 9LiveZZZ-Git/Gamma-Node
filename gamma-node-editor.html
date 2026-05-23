@@ -54695,6 +54695,16 @@ fn vs_planet_cdlod(in: VsInCDLOD) -> VsOut {
   // (small magnitude) so uD.model * in.pos yields a VIEW-SPACE position
   // directly. Distance to camera = length(viewSpacePos) since rotation
   // preserves length. Output projection uses proj-only (uS.proj).
+  //
+  // Sprint 9-4-fix: out.worldPos must be in WORLD space (fragments
+  // sample biome textures triplanar against it, run atmosphere height
+  // math, etc.). Writing viewSpacePos to worldPos made the textures
+  // slide with the camera (water-like effect) and the atmosphere
+  // render as a translucent shell inside the planet. Recover world
+  // coords by adding the f32 anchor approximation (uD.vsParams.xyz):
+  // world = anchor + local. This loses sub-meter precision at Earth
+  // radius, which is fine for the consumers; the precision-critical
+  // path (clip-space output) still uses the f64-composed mv_rtc.
   let highView4 = uD.model * vec4<f32>(in.pos,    1.0);
   let lowView4  = uD.model * vec4<f32>(in.lowPos, 1.0);
   let highPos = highView4.xyz;
@@ -54706,26 +54716,20 @@ fn vs_planet_cdlod(in: VsInCDLOD) -> VsOut {
   if (morphLow > 0.0) {
     morph = clamp((dist - morphLow) / morphLow * 2.0 - 1.0, 0.0, 1.0);
   }
-  let morphedPos = mix(highPos, lowPos, morph);
+  let morphedPos   = mix(highPos, lowPos, morph);
+  let morphedLocal = mix(in.pos,  in.lowPos, morph);
 
-  // For the fragment shader's worldPos input (used by atmosphere,
-  // lighting, etc.), reconstruct world coords by adding camera back:
-  // worldPos = inv(view) * viewSpacePos ≈ camera + R^T * viewSpacePos.
-  // For now we pass viewSpacePos as worldPos; only fs_unlit_vc reads
-  // worldPos and it doesn't use it for shading-critical math. If a
-  // future shader needs true world coords here, undo the rotation
-  // explicitly.
-  out.worldPos = morphedPos;
+  let anchorF32 = uD.vsParams.xyz;
+  out.worldPos = anchorF32 + morphedLocal;
   out.pos = uS.proj * vec4<f32>(morphedPos, 1.0);
   out.color = in.color;
-  // Normal: uD.model carries view * translate, so it includes the
-  // view rotation. For the normal (a direction, w=0), the translation
-  // doesn't apply; the rotation rotates it into view space. That's
-  // fine for Lambert math against uS.envSun (world-space sun, but
-  // since lambert is baked per-vertex JS-side anyway this is just
-  // descriptive metadata).
-  let n4 = uD.model * vec4<f32>(in.normal, 0.0);
-  out.normal = normalize(n4.xyz);
+  // Normal: in.normal is already world-oriented (the oblate-spheroid
+  // surface normal computed JS-side). Translation doesn't affect a
+  // direction, so we just pass it through normalized. (Previously
+  // ran in.normal through uD.model, which rotated it into view space
+  // and gave fragments a wrong normal -- contributed to the broken
+  // sun lighting on the surface.)
+  out.normal = normalize(in.normal);
   out.uv = in.uv;
   return out;
 }
@@ -61631,12 +61635,13 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
       const pz = r * uz           + altitude * uz;
       const baseCol = (cellIdx >= 0) ? colorForCell(cellIdx, elev) : _planetColorForHeight(elev, seaLevel);
       const biomeId = (cellIdx >= 0) ? biomeForCell(cellIdx, elev) : 0;
+      // Smooth oblate-spheroid radial; used as a fallback for
+      // degenerate triangles in the face-normal pass below.
       const nxn = ux;
       const nyn = uy / polRatio2;
       const nzn = uz;
       const ninv = 1 / Math.max(1e-12, Math.sqrt(nxn*nxn + nyn*nyn + nzn*nzn));
       const nuX = nxn * ninv, nuY = nyn * ninv, nuZ = nzn * ninv;
-      const lambert = Math.max(ambient, nuX * sunX + nuY * sunY + nuZ * sunZ);
 
       // World-space AABB for frustum cull (add the anchor back).
       const wpx = px + cxC, wpy = py + cyC, wpz = pz + czC;
@@ -61650,12 +61655,68 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
       highPosZ[gi] = pz;
       edgeDirs[gi*3+0] = ux; edgeDirs[gi*3+1] = uy; edgeDirs[gi*3+2] = uz;
       edgeAlt[gi] = altitude;
-      edgeCol[gi*3+0] = baseCol[0] * lambert;
-      edgeCol[gi*3+1] = baseCol[1] * lambert;
-      edgeCol[gi*3+2] = baseCol[2] * lambert;
+      // Sprint 9-4-fix: store BASE color (no lambert). Lambert is
+      // re-applied in pass 2 below using the face-normal-accumulated
+      // shading normal, so ridges/valleys catch sun.
+      edgeCol[gi*3+0] = baseCol[0];
+      edgeCol[gi*3+1] = baseCol[1];
+      edgeCol[gi*3+2] = baseCol[2];
       edgeBId[gi] = biomeId;
       edgeNrm[gi*3+0] = nuX; edgeNrm[gi*3+1] = nuY; edgeNrm[gi*3+2] = nuZ;
     }
+  }
+
+  // Sprint 9-4-fix Pass 1.5: face-normal accumulation. The radial
+  // normal stored in edgeNrm gives smooth-sphere shading even when
+  // the surface has bumps from detail noise. Override it with the
+  // area-weighted face normal so geometry actually reads as 3D.
+  // Skirt verts (built below) inherit edgeNrm from their ring
+  // vertex, so they pick up the terrain normal automatically.
+  const accumNX = new Float32Array(N * N);
+  const accumNY = new Float32Array(N * N);
+  const accumNZ = new Float32Array(N * N);
+  for (let jy = 0; jy < segs; jy++) {
+    for (let jx = 0; jx < segs; jx++) {
+      const a = jy * N + jx;
+      const b = a + 1;
+      const c = a + N;
+      const d = c + 1;
+      // Cross-product gives one face-normal per triangle. Sign is
+      // checked + flipped per-vertex at normalization time so
+      // backface-culling-off winding doesn't matter.
+      const e1x = highPosX[b] - highPosX[a], e1y = highPosY[b] - highPosY[a], e1z = highPosZ[b] - highPosZ[a];
+      const e2x = highPosX[c] - highPosX[a], e2y = highPosY[c] - highPosY[a], e2z = highPosZ[c] - highPosZ[a];
+      let fnx = e1y*e2z - e1z*e2y;
+      let fny = e1z*e2x - e1x*e2z;
+      let fnz = e1x*e2y - e1y*e2x;
+      accumNX[a] += fnx; accumNY[a] += fny; accumNZ[a] += fnz;
+      accumNX[b] += fnx; accumNY[b] += fny; accumNZ[b] += fnz;
+      accumNX[c] += fnx; accumNY[c] += fny; accumNZ[c] += fnz;
+      const e3x = highPosX[d] - highPosX[b], e3y = highPosY[d] - highPosY[b], e3z = highPosZ[d] - highPosZ[b];
+      const e4x = highPosX[c] - highPosX[b], e4y = highPosY[c] - highPosY[b], e4z = highPosZ[c] - highPosZ[b];
+      fnx = e3y*e4z - e3z*e4y;
+      fny = e3z*e4x - e3x*e4z;
+      fnz = e3x*e4y - e3y*e4x;
+      accumNX[b] += fnx; accumNY[b] += fny; accumNZ[b] += fnz;
+      accumNX[c] += fnx; accumNY[c] += fny; accumNZ[c] += fnz;
+      accumNX[d] += fnx; accumNY[d] += fny; accumNZ[d] += fnz;
+    }
+  }
+  for (let i = 0; i < N * N; i++) {
+    const ax = accumNX[i], ay = accumNY[i], az = accumNZ[i];
+    const len = Math.hypot(ax, ay, az);
+    if (len > 1e-9) {
+      let nx = ax / len, ny = ay / len, nz = az / len;
+      // Outward-orientation check via the unit-sphere radial
+      // (chunk verts are always on the outside of the sphere so
+      // radial dot > 0 means outward).
+      const rdot = nx * edgeDirs[i*3+0] + ny * edgeDirs[i*3+1] + nz * edgeDirs[i*3+2];
+      if (rdot < 0) { nx = -nx; ny = -ny; nz = -nz; }
+      edgeNrm[i*3+0] = nx;
+      edgeNrm[i*3+1] = ny;
+      edgeNrm[i*3+2] = nz;
+    }
+    // else: keep the radial fallback from pass 1.
   }
 
   // Pass 2: write interior verts. lowPos comes from bilinear interp
@@ -61695,15 +61756,20 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
         lpY = 0.25 * (highPosY[a] + highPosY[b] + highPosY[c] + highPosY[d]);
         lpZ = 0.25 * (highPosZ[a] + highPosZ[b] + highPosZ[c] + highPosZ[d]);
       }
+      // Sprint 9-4-fix: lambert per vertex with the face-normal-
+      // accumulated terrain normal. Now ridges catch sun + valleys
+      // shadow, instead of the old uniform radial-normal shading.
+      const nx = edgeNrm[gi*3+0], ny = edgeNrm[gi*3+1], nz = edgeNrm[gi*3+2];
+      const lambert = Math.max(ambient, nx * sunX + ny * sunY + nz * sunZ);
       verts[vWrite++] = highPosX[gi];
       verts[vWrite++] = highPosY[gi];
       verts[vWrite++] = highPosZ[gi];
-      verts[vWrite++] = edgeCol[gi*3+0];
-      verts[vWrite++] = edgeCol[gi*3+1];
-      verts[vWrite++] = edgeCol[gi*3+2];
-      verts[vWrite++] = edgeNrm[gi*3+0];
-      verts[vWrite++] = edgeNrm[gi*3+1];
-      verts[vWrite++] = edgeNrm[gi*3+2];
+      verts[vWrite++] = edgeCol[gi*3+0] * lambert;
+      verts[vWrite++] = edgeCol[gi*3+1] * lambert;
+      verts[vWrite++] = edgeCol[gi*3+2] * lambert;
+      verts[vWrite++] = nx;
+      verts[vWrite++] = ny;
+      verts[vWrite++] = nz;
       verts[vWrite++] = edgeBId[gi];
       verts[vWrite++] = morphLow;       // uv.y -- per-vertex copy
       verts[vWrite++] = lpX;
@@ -61747,15 +61813,21 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
     // 14-float vertex (CDLOD layout). morphLow = 0 disables morph
     // on skirt verts (they're spheroid-anchored, no parent geometry
     // to morph toward); lowPos = highPos for same reason.
+    // Sprint 9-4-fix: bake lambert into the skirt color too,
+    // matching the per-vertex shading now used for interior verts.
+    // edgeCol is base color (no lambert) per the pass-1 change;
+    // skirt's lambert uses its ring vertex's accumulated normal.
+    const skNx = edgeNrm[gi*3+0], skNy = edgeNrm[gi*3+1], skNz = edgeNrm[gi*3+2];
+    const skLambert = Math.max(ambient, skNx * sunX + skNy * sunY + skNz * sunZ);
     verts[vWrite++] = px;
     verts[vWrite++] = py;
     verts[vWrite++] = pz;
-    verts[vWrite++] = edgeCol[gi*3+0];
-    verts[vWrite++] = edgeCol[gi*3+1];
-    verts[vWrite++] = edgeCol[gi*3+2];
-    verts[vWrite++] = edgeNrm[gi*3+0];
-    verts[vWrite++] = edgeNrm[gi*3+1];
-    verts[vWrite++] = edgeNrm[gi*3+2];
+    verts[vWrite++] = edgeCol[gi*3+0] * skLambert;
+    verts[vWrite++] = edgeCol[gi*3+1] * skLambert;
+    verts[vWrite++] = edgeCol[gi*3+2] * skLambert;
+    verts[vWrite++] = skNx;
+    verts[vWrite++] = skNy;
+    verts[vWrite++] = skNz;
     verts[vWrite++] = edgeBId[gi];
     verts[vWrite++] = 0;        // morphLow = 0 -> skirt never morphs
     verts[vWrite++] = px;       // lowPos = highPos for skirts
@@ -65371,16 +65443,22 @@ function _encodeScenePass(enc, entry) {
       inst.drawScratch[42] = 0;
       inst.drawScratch[43] = 0;
     }
-    // Phase 8 sprint 8-6 -- PlanetMesh vertex-displacement flag.
-    // vsParams.x = displacementScale (param), .z = 1.0 marker that
-    // tells vs_main "this is a planet vertex, apply detail-noise
-    // displacement". Skip for the synthesized detail-patch entry
-    // (it uses vs_planet_detail and packs different vsParams below).
-    if (m.node && m.node.type === "PlanetMesh" && !m.isPlanetDetailPatch) {
-      const ptp = m.node.params || {};
-      const dispScale = (typeof ptp.displacementScale === "number") ? ptp.displacementScale : 500.0;
-      inst.drawScratch[40] = dispScale;  // vsParams.x
-      inst.drawScratch[42] = 1.0;        // vsParams.z (planet flag)
+    // Sprint 9-3 / 9-4-fix: for PlanetMesh draws, vsParams now
+    // carries the f32 approximation of the chunk's anchorF64 so
+    // vs_planet_cdlod can reconstruct world position by adding it
+    // to the anchor-relative vertex. (sprint 9-3 had repurposed
+    // uD.model for mv_rtc = view * translate(anchor), which lands
+    // pos in VIEW space; the fragment-side worldPos consumers --
+    // biome textures, atmosphere, lighting -- need true world
+    // space.) The old displacementScale-flag use of vsParams in
+    // vs_main is retired (displacementScale default 0 after 9-1).
+    if (m.node && m.node.type === "PlanetMesh" && !m.isPlanetDetailPatch
+        && buf && buf.tiledChunks && buf.tiledChunks.length > 0) {
+      const anchor = buf.tiledChunks[0].anchorF64 || { x: 0, y: 0, z: 0 };
+      inst.drawScratch[40] = anchor.x;   // vsParams.x = anchorF32.x
+      inst.drawScratch[41] = anchor.y;   // vsParams.y = anchorF32.y
+      inst.drawScratch[42] = anchor.z;   // vsParams.z = anchorF32.z
+      inst.drawScratch[43] = 0;
     }
     // Phase 8 sprint 8-7b -- synthesized planet detail-patch
     // per-draw uniforms. Reads detailPatch* params from the
