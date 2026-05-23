@@ -47111,6 +47111,147 @@ function _planetValueNoise3D(x, y, z) {
   const y1 = x01 + (x11 - x01) * uy;
   return y0 + (y1 - y0) * uz;
 }
+
+/* Sprint 9-5 -- value noise with analytic gradient (Iñigo Quilez's
+ * `noised` recipe). Returns [value, ∂/∂x, ∂/∂y, ∂/∂z] for the same
+ * cubic-smoothstepped 3D value noise. Used by Swiss and Jordan
+ * turbulence (shapes 5 and 6 below) -- Carpentier's gradient-feed-
+ * back trick makes mountains read as eroded instead of fractal-
+ * fuzz, at ~5x the cost of plain value noise per octave. */
+function _planetValueNoise3DDeriv(x, y, z) {
+  const ix = Math.floor(x), iy = Math.floor(y), iz = Math.floor(z);
+  const fx = x - ix, fy = y - iy, fz = z - iz;
+  const ux = fx * fx * (3 - 2 * fx);
+  const uy = fy * fy * (3 - 2 * fy);
+  const uz = fz * fz * (3 - 2 * fz);
+  const dux = 6 * fx * (1 - fx);
+  const duy = 6 * fy * (1 - fy);
+  const duz = 6 * fz * (1 - fz);
+  const a = _planetHash13(ix,     iy,     iz    );
+  const b = _planetHash13(ix + 1, iy,     iz    );
+  const c = _planetHash13(ix,     iy + 1, iz    );
+  const d = _planetHash13(ix + 1, iy + 1, iz    );
+  const e = _planetHash13(ix,     iy,     iz + 1);
+  const f = _planetHash13(ix + 1, iy,     iz + 1);
+  const g = _planetHash13(ix,     iy + 1, iz + 1);
+  const h = _planetHash13(ix + 1, iy + 1, iz + 1);
+  const k1 = b - a;
+  const k2 = c - a;
+  const k3 = e - a;
+  const k4 = a - b - c + d;
+  const k5 = a - c - e + g;
+  const k6 = a - b - e + f;
+  const k7 = -a + b + c - d + e - f - g + h;
+  const val = a + k1*ux + k2*uy + k3*uz
+            + k4*ux*uy + k5*uy*uz + k6*uz*ux + k7*ux*uy*uz;
+  const gx = dux * (k1 + k4*uy + k6*uz + k7*uy*uz);
+  const gy = duy * (k2 + k5*uz + k4*ux + k7*uz*ux);
+  const gz = duz * (k3 + k6*ux + k5*uy + k7*ux*uy);
+  return [val, gx, gy, gz];
+}
+
+/* Sprint 9-5 -- Swiss turbulence (Carpentier 2010, "Scape" engine).
+ * Ridged value noise where each next-octave amplitude is modulated
+ * by the cumulative noise sum and each next-octave input position
+ * is warped by the cumulative gradient. The output reads as
+ * eroded alpine terrain: sharp ridges, smooth valleys, no fractal-
+ * fuzz on flats. ~5x cost of plain fbm at the same octave count. */
+function _planetSwissTurbulence(wx, wy, wz, baseFreq, lacunarity, roughness, warpStrength, octF) {
+  const fullOct = Math.floor(octF);
+  const fade = octF - fullOct;
+  const totalOct = Math.min(12, fullOct + (fade > 0.001 ? 1 : 0));
+  const warpK = warpStrength > 0 ? warpStrength : 0.15;
+  let sum = 0, ampSum = 0;
+  let freq = baseFreq, amp = 1;
+  let dsumX = 0, dsumY = 0, dsumZ = 0;
+  for (let k = 0; k < totalOct; k++) {
+    const ox = k * 13.37, oy = k * 7.91, oz = k * 23.45;
+    const px = (wx + warpK * dsumX) * freq + ox;
+    const py = (wy + warpK * dsumY) * freq + oy;
+    const pz = (wz + warpK * dsumZ) * freq + oz;
+    const nd = _planetValueNoise3DDeriv(px, py, pz);
+    const sn = nd[0] * 2 - 1;
+    const ridgeV = 1 - Math.abs(sn);
+    const sgn = sn >= 0 ? 1 : -1;
+    const gradX = -2 * sgn * nd[1] * freq;
+    const gradY = -2 * sgn * nd[2] * freq;
+    const gradZ = -2 * sgn * nd[3] * freq;
+    const w = (k === fullOct && fade > 0.001 && fade < 0.999) ? fade : 1;
+    sum    += amp * ridgeV * w;
+    ampSum += amp * w;
+    dsumX  += amp * gradX * w;
+    dsumY  += amp * gradY * w;
+    dsumZ  += amp * gradZ * w;
+    freq *= lacunarity;
+    // Amplitude shrinks where the cumulative noise sum is high
+    // (steep terrain dampens finer octaves -- Carpentier's
+    // alpine-erosion signature).
+    amp *= roughness * Math.max(0, Math.min(1, sum));
+  }
+  return (ampSum > 1e-6) ? (sum / ampSum) : 0;
+}
+
+/* Sprint 9-5 -- Jordan turbulence (Carpentier 2010, "Scape").
+ * Squared value noise (so all positive, slight billow), with
+ * separate "warp" and "damp" gradient accumulators that bend
+ * finer octaves downhill (fluvial-erosion gulleys) and attenuate
+ * amplitude in flats (thermal-erosion plateaus). Most heavily-
+ * eroded look in Scape; produces rounded, river-carved
+ * mountains. */
+function _planetJordanTurbulence(wx, wy, wz, baseFreq, lacunarity, roughness, warpStrength, octF) {
+  const fullOct = Math.floor(octF);
+  const fade = octF - fullOct;
+  const totalOct = Math.min(12, fullOct + (fade > 0.001 ? 1 : 0));
+  const gain1 = 0.8;
+  const warp0 = 0.4;
+  const warpK = warpStrength > 0 ? warpStrength : 0.35;
+  const damp0 = 1.0;
+  const dampK = 0.8;
+  const dampScale = 1.0;
+  // Octave 0: seed both accumulators.
+  const nd0 = _planetValueNoise3DDeriv(wx * baseFreq, wy * baseFreq, wz * baseFreq);
+  const sn0 = nd0[0] * 2 - 1;
+  let sum = sn0 * sn0;
+  let ampSum = 1;
+  let warpDX = warp0 * 2 * sn0 * nd0[1] * baseFreq;
+  let warpDY = warp0 * 2 * sn0 * nd0[2] * baseFreq;
+  let warpDZ = warp0 * 2 * sn0 * nd0[3] * baseFreq;
+  let dampDX = damp0 * 2 * sn0 * nd0[1] * baseFreq;
+  let dampDY = damp0 * 2 * sn0 * nd0[2] * baseFreq;
+  let dampDZ = damp0 * 2 * sn0 * nd0[3] * baseFreq;
+  let freq = baseFreq * lacunarity;
+  let amp = gain1;
+  let damped = amp * dampScale;
+  for (let k = 1; k < totalOct; k++) {
+    const ox = k * 13.37, oy = k * 7.91, oz = k * 23.45;
+    const px = (wx * freq) + warpDX + ox;
+    const py = (wy * freq) + warpDY + oy;
+    const pz = (wz * freq) + warpDZ + oz;
+    const nd = _planetValueNoise3DDeriv(px, py, pz);
+    const sn = nd[0] * 2 - 1;
+    const sq = sn * sn;
+    const gx = 2 * sn * nd[1] * freq;
+    const gy = 2 * sn * nd[2] * freq;
+    const gz = 2 * sn * nd[3] * freq;
+    const w = (k === fullOct && fade > 0.001 && fade < 0.999) ? fade : 1;
+    sum    += damped * sq * w;
+    ampSum += damped * w;
+    warpDX += warpK * amp * gx * w;
+    warpDY += warpK * amp * gy * w;
+    warpDZ += warpK * amp * gz * w;
+    dampDX += dampK * amp * gx * w;
+    dampDY += dampK * amp * gy * w;
+    dampDZ += dampK * amp * gz * w;
+    freq *= lacunarity;
+    amp  *= roughness;
+    const dampLen = Math.sqrt(dampDX*dampDX + dampDY*dampDY + dampDZ*dampDZ);
+    damped = amp * Math.max(0, 1 - Math.min(1, dampLen));
+  }
+  // Squared noise lives in [0, 1]; recenter to [-1, 1] so the
+  // output is zero-mean displacement like other shapes.
+  return (ampSum > 1e-6) ? ((sum / ampSum) * 2 - 1) : 0;
+}
+
 function _planetDetailNoiseHeight(wx, wy, wz, biomeId, biomeOverride, maxOctaveF) {
   if (biomeId < 0 || biomeId > 12) return 0;
   if (typeof PLANET_BIOME_DETAIL_DEFAULTS === "undefined") return 0;
@@ -47127,6 +47268,15 @@ function _planetDetailNoiseHeight(wx, wy, wz, biomeId, biomeOverride, maxOctaveF
   // pre-sprint-9-4 callers (legacy collision / walk surface) bit-
   // identical.
   const octF = (typeof maxOctaveF === "number" && maxOctaveF > 0) ? maxOctaveF : 6;
+  // Sprint 9-5: shape 5 = Swiss, shape 6 = Jordan. Both use the
+  // analytic-gradient pipeline (Carpentier); biome's warpStrength
+  // (def[5]) controls erosion intensity.
+  if (shape === 5) {
+    return _planetSwissTurbulence(wx, wy, wz, baseFreq, lacunarity, roughness, def[5], octF) * amplitude;
+  }
+  if (shape === 6) {
+    return _planetJordanTurbulence(wx, wy, wz, baseFreq, lacunarity, roughness, def[5], octF) * amplitude;
+  }
   const fullOctaves = Math.floor(octF);
   const fade = octF - fullOctaves;
   const totalOct = Math.min(12, fullOctaves + (fade > 0.001 ? 1 : 0));
@@ -58910,36 +59060,43 @@ const PLANET_BIOMES_NAMES = [
 // sub-noise micro-bumps invisible at foot level (~30x too low per
 // the research dive: Outerra, Iñigo Quilez, Carpentier, Star
 // Citizen all sit in the 20-200 m range for visible relief while
-// keeping the macro silhouette readable from orbit). Per-biome
-// shape choice unchanged; just bumping the amp column.
+// keeping the macro silhouette readable from orbit).
+// Sprint 9-5: mountain biomes promoted to Swiss/Jordan turbulence
+// (analytic-derivative gradient feedback). Glacier + Taiga + Tundra
+// run Swiss (alpine erosion: sharp ridges, smooth valleys); tropical
+// rainforest runs Jordan (fluvial erosion: river-carved gulleys).
+// Other biomes keep their existing shapes (Hot desert = dunes,
+// flatter biomes = fbm) since Swiss/Jordan are ~5x noise cost and
+// the difference is only visible on actual mountains.
 //   col 0 = amplitude (m, peak displacement)
 //   col 1 = baseFreq (1/m, ≈ 1/wavelength_max)
 //   col 2 = roughness (per-octave amp ratio, ≈ gain)
 //   col 3 = lacunarity (per-octave freq ratio)
 //   col 4 = shape enum  0=fbm 1=ridged 2=billowed 3=dunes 4=cracks
-//   col 5 = warpStrength
+//                       5=Swiss (alpine erosion) 6=Jordan (fluvial)
+//   col 5 = warpStrength  (Swiss: 0.10-0.20; Jordan: 0.30-0.40)
 //   col 6 = warpFreq
 //   col 7 = textureStyleId
 const PLANET_BIOME_DETAIL_DEFAULTS = [
   [  0.0, 0.0010, 0.50, 2.0, 0.0, 0.0,    0.0,    0.0],  // 0 Marine (flat)
-  [ 80.0, 0.0010, 0.55, 2.0, 3.0, 0.4,    0.0005, 2.0],  // 1 Hot desert (dunes, large amp)
+  [ 80.0, 0.0010, 0.55, 2.0, 3.0, 0.4,    0.0005, 2.0],  // 1 Hot desert (dunes)
   [ 50.0, 0.0010, 0.55, 2.0, 3.0, 0.3,    0.0005, 6.0],  // 2 Cold desert
   [ 30.0, 0.0008, 0.50, 2.0, 0.0, 0.0,    0.0,    6.0],  // 3 Savanna (rolling hills)
   [ 20.0, 0.0005, 0.50, 2.0, 0.0, 0.0,    0.0,    3.0],  // 4 Grassland (gentle hills)
   [ 40.0, 0.0012, 0.50, 2.0, 0.0, 0.0,    0.0,    3.0],  // 5 Trop seasonal forest
   [ 60.0, 0.0010, 0.55, 2.0, 0.0, 0.0,    0.0,    3.0],  // 6 Temp deciduous forest
-  [ 50.0, 0.0012, 0.50, 2.0, 0.0, 0.0,    0.0,    3.0],  // 7 Trop rainforest (river valleys)
+  [ 50.0, 0.0012, 0.50, 2.0, 6.0, 0.35,   0.0,    3.0],  // 7 Trop rainforest (Jordan -- river-carved)
   [ 70.0, 0.0010, 0.55, 2.0, 0.0, 0.0,    0.0,    3.0],  // 8 Temp rainforest
-  [120.0, 0.0008, 0.60, 2.0, 1.0, 0.3,    0.0003, 1.0],  // 9 Taiga (rocky / ridged)
-  [ 90.0, 0.0006, 0.55, 2.0, 1.0, 0.2,    0.0003, 4.0],  // 10 Tundra (low ridges)
-  [200.0, 0.0006, 0.65, 2.0, 1.0, 0.5,    0.0003, 5.0],  // 11 Glacier (alpine ridged)
+  [120.0, 0.0008, 0.60, 2.0, 5.0, 0.15,   0.0,    1.0],  // 9 Taiga (Swiss -- alpine ridged)
+  [ 90.0, 0.0006, 0.55, 2.0, 5.0, 0.12,   0.0,    4.0],  // 10 Tundra (Swiss -- low ridges)
+  [200.0, 0.0006, 0.65, 2.0, 5.0, 0.18,   0.0,    5.0],  // 11 Glacier (Swiss -- glacial cirques)
   [ 15.0, 0.0008, 0.40, 2.0, 0.0, 0.0,    0.0,    3.0]   // 12 Wetland (flat-ish)
 ];
 const PLANET_BIOME_TEX_STYLES = [
   "none", "rock", "sand", "grass", "snow", "ice", "dirt"
 ];
 const PLANET_BIOME_SHAPES = [
-  "fbm", "ridged", "billowed", "dunes", "cracks"
+  "fbm", "ridged", "billowed", "dunes", "cracks", "swiss", "jordan"
 ];
 
 // Phase 8 sprint 8-5 -- thumbnail generation for the texture browser.
