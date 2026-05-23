@@ -10804,10 +10804,19 @@ public:
       { n: "heightScale",       t: "param" },
       { n: "seaLevel",          t: "param" },
       { n: "subdivide",         t: "param" },
-      // Sprint 9-1: cube-sphere static base resolution (verts per
-      // face edge). Static base for now; the quadtree (9-2) takes
-      // over and this becomes the coarsest LOD level.
+      // Sprint 9-1: cube-sphere static base resolution (legacy --
+      // reachable only when the chunked path is bypassed for debug).
       { n: "gridResolution",    t: "param" },
+      // Sprint 9-2: quadtree-streaming knobs. Each visible leaf is
+      // a (segments+1)^2 grid in cube-face (u, v) coords; chunks
+      // split when distance < chunkEdge * splitFactor up to maxDepth.
+      // Foot-to-orbit on Earth radius wants maxDepth ~14-16 so leaf
+      // chunkEdge gets to ~10m (Earth surface circumference 40000km /
+      // 4 quadrants / 2^14 chunks per quadrant ≈ 610m per chunkEdge
+      // -- enough for foot-level silhouette when segs >= 16).
+      { n: "segments",          t: "param" },
+      { n: "maxDepth",          t: "param" },
+      { n: "splitFactor",       t: "param" },
       // Phase 8 sprint 8-3b -- texture inputs. When wired, the planet
       // body fragments sample triplanar from these textures (mixed
       // with the baked biome / water shading). When unwired, the
@@ -10847,6 +10856,12 @@ public:
       heightScale: 0, seaLevel: 0.5,
       subdivide: 0,
       gridResolution: 129,
+      // Sprint 9-2 defaults: 16 verts/chunk-edge, 12 LOD levels
+      // (~5km leaves on Earth), splitFactor 5 = split when camera is
+      // within 5x the chunk's edge-length.
+      segments: 16,
+      maxDepth: 12,
+      splitFactor: 5.0,
       textureScale: 0.001,
       textureMix:   1.0,
       // Sprint 9-1: per-vertex detail-noise displacement retired in
@@ -57376,6 +57391,14 @@ function _ensureMeshBuffers(meshEntry) {
   if (node.type === "Planet") {
     return _ensurePlanetChunks(node);
   }
+  // Sprint 9-2: PlanetMesh routes through the cube-sphere quadtree
+  // streaming path (same per-chunk pattern Planet uses, but reading
+  // elevation from the wired PlanetMap's cell graph). Replaces the
+  // sprint 9-1 static cube-sphere single-mesh builder, which is now
+  // unreachable but kept in the file as a reference fallback.
+  if (node.type === "PlanetMesh") {
+    return _ensurePlanetMeshChunks(node);
+  }
   const cached = Visual.meshBufferCache.get(node.id);
   if (cached && _meshCacheKey(node) === cached.cacheKey) return cached;
   // Params changed -- destroy + rebuild. Cheap (just a couple of
@@ -61287,6 +61310,348 @@ function _ensurePlanetChunks(node) {
  * (unexpected), return an empty mesh rather than crashing. */
 function _buildPlanet(node) {
   return null;   // streaming path is the real route; _ensureMeshBuffers handles null safely
+}
+
+/* Sprint 9-2 -- PlanetMesh quadtree streaming. Mirrors the legacy
+ * Planet path (_ensurePlanetChunks / _buildSinglePlanetChunk) but
+ * sources elevation from the wired PlanetMap's cell graph instead
+ * of runtime fbm. Same per-chunk VBO/IBO + visible-set Map + two-
+ * phase placeholder/upgrade build + frustum cull machinery -- the
+ * geometry plumbing is unchanged; only the height function differs.
+ *
+ * Per-frame: walk the cube-sphere quadtree from the camera; each
+ * face root recurses, splitting when distance < chunkEdge * split-
+ * Factor with horizon-occlusion culling. Visible chunks are built
+ * lazily (segs=2 placeholder first, then upgraded to full segs
+ * under a time budget). Chunks leaving the visible set get their
+ * GPU buffers destroyed. */
+function _resolvePlanetMeshGeom(p) {
+  const polRatio = Math.max(0.5, Math.min(1.5, (typeof p.polarRadiusRatio === "number") ? p.polarRadiusRatio : 1.0));
+  return {
+    r:        (typeof p.radius   === "number") ? p.radius   : 1000,
+    polRatio,
+    polRatio2: polRatio * polRatio,
+    cxC: (typeof p.centerX === "number") ? p.centerX : 0,
+    cyC: (typeof p.centerY === "number") ? p.centerY : 0,
+    czC: (typeof p.centerZ === "number") ? p.centerZ : 0,
+    segs:        Math.max(2, Math.min(64, Math.floor((typeof p.segments === "number") ? p.segments : 16))),
+    maxDepth:    Math.max(0, Math.min(18, Math.floor((typeof p.maxDepth    === "number") ? p.maxDepth    : 12))),
+    splitFactor: Math.max(0.1, Math.min(50, (typeof p.splitFactor === "number") ? p.splitFactor : 5.0)),
+    hs:       (typeof p.heightScale === "number") ? p.heightScale : 0,
+    seaLevel: Math.max(0, Math.min(1, (typeof p.seaLevel === "number") ? p.seaLevel : 0.5))
+  };
+}
+
+function _planetMeshGlobalCacheKey(node) {
+  const p = node.params || {};
+  return [
+    p.radius, p.polarRadiusRatio,
+    p.centerX, p.centerY, p.centerZ,
+    p.segments, p.maxDepth, p.splitFactor,
+    p.heightScale, p.seaLevel
+  ].join(",");
+}
+
+function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cells) {
+  if (!Visual.device) return null;
+  const p = node.params || {};
+  const geom = _resolvePlanetMeshGeom(p);
+  const r = geom.r, polRatio = geom.polRatio, polRatio2 = geom.polRatio2;
+  const cxC = geom.cxC, cyC = geom.cyC, czC = geom.czC;
+  const hs = geom.hs, seaLevel = geom.seaLevel;
+  const segs = info.segs;
+  const sunX = sun[0], sunY = sun[1], sunZ = sun[2];
+
+  const face = _PLANET_FACES[info.face];
+  const nX = face.n[0], nY = face.n[1], nZ = face.n[2];
+  const tX = face.t[0], tY = face.t[1], tZ = face.t[2];
+  const bX = face.b[0], bY = face.b[1], bZ = face.b[2];
+
+  // Per-cell biome / river / lake coloring -- same recipe as the
+  // legacy single-mesh path so the planet looks identical from
+  // orbit, just chunked toward the camera now.
+  const RIVER_BLUE = [0.20, 0.45, 0.75];
+  const RIVER_BIG  = [0.15, 0.32, 0.62];
+  const colorForCell = function(idx, elev) {
+    if (cells.lake && cells.lake[idx]) return PLANET_BIOMES_COLORS[0];
+    if (cells.riverId && cells.riverId[idx] >= 0 && cells.flux && elev >= seaLevel) {
+      const flx = cells.flux[idx];
+      const t = Math.min(1, Math.max(0, (flx - 30) / 200));
+      return [
+        RIVER_BLUE[0] + (RIVER_BIG[0] - RIVER_BLUE[0]) * t,
+        RIVER_BLUE[1] + (RIVER_BIG[1] - RIVER_BLUE[1]) * t,
+        RIVER_BLUE[2] + (RIVER_BIG[2] - RIVER_BLUE[2]) * t
+      ];
+    }
+    if (cells.biome) return PLANET_BIOMES_COLORS[cells.biome[idx]];
+    return _planetColorForHeight(elev, seaLevel);
+  };
+  const biomeForCell = function(idx, elev) {
+    if (cells.lake && cells.lake[idx]) return 0;
+    if (cells.riverId && cells.riverId[idx] >= 0 && cells.flux && elev >= seaLevel) return 0;
+    if (cells.biome) return cells.biome[idx];
+    return 0;
+  };
+
+  const N = segs + 1;
+  const verts = new Float32Array(N * N * 11);
+  const indices = new Uint32Array(segs * segs * 6);
+  let vWrite = 0, iWrite = 0;
+  let minX = Infinity, minY = Infinity, minZ = Infinity;
+  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+
+  for (let iy = 0; iy <= segs; iy++) {
+    const fy01 = iy / segs;
+    const v = info.vMin + (info.vMax - info.vMin) * fy01;
+    for (let ix = 0; ix <= segs; ix++) {
+      const fx01 = ix / segs;
+      const u = info.uMin + (info.uMax - info.uMin) * fx01;
+      const cx = nX + tX * u + bX * v;
+      const cy = nY + tY * u + bY * v;
+      const cz = nZ + tZ * u + bZ * v;
+      // Phil Nowell spherified-cube projection.
+      const cxx = cx * cx, cyy = cy * cy, czz = cz * cz;
+      const sx = cx * Math.sqrt(Math.max(0, 1 - cyy * 0.5 - czz * 0.5 + cyy * czz / 3));
+      const sy = cy * Math.sqrt(Math.max(0, 1 - cxx * 0.5 - czz * 0.5 + cxx * czz / 3));
+      const sz = cz * Math.sqrt(Math.max(0, 1 - cxx * 0.5 - cyy * 0.5 + cxx * cyy / 3));
+      const invLen = 1 / Math.max(1e-12, Math.sqrt(sx*sx + sy*sy + sz*sz));
+      const ux = sx * invLen, uy = sy * invLen, uz = sz * invLen;
+      // PlanetMap cell lookup at this direction.
+      const cellIdx = _findNearestCell(cells, pmap._cellsHash, ux, uy, uz);
+      const elev = (cellIdx >= 0) ? cells.elevations[cellIdx] : 0;
+      let altitude = 0;
+      if (elev > seaLevel && hs !== 0) {
+        altitude = hs * (elev - seaLevel) / Math.max(1e-6, 1 - seaLevel);
+      }
+      const px = cxC + r * ux           + altitude * ux;
+      const py = cyC + r * uy * polRatio + altitude * uy;
+      const pz = czC + r * uz           + altitude * uz;
+      const baseCol = (cellIdx >= 0) ? colorForCell(cellIdx, elev) : _planetColorForHeight(elev, seaLevel);
+      const biomeId = (cellIdx >= 0) ? biomeForCell(cellIdx, elev) : 0;
+      // Approximate normal: oblate-spheroid surface normal at this
+      // direction. Doesn't capture per-vertex elevation gradients, so
+      // mountains shade flat-lit -- acceptable for sprint 9-2; proper
+      // face-normal accumulation can come in a polish pass.
+      const nxn = ux;
+      const nyn = uy / polRatio2;
+      const nzn = uz;
+      const ninv = 1 / Math.max(1e-12, Math.sqrt(nxn*nxn + nyn*nyn + nzn*nzn));
+      const nuX = nxn * ninv, nuY = nyn * ninv, nuZ = nzn * ninv;
+      const lambert = Math.max(ambient, nuX * sunX + nuY * sunY + nuZ * sunZ);
+
+      if (px < minX) minX = px; if (px > maxX) maxX = px;
+      if (py < minY) minY = py; if (py > maxY) maxY = py;
+      if (pz < minZ) minZ = pz; if (pz > maxZ) maxZ = pz;
+      verts[vWrite++] = px;
+      verts[vWrite++] = py;
+      verts[vWrite++] = pz;
+      verts[vWrite++] = baseCol[0] * lambert;
+      verts[vWrite++] = baseCol[1] * lambert;
+      verts[vWrite++] = baseCol[2] * lambert;
+      verts[vWrite++] = nuX; verts[vWrite++] = nuY; verts[vWrite++] = nuZ;
+      verts[vWrite++] = biomeId; verts[vWrite++] = 0;
+    }
+  }
+  for (let iy = 0; iy < segs; iy++) {
+    for (let ix = 0; ix < segs; ix++) {
+      const a = iy * N + ix;
+      const b = a + 1;
+      const c = a + N;
+      const d = c + 1;
+      indices[iWrite++] = a; indices[iWrite++] = c; indices[iWrite++] = b;
+      indices[iWrite++] = b; indices[iWrite++] = c; indices[iWrite++] = d;
+    }
+  }
+
+  const vertexBuffer = Visual.device.createBuffer({
+    label: "planetmesh-vb-" + info.face + "-" + info.depth + "-" + info.ix + "-" + info.iy + "-" + segs,
+    size: verts.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    mappedAtCreation: true
+  });
+  new Float32Array(vertexBuffer.getMappedRange()).set(verts);
+  vertexBuffer.unmap();
+  const indexBuffer = Visual.device.createBuffer({
+    label: "planetmesh-ib-" + info.face + "-" + info.depth + "-" + info.ix + "-" + info.iy + "-" + segs,
+    size: indices.byteLength,
+    usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+    mappedAtCreation: true
+  });
+  new Uint32Array(indexBuffer.getMappedRange()).set(indices);
+  indexBuffer.unmap();
+
+  return {
+    vertexBuffer,
+    indexBuffer,
+    indexCount: iWrite,
+    aabbMin: new Float32Array([minX, minY, minZ]),
+    aabbMax: new Float32Array([maxX, maxY, maxZ]),
+    face: info.face,
+    depth: info.depth,
+    ix: info.ix,
+    iy: info.iy
+  };
+}
+
+function _ensurePlanetMeshChunks(node) {
+  if (!Visual.device) return null;
+  if (!Visual.planetMeshChunkCache) Visual.planetMeshChunkCache = new Map();
+  let entry = Visual.planetMeshChunkCache.get(node.id);
+  if (!entry) {
+    entry = { chunks: new Map(), globalKey: null };
+    Visual.planetMeshChunkCache.set(node.id, entry);
+  }
+
+  // Find wired PlanetMap. PlanetMesh requires one -- the elevation
+  // source. Without it we emit no chunks (consistent with the old
+  // single-mesh builder's null-return behavior).
+  let pmap = null;
+  if (state && Array.isArray(state.edges)) {
+    const ed = state.edges.find(e =>
+      e && e.to && e.to.node === node.id && e.to.port === "heightmap"
+    );
+    if (ed && ed.from) {
+      pmap = state.nodes.find(n => n && n.id === ed.from.node && n.type === "PlanetMap") || null;
+    }
+  }
+  if (!pmap) {
+    return { tiledChunks: [], vertexBuffer: null, indexBuffer: null,
+             vertexCount: 0, indexCount: 0,
+             aabbMin: new Float32Array([0,0,0]), aabbMax: new Float32Array([0,0,0]),
+             cacheKey: "planetmesh-no-map" };
+  }
+  const cells = _ensurePlanetMapCells(pmap);
+  if (!cells || !pmap._cellsHash) {
+    return { tiledChunks: [], vertexBuffer: null, indexBuffer: null,
+             vertexCount: 0, indexCount: 0,
+             aabbMin: new Float32Array([0,0,0]), aabbMax: new Float32Array([0,0,0]),
+             cacheKey: "planetmesh-no-cells" };
+  }
+  _ensurePlanetClimate(pmap, _resolvePlanetMeshGeom(node.params || {}).seaLevel);
+  _ensurePlanetRivers(pmap, _resolvePlanetMeshGeom(node.params || {}).seaLevel);
+
+  // Invalidate the whole chunk cache when global geometry params OR
+  // the wired PlanetMap's cells change (elevation edits in the
+  // painter bump pmap._cellsKey).
+  const pmKey = (typeof pmap._cellsKey === "string") ? pmap._cellsKey : "no-key";
+  const globalKey = _planetMeshGlobalCacheKey(node) + "|" + pmKey;
+  if (globalKey !== entry.globalKey) {
+    for (const c of entry.chunks.values()) {
+      try { c.vertexBuffer && c.vertexBuffer.destroy(); } catch (_) {}
+      try { c.indexBuffer  && c.indexBuffer.destroy();  } catch (_) {}
+    }
+    entry.chunks.clear();
+    entry.globalKey = globalKey;
+  }
+
+  const geom = _resolvePlanetMeshGeom(node.params || {});
+  const camPosWorld = _planetCameraPos(node);
+  const camPos = {
+    x: camPosWorld.x - geom.cxC,
+    y: camPosWorld.y - geom.cyC,
+    z: camPosWorld.z - geom.czC
+  };
+  const visList = _planetVisibleChunks(camPos, geom.r, geom.hs, geom.maxDepth, geom.splitFactor);
+  const visible = new Map();
+  for (const v of visList) {
+    visible.set(_planetChunkKey(v.face, v.depth, v.ix, v.iy), v);
+  }
+
+  // Drop chunks that left the visible set.
+  const keysToDrop = [];
+  for (const key of entry.chunks.keys()) {
+    if (!visible.has(key)) keysToDrop.push(key);
+  }
+  for (const key of keysToDrop) {
+    const c = entry.chunks.get(key);
+    try { c.vertexBuffer && c.vertexBuffer.destroy(); } catch (_) {}
+    try { c.indexBuffer  && c.indexBuffer.destroy();  } catch (_) {}
+    entry.chunks.delete(key);
+  }
+
+  const sun = _planetSunDir();
+  const ambient = 0.18;
+
+  // Two-phase incremental build under per-frame time budgets. Phase 1
+  // = segs=2 placeholder so every visible chunk has SOMETHING within a
+  // frame. Phase 2 = upgrade to full segs. Same shape as legacy Planet.
+  const phPending = [];
+  for (const [key, info] of visible) {
+    if (entry.chunks.has(key)) continue;
+    phPending.push({ key, info });
+  }
+  phPending.sort((a, b) => b.info.depth - a.info.depth);
+  const PH_BUDGET_MS = 8;
+  const phStart = performance.now();
+  for (let i = 0; i < phPending.length; i++) {
+    const item = phPending[i];
+    const ph = _buildSinglePlanetMeshChunk(node, Object.assign({}, item.info, { segs: 2 }), camPos, sun, ambient, pmap, cells);
+    if (ph) {
+      ph.currentLod = 2;
+      entry.chunks.set(item.key, ph);
+    }
+    if (performance.now() - phStart > PH_BUDGET_MS) break;
+  }
+
+  const upPending = [];
+  for (const [key, info] of visible) {
+    const c = entry.chunks.get(key);
+    if (!c || c.currentLod === geom.segs) continue;
+    upPending.push({ key, info, c });
+  }
+  upPending.sort((a, b) => b.info.depth - a.info.depth);
+  const UP_BUDGET_MS = 12;
+  const upStart = performance.now();
+  for (let i = 0; i < upPending.length; i++) {
+    const item = upPending[i];
+    const proper = _buildSinglePlanetMeshChunk(node, Object.assign({}, item.info, { segs: geom.segs }), camPos, sun, ambient, pmap, cells);
+    if (proper) {
+      try { item.c.vertexBuffer && item.c.vertexBuffer.destroy(); } catch (_) {}
+      try { item.c.indexBuffer  && item.c.indexBuffer.destroy();  } catch (_) {}
+      proper.currentLod = geom.segs;
+      entry.chunks.set(item.key, proper);
+    }
+    if (performance.now() - upStart > UP_BUDGET_MS) break;
+  }
+
+  // Aggregate AABB for the outer (whole-mesh) frustum cull.
+  let aabbMin, aabbMax;
+  if (entry.chunks.size === 0) {
+    aabbMin = new Float32Array([0, 0, 0]);
+    aabbMax = new Float32Array([0, 0, 0]);
+  } else {
+    aabbMin = new Float32Array([Infinity, Infinity, Infinity]);
+    aabbMax = new Float32Array([-Infinity, -Infinity, -Infinity]);
+    for (const c of entry.chunks.values()) {
+      if (c.aabbMin[0] < aabbMin[0]) aabbMin[0] = c.aabbMin[0];
+      if (c.aabbMin[1] < aabbMin[1]) aabbMin[1] = c.aabbMin[1];
+      if (c.aabbMin[2] < aabbMin[2]) aabbMin[2] = c.aabbMin[2];
+      if (c.aabbMax[0] > aabbMax[0]) aabbMax[0] = c.aabbMax[0];
+      if (c.aabbMax[1] > aabbMax[1]) aabbMax[1] = c.aabbMax[1];
+      if (c.aabbMax[2] > aabbMax[2]) aabbMax[2] = c.aabbMax[2];
+    }
+  }
+  const allChunks = [];
+  for (const c of entry.chunks.values()) allChunks.push(c);
+  if (!Visual._planetMeshQuadtreeLogged) {
+    Visual._planetMeshQuadtreeLogged = true;
+    console.log("[planetmesh-quadtree] first build:"
+      + " visible=" + visible.size
+      + " resident=" + entry.chunks.size
+      + " maxDepth=" + geom.maxDepth
+      + " splitFactor=" + geom.splitFactor.toFixed(1)
+      + " segs=" + geom.segs);
+  }
+  return {
+    tiledChunks: allChunks,
+    vertexBuffer: null,
+    indexBuffer: null,
+    vertexCount: 0,
+    indexCount: 0,
+    aabbMin,
+    aabbMax,
+    cacheKey: "planetmesh-streamed"
+  };
 }
 
 /* §planet-spec Phase 7.d-azgaar -- direct cell-mesh planet builder.
