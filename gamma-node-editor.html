@@ -58735,18 +58735,117 @@ const _PLANET_FACES = [
  * direction, find the cube face by max-component test, project to
  * face-local (u, v), bilinear-sample the 4 nearest texels. Inverse
  * of the bake's face projection, by construction. */
+/* Sprint 10-1b -- ridge enhancement (the procedural-tectonic
+ * substitute for Cortial 2019's plate-boundary uplift). For each
+ * high cell whose neighbors are ALSO high, boost its elevation in
+ * proportion to how many high neighbors it has. Effect: a chain of
+ * adjacent high cells (linear mountain RANGE) gets every cell along
+ * the chain pushed up, so the range stands out as a continuous spine
+ * relative to isolated peaks. Lone high cells get zero boost, so
+ * "blob hills" with one high cell don't get amplified.
+ *
+ * Sized for our cell defaults: peak threshold 0.62 (just above the
+ * 0.5 sea level so the ridge mask doesn't trigger on coastal
+ * lowlands), boost factor 0.06 per extra high neighbor (so 6
+ * neighbors -> max +0.3 boost, ~30% elevation lift for ridge
+ * spines). Clamped at 1.0 so we don't drive cells past peak.
+ *
+ * Output: Float32Array(cells.count) of additive boost. Cached on
+ * the node as _ridgeBoost (re-derived when cellsKey changes). */
+function _planetEnhanceRidges(cells, neighbors, K) {
+  const n = cells.count;
+  const boost = new Float32Array(n);
+  const peakThresh = 0.62;
+  const ridgeThresh = 0.55;
+  const perNbrBoost = 0.06;
+  for (let i = 0; i < n; i++) {
+    if (cells.elevations[i] < peakThresh) continue;
+    let highCount = 0;
+    for (let k = 0; k < K; k++) {
+      const ni = neighbors[i * K + k];
+      if (ni < 0) break;
+      if (cells.elevations[ni] >= ridgeThresh) highCount++;
+    }
+    // Cells with 2+ high neighbors are likely part of a spine
+    // (chains, not isolated peaks). Boost by (count - 1) so a
+    // 2-neighbor cell gets one unit, 6-neighbor gets 5 units.
+    if (highCount >= 2) {
+      const b = (highCount - 1) * perNbrBoost;
+      boost[i] = Math.min(0.35, b);
+    }
+  }
+  return boost;
+}
+
+/* Sprint 10-1b -- variant of _samplePlanetCellsIDW that adds the
+ * tectonic ridge boost (if present) into the per-cell elevation
+ * before the K=3 weighted blend. Used by _ensurePlanetMapCubemap so
+ * the baked surface inherits the ridge enhancement; the rest of
+ * the renderer (chunk builder) reads from the cubemap and never
+ * sees the boost array. */
+function _samplePlanetCellsIDWBoosted(cells, hash, boost, ux, uy, uz) {
+  const GRID = hash.GRID;
+  const ix0 = Math.max(0, Math.min(GRID - 1, Math.floor((ux + 1) * 0.5 * GRID)));
+  const iy0 = Math.max(0, Math.min(GRID - 1, Math.floor((uy + 1) * 0.5 * GRID)));
+  const iz0 = Math.max(0, Math.min(GRID - 1, Math.floor((uz + 1) * 0.5 * GRID)));
+  let i0 = -1, i1 = -1, i2 = -1;
+  let d0 = -2, d1 = -2, d2 = -2;
+  for (let dx = -1; dx <= 1; dx++) {
+    const bx = ix0 + dx;
+    if (bx < 0 || bx >= GRID) continue;
+    for (let dy = -1; dy <= 1; dy++) {
+      const by = iy0 + dy;
+      if (by < 0 || by >= GRID) continue;
+      for (let dz = -1; dz <= 1; dz++) {
+        const bz = iz0 + dz;
+        if (bz < 0 || bz >= GRID) continue;
+        const bucket = hash.buckets.get(bx * GRID * GRID + by * GRID + bz);
+        if (!bucket) continue;
+        for (let i = 0; i < bucket.length; i++) {
+          const cidx = bucket[i];
+          const dot = ux * cells.positions[cidx*3]
+                    + uy * cells.positions[cidx*3+1]
+                    + uz * cells.positions[cidx*3+2];
+          if (dot > d0)      { i2 = i1; d2 = d1; i1 = i0; d1 = d0; i0 = cidx; d0 = dot; }
+          else if (dot > d1) { i2 = i1; d2 = d1; i1 = cidx; d1 = dot; }
+          else if (dot > d2) { i2 = cidx; d2 = dot; }
+        }
+      }
+    }
+  }
+  if (i0 < 0) {
+    for (let i = 0; i < cells.count; i++) {
+      const dot = ux * cells.positions[i*3]
+                + uy * cells.positions[i*3+1]
+                + uz * cells.positions[i*3+2];
+      if (dot > d0)      { i2 = i1; d2 = d1; i1 = i0; d1 = d0; i0 = i; d0 = dot; }
+      else if (dot > d1) { i2 = i1; d2 = d1; i1 = i; d1 = dot; }
+      else if (dot > d2) { i2 = i; d2 = dot; }
+    }
+  }
+  const w0 = 1.0 / (2.0 - 2.0 * d0 + 1e-6);
+  const w1 = (i1 >= 0) ? 1.0 / (2.0 - 2.0 * d1 + 1e-6) : 0;
+  const w2 = (i2 >= 0) ? 1.0 / (2.0 - 2.0 * d2 + 1e-6) : 0;
+  const wSum = w0 + w1 + w2;
+  const e0 = Math.min(1, cells.elevations[i0] + (boost ? boost[i0] : 0));
+  const e1 = (i1 >= 0) ? Math.min(1, cells.elevations[i1] + (boost ? boost[i1] : 0)) : e0;
+  const e2 = (i2 >= 0) ? Math.min(1, cells.elevations[i2] + (boost ? boost[i2] : 0)) : e0;
+  return (w0 * e0 + w1 * e1 + w2 * e2) / wSum;
+}
+
 function _planetMapCacheKey(node) {
   const p = node.params || {};
   // §planet-spec Phase 7.d -- cellsVersion gets bumped by the painter
-  // each time a brush stroke mutates cells.elevations. Including it
-  // in the cache key forces the cubemap to re-bake from the modified
-  // cells on the next _ensurePlanetMapCubemap call.
+  // each time a brush stroke mutates cells.elevations.
+  // Sprint 10-1b -- "p10b" tag invalidates any pre-Phase-10 bakes
+  // (saved in patch.cubemapData) so the new tectonic ridge boost
+  // gets picked up on next load instead of replaying a stale bake.
   const ver = (typeof node._cellsVersion === "number") ? node._cellsVersion : 0;
   return [
     p.resolution, p.cellCount,
     p.seed, p.frequency, p.octaves,
     p.lacunarity, p.gain, p.ridges,
-    "v" + ver
+    "v" + ver, "p10b"
   ].join(",");
 }
 
@@ -61171,6 +61270,34 @@ function _ensurePlanetMapCubemap(node) {
   // edits with no other code change.
   const cells = _ensurePlanetMapCells(node);
   const hash = node._cellsHash;
+  // Sprint 10-1b: ridge enhancement runs once per cellsKey, cached
+  // on the node. Provides a per-cell additive elevation boost that
+  // amplifies linear ridges (mountain chains) and leaves isolated
+  // peaks/lowlands alone. Baked into the cubemap below so the
+  // chunk builder samples the enhanced surface.
+  if (!node._ridgeBoost || node._ridgeBoostKey !== key) {
+    const tR = (typeof performance !== "undefined") ? performance.now() : 0;
+    if (node._cellNeighbors && typeof node._cellNeighborsK === "number") {
+      node._ridgeBoost = _planetEnhanceRidges(cells, node._cellNeighbors, node._cellNeighborsK);
+    } else {
+      node._ridgeBoost = new Float32Array(cells.count);
+    }
+    node._ridgeBoostKey = key;
+    if (!Visual._planetRidgeLogged) {
+      Visual._planetRidgeLogged = true;
+      let ridgeCellCount = 0;
+      let maxBoost = 0;
+      for (let i = 0; i < cells.count; i++) {
+        if (node._ridgeBoost[i] > 0) {
+          ridgeCellCount++;
+          if (node._ridgeBoost[i] > maxBoost) maxBoost = node._ridgeBoost[i];
+        }
+      }
+      const tdR = ((typeof performance !== "undefined") ? performance.now() : 0) - tR;
+      console.log("[planet-map] ridge boost: " + ridgeCellCount + "/" + cells.count + " cells boosted (max +" + maxBoost.toFixed(3) + ") in " + tdR.toFixed(1) + "ms");
+    }
+  }
+  const ridgeBoost = node._ridgeBoost;
   const faces = [];
   const t0 = (typeof performance !== "undefined") ? performance.now() : 0;
   for (let f = 0; f < 6; f++) {
@@ -61194,9 +61321,11 @@ function _ensurePlanetMapCubemap(node) {
         const ux = sx * invLen, uy = sy * invLen, uz = sz * invLen;
         // §planet-spec Phase 7.d+ -- IDW interpolation between 3 nearest
         // cells (smooth surface) instead of nearest-cell flat shading.
-        // Removes the "flat voronoi patches" artifact that made
-        // mountains read as plateaus from orbit.
-        data[iy * res + ix] = _samplePlanetCellsIDW(cells, hash, ux, uy, uz);
+        // Sprint 10-1b: uses the boosted variant so the bake inherits
+        // the tectonic ridge enhancement (linear mountain spines get
+        // amplified relative to isolated peaks). Chunk builder reads
+        // from this cubemap and never sees the raw cell field.
+        data[iy * res + ix] = _samplePlanetCellsIDWBoosted(cells, hash, ridgeBoost, ux, uy, uz);
       }
     }
     faces.push(data);
