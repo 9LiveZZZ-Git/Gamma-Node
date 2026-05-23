@@ -61394,11 +61394,38 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
   };
 
   const N = segs + 1;
-  const verts = new Float32Array(N * N * 11);
-  const indices = new Uint32Array(segs * segs * 6);
+  // Sprint 9-2b: skirts. Each chunk gets a 1-vert-thick "skirt"
+  // around its 4 edges, projected radially inward to the bare
+  // spheroid surface (altitude = 0). At LOD boundaries where the
+  // current chunk's edge verts have different elevations than the
+  // neighbor's coarser samples, the visible gap is occluded by the
+  // skirt's vertical wall instead of showing as a crack to space.
+  // Cuberact + Sebastian Lague use the same trick; CDLOD vertex
+  // morphing (9-2c) would let us drop them, but skirts ship in a
+  // single chunk-builder edit with no pipeline / shader changes.
+  //
+  // Skirt verts: one per edge vertex (4*(N-1) total, corners
+  // counted once via the ring traversal). Stored AFTER the interior
+  // verts so indices into the interior stay stable.
+  const SKIRT_VERT_COUNT = 4 * (N - 1);
+  const totalVerts = N * N + SKIRT_VERT_COUNT;
+  // Skirt indices: one strip per edge, 2 tris per segment.
+  const SKIRT_INDEX_COUNT = 4 * segs * 6;
+  const totalIndices = segs * segs * 6 + SKIRT_INDEX_COUNT;
+  const verts = new Float32Array(totalVerts * 11);
+  const indices = new Uint32Array(totalIndices);
   let vWrite = 0, iWrite = 0;
   let minX = Infinity, minY = Infinity, minZ = Infinity;
   let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+
+  // Per-vertex direction + elevation cached for skirt construction.
+  // Skirt verts share the (ux, uy, uz) direction of their edge but
+  // override altitude to 0 (= bare spheroid surface).
+  const edgeDirs = new Float32Array(N * N * 3);
+  const edgeAlt  = new Float32Array(N * N);
+  const edgeCol  = new Float32Array(N * N * 3);
+  const edgeBId  = new Float32Array(N * N);
+  const edgeNrm  = new Float32Array(N * N * 3);
 
   for (let iy = 0; iy <= segs; iy++) {
     const fy01 = iy / segs;
@@ -61428,10 +61455,6 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
       const pz = czC + r * uz           + altitude * uz;
       const baseCol = (cellIdx >= 0) ? colorForCell(cellIdx, elev) : _planetColorForHeight(elev, seaLevel);
       const biomeId = (cellIdx >= 0) ? biomeForCell(cellIdx, elev) : 0;
-      // Approximate normal: oblate-spheroid surface normal at this
-      // direction. Doesn't capture per-vertex elevation gradients, so
-      // mountains shade flat-lit -- acceptable for sprint 9-2; proper
-      // face-normal accumulation can come in a polish pass.
       const nxn = ux;
       const nyn = uy / polRatio2;
       const nzn = uz;
@@ -61450,8 +61473,20 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
       verts[vWrite++] = baseCol[2] * lambert;
       verts[vWrite++] = nuX; verts[vWrite++] = nuY; verts[vWrite++] = nuZ;
       verts[vWrite++] = biomeId; verts[vWrite++] = 0;
+
+      // Stash data the skirt builder needs (only edge verts will
+      // actually be used; storing all is cheaper than branching).
+      const gi = iy * N + ix;
+      edgeDirs[gi*3+0] = ux; edgeDirs[gi*3+1] = uy; edgeDirs[gi*3+2] = uz;
+      edgeAlt[gi] = altitude;
+      edgeCol[gi*3+0] = baseCol[0] * lambert;
+      edgeCol[gi*3+1] = baseCol[1] * lambert;
+      edgeCol[gi*3+2] = baseCol[2] * lambert;
+      edgeBId[gi] = biomeId;
+      edgeNrm[gi*3+0] = nuX; edgeNrm[gi*3+1] = nuY; edgeNrm[gi*3+2] = nuZ;
     }
   }
+  // Interior triangulation (unchanged).
   for (let iy = 0; iy < segs; iy++) {
     for (let ix = 0; ix < segs; ix++) {
       const a = iy * N + ix;
@@ -61462,6 +61497,67 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
       indices[iWrite++] = b; indices[iWrite++] = c; indices[iWrite++] = d;
     }
   }
+
+  // Sprint 9-2b: skirt construction. Walk the ring of edge verts in
+  // four passes (top edge L->R, right edge T->B, bottom R->L, left
+  // B->T) and emit one skirt vertex per ring step. Skirt index is
+  // (N*N) + ringOrder; the index map below remembers which grid
+  // vertex each skirt vert sits below so triangulation can connect
+  // them. The radial inward shift uses the SAME (ux, uy, uz)
+  // direction as the edge vert but with altitude = 0 -- guarantees
+  // the skirt sits below the edge along the oblate-spheroid normal,
+  // even at non-equator latitudes.
+  const skirtVertOf = new Int32Array(N * N);  // grid -> skirt index, -1 = no skirt
+  for (let i = 0; i < N * N; i++) skirtVertOf[i] = -1;
+  const skirtBase = N * N;
+  let skirtIdx = skirtBase;
+  function emitSkirt(gi) {
+    if (skirtVertOf[gi] >= 0) return skirtVertOf[gi];
+    const ux = edgeDirs[gi*3+0], uy = edgeDirs[gi*3+1], uz = edgeDirs[gi*3+2];
+    // Skirt sits 0.05% of planet radius below the spheroid surface
+    // (small but non-zero so seam fills even when neighbor elevation
+    // = sea level exactly). Scaled by r so it's invariant under
+    // changing planet sizes.
+    const skirtDrop = -r * 0.0005;
+    const px = cxC + (r + skirtDrop) * ux;
+    const py = cyC + (r + skirtDrop) * uy * polRatio;
+    const pz = czC + (r + skirtDrop) * uz;
+    verts[vWrite++] = px;
+    verts[vWrite++] = py;
+    verts[vWrite++] = pz;
+    verts[vWrite++] = edgeCol[gi*3+0];
+    verts[vWrite++] = edgeCol[gi*3+1];
+    verts[vWrite++] = edgeCol[gi*3+2];
+    verts[vWrite++] = edgeNrm[gi*3+0];
+    verts[vWrite++] = edgeNrm[gi*3+1];
+    verts[vWrite++] = edgeNrm[gi*3+2];
+    verts[vWrite++] = edgeBId[gi];
+    verts[vWrite++] = 0;
+    if (px < minX) minX = px; if (px > maxX) maxX = px;
+    if (py < minY) minY = py; if (py > maxY) maxY = py;
+    if (pz < minZ) minZ = pz; if (pz > maxZ) maxZ = pz;
+    skirtVertOf[gi] = skirtIdx;
+    return skirtIdx++;
+  }
+  function skirtEdge(getGi) {
+    // getGi(t) returns the grid index of the t-th vert along this
+    // edge (t = 0..segs). We emit skirts for both endpoints, then
+    // bridge each consecutive pair (t, t+1) with two triangles
+    // wound so the skirt faces outward (back-face cull would drop
+    // it if we got this wrong).
+    for (let t = 0; t < segs; t++) {
+      const giA = getGi(t),     giB = getGi(t + 1);
+      const skA = emitSkirt(giA), skB = emitSkirt(giB);
+      // Quad (giA, giB, skB, skA). Triangulated CCW from outside:
+      // pick the winding that matches the interior tris next to it.
+      indices[iWrite++] = giA; indices[iWrite++] = skA; indices[iWrite++] = giB;
+      indices[iWrite++] = giB; indices[iWrite++] = skA; indices[iWrite++] = skB;
+    }
+  }
+  skirtEdge(t => 0 * N + t);                  // top edge (iy = 0)
+  skirtEdge(t => t * N + segs);               // right edge (ix = segs)
+  skirtEdge(t => segs * N + (segs - t));      // bottom edge (iy = segs), reversed
+  skirtEdge(t => (segs - t) * N + 0);         // left edge (ix = 0), reversed
 
   const vertexBuffer = Visual.device.createBuffer({
     label: "planetmesh-vb-" + info.face + "-" + info.depth + "-" + info.ix + "-" + info.iy + "-" + segs,
