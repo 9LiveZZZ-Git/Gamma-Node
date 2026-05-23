@@ -10804,6 +10804,10 @@ public:
       { n: "heightScale",       t: "param" },
       { n: "seaLevel",          t: "param" },
       { n: "subdivide",         t: "param" },
+      // Sprint 9-1: cube-sphere static base resolution (verts per
+      // face edge). Static base for now; the quadtree (9-2) takes
+      // over and this becomes the coarsest LOD level.
+      { n: "gridResolution",    t: "param" },
       // Phase 8 sprint 8-3b -- texture inputs. When wired, the planet
       // body fragments sample triplanar from these textures (mixed
       // with the baked biome / water shading). When unwired, the
@@ -10842,10 +10846,17 @@ public:
       centerX: 0, centerY: 0, centerZ: 0,
       heightScale: 0, seaLevel: 0.5,
       subdivide: 0,
+      gridResolution: 129,
       textureScale: 0.001,
       textureMix:   1.0,
-      displacementScale: 500.0,
-      detailPatchEnabled: 1,
+      // Sprint 9-1: per-vertex detail-noise displacement retired in
+      // favor of cube-sphere quadtree (Phase 9). Default 0 keeps the
+      // shader path inert; user can opt back in by editing the param.
+      displacementScale: 0.0,
+      // Sprint 9-1: detail patch retired -- the quadtree's leaf
+      // chunks (9-2) take over the foot-level detail role. Default
+      // off; existing patches with detailPatchEnabled=1 still synthesize.
+      detailPatchEnabled: 0,
       // Sprint 8-7c -- bigger default patch (8km) and ~10x
       // displacement so the surface relief reads even on hot-desert
       // / glacier biomes where per-biome amplitude is just a few
@@ -52420,9 +52431,12 @@ function _resolveSceneMeshes(sceneNode) {
     // wire a separate node.
     if (resolved.node && resolved.node.type === "PlanetMesh") {
       const pp = resolved.node.params || {};
+      // Sprint 9-1: detail patch retired in favor of cube-sphere
+      // quadtree (Phase 9). Default off when param is missing; old
+      // saves with explicit detailPatchEnabled=1 still synthesize.
       const enabled = (typeof pp.detailPatchEnabled === "number")
         ? pp.detailPatchEnabled >= 0.5
-        : true;
+        : false;
       if (enabled) {
         meshes.push({
           node: resolved.node,
@@ -61397,6 +61411,39 @@ function _loopSubdividePlanet(positions3, tris, N) {
   return { positions: newPositions, tris: newTris, edgeParents: edgeParents, oldCount: N, newCount: newV };
 }
 
+// Sprint 9-1: cube-sphere face basis. Each entry maps (u, v) in [-1, 1]
+// to a point on the corresponding cube face. Winding is verified per
+// face to come out CCW when viewed from outside the sphere using the
+// quad order (i,j) -> (i+1,j) -> (i+1,j+1) -> (i,j+1).
+const _CUBE_FACES = [
+  { name: "+X", apply: function(u, v) { return [ 1,  v, -u]; } },
+  { name: "-X", apply: function(u, v) { return [-1,  v,  u]; } },
+  { name: "+Y", apply: function(u, v) { return [ u,  1, -v]; } },
+  { name: "-Y", apply: function(u, v) { return [ u, -1,  v]; } },
+  { name: "+Z", apply: function(u, v) { return [ u,  v,  1]; } },
+  { name: "-Z", apply: function(u, v) { return [-u,  v, -1]; } }
+];
+
+/* Sprint 9-1 -- cube-sphere planet mesh replacing the Fibonacci-
+ * Voronoi single-mesh path. Six static face grids; each vertex is
+ * projected onto the unit sphere, looked up in the PlanetMap cell
+ * graph for elevation + biome, then placed on the oblate spheroid
+ * at radius + altitude.
+ *
+ * This is the static-base step of the Phase 9 cube-sphere quadtree
+ * pivot (docs/PLANET-SCALE-TERRAIN.md §9.4). The quadtree (9-2) will
+ * subdivide leaves toward the camera; CDLOD morphing (9-2) handles
+ * LOD seams. For now everything is one static base mesh -- the
+ * planet will look chunky compared to the old 240k-cell Fibonacci
+ * mesh at the same resolution, but the topology is now compatible
+ * with subdivision.
+ *
+ * The previous per-vertex detail-noise displacement (vs_main planet
+ * branch) and the camera-anchored detail patch (vs_planet_detail)
+ * are both retired: the patch synthesis defaults off in
+ * _resolveSceneMeshes; the per-vertex displacement defaults to 0 in
+ * the encoder. Both code paths remain in the file for now in case
+ * rollback is needed, but ship un-fired. */
 function _buildPlanetMesh(node) {
   if (!state || !Array.isArray(state.edges)) {
     console.warn("[planet-mesh] no state.edges yet, skipping mesh");
@@ -61415,115 +61462,113 @@ function _buildPlanetMesh(node) {
     return null;
   }
   const cells = _ensurePlanetMapCells(pmap);
-  if (!cells || !pmap._cellNeighbors) {
+  if (!cells || !pmap._cellsHash) {
     console.warn("[planet-mesh] PlanetMap cells not ready",
-                 { cells: !!cells, neighbors: !!pmap._cellNeighbors });
+                 { cells: !!cells, hash: !!pmap._cellsHash });
     return null;
   }
-  const neighbors = pmap._cellNeighbors;
-  const K = pmap._cellNeighborsK;
-  const N = cells.count;
 
   // Read PlanetMesh params.
   const p = node.params || {};
   const r = (typeof p.radius === "number") ? p.radius : 1000;
   const polRatio = Math.max(0.5, Math.min(1.5, (typeof p.polarRadiusRatio === "number") ? p.polarRadiusRatio : 1.0));
-  const polRatio2 = polRatio * polRatio;
   const cxC = (typeof p.centerX === "number") ? p.centerX : 0;
   const cyC = (typeof p.centerY === "number") ? p.centerY : 0;
   const czC = (typeof p.centerZ === "number") ? p.centerZ : 0;
   const hs = (typeof p.heightScale === "number") ? p.heightScale : 0;
   const seaLevel = Math.max(0, Math.min(1, (typeof p.seaLevel === "number") ? p.seaLevel : 0.5));
-
-  // Cache the triangulation on the PlanetMap node (depends on cell
-  // positions + neighbor table only -- invariant under elevation
-  // edits, so the painter doesn't trigger re-triangulation).
-  if (!pmap._cellTris || pmap._cellTrisKey !== pmap._cellsKey) {
-    const t0 = performance.now();
-    pmap._cellTris = _buildCellTriangulation(cells.positions, neighbors, K, N, pmap._cellsHash);
-    pmap._cellTrisKey = pmap._cellsKey;
-    console.log("[planet-mesh] triangulated " + N + " cells into " + (pmap._cellTris.length / 3) + " triangles in " + (performance.now() - t0).toFixed(0) + "ms");
-  }
-  const tris = pmap._cellTris;
+  // Sprint 9-1: vertices per cube-face edge. Static base mesh; the
+  // quadtree (9-2) will subdivide leaves toward the camera. 129
+  // gives ~100k verts total (6 * 129^2) vs the old Fibonacci ~240k
+  // cells -- ~2.4x lower density, but uniform across the sphere
+  // and ready for parent/child subdivision.
+  const gridRes = Math.max(8, Math.min(513, Math.floor((typeof p.gridResolution === "number") ? p.gridResolution : 129)));
 
   // §planet-spec Phase 7.e -- compute climate + biomes + rivers
   // once per (cellsKey, seaLevel) combination. Painter edits to
-  // elevation currently DO NOT invalidate this cache (cellsKey is
-  // stable across the painter's elevation tweaks); add an explicit
-  // bump if/when sub-cell edits are needed.
+  // elevation currently DO NOT invalidate this cache; add an
+  // explicit bump if/when sub-cell edits are needed.
   _ensurePlanetClimate(pmap, seaLevel);
   _ensurePlanetRivers(pmap, seaLevel);
 
-  // Build vertex array in three passes:
-  //   Pass 1: compute displaced positions (cell radial + altitude).
-  //   Pass 2: accumulate face normals (area-weighted) onto each
-  //           vertex; this is the standard "smooth shading" recipe
-  //           and produces real terrain shading -- mountain slopes
-  //           catch the sun, valleys go dark. Without this the
-  //           planet shaded as a smooth sphere regardless of
-  //           heightScale, hiding all 3D relief.
-  //   Pass 3: normalize normals, compute Lambert + bake into vertex
-  //           color, write the interleaved layout the renderer
-  //           expects (pos, col, normal, uv).
-  const sun = _planetSunDir();
-  const sunX = sun[0], sunY = sun[1], sunZ = sun[2];
-  const ambient = 0.18;
+  const N = gridRes;
+  const vertsPerFace = N * N;
+  const totalVerts = vertsPerFace * 6;
+  const quadsPerFace = (N - 1) * (N - 1);
+  const totalTris = quadsPerFace * 6 * 2;
 
-  // Pass 1: positions.
-  const positions3 = new Float32Array(N * 3);
-  let hMin = Infinity, hMax = -Infinity, altMax = 0;
-  for (let i = 0; i < N; i++) {
-    const ux = cells.positions[i * 3 + 0];
-    const uy = cells.positions[i * 3 + 1];
-    const uz = cells.positions[i * 3 + 2];
-    const h  = cells.elevations[i];
-    if (h < hMin) hMin = h;
-    if (h > hMax) hMax = h;
-    let altitude = 0;
-    if (h > seaLevel && hs !== 0) {
-      altitude = hs * (h - seaLevel) / Math.max(1e-6, 1 - seaLevel);
-      if (altitude > altMax) altMax = altitude;
+  // Pass 1: positions + per-vertex cell lookup. Each face is a
+  // regular (u, v) grid in [-1, 1]; project to unit sphere via
+  // normalize, look up the PlanetMap cell at that direction for
+  // elevation + biome, place on the oblate spheroid at radius +
+  // altitude. The same noise/biome data the old Fibonacci path
+  // produced flows through unchanged; only the topology is new.
+  const positions3 = new Float32Array(totalVerts * 3);
+  const vertCellIdx = new Int32Array(totalVerts);
+  let altMax = 0;
+  const t0 = performance.now();
+  for (let f = 0; f < 6; f++) {
+    const face = _CUBE_FACES[f];
+    const fOff = f * vertsPerFace;
+    for (let j = 0; j < N; j++) {
+      const vCoord = -1 + 2 * j / (N - 1);
+      for (let i = 0; i < N; i++) {
+        const uCoord = -1 + 2 * i / (N - 1);
+        const cube = face.apply(uCoord, vCoord);
+        const cLen = Math.hypot(cube[0], cube[1], cube[2]);
+        const ux = cube[0] / cLen;
+        const uy = cube[1] / cLen;
+        const uz = cube[2] / cLen;
+        const cellIdx = _findNearestCell(cells, pmap._cellsHash, ux, uy, uz);
+        const elev = (cellIdx >= 0) ? cells.elevations[cellIdx] : 0;
+        let altitude = 0;
+        if (elev > seaLevel && hs !== 0) {
+          altitude = hs * (elev - seaLevel) / Math.max(1e-6, 1 - seaLevel);
+          if (altitude > altMax) altMax = altitude;
+        }
+        const vi = fOff + j * N + i;
+        positions3[vi * 3 + 0] = cxC + r * ux           + altitude * ux;
+        positions3[vi * 3 + 1] = cyC + r * uy * polRatio + altitude * uy;
+        positions3[vi * 3 + 2] = czC + r * uz           + altitude * uz;
+        vertCellIdx[vi] = cellIdx;
+      }
     }
-    positions3[i*3+0] = cxC + r * ux           + altitude * ux;
-    positions3[i*3+1] = cyC + r * uy * polRatio + altitude * uy;
-    positions3[i*3+2] = czC + r * uz           + altitude * uz;
   }
   if (!Visual._planetMeshDisplaceLogged) {
     Visual._planetMeshDisplaceLogged = true;
-    console.log("[planet-mesh] displacement check:"
-      + " elevation range=[" + hMin.toFixed(3) + ".." + hMax.toFixed(3) + "]"
+    console.log("[planet-mesh] cube-sphere displacement check:"
       + " seaLevel=" + seaLevel.toFixed(2)
       + " heightScale=" + hs + "m"
       + " max altitude=" + altMax.toFixed(0) + "m"
       + " (=" + (100 * altMax / r).toFixed(3) + "% of radius)");
   }
 
-  // Pass 1.5 (optional): Loop subdivide. New edge vertices are
-  // weighted averages of their endpoint + apex parents (the standard
-  // Loop stencil); old vertices move slightly via the β-rule, which
-  // is what makes mountains "round off" instead of staying spiky.
-  const subdivide = ((typeof p.subdivide === "number") ? p.subdivide : 0) >= 0.5;
-  let outPositions = positions3;
-  let outTris = tris;
-  let outCount = N;
-  let edgeParents = null;
-  if (subdivide) {
-    const t0 = performance.now();
-    const sub = _loopSubdividePlanet(positions3, tris, N);
-    outPositions = sub.positions;
-    outTris = sub.tris;
-    outCount = sub.newCount;
-    edgeParents = sub.edgeParents;
-    console.log("[planet-mesh] loop-subdivided " + N + "→" + outCount + " verts (" + (tris.length/3) + "→" + (outTris.length/3) + " tris) in " + (performance.now() - t0).toFixed(0) + "ms");
+  // Triangulate each face. Quad (a,b,c,d) = (i,j) -> (i+1,j) ->
+  // (i+1,j+1) -> (i,j+1). Per-face analysis verified this winds
+  // CCW from outside the sphere for all six _CUBE_FACES entries.
+  const tris = new Uint32Array(totalTris * 3);
+  let tIdx = 0;
+  for (let f = 0; f < 6; f++) {
+    const fOff = f * vertsPerFace;
+    for (let j = 0; j < N - 1; j++) {
+      for (let i = 0; i < N - 1; i++) {
+        const a = fOff + j * N + i;
+        const b = fOff + j * N + (i + 1);
+        const c = fOff + (j + 1) * N + (i + 1);
+        const d = fOff + (j + 1) * N + i;
+        tris[tIdx++] = a; tris[tIdx++] = b; tris[tIdx++] = c;
+        tris[tIdx++] = a; tris[tIdx++] = c; tris[tIdx++] = d;
+      }
+    }
   }
 
-  // Pass 2: face-normal accumulation on the final geometry.
-  const normals3 = new Float32Array(outCount * 3);
-  for (let t = 0; t < outTris.length; t += 3) {
-    const a = outTris[t], b = outTris[t+1], c = outTris[t+2];
-    const ax = outPositions[a*3], ay = outPositions[a*3+1], az = outPositions[a*3+2];
-    const bx = outPositions[b*3], by = outPositions[b*3+1], bz = outPositions[b*3+2];
-    const cx = outPositions[c*3], cy = outPositions[c*3+1], cz = outPositions[c*3+2];
+  // Pass 2: face-normal accumulation.
+  const normals3 = new Float32Array(totalVerts * 3);
+  for (let t = 0; t < tris.length; t += 3) {
+    const a = tris[t], b = tris[t+1], c = tris[t+2];
+    const ax = positions3[a*3], ay = positions3[a*3+1], az = positions3[a*3+2];
+    const bx = positions3[b*3], by = positions3[b*3+1], bz = positions3[b*3+2];
+    const cx = positions3[c*3], cy = positions3[c*3+1], cz = positions3[c*3+2];
     const e1x = bx - ax, e1y = by - ay, e1z = bz - az;
     const e2x = cx - ax, e2y = cy - ay, e2z = cz - az;
     const fnx = e1y*e2z - e1z*e2y;
@@ -61534,79 +61579,52 @@ function _buildPlanetMesh(node) {
     normals3[c*3+0] += fnx; normals3[c*3+1] += fny; normals3[c*3+2] += fnz;
   }
 
-  // Pass 3: interleave + Lambert. For subdivided meshes, the edge-
-  // vertex elevation is interpolated from its two endpoint cells so
-  // color blends smoothly across the new vertex (matches the
-  // texture-interpolation behavior of Azgaar's UV-mapped path).
-  const verts = new Float32Array(outCount * 11);
-  for (let i = 0; i < outCount; i++) {
-    const px = outPositions[i*3+0], py = outPositions[i*3+1], pz = outPositions[i*3+2];
+  // Pass 3: interleave + Lambert + biome color. Same per-cell
+  // lookup as the Fibonacci path (river / lake / biome); the only
+  // change is iterating cube-sphere verts instead of Voronoi cells.
+  const sun = _planetSunDir();
+  const sunX = sun[0], sunY = sun[1], sunZ = sun[2];
+  const ambient = 0.18;
+  const RIVER_BLUE = [0.20, 0.45, 0.75];
+  const RIVER_BIG  = [0.15, 0.32, 0.62];
+  const colorForCell = function(idx, elev) {
+    if (cells.lake && cells.lake[idx]) return PLANET_BIOMES_COLORS[0];
+    if (cells.riverId && cells.riverId[idx] >= 0 && cells.flux && elev >= seaLevel) {
+      const flx = cells.flux[idx];
+      const t = Math.min(1, Math.max(0, (flx - 30) / 200));
+      return [
+        RIVER_BLUE[0] + (RIVER_BIG[0] - RIVER_BLUE[0]) * t,
+        RIVER_BLUE[1] + (RIVER_BIG[1] - RIVER_BLUE[1]) * t,
+        RIVER_BLUE[2] + (RIVER_BIG[2] - RIVER_BLUE[2]) * t
+      ];
+    }
+    if (cells.biome) return PLANET_BIOMES_COLORS[cells.biome[idx]];
+    return _planetColorForHeight(elev, seaLevel);
+  };
+  const biomeForCell = function(idx, elev) {
+    if (cells.lake && cells.lake[idx]) return 0;
+    if (cells.riverId && cells.riverId[idx] >= 0 && cells.flux && elev >= seaLevel) return 0;
+    if (cells.biome) return cells.biome[idx];
+    return 0;
+  };
+
+  const verts = new Float32Array(totalVerts * 11);
+  for (let i = 0; i < totalVerts; i++) {
+    const px = positions3[i*3+0], py = positions3[i*3+1], pz = positions3[i*3+2];
     let nx = normals3[i*3+0], ny = normals3[i*3+1], nz = normals3[i*3+2];
     let nl = Math.hypot(nx, ny, nz);
     if (nl > 1e-9) { nx /= nl; ny /= nl; nz /= nl; }
-    else if (i < N) {
-      const ux = cells.positions[i*3+0], uy = cells.positions[i*3+1], uz = cells.positions[i*3+2];
-      const ny0 = uy / polRatio2;
-      const inv = 1 / Math.max(1e-12, Math.sqrt(ux*ux + ny0*ny0 + uz*uz));
-      nx = ux * inv; ny = ny0 * inv; nz = uz * inv;
-    } else {
-      nx = 0; ny = 1; nz = 0;
+    else {
+      const dx = px - cxC, dy = py - cyC, dz = pz - czC;
+      const dl = Math.hypot(dx, dy, dz) || 1;
+      nx = dx / dl; ny = dy / dl; nz = dz / dl;
     }
     const radialDot = nx * (px - cxC) + ny * (py - cyC) + nz * (pz - czC);
     if (radialDot < 0) { nx = -nx; ny = -ny; nz = -nz; }
-    // Per-vertex elevation + biome + river lookup. Cell index for
-    // the first N vertices; mean / blend of the two endpoint cells
-    // for subdivided edge vertices. River cells override the biome
-    // color with a flux-modulated blue (darker blue for big rivers,
-    // lighter for tributaries).
-    const RIVER_BLUE   = [0.20, 0.45, 0.75];
-    const RIVER_BIG    = [0.15, 0.32, 0.62];
-    let h, baseCol;
-    const colorForCell = function(idx, elev) {
-      // Closed-basin lake (from _planetRivers depression-fill) -> marine blue.
-      if (cells.lake && cells.lake[idx]) return PLANET_BIOMES_COLORS[0];
-      if (cells.riverId && cells.riverId[idx] >= 0 && cells.flux && elev >= seaLevel) {
-        // Map flux to blue intensity: larger river = darker, more saturated.
-        const flx = cells.flux[idx];
-        const t = Math.min(1, Math.max(0, (flx - 30) / 200));
-        return [
-          RIVER_BLUE[0] + (RIVER_BIG[0] - RIVER_BLUE[0]) * t,
-          RIVER_BLUE[1] + (RIVER_BIG[1] - RIVER_BLUE[1]) * t,
-          RIVER_BLUE[2] + (RIVER_BIG[2] - RIVER_BLUE[2]) * t
-        ];
-      }
-      if (cells.biome) return PLANET_BIOMES_COLORS[cells.biome[idx]];
-      return _planetColorForHeight(elev, seaLevel);
-    };
-    // Phase 8 sprint 8-2: bake biome ID into vertex's UV.x so the
-    // fragment shader can route per-biome detail-noise parameters
-    // (amplitude / frequency / shape) via BIOME_DETAIL_PARAMS. Edge
-    // verts inherit from one parent; the fragment uses round() so
-    // ~95% of fragments land on the correct integer biome (cell-cell
-    // boundary fragments may snap to either neighbor).
-    const biomeForCell = function(idx, elev) {
-      if (cells.lake && cells.lake[idx]) return 0;
-      if (cells.riverId && cells.riverId[idx] >= 0 && cells.flux && elev >= seaLevel) return 0;
-      if (cells.biome) return cells.biome[idx];
-      return 0;
-    };
-    let biomeId = 0;
-    if (i < N) {
-      h = cells.elevations[i];
-      baseCol = colorForCell(i, h);
-      biomeId = biomeForCell(i, h);
-    } else if (edgeParents) {
-      const a = edgeParents[(i - N) * 2 + 0];
-      const b = edgeParents[(i - N) * 2 + 1];
-      h = 0.5 * (cells.elevations[a] + cells.elevations[b]);
-      const cA = colorForCell(a, cells.elevations[a]);
-      const cB = colorForCell(b, cells.elevations[b]);
-      baseCol = [0.5*(cA[0]+cB[0]), 0.5*(cA[1]+cB[1]), 0.5*(cA[2]+cB[2])];
-      biomeId = biomeForCell(a, cells.elevations[a]);
-    } else {
-      h = seaLevel;
-      baseCol = _planetColorForHeight(h, seaLevel);
-    }
+    const cellIdx = vertCellIdx[i];
+    const elev = (cellIdx >= 0) ? cells.elevations[cellIdx] : seaLevel;
+    const baseCol = (cellIdx >= 0) ? colorForCell(cellIdx, elev) : _planetColorForHeight(elev, seaLevel);
+    const biomeId = (cellIdx >= 0) ? biomeForCell(cellIdx, elev) : 0;
     const lambert = Math.max(ambient, nx * sunX + ny * sunY + nz * sunZ);
     const base = i * 11;
     verts[base + 0] = px;
@@ -61623,9 +61641,9 @@ function _buildPlanetMesh(node) {
   }
   if (!Visual._planetMeshBuiltLogged) {
     Visual._planetMeshBuiltLogged = true;
-    console.log("[planet-mesh] built mesh with " + outCount + " verts + " + (outTris.length / 3) + " triangles for node", node.id);
+    console.log("[planet-mesh] cube-sphere built: " + totalVerts + " verts + " + totalTris + " tris (6 faces × " + N + "×" + N + ") in " + (performance.now() - t0).toFixed(0) + "ms");
   }
-  return { verts, indices: outTris };
+  return { verts, indices: tris };
 }
 
 // Phase 8 sprint 8-7: PlanetDetailPatch -- static (u, v) grid mesh.
