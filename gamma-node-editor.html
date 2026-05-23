@@ -58837,15 +58837,16 @@ function _planetMapCacheKey(node) {
   const p = node.params || {};
   // §planet-spec Phase 7.d -- cellsVersion gets bumped by the painter
   // each time a brush stroke mutates cells.elevations.
-  // Sprint 10-1b -- "p10b" tag invalidates any pre-Phase-10 bakes
-  // (saved in patch.cubemapData) so the new tectonic ridge boost
-  // gets picked up on next load instead of replaying a stale bake.
+  // Sprint 10-1b -- "p10b" invalidated pre-Phase-10 bakes.
+  // Sprint 10-2 -- "p10c" invalidates the 10-1b bakes too so the
+  // new hydraulic-erosion pass runs (rivers, drainage, carved
+  // valleys -- not present in p10b cubemaps).
   const ver = (typeof node._cellsVersion === "number") ? node._cellsVersion : 0;
   return [
     p.resolution, p.cellCount,
     p.seed, p.frequency, p.octaves,
     p.lacunarity, p.gain, p.ridges,
-    "v" + ver, "p10b"
+    "v" + ver, "p10c"
   ].join(",");
 }
 
@@ -61241,6 +61242,155 @@ function _decodeCubemapBase64(b64, res) {
   return { resolution: res, faces };
 }
 
+/* Sprint 10-2 -- hydraulic erosion via Sebastian Lague's droplet
+ * algorithm (Inria HAL inria-00402079 / "Coding Adventure:
+ * Hydraulic Erosion" YouTube). For each face: spawn N random
+ * water droplets, walk each one ~30 steps downhill, transfer
+ * sediment from steeper segments to flatter ones. Cumulative
+ * water flux per texel is tracked in a parallel drainage array.
+ * Result: branching valleys carved into the macro heightmap +
+ * a drainage texture that lights up along river paths.
+ *
+ * Operates per-face on the cubemap (~512² each). Droplets that
+ * walk off the face edge are discarded -- minor seam artifact
+ * acceptable at face boundaries since the cube-sphere corner is
+ * already a noisy region. Droplets that drop into ocean (height
+ * < seaLevel) are also stopped (no underwater carving).
+ *
+ * Defaults tuned for our normalized [0, 1] heightmap range:
+ * inertia=0.05, sedimentCapacityFactor=4, minSlope=0.01,
+ * depositSpeed=0.3, erodeSpeed=0.3, gravity=4, evaporate=0.01,
+ * erodeRadius=3 (brush spread to avoid single-pixel carving).
+ *
+ * Cost: ~30k droplets × 30 steps × 4 bilinear samples × 6 faces
+ * = ~22M ops, ~0.5-1.5 s in JS at typical res. One-time per
+ * cubemap key change. */
+function _erodeFaceHydraulic(face, drainage, res, seaLevel, params) {
+  const inertia = (params && params.inertia) || 0.05;
+  const capacityFactor = (params && params.capacityFactor) || 4.0;
+  const minSlope = (params && params.minSlope) || 0.01;
+  const depositSpeed = (params && params.depositSpeed) || 0.3;
+  const erodeSpeed = (params && params.erodeSpeed) || 0.3;
+  const gravity = (params && params.gravity) || 4.0;
+  const evaporate = (params && params.evaporate) || 0.01;
+  const numDroplets = (params && params.numDroplets) || 30000;
+  const maxSteps = (params && params.maxSteps) || 30;
+  const erodeRadius = (params && params.erodeRadius) || 3;
+  const initSpeed = 1.0;
+  const initWater = 1.0;
+  // Pre-build erosion brush: square kernel of weights that
+  // diminish with distance to brush center. Carving with a
+  // brush (vs single pixel) avoids 1-pixel-deep channels and
+  // gives smoother river valleys.
+  const brushSize = erodeRadius * 2 + 1;
+  const brushW = new Float32Array(brushSize * brushSize);
+  let brushWeightSum = 0;
+  for (let by = -erodeRadius; by <= erodeRadius; by++) {
+    for (let bx = -erodeRadius; bx <= erodeRadius; bx++) {
+      const d2 = bx*bx + by*by;
+      if (d2 > erodeRadius * erodeRadius) continue;
+      const w = 1 - Math.sqrt(d2) / erodeRadius;
+      brushW[(by + erodeRadius) * brushSize + (bx + erodeRadius)] = w;
+      brushWeightSum += w;
+    }
+  }
+  for (let i = 0; i < brushW.length; i++) brushW[i] /= brushWeightSum;
+
+  // Simple LCG seeded by face content hash so erosion is
+  // deterministic per face (won't drift between runs).
+  let rngS = 0;
+  for (let i = 0; i < Math.min(64, face.length); i++) rngS = (rngS * 31 + Math.floor(face[i] * 1000)) | 0;
+  if (rngS === 0) rngS = 1;
+  const rng = function() {
+    rngS = (Math.imul(rngS, 1664525) + 1013904223) | 0;
+    return (rngS >>> 0) / 4294967296;
+  };
+
+  for (let d = 0; d < numDroplets; d++) {
+    let px = rng() * (res - 1);
+    let py = rng() * (res - 1);
+    let vx = 0, vy = 0;
+    let water = initWater;
+    let sediment = 0;
+    let speed = initSpeed;
+    for (let step = 0; step < maxSteps; step++) {
+      const ix = Math.floor(px);
+      const iy = Math.floor(py);
+      if (ix < 0 || ix >= res - 1 || iy < 0 || iy >= res - 1) break;
+      const fx = px - ix;
+      const fy = py - iy;
+      const h00 = face[iy * res + ix];
+      const h10 = face[iy * res + ix + 1];
+      const h01 = face[(iy + 1) * res + ix];
+      const h11 = face[(iy + 1) * res + ix + 1];
+      // Bilinear height + gradient at (px, py).
+      const h = h00 * (1 - fx) * (1 - fy) + h10 * fx * (1 - fy)
+              + h01 * (1 - fx) * fy       + h11 * fx * fy;
+      if (h < seaLevel) break;          // hit ocean -- no underwater carving
+      const gx = (h10 - h00) * (1 - fy) + (h11 - h01) * fy;
+      const gy = (h01 - h00) * (1 - fx) + (h11 - h10) * fx;
+      // Update velocity: lerp between previous direction and steepest descent.
+      vx = vx * inertia - gx * (1 - inertia);
+      vy = vy * inertia - gy * (1 - inertia);
+      const vLen = Math.hypot(vx, vy);
+      if (vLen < 1e-6) break;
+      vx /= vLen; vy /= vLen;
+      const npx = px + vx;
+      const npy = py + vy;
+      const nix = Math.floor(npx);
+      const niy = Math.floor(npy);
+      if (nix < 0 || nix >= res - 1 || niy < 0 || niy >= res - 1) break;
+      const nfx = npx - nix;
+      const nfy = npy - niy;
+      const nh00 = face[niy * res + nix];
+      const nh10 = face[niy * res + nix + 1];
+      const nh01 = face[(niy + 1) * res + nix];
+      const nh11 = face[(niy + 1) * res + nix + 1];
+      const hNew = nh00 * (1 - nfx) * (1 - nfy) + nh10 * nfx * (1 - nfy)
+                 + nh01 * (1 - nfx) * nfy       + nh11 * nfx * nfy;
+      const dh = hNew - h;
+      const capacity = Math.max(-dh, minSlope) * speed * water * capacityFactor;
+      if (sediment > capacity || dh > 0) {
+        // Deposit sediment back into the heightmap. Going uphill =
+        // forced deposit (fill the pit); otherwise deposit excess
+        // sediment proportional to depositSpeed.
+        const amount = (dh > 0) ? Math.min(dh, sediment) : (sediment - capacity) * depositSpeed;
+        sediment -= amount;
+        face[iy * res + ix]           += amount * (1 - fx) * (1 - fy);
+        face[iy * res + ix + 1]       += amount * fx       * (1 - fy);
+        face[(iy + 1) * res + ix]     += amount * (1 - fx) * fy;
+        face[(iy + 1) * res + ix + 1] += amount * fx       * fy;
+      } else {
+        // Erode. Spread the carve across the brush so we don't
+        // make 1-pixel-deep channels.
+        const amount = Math.min((capacity - sediment) * erodeSpeed, -dh);
+        for (let by = -erodeRadius; by <= erodeRadius; by++) {
+          const yy = iy + by;
+          if (yy < 0 || yy >= res) continue;
+          for (let bx = -erodeRadius; bx <= erodeRadius; bx++) {
+            const xx = ix + bx;
+            if (xx < 0 || xx >= res) continue;
+            const w = brushW[(by + erodeRadius) * brushSize + (bx + erodeRadius)];
+            if (w <= 0) continue;
+            const carved = Math.min(amount * w, face[yy * res + xx] - seaLevel);
+            if (carved > 0) {
+              face[yy * res + xx] -= carved;
+              sediment += carved;
+            }
+          }
+        }
+      }
+      // Track cumulative water passing through this cell -- the
+      // drainage signal that will paint rivers in the render.
+      drainage[iy * res + ix] += water;
+      // Update speed (downhill gains, uphill loses) + evaporate.
+      speed = Math.sqrt(Math.max(0, speed * speed + dh * gravity));
+      water *= (1 - evaporate);
+      px = npx; py = npy;
+    }
+  }
+}
+
 function _ensurePlanetMapCubemap(node) {
   if (!node || !node.params) return null;
   const key = _planetMapCacheKey(node);
@@ -61340,6 +61490,59 @@ function _ensurePlanetMapCubemap(node) {
     faces.push(data);
   }
   const dtMs = ((typeof performance !== "undefined") ? performance.now() : 0) - t0;
+
+  // Sprint 10-2: hydraulic erosion pass. Operates on each face in-
+  // place; modifies elevations + accumulates a parallel drainage
+  // texture per face. Drainage is sampled by the chunk vertex
+  // shader to tint river paths blue. Erosion scaling: numDroplets
+  // grows with face area so deeper-res cubemaps get proportionally
+  // more droplets (constant per-texel coverage).
+  const dropletsPerFace = Math.round(res * res * 0.12);  // ~30k @ 512², ~120k @ 1024²
+  const drainageFaces = [];
+  // Sea-level threshold for erosion (stop carving below this). Read
+  // from the wired PlanetMesh's seaLevel if any are in the graph;
+  // otherwise default 0.5 (the PlanetMesh registry default).
+  let _eroSeaLevel = 0.5;
+  if (typeof state !== "undefined" && state && Array.isArray(state.nodes)) {
+    const pmesh = state.nodes.find(n => n && n.type === "PlanetMesh");
+    if (pmesh && pmesh.params && typeof pmesh.params.seaLevel === "number") {
+      _eroSeaLevel = Math.max(0, Math.min(1, pmesh.params.seaLevel));
+    }
+  }
+  const eroT0 = (typeof performance !== "undefined") ? performance.now() : 0;
+  for (let f = 0; f < 6; f++) {
+    const d = new Float32Array(res * res);
+    _erodeFaceHydraulic(faces[f], d, res, _eroSeaLevel, {
+      numDroplets: dropletsPerFace,
+      maxSteps: 30,
+      erodeRadius: 3,
+      inertia: 0.05,
+      capacityFactor: 4.0,
+      depositSpeed: 0.3,
+      erodeSpeed: 0.3,
+      gravity: 4.0,
+      evaporate: 0.01,
+      minSlope: 0.01
+    });
+    drainageFaces.push(d);
+  }
+  const eroDtMs = ((typeof performance !== "undefined") ? performance.now() : 0) - eroT0;
+  node._drainage = { resolution: res, faces: drainageFaces };
+  if (!Visual._planetErodeLogged) {
+    Visual._planetErodeLogged = true;
+    let maxFlux = 0, riverTexels = 0;
+    for (let f = 0; f < 6; f++) {
+      for (let i = 0; i < drainageFaces[f].length; i++) {
+        const v = drainageFaces[f][i];
+        if (v > maxFlux) maxFlux = v;
+        if (v > 50) riverTexels++;
+      }
+    }
+    console.log("[planet-erode] " + (6 * dropletsPerFace) + " droplets × 30 steps × 6 faces in "
+                + eroDtMs.toFixed(0) + "ms; max drainage flux=" + maxFlux.toFixed(1)
+                + ", river texels (flux>50)=" + riverTexels + "/" + (6 * res * res));
+  }
+
   node._cubemap = { resolution: res, faces };
   node._cubemapKey = key;
   // §planet-spec Phase 7.b -- serialize the freshly-baked cubemap
@@ -61918,10 +62121,13 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
 
   // Sprint 10-1: ensure the baked heightmap cubemap exists. This is
   // a once-per-PlanetMap operation (key-cached); subsequent chunks
-  // reuse the already-baked faces. Phase 10 stages 10-2/3 (erosion,
-  // climate) will accumulate ON this same cubemap so chunk builds
-  // sample the final eroded surface, not the raw cell IDW.
+  // reuse the already-baked faces. Sprint 10-2 added an erosion
+  // pass that modifies these faces in-place + populates pmap._drainage
+  // (parallel cubemap of cumulative water flux per texel). The chunk
+  // builder samples both: heightmap for elevation, drainage for
+  // river tinting along carved channels.
   const _planetCubemap = pmap ? _ensurePlanetMapCubemap(pmap) : null;
+  const _planetDrainage = (pmap && pmap._drainage) || null;
 
   const face = _PLANET_FACES[info.face];
   const nX = face.n[0], nY = face.n[1], nZ = face.n[2];
@@ -62100,6 +62306,28 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
       // noise. Phase 10 climate field (10-3) is the proper way to
       // get smooth color variation -- temperature + moisture +
       // slope drive color directly, not random noise modulation.
+      //
+      // Sprint 10-2: river tint from drainage cubemap. _ensure-
+      // PlanetMapCubemap populated pmap._drainage with cumulative
+      // water-flux per texel; high-flux cells = river channels.
+      // Sample with the same cubemap projection used for elevation;
+      // smoothly tint toward river-blue where flux passes threshold.
+      // Only tints land cells (elev > seaLevel) so ocean isn't
+      // double-coloured.
+      if (_planetDrainage && elev > seaLevel) {
+        const flux = _samplePlanetMapCubemap(_planetDrainage, ux, uy, uz);
+        // smoothstep across 50..400 flux: subtle creek at 50,
+        // big river by 400. Capped at 0.85 so river color blends
+        // with the biome behind it (not pure blue) -- looks like
+        // a river through forest, not a blue line.
+        const riverAmt = Math.max(0, Math.min(0.85, (flux - 50) / 350));
+        if (riverAmt > 0) {
+          const _riverR = 0.18, _riverG = 0.38, _riverB = 0.62;
+          blendR = blendR + (_riverR - blendR) * riverAmt;
+          blendG = blendG + (_riverG - blendG) * riverAmt;
+          blendB = blendB + (_riverB - blendB) * riverAmt;
+        }
+      }
       const baseCol = [blendR, blendG, blendB];
       const biomeId = (cellIdx >= 0) ? biomeForCell(cellIdx, elev) : 0;
       // Smooth oblate-spheroid radial; used as a fallback for
