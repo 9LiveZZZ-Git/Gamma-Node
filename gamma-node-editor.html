@@ -10856,11 +10856,14 @@ public:
       heightScale: 0, seaLevel: 0.5,
       subdivide: 0,
       gridResolution: 129,
-      // Sprint 9-2 defaults: 16 verts/chunk-edge, 12 LOD levels
-      // (~5km leaves on Earth), splitFactor 5 = split when camera is
-      // within 5x the chunk's edge-length.
+      // Sprint 9-2 defaults: 16 verts/chunk-edge, splitFactor 5 =
+      // split when camera is within 5x the chunk's edge-length.
+      // Sprint 9-6: maxDepth bumped 12 -> 16 for foot-level
+      // resolution (~10m vertex spacing under the camera at Earth
+      // radius). Cap raised to 20 in the resolver for users who
+      // want sub-foot detail.
       segments: 16,
-      maxDepth: 12,
+      maxDepth: 16,
       splitFactor: 5.0,
       textureScale: 0.001,
       textureMix:   1.0,
@@ -47252,7 +47255,55 @@ function _planetJordanTurbulence(wx, wy, wz, baseFreq, lacunarity, roughness, wa
   return (ampSum > 1e-6) ? ((sum / ampSum) * 2 - 1) : 0;
 }
 
-function _planetDetailNoiseHeight(wx, wy, wz, biomeId, biomeOverride, maxOctaveF) {
+/* Sprint 9-6 -- anti-tiling infrastructure. Pre-baked 3D rotation
+ * matrices (one per octave) that the noise loops apply per-octave
+ * to break the lattice-alignment "stamp" pattern. Plus per-octave
+ * lacunarity jitter (Geiss, GPU Gems 3 Ch.1): "It's important not
+ * to make the frequency exactly double... the interference of two
+ * overlapping, repeating signals at slightly different frequencies
+ * is beneficial... it helps break up repetition." */
+const _PLANET_OCTAVE_LAC_JITTER = [
+  1.00, 1.04, 0.97, 1.03, 0.99, 1.05, 0.96, 1.02, 0.98, 1.04, 0.95, 1.03
+];
+function _planetOctaveRotMat(k) {
+  // Deterministic seed per octave -> 3D rotation matrix. Picks
+  // three orthogonal-ish axes and an angle from the hash; the
+  // exact orientation doesn't matter so long as adjacent octaves
+  // are decorrelated.
+  const s = Math.sin(k * 2.71828 + 0.31) * 0.5 + 0.5;
+  const t = Math.sin(k * 3.14159 + 1.57) * 0.5 + 0.5;
+  const u = Math.sin(k * 1.61803 + 2.45) * 0.5 + 0.5;
+  const ang = s * 6.28318;
+  const ax = t * 2 - 1;
+  const ay = u * 2 - 1;
+  const az = Math.sqrt(Math.max(0, 1 - ax * ax - ay * ay)) * (s > 0.5 ? 1 : -1);
+  const c = Math.cos(ang), si = Math.sin(ang), omc = 1 - c;
+  return [
+    c + ax*ax*omc,    ax*ay*omc - az*si, ax*az*omc + ay*si,
+    ay*ax*omc + az*si, c + ay*ay*omc,    ay*az*omc - ax*si,
+    az*ax*omc - ay*si, az*ay*omc + ax*si, c + az*az*omc
+  ];
+}
+const _PLANET_OCTAVE_ROTS = [];
+for (let k = 0; k < 12; k++) _PLANET_OCTAVE_ROTS.push(_planetOctaveRotMat(k));
+
+/* Sprint 9-6 -- per-chunk hash offset. Translates the noise field
+ * by (hash * 4096 m) per chunk so the same biome's noise pattern
+ * doesn't recur identically on the other side of the planet.
+ * Cheap (one hash3 call per chunk, applied as a constant offset to
+ * the entire chunk's noise sampling). */
+function _planetChunkNoiseOffset(face, depth, ix, iy) {
+  const s = Math.sin(face * 12.9898 + depth * 78.233 + ix * 37.719 + iy * 27.181) * 43758.5453;
+  const t = Math.sin(face * 4.1414 + depth * 28.331 + ix * 7.319 + iy * 17.811) * 23421.6310;
+  const u = Math.sin(face * 23.231 + depth * 9.114 + ix * 47.213 + iy * 31.421) * 19073.4111;
+  return [
+    (s - Math.floor(s)) * 4096,
+    (t - Math.floor(t)) * 4096,
+    (u - Math.floor(u)) * 4096
+  ];
+}
+
+function _planetDetailNoiseHeight(wx, wy, wz, biomeId, biomeOverride, maxOctaveF, chunkOffset) {
   if (biomeId < 0 || biomeId > 12) return 0;
   if (typeof PLANET_BIOME_DETAIL_DEFAULTS === "undefined") return 0;
   const def = (biomeOverride && biomeOverride[biomeId]) || PLANET_BIOME_DETAIL_DEFAULTS[biomeId];
@@ -47260,41 +47311,82 @@ function _planetDetailNoiseHeight(wx, wy, wz, biomeId, biomeOverride, maxOctaveF
   const amplitude = def[0], baseFreq = def[1], roughness = def[2];
   const lacunarity = def[3], shape = def[4] | 0;
   if (amplitude <= 0) return 0;
-  // Sprint 9-4: octave count is now a continuous param. Floor =
-  // fully-summed octaves; the partial (fractional) one gets weighted
-  // by the fract part, so when the LOD crossfades to a higher octave
-  // count (deeper chunk takes over) the new top octave fades in
-  // smoothly across the morph band -- no pop. Default 6 keeps the
-  // pre-sprint-9-4 callers (legacy collision / walk surface) bit-
-  // identical.
+  // Sprint 9-6: per-chunk hash offset (kills planet-wide
+  // recurrence of the same noise pattern at the same world point).
+  const ox0 = chunkOffset ? chunkOffset[0] : 0;
+  const oy0 = chunkOffset ? chunkOffset[1] : 0;
+  const oz0 = chunkOffset ? chunkOffset[2] : 0;
+  const px = wx + ox0, py = wy + oy0, pz = wz + oz0;
   const octF = (typeof maxOctaveF === "number" && maxOctaveF > 0) ? maxOctaveF : 6;
-  // Sprint 9-5: shape 5 = Swiss, shape 6 = Jordan. Both use the
-  // analytic-gradient pipeline (Carpentier); biome's warpStrength
-  // (def[5]) controls erosion intensity.
+  // Sprint 9-5: shape 5 = Swiss, shape 6 = Jordan.
   if (shape === 5) {
-    return _planetSwissTurbulence(wx, wy, wz, baseFreq, lacunarity, roughness, def[5], octF) * amplitude;
+    return _planetSwissTurbulence(px, py, pz, baseFreq, lacunarity, roughness, def[5], octF) * amplitude;
   }
   if (shape === 6) {
-    return _planetJordanTurbulence(wx, wy, wz, baseFreq, lacunarity, roughness, def[5], octF) * amplitude;
+    return _planetJordanTurbulence(px, py, pz, baseFreq, lacunarity, roughness, def[5], octF) * amplitude;
   }
+  // Sprint 9-6: Quilez double domain warp (iquilezles.org/articles/
+  // warp). Two layers of fbm warp the input position before the
+  // main fbm samples -- turns the lattice-aligned noise into
+  // organic curves. The inner warps use just a few octaves each;
+  // total noise cost is ~1.7x plain fbm.
+  const warpOctF = Math.min(3, octF * 0.5);
+  const wq1x = _planetFbmCheap(px,         py,         pz,         baseFreq, lacunarity, roughness, warpOctF, 0);
+  const wq1y = _planetFbmCheap(px + 5.2,   py + 1.3,   pz + 7.7,   baseFreq, lacunarity, roughness, warpOctF, 0);
+  const wq1z = _planetFbmCheap(px + 11.3,  py + 17.5,  pz + 3.1,   baseFreq, lacunarity, roughness, warpOctF, 0);
+  const warp1 = 4.0 / baseFreq;  // 4x noise wavelength
+  const qx = px + warp1 * wq1x;
+  const qy = py + warp1 * wq1y;
+  const qz = pz + warp1 * wq1z;
+  const wq2x = _planetFbmCheap(qx + 1.7,   qy + 9.2,   qz + 2.4,   baseFreq, lacunarity, roughness, warpOctF, 0);
+  const wq2y = _planetFbmCheap(qx + 8.3,   qy + 2.8,   qz + 6.1,   baseFreq, lacunarity, roughness, warpOctF, 0);
+  const wq2z = _planetFbmCheap(qx + 4.4,   qy + 5.6,   qz + 13.9,  baseFreq, lacunarity, roughness, warpOctF, 0);
+  const rx = qx + warp1 * wq2x;
+  const ry = qy + warp1 * wq2y;
+  const rz = qz + warp1 * wq2z;
   const fullOctaves = Math.floor(octF);
   const fade = octF - fullOctaves;
   const totalOct = Math.min(12, fullOctaves + (fade > 0.001 ? 1 : 0));
   let sum = 0, ampSum = 0, freq = baseFreq, amp = 1;
   for (let kk = 0; kk < totalOct; kk++) {
-    const ox = kk * 13.37, oy = kk * 7.91, oz = kk * 23.45;
-    let n = _planetValueNoise3D(wx * freq + ox, wy * freq + oy, wz * freq + oz) * 2 - 1;
+    // Sprint 9-6: per-octave rotation + lacunarity jitter to
+    // decorrelate the octave lattice peaks (Geiss GPU Gems 3 +
+    // Quilez fbm article).
+    const R = _PLANET_OCTAVE_ROTS[kk];
+    const rrx = R[0]*rx + R[1]*ry + R[2]*rz;
+    const rry = R[3]*rx + R[4]*ry + R[5]*rz;
+    const rrz = R[6]*rx + R[7]*ry + R[8]*rz;
+    const oxk = kk * 13.37, oyk = kk * 7.91, ozk = kk * 23.45;
+    let n = _planetValueNoise3D(rrx * freq + oxk, rry * freq + oyk, rrz * freq + ozk) * 2 - 1;
     if (shape === 1 || shape === 3) { const r = 1 - Math.abs(n); n = r * r; }
     else if (shape === 2) { n = Math.abs(n); }
     else if (shape === 4) { const r = 1 - Math.abs(n); n = -r * r; }
     const w = (kk === fullOctaves && fade > 0.001 && fade < 0.999) ? fade : 1;
     sum    += amp * n * w;
     ampSum += amp * w;
-    freq   *= lacunarity;
+    freq   *= lacunarity * _PLANET_OCTAVE_LAC_JITTER[kk];
     amp    *= roughness;
   }
   if (ampSum < 1e-6) return 0;
   return (sum / ampSum) * amplitude;
+}
+
+/* Sprint 9-6 -- minimal fbm used by the Quilez double domain warp
+ * (above). Plain octave loop, no shape modifiers, no rotation; the
+ * warp field just needs SOMETHING smoothly varying. ~3 octaves
+ * keeps the warp cost down. */
+function _planetFbmCheap(wx, wy, wz, baseFreq, lacunarity, roughness, octF, _) {
+  const total = Math.max(1, Math.floor(octF) | 0);
+  let sum = 0, ampSum = 0, freq = baseFreq, amp = 1;
+  for (let kk = 0; kk < total; kk++) {
+    const oxk = kk * 13.37, oyk = kk * 7.91, ozk = kk * 23.45;
+    const n = _planetValueNoise3D(wx * freq + oxk, wy * freq + oyk, wz * freq + ozk) * 2 - 1;
+    sum    += amp * n;
+    ampSum += amp;
+    freq   *= lacunarity;
+    amp    *= roughness;
+  }
+  return (ampSum > 1e-6) ? (sum / ampSum) : 0;
 }
 
 /* Sprint 8-8 -- given a world-space position (wx, wy, wz), find the
@@ -47346,7 +47438,12 @@ function _planetMeshSurfacePos(wx, wy, wz, pl) {
     const bLen = Math.hypot(bX, bY, bZ) || 1;
     const rdX = bX / bLen, rdY = bY / bLen, rdZ = bZ / bLen;
     const biomeOverride = (pmap && pmap._biomeParams) || null;
-    const dispH = _planetDetailNoiseHeight(baseX, baseY, baseZ, biomeId, biomeOverride);
+    // Sprint 9-6: 10 octaves matches the Nyquist octave count at
+    // the deepest LOD (maxDepth=16-20 chunks). Without this the
+    // collision surface sits ~30 m below the rendered chunks --
+    // camera walks on a smoother floor while bumps poke through
+    // around it.
+    const dispH = _planetDetailNoiseHeight(baseX, baseY, baseZ, biomeId, biomeOverride, 10);
     totalDisp = dispH * pl.dispScale;
     return {
       x: baseX + rdX * totalDisp,
@@ -58879,6 +58976,58 @@ function _samplePlanetCellsIDW(cells, hash, ux, uy, uz) {
   return (w0 * e0 + w1 * e1 + w2 * e2) / wSum;
 }
 
+/* Sprint 9-6 -- K=3 IDW kernel that returns the 3 nearest cell
+ * indices + their weights (instead of a single blended scalar
+ * like _samplePlanetCellsIDW). Lets callers blend per-cell data
+ * other than elevation -- specifically biome colors, where we
+ * want the same kernel that smooths elevation to also smooth
+ * the color transitions across biome boundaries. */
+function _samplePlanetCellsK3(cells, hash, ux, uy, uz) {
+  const GRID = hash.GRID;
+  const ix0 = Math.max(0, Math.min(GRID - 1, Math.floor((ux + 1) * 0.5 * GRID)));
+  const iy0 = Math.max(0, Math.min(GRID - 1, Math.floor((uy + 1) * 0.5 * GRID)));
+  const iz0 = Math.max(0, Math.min(GRID - 1, Math.floor((uz + 1) * 0.5 * GRID)));
+  let i0 = -1, i1 = -1, i2 = -1;
+  let d0 = -2, d1 = -2, d2 = -2;
+  for (let dx = -1; dx <= 1; dx++) {
+    const bx = ix0 + dx;
+    if (bx < 0 || bx >= GRID) continue;
+    for (let dy = -1; dy <= 1; dy++) {
+      const by = iy0 + dy;
+      if (by < 0 || by >= GRID) continue;
+      for (let dz = -1; dz <= 1; dz++) {
+        const bz = iz0 + dz;
+        if (bz < 0 || bz >= GRID) continue;
+        const bucket = hash.buckets.get(bx * GRID * GRID + by * GRID + bz);
+        if (!bucket) continue;
+        for (let i = 0; i < bucket.length; i++) {
+          const cidx = bucket[i];
+          const dot = ux * cells.positions[cidx * 3]
+                    + uy * cells.positions[cidx * 3 + 1]
+                    + uz * cells.positions[cidx * 3 + 2];
+          if (dot > d0)      { i2 = i1; d2 = d1; i1 = i0; d1 = d0; i0 = cidx; d0 = dot; }
+          else if (dot > d1) { i2 = i1; d2 = d1; i1 = cidx; d1 = dot; }
+          else if (dot > d2) { i2 = cidx; d2 = dot; }
+        }
+      }
+    }
+  }
+  if (i0 < 0) {
+    for (let i = 0; i < cells.count; i++) {
+      const dot = ux * cells.positions[i * 3]
+                + uy * cells.positions[i * 3 + 1]
+                + uz * cells.positions[i * 3 + 2];
+      if (dot > d0)      { i2 = i1; d2 = d1; i1 = i0; d1 = d0; i0 = i; d0 = dot; }
+      else if (dot > d1) { i2 = i1; d2 = d1; i1 = i; d1 = dot; }
+      else if (dot > d2) { i2 = i; d2 = dot; }
+    }
+  }
+  const w0 = 1.0 / (2.0 - 2.0 * d0 + 1e-6);
+  const w1 = (i1 >= 0) ? 1.0 / (2.0 - 2.0 * d1 + 1e-6) : 0;
+  const w2 = (i2 >= 0) ? 1.0 / (2.0 - 2.0 * d2 + 1e-6) : 0;
+  return { i0, i1, i2, w0, w1, w2, wSum: w0 + w1 + w2 };
+}
+
 /* §planet-spec Phase 7.c -- get or build the cell graph for a
  * PlanetMap node. Cached on node._cells with a key over (cellCount,
  * seed, frequency, octaves, lacunarity, gain, ridges). Resolution
@@ -61620,7 +61769,15 @@ function _resolvePlanetMeshGeom(p) {
     cyC: (typeof p.centerY === "number") ? p.centerY : 0,
     czC: (typeof p.centerZ === "number") ? p.centerZ : 0,
     segs:        Math.max(2, Math.min(64, Math.floor((typeof p.segments === "number") ? p.segments : 16))),
-    maxDepth:    Math.max(0, Math.min(18, Math.floor((typeof p.maxDepth    === "number") ? p.maxDepth    : 12))),
+    // Sprint 9-6: maxDepth default bumped 12 -> 16 so foot-level
+    // chunks get small enough to resolve detail-noise features.
+    // At Earth radius with depth 16 the deepest leaf is ~152m wide
+    // (segs=16 → vertex spacing 9.5m); depth 20 gets to ~9m wide
+    // (vertex spacing 0.6m, sub-foot). cuberact ships maxDepth ~18
+    // and the angular-size split rule keeps total visible-chunk
+    // count near constant (only chunks UNDER the camera split deep
+    // -- distant chunks stay coarse).
+    maxDepth:    Math.max(0, Math.min(20, Math.floor((typeof p.maxDepth    === "number") ? p.maxDepth    : 16))),
     splitFactor: Math.max(0.1, Math.min(50, (typeof p.splitFactor === "number") ? p.splitFactor : 5.0)),
     hs:       (typeof p.heightScale === "number") ? p.heightScale : 0,
     seaLevel: Math.max(0, Math.min(1, (typeof p.seaLevel === "number") ? p.seaLevel : 0.5))
@@ -61693,6 +61850,13 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
   // 2*morphLow, giving morph delta = morphLow.
   const chunkEdgeM = (info.uMax - info.uMin) * r * (Math.PI * 0.25);
   const morphLow = chunkEdgeM * geom.splitFactor;
+  // Sprint 9-6: per-chunk hash offset for the detail noise. Two
+  // chunks of the same biome at different planet locations now get
+  // different noise patterns -- breaks the "same desert shape on
+  // the other side of the planet" failure mode at zero per-vertex
+  // cost (one hash, used as a constant offset to every noise call
+  // in this chunk).
+  const _chunkOffset = _planetChunkNoiseOffset(info.face, info.depth, info.ix, info.iy);
   // Sprint 9-2b: skirts. 1-vert-thick ring around the 4 edges,
   // projected radially inward to the bare spheroid surface.
   const SKIRT_VERT_COUNT = 4 * (N - 1);
@@ -61742,27 +61906,19 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
       const sz = cz * Math.sqrt(Math.max(0, 1 - cxx * 0.5 - cyy * 0.5 + cxx * cyy / 3));
       const invLen = 1 / Math.max(1e-12, Math.sqrt(sx*sx + sy*sy + sz*sz));
       const ux = sx * invLen, uy = sy * invLen, uz = sz * invLen;
-      // Sprint 9-4: K=3 inverse-distance-weighted elevation blend
-      // (kills the per-cell plateau artifact -- adjacent vertices
-      // inside the same Voronoi cell no longer all share that one
-      // cell's elevation; instead their elevation varies smoothly
-      // by distance to the 3 nearest cell centers). The biome /
-      // river / lake lookup still goes through _findNearestCell
-      // (categorical attributes can't be blended).
+      // Sprint 9-4: K=3 IDW elevation blend kills the per-cell
+      // plateau artifact. Sprint 9-6: also use the same K=3 IDW
+      // weights to blend the per-cell BIOME COLOR, so adjacent
+      // biomes meet at a soft gradient instead of a hard line.
+      // (Biome ID itself stays nearest-only since blending integer
+      // IDs is meaningless -- biome ID is used for noise shape +
+      // detail-amp, color is what the eye sees.)
       const cellIdx = _findNearestCell(cells, pmap._cellsHash, ux, uy, uz);
       const elev = _samplePlanetCellsIDW(cells, pmap._cellsHash, ux, uy, uz);
       let altitude = 0;
       if (elev > seaLevel && hs !== 0) {
         altitude = hs * (elev - seaLevel) / Math.max(1e-6, 1 - seaLevel);
       }
-      // Sprint 9-4: bake sub-cell detail noise on top of the macro
-      // elevation. Octave count per leaf = Nyquist rule: the highest
-      // octave whose wavelength is still > 2x the leaf vertex
-      // spacing. Deeper chunks (closer to camera) get more octaves;
-      // octaves crossfade smoothly across the parent->child LOD
-      // boundary via the fractional-octave fade in
-      // _planetDetailNoiseHeight. We sample on land cells only --
-      // ocean stays flat (rendered separately via Water if wired).
       const biomeRow = (pmap && pmap._biomeParams && pmap._biomeParams[cellIdx >= 0 && cells.biome ? cells.biome[cellIdx] : 0])
                      || PLANET_BIOME_DETAIL_DEFAULTS[cellIdx >= 0 && cells.biome ? cells.biome[cellIdx] : 0]
                      || PLANET_BIOME_DETAIL_DEFAULTS[4];
@@ -61773,11 +61929,9 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
       if (elev > seaLevel && hs !== 0) {
         const _bid = cellIdx >= 0 && cells.biome ? cells.biome[cellIdx] : 0;
         const _biomeOverride = (pmap && pmap._biomeParams) || null;
-        // World-space coords for noise sampling so the noise field
-        // is consistent across chunk LODs AND with the collision /
-        // walk-mode AGL queries (_planetMeshSurfacePos samples the
-        // same noise function at world coords too).
-        _detailH = _planetDetailNoiseHeight(cxC + r * ux, cyC + r * uy * polRatio, czC + r * uz, _bid, _biomeOverride, _nyqOct);
+        // World-space coords for noise sampling + per-chunk offset
+        // for anti-recurrence (sprint 9-6).
+        _detailH = _planetDetailNoiseHeight(cxC + r * ux, cyC + r * uy * polRatio, czC + r * uz, _bid, _biomeOverride, _nyqOct, _chunkOffset);
       }
       altitude += _detailH;
       // Sprint 9-3: VBO holds vertices RELATIVE to the planet's
@@ -61790,7 +61944,46 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
       const px = r * ux           + altitude * ux;
       const py = r * uy * polRatio + altitude * uy;
       const pz = r * uz           + altitude * uz;
-      const baseCol = (cellIdx >= 0) ? colorForCell(cellIdx, elev) : _planetColorForHeight(elev, seaLevel);
+      // Sprint 9-6: K=3 IDW BIOME COLOR blend. Same 3x3x3 scan we
+      // already do for elevation, weighted with the same 1/(d²+ε)
+      // kernel -- but with color. Adjacent biomes meet at a smooth
+      // gradient instead of a hard line. Planetation + SpaceEngine
+      // both ship this pattern.
+      const _idw = _samplePlanetCellsK3(cells, pmap._cellsHash, ux, uy, uz);
+      const c0 = (_idw.i0 >= 0) ? colorForCell(_idw.i0, cells.elevations[_idw.i0]) : _planetColorForHeight(elev, seaLevel);
+      const c1 = (_idw.i1 >= 0) ? colorForCell(_idw.i1, cells.elevations[_idw.i1]) : c0;
+      const c2 = (_idw.i2 >= 0) ? colorForCell(_idw.i2, cells.elevations[_idw.i2]) : c0;
+      let blendR = (_idw.w0 * c0[0] + _idw.w1 * c1[0] + _idw.w2 * c2[0]) / _idw.wSum;
+      let blendG = (_idw.w0 * c0[1] + _idw.w1 * c1[1] + _idw.w2 * c2[1]) / _idw.wSum;
+      let blendB = (_idw.w0 * c0[2] + _idw.w1 * c1[2] + _idw.w2 * c2[2]) / _idw.wSum;
+      // Sprint 9-6: per-cell hash micro-tint. Each Voronoi cell
+      // gets a small RGB jitter (±5%) keyed off its index, so two
+      // adjacent cells of the SAME biome don't read as one flat
+      // patch -- they're recognizably distinct without breaking
+      // the biome's color identity.
+      if (_idw.i0 >= 0) {
+        const _ti = _idw.i0;
+        const tintR = (Math.sin(_ti * 12.9898) * 0.5 + 0.5 - 0.5) * 0.10;
+        const tintG = (Math.sin(_ti * 78.233) * 0.5 + 0.5 - 0.5) * 0.10;
+        const tintB = (Math.sin(_ti * 4.1414) * 0.5 + 0.5 - 0.5) * 0.10;
+        blendR = blendR * (1 + tintR);
+        blendG = blendG * (1 + tintG);
+        blendB = blendB * (1 + tintB);
+      }
+      // Sprint 9-6: color breakup noise. Low-frequency value noise
+      // (~200m wavelength) modulates the base color by ±12%. Kills
+      // "uniform green" within a biome -- the color subtly varies
+      // like real terrain (lichens, dust, sun-bleached patches).
+      const _cbN = _planetValueNoise3D(
+        (cxC + r * ux) * 0.005 + _chunkOffset[0] * 0.1,
+        (cyC + r * uy * polRatio) * 0.005 + _chunkOffset[1] * 0.1,
+        (czC + r * uz) * 0.005 + _chunkOffset[2] * 0.1
+      );
+      const _cbMod = 1 + (_cbN * 2 - 1) * 0.12;
+      blendR = Math.max(0, Math.min(1.5, blendR * _cbMod));
+      blendG = Math.max(0, Math.min(1.5, blendG * _cbMod));
+      blendB = Math.max(0, Math.min(1.5, blendB * _cbMod));
+      const baseCol = [blendR, blendG, blendB];
       const biomeId = (cellIdx >= 0) ? biomeForCell(cellIdx, elev) : 0;
       // Smooth oblate-spheroid radial; used as a fallback for
       // degenerate triangles in the face-normal pass below.
@@ -61918,12 +62111,26 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
       // shadow, instead of the old uniform radial-normal shading.
       const nx = edgeNrm[gi*3+0], ny = edgeNrm[gi*3+1], nz = edgeNrm[gi*3+2];
       const lambert = Math.max(ambient, nx * sunX + ny * sunY + nz * sunZ);
+      // Sprint 9-6: slope-modulated color (Outerra signature trick).
+      // Where the surface is steep (face normal diverges from the
+      // local radial), blend the biome color toward rock-grey so
+      // cliffs / mountain sides read as rock instead of grass-on-
+      // green. Slope = 1 - dot(normal, radial); smooths over a
+      // 0.15 band (~30° angle) so the rock starts showing as the
+      // slope passes ~45°.
+      const radX = edgeDirs[gi*3+0], radY = edgeDirs[gi*3+1], radZ = edgeDirs[gi*3+2];
+      const slopeCos = nx * radX + ny * radY + nz * radZ;
+      const slopeAmt = 1 - Math.max(0, Math.min(1, (slopeCos - 0.55) / 0.30));
+      const rockR = 0.45, rockG = 0.42, rockB = 0.38;
+      const slopedR = edgeCol[gi*3+0] + (rockR - edgeCol[gi*3+0]) * slopeAmt;
+      const slopedG = edgeCol[gi*3+1] + (rockG - edgeCol[gi*3+1]) * slopeAmt;
+      const slopedB = edgeCol[gi*3+2] + (rockB - edgeCol[gi*3+2]) * slopeAmt;
       verts[vWrite++] = highPosX[gi];
       verts[vWrite++] = highPosY[gi];
       verts[vWrite++] = highPosZ[gi];
-      verts[vWrite++] = edgeCol[gi*3+0] * lambert;
-      verts[vWrite++] = edgeCol[gi*3+1] * lambert;
-      verts[vWrite++] = edgeCol[gi*3+2] * lambert;
+      verts[vWrite++] = slopedR * lambert;
+      verts[vWrite++] = slopedG * lambert;
+      verts[vWrite++] = slopedB * lambert;
       verts[vWrite++] = nx;
       verts[vWrite++] = ny;
       verts[vWrite++] = nz;
