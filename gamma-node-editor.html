@@ -61314,6 +61314,83 @@ function _earthElevationAt(lat, lon) {
   return Math.max(0, Math.min(1, landMax));
 }
 
+/* Sprint 10-5a-fix -- per-vertex Earth surface color. Latitude
+ * gives the climate band (polar / boreal / temperate / sub-trop /
+ * tropical); elevation gives the ocean / coast / lowland / upland /
+ * peak band. The cross of the two is a 5x5 LUT of plausible biome
+ * colors, blended smoothly across boundaries. Replaces the cell-
+ * graph IDW color blend when PlanetMap.source === "earth", so
+ * the Azgaar biome-quilt overlay doesn't show on Earth-shaped
+ * continents. Climate field (10-3) will replace this with a more
+ * accurate temp + moisture derivation; for now this is the
+ * "doesn't read as cell-painted" minimum.
+ *
+ * lat in degrees, elev in [0, 1] where 0.5 = sea level. Returns
+ * a 3-element RGB array in [0, 1] (multiplied by lambert later
+ * by the caller). */
+function _earthSurfaceColorAt(latDeg, elev, seaLevel) {
+  // Ocean: deeper = darker blue. Goes shallow → coastal aqua.
+  if (elev <= seaLevel) {
+    const depth = (seaLevel - elev) / Math.max(0.001, seaLevel);  // 0 at shore, 1 at deep
+    const shoreR = 0.18, shoreG = 0.36, shoreB = 0.52;
+    const deepR  = 0.04, deepG  = 0.10, deepB  = 0.22;
+    return [
+      shoreR + (deepR - shoreR) * depth,
+      shoreG + (deepG - shoreG) * depth,
+      shoreB + (deepB - shoreB) * depth
+    ];
+  }
+  // Land: climate band by latitude.
+  const absLat = Math.abs(latDeg);
+  // Above peak threshold = snow regardless of latitude.
+  const peakStart = seaLevel + 0.35;
+  const peakBlend = Math.max(0, Math.min(1, (elev - peakStart) / 0.10));
+  // Land elevation [seaLevel, 1] mapped to a 0..1 inland scale.
+  const landH = (elev - seaLevel) / Math.max(0.001, 1 - seaLevel);  // 0 at shore, 1 at peak
+  // Color picks: tropical/temperate/boreal/polar at increasing latitude.
+  // Each picks a (lowland, upland) pair; blend by landH.
+  let lowR, lowG, lowB, upR, upG, upB;
+  if (absLat < 23) {
+    // Tropical: lowland = jungle green, upland = darker forest.
+    lowR = 0.30; lowG = 0.55; lowB = 0.22;
+    upR  = 0.20; upG  = 0.40; upB  = 0.18;
+  } else if (absLat < 35) {
+    // Sub-tropical / Mediterranean: drier, ochre + olive.
+    lowR = 0.55; lowG = 0.52; lowB = 0.30;
+    upR  = 0.45; upG  = 0.42; upB  = 0.28;
+  } else if (absLat < 55) {
+    // Temperate: grassland/forest greens.
+    lowR = 0.38; lowG = 0.50; lowB = 0.28;
+    upR  = 0.30; upG  = 0.42; upB  = 0.24;
+  } else if (absLat < 70) {
+    // Boreal / taiga: dark conifer green, mosses.
+    lowR = 0.28; lowG = 0.36; lowB = 0.22;
+    upR  = 0.40; upG  = 0.42; upB  = 0.34;
+  } else {
+    // Polar: tundra browns + snow on heights.
+    lowR = 0.55; lowG = 0.54; lowB = 0.48;
+    upR  = 0.78; upG  = 0.80; upB  = 0.85;
+  }
+  // Hot desert override: arid mid-latitude continental interiors.
+  // Approximate desert bands at ~25° both hemispheres.
+  if (absLat > 18 && absLat < 35) {
+    const desertBand = Math.exp(-Math.pow((absLat - 26) / 7, 2));
+    const sandR = 0.78, sandG = 0.66, sandB = 0.42;
+    lowR = lowR + (sandR - lowR) * desertBand * 0.6;
+    lowG = lowG + (sandG - lowG) * desertBand * 0.6;
+    lowB = lowB + (sandB - lowB) * desertBand * 0.6;
+  }
+  let r = lowR + (upR - lowR) * landH;
+  let g = lowG + (upG - lowG) * landH;
+  let b = lowB + (upB - lowB) * landH;
+  // Snow on peaks.
+  const snowR = 0.92, snowG = 0.95, snowB = 0.98;
+  r = r + (snowR - r) * peakBlend;
+  g = g + (snowG - g) * peakBlend;
+  b = b + (snowB - b) * peakBlend;
+  return [r, g, b];
+}
+
 function _buildEarthCubemap(resolution) {
   const res = Math.max(16, Math.min(2048, Math.floor(resolution || 512)));
   const faces = [];
@@ -62247,6 +62324,10 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
   // river tinting along carved channels.
   const _planetCubemap = pmap ? _ensurePlanetMapCubemap(pmap) : null;
   const _planetDrainage = (pmap && pmap._drainage) || null;
+  // Sprint 10-5a-fix: when source === "earth", bypass the cell-
+  // graph IDW color blend (Azgaar quilt) and compute color per
+  // vertex from latitude + elevation directly.
+  const _planetIsEarth = !!(pmap && pmap.params && pmap.params.source === "earth");
 
   const face = _PLANET_FACES[info.face];
   const nX = face.n[0], nY = face.n[1], nZ = face.n[2];
@@ -62393,31 +62474,40 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
       const px = r * ux           + altitude * ux;
       const py = r * uy * polRatio + altitude * uy;
       const pz = r * uz           + altitude * uz;
-      // Sprint 9-6: K=3 IDW BIOME COLOR blend. Same 3x3x3 scan we
-      // already do for elevation, weighted with the same 1/(d²+ε)
-      // kernel -- but with color. Adjacent biomes meet at a smooth
-      // gradient instead of a hard line. Planetation + SpaceEngine
-      // both ship this pattern.
-      const _idw = _samplePlanetCellsK3(cells, pmap._cellsHash, ux, uy, uz);
-      const c0 = (_idw.i0 >= 0) ? colorForCell(_idw.i0, cells.elevations[_idw.i0]) : _planetColorForHeight(elev, seaLevel);
-      const c1 = (_idw.i1 >= 0) ? colorForCell(_idw.i1, cells.elevations[_idw.i1]) : c0;
-      const c2 = (_idw.i2 >= 0) ? colorForCell(_idw.i2, cells.elevations[_idw.i2]) : c0;
-      let blendR = (_idw.w0 * c0[0] + _idw.w1 * c1[0] + _idw.w2 * c2[0]) / _idw.wSum;
-      let blendG = (_idw.w0 * c0[1] + _idw.w1 * c1[1] + _idw.w2 * c2[1]) / _idw.wSum;
-      let blendB = (_idw.w0 * c0[2] + _idw.w1 * c1[2] + _idw.w2 * c2[2]) / _idw.wSum;
-      // Sprint 9-6: per-cell hash micro-tint. Each Voronoi cell
-      // gets a small RGB jitter (±5%) keyed off its index, so two
-      // adjacent cells of the SAME biome don't read as one flat
-      // patch -- they're recognizably distinct without breaking
-      // the biome's color identity.
-      if (_idw.i0 >= 0) {
-        const _ti = _idw.i0;
-        const tintR = (Math.sin(_ti * 12.9898) * 0.5 + 0.5 - 0.5) * 0.10;
-        const tintG = (Math.sin(_ti * 78.233) * 0.5 + 0.5 - 0.5) * 0.10;
-        const tintB = (Math.sin(_ti * 4.1414) * 0.5 + 0.5 - 0.5) * 0.10;
-        blendR = blendR * (1 + tintR);
-        blendG = blendG * (1 + tintG);
-        blendB = blendB * (1 + tintB);
+      // Sprint 10-5a-fix: in Earth mode, color comes from elevation
+      // + latitude directly (climate-band LUT) -- no cell-graph
+      // biome reads, no per-cell hash tint, no quilt overlay. The
+      // K=3 IDW blend path below stays for source="custom"
+      // (hand-painted) maps where the user IS authoring per-cell
+      // biome.
+      let blendR, blendG, blendB;
+      if (_planetIsEarth) {
+        // Unit-sphere direction → lat/lon for the climate lookup.
+        // (ux/uy/uz already computed above for the cubemap sample.)
+        const _latDeg = Math.asin(Math.max(-1, Math.min(1, uy))) * 180 / Math.PI;
+        const _earthCol = _earthSurfaceColorAt(_latDeg, elev, seaLevel);
+        blendR = _earthCol[0];
+        blendG = _earthCol[1];
+        blendB = _earthCol[2];
+      } else {
+        // Custom-source path: K=3 IDW cell-color blend + per-cell tint.
+        const _idw = _samplePlanetCellsK3(cells, pmap._cellsHash, ux, uy, uz);
+        const c0 = (_idw.i0 >= 0) ? colorForCell(_idw.i0, cells.elevations[_idw.i0]) : _planetColorForHeight(elev, seaLevel);
+        const c1 = (_idw.i1 >= 0) ? colorForCell(_idw.i1, cells.elevations[_idw.i1]) : c0;
+        const c2 = (_idw.i2 >= 0) ? colorForCell(_idw.i2, cells.elevations[_idw.i2]) : c0;
+        blendR = (_idw.w0 * c0[0] + _idw.w1 * c1[0] + _idw.w2 * c2[0]) / _idw.wSum;
+        blendG = (_idw.w0 * c0[1] + _idw.w1 * c1[1] + _idw.w2 * c2[1]) / _idw.wSum;
+        blendB = (_idw.w0 * c0[2] + _idw.w1 * c1[2] + _idw.w2 * c2[2]) / _idw.wSum;
+        // Per-cell hash micro-tint (custom mode only).
+        if (_idw.i0 >= 0) {
+          const _ti = _idw.i0;
+          const tintR = (Math.sin(_ti * 12.9898) * 0.5 + 0.5 - 0.5) * 0.10;
+          const tintG = (Math.sin(_ti * 78.233) * 0.5 + 0.5 - 0.5) * 0.10;
+          const tintB = (Math.sin(_ti * 4.1414) * 0.5 + 0.5 - 0.5) * 0.10;
+          blendR = blendR * (1 + tintR);
+          blendG = blendG * (1 + tintG);
+          blendB = blendB * (1 + tintB);
+        }
       }
       // Sprint 10-1d: color breakup noise REMOVED along with the
       // noise terrain displacement. Per-cell hash tint above gives
