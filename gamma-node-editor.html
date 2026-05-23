@@ -54636,6 +54636,66 @@ fn vs_planet_detail(in: VsIn) -> VsOut {
   return out;
 }
 
+// === Sprint 9-2c: vs_planet_cdlod (Strugar CDLOD vertex morphing) ===
+// Per-vertex morph between this LOD's position (highPos) and the
+// parent LOD's emulated position (lowPos, computed JS-side as the
+// bilinear interp of even-grid neighbors). The morph factor goes
+// 0→1 over the outer half of this chunk's LOD range so adjacent
+// chunks at different LODs meet at identical positions on their
+// shared edge -- no cracks, no skirts needed.
+//
+// Vertex layout (14 floats, stride 56):
+//   loc 0: pos.xyz     -- highPos (this LOD's vertex world position)
+//   loc 1: color.rgb   -- vertex-baked Lambert
+//   loc 2: normal.xyz  -- oblate-spheroid surface normal
+//   loc 3: uv.xy       -- x = biomeId (for fs biome routing),
+//                         y = morphLow (this chunk's split distance)
+//   loc 4: lowPos.xyz  -- parent-LOD-emulated vertex position
+//
+// Morph formula (Strugar 2010):
+//   morph = clamp((dist - morphLow) / morphLow * 2 - 1, 0, 1)
+// At dist = morphLow (close): morph = -1 → 0. No morph.
+// At dist = 1.5 * morphLow:    morph = 0. Still no morph.
+// At dist = 2 * morphLow:      morph = 1. Fully morphed → snap to parent.
+// Parent's split distance is exactly 2*morphLow (chunkEdge doubles
+// at every LOD step), so at the moment the parent takes over the
+// child has finished morphing -- no pop.
+struct VsInCDLOD {
+  @location(0) pos:    vec3<f32>,
+  @location(1) color:  vec3<f32>,
+  @location(2) normal: vec3<f32>,
+  @location(3) uv:     vec2<f32>,
+  @location(4) lowPos: vec3<f32>
+};
+@vertex
+fn vs_planet_cdlod(in: VsInCDLOD) -> VsOut {
+  var out: VsOut;
+  let highWorld4 = uD.model * vec4<f32>(in.pos,    1.0);
+  let lowWorld4  = uD.model * vec4<f32>(in.lowPos, 1.0);
+  let highPos = highWorld4.xyz;
+  let lowPos  = lowWorld4.xyz;
+
+  let camPos = uS.eye.xyz;
+  let dist = distance(highPos, camPos);
+  let morphLow = in.uv.y;
+  // morphLow > 0 only for interior chunk verts; skirt verts pass 0
+  // here so they never morph (they're already at the spheroid
+  // surface, no parent geometry to morph toward).
+  var morph: f32 = 0.0;
+  if (morphLow > 0.0) {
+    morph = clamp((dist - morphLow) / morphLow * 2.0 - 1.0, 0.0, 1.0);
+  }
+  let morphedPos = mix(highPos, lowPos, morph);
+
+  out.worldPos = morphedPos;
+  out.pos = uS.viewProj * vec4<f32>(morphedPos, 1.0);
+  out.color = in.color;
+  let n4 = uD.model * vec4<f32>(in.normal, 0.0);
+  out.normal = normalize(n4.xyz);
+  out.uv = in.uv;
+  return out;
+}
+
 // Phase 7 §5.5.h-25 -- vs_horizon. Same VsOut shape as vs_main, but
 // applies a planet-curvature Y warp to each vertex based on the
 // camera's altitude. At low altitude the warp factor is 0 (flat
@@ -56342,32 +56402,48 @@ function _ensureMeshPipeline(materialType, sampleCount, displaced, vsVariant) {
   // true. Same VsOut interface so any fragment shader works on top.
   // §5.5.h-25 -- horizon material gets vs_horizon for planet-
   // curvature blend.
-  const vsEntry = (vsVariant === "planet_detail") ? "vs_planet_detail"
+  const vsEntry = (vsVariant === "planet_cdlod")  ? "vs_planet_cdlod"
+                : (vsVariant === "planet_detail") ? "vs_planet_detail"
                 : (materialType === "horizon")    ? "vs_horizon"
                 : displaced                       ? "vs_terrain"
                 :                                   "vs_main";
+  // Sprint 9-2c: planet_cdlod uses an extended 14-float vertex
+  // layout (adds lowPos.xyz at @location(4)). Other variants stay on
+  // the standard 11-float layout. Stride matters here -- the
+  // pipeline's expected attribute strides must match what
+  // _buildSinglePlanetMeshChunk uploads.
+  const vertexBuffers = (vsVariant === "planet_cdlod") ? [{
+    arrayStride: 14 * 4,
+    attributes: [
+      { shaderLocation: 0, offset: 0,      format: "float32x3" },  // pos (highPos)
+      { shaderLocation: 1, offset: 3 * 4,  format: "float32x3" },  // color
+      { shaderLocation: 2, offset: 6 * 4,  format: "float32x3" },  // normal
+      { shaderLocation: 3, offset: 9 * 4,  format: "float32x2" },  // uv (x=biomeId, y=morphLow)
+      { shaderLocation: 4, offset: 11 * 4, format: "float32x3" }   // lowPos (parent-grid-emulated vertex)
+    ]
+  }] : [{
+    // Vertex layout (sprint 7.5.3c push 6): 11 floats per
+    // vertex = position (3) + color (3) + normal (3) + uv (2).
+    // Stride 44 bytes. UV added for proper per-mesh texture
+    // mapping in ShaderMat(preset=texture); each primitive
+    // builder emits a natural mapping for its shape.
+    arrayStride: 11 * 4,
+    attributes: [
+      { shaderLocation: 0, offset: 0,     format: "float32x3" },  // position
+      { shaderLocation: 1, offset: 3 * 4, format: "float32x3" },  // color
+      { shaderLocation: 2, offset: 6 * 4, format: "float32x3" },  // normal
+      { shaderLocation: 3, offset: 9 * 4, format: "float32x2" }   // uv
+    ]
+  }];
   let pipeline;
   try {
     pipeline = Visual.device.createRenderPipeline({
-      label: "mesh-pipeline-" + materialType + "-" + (displaced ? "d-" : "") + sampleCount + "x",
+      label: "mesh-pipeline-" + materialType + "-" + (displaced ? "d-" : "") + sampleCount + "x" + (vsVariant ? ("-" + vsVariant) : ""),
       layout: Visual.meshPipelineLayout,
       vertex: {
         module,
         entryPoint: vsEntry,
-        buffers: [{
-          // Vertex layout (sprint 7.5.3c push 6): 11 floats per
-          // vertex = position (3) + color (3) + normal (3) + uv (2).
-          // Stride 44 bytes. UV added for proper per-mesh texture
-          // mapping in ShaderMat(preset=texture); each primitive
-          // builder emits a natural mapping for its shape.
-          arrayStride: 11 * 4,
-          attributes: [
-            { shaderLocation: 0, offset: 0,     format: "float32x3" },  // position
-            { shaderLocation: 1, offset: 3 * 4, format: "float32x3" },  // color
-            { shaderLocation: 2, offset: 6 * 4, format: "float32x3" },  // normal
-            { shaderLocation: 3, offset: 9 * 4, format: "float32x2" }   // uv
-          ]
-        }]
+        buffers: vertexBuffers
       },
       fragment: {
         module,
@@ -61394,39 +61470,54 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
   };
 
   const N = segs + 1;
-  // Sprint 9-2b: skirts. Each chunk gets a 1-vert-thick "skirt"
-  // around its 4 edges, projected radially inward to the bare
-  // spheroid surface (altitude = 0). At LOD boundaries where the
-  // current chunk's edge verts have different elevations than the
-  // neighbor's coarser samples, the visible gap is occluded by the
-  // skirt's vertical wall instead of showing as a crack to space.
-  // Cuberact + Sebastian Lague use the same trick; CDLOD vertex
-  // morphing (9-2c) would let us drop them, but skirts ship in a
-  // single chunk-builder edit with no pipeline / shader changes.
+  // Sprint 9-2c: extended 14-float layout with per-vertex lowPos.xyz
+  // for Strugar CDLOD vertex morphing. Per-chunk split distance
+  // (`morphLow`) packed into uv.y so the vertex shader has it
+  // without per-chunk uniforms. The morph closes LOD boundaries
+  // at exactly the moment the parent takes over -- skirts (9-2b)
+  // stay as belt-and-suspenders for the rare visual edge cases
+  // (camera grazing a LOD seam from extreme angles, mid-morph
+  // float-precision drift).
   //
-  // Skirt verts: one per edge vertex (4*(N-1) total, corners
-  // counted once via the ring traversal). Stored AFTER the interior
-  // verts so indices into the interior stay stable.
+  // Per-chunk morphLow = chunkEdge * splitFactor (= this chunk's
+  // own split distance). The parent's split distance is exactly
+  // 2*morphLow, giving morph delta = morphLow.
+  const chunkEdgeM = (info.uMax - info.uMin) * r * (Math.PI * 0.25);
+  const morphLow = chunkEdgeM * geom.splitFactor;
+  // Sprint 9-2b: skirts. 1-vert-thick ring around the 4 edges,
+  // projected radially inward to the bare spheroid surface.
   const SKIRT_VERT_COUNT = 4 * (N - 1);
   const totalVerts = N * N + SKIRT_VERT_COUNT;
-  // Skirt indices: one strip per edge, 2 tris per segment.
   const SKIRT_INDEX_COUNT = 4 * segs * 6;
   const totalIndices = segs * segs * 6 + SKIRT_INDEX_COUNT;
-  const verts = new Float32Array(totalVerts * 11);
+  // 14 floats per vertex: pos.xyz (3) + color.rgb (3) + normal.xyz (3)
+  // + uv.xy (2: biomeId, morphLow) + lowPos.xyz (3) = 14.
+  const verts = new Float32Array(totalVerts * 14);
   const indices = new Uint32Array(totalIndices);
   let vWrite = 0, iWrite = 0;
   let minX = Infinity, minY = Infinity, minZ = Infinity;
   let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
 
-  // Per-vertex direction + elevation cached for skirt construction.
-  // Skirt verts share the (ux, uy, uz) direction of their edge but
-  // override altitude to 0 (= bare spheroid surface).
+  // Per-vertex direction + position scratch for skirt construction
+  // AND for lowPos bilinear interp. Keeping a second pass lets us
+  // write the final VBO with lowPos already known per vertex.
   const edgeDirs = new Float32Array(N * N * 3);
   const edgeAlt  = new Float32Array(N * N);
   const edgeCol  = new Float32Array(N * N * 3);
   const edgeBId  = new Float32Array(N * N);
   const edgeNrm  = new Float32Array(N * N * 3);
+  // High positions: needed to compute lowPos as bilinear interp of
+  // even-grid neighbors (the parent grid's vertex set is exactly
+  // this chunk's verts at even (gx, gy); odd-positioned verts
+  // morph toward the interpolation of their parent-grid
+  // neighbors).
+  const highPosX = new Float32Array(N * N);
+  const highPosY = new Float32Array(N * N);
+  const highPosZ = new Float32Array(N * N);
 
+  // Pass 1: compute high positions + per-vertex shading data.
+  // (No VBO writes yet -- we need to know neighbor highPos values
+  // to compute lowPos via bilinear interp before writing.)
   for (let iy = 0; iy <= segs; iy++) {
     const fy01 = iy / segs;
     const v = info.vMin + (info.vMax - info.vMin) * fy01;
@@ -61436,14 +61527,12 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
       const cx = nX + tX * u + bX * v;
       const cy = nY + tY * u + bY * v;
       const cz = nZ + tZ * u + bZ * v;
-      // Phil Nowell spherified-cube projection.
       const cxx = cx * cx, cyy = cy * cy, czz = cz * cz;
       const sx = cx * Math.sqrt(Math.max(0, 1 - cyy * 0.5 - czz * 0.5 + cyy * czz / 3));
       const sy = cy * Math.sqrt(Math.max(0, 1 - cxx * 0.5 - czz * 0.5 + cxx * czz / 3));
       const sz = cz * Math.sqrt(Math.max(0, 1 - cxx * 0.5 - cyy * 0.5 + cxx * cyy / 3));
       const invLen = 1 / Math.max(1e-12, Math.sqrt(sx*sx + sy*sy + sz*sz));
       const ux = sx * invLen, uy = sy * invLen, uz = sz * invLen;
-      // PlanetMap cell lookup at this direction.
       const cellIdx = _findNearestCell(cells, pmap._cellsHash, ux, uy, uz);
       const elev = (cellIdx >= 0) ? cells.elevations[cellIdx] : 0;
       let altitude = 0;
@@ -61465,18 +61554,11 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
       if (px < minX) minX = px; if (px > maxX) maxX = px;
       if (py < minY) minY = py; if (py > maxY) maxY = py;
       if (pz < minZ) minZ = pz; if (pz > maxZ) maxZ = pz;
-      verts[vWrite++] = px;
-      verts[vWrite++] = py;
-      verts[vWrite++] = pz;
-      verts[vWrite++] = baseCol[0] * lambert;
-      verts[vWrite++] = baseCol[1] * lambert;
-      verts[vWrite++] = baseCol[2] * lambert;
-      verts[vWrite++] = nuX; verts[vWrite++] = nuY; verts[vWrite++] = nuZ;
-      verts[vWrite++] = biomeId; verts[vWrite++] = 0;
 
-      // Stash data the skirt builder needs (only edge verts will
-      // actually be used; storing all is cheaper than branching).
       const gi = iy * N + ix;
+      highPosX[gi] = px;
+      highPosY[gi] = py;
+      highPosZ[gi] = pz;
       edgeDirs[gi*3+0] = ux; edgeDirs[gi*3+1] = uy; edgeDirs[gi*3+2] = uz;
       edgeAlt[gi] = altitude;
       edgeCol[gi*3+0] = baseCol[0] * lambert;
@@ -61484,6 +61566,60 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
       edgeCol[gi*3+2] = baseCol[2] * lambert;
       edgeBId[gi] = biomeId;
       edgeNrm[gi*3+0] = nuX; edgeNrm[gi*3+1] = nuY; edgeNrm[gi*3+2] = nuZ;
+    }
+  }
+
+  // Pass 2: write interior verts. lowPos comes from bilinear interp
+  // of even-grid neighbors. Even-indexed verts (parent-grid) have
+  // lowPos == highPos (no morph). Odd verts interpolate between
+  // their parent-grid neighbors so the morph end (morph=1) snaps
+  // exactly to the parent's emulated grid.
+  vWrite = 0;
+  for (let iy = 0; iy <= segs; iy++) {
+    for (let ix = 0; ix <= segs; ix++) {
+      const gi = iy * N + ix;
+      // Compute lowPos.
+      const xOdd = (ix & 1) === 1;
+      const yOdd = (iy & 1) === 1;
+      let lpX, lpY, lpZ;
+      if (!xOdd && !yOdd) {
+        lpX = highPosX[gi]; lpY = highPosY[gi]; lpZ = highPosZ[gi];
+      } else if (xOdd && !yOdd) {
+        const a = iy * N + (ix - 1);
+        const b = iy * N + (ix + 1);
+        lpX = 0.5 * (highPosX[a] + highPosX[b]);
+        lpY = 0.5 * (highPosY[a] + highPosY[b]);
+        lpZ = 0.5 * (highPosZ[a] + highPosZ[b]);
+      } else if (!xOdd && yOdd) {
+        const a = (iy - 1) * N + ix;
+        const b = (iy + 1) * N + ix;
+        lpX = 0.5 * (highPosX[a] + highPosX[b]);
+        lpY = 0.5 * (highPosY[a] + highPosY[b]);
+        lpZ = 0.5 * (highPosZ[a] + highPosZ[b]);
+      } else {
+        // Both odd: lerp 4 even-grid corners.
+        const a = (iy - 1) * N + (ix - 1);
+        const b = (iy - 1) * N + (ix + 1);
+        const c = (iy + 1) * N + (ix - 1);
+        const d = (iy + 1) * N + (ix + 1);
+        lpX = 0.25 * (highPosX[a] + highPosX[b] + highPosX[c] + highPosX[d]);
+        lpY = 0.25 * (highPosY[a] + highPosY[b] + highPosY[c] + highPosY[d]);
+        lpZ = 0.25 * (highPosZ[a] + highPosZ[b] + highPosZ[c] + highPosZ[d]);
+      }
+      verts[vWrite++] = highPosX[gi];
+      verts[vWrite++] = highPosY[gi];
+      verts[vWrite++] = highPosZ[gi];
+      verts[vWrite++] = edgeCol[gi*3+0];
+      verts[vWrite++] = edgeCol[gi*3+1];
+      verts[vWrite++] = edgeCol[gi*3+2];
+      verts[vWrite++] = edgeNrm[gi*3+0];
+      verts[vWrite++] = edgeNrm[gi*3+1];
+      verts[vWrite++] = edgeNrm[gi*3+2];
+      verts[vWrite++] = edgeBId[gi];
+      verts[vWrite++] = morphLow;       // uv.y -- per-vertex copy
+      verts[vWrite++] = lpX;
+      verts[vWrite++] = lpY;
+      verts[vWrite++] = lpZ;
     }
   }
   // Interior triangulation (unchanged).
@@ -61514,14 +61650,13 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
   function emitSkirt(gi) {
     if (skirtVertOf[gi] >= 0) return skirtVertOf[gi];
     const ux = edgeDirs[gi*3+0], uy = edgeDirs[gi*3+1], uz = edgeDirs[gi*3+2];
-    // Skirt sits 0.05% of planet radius below the spheroid surface
-    // (small but non-zero so seam fills even when neighbor elevation
-    // = sea level exactly). Scaled by r so it's invariant under
-    // changing planet sizes.
     const skirtDrop = -r * 0.0005;
     const px = cxC + (r + skirtDrop) * ux;
     const py = cyC + (r + skirtDrop) * uy * polRatio;
     const pz = czC + (r + skirtDrop) * uz;
+    // 14-float vertex (CDLOD layout). morphLow = 0 disables morph
+    // on skirt verts (they're spheroid-anchored, no parent geometry
+    // to morph toward); lowPos = highPos for same reason.
     verts[vWrite++] = px;
     verts[vWrite++] = py;
     verts[vWrite++] = pz;
@@ -61532,7 +61667,10 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
     verts[vWrite++] = edgeNrm[gi*3+1];
     verts[vWrite++] = edgeNrm[gi*3+2];
     verts[vWrite++] = edgeBId[gi];
-    verts[vWrite++] = 0;
+    verts[vWrite++] = 0;        // morphLow = 0 -> skirt never morphs
+    verts[vWrite++] = px;       // lowPos = highPos for skirts
+    verts[vWrite++] = py;
+    verts[vWrite++] = pz;
     if (px < minX) minX = px; if (px > maxX) maxX = px;
     if (py < minY) minY = py; if (py > maxY) maxY = py;
     if (pz < minZ) minZ = pz; if (pz > maxZ) maxZ = pz;
@@ -64806,7 +64944,16 @@ function _encodeScenePass(enc, entry) {
     // vs_planet_detail. Flag set by _resolveSceneMeshes alongside
     // PlanetMesh; the node still points to the PlanetMesh for
     // param access.
-    const vsVariant = m.isPlanetDetailPatch ? "planet_detail" : null;
+    //
+    // Sprint 9-2c: PlanetMesh chunks (resolved through
+    // _ensurePlanetMeshChunks, kind=mesh-gen) use the CDLOD vertex
+    // shader. The 14-float per-vertex layout requires the matching
+    // pipeline variant -- routing it via vsVariant keeps the
+    // pipeline-cache key correct and the input attribute layout in
+    // sync with the VBO.
+    const vsVariant = m.isPlanetDetailPatch        ? "planet_detail"
+                    : (m.node && m.node.type === "PlanetMesh") ? "planet_cdlod"
+                    : null;
     const pipelineKeyStr = matType + (useDisplaced ? "+d" : "") + (vsVariant ? ("+" + vsVariant) : "");
     if (pipelineKeyStr !== curMaterialType) {
       const pipeline = _ensureMeshPipeline(matType, sampleCount, useDisplaced, vsVariant);
