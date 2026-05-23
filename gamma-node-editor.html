@@ -47111,7 +47111,7 @@ function _planetValueNoise3D(x, y, z) {
   const y1 = x01 + (x11 - x01) * uy;
   return y0 + (y1 - y0) * uz;
 }
-function _planetDetailNoiseHeight(wx, wy, wz, biomeId, biomeOverride) {
+function _planetDetailNoiseHeight(wx, wy, wz, biomeId, biomeOverride, maxOctaveF) {
   if (biomeId < 0 || biomeId > 12) return 0;
   if (typeof PLANET_BIOME_DETAIL_DEFAULTS === "undefined") return 0;
   const def = (biomeOverride && biomeOverride[biomeId]) || PLANET_BIOME_DETAIL_DEFAULTS[biomeId];
@@ -47119,17 +47119,29 @@ function _planetDetailNoiseHeight(wx, wy, wz, biomeId, biomeOverride) {
   const amplitude = def[0], baseFreq = def[1], roughness = def[2];
   const lacunarity = def[3], shape = def[4] | 0;
   if (amplitude <= 0) return 0;
+  // Sprint 9-4: octave count is now a continuous param. Floor =
+  // fully-summed octaves; the partial (fractional) one gets weighted
+  // by the fract part, so when the LOD crossfades to a higher octave
+  // count (deeper chunk takes over) the new top octave fades in
+  // smoothly across the morph band -- no pop. Default 6 keeps the
+  // pre-sprint-9-4 callers (legacy collision / walk surface) bit-
+  // identical.
+  const octF = (typeof maxOctaveF === "number" && maxOctaveF > 0) ? maxOctaveF : 6;
+  const fullOctaves = Math.floor(octF);
+  const fade = octF - fullOctaves;
+  const totalOct = Math.min(12, fullOctaves + (fade > 0.001 ? 1 : 0));
   let sum = 0, ampSum = 0, freq = baseFreq, amp = 1;
-  for (let kk = 0; kk < 6; kk++) {
+  for (let kk = 0; kk < totalOct; kk++) {
     const ox = kk * 13.37, oy = kk * 7.91, oz = kk * 23.45;
     let n = _planetValueNoise3D(wx * freq + ox, wy * freq + oy, wz * freq + oz) * 2 - 1;
     if (shape === 1 || shape === 3) { const r = 1 - Math.abs(n); n = r * r; }
     else if (shape === 2) { n = Math.abs(n); }
     else if (shape === 4) { const r = 1 - Math.abs(n); n = -r * r; }
-    sum += amp * n;
-    ampSum += amp;
-    freq *= lacunarity;
-    amp *= roughness;
+    const w = (kk === fullOctaves && fade > 0.001 && fade < 0.999) ? fade : 1;
+    sum    += amp * n * w;
+    ampSum += amp * w;
+    freq   *= lacunarity;
+    amp    *= roughness;
   }
   if (ampSum < 1e-6) return 0;
   return (sum / ampSum) * amplitude;
@@ -58890,20 +58902,34 @@ const PLANET_BIOMES_NAMES = [
 //    shape, warpStrength, warpFreq, textureStyleId]
 // shape:           0=fbm 1=ridged 2=billowed 3=dunes 4=cracks
 // textureStyleId:  0=none 1=rock 2=sand 3=grass 4=snow 5=ice 6=dirt
+// Sprint 9-4: AAA-scale amplitudes. The old 0.5-4 m amps produced
+// sub-noise micro-bumps invisible at foot level (~30x too low per
+// the research dive: Outerra, Iñigo Quilez, Carpentier, Star
+// Citizen all sit in the 20-200 m range for visible relief while
+// keeping the macro silhouette readable from orbit). Per-biome
+// shape choice unchanged; just bumping the amp column.
+//   col 0 = amplitude (m, peak displacement)
+//   col 1 = baseFreq (1/m, ≈ 1/wavelength_max)
+//   col 2 = roughness (per-octave amp ratio, ≈ gain)
+//   col 3 = lacunarity (per-octave freq ratio)
+//   col 4 = shape enum  0=fbm 1=ridged 2=billowed 3=dunes 4=cracks
+//   col 5 = warpStrength
+//   col 6 = warpFreq
+//   col 7 = textureStyleId
 const PLANET_BIOME_DETAIL_DEFAULTS = [
-  [0.0, 0.0010, 0.50, 2.0, 0.0, 0.0,    0.0,    0.0],  // 0 Marine
-  [4.0, 0.0010, 0.55, 2.0, 3.0, 0.4,    0.0005, 2.0],  // 1 Hot desert (sand)
-  [2.5, 0.0010, 0.55, 2.0, 3.0, 0.3,    0.0005, 6.0],  // 2 Cold desert (dirt)
-  [1.5, 0.0008, 0.50, 2.0, 0.0, 0.0,    0.0,    6.0],  // 3 Savanna (dirt)
-  [1.0, 0.0005, 0.50, 2.0, 0.0, 0.0,    0.0,    3.0],  // 4 Grassland (grass)
-  [2.0, 0.0012, 0.50, 2.0, 0.0, 0.0,    0.0,    3.0],  // 5 Trop seasonal forest (grass)
-  [2.0, 0.0010, 0.50, 2.0, 0.0, 0.0,    0.0,    3.0],  // 6 Temp deci forest (grass)
-  [3.0, 0.0015, 0.50, 2.0, 0.0, 0.0,    0.0,    3.0],  // 7 Trop rainforest (grass)
-  [2.5, 0.0012, 0.50, 2.0, 0.0, 0.0,    0.0,    3.0],  // 8 Temp rainforest (grass)
-  [2.5, 0.0014, 0.55, 2.0, 1.0, 0.0,    0.0,    1.0],  // 9 Taiga (rock)
-  [1.5, 0.0010, 0.50, 2.0, 0.0, 0.0,    0.0,    6.0],  // 10 Tundra (dirt)
-  [1.5, 0.0008, 0.50, 2.0, 4.0, 0.0,    0.0,    4.0],  // 11 Glacier (snow + cracks)
-  [0.5, 0.0005, 0.50, 2.0, 0.0, 0.0,    0.0,    3.0]   // 12 Wetland (grass)
+  [  0.0, 0.0010, 0.50, 2.0, 0.0, 0.0,    0.0,    0.0],  // 0 Marine (flat)
+  [ 80.0, 0.0010, 0.55, 2.0, 3.0, 0.4,    0.0005, 2.0],  // 1 Hot desert (dunes, large amp)
+  [ 50.0, 0.0010, 0.55, 2.0, 3.0, 0.3,    0.0005, 6.0],  // 2 Cold desert
+  [ 30.0, 0.0008, 0.50, 2.0, 0.0, 0.0,    0.0,    6.0],  // 3 Savanna (rolling hills)
+  [ 20.0, 0.0005, 0.50, 2.0, 0.0, 0.0,    0.0,    3.0],  // 4 Grassland (gentle hills)
+  [ 40.0, 0.0012, 0.50, 2.0, 0.0, 0.0,    0.0,    3.0],  // 5 Trop seasonal forest
+  [ 60.0, 0.0010, 0.55, 2.0, 0.0, 0.0,    0.0,    3.0],  // 6 Temp deciduous forest
+  [ 50.0, 0.0012, 0.50, 2.0, 0.0, 0.0,    0.0,    3.0],  // 7 Trop rainforest (river valleys)
+  [ 70.0, 0.0010, 0.55, 2.0, 0.0, 0.0,    0.0,    3.0],  // 8 Temp rainforest
+  [120.0, 0.0008, 0.60, 2.0, 1.0, 0.3,    0.0003, 1.0],  // 9 Taiga (rocky / ridged)
+  [ 90.0, 0.0006, 0.55, 2.0, 1.0, 0.2,    0.0003, 4.0],  // 10 Tundra (low ridges)
+  [200.0, 0.0006, 0.65, 2.0, 1.0, 0.5,    0.0003, 5.0],  // 11 Glacier (alpine ridged)
+  [ 15.0, 0.0008, 0.40, 2.0, 0.0, 0.0,    0.0,    3.0]   // 12 Wetland (flat-ish)
 ];
 const PLANET_BIOME_TEX_STYLES = [
   "none", "rock", "sand", "grass", "snow", "ice", "dirt"
@@ -61555,12 +61581,44 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
       const sz = cz * Math.sqrt(Math.max(0, 1 - cxx * 0.5 - cyy * 0.5 + cxx * cyy / 3));
       const invLen = 1 / Math.max(1e-12, Math.sqrt(sx*sx + sy*sy + sz*sz));
       const ux = sx * invLen, uy = sy * invLen, uz = sz * invLen;
+      // Sprint 9-4: K=3 inverse-distance-weighted elevation blend
+      // (kills the per-cell plateau artifact -- adjacent vertices
+      // inside the same Voronoi cell no longer all share that one
+      // cell's elevation; instead their elevation varies smoothly
+      // by distance to the 3 nearest cell centers). The biome /
+      // river / lake lookup still goes through _findNearestCell
+      // (categorical attributes can't be blended).
       const cellIdx = _findNearestCell(cells, pmap._cellsHash, ux, uy, uz);
-      const elev = (cellIdx >= 0) ? cells.elevations[cellIdx] : 0;
+      const elev = _samplePlanetCellsIDW(cells, pmap._cellsHash, ux, uy, uz);
       let altitude = 0;
       if (elev > seaLevel && hs !== 0) {
         altitude = hs * (elev - seaLevel) / Math.max(1e-6, 1 - seaLevel);
       }
+      // Sprint 9-4: bake sub-cell detail noise on top of the macro
+      // elevation. Octave count per leaf = Nyquist rule: the highest
+      // octave whose wavelength is still > 2x the leaf vertex
+      // spacing. Deeper chunks (closer to camera) get more octaves;
+      // octaves crossfade smoothly across the parent->child LOD
+      // boundary via the fractional-octave fade in
+      // _planetDetailNoiseHeight. We sample on land cells only --
+      // ocean stays flat (rendered separately via Water if wired).
+      const biomeRow = (pmap && pmap._biomeParams && pmap._biomeParams[cellIdx >= 0 && cells.biome ? cells.biome[cellIdx] : 0])
+                     || PLANET_BIOME_DETAIL_DEFAULTS[cellIdx >= 0 && cells.biome ? cells.biome[cellIdx] : 0]
+                     || PLANET_BIOME_DETAIL_DEFAULTS[4];
+      const _f0 = biomeRow[1] || 0.001;
+      const _dxLeaf = chunkEdgeM / Math.max(1, segs);
+      const _nyqOct = Math.max(1, Math.min(10, Math.log2(1 / Math.max(1e-9, 2 * _f0 * _dxLeaf))));
+      let _detailH = 0;
+      if (elev > seaLevel && hs !== 0) {
+        const _bid = cellIdx >= 0 && cells.biome ? cells.biome[cellIdx] : 0;
+        const _biomeOverride = (pmap && pmap._biomeParams) || null;
+        // World-space coords for noise sampling so the noise field
+        // is consistent across chunk LODs AND with the collision /
+        // walk-mode AGL queries (_planetMeshSurfacePos samples the
+        // same noise function at world coords too).
+        _detailH = _planetDetailNoiseHeight(cxC + r * ux, cyC + r * uy * polRatio, czC + r * uz, _bid, _biomeOverride, _nyqOct);
+      }
+      altitude += _detailH;
       // Sprint 9-3: VBO holds vertices RELATIVE to the planet's
       // center (anchorF64). The per-frame mv_rtc model matrix
       // re-adds the anchor in f64-composed view space so the GPU
