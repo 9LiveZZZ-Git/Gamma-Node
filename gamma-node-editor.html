@@ -33315,16 +33315,14 @@ const _demos = [
         centerX:          0,
         centerY:          -PLANET_R * PLANET_POL,
         centerZ:          0,
-        // Sprint 10-5b-fix: bumped 20000 -> 80000 (~4x vertical
-        // exaggeration). The zoom-3 DEM is heavily smoothed (each
-        // tile-pixel ~ 5km wide; peaks get averaged with surroundings),
-        // so realistic 1x scale produces a visually flat Earth. 4x
-        // exaggeration matches Outerra's default Earth view and makes
-        // mountains visibly chunky from orbit while still reading as
-        // "mountains" not "spikes." Sub-cell detail amplification in
-        // 10-4 will let us drop this back as foot-level resolution
-        // recovers from higher-zoom DEM tiles (10-6).
-        heightScale:      80000,
+        // Sprint 10-5b-fix v2: back to realistic 10000 per user. Earth-
+        // scale Everest is 8848 m; 10000 m heightScale puts the highest
+        // chunk vertex at ~7.4 km above sea level (zoom-3 DEM smoothing
+        // means we never see the actual 8848 m peak). Mountains will
+        // read flat from orbit -- ground-level DEM tiles (sprint 10-6)
+        // are what'll restore foot-level relief. Until then this is
+        // 'looks like Earth from space' but not 'dramatic mountains.'
+        heightScale:      10000,
         seaLevel:         0.55,
         subdivide:        1  // one Loop subdivision pass -- smooths cell-faceting
       });
@@ -54418,9 +54416,30 @@ fn sample_aerial_perspective_lut(camPos: vec3<f32>, fragPos: vec3<f32>) -> AtmRe
   // definition), the sky-view LUT integrated FROM the camera in
   // that direction TO the ground hit -- exactly the aerial-
   // perspective in-scatter. No depth axis = no depth aliasing.
-  let inScatter = sample_skyview_lut(dir);
+  let inScatterFull = sample_skyview_lut(dir);
 
-  return AtmResult(inScatter, transmittance);
+  // Sprint 10-5b-fix v2 -- distance-aware aerial perspective.
+  // Previously the FULL sky-view scatter + transmittance was applied
+  // regardless of fragment distance. Skyview is integrated to the
+  // atmosphere edge (effectively infinity), so close terrain got the
+  // same fog as the sky, washing every nearby surface fragment to
+  // uniform haze when the camera was on the ground.
+  //
+  // Approximation: exponential ramp with 8 km scale height (~Earth
+  // atmosphere effective thickness). The further the fragment, the
+  // more of the atmospheric path is between cam and fragment, the
+  // more scatter + extinction applies. Reduces to identity (no fog,
+  // full transmittance) for close fragments, full LUT-based aerial
+  // perspective for distant ones.
+  //
+  //   dist 1 km  -> apScale 0.12 (terrain mostly clear)
+  //   dist 10 km -> apScale 0.71 (visible haze)
+  //   dist 50 km -> apScale 0.998 (fully fogged, distant mountains)
+  let apScale = 1.0 - exp(-dist / 8000.0);
+  let inScatter = inScatterFull * apScale;
+  let transmittanceScaled = mix(vec3<f32>(1.0), transmittance, apScale);
+
+  return AtmResult(inScatter, transmittanceScaled);
 }
 
 fn sample_procedural_sky_features(dir: vec3<f32>) -> vec3<f32> {
@@ -58932,7 +58951,7 @@ function _planetMapCacheKey(node) {
     p.resolution, p.cellCount,
     p.seed, p.frequency, p.octaves,
     p.lacunarity, p.gain, p.ridges,
-    "v" + ver, "p11d", "src=earth-forced",
+    "v" + ver, "p11e", "src=earth-forced",
     _EARTH_DEM.loaded ? "dem=real" : "dem=ellipse"
   ].join(",");
 }
