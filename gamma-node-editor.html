@@ -47643,6 +47643,10 @@ function _tickFPCameraWalk(node, p, dt, input, k) {
   }
 
   // Snap to ground.
+  // Sprint 10-6 v3: camera drift diagnostic. Captures pre-snap pos so
+  // we can tell whether camera movement comes from input (WASD/mouse)
+  // vs terrain-snap (surface moved under the camera as tiles arrive).
+  const _preSnapPx = px, _preSnapPy = py, _preSnapPz = pz;
   if (_walkOnPlanet) {
     const surf = _planetMeshSurfacePos(px, py, pz, _walkPL);
     if (surf) {
@@ -47660,6 +47664,41 @@ function _tickFPCameraWalk(node, p, dt, input, k) {
     const groundY = _fpcSampleGroundY(px, pz, py);
     if (groundY !== null) py = groundY + eyeH;
   }
+
+  // Drift diagnostic. Detects movement-without-input by comparing
+  // current pos to the previous tick's pos when no input keys are
+  // held and no mouse motion arrived. Distinguishes:
+  //   * input-driven (WASD/mouse) -> not logged
+  //   * snap-drift (terrain moved under cam from tile arrival) -> logged
+  // Throttled to 1 line per 500 ms to avoid spam.
+  const _hasInputThisTick = (
+    k.has("KeyW") || k.has("KeyA") || k.has("KeyS") || k.has("KeyD") ||
+    k.has("KeyI") || k.has("KeyJ") || k.has("KeyK") || k.has("KeyL") ||
+    k.has("KeyX") || k.has("KeyZ") || k.has("KeyR") || k.has("KeyF") ||
+    k.has("Space") || k.has("ShiftLeft") || k.has("ShiftRight") ||
+    Math.abs(input.mouseDx || 0) > 0.0001 ||
+    Math.abs(input.mouseDy || 0) > 0.0001
+  );
+  if (!input._prevCamPos) input._prevCamPos = { x: null, y: null, z: null };
+  const _prevPx = input._prevCamPos.x, _prevPy = input._prevCamPos.y, _prevPz = input._prevCamPos.z;
+  if (_prevPx !== null && !_hasInputThisTick) {
+    const drift = Math.hypot(px - _prevPx, py - _prevPy, pz - _prevPz);
+    if (drift > 0.01) {
+      const now = (typeof performance !== "undefined") ? performance.now() : 0;
+      if (!input._lastDriftLog || (now - input._lastDriftLog) > 500) {
+        input._lastDriftLog = now;
+        // Split into pre-snap vs snap delta so we can tell which is moving us.
+        const dPreX = _preSnapPx - _prevPx, dPreY = _preSnapPy - _prevPy, dPreZ = _preSnapPz - _prevPz;
+        const dSnapX = px - _preSnapPx,    dSnapY = py - _preSnapPy,    dSnapZ = pz - _preSnapPz;
+        const driftPre  = Math.hypot(dPreX, dPreY, dPreZ);
+        const driftSnap = Math.hypot(dSnapX, dSnapY, dSnapZ);
+        console.log("[cam-drift] no-input drift " + drift.toFixed(2) + "m total"
+                  + " (pre-snap " + driftPre.toFixed(2) + " m, terrain-snap " + driftSnap.toFixed(2) + " m)"
+                  + " | pos=(" + px.toFixed(0) + "," + py.toFixed(0) + "," + pz.toFixed(0) + ")");
+      }
+    }
+  }
+  input._prevCamPos.x = px; input._prevCamPos.y = py; input._prevCamPos.z = pz;
 
   p.posX = px; p.posY = py; p.posZ = pz;
   // Derive yaw/pitch from forward in the LOCAL frame so HUD and the
@@ -61740,10 +61779,33 @@ function _ensureHighResTilesForChunk(info, zoom) {
   }
 }
 
+/* Sprint 10-6 v3: which chunk depths benefit from a tile at zoom Z?
+ * Tiles meaningfully improve chunks whose preferred zoom is the tile's
+ * zoom -- coarser chunks would still pick a coarser tile (via the
+ * highest-zoom-first sampler) and finer chunks need finer tiles.
+ * Invalidating depths NOT in this set wastes a rebuild without
+ * changing the visible result. */
+function _zoomToChunkDepths(zoom) {
+  if (zoom === 3)  return new Set([0, 1, 2, 3, 4, 5]);
+  if (zoom === 5)  return new Set([6, 7]);
+  if (zoom === 7)  return new Set([8, 9]);
+  if (zoom === 9)  return new Set([10, 11]);
+  if (zoom === 11) return new Set([12, 13]);
+  if (zoom === 13) return new Set([14, 15]);
+  if (zoom === 14) return new Set([16, 17, 18, 19, 20]);
+  return new Set();
+}
+
 /* Sprint 10-6 v2: when a new tile arrives, drop any cached chunk whose
  * lat/lon AABB overlaps the tile's area. Those chunks will rebuild on
  * the next frame with the now-available finer elevation; chunks
- * outside the tile's area are left alone (no thrash). */
+ * outside the tile's area are left alone (no thrash).
+ *
+ * v3: additionally restrict to chunks whose own preferred zoom matches
+ * this tile's zoom -- a zoom-14 tile shouldn't invalidate depth-6
+ * chunks even though it's geographically inside them, because depth-6
+ * is sampling at zoom 5 and won't read the zoom-14 tile. v2 invalidated
+ * 1085 chunks per zoom-14 tile; v3 brings this to 1-4. */
 function _invalidateChunksForTile(z, tx, ty) {
   if (!Visual.planetMeshChunkCache) return;
   // Tile bounds in lat/lon. Slippy-map convention: tile (z, tx, ty)
@@ -61758,10 +61820,13 @@ function _invalidateChunksForTile(z, tx, ty) {
   const tileLatMax = Math.atan(Math.sinh(Math.PI * (1 - 2 * yNorm0))) * 180 / Math.PI;
   const tileLatMin = Math.atan(Math.sinh(Math.PI * (1 - 2 * yNorm1))) * 180 / Math.PI;
 
+  const validDepths = _zoomToChunkDepths(z);
   let droppedTotal = 0;
   for (const [nodeId, entry] of Visual.planetMeshChunkCache) {
     const keysToDelete = [];
     for (const [chunkKey, chunk] of entry.chunks) {
+      // v3: only drop chunks whose preferred zoom matches this tile's zoom.
+      if (!validDepths.has(chunk.depth)) continue;
       const cb = chunk.latLonBounds;
       if (!cb) continue;
       // Lat AABB overlap: standard 1D interval intersect.
