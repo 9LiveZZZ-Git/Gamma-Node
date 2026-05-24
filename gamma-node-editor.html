@@ -61647,6 +61647,12 @@ function _loadHighResTile(z, x, y) {
                   + _EARTH_TILES.pending.size + " in flight, "
                   + _EARTH_TILES.loadCount + " loaded total)");
     }
+    // Sprint 10-6 v2: selective invalidation -- drop only chunks
+    // whose lat/lon bounds overlap THIS tile, not every chunk on
+    // the planet. Removes the "world constantly moves" thrash
+    // (was: every 64-tile batch dropped 3000+ chunks; now: 1-4
+    // chunks per tile on average).
+    _invalidateChunksForTile(z, x, y);
   }).catch((err) => {
     _EARTH_TILES.pending.delete(key);
     // Silent on individual tile failures -- common at zoom edges over water.
@@ -61731,6 +61737,60 @@ function _ensureHighResTilesForChunk(info, zoom) {
     const sz = cz * Math.sqrt(Math.max(0, 1 - cxx*0.5 - cyy*0.5 + cxx*cyy/3));
     const invLen = 1 / Math.max(1e-12, Math.sqrt(sx*sx + sy*sy + sz*sz));
     _ensureHighResTileForDir(sx*invLen, sy*invLen, sz*invLen, zoom);
+  }
+}
+
+/* Sprint 10-6 v2: when a new tile arrives, drop any cached chunk whose
+ * lat/lon AABB overlaps the tile's area. Those chunks will rebuild on
+ * the next frame with the now-available finer elevation; chunks
+ * outside the tile's area are left alone (no thrash). */
+function _invalidateChunksForTile(z, tx, ty) {
+  if (!Visual.planetMeshChunkCache) return;
+  // Tile bounds in lat/lon. Slippy-map convention: tile (z, tx, ty)
+  // covers xNorm = [tx, tx+1] / 2^z, yNorm = [ty, ty+1] / 2^z.
+  const tilesPerEdge = 1 << z;
+  const tileLonMin = (tx     / tilesPerEdge) * 360 - 180;
+  const tileLonMax = ((tx+1) / tilesPerEdge) * 360 - 180;
+  // Inverse Mercator: lat = atan(sinh(π * (1 - 2*yNorm))) (deg).
+  // ty=0 is the NORTHERN edge, ty=tilesPerEdge-1 is the SOUTHERN.
+  const yNorm0 = ty     / tilesPerEdge;
+  const yNorm1 = (ty+1) / tilesPerEdge;
+  const tileLatMax = Math.atan(Math.sinh(Math.PI * (1 - 2 * yNorm0))) * 180 / Math.PI;
+  const tileLatMin = Math.atan(Math.sinh(Math.PI * (1 - 2 * yNorm1))) * 180 / Math.PI;
+
+  let droppedTotal = 0;
+  for (const [nodeId, entry] of Visual.planetMeshChunkCache) {
+    const keysToDelete = [];
+    for (const [chunkKey, chunk] of entry.chunks) {
+      const cb = chunk.latLonBounds;
+      if (!cb) continue;
+      // Lat AABB overlap: standard 1D interval intersect.
+      if (cb.latMax < tileLatMin || cb.latMin > tileLatMax) continue;
+      // Lon AABB overlap: AM-aware. If either side wraps, conservatively
+      // say overlap (rare and chunks-near-AM aren't common cases).
+      let lonOverlap;
+      if (cb.crossesAM || cb.nearPole) {
+        lonOverlap = true;
+      } else {
+        lonOverlap = !(cb.lonMax < tileLonMin || cb.lonMin > tileLonMax);
+      }
+      if (lonOverlap) keysToDelete.push(chunkKey);
+    }
+    for (const k of keysToDelete) {
+      const c = entry.chunks.get(k);
+      try { c.vertexBuffer && c.vertexBuffer.destroy(); } catch (_) {}
+      try { c.indexBuffer  && c.indexBuffer.destroy();  } catch (_) {}
+      entry.chunks.delete(k);
+      droppedTotal++;
+    }
+  }
+  // Log only when we actually dropped something AND it's a sparse event
+  // (every 32 tiles for the noisy startup phase).
+  if (droppedTotal > 0 && _EARTH_TILES.loadCount % 32 === 0) {
+    console.log("[earth-dem-hires] tile " + z + "/" + tx + "/" + ty
+              + " selectively invalidated " + droppedTotal + " chunks (vs "
+              + (Visual.planetMeshChunkCache.size > 0 ? "thousands" : "0")
+              + " under old per-batch invalidation)");
   }
 }
 
@@ -63428,6 +63488,72 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
   new Uint32Array(indexBuffer.getMappedRange()).set(indices);
   indexBuffer.unmap();
 
+  // Sprint 10-6 v2: per-chunk lat/lon bounds for selective tile
+  // invalidation. We sample the 4 corners + center of the chunk in
+  // cube coords, project to unit sphere, convert to (lat, lon), and
+  // compute an AABB. When a high-res tile loads, _invalidateChunks-
+  // ForTile checks this AABB to decide whether this chunk needs
+  // rebuilding (vs blowing away every chunk on the planet).
+  // For chunks near the pole or crossing the antimeridian, the bounds
+  // become coarse (extreme polar chunks fall back to "always invalidate"
+  // via a flag) -- acceptable for MVP, polar terrain is sparse anyway.
+  const _latLonBounds = (function() {
+    const face = _PLANET_FACES[info.face];
+    const samples = [
+      [info.uMin, info.vMin], [info.uMax, info.vMin],
+      [info.uMin, info.vMax], [info.uMax, info.vMax],
+      [(info.uMin + info.uMax) * 0.5, (info.vMin + info.vMax) * 0.5]
+    ];
+    const lats = [], lons = [];
+    let nearPole = false;
+    for (let i = 0; i < samples.length; i++) {
+      const u = samples[i][0], v = samples[i][1];
+      const cx = face.n[0] + face.t[0]*u + face.b[0]*v;
+      const cy = face.n[1] + face.t[1]*u + face.b[1]*v;
+      const cz = face.n[2] + face.t[2]*u + face.b[2]*v;
+      const cxx = cx*cx, cyy = cy*cy, czz = cz*cz;
+      const sx = cx * Math.sqrt(Math.max(0, 1 - cyy*0.5 - czz*0.5 + cyy*czz/3));
+      const sy = cy * Math.sqrt(Math.max(0, 1 - cxx*0.5 - czz*0.5 + cxx*czz/3));
+      const sz = cz * Math.sqrt(Math.max(0, 1 - cxx*0.5 - cyy*0.5 + cxx*cyy/3));
+      const inv = 1 / Math.max(1e-12, Math.sqrt(sx*sx + sy*sy + sz*sz));
+      const ux_ = sx*inv, uy_ = sy*inv, uz_ = sz*inv;
+      const lat = Math.asin(Math.max(-1, Math.min(1, uy_))) * 180 / Math.PI;
+      const lon = Math.atan2(uz_, ux_) * 180 / Math.PI;
+      lats.push(lat);
+      lons.push(lon);
+      if (Math.abs(lat) > 80) nearPole = true;
+    }
+    let latMin = Infinity, latMax = -Infinity;
+    for (const l of lats) { if (l < latMin) latMin = l; if (l > latMax) latMax = l; }
+    // Antimeridian wrap detection: if any pair of lons differs by >180
+    // (impossible in real-space; means we crossed -180/+180 boundary),
+    // mark as crossing and use the full lon range.
+    let lonMin = Infinity, lonMax = -Infinity;
+    let crossesAM = false;
+    for (let i = 0; i < lons.length; i++) {
+      for (let j = i + 1; j < lons.length; j++) {
+        if (Math.abs(lons[i] - lons[j]) > 180) { crossesAM = true; break; }
+      }
+      if (crossesAM) break;
+    }
+    if (!crossesAM) {
+      for (const l of lons) { if (l < lonMin) lonMin = l; if (l > lonMax) lonMax = l; }
+    } else {
+      lonMin = -180; lonMax = 180;
+    }
+    // Polar chunks: a chunk near the pole spans all longitudes when
+    // projected to lat/lon. Be conservative.
+    if (nearPole) { lonMin = -180; lonMax = 180; }
+    // 5% margin: the 4-corners-and-center sample doesn't exactly hit
+    // the chunk's true lat/lon extrema (extrema can lie on edges, not
+    // corners). Small margin catches tiles that nick the chunk edge.
+    const latMargin = Math.max(0.1, (latMax - latMin) * 0.05);
+    const lonMargin = Math.max(0.1, (lonMax - lonMin) * 0.05);
+    latMin -= latMargin; latMax += latMargin;
+    if (!crossesAM && !nearPole) { lonMin -= lonMargin; lonMax += lonMargin; }
+    return { latMin, latMax, lonMin, lonMax, crossesAM, nearPole };
+  })();
+
   return {
     vertexBuffer,
     indexBuffer,
@@ -63443,7 +63569,8 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
     // For now all chunks of a PlanetMesh share the planet center
     // (single per-mesh anchor); future 9-3b swaps in per-chunk
     // centroids for sub-meter precision near the surface.
-    anchorF64: { x: cxC, y: cyC, z: czC }
+    anchorF64: { x: cxC, y: cyC, z: czC },
+    latLonBounds: _latLonBounds
   };
 }
 
@@ -63499,15 +63626,11 @@ function _ensurePlanetMeshChunks(node) {
   // baked into vertex Y) never rebuild.
   const cellsTag   = (typeof pmap._cellsKey   === "string") ? pmap._cellsKey   : "no-cells";
   const cubemapTag = (typeof pmap._cubemapKey === "string") ? pmap._cubemapKey : "no-cubemap";
-  // Sprint 10-6: include the high-res tile load count so chunks
-  // rebuild as new tiles arrive. Bucketed by 64 -- earlier 16 caused
-  // a visible "world constantly moves" because each batch dropped
-  // 3000+ chunks and rebuilt them, snapping vertices to new altitudes.
-  // 64-batch trades a bit more latency (tiles 1-63 wait for batch 64)
-  // for 4x less thrash. Proper fix is selective per-chunk-area
-  // invalidation, deferred to a future sprint.
-  const tileBucket = Math.floor((_EARTH_TILES.loadCount || 0) / 64);
-  const pmKey = cellsTag + "|" + cubemapTag + "|tb=" + tileBucket;
+  // Sprint 10-6 v2: tile-bucket REMOVED from the chunk cache key.
+  // Selective per-chunk invalidation (_invalidateChunksForTile) now
+  // handles tile-load rebuilds at finer granularity -- bulk cache key
+  // bump just thrashed every chunk on the planet every 64 tiles.
+  const pmKey = cellsTag + "|" + cubemapTag;
   const globalKey = _planetMeshGlobalCacheKey(node) + "|" + pmKey;
   if (globalKey !== entry.globalKey) {
     const oldChunkCount = entry.chunks.size;
