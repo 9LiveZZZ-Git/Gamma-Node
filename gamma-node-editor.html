@@ -47432,8 +47432,12 @@ function _planetMeshSurfacePos(wx, wy, wz, pl) {
       if (cellIdx >= 0 && pmap._cells.biome) biomeId = pmap._cells.biome[cellIdx];
     }
     const cubemap = (typeof _ensurePlanetMapCubemap === "function") ? _ensurePlanetMapCubemap(pmap) : null;
+    // Sprint 10-6: collision uses best-cached high-res tile so walking
+    // and flying-near-surface track the actual rendered geometry
+    // (which uses the same sampler in the chunk builder). Falls back
+    // to macro cubemap when no high-res tile is loaded for this dir.
     const e = cubemap
-      ? _samplePlanetMapCubemap(cubemap, ux, uy, uz)
+      ? _planetSampleElevationCached(cubemap, ux, uy, uz)
       : ((cellIdx >= 0) ? pmap._cells.elevations[cellIdx] : 0);
     if (e > pl.seaLevel && pl.heightScale > 0) {
       alt = pl.heightScale * (e - pl.seaLevel) / Math.max(1e-6, 1 - pl.seaLevel);
@@ -61571,6 +61575,181 @@ function _earthDEMSampleMeters(latDeg, lonDeg) {
        + (e01 * (1 - wx) + e11 * wx) * wy;
 }
 
+/* =========================================================================
+ * Sprint 10-6 -- streamed high-resolution DEM tiles for foot-level relief.
+ *
+ * Architecture: the global zoom-3 grid (10-5b) is too coarse for foot
+ * scale -- ~5 km/pixel = smoothed peaks. As the camera approaches the
+ * surface, chunks subdivide deeper (quadtree LOD); each chunk depth has
+ * an appropriate Mapzen zoom level for its size. Tiles fetch on demand
+ * as chunks are built, get cached in memory, and trigger chunk re-bake
+ * when they arrive so the now-detailed elevation flows into the VBO.
+ *
+ * Per-vertex sampling never blocks on a fetch -- it returns the best
+ * cached zoom and falls back to the macro cubemap if nothing closer
+ * is loaded yet. Chunks rebuild progressively as new tiles arrive.
+ *
+ * Depth → zoom mapping (chunk edge ÷ 32 px/edge ≈ pixel resolution):
+ *   depth ≤ 5  → zoom 3   (macro cubemap covers it)
+ *   depth 6-7  → zoom 5   (~1.2 km/px)
+ *   depth 8-9  → zoom 7   (~300 m/px)
+ *   depth 10-11→ zoom 9   (~75 m/px)
+ *   depth 12-13→ zoom 11  (~19 m/px)
+ *   depth 14-15→ zoom 13  (~5 m/px)
+ *   depth ≥ 16 → zoom 14  (~2.4 m/px, near Mapzen ceiling of 15)
+ *
+ * Memory: each tile = 256² × 4 bytes = 256 KB. 500 tile cap ≈ 128 MB.
+ * Browser HTTP cache covers second+ loads at ~no cost. */
+const _EARTH_TILES = {
+  cache: new Map(),          // "z/x/y" -> { meters: Float32Array(256*256), z, x, y, t }
+  pending: new Set(),        // "z/x/y" currently fetching
+  loadCount: 0,              // bumped on every successful load (chunk cache key)
+  maxEntries: 500,
+};
+
+function _depthToZoom(depth) {
+  if (depth <= 5)  return 3;
+  if (depth <= 7)  return 5;
+  if (depth <= 9)  return 7;
+  if (depth <= 11) return 9;
+  if (depth <= 13) return 11;
+  if (depth <= 15) return 13;
+  return 14;
+}
+
+/* Idempotent. No-op if cached or already in-flight. */
+function _loadHighResTile(z, x, y) {
+  const key = z + "/" + x + "/" + y;
+  if (_EARTH_TILES.cache.has(key) || _EARTH_TILES.pending.has(key)) return;
+  // LRU-ish: drop oldest entries if over cap. Map iteration is insertion order.
+  if (_EARTH_TILES.cache.size >= _EARTH_TILES.maxEntries) {
+    const firstKey = _EARTH_TILES.cache.keys().next().value;
+    _EARTH_TILES.cache.delete(firstKey);
+  }
+  _EARTH_TILES.pending.add(key);
+  _loadEarthDEMTile(z, x, y).then((imgData) => {
+    const meters = new Float32Array(256 * 256);
+    const px = imgData.data;
+    for (let py = 0; py < 256; py++) {
+      for (let pxIdx = 0; pxIdx < 256; pxIdx++) {
+        const i4 = (py * 256 + pxIdx) * 4;
+        meters[py * 256 + pxIdx] = _decodeTerrariumPixel(px[i4], px[i4+1], px[i4+2]);
+      }
+    }
+    _EARTH_TILES.cache.set(key, { meters, z: z, x: x, y: y, t: performance.now() });
+    _EARTH_TILES.pending.delete(key);
+    _EARTH_TILES.loadCount++;
+    // Logged sparingly (every 16 tiles) so progress is visible without spam.
+    if (_EARTH_TILES.loadCount % 16 === 1) {
+      console.log("[earth-dem-hires] cached " + _EARTH_TILES.cache.size + " tiles ("
+                  + _EARTH_TILES.pending.size + " in flight, "
+                  + _EARTH_TILES.loadCount + " loaded total)");
+    }
+  }).catch((err) => {
+    _EARTH_TILES.pending.delete(key);
+    // Silent on individual tile failures -- common at zoom edges over water.
+  });
+}
+
+/* Sample any cached high-res tile that covers (lat, lon) at the given zoom.
+ * Returns meters, or NaN if no tile cached. Does NOT trigger a fetch. */
+function _sampleHighResDEMMeters(latDeg, lonDeg, zoom) {
+  if (latDeg > 85.05 || latDeg < -85.05) return NaN;
+  const latRad = latDeg * Math.PI / 180;
+  const yNorm = (1 - Math.log(Math.tan(Math.PI / 4 + latRad / 2)) / Math.PI) / 2;
+  let lonN = lonDeg;
+  while (lonN >  180) lonN -= 360;
+  while (lonN < -180) lonN += 360;
+  const xNorm = (lonN + 180) / 360;
+  const tilesPerEdge = 1 << zoom;
+  const tx = Math.floor(xNorm * tilesPerEdge);
+  const ty = Math.floor(yNorm * tilesPerEdge);
+  const key = zoom + "/" + tx + "/" + ty;
+  const tile = _EARTH_TILES.cache.get(key);
+  if (!tile) return NaN;
+  const px = (xNorm * tilesPerEdge - tx) * 256 - 0.5;
+  const py = (yNorm * tilesPerEdge - ty) * 256 - 0.5;
+  const x0 = Math.max(0, Math.min(255, Math.floor(px)));
+  const y0 = Math.max(0, Math.min(255, Math.floor(py)));
+  const x1 = Math.min(255, x0 + 1);
+  const y1 = Math.min(255, y0 + 1);
+  const wx = Math.max(0, Math.min(1, px - Math.floor(px)));
+  const wy = Math.max(0, Math.min(1, py - Math.floor(py)));
+  const m = tile.meters;
+  const e00 = m[y0 * 256 + x0];
+  const e10 = m[y0 * 256 + x1];
+  const e01 = m[y1 * 256 + x0];
+  const e11 = m[y1 * 256 + x1];
+  return (e00 * (1 - wx) + e10 * wx) * (1 - wy)
+       + (e01 * (1 - wx) + e11 * wx) * wy;
+}
+
+/* Convert meters → normalized elev (matches _earthElevationAt mapping). */
+function _metersToElev(m) {
+  if (m >= 0) return 0.5 + Math.min(0.5, (m / 8848) * 0.5);
+  return Math.max(0, 0.5 + (m / 11034) * 0.5);
+}
+
+/* Trigger fetch for the tile covering a unit-sphere direction at the
+ * given zoom. Idempotent. */
+function _ensureHighResTileForDir(ux, uy, uz, zoom) {
+  const latDeg = Math.asin(Math.max(-1, Math.min(1, uy))) * 180 / Math.PI;
+  if (latDeg > 85.05 || latDeg < -85.05) return;
+  const lonDeg = Math.atan2(uz, ux) * 180 / Math.PI;
+  const latRad = latDeg * Math.PI / 180;
+  const yNorm = (1 - Math.log(Math.tan(Math.PI / 4 + latRad / 2)) / Math.PI) / 2;
+  let lonN = lonDeg;
+  while (lonN >  180) lonN -= 360;
+  while (lonN < -180) lonN += 360;
+  const xNorm = (lonN + 180) / 360;
+  const tilesPerEdge = 1 << zoom;
+  const tx = Math.max(0, Math.min(tilesPerEdge - 1, Math.floor(xNorm * tilesPerEdge)));
+  const ty = Math.max(0, Math.min(tilesPerEdge - 1, Math.floor(yNorm * tilesPerEdge)));
+  _loadHighResTile(zoom, tx, ty);
+}
+
+/* For each of the 5 representative points on the chunk (4 corners + center),
+ * trigger a fetch of the covering tile at the chunk's appropriate zoom.
+ * 4 corners ensure tiles that straddle the chunk boundary all get fetched. */
+function _ensureHighResTilesForChunk(info, zoom) {
+  const face = _PLANET_FACES[info.face];
+  const corners = [
+    [info.uMin, info.vMin], [info.uMax, info.vMin],
+    [info.uMin, info.vMax], [info.uMax, info.vMax],
+    [(info.uMin + info.uMax) * 0.5, (info.vMin + info.vMax) * 0.5]
+  ];
+  for (let i = 0; i < corners.length; i++) {
+    const u = corners[i][0], v = corners[i][1];
+    const cx = face.n[0] + face.t[0]*u + face.b[0]*v;
+    const cy = face.n[1] + face.t[1]*u + face.b[1]*v;
+    const cz = face.n[2] + face.t[2]*u + face.b[2]*v;
+    const cxx = cx*cx, cyy = cy*cy, czz = cz*cz;
+    const sx = cx * Math.sqrt(Math.max(0, 1 - cyy*0.5 - czz*0.5 + cyy*czz/3));
+    const sy = cy * Math.sqrt(Math.max(0, 1 - cxx*0.5 - czz*0.5 + cxx*czz/3));
+    const sz = cz * Math.sqrt(Math.max(0, 1 - cxx*0.5 - cyy*0.5 + cxx*cyy/3));
+    const invLen = 1 / Math.max(1e-12, Math.sqrt(sx*sx + sy*sy + sz*sz));
+    _ensureHighResTileForDir(sx*invLen, sy*invLen, sz*invLen, zoom);
+  }
+}
+
+/* Best-available elevation sampler. Tries cached high-res tiles from highest
+ * zoom downward, falls back to the macro cubemap. Does NOT trigger fetches
+ * -- safe to call from collision / AGL / per-vertex chunk build paths. */
+function _planetSampleElevationCached(cubemap, ux, uy, uz) {
+  if (!cubemap) return 0;
+  // Only bother checking high-res if any tiles are loaded at all.
+  if (_EARTH_TILES.cache.size > 0) {
+    const latDeg = Math.asin(Math.max(-1, Math.min(1, uy))) * 180 / Math.PI;
+    const lonDeg = Math.atan2(uz, ux) * 180 / Math.PI;
+    // Try from highest zoom down. First hit wins.
+    for (let z = 14; z >= 5; z -= 2) {
+      const m = _sampleHighResDEMMeters(latDeg, lonDeg, z);
+      if (!isNaN(m)) return _metersToElev(m);
+    }
+  }
+  return _samplePlanetMapCubemap(cubemap, ux, uy, uz);
+}
+
 const _EARTH_CONTINENTS = [
   { name: "Africa",       lat:    5, lon:   20, hw: 35, hh: 35, rot:   5, base: 0.62 },
   { name: "Eurasia",      lat:   50, lon:   80, hw: 90, hh: 25, rot:   0, base: 0.62 },
@@ -62729,6 +62908,14 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
   // The cell-graph IDW branch below the `if (_planetIsEarth)` is
   // dead code; will be deleted once Earth is confirmed visible.
   const _planetIsEarth = true;
+  // Sprint 10-6: trigger high-res tile fetches for this chunk's area
+  // ONCE per build (not per vertex). Tiles arrive async, bump the
+  // global _EARTH_TILES.loadCount, which is in the chunk cache key
+  // -- so chunks rebuild and pick up the new detail on subsequent
+  // frames. Depth-aware zoom: deeper chunks fetch finer tiles.
+  if (_planetIsEarth && info.depth > 5) {
+    _ensureHighResTilesForChunk(info, _depthToZoom(info.depth));
+  }
 
   const face = _PLANET_FACES[info.face];
   const nX = face.n[0], nY = face.n[1], nZ = face.n[2];
@@ -62861,8 +63048,13 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
       // always comes from the cubemap; cellIdx is only consumed by the
       // (dead) custom color path below. Skip the lookup when no cells.
       const cellIdx = cells ? _findNearestCell(cells, pmap._cellsHash, ux, uy, uz) : -1;
+      // Sprint 10-6: per-vertex sample uses best-cached high-res tile
+      // (via _planetSampleElevationCached) and falls back to the macro
+      // cubemap when nothing closer is cached. Fetch trigger for this
+      // chunk's tiles happens ONCE outside the loop (see below) -- per
+      // vertex we never block on the network.
       const elev = _planetCubemap
-        ? _samplePlanetMapCubemap(_planetCubemap, ux, uy, uz)
+        ? _planetSampleElevationCached(_planetCubemap, ux, uy, uz)
         : (cells ? _samplePlanetCellsIDW(cells, pmap._cellsHash, ux, uy, uz) : 0);
       let altitude = 0;
       if (elev > seaLevel && hs !== 0) {
@@ -63297,7 +63489,14 @@ function _ensurePlanetMeshChunks(node) {
   // baked into vertex Y) never rebuild.
   const cellsTag   = (typeof pmap._cellsKey   === "string") ? pmap._cellsKey   : "no-cells";
   const cubemapTag = (typeof pmap._cubemapKey === "string") ? pmap._cubemapKey : "no-cubemap";
-  const pmKey = cellsTag + "|" + cubemapTag;
+  // Sprint 10-6: include the high-res tile load count so chunks
+  // rebuild as new tiles arrive. Bucketed by 16 so we don't thrash
+  // the chunk cache after EVERY single tile -- 16-tile batches
+  // amortize the rebuild cost while keeping detail current. Trades
+  // a bit of latency (last 1-15 tiles wait for the next batch) for
+  // ~16x less wasted chunk rebuild work.
+  const tileBucket = Math.floor((_EARTH_TILES.loadCount || 0) / 16);
+  const pmKey = cellsTag + "|" + cubemapTag + "|tb=" + tileBucket;
   const globalKey = _planetMeshGlobalCacheKey(node) + "|" + pmKey;
   if (globalKey !== entry.globalKey) {
     const oldChunkCount = entry.chunks.size;
