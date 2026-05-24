@@ -53514,7 +53514,12 @@ struct PerScene {
   // the polRatio; remaining slots reserved for future expansion
   // (e.g. axial-tilt quaternion when planets get rotation).
   //   envPlanetGeom.x = polRatio (1.0 = perfect sphere)
-  //   envPlanetGeom.yzw = reserved
+  //   envPlanetGeom.y = terrain height at camera's lat/lon, m above
+  //                     planetR (0 = camera over ocean / sea level).
+  //                     Sprint 10-6 v7: used to shift LUT lookup from
+  //                     MSL to AGL so atmosphere references local
+  //                     terrain rather than always sea level.
+  //   envPlanetGeom.zw = reserved
   envPlanetGeom: vec4<f32>,
   // Sprint 8-4 -- per-biome detail-noise parameters editable via the
   // PlanetMap modal's Biomes tab. 13 biomes x 2 vec4 each:
@@ -54529,9 +54534,20 @@ fn sample_aerial_perspective_lut(camPos: vec3<f32>, fragPos: vec3<f32>) -> AtmRe
   // fragment the LUT clips at ground = the fragment, so this single
   // lookup is T(entry, frag) analytically. (T(cam, entry) = 1 when
   // camera is outside the atm, so T(cam, frag) = T_LUT.)
+  //
+  // Sprint 10-6 v7: shift LUT lookup from MSL to AGL by subtracting
+  // the terrain height at the camera's lat/lon (envPlanetGeom.y).
+  // The LUT is calibrated assuming density falls off from planetR
+  // (sea level) -- but a camera on a 5 km mountain peak should see
+  // through THIN air (it's above the densest atmosphere layer), not
+  // through 5 km of sea-level dense air. Subtracting terrain shifts
+  // the reference so vT=0 (densest LUT row) corresponds to the local
+  // terrain rather than always to sea level.
   let entryRadial = entryPos - planetC;
   let entryRadialLen = length(entryRadial);
-  let entryAlt = max(0.0, entryRadialLen - planetR);
+  let terrainAtCam = max(0.0, uS.envPlanetGeom.y);
+  let entryAltMSL = max(0.0, entryRadialLen - planetR);
+  let entryAlt = max(0.0, entryAltMSL - terrainAtCam);
   let entryUp  = entryRadial / max(entryRadialLen, 1.0);
   let cosVZ = dot(dir, entryUp);
   let uT = sqrt(clamp(cosVZ * 0.5 + 0.5, 0.0, 1.0));
@@ -66774,7 +66790,26 @@ function _encodeScenePass(enc, entry) {
     inst.sceneScratch[138] = scaleHM;
     inst.sceneScratch[139] = sunI;
     inst.sceneScratch[140] = polRatio;
-    inst.sceneScratch[141] = 0;
+    // Sprint 10-6 v7: terrain height at the camera's lat/lon (meters
+    // above planet radius). Sent every frame so the aerial-perspective
+    // shader can convert MSL → AGL when looking up the LUT. The LUT
+    // is MSL-referenced (densest at sea level), so when camera is over
+    // ocean (terrain=0) it works correctly; but over a 5km mountain
+    // it treats the camera as if it were in a thick column of 5km
+    // of sea-level air, washing out nearby terrain. AGL shifts the
+    // reference to local ground so the atmosphere "sits on" the
+    // terrain instead of bleeding through it.
+    let _terrainAtCamM = 0;
+    if (typeof _planetMeshSurfacePos === "function") {
+      const _surf = _planetMeshSurfacePos(camera.eye[0], camera.eye[1], camera.eye[2], planetInfo);
+      if (_surf) {
+        const _sdx = _surf.x - planetInfo.centerX;
+        const _sdy = _surf.y - planetInfo.centerY;
+        const _sdz = _surf.z - planetInfo.centerZ;
+        _terrainAtCamM = Math.max(0, Math.hypot(_sdx, _sdy, _sdz) - planetR);
+      }
+    }
+    inst.sceneScratch[141] = _terrainAtCamM;
     inst.sceneScratch[142] = 0;
     inst.sceneScratch[143] = 0;
   } else {
