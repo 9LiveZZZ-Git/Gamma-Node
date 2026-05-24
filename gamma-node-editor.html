@@ -59101,7 +59101,7 @@ function _planetMapCacheKey(node) {
     p.resolution, p.cellCount,
     p.seed, p.frequency, p.octaves,
     p.lacunarity, p.gain, p.ridges,
-    "v" + ver, "p13a", "src=earth-amp",
+    "v" + ver, "p13b", "src=earth-amp-tuned",
     _EARTH_DEM.loaded ? "dem=real" : "dem=ellipse"
   ].join(",");
 }
@@ -63422,45 +63422,46 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
       if (elev > seaLevel && hs !== 0) {
         altitude = hs * (elev - seaLevel) / Math.max(1e-6, 1 - seaLevel);
       }
-      // Sprint 10-4: runtime detail amplification. Adds sub-DEM
-      // displacement noise on top of the macro altitude. Gated by:
-      //   - chunk depth (only depth >= 8 -- ~40 km chunks and finer
-      //     -- gets amplification; coarse chunks stay smooth so
-      //     orbital views aren't speckled)
-      //   - land mask (no amplification on ocean -- water surface
-      //     stays flat at the sphere)
-      //   - elevation (mountains get more amplification than plains;
-      //     scales linearly with normalized land height)
+      // Sprint 10-4 v2: runtime detail amplification (tuned for less
+      // spikiness, higher frequency).
       //
-      // Noise frequency doubles per depth so each LOD level adds
-      // octave-scale detail rather than re-sampling the same coarse
-      // wavelength. Amplitude tuned so the detail reads as 'rocky
-      // ground' at foot level, never as spikes.
-      if (info.depth >= 8 && elev > seaLevel && _planetIsEarth) {
+      // v1 used per-chunk-depth frequency scaling with amp = hs*0.04,
+      // which on Earth (hs=10000) produced ±400 m of low-frequency
+      // displacement -- creating obvious tilted Phong triangles
+      // visible from low orbit. v2 fixes both:
+      //   1. Bumped frequency 5x (base wavelength 400 m -> 80 m)
+      //   2. Bumped octave count so deeper chunks add HIGHER-freq
+      //      detail rather than re-displaying the same wavelength
+      //   3. Cut total amplitude ~10x (max ±30 m on full-height land)
+      //   4. Bumped min depth 8 -> 10 (no noise on chunks > 10 km
+      //      because their vertex spacing can't represent it without
+      //      aliasing into triangular facets)
+      //
+      // All chunks sample the SAME multi-octave fbm centered at the
+      // same world-space coordinates; the chunk's depth only changes
+      // how many octaves get summed. So depth-10 and depth-16 chunks
+      // covering the same area agree on the low-frequency octaves
+      // (no seam between adjacent LOD chunks).
+      if (info.depth >= 10 && elev > seaLevel && _planetIsEarth) {
         const landH = (elev - seaLevel) / Math.max(0.001, 1 - seaLevel);
-        // Frequency: depth 8 = 1/2000m, depth 16 = 1/8m. World units.
-        const noiseFreq = Math.pow(2, info.depth - 8) / 2000;
         const noiseDef = {
-          frequency: noiseFreq,
-          octaves: Math.min(4, info.depth - 6),
+          frequency: 1 / 80,                                     // 80 m base wavelength
+          octaves: Math.min(8, Math.max(3, info.depth - 7)),     // depth 10=3, depth 16=8
           lacunarity: 2.0,
           gain: 0.5,
-          ridges: 0.4,           // mostly ridged for rocky terrain
+          ridges: 0.55,           // mostly ridged for rocky terrain
           seed: 17.3
         };
-        // Sample in world space (planet-relative position) so detail
-        // is consistent across chunks at the same depth.
         const n = _terrainFBM3D(
           r * ux + cxC,
           r * uy + cyC,
           r * uz + czC,
           noiseDef
         );
-        // Amp: scales with elevation. Peaks at full height get ~5%
-        // of the macro mountain amplitude; gentle slopes get less.
-        // At depth 16 (foot level), max amp ~10m for visible boulders.
-        const ampScale = hs * 0.04 * landH;
-        altitude += (n - 0.5) * 2 * ampScale;
+        // Total max amp: 30 m at landH=1, scaled by landH.
+        // Reads as 'rocky/textured terrain' rather than 'spikes'.
+        const ampM = 30 * landH;
+        altitude += (n - 0.5) * 2 * ampM;
       }
       // Sprint 9-3: VBO holds vertices RELATIVE to the planet's
       // center (anchorF64). The per-frame mv_rtc model matrix
