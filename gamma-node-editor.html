@@ -48024,7 +48024,8 @@ function _renderPlanetMinimap(img, RES, planet, minimapNode) {
       // builder + Earth cubemap bake so positions / colors are consistent.
       const elev = _samplePlanetMapCubemap(cubemap, dx, dy, dz);
       const latDeg = Math.asin(Math.max(-1, Math.min(1, dy))) * 180 / Math.PI;
-      const col = _earthSurfaceColorAt(latDeg, elev, seaLevel);
+      const lonDeg = -Math.atan2(dz, dx) * 180 / Math.PI;
+      const col = _earthSurfaceColorAt(latDeg, lonDeg, elev, seaLevel);
       const shade = 0.55 + 0.45 * w;   // curvature shading
       img.data[o+0] = Math.max(0, Math.min(255, Math.floor(col[0] * shade * 255)));
       img.data[o+1] = Math.max(0, Math.min(255, Math.floor(col[1] * shade * 255)));
@@ -59100,7 +59101,7 @@ function _planetMapCacheKey(node) {
     p.resolution, p.cellCount,
     p.seed, p.frequency, p.octaves,
     p.lacunarity, p.gain, p.ridges,
-    "v" + ver, "p12a", "src=earth-forced-ewflip-climate",
+    "v" + ver, "p12b", "src=earth-forced-ewflip-climate-8x8",
     _EARTH_DEM.loaded ? "dem=real" : "dem=ellipse"
   ].join(",");
 }
@@ -62157,20 +62158,83 @@ function _earthClimateAt(latDeg, elev, seaLevel) {
   return { T, P, elevMSL };
 }
 
-/* 4×4 Whittaker biome color matrix. Rows = temperature bands
- * (cold→hot), cols = precipitation bands (dry→wet). */
+/* Sprint 10-3 polish: 8×8 Whittaker biome color matrix (64 entries).
+ * Rows = temperature bands (cold→hot), cols = precipitation bands
+ * (dry→wet). Bilinearly interpolated for smooth transitions.
+ *
+ * Real-world biome reference:
+ *   Cold-dry  → arctic desert / Antarctic dry valleys
+ *   Cold-wet  → tundra → taiga as it warms
+ *   Cool-dry  → cold steppe (Mongolia, Patagonia)
+ *   Cool-wet  → boreal forest / mixed taiga
+ *   Temp-dry  → cold desert (Gobi, Great Basin)
+ *   Temp-wet  → temperate deciduous + rainforest (Pacific NW)
+ *   Sub-dry   → Mediterranean scrub / chaparral
+ *   Sub-wet   → subtropical broadleaf forest
+ *   Hot-dry   → Sahara / Arabian / Australian desert
+ *   Hot-wet   → tropical rainforest (Amazon, Congo, Indonesia)
+ *
+ * Colors tuned to match satellite Earth imagery aesthetic: warm-tan
+ * deserts, dark forest greens, golden savannas, gray-white tundras. */
 const _BIOME_COLOR_MATRIX = [
-  // Cold (T < -5):   dry           semi-arid       moderate         humid
-  [[0.62, 0.62, 0.55], [0.58, 0.60, 0.52], [0.50, 0.55, 0.50], [0.45, 0.52, 0.48]],
-  // Cool (-5..10):
-  [[0.65, 0.62, 0.45], [0.50, 0.55, 0.32], [0.32, 0.48, 0.30], [0.25, 0.42, 0.28]],
-  // Temperate (10..22):
-  [[0.78, 0.68, 0.42], [0.62, 0.60, 0.32], [0.38, 0.55, 0.28], [0.22, 0.48, 0.22]],
-  // Hot (>22):
-  [[0.85, 0.72, 0.45], [0.72, 0.65, 0.32], [0.32, 0.55, 0.20], [0.10, 0.40, 0.15]]
+  // Row 0: Arctic (T < -10):
+  //         hyper-arid          arid                semi-arid           dry-sub             moist               wet                 v-wet               hyper-wet
+  [ [0.72,0.72,0.66], [0.70,0.71,0.66], [0.68,0.70,0.66], [0.65,0.69,0.66], [0.62,0.68,0.65], [0.58,0.66,0.64], [0.55,0.65,0.62], [0.52,0.62,0.60] ],
+  // Row 1: Subarctic (T -10..-2):
+  [ [0.68,0.65,0.55], [0.62,0.63,0.52], [0.58,0.62,0.50], [0.52,0.60,0.48], [0.46,0.58,0.45], [0.40,0.55,0.42], [0.36,0.52,0.40], [0.32,0.48,0.38] ],
+  // Row 2: Cold continental (T -2..6):
+  [ [0.70,0.62,0.45], [0.65,0.60,0.42], [0.58,0.58,0.40], [0.48,0.55,0.36], [0.38,0.52,0.34], [0.30,0.50,0.32], [0.25,0.46,0.30], [0.22,0.42,0.28] ],
+  // Row 3: Cool temperate (T 6..12):
+  [ [0.72,0.62,0.42], [0.66,0.62,0.38], [0.58,0.60,0.34], [0.46,0.58,0.32], [0.36,0.55,0.30], [0.28,0.52,0.28], [0.24,0.48,0.26], [0.20,0.45,0.25] ],
+  // Row 4: Warm temperate (T 12..18):
+  [ [0.78,0.66,0.42], [0.70,0.64,0.38], [0.62,0.62,0.34], [0.50,0.60,0.30], [0.40,0.58,0.28], [0.30,0.55,0.26], [0.24,0.50,0.24], [0.20,0.46,0.22] ],
+  // Row 5: Subtropical (T 18..24):
+  [ [0.82,0.68,0.42], [0.76,0.66,0.40], [0.68,0.64,0.36], [0.56,0.60,0.32], [0.42,0.58,0.28], [0.30,0.54,0.24], [0.22,0.48,0.20], [0.18,0.44,0.18] ],
+  // Row 6: Tropical (T 24..28):
+  [ [0.85,0.70,0.44], [0.80,0.66,0.40], [0.72,0.62,0.34], [0.58,0.58,0.28], [0.42,0.55,0.24], [0.28,0.52,0.20], [0.16,0.46,0.18], [0.10,0.40,0.15] ],
+  // Row 7: Hot tropical (T > 28):
+  [ [0.88,0.72,0.46], [0.83,0.68,0.42], [0.75,0.64,0.36], [0.60,0.60,0.30], [0.40,0.55,0.22], [0.22,0.48,0.18], [0.12,0.40,0.16], [0.06,0.34,0.12] ]
 ];
+const _BIOME_T_BREAKS = [-10, -2, 6, 12, 18, 24, 28, 34];   // 8 boundary points
+const _BIOME_P_BREAKS = [0.05, 0.18, 0.30, 0.42, 0.55, 0.68, 0.82, 0.95];
 
-function _earthSurfaceColorAt(latDeg, elev, seaLevel) {
+/* Helper: bilinear sample of the 8×8 biome matrix given fractional
+ * row / col positions. Clamps to grid extents. */
+function _biomeMatrixSample(rowF, colF) {
+  rowF = Math.max(0, Math.min(7, rowF));
+  colF = Math.max(0, Math.min(7, colF));
+  const row0 = Math.max(0, Math.min(6, Math.floor(rowF)));
+  const row1 = row0 + 1;
+  const col0 = Math.max(0, Math.min(6, Math.floor(colF)));
+  const col1 = col0 + 1;
+  const wr = rowF - row0;
+  const wc = colF - col0;
+  const c00 = _BIOME_COLOR_MATRIX[row0][col0];
+  const c10 = _BIOME_COLOR_MATRIX[row0][col1];
+  const c01 = _BIOME_COLOR_MATRIX[row1][col0];
+  const c11 = _BIOME_COLOR_MATRIX[row1][col1];
+  return [
+    (c00[0]*(1-wc) + c10[0]*wc)*(1-wr) + (c01[0]*(1-wc) + c11[0]*wc)*wr,
+    (c00[1]*(1-wc) + c10[1]*wc)*(1-wr) + (c01[1]*(1-wc) + c11[1]*wc)*wr,
+    (c00[2]*(1-wc) + c10[2]*wc)*(1-wr) + (c01[2]*(1-wc) + c11[2]*wc)*wr
+  ];
+}
+
+/* Helper: find fractional index of value v in a monotonic increasing
+ * breakpoint array. Returns 0 below first, len-1 above last, and
+ * interpolated fractional index between. */
+function _bandIndexFractional(v, breaks) {
+  if (v <= breaks[0]) return 0;
+  if (v >= breaks[breaks.length - 1]) return breaks.length - 1;
+  for (let i = 0; i < breaks.length - 1; i++) {
+    if (v >= breaks[i] && v < breaks[i+1]) {
+      return i + (v - breaks[i]) / (breaks[i+1] - breaks[i]);
+    }
+  }
+  return 0;
+}
+
+function _earthSurfaceColorAt(latDeg, lonDeg, elev, seaLevel) {
   // Ocean: deeper = darker blue. Unchanged.
   if (elev <= seaLevel) {
     const depth = (seaLevel - elev) / Math.max(0.001, seaLevel);
@@ -62185,61 +62249,38 @@ function _earthSurfaceColorAt(latDeg, elev, seaLevel) {
   // Compute climate at this point.
   const climate = _earthClimateAt(latDeg, elev, seaLevel);
   const T = climate.T, P = climate.P;
-  // Snow / ice if it's cold enough -- overrides any biome lookup.
-  // T < -10 -> permanent ice (white). T < -5 -> patchy snow / tundra mix.
-  if (T < -10) return [0.92, 0.95, 0.98];
-  // Map T to row index [0..3] with bilinear blending.
-  //   T = -5  -> rowF = 0    (cold)
-  //   T = 5   -> rowF = 1    (cool)
-  //   T = 18  -> rowF = 2    (temperate)
-  //   T = 30  -> rowF = 3    (hot)
-  const T_breakpoints = [-5, 5, 18, 30];
-  let rowF = 0;
-  for (let i = 0; i < 3; i++) {
-    if (T >= T_breakpoints[i] && T < T_breakpoints[i+1]) {
-      rowF = i + (T - T_breakpoints[i]) / (T_breakpoints[i+1] - T_breakpoints[i]);
-      break;
-    }
-  }
-  if (T >= T_breakpoints[3]) rowF = 3;
-  // Map P to col index [0..3]. P=0 dry, P=1 wet.
-  // Breakpoints: 0.15, 0.40, 0.65, 0.85 (dry / semi / moderate / humid)
-  const P_breakpoints = [0.15, 0.40, 0.65, 0.85];
-  let colF = 0;
-  for (let i = 0; i < 3; i++) {
-    if (P >= P_breakpoints[i] && P < P_breakpoints[i+1]) {
-      colF = i + (P - P_breakpoints[i]) / (P_breakpoints[i+1] - P_breakpoints[i]);
-      break;
-    }
-  }
-  if (P >= P_breakpoints[3]) colF = 3;
-  if (P < P_breakpoints[0])  colF = 0;
-  // Bilinear sample the 4×4 matrix.
-  const row0 = Math.max(0, Math.min(3, Math.floor(rowF)));
-  const row1 = Math.min(3, row0 + 1);
-  const col0 = Math.max(0, Math.min(3, Math.floor(colF)));
-  const col1 = Math.min(3, col0 + 1);
-  const wr = rowF - row0;
-  const wc = colF - col0;
-  const c00 = _BIOME_COLOR_MATRIX[row0][col0];
-  const c10 = _BIOME_COLOR_MATRIX[row0][col1];
-  const c01 = _BIOME_COLOR_MATRIX[row1][col0];
-  const c11 = _BIOME_COLOR_MATRIX[row1][col1];
-  let r = (c00[0]*(1-wc) + c10[0]*wc)*(1-wr) + (c01[0]*(1-wc) + c11[0]*wc)*wr;
-  let g = (c00[1]*(1-wc) + c10[1]*wc)*(1-wr) + (c01[1]*(1-wc) + c11[1]*wc)*wr;
-  let b = (c00[2]*(1-wc) + c10[2]*wc)*(1-wr) + (c01[2]*(1-wc) + c11[2]*wc)*wr;
-  // Snow blend: cold-but-not-frozen gets snow-streaked appearance.
-  // T in [-10, -5] interpolates between snow color and biome color.
+  // Permanent ice/snow override: very cold = solid white regardless of
+  // biome. T < -15 = perpetual ice (Antarctica interior, Greenland ice cap).
+  if (T < -15) return [0.92, 0.95, 0.98];
+
+  // Bilinear sample the 8×8 biome matrix.
+  const rowF = _bandIndexFractional(T, _BIOME_T_BREAKS);
+  const colF = _bandIndexFractional(P, _BIOME_P_BREAKS);
+  let [r, g, b] = _biomeMatrixSample(rowF, colF);
+
+  // Sub-biome micro-variation: ±4% color jitter per lat/lon hash. Breaks
+  // up the otherwise uniform color blocks. Tuned subtle -- enough to
+  // suggest "patches of darker/lighter forest" without reading as noise.
+  // Hash uses both lat AND lon (and elev as a 3rd seed) so adjacent
+  // pixels get different jitter.
+  const hashS = Math.sin(latDeg * 12.9898 + lonDeg * 78.233 + elev * 3145.7);
+  const jitter = (hashS - Math.floor(hashS)) - 0.5;  // -0.5..0.5
+  const microAmp = 0.06;  // ±3% per channel after multiply
+  r += jitter * microAmp;
+  g += jitter * microAmp * 0.8;  // less green jitter = more natural
+  b += jitter * microAmp * 0.6;
+
+  // Snow streaks: T in [-15, -5] blends snow into the biome color.
   if (T < -5) {
-    const snowBlend = (-5 - T) / 5;  // 0 at -5, 1 at -10
+    const snowBlend = Math.min(1, (-5 - T) / 10);
     const snowR = 0.92, snowG = 0.95, snowB = 0.98;
     r = r + (snowR - r) * snowBlend;
     g = g + (snowG - g) * snowBlend;
     b = b + (snowB - b) * snowBlend;
   }
-  // High-altitude snow regardless of latitude (mountain snow line ≈ 3000m
-  // in temperate, ≈ 5000m at equator; we approximate with a single
-  // climate-aware threshold).
+  // Altitudinal snow line (mountain caps): scales with latitude.
+  // Equator ~4500 m, temperate ~3000 m, polar ~1500 m. Smooth transition
+  // up to 1km above the snow line for partial cover (rocky-icy mix).
   const snowLine = (T > 10) ? 4500 : (T > 0) ? 3000 : 1500;
   if (climate.elevMSL > snowLine) {
     const snowAmt = Math.min(1, (climate.elevMSL - snowLine) / 1000);
@@ -62247,6 +62288,19 @@ function _earthSurfaceColorAt(latDeg, elev, seaLevel) {
     r = r + (snowR - r) * snowAmt;
     g = g + (snowG - g) * snowAmt;
     b = b + (snowB - b) * snowAmt;
+  }
+  // Coastal beach strip: very low land near shore = sandy tan.
+  // Approximates beaches/coastal plain. Only fires for warm-enough
+  // climates (no beaches on polar coasts where it's just rocky tundra).
+  const coastBand = (elev - seaLevel) / Math.max(0.001, 1 - seaLevel);
+  if (coastBand < 0.015 && T > 0) {
+    const beachAmt = Math.min(1, (0.015 - coastBand) / 0.015);
+    const beachR = 0.82, beachG = 0.74, beachB = 0.58;
+    const tropicalBeachAmt = Math.min(1, (T - 0) / 20);  // ramp in by 20°C
+    const blendStrength = beachAmt * tropicalBeachAmt * 0.7;
+    r = r + (beachR - r) * blendStrength;
+    g = g + (beachG - g) * blendStrength;
+    b = b + (beachB - b) * blendStrength;
   }
   return [r, g, b];
 }
@@ -63389,7 +63443,8 @@ function _buildSinglePlanetMeshChunk(node, info, camPos, sun, ambient, pmap, cel
         // Unit-sphere direction → lat/lon for the climate lookup.
         // (ux/uy/uz already computed above for the cubemap sample.)
         const _latDeg = Math.asin(Math.max(-1, Math.min(1, uy))) * 180 / Math.PI;
-        const _earthCol = _earthSurfaceColorAt(_latDeg, elev, seaLevel);
+        const _lonDeg = -Math.atan2(uz, ux) * 180 / Math.PI;  // east-west flip (see 10-6 v6)
+        const _earthCol = _earthSurfaceColorAt(_latDeg, _lonDeg, elev, seaLevel);
         blendR = _earthCol[0];
         blendG = _earthCol[1];
         blendB = _earthCol[2];
