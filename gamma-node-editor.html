@@ -47656,19 +47656,39 @@ function _tickFPCameraWalk(node, p, dt, input, k) {
   // Snap to ground.
   const _preSnapPx = px, _preSnapPy = py, _preSnapPz = pz;
   if (_walkOnPlanet) {
-    // Sprint 10-6 v4: surf CACHE. The drift diagnostic in v3 showed
-    // the camera was snapping ~1.5m every frame with zero input,
-    // because high-res tiles continuously update the elev sample
-    // under the camera. Caching the last surface point and re-using
-    // it while no input is held freezes the camera in place between
-    // user actions. Walking (any key down) refreshes the cache so
-    // the camera tracks normally.
+    // Sprint 10-6 v5: surf cache with sanity checks. v4 froze surf
+    // whenever no input was held -- but if camera was teleported or
+    // the chunk rebuilt with very different alts, cached surf could
+    // be hundreds of meters off, leaving the camera floating. v5
+    // refreshes when:
+    //   - Input is held (normal walking)
+    //   - No cache yet
+    //   - Cache > 2 seconds old (covers slow tile loads)
+    //   - Cached surf is far (> 50 m) from current camera direction
+    //     (covers teleport / large jumps)
     let surf;
-    if (input._cachedSurf && !_hasInputThisTick) {
-      surf = input._cachedSurf;
-    } else {
+    const now = (typeof performance !== "undefined") ? performance.now() : 0;
+    let needsFresh = _hasInputThisTick || !input._cachedSurf;
+    if (!needsFresh && input._cachedSurfTime
+        && (now - input._cachedSurfTime) > 2000) {
+      needsFresh = true;
+    }
+    if (!needsFresh && input._cachedSurf) {
+      // Distance from cam to cached surf along the radial. If we've
+      // moved far from the cached position (unexpected) recompute.
+      const sdx = input._cachedSurf.x - px;
+      const sdy = input._cachedSurf.y - py;
+      const sdz = input._cachedSurf.z - pz;
+      if ((sdx*sdx + sdy*sdy + sdz*sdz) > 50*50) needsFresh = true;
+    }
+    if (needsFresh) {
       surf = _planetMeshSurfacePos(px, py, pz, _walkPL);
-      if (surf) input._cachedSurf = surf;
+      if (surf) {
+        input._cachedSurf = surf;
+        input._cachedSurfTime = now;
+      }
+    } else {
+      surf = input._cachedSurf;
     }
     if (surf) {
       // Re-derive up at the new position (we moved along a flat
@@ -48368,13 +48388,41 @@ function _flyToGoClicked() {
   const uy = Math.sin(latR);
   const uz = cosLat * Math.sin(lonR);
   const rAlt = pl.radius + altM;
-  cam.params.posX = pl.centerX + rAlt * ux;
-  cam.params.posY = pl.centerY + rAlt * uy * pl.polRatio;
-  cam.params.posZ = pl.centerZ + rAlt * uz;
+  const newPx = pl.centerX + rAlt * ux;
+  const newPy = pl.centerY + rAlt * uy * pl.polRatio;
+  const newPz = pl.centerZ + rAlt * uz;
+  cam.params.posX = newPx;
+  cam.params.posY = newPy;
+  cam.params.posZ = newPz;
+  // Sprint 10-6 v5: set camera orientation on teleport.
+  // Previously target/up survived from pre-teleport orientation,
+  // meaning "forward" pointed in whatever direction the camera last
+  // happened to face -- usually NOT a useful direction at the new
+  // lat/lon. Now we set:
+  //   up      = radial outward (camera upright on the surface)
+  //   forward = local east (along +lon tangent)
+  // So pressing W after teleport reliably moves you eastward, and
+  // mouse-look rotates around the local horizon plane as expected.
+  // Tangent basis at (lat, lon):
+  //   east  = (-sinLon, 0, cosLon)
+  //   up    = (cosLat*cosLon, sinLat, cosLat*sinLon) = (ux, uy, uz)
+  const sinLon = Math.sin(lonR), cosLon = Math.cos(lonR);
+  const eastX = -sinLon, eastY = 0, eastZ = cosLon;
+  cam.params.upX = ux; cam.params.upY = uy; cam.params.upZ = uz;
+  cam.params.targetX = newPx + eastX;
+  cam.params.targetY = newPy + eastY;
+  cam.params.targetZ = newPz + eastZ;
   // Engage fly mode so we don't immediately snap to terrain on arrival.
   cam.params.walkMode = 0;
+  // Reset cached surf so walk-mode (if you switch later) doesn't try
+  // to use a surf from the old location.
+  const fpcInput = Visual.fpcInput;
+  if (fpcInput) {
+    fpcInput._cachedSurf = null;
+    fpcInput._cachedSurfTime = 0;
+  }
   console.log("[flyto] teleported to lat=" + latDeg.toFixed(2) + " lon=" + lonDeg.toFixed(2)
-              + " alt=" + (altM/1000).toFixed(0) + "km (mode=FLY)");
+              + " alt=" + (altM/1000).toFixed(0) + "km (mode=FLY, facing east)");
 }
 
 function _flyToModeClicked() {
