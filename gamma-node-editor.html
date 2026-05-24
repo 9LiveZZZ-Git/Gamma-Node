@@ -59100,7 +59100,7 @@ function _planetMapCacheKey(node) {
     p.resolution, p.cellCount,
     p.seed, p.frequency, p.octaves,
     p.lacunarity, p.gain, p.ridges,
-    "v" + ver, "p11f", "src=earth-forced-ewflip",
+    "v" + ver, "p11g", "src=earth-forced-ewflip",
     _EARTH_DEM.loaded ? "dem=real" : "dem=ellipse"
   ].join(",");
 }
@@ -61738,13 +61738,15 @@ const _EARTH_TILES = {
 };
 
 function _depthToZoom(depth) {
+  // Sprint 10-6 v8: bumped deepest from 14 → 15 (Mapzen's max). At
+  // foot level (depth 16+) this gives ~1.2 m/px instead of ~2.4 m/px.
   if (depth <= 5)  return 3;
   if (depth <= 7)  return 5;
   if (depth <= 9)  return 7;
   if (depth <= 11) return 9;
   if (depth <= 13) return 11;
   if (depth <= 15) return 13;
-  return 14;
+  return 15;
 }
 
 /* Idempotent. No-op if cached or already in-flight. */
@@ -61788,7 +61790,15 @@ function _loadHighResTile(z, x, y) {
 }
 
 /* Sample any cached high-res tile that covers (lat, lon) at the given zoom.
- * Returns meters, or NaN if no tile cached. Does NOT trigger a fetch. */
+ * Returns meters, or NaN if no tile cached. Does NOT trigger a fetch.
+ *
+ * Sprint 10-6 v8: cross-tile bilinear. Previously the bilinear was
+ * clipped at the host tile's pixel boundary (x1 = min(255, x0+1)),
+ * which left a 1-pixel discontinuity at every tile edge -- visible as
+ * thin grid seams across the planet. Now when a corner of the bilinear
+ * footprint falls into a neighbor tile, we look that neighbor up and
+ * sample from it instead. If the neighbor isn't cached we degrade
+ * gracefully by clamping to the host tile edge (old behavior). */
 function _sampleHighResDEMMeters(latDeg, lonDeg, zoom) {
   if (latDeg > 85.05 || latDeg < -85.05) return NaN;
   const latRad = latDeg * Math.PI / 180;
@@ -61800,22 +61810,59 @@ function _sampleHighResDEMMeters(latDeg, lonDeg, zoom) {
   const tilesPerEdge = 1 << zoom;
   const tx = Math.floor(xNorm * tilesPerEdge);
   const ty = Math.floor(yNorm * tilesPerEdge);
-  const key = zoom + "/" + tx + "/" + ty;
-  const tile = _EARTH_TILES.cache.get(key);
-  if (!tile) return NaN;
-  const px = (xNorm * tilesPerEdge - tx) * 256 - 0.5;
-  const py = (yNorm * tilesPerEdge - ty) * 256 - 0.5;
-  const x0 = Math.max(0, Math.min(255, Math.floor(px)));
-  const y0 = Math.max(0, Math.min(255, Math.floor(py)));
-  const x1 = Math.min(255, x0 + 1);
-  const y1 = Math.min(255, y0 + 1);
-  const wx = Math.max(0, Math.min(1, px - Math.floor(px)));
-  const wy = Math.max(0, Math.min(1, py - Math.floor(py)));
-  const m = tile.meters;
-  const e00 = m[y0 * 256 + x0];
-  const e10 = m[y0 * 256 + x1];
-  const e01 = m[y1 * 256 + x0];
-  const e11 = m[y1 * 256 + x1];
+  const hostKey = zoom + "/" + tx + "/" + ty;
+  const hostTile = _EARTH_TILES.cache.get(hostKey);
+  if (!hostTile) return NaN;
+
+  // Position within the host tile in pixel coords. Range [-0.5, 255.5)
+  // when the lat/lon falls inside this tile -- can extend outside that
+  // range when the bilinear's right/bottom corner needs the neighbor.
+  const pxF = (xNorm * tilesPerEdge - tx) * 256 - 0.5;
+  const pyF = (yNorm * tilesPerEdge - ty) * 256 - 0.5;
+  const x0 = Math.floor(pxF);
+  const y0 = Math.floor(pyF);
+  const wx = pxF - x0;
+  const wy = pyF - y0;
+
+  // For each corner of the bilinear (x,y), figure out which tile it
+  // belongs to and read the appropriate pixel. Neighbors in -x, -y,
+  // +x, +y direction; corner cases hit ±x ±y diagonal neighbor.
+  // _readPixel returns either the neighbor's pixel OR the clamped
+  // host pixel if neighbor isn't loaded.
+  const _readPixel = function(localX, localY) {
+    let tileX = tx, tileY = ty;
+    let ix = localX, iy = localY;
+    if (ix < 0)    { tileX -= 1; ix += 256; }
+    if (ix > 255)  { tileX += 1; ix -= 256; }
+    if (iy < 0)    { tileY -= 1; iy += 256; }
+    if (iy > 255)  { tileY += 1; iy -= 256; }
+    // Wrap longitude tile index (anti-meridian).
+    if (tileX < 0)            tileX += tilesPerEdge;
+    if (tileX >= tilesPerEdge) tileX -= tilesPerEdge;
+    // Latitude can't wrap (Mercator).
+    if (tileY < 0 || tileY >= tilesPerEdge) {
+      // Polar fallthrough -- clamp to host edge.
+      const cx = Math.max(0, Math.min(255, localX));
+      const cy = Math.max(0, Math.min(255, localY));
+      return hostTile.meters[cy * 256 + cx];
+    }
+    if (tileX === tx && tileY === ty) {
+      return hostTile.meters[iy * 256 + ix];
+    }
+    const nbrKey = zoom + "/" + tileX + "/" + tileY;
+    const nbrTile = _EARTH_TILES.cache.get(nbrKey);
+    if (nbrTile) return nbrTile.meters[iy * 256 + ix];
+    // Neighbor not cached -- clamp to host edge (old behavior, leaves
+    // a small seam but at least no NaN/hole).
+    const cx = Math.max(0, Math.min(255, localX));
+    const cy = Math.max(0, Math.min(255, localY));
+    return hostTile.meters[cy * 256 + cx];
+  };
+
+  const e00 = _readPixel(x0,     y0);
+  const e10 = _readPixel(x0 + 1, y0);
+  const e01 = _readPixel(x0,     y0 + 1);
+  const e11 = _readPixel(x0 + 1, y0 + 1);
   return (e00 * (1 - wx) + e10 * wx) * (1 - wy)
        + (e01 * (1 - wx) + e11 * wx) * wy;
 }
