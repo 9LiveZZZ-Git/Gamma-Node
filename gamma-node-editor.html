@@ -58800,7 +58800,8 @@ function _planetMapCacheKey(node) {
     p.resolution, p.cellCount,
     p.seed, p.frequency, p.octaves,
     p.lacunarity, p.gain, p.ridges,
-    "v" + ver, "p11a", "src=earth-forced"
+    "v" + ver, "p11b", "src=earth-forced",
+    _EARTH_DEM.loaded ? "dem=real" : "dem=ellipse"
   ].join(",");
 }
 
@@ -61213,7 +61214,165 @@ function _decodeCubemapBase64(b64, res) {
  * Ridge polylines: each entry is a list of lat/lon points + a
  * cross-section width + an elevation boost. Closest-point on
  * each segment determines how much boost a query point gets.
- * Boost only applies on land so mid-ocean ridges don't appear. */
+ * Boost only applies on land so mid-ocean ridges don't appear.
+ *
+ * Sprint 10-5b -- real DEM path. AWS Terrain Tiles (Mapzen
+ * terrarium PNG format, S3-hosted, CORS-enabled, no key).
+ * URL: https://elevation-tiles-prod.s3.amazonaws.com/terrarium/{z}/{x}/{y}.png
+ * Encoding per pixel: height_m = (R*256 + G + B/256) - 32768
+ * Range: -11034 m (Mariana) to 8848 m (Everest).
+ *
+ * Strategy: lazy fetch on first _earthElevationAt call. While
+ * loading, return the ellipse approximation so something shows.
+ * On completion: clear all PlanetMap cubemap caches so the next
+ * bake re-runs with real DEM. Zoom 3 = 64 tiles ≈ 2-4 MB total
+ * fetched once, browser HTTP-cached after.
+ *
+ * Web-Mercator caveat: tiles top out at |lat| ≈ 85.05° -- polar
+ * regions (Antarctica, Greenland's far north) fall through to
+ * the ellipse fallback. Acceptable for v1; future iteration can
+ * splice in polar stereographic tiles. */
+const _EARTH_DEM = {
+  zoom: 3,                  // 2^3 = 8 tiles per edge, 64 total
+  tileSize: 256,
+  width:  8 * 256,
+  height: 8 * 256,
+  data: null,
+  loaded: false,
+  loading: false,
+  loadPromise: null,
+  loadFailed: false
+};
+
+function _decodeTerrariumPixel(r, g, b) {
+  return (r * 256 + g + b / 256) - 32768;
+}
+
+function _loadEarthDEMTile(z, x, y) {
+  return new Promise((resolve, reject) => {
+    const url = "https://elevation-tiles-prod.s3.amazonaws.com/terrarium/"
+              + z + "/" + x + "/" + y + ".png";
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => {
+      try {
+        const canvas = document.createElement("canvas");
+        canvas.width = 256;
+        canvas.height = 256;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0);
+        resolve(ctx.getImageData(0, 0, 256, 256));
+      } catch (err) {
+        reject(err);
+      }
+    };
+    img.onerror = () => reject(new Error("tile fetch failed: " + url));
+    img.src = url;
+  });
+}
+
+function _loadEarthDEM() {
+  if (_EARTH_DEM.loaded || _EARTH_DEM.loadFailed) return _EARTH_DEM.loadPromise;
+  if (_EARTH_DEM.loading) return _EARTH_DEM.loadPromise;
+  _EARTH_DEM.loading = true;
+  const z = _EARTH_DEM.zoom;
+  const tilesPerEdge = 1 << z;
+  const totalTiles = tilesPerEdge * tilesPerEdge;
+  const W = _EARTH_DEM.width;
+  const H = _EARTH_DEM.height;
+  const data = new Float32Array(W * H);
+  console.log("[earth-dem] fetching " + totalTiles
+              + " Mapzen terrarium tiles at zoom " + z
+              + " (~" + (totalTiles * 60 / 1024).toFixed(1) + " MB) ...");
+  const t0 = (typeof performance !== "undefined") ? performance.now() : 0;
+  const tasks = [];
+  let failedTiles = 0;
+  for (let ty = 0; ty < tilesPerEdge; ty++) {
+    for (let tx = 0; tx < tilesPerEdge; tx++) {
+      const _tx = tx, _ty = ty;
+      tasks.push(_loadEarthDEMTile(z, _tx, _ty).then((imgData) => {
+        const px = imgData.data;
+        const baseX = _tx * 256;
+        const baseY = _ty * 256;
+        for (let py = 0; py < 256; py++) {
+          for (let pxIdx = 0; pxIdx < 256; pxIdx++) {
+            const i4 = (py * 256 + pxIdx) * 4;
+            data[(baseY + py) * W + (baseX + pxIdx)] =
+              _decodeTerrariumPixel(px[i4], px[i4 + 1], px[i4 + 2]);
+          }
+        }
+      }).catch((err) => {
+        failedTiles++;
+        console.warn("[earth-dem] tile (" + _tx + ", " + _ty + ") failed:", err.message);
+      }));
+    }
+  }
+  _EARTH_DEM.loadPromise = Promise.all(tasks).then(() => {
+    if (failedTiles >= totalTiles * 0.5) {
+      _EARTH_DEM.loadFailed = true;
+      _EARTH_DEM.loading = false;
+      console.warn("[earth-dem] FAILED -- " + failedTiles + "/" + totalTiles
+                   + " tiles missing. Falling back to ellipse approximation permanently.");
+      return;
+    }
+    _EARTH_DEM.data = data;
+    _EARTH_DEM.loaded = true;
+    _EARTH_DEM.loading = false;
+    const dt = ((typeof performance !== "undefined") ? performance.now() : 0) - t0;
+    console.log("[earth-dem] LOADED " + (totalTiles - failedTiles) + "/" + totalTiles
+                + " tiles (" + W + "×" + H + " mercator grid) in "
+                + (dt / 1000).toFixed(1) + "s. Invalidating PlanetMap cubemaps for re-bake.");
+    if (typeof state !== "undefined" && state && Array.isArray(state.nodes)) {
+      let invalidated = 0;
+      for (const n of state.nodes) {
+        if (n && n.type === "PlanetMap") {
+          n._cubemap = null;
+          n._cubemapKey = null;
+          if (n.params) {
+            n.params.cubemapData = null;
+            n.params.cubemapKey = null;
+          }
+          invalidated++;
+        }
+      }
+      if (invalidated > 0) console.log("[earth-dem] invalidated " + invalidated + " PlanetMap node(s)");
+    }
+  });
+  return _EARTH_DEM.loadPromise;
+}
+
+// Sample DEM at (lat, lon) using inverse Web Mercator projection.
+// Returns meters, or NaN if outside the Mercator-projectable band.
+function _earthDEMSampleMeters(latDeg, lonDeg) {
+  if (!_EARTH_DEM.loaded || !_EARTH_DEM.data) return NaN;
+  if (latDeg > 85.05 || latDeg < -85.05) return NaN;  // polar fallthrough
+  const latRad = latDeg * Math.PI / 180;
+  // Mercator y_norm in [0, 1]: 0 = north pole limit, 1 = south pole limit
+  const yNorm = (1 - Math.log(Math.tan(Math.PI / 4 + latRad / 2)) / Math.PI) / 2;
+  let lonN = lonDeg;
+  while (lonN >  180) lonN -= 360;
+  while (lonN < -180) lonN += 360;
+  const xNorm = (lonN + 180) / 360;
+  const W = _EARTH_DEM.width;
+  const H = _EARTH_DEM.height;
+  // Bilinear sample.
+  const fx = xNorm * W - 0.5;
+  const fy = yNorm * H - 0.5;
+  const x0 = Math.max(0, Math.min(W - 1, Math.floor(fx)));
+  const y0 = Math.max(0, Math.min(H - 1, Math.floor(fy)));
+  const x1 = Math.min(W - 1, x0 + 1);
+  const y1 = Math.min(H - 1, y0 + 1);
+  const wx = fx - Math.floor(fx);
+  const wy = fy - Math.floor(fy);
+  const d = _EARTH_DEM.data;
+  const e00 = d[y0 * W + x0];
+  const e10 = d[y0 * W + x1];
+  const e01 = d[y1 * W + x0];
+  const e11 = d[y1 * W + x1];
+  return (e00 * (1 - wx) + e10 * wx) * (1 - wy)
+       + (e01 * (1 - wx) + e11 * wx) * wy;
+}
+
 const _EARTH_CONTINENTS = [
   { name: "Africa",       lat:    5, lon:   20, hw: 35, hh: 35, rot:   5, base: 0.62 },
   { name: "Eurasia",      lat:   50, lon:   80, hw: 90, hh: 25, rot:   0, base: 0.62 },
@@ -61263,7 +61422,23 @@ const _EARTH_RIDGES = [
 ];
 
 function _earthElevationAt(lat, lon) {
-  // 1) Test against every continent ellipse. Highest land wins.
+  // Sprint 10-5b: real DEM path. Trigger lazy load on first call.
+  // If loaded, return real meters mapped to [0, 1]; else ellipse fallback.
+  if (!_EARTH_DEM.loaded && !_EARTH_DEM.loading && !_EARTH_DEM.loadFailed) {
+    _loadEarthDEM().catch((err) => console.warn("[earth-dem] load error:", err));
+  }
+  if (_EARTH_DEM.loaded) {
+    const m = _earthDEMSampleMeters(lat, lon);
+    if (!isNaN(m)) {
+      // Map meters → [0, 1] with sea level at 0.5.
+      // Land: 0..8848m → 0.5..1.0 (Everest at top).
+      // Ocean: -11034..0m → 0.0..0.5 (Mariana at bottom).
+      if (m >= 0) return 0.5 + Math.min(0.5, (m / 8848) * 0.5);
+      return Math.max(0, 0.5 + (m / 11034) * 0.5);
+    }
+    // m is NaN -> polar region; fall through to ellipse.
+  }
+  // Ellipse approximation (used until DEM loads + for polar regions).
   let landMax = 0.30;     // deep-ocean baseline
   for (let i = 0; i < _EARTH_CONTINENTS.length; i++) {
     const c = _EARTH_CONTINENTS[i];
