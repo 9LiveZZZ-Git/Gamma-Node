@@ -48381,12 +48381,14 @@ function _flyToGoClicked() {
   const latR = latDeg * Math.PI / 180;
   const lonR = lonDeg * Math.PI / 180;
   const cosLat = Math.cos(latR);
-  // Same convention as _buildEarthCubemap: ux = cosLat*cosLon,
-  // uy = sinLat, uz = cosLat*sinLon -- so the lat/lon you type lands
-  // exactly where the cubemap was baked at that coordinate.
+  // Sprint 10-6 v6: convert user-friendly lon to internal coords with
+  // an east-west flip. The bake stores real-world east at internal -Z
+  // direction (so it renders on screen RIGHT). For user typing lon=87
+  // to land at the same place the cubemap put real-world lon=87 data,
+  // we negate the uz component: internal_lon = -user_lon.
   const ux = cosLat * Math.cos(lonR);
   const uy = Math.sin(latR);
-  const uz = cosLat * Math.sin(lonR);
+  const uz = -cosLat * Math.sin(lonR);
   const rAlt = pl.radius + altM;
   const newPx = pl.centerX + rAlt * ux;
   const newPy = pl.centerY + rAlt * uy * pl.polRatio;
@@ -48404,10 +48406,16 @@ function _flyToGoClicked() {
   // So pressing W after teleport reliably moves you eastward, and
   // mouse-look rotates around the local horizon plane as expected.
   // Tangent basis at (lat, lon):
-  //   east  = (-sinLon, 0, cosLon)
-  //   up    = (cosLat*cosLon, sinLat, cosLat*sinLon) = (ux, uy, uz)
+  //   east  = (-sinLon, 0, -cosLon)  ← Z negated for v6 east-west flip
+  //   up    = (cosLat*cosLon, sinLat, -cosLat*sinLon) = (ux, uy, uz)
+  // East tangent points in the direction of increasing user_lon. Since
+  // internal_lon = -user_lon, increasing user_lon = decreasing internal_lon,
+  // and the tangent of decreasing internal_lon is the negation of the
+  // standard east tangent (-sinLon, 0, cosLon) → (-sinLon, 0, -cosLon).
+  // Same world direction as the cubemap's east hemisphere (now on
+  // screen RIGHT).
   const sinLon = Math.sin(lonR), cosLon = Math.cos(lonR);
-  const eastX = -sinLon, eastY = 0, eastZ = cosLon;
+  const eastX = -sinLon, eastY = 0, eastZ = -cosLon;
   cam.params.upX = ux; cam.params.upY = uy; cam.params.upZ = uz;
   cam.params.targetX = newPx + eastX;
   cam.params.targetY = newPy + eastY;
@@ -48484,7 +48492,12 @@ function _tickAltimeterNodes() {
     if (r > 1e-6) {
       const ux = dx / r, uy = dy / r, uz = dz / r;
       latDeg = Math.asin(Math.max(-1, Math.min(1, uy))) * 180 / Math.PI;
-      lonDeg = Math.atan2(uz, ux) * 180 / Math.PI;
+      // Sprint 10-6 v6: negate atan2(uz,ux) so display matches the
+      // visible planet orientation (east on screen RIGHT). Right-handed
+      // lookAt puts world +Z on screen LEFT, so what's at internal
+      // lon=+90 (atan2=+90) appears on the user's left; we want the
+      // HUD to report real-world lon (east=positive).
+      lonDeg = -Math.atan2(uz, ux) * 180 / Math.PI;
     }
     // Sprint 8-8: AGL via shared _planetMeshSurfacePos helper. It
     // applies the polRatio-corrected unit-sphere direction (matches
@@ -59068,7 +59081,7 @@ function _planetMapCacheKey(node) {
     p.resolution, p.cellCount,
     p.seed, p.frequency, p.octaves,
     p.lacunarity, p.gain, p.ridges,
-    "v" + ver, "p11e", "src=earth-forced",
+    "v" + ver, "p11f", "src=earth-forced-ewflip",
     _EARTH_DEM.loaded ? "dem=real" : "dem=ellipse"
   ].join(",");
 }
@@ -61645,6 +61658,10 @@ function _earthDEMSampleMeters(latDeg, lonDeg) {
   const latRad = latDeg * Math.PI / 180;
   // Mercator y_norm in [0, 1]: 0 = north pole limit, 1 = south pole limit
   const yNorm = (1 - Math.log(Math.tan(Math.PI / 4 + latRad / 2)) / Math.PI) / 2;
+  // Sprint 10-6 v6: lonDeg here is REAL-WORLD lon (east = +). Callers
+  // doing dir→lat/lon negate atan2(uz,ux) at their site so internal
+  // world coords (where +Z appears on screen LEFT per right-handed
+  // lookAt) get correctly mapped to real-world (east on screen RIGHT).
   let lonN = lonDeg;
   while (lonN >  180) lonN -= 360;
   while (lonN < -180) lonN += 360;
@@ -61795,7 +61812,8 @@ function _metersToElev(m) {
 function _ensureHighResTileForDir(ux, uy, uz, zoom) {
   const latDeg = Math.asin(Math.max(-1, Math.min(1, uy))) * 180 / Math.PI;
   if (latDeg > 85.05 || latDeg < -85.05) return;
-  const lonDeg = Math.atan2(uz, ux) * 180 / Math.PI;
+  // Sprint 10-6 v6: negate atan2 -> see _earthDEMSampleMeters comment.
+  const lonDeg = -Math.atan2(uz, ux) * 180 / Math.PI;
   const latRad = latDeg * Math.PI / 180;
   const yNorm = (1 - Math.log(Math.tan(Math.PI / 4 + latRad / 2)) / Math.PI) / 2;
   let lonN = lonDeg;
@@ -61902,7 +61920,8 @@ function _planetSampleElevationCached(cubemap, ux, uy, uz) {
   // Only bother checking high-res if any tiles are loaded at all.
   if (_EARTH_TILES.cache.size > 0) {
     const latDeg = Math.asin(Math.max(-1, Math.min(1, uy))) * 180 / Math.PI;
-    const lonDeg = Math.atan2(uz, ux) * 180 / Math.PI;
+    // Sprint 10-6 v6: negate atan2 -> see _earthDEMSampleMeters comment.
+    const lonDeg = -Math.atan2(uz, ux) * 180 / Math.PI;
     // Try from highest zoom down. First hit wins.
     for (let z = 14; z >= 5; z--) {
       const m = _sampleHighResDEMMeters(latDeg, lonDeg, z);
@@ -62131,7 +62150,10 @@ function _buildEarthCubemap(resolution) {
         const invLen = 1 / Math.max(1e-12, Math.sqrt(sx*sx + sy*sy + sz*sz));
         const ux = sx * invLen, uy = sy * invLen, uz = sz * invLen;
         const latDeg = Math.asin(Math.max(-1, Math.min(1, uy))) * 180 / Math.PI;
-        const lonDeg = Math.atan2(uz, ux) * 180 / Math.PI;
+        // Sprint 10-6 v6: negate atan2 so the cubemap stores real-world
+        // EAST data at the direction that renders on screen RIGHT.
+        // (Right-handed lookAt puts world +Z on screen LEFT.)
+        const lonDeg = -Math.atan2(uz, ux) * 180 / Math.PI;
         data[iy * res + ix] = _earthElevationAt(latDeg, lonDeg);
       }
     }
