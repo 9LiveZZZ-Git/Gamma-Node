@@ -61319,9 +61319,37 @@ function _loadEarthDEM() {
     _EARTH_DEM.loaded = true;
     _EARTH_DEM.loading = false;
     const dt = ((typeof performance !== "undefined") ? performance.now() : 0) - t0;
+    // Diagnostic: dump elevation stats + a few known-location samples
+    // so we can verify the decode + projection are working.
+    let dMin = Infinity, dMax = -Infinity, dSum = 0, nonZero = 0;
+    for (let i = 0; i < data.length; i++) {
+      const v = data[i];
+      if (v < dMin) dMin = v;
+      if (v > dMax) dMax = v;
+      dSum += v;
+      if (v !== 0) nonZero++;
+    }
     console.log("[earth-dem] LOADED " + (totalTiles - failedTiles) + "/" + totalTiles
                 + " tiles (" + W + "×" + H + " mercator grid) in "
-                + (dt / 1000).toFixed(1) + "s. Invalidating PlanetMap cubemaps for re-bake.");
+                + (dt / 1000).toFixed(1) + "s. min=" + dMin.toFixed(0)
+                + "m max=" + dMax.toFixed(0) + "m mean=" + (dSum/data.length).toFixed(0)
+                + "m nonzero=" + nonZero + "/" + data.length);
+    // Sample at known-Earth locations to sanity-check projection.
+    const probes = [
+      { name: "Atlantic eq",  lat:   0, lon: -30 },
+      { name: "Africa cent",  lat:   0, lon:  25 },
+      { name: "Himalaya",     lat:  28, lon:  85 },
+      { name: "Pacific eq",   lat:   0, lon: 180 },
+      { name: "Andes",        lat: -25, lon: -70 },
+      { name: "Greenland",    lat:  70, lon: -40 },
+      { name: "Sahara",       lat:  25, lon:   5 },
+      { name: "Amazon",       lat:  -5, lon: -60 }
+    ];
+    for (const p of probes) {
+      const m = _earthDEMSampleMeters(p.lat, p.lon);
+      console.log("[earth-dem]   probe " + p.name + " (lat="+p.lat+", lon="+p.lon+") = " + m.toFixed(0) + "m");
+    }
+    console.log("[earth-dem] invalidating PlanetMap cubemaps for re-bake ...");
     if (typeof state !== "undefined" && state && Array.isArray(state.nodes)) {
       let invalidated = 0;
       for (const n of state.nodes) {
@@ -61840,9 +61868,27 @@ function _ensurePlanetMapCubemap(node) {
     const earthCubemap = _buildEarthCubemap(res);
     faces = earthCubemap.faces;
     const dt = ((typeof performance !== "undefined") ? performance.now() : 0) - eTo;
-    console.log("[planet-map] EARTH bake done: " + res + "² × 6 faces, "
-                + _EARTH_CONTINENTS.length + " continents + "
-                + _EARTH_RIDGES.length + " ridges in " + dt.toFixed(0) + "ms");
+    // Dump face-elevation stats so we can tell if the bake actually
+    // produced varied terrain or just baked sea level everywhere.
+    let cMin = Infinity, cMax = -Infinity, cSum = 0, nLand = 0, nOcean = 0, nTotal = 0;
+    const seaLvl = (typeof node.params.seaLevel === "number") ? node.params.seaLevel : 0.5;
+    for (let f = 0; f < faces.length; f++) {
+      const arr = faces[f];
+      for (let i = 0; i < arr.length; i++) {
+        const v = arr[i];
+        if (v < cMin) cMin = v;
+        if (v > cMax) cMax = v;
+        cSum += v;
+        if (v > seaLvl) nLand++; else nOcean++;
+        nTotal++;
+      }
+    }
+    const landPct = (100 * nLand / nTotal).toFixed(1);
+    console.log("[planet-map] EARTH bake done: " + res + "² × 6 faces in " + dt.toFixed(0) + "ms"
+                + " | source=" + (_EARTH_DEM.loaded ? "REAL DEM" : "ellipse fallback")
+                + " | elev range=[" + cMin.toFixed(3) + ", " + cMax.toFixed(3) + "]"
+                + " mean=" + (cSum/nTotal).toFixed(3) + " seaLevel=" + seaLvl
+                + " | land=" + landPct + "% ocean=" + (100-parseFloat(landPct)).toFixed(1) + "%");
   } else {
     // Custom source: existing cell-graph bake path.
     cells = _ensurePlanetMapCells(node);
@@ -63061,11 +63107,18 @@ function _ensurePlanetMeshChunks(node) {
   const pmKey = cellsTag + "|" + cubemapTag;
   const globalKey = _planetMeshGlobalCacheKey(node) + "|" + pmKey;
   if (globalKey !== entry.globalKey) {
+    const oldChunkCount = entry.chunks.size;
     for (const c of entry.chunks.values()) {
       try { c.vertexBuffer && c.vertexBuffer.destroy(); } catch (_) {}
       try { c.indexBuffer  && c.indexBuffer.destroy();  } catch (_) {}
     }
     entry.chunks.clear();
+    // Diagnostic: every invalidation. Tells us when DEM-load cubemap
+    // re-bake actually cascades into chunk-VBO rebuild.
+    if (entry.globalKey !== null) {
+      console.log("[planetmesh-quadtree] chunk cache invalidated (" + oldChunkCount + " chunks dropped). "
+                  + "Old key tail=..." + String(entry.globalKey).slice(-60) + " | New key tail=..." + globalKey.slice(-60));
+    }
     entry.globalKey = globalKey;
   }
 
