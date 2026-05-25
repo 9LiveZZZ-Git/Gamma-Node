@@ -62116,7 +62116,13 @@ function _svtAllocateSlot(face, pageX, pageY) {
     existing.lastFrame = _SVT.frame;
     return { slotX: existing.slotX, slotY: existing.slotY };
   }
-  if (_SVT.freeSlots.length === 0) return null;
+  // Sprint 10-5c-e: when atlas full, evict the LRU page to free a slot.
+  // Bounded loop: if eviction fails (e.g., everything was touched this
+  // frame -- shouldn't happen with reasonable visible set size), give
+  // up and return null.
+  if (_SVT.freeSlots.length === 0) {
+    if (!_svtEvictLRU()) return null;
+  }
   const slot = _SVT.freeSlots.pop();
   _SVT.residency.set(key, {
     slotX: slot.x,
@@ -62144,6 +62150,54 @@ function _svtWritePageTable(face, pageX, pageY, slotX, slotY) {
     { bytesPerRow: 4, rowsPerImage: 1 },
     [1, 1, 1]
   );
+}
+
+/* Mark a page table entry as unresident (PAGE_UNRESIDENT sentinel).
+ * Shader reads this and falls back to per-fragment procedural. */
+function _svtMarkUnresident(face, pageX, pageY) {
+  if (!_SVT.pageTableTexture || !Visual.device) return;
+  const buf = new Uint32Array([_SVT.PAGE_UNRESIDENT]);
+  Visual.device.queue.writeTexture(
+    {
+      texture: _SVT.pageTableTexture,
+      origin: { x: pageX, y: pageY, z: face },
+    },
+    buf,
+    { bytesPerRow: 4, rowsPerImage: 1 },
+    [1, 1, 1]
+  );
+}
+
+/* Sprint 10-5c-e: evict the oldest-touched resident page and return
+ * its freed slot. Skips pages touched within the last 2 frames (so
+ * we don't thrash pages that are still in the visible set this frame).
+ * Returns true if an eviction happened (slot pushed to freeSlots),
+ * false if no evictable page found (rare -- only if all 1024 slots
+ * have been touched in the last 2 frames, which means visible-page
+ * count exceeds atlas capacity).
+ *
+ * Cost: O(N) linear scan through residency Map. With N=1024 entries
+ * × maybe 10 evictions/frame = 10k iterations/frame -- fine. Future
+ * optimization: maintain a sorted-by-lastFrame structure if profile
+ * shows this is hot. */
+function _svtEvictLRU() {
+  let oldestKey = null;
+  let oldestFrame = Infinity;
+  const cutoffFrame = _SVT.frame - 1;   // skip pages touched in last 2 frames
+  for (const [key, res] of _SVT.residency) {
+    if (res.lastFrame >= cutoffFrame) continue;
+    if (res.lastFrame < oldestFrame) {
+      oldestFrame = res.lastFrame;
+      oldestKey = key;
+    }
+  }
+  if (!oldestKey) return false;
+  const evict = _SVT.residency.get(oldestKey);
+  _SVT.residency.delete(oldestKey);
+  _svtMarkUnresident(evict.face, evict.pageX, evict.pageY);
+  _SVT.freeSlots.push({ x: evict.slotX, y: evict.slotY });
+  _SVT.stats.pagesEvicted++;
+  return true;
 }
 
 /* Sprint 10-5c-b: generate the RGBA content for a single SVT page.
@@ -62321,14 +62375,13 @@ function _svtTickGeneration(pmap, budgetMs) {
     const existing = _SVT.residency.get(key);
     if (existing && existing.generated) continue;
     const ok = _svtUploadPage(item.face, item.pageX, item.pageY, pmap);
-    if (!ok && _SVT.freeSlots.length === 0) {
-      // Atlas full -- stop processing. Future pages won't get
-      // slots until 10-5c-e LRU lands. Drop the rest of the queue
-      // for this frame; next frame's visibility set will re-queue
-      // the still-needed ones (typically a smaller set than what
-      // we just emptied).
-      _SVT.generationQueue.length = 0;
-      _SVT.queueKeys.clear();
+    if (!ok) {
+      // _svtAllocateSlot returns null only if LRU eviction couldn't
+      // find a candidate (all 1024 slots touched this frame --
+      // means visible-page count exceeds atlas capacity). In that
+      // case bail this frame; next frame's visibility set will be
+      // smaller (we're paused, presumably) and eviction will find
+      // candidates.
       break;
     }
     processed++;
@@ -62340,7 +62393,8 @@ function _svtTickGeneration(pmap, budgetMs) {
     // log spam every frame.
     console.log("[svt] residency: " + _SVT.residency.size + "/" + _SVT.TOTAL_SLOTS
               + " slots, " + _SVT.generationQueue.length + " queued, "
-              + _SVT.stats.pagesGenerated + " generated total");
+              + _SVT.stats.pagesGenerated + " generated, "
+              + _SVT.stats.pagesEvicted + " evicted total");
   }
 }
 
