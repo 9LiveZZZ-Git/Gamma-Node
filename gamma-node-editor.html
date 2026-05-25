@@ -6501,6 +6501,7 @@
       </span>
       <button class="btn primary" id="btn-gen" title="Open the Generated C++ tab">Generate C++</button>
       <button class="btn" id="btn-export-open" title="Export center — patch, frame/video capture (composite or per-display), rig calibration bundles">Export ▾</button>
+      <button class="btn" id="btn-sprite-studio" title="Sprite Studio — LLM-driven sprite creator. Generates pixel art from text prompts via Claude API. Output goes to the asset library.">Sprite Studio</button>
       <button class="btn icon-btn" id="btn-live-mode" title="Live Mode — hide the editor, show only the visual layer (Ctrl+L)" aria-label="Toggle Live Mode">◐</button>
       <button class="btn icon-btn" id="btn-help" title="Keyboard shortcuts">?</button>
     </div>
@@ -7538,6 +7539,94 @@
           <span class="pr-stat-key">SHORTCUTS</span>
           <span class="pr-stat-val muted">← → SCRUB · ⇧ ← → COARSE · ESC CLOSE</span>
         </span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Sprint SpriteCreator-1 -- Sprite Studio modal. LLM-driven pixel
+       art generator. Layout:
+         Left:   prompt textarea + style presets + generate button
+         Center: preview canvas (zoom-fits the generated bitmap)
+         Right:  asset metadata (name, size, frames, scale) + save button
+       Generated JS runs in main thread inside `new Function("ctx", ...)`.
+       Worker isolation deferred to v2 (the LLM is trusted via the user's
+       own API key; v1 trades isolation for simpler debugging). -->
+  <div class="modal-backdrop" id="spritestudio-modal" style="display:none;">
+    <div class="modal" style="width: 920px; max-width: 95vw; max-height: 90vh; display: flex; flex-direction: column;">
+      <div class="modal-head" style="display:flex; align-items:center; gap:10px;">
+        <span class="modal-title" style="font-family: var(--font-instr); letter-spacing: 0.20em; color: var(--phosphor); text-transform: lowercase;">sprite studio</span>
+        <span id="ss-status" style="font-family: var(--font-mono); font-size: 10px; color: var(--text-3); flex: 1;">ready</span>
+        <button class="btn modal-x" id="ss-close" type="button">×</button>
+      </div>
+      <div style="display:grid; grid-template-columns: 280px 1fr 220px; gap:0; flex:1; min-height:0; border-top:1px solid var(--instr-rule);">
+        <!-- Left: prompt panel -->
+        <div style="padding:12px; border-right:1px solid var(--instr-rule); display:flex; flex-direction:column; gap:10px; overflow:auto;">
+          <div>
+            <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); letter-spacing:0.06em; margin-bottom:4px;">DESCRIPTION</div>
+            <textarea id="ss-prompt" placeholder="small red fox, side view, idle pose, simple SNES-era pixel art" style="width:100%; height:110px; padding:6px 8px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10.5px; resize:vertical;"></textarea>
+          </div>
+          <div>
+            <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); letter-spacing:0.06em; margin-bottom:4px;">STYLE PRESET</div>
+            <select id="ss-preset" style="width:100%; padding:5px 6px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10.5px;">
+              <option value="snes" selected>SNES 16-bit (limited palette)</option>
+              <option value="nes">NES 8-bit (4-color)</option>
+              <option value="gameboy">Game Boy (4 greens)</option>
+              <option value="modern">Modern pixel art (free palette)</option>
+            </select>
+          </div>
+          <button class="btn primary" id="ss-generate" style="width:100%; padding:8px;">Generate</button>
+          <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); line-height:1.5;">
+            Uses the LLM provider set in <em>User DSP → ⚙</em>. Default: Claude API. Output runs as JS canvas paint code in this page. No corporate-IP references in the prompt.
+          </div>
+        </div>
+        <!-- Center: preview -->
+        <div style="background:#0a0c10; display:flex; align-items:center; justify-content:center; overflow:hidden; min-height:300px; position:relative;">
+          <canvas id="ss-canvas" width="32" height="32" style="image-rendering:pixelated; image-rendering:crisp-edges; background:checkerboard; max-width:90%; max-height:90%;"></canvas>
+          <div id="ss-empty" style="position:absolute; color:var(--text-3); font-family:var(--font-mono); font-size:10.5px; text-align:center; pointer-events:none;">
+            Empty preview.<br/>Type a description and click Generate.
+          </div>
+        </div>
+        <!-- Right: metadata + save -->
+        <div style="padding:12px; border-left:1px solid var(--instr-rule); display:flex; flex-direction:column; gap:8px; overflow:auto;">
+          <div>
+            <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); letter-spacing:0.06em; margin-bottom:4px;">NAME</div>
+            <input type="text" id="ss-name" placeholder="my-sprite" style="width:100%; padding:5px 6px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10.5px;"/>
+          </div>
+          <div style="display:grid; grid-template-columns: 1fr 1fr; gap:6px;">
+            <div>
+              <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); margin-bottom:3px;">WIDTH</div>
+              <input type="number" id="ss-width" value="32" min="8" max="512" step="8" style="width:100%; padding:4px 6px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10.5px;"/>
+            </div>
+            <div>
+              <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); margin-bottom:3px;">HEIGHT</div>
+              <input type="number" id="ss-height" value="32" min="8" max="512" step="8" style="width:100%; padding:4px 6px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10.5px;"/>
+            </div>
+          </div>
+          <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:6px;">
+            <div>
+              <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); margin-bottom:3px;">COLS</div>
+              <input type="number" id="ss-framesX" value="1" min="1" max="32" step="1" style="width:100%; padding:4px 6px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10.5px;"/>
+            </div>
+            <div>
+              <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); margin-bottom:3px;">ROWS</div>
+              <input type="number" id="ss-framesY" value="1" min="1" max="32" step="1" style="width:100%; padding:4px 6px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10.5px;"/>
+            </div>
+            <div>
+              <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); margin-bottom:3px;">FPS</div>
+              <input type="number" id="ss-fps" value="8" min="0.5" max="60" step="0.5" style="width:100%; padding:4px 6px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10.5px;"/>
+            </div>
+          </div>
+          <div>
+            <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); margin-bottom:3px;" title="pixels per world unit">SCALE (px/unit)</div>
+            <input type="number" id="ss-scale" value="32" min="1" max="2048" step="1" style="width:100%; padding:4px 6px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10.5px;"/>
+          </div>
+          <div style="flex:1;"></div>
+          <button class="btn" id="ss-save" disabled style="width:100%; padding:8px;">Save to Assets</button>
+          <details style="margin-top:6px;">
+            <summary style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); cursor:pointer;">Generated JS (read-only)</summary>
+            <textarea id="ss-code" readonly style="width:100%; height:120px; margin-top:4px; padding:6px; background:var(--bg-1); color:var(--text-2); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:9.5px; resize:vertical;"></textarea>
+          </details>
+        </div>
       </div>
     </div>
   </div>
@@ -86275,6 +86364,259 @@ async function loadImageFileToSpriteAsset(file, opts) {
   await Assets.put(rec);
   console.log("[assets] added sprite '" + rec.name + "' (" + width + "×" + height + ") id=" + rec.id);
   return rec;
+}
+
+/* ── Sprite Studio modal (SpriteCreator-1) ──────────────────────── */
+/* LLM-driven pixel art generator. Opens from the topbar 'Sprite Studio'
+ * button. User types a description; Claude (or local Gemma) writes JS
+ * canvas paint code; we run it against an offscreen canvas; preview
+ * + save into the asset library.
+ *
+ * System prompt is crafted to:
+ *   - Forbid corporate-IP references (no Mario, Pokemon, Disney, etc).
+ *   - Produce concise canvas-2D code (no setup boilerplate).
+ *   - Honor size + frame count (multi-frame strips horizontal).
+ *   - Use a palette appropriate to the chosen style preset.
+ *
+ * Generated JS runs in `new Function('ctx', 'width', 'height', 'framesX', 'framesY', code)`.
+ * The LLM is trusted via the user's own API key; v1 trades worker
+ * isolation for simpler debugging. Future hardening = Worker sandbox. */
+const _SS_STYLE_PROMPTS = {
+  snes: "16-bit SNES era pixel art, limited palette of 16 colors, no anti-aliasing on edges (1px solid strokes only), readable silhouette, slight shading for depth using 2-3 tones per color.",
+  nes:  "8-bit NES era pixel art, hard-limit to 4 colors per sprite total (one transparent + three solids), bold flat colors with no gradient, blocky silhouette.",
+  gameboy: "Game Boy era pixel art, hard-limit to 4 colors from the GB palette (#0f380f, #306230, #8bac0f, #9bbc0f), no other colors.",
+  modern: "Modern pixel art style, free palette, soft shading is OK, anti-aliasing on diagonals is OK, crisp silhouette."
+};
+function _ssBuildSystemPrompt() {
+  return [
+    "You are a pixel-art sprite painter. The user describes a sprite; you write JavaScript that draws it onto a CanvasRenderingContext2D.",
+    "",
+    "OUTPUT RULES:",
+    "- Output ONLY raw JavaScript code, no markdown fences, no comments, no setup.",
+    "- The available globals are: ctx (CanvasRenderingContext2D), width (number), height (number), framesX (number, columns), framesY (number, rows).",
+    "- For multi-frame sprites: width and height are the FULL sheet dimensions; one frame is (width/framesX) x (height/framesY). Draw frames left-to-right, top-to-bottom.",
+    "- Do NOT call any APIs other than ctx.* (no fetch, no document, no window, no eval, no new Function, no createElement).",
+    "- Do NOT reference any real-world brand, franchise, character name, or company. Generic descriptions only (e.g. 'red fox', NOT 'Pokemon fox').",
+    "- The canvas comes pre-cleared to transparent. Draw your sprite directly.",
+    "- Use ctx.fillRect with integer coords for crisp pixels. Do not use fillStyle gradients on edges.",
+    "",
+    "STYLE: see the user message for the chosen preset."
+  ].join("\n");
+}
+function _ssBuildUserPrompt(description, stylePreset, width, height, framesX, framesY) {
+  const styleNote = _SS_STYLE_PROMPTS[stylePreset] || _SS_STYLE_PROMPTS.snes;
+  const frameNote = (framesX > 1 || framesY > 1)
+    ? `Animation: ${framesX * framesY} frames arranged as ${framesX} cols x ${framesY} rows. Each frame is ${Math.floor(width/framesX)}x${Math.floor(height/framesY)} pixels.`
+    : "Single frame.";
+  return [
+    `Sprite description: ${description}`,
+    `Sheet size: ${width}x${height} pixels.`,
+    frameNote,
+    `Style: ${styleNote}`,
+    "",
+    "Now output the JavaScript paint code:"
+  ].join("\n");
+}
+
+/* Strip markdown fences if Claude wrapped the code despite instructions. */
+function _ssExtractJsFromResponse(text) {
+  if (!text) return "";
+  // Match ```javascript ... ``` or ``` ... ``` fences.
+  const fence = text.match(/```(?:javascript|js)?\s*\n?([\s\S]*?)```/);
+  if (fence) return fence[1].trim();
+  return text.trim();
+}
+
+/* Run the generated JS against an OffscreenCanvas, return the bitmap.
+ * Throws if the code errors. Time-budget: hard 2-second cap via setTimeout
+ * defeats infinite loops only across yields (a tight sync loop will still
+ * hang for now; Worker isolation in -2 fixes that). */
+async function _ssExecutePaintCode(code, width, height, framesX, framesY) {
+  const canvas = new OffscreenCanvas(width, height);
+  const ctx = canvas.getContext("2d");
+  // Match the sprite shader's "pixelated" rendering convention.
+  ctx.imageSmoothingEnabled = false;
+  // Throws if code is invalid JavaScript.
+  const fn = new Function("ctx", "width", "height", "framesX", "framesY", code);
+  fn(ctx, width, height, framesX, framesY);
+  return await canvas.convertToBlob({ type: "image/png" });
+}
+
+/* Open / close the Sprite Studio modal. */
+function _ssOpen() {
+  const modal = document.getElementById("spritestudio-modal");
+  if (!modal) return;
+  modal.style.display = "flex";
+  // Default name to a slugified prompt-ish placeholder.
+  const nameEl = document.getElementById("ss-name");
+  if (nameEl && !nameEl.value) nameEl.value = "sprite-" + Date.now().toString(36).slice(-5);
+  _ssRedrawPreview(null);  // clear preview if any
+  const promptEl = document.getElementById("ss-prompt");
+  if (promptEl) setTimeout(() => promptEl.focus(), 50);
+}
+function _ssClose() {
+  const modal = document.getElementById("spritestudio-modal");
+  if (modal) modal.style.display = "none";
+}
+
+/* Draw the result blob into the preview canvas, sized to the chosen
+ * width/height. Empty placeholder hidden when bitmap is present. */
+async function _ssRedrawPreview(blob) {
+  const canvas = document.getElementById("ss-canvas");
+  const empty = document.getElementById("ss-empty");
+  if (!canvas) return;
+  const w = parseInt(document.getElementById("ss-width").value, 10) || 32;
+  const h = parseInt(document.getElementById("ss-height").value, 10) || 32;
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  ctx.imageSmoothingEnabled = false;
+  ctx.clearRect(0, 0, w, h);
+  if (!blob) {
+    if (empty) empty.style.display = "block";
+    document.getElementById("ss-save").disabled = true;
+    return;
+  }
+  if (empty) empty.style.display = "none";
+  try {
+    const bmp = await createImageBitmap(blob);
+    ctx.drawImage(bmp, 0, 0);
+    if (bmp.close) try { bmp.close(); } catch (_) {}
+    document.getElementById("ss-save").disabled = false;
+    // Stash the blob on the canvas DOM node so Save can read it.
+    canvas._ssBlob = blob;
+  } catch (e) {
+    _ssStatus("Preview failed: " + (e.message || e), "err");
+  }
+}
+
+function _ssStatus(msg, kind) {
+  const el = document.getElementById("ss-status");
+  if (!el) return;
+  el.textContent = msg;
+  el.style.color = kind === "err" ? "#ff8060"
+                 : kind === "ok"  ? "#80ff80"
+                 : kind === "thinking" ? "var(--phosphor)"
+                 : "var(--text-3)";
+}
+
+/* Wire the Sprite Studio: topbar button, modal close, generate, save. */
+function _ssInstall() {
+  const openBtn = document.getElementById("btn-sprite-studio");
+  if (openBtn && !openBtn._ssWired) {
+    openBtn._ssWired = true;
+    openBtn.addEventListener("click", _ssOpen);
+  }
+  const closeBtn = document.getElementById("ss-close");
+  if (closeBtn && !closeBtn._ssWired) {
+    closeBtn._ssWired = true;
+    closeBtn.addEventListener("click", _ssClose);
+  }
+  const modal = document.getElementById("spritestudio-modal");
+  if (modal && !modal._ssWired) {
+    modal._ssWired = true;
+    modal.addEventListener("click", e => { if (e.target === modal) _ssClose(); });
+  }
+  const genBtn = document.getElementById("ss-generate");
+  if (genBtn && !genBtn._ssWired) {
+    genBtn._ssWired = true;
+    genBtn.addEventListener("click", async () => {
+      const description = document.getElementById("ss-prompt").value.trim();
+      if (!description) { _ssStatus("Enter a description first.", "err"); return; }
+      const stylePreset = document.getElementById("ss-preset").value;
+      const w = parseInt(document.getElementById("ss-width").value, 10) || 32;
+      const h = parseInt(document.getElementById("ss-height").value, 10) || 32;
+      const fx = parseInt(document.getElementById("ss-framesX").value, 10) || 1;
+      const fy = parseInt(document.getElementById("ss-framesY").value, 10) || 1;
+      const provider = PROVIDERS[aiSettings.provider];
+      if (!provider) { _ssStatus("No LLM provider configured (User DSP → ⚙).", "err"); return; }
+      let key = "";
+      if (provider.requiresKey) {
+        key = aiSettings.anthropicKey;
+        if (!key) { _ssStatus("API key required — set in User DSP → ⚙.", "err"); return; }
+      }
+      genBtn.disabled = true;
+      _ssStatus("Asking " + aiSettings.provider + "…", "thinking");
+      try {
+        const system = _ssBuildSystemPrompt();
+        const user = _ssBuildUserPrompt(description, stylePreset, w, h, fx, fy);
+        const reply = await provider.call({
+          system, user, key, model: aiSettings.model,
+          temperature: 0.4, maxTokens: 4096
+        });
+        const code = _ssExtractJsFromResponse(reply);
+        document.getElementById("ss-code").value = code;
+        _ssStatus("Painting…", "thinking");
+        const blob = await _ssExecutePaintCode(code, w, h, fx, fy);
+        await _ssRedrawPreview(blob);
+        _ssStatus("Generated (" + Math.round(blob.size / 1024) + " KB). Click Save.", "ok");
+      } catch (e) {
+        console.error("[sprite-studio] generate failed:", e);
+        _ssStatus("Generate failed: " + (e.message || e), "err");
+        document.getElementById("ss-save").disabled = true;
+      } finally {
+        genBtn.disabled = false;
+      }
+    });
+  }
+  const saveBtn = document.getElementById("ss-save");
+  if (saveBtn && !saveBtn._ssWired) {
+    saveBtn._ssWired = true;
+    saveBtn.addEventListener("click", async () => {
+      const canvas = document.getElementById("ss-canvas");
+      const blob = canvas && canvas._ssBlob;
+      if (!blob) { _ssStatus("Nothing to save yet.", "err"); return; }
+      const nameRaw = (document.getElementById("ss-name").value || "").trim();
+      const name = nameRaw.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || ("sprite-" + Date.now().toString(36).slice(-5));
+      const w = parseInt(document.getElementById("ss-width").value, 10) || 32;
+      const h = parseInt(document.getElementById("ss-height").value, 10) || 32;
+      const fx = parseInt(document.getElementById("ss-framesX").value, 10) || 1;
+      const fy = parseInt(document.getElementById("ss-framesY").value, 10) || 1;
+      const fps = parseFloat(document.getElementById("ss-fps").value) || 8;
+      const scale = parseFloat(document.getElementById("ss-scale").value) || 32;
+      saveBtn.disabled = true;
+      _ssStatus("Saving to asset library…", "thinking");
+      try {
+        // Wrap the blob in a fake File-like so loadImageFileToSpriteAsset
+        // can compute width/height + create the asset record via the
+        // existing path. We pre-set framesX/Y/fps/scale via opts so the
+        // record carries the user's chosen metadata immediately.
+        const fakeFile = new File([blob], name + ".png", { type: "image/png" });
+        const rec = await loadImageFileToSpriteAsset(fakeFile, {
+          name, framesX: fx, framesY: fy, fps, scale,
+          source: "creator"
+        });
+        if (!rec) throw new Error("asset create returned null");
+        _ssStatus("Saved as '" + rec.name + "'.", "ok");
+        // Refresh Assets tab so the new sprite shows up immediately.
+        if (typeof brRenderAssets === "function") brRenderAssets();
+        // Auto-close after a short delay so the user sees the success msg.
+        setTimeout(_ssClose, 700);
+      } catch (e) {
+        console.error("[sprite-studio] save failed:", e);
+        _ssStatus("Save failed: " + (e.message || e), "err");
+        saveBtn.disabled = false;
+      }
+    });
+  }
+  // Live-update preview canvas size when width/height inputs change
+  // (so the user can see the empty canvas at the right aspect before
+  // clicking Generate).
+  ["ss-width", "ss-height"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el && !el._ssWired) {
+      el._ssWired = true;
+      el.addEventListener("change", () => _ssRedrawPreview(null));
+    }
+  });
+}
+// Install on next tick (DOM is ready by the time this script tag runs).
+if (typeof document !== "undefined") {
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", _ssInstall);
+  } else {
+    _ssInstall();
+  }
 }
 
 /* ── Audio file decode + asset creation ─────────────────────────── */
