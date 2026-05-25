@@ -36319,6 +36319,63 @@ const _demos = [
     }
   },
 
+  /* Sprint plat-2a-render -- Sprite Texture Test. Smallest possible
+   * patch that exercises the sprite pipeline end-to-end: ImageURL
+   * with the preset:test4x4 built-in (64×64, 2×2 colored quadrants)
+   * → Sprite (texture wired) → Translate (z=-1 to sit in front of
+   * any background) → Scene2D + OrthoCamera2D → VisualOutput.
+   *
+   * Expected output: a single quad showing a 2×2 grid of colored
+   * blocks. UV orientation is correct when:
+   *   - top-left of sprite      = RED
+   *   - top-right of sprite     = GREEN
+   *   - bottom-left of sprite   = BLUE
+   *   - bottom-right of sprite  = YELLOW
+   * (Matches the preset's drawn pattern; the shader's V-flip lines
+   *  up the image's top with the sprite's top in screen space.) */
+  {
+    id: "sprite-texture-test",
+    name: "Sprite Texture Test",
+    sub: "test4x4 → Sprite → Scene2D",
+    type: "visual",
+    thumb: `<svg viewBox="0 0 100 44">
+      <rect width="100" height="44" fill="rgba(10,18,34,0.85)"/>
+      <g>
+        <rect x="34" y="6"  width="16" height="16" fill="rgb(255,48,48)"/>
+        <rect x="50" y="6"  width="16" height="16" fill="rgb(48,255,48)"/>
+        <rect x="34" y="22" width="16" height="16" fill="rgb(48,96,255)"/>
+        <rect x="50" y="22" width="16" height="16" fill="rgb(255,255,48)"/>
+      </g>
+    </svg>`,
+    build: () => {
+      const img = makeNode("ImageURL", 40, 60, {
+        url: "preset:test4x4",
+        filterMode: "nearest"
+      });
+      const spr = makeNode("Sprite", 240, 60, {
+        width: 3, height: 3,
+        anchorX: 0.5, anchorY: 0.5,
+        framesX: 1, framesY: 1, frame: 0,
+        tintR: 1, tintG: 1, tintB: 1, tintA: 1
+      });
+      state.edges.push({ from: { node: img, port: "texture" }, to: { node: spr, port: "texture" } });
+      const t = makeNode("Translate", 440, 60, { x: 0, y: 0, z: -1 });
+      state.edges.push({ from: { node: spr, port: "mesh" }, to: { node: t, port: "mesh" } });
+      const cam = makeNode("OrthoCamera2D", 240, 240, {
+        posX: 0, posY: 0,
+        orthoSize: 3,
+        pixelSnap: 0
+      });
+      const scene = makeNode("Scene2D", 640, 60, {
+        clearR: 0.08, clearG: 0.10, clearB: 0.16
+      });
+      state.edges.push({ from: { node: t,    port: "mesh"   }, to: { node: scene, port: "mesh1"  } });
+      state.edges.push({ from: { node: cam,  port: "camera" }, to: { node: scene, port: "camera" } });
+      const vo = makeNode("VisualOutput", 860, 60, { display: 0 });
+      state.edges.push({ from: { node: scene, port: "out" }, to: { node: vo, port: "in" } });
+    }
+  },
+
   /* Sprint platformer-1 -- Platformer 2D demo. A single-screen
    * platformer wired entirely from nodes:
    *   KeyAxis2D       -- WASD + Space
@@ -45924,6 +45981,19 @@ const Visual = {
   // width, height, error?: string }. Shared across ImageURL nodes so
   // multiple nodes with the same URL upload only once.
   imageTextures: new Map(),
+
+  // Sprint plat-2a-render -- sprite pipeline infrastructure. Separate
+  // from the mesh path (mesh BGL has 16 bindings; sprite uses 3) so
+  // textured 2D sprites don't drag along all the planet / IBL / SVT
+  // bindings they don't need.
+  spriteBindGroupLayout: null,    // 3 entries: drawU, texture, sampler
+  spritePipelineLayout:  null,
+  spriteShaderModule:    null,
+  spritePipelineCache:   new Map(),  // key = sampleCount; value = GPURenderPipeline
+  spriteSamplers:        new Map(),  // key = filterMode ("nearest"/"linear")
+  // Per-sprite-node draw state. Map<nodeId, {uniformBuffer, bindGroup,
+  // boundTextureView, boundSampler, scratch: Float32Array(24)}>.
+  spriteInstances: new Map(),
 
   // Sprint 7.5.3a -- 3D rendering state.
   // depthTexture covers (fbWidth, fbHeight) at depth32float; shared
@@ -59135,6 +59205,253 @@ function _ensureMeshPipeline(materialType, sampleCount, displaced, vsVariant) {
   return pipeline;
 }
 
+/* Sprint plat-2a-render -- sprite WGSL. Reuses the standard 11-float
+ * vertex layout (pos3 + color3 + normal3 + uv2) so existing Sprite
+ * meshes work unchanged; only the shader and bind-group layout change.
+ *
+ * The vertex shader composes modelViewProj from the per-draw uniform
+ * and remaps the quad's [0,1] UV into the sub-rect for the current
+ * frame in a spritesheet. flipX mirrors U for left-facing animations.
+ *
+ * The fragment shader samples the bound sprite texture, multiplies by
+ * the per-draw tint, and outputs premultiplied alpha to match Scene's
+ * blend state (srcFactor=ONE, dstFactor=ONE_MINUS_SRC_ALPHA).
+ *
+ * UV convention: the Sprite mesh builder emits UVs with (0,0) at the
+ * BOTTOM-LEFT corner (consistent with the vertex order). Textures
+ * have (0,0) at the TOP-LEFT (standard image convention). The shader
+ * flips V (v_tex = 1 - v_mesh) so the visible sprite shows the image
+ * right-side-up in screen space. */
+const _SPRITE_WGSL = `
+struct DrawU {
+  modelViewProj: mat4x4<f32>,
+  tint:          vec4<f32>,        // multiply through after texture sample
+  frameMeta:     vec4<f32>,        // .x = frame, .y = framesX, .z = framesY, .w = flipX
+};
+
+@group(0) @binding(0) var<uniform> draw: DrawU;
+@group(0) @binding(1) var spriteTex: texture_2d<f32>;
+@group(0) @binding(2) var spriteSampler: sampler;
+
+struct VsOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) uv: vec2<f32>,
+  @location(1) tint: vec4<f32>,
+};
+
+@vertex
+fn vs_sprite(
+  @location(0) inPos: vec3<f32>,
+  @location(1) inColor: vec3<f32>,
+  @location(2) inNormal: vec3<f32>,
+  @location(3) inUV: vec2<f32>,
+) -> VsOut {
+  var out: VsOut;
+  out.pos = draw.modelViewProj * vec4<f32>(inPos, 1.0);
+
+  let fx = max(draw.frameMeta.y, 1.0);
+  let fy = max(draw.frameMeta.z, 1.0);
+  let totalFrames = fx * fy;
+  let frame = clamp(draw.frameMeta.x, 0.0, totalFrames - 1.0);
+  let frameCol = floor(frame - floor(frame / fx) * fx);  // = frame % fx
+  let frameRow = floor(frame / fx);
+  let cellW = 1.0 / fx;
+  let cellH = 1.0 / fy;
+
+  // Sprite mesh UV: (0,0) bottom-left, (1,1) top-right.
+  // Texture UV: (0,0) top-left. Flip V here so the bottom-left of the
+  // SPRITE shows the bottom-left of the IMAGE (intuitive for level art).
+  var u = inUV.x;
+  let v = 1.0 - inUV.y;
+  if (draw.frameMeta.w >= 0.5) { u = 1.0 - u; }
+  out.uv = vec2<f32>(
+    (frameCol + u) * cellW,
+    (frameRow + v) * cellH
+  );
+  // Per-vertex color (from Sprite's tintR/G/B at build time) AND the
+  // per-draw tint compose together. Both default to white so the
+  // user can choose either path (build-time or animated).
+  out.tint = vec4<f32>(inColor, 1.0) * draw.tint;
+  return out;
+}
+
+@fragment
+fn fs_sprite(in: VsOut) -> @location(0) vec4<f32> {
+  let texColor = textureSample(spriteTex, spriteSampler, in.uv);
+  let result = texColor * in.tint;
+  // Premultiplied alpha output (matches mesh-pipeline blend state).
+  return vec4<f32>(result.rgb * result.a, result.a);
+}
+`;
+
+function _ensureSpriteBindGroupLayout() {
+  if (Visual.spriteBindGroupLayout) return Visual.spriteBindGroupLayout;
+  if (!Visual.device) return null;
+  Visual.spriteBindGroupLayout = Visual.device.createBindGroupLayout({
+    label: "sprite-bgl",
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+      { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d", multisampled: false } },
+      { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } }
+    ]
+  });
+  Visual.spritePipelineLayout = Visual.device.createPipelineLayout({
+    label: "sprite-pl",
+    bindGroupLayouts: [Visual.spriteBindGroupLayout]
+  });
+  return Visual.spriteBindGroupLayout;
+}
+
+function _ensureSpriteShaderModule() {
+  if (Visual.spriteShaderModule) return Visual.spriteShaderModule;
+  if (!Visual.device) return null;
+  let mod;
+  try {
+    mod = Visual.device.createShaderModule({ label: "sprite-shader", code: _SPRITE_WGSL });
+  } catch (e) {
+    console.warn("[sprite] shader compile failed:", e);
+    return null;
+  }
+  Visual.spriteShaderModule = mod;
+  mod.getCompilationInfo().then(info => {
+    const errs = info.messages.filter(m => m.type === "error");
+    if (errs.length) {
+      console.error("[sprite] shader WGSL errors:");
+      for (const m of errs) {
+        console.error("  line " + m.lineNum + " col " + m.linePos + ": " + m.message);
+      }
+    }
+  });
+  return mod;
+}
+
+function _ensureSpritePipeline(sampleCount) {
+  const key = sampleCount;
+  if (Visual.spritePipelineCache.has(key)) {
+    return Visual.spritePipelineCache.get(key);
+  }
+  if (!Visual.device) return null;
+  if (!_ensureSpriteBindGroupLayout()) return null;
+  const module = _ensureSpriteShaderModule();
+  if (!module) return null;
+  let pipeline;
+  try {
+    pipeline = Visual.device.createRenderPipeline({
+      label: "sprite-pipeline-" + sampleCount + "x",
+      layout: Visual.spritePipelineLayout,
+      vertex: {
+        module,
+        entryPoint: "vs_sprite",
+        buffers: [{
+          arrayStride: 11 * 4,
+          attributes: [
+            { shaderLocation: 0, offset: 0,     format: "float32x3" },  // position
+            { shaderLocation: 1, offset: 3 * 4, format: "float32x3" },  // color
+            { shaderLocation: 2, offset: 6 * 4, format: "float32x3" },  // normal (unused)
+            { shaderLocation: 3, offset: 9 * 4, format: "float32x2" }   // uv
+          ]
+        }]
+      },
+      fragment: {
+        module,
+        entryPoint: "fs_sprite",
+        targets: [{
+          format: Visual.fbFormat,
+          blend: {
+            color: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+            alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" }
+          }
+        }]
+      },
+      primitive: {
+        topology: "triangle-list",
+        cullMode: "none",
+        frontFace: "ccw"
+      },
+      depthStencil: {
+        format: "depth32float",
+        // Reverse-Z compare matches the mesh pipeline so sprites
+        // composite correctly with 3D meshes in the same scene.
+        depthCompare: "greater",
+        depthWriteEnabled: true
+      },
+      multisample: { count: sampleCount }
+    });
+  } catch (e) {
+    console.warn("[sprite] pipeline " + sampleCount + "x failed:", e);
+    return null;
+  }
+  Visual.spritePipelineCache.set(key, pipeline);
+  if (!Visual._spriteFirstPipelineLogged) {
+    Visual._spriteFirstPipelineLogged = true;
+    console.log("[sprite] first pipeline built (sampleCount=" + sampleCount + "x, fbFormat=" + Visual.fbFormat + ")");
+  }
+  return pipeline;
+}
+
+/* Return (or create) a cached GPUSampler for the given filter mode.
+ * Sprites with `filterMode: "nearest"` get crisp pixel-art edges;
+ * "linear" gets bilinear-filtered smooth sampling. Both clamp at
+ * the texture edge (sprite UV is always 0..cellW × 0..cellH, never
+ * sampled outside its frame's sub-rect). */
+function _ensureSpriteSampler(filterMode) {
+  const key = (filterMode === "linear") ? "linear" : "nearest";
+  if (Visual.spriteSamplers.has(key)) return Visual.spriteSamplers.get(key);
+  if (!Visual.device) return null;
+  const sampler = Visual.device.createSampler({
+    label: "sprite-sampler-" + key,
+    magFilter: key,
+    minFilter: key,
+    mipmapFilter: key,
+    addressModeU: "clamp-to-edge",
+    addressModeV: "clamp-to-edge"
+  });
+  Visual.spriteSamplers.set(key, sampler);
+  return sampler;
+}
+
+/* Per-sprite-node draw-state allocator. Creates the uniform buffer +
+ * bind group ONCE per sprite node, then updates the bind group only
+ * when the bound texture view (or sampler filter mode) changes. The
+ * uniform is rewritten every frame from `scratch` via writeBuffer. */
+function _ensureSpriteInstance(spriteNode, textureView, sampler) {
+  if (!Visual.device) return null;
+  let inst = Visual.spriteInstances.get(spriteNode.id);
+  if (!inst) {
+    const uniformBuffer = Visual.device.createBuffer({
+      label: "sprite-draw-uniform-" + spriteNode.id,
+      // 24 floats × 4 bytes = 96 bytes; round up to 256 for safety
+      // (some implementations want larger min uniform size).
+      size: 256,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+    inst = {
+      uniformBuffer,
+      bindGroup: null,
+      boundTextureView: null,
+      boundSampler: null,
+      scratch: new Float32Array(24)
+    };
+    Visual.spriteInstances.set(spriteNode.id, inst);
+  }
+  // Rebuild bind group when texture view or sampler swaps (e.g., the
+  // ImageURL finishes loading, or the user changes filterMode).
+  if (inst.boundTextureView !== textureView || inst.boundSampler !== sampler) {
+    inst.bindGroup = Visual.device.createBindGroup({
+      label: "sprite-bg-" + spriteNode.id,
+      layout: Visual.spriteBindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: inst.uniformBuffer } },
+        { binding: 1, resource: textureView },
+        { binding: 2, resource: sampler }
+      ]
+    });
+    inst.boundTextureView = textureView;
+    inst.boundSampler = sampler;
+  }
+  return inst;
+}
+
 /* Sprint 7.5.4.c-sky -- background sky pipeline. Shares the same
  * pipeline layout as mesh pipelines (binding 0 = perScene) but
  * uses a different vertex / fragment entry pair (vs_sky / fs_sky)
@@ -70273,6 +70590,73 @@ function _encodeScenePass(enc, entry) {
         culledCount++;
         continue;
       }
+    }
+    // Sprint plat-2a-render -- textured-sprite dispatch. Sprites with
+    // a wired (and loaded) ImageURL on their `texture` input render
+    // through the dedicated sprite pipeline (3-binding BGL: drawU,
+    // texture, sampler). After the draw, curMaterialType is cleared
+    // so the next mesh in the loop re-sets its own pipeline state.
+    if (m.node && m.node.type === "Sprite" && buf && buf.vertexBuffer) {
+      const texEntry = (typeof _resolveSpriteTextureEntry === "function")
+        ? _resolveSpriteTextureEntry(m.node) : null;
+      if (texEntry && texEntry.state === "ready" && texEntry.view) {
+        const spritePipeline = _ensureSpritePipeline(sampleCount);
+        if (spritePipeline) {
+          const sp = _resolveNodeParams(m.node);
+          // Sampler filter follows the upstream ImageURL's filterMode
+          // (default nearest = pixel-art crisp).
+          let filterMode = "nearest";
+          const texWire = state && Array.isArray(state.edges) && state.edges.find(e =>
+            e && e.to && e.to.node === m.node.id && e.to.port === "texture"
+          );
+          if (texWire && texWire.from) {
+            const imgNode = state.nodes.find(n => n && n.id === texWire.from.node);
+            if (imgNode && imgNode.params && typeof imgNode.params.filterMode === "string") {
+              filterMode = imgNode.params.filterMode;
+            }
+          }
+          const sampler = _ensureSpriteSampler(filterMode);
+          const inst = _ensureSpriteInstance(m.node, texEntry.view, sampler);
+          if (inst) {
+            // Pack uniform: modelViewProj (16) + tint (4) + frameMeta (4) = 24 floats.
+            const mvp = inst.scratch;
+            // viewProj * model -- model is m.transform (Translate-chain composed).
+            const tmp = new Float32Array(16);
+            _mat4Multiply(tmp, camera.viewProj, m.transform || _mat4Identity());
+            for (let k = 0; k < 16; k++) mvp[k] = tmp[k];
+            mvp[16] = (typeof sp.tintR === "number") ? sp.tintR : 1.0;
+            mvp[17] = (typeof sp.tintG === "number") ? sp.tintG : 1.0;
+            mvp[18] = (typeof sp.tintB === "number") ? sp.tintB : 1.0;
+            mvp[19] = (typeof sp.tintA === "number") ? sp.tintA : 1.0;
+            mvp[20] = (typeof sp.frame   === "number") ? Math.floor(sp.frame)   : 0;
+            mvp[21] = (typeof sp.framesX === "number") ? Math.max(1, Math.floor(sp.framesX)) : 1;
+            mvp[22] = (typeof sp.framesY === "number") ? Math.max(1, Math.floor(sp.framesY)) : 1;
+            mvp[23] = (typeof sp.flipX   === "number" && sp.flipX >= 0.5) ? 1.0 : 0.0;
+            Visual.device.queue.writeBuffer(inst.uniformBuffer, 0, mvp.buffer, 0, 24 * 4);
+            pass.setPipeline(spritePipeline);
+            pass.setBindGroup(0, inst.bindGroup);
+            pass.setVertexBuffer(0, buf.vertexBuffer);
+            if (buf.indexBuffer) {
+              pass.setIndexBuffer(buf.indexBuffer, "uint32");
+              pass.drawIndexed(buf.indexCount);
+            } else {
+              pass.draw(buf.vertexCount);
+            }
+            curMaterialType = null;  // next mesh must re-set the mesh pipeline + bind group
+            if (!Visual._spriteFirstDrawLogged) {
+              Visual._spriteFirstDrawLogged = true;
+              console.log("[sprite] first textured draw: node=" + m.node.id
+                + " tex=" + texEntry.width + "×" + texEntry.height
+                + " filter=" + filterMode
+                + " frame=" + mvp[20] + "/" + (mvp[21] * mvp[22]));
+            }
+            continue;
+          }
+        }
+      }
+      // Sprite without a loaded texture falls through to the standard
+      // unlit-vc path (solid-color from vertex tint). Same behavior as
+      // before platformer-2a so unwired sprites keep working.
     }
     // §5.5.h -- Water node bakes its own material; override matType
     // so fs_water fires regardless of any wired Material.
