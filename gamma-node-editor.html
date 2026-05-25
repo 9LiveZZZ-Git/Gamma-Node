@@ -33471,7 +33471,14 @@ const _demos = [
         // Crank to 32/18 or 64/20 once we move SVT generation to
         // a Worker so it doesn't compete for the main-thread budget.
         segments:         16,
-        maxDepth:         16,
+        // §bonus-perf-foot-8 (2026-05-25) -- maxDepth 16 → 12. The
+        // foot-7 binary diagnostic proved per-fragment is NOT the
+        // bottleneck. Next suspect: rasterizer efficiency on hundreds
+        // of tiny depth-16 chunks (each ~2-5 pixels). At maxDepth=12
+        // the deepest chunks are ~2.4 km wide -- foot detail comes
+        // from SVT albedo/normal + texture rather than mesh density.
+        // Coarser silhouette up close but should restore frame rate.
+        maxDepth:         12,
         // §bonus-perf-foot-3 (2026-05-25) -- splitFactor 5 → 2.5.
         // CDLOD subdivides a chunk when camera distance is less than
         // (chunkEdge * splitFactor). At factor 5, depth-16 chunks
@@ -56297,21 +56304,12 @@ fn fs_unlit_vc(in: VsOut) -> @location(0) vec4<f32> {
       //   resident=0 (chunk just entered view, pages streaming):
       //                run the full procedural so the surface
       //                stays detailed during the brief load window.
-      // §bonus-perf-foot-7 (2026-05-25) -- BINARY DIAGNOSTIC. User's
-      // v0.3.402 didn't move foot fps. Theory: SVT is thrashing
-      // (30k queue, atlas full, most fragments miss → procedural
-      // path runs every frame on most pixels). To CONFIRM this is
-      // the cost, hard-skip the procedural pass entirely this
-      // commit. The surface will look flat-color (per-vertex only)
-      // at foot when SVT misses -- THAT IS EXPECTED for this test.
-      // What matters: does fps at foot come back to 30+?
-      //   YES: procedural is the bottleneck. Next sprint bakes
-      //        climate per-vertex so we keep the look without per-
-      //        fragment cost.
-      //   NO:  cost is elsewhere (vertex shader, draw calls, atm
-      //        LUT, GPU pipeline state). Keep digging.
-      // Revert this in the next commit once we have the answer.
-      if (false && svtSample.resident < 0.5) {
+      // §bonus-perf-foot-7 RESULT (2026-05-25): user data showed
+      // fps unchanged at 9.2 with this block fully skipped. Per-
+      // fragment procedural is NOT the bottleneck. Reverted to
+      // original gate; cost is elsewhere (suspect: rasterizer
+      // efficiency on the 1100+ tiny chunks at foot, see foot-8).
+      if (svtSample.resident < 0.5) {
         let camDistL = length(uS.eye.xyz - in.worldPos);
         let macroFade = 1.0 - smoothstep(500.0,  2000.0, camDistL);
         let midFade   = 1.0 - smoothstep(150.0,   500.0, camDistL);
@@ -57305,6 +57303,7 @@ function _perfFrameReset() {
   _PERFSTATS.demTilesArrived = 0;
   _PERFSTATS.chunksInvalidated = 0;
   _PERFSTATS.svtPagesGenThisFrame = 0;
+  _PERFSTATS.depthHist = {};
 }
 function _perfFrameDump() {
   // §bonus-perf-diag v2 -- dump every 30 frames (was 60) so we get
@@ -57322,10 +57321,22 @@ function _perfFrameDump() {
   const fps = medMs > 0 ? (1000 / medMs).toFixed(1) : "?";
   const draws = (typeof Visual !== "undefined" && Visual.perf)
     ? Visual.perf.drawCalls : 0;
+  // §bonus-perf-foot-8 -- compact depth histogram. Shows top 3 depth
+  // bins with chunk count, e.g. "d16:840 d14:120 d12:60". Tells us
+  // if the foot frame is dominated by 1000+ tiny depth-16 chunks.
+  let depthStr = "";
+  if (_PERFSTATS.depthHist) {
+    const pairs = Object.keys(_PERFSTATS.depthHist)
+      .map(k => [Number(k), _PERFSTATS.depthHist[k]])
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 4);
+    depthStr = " depths=[" + pairs.map(p => "d" + p[0] + ":" + p[1]).join(" ") + "]";
+  }
   console.log("[perf] f=" + _PERFSTATS.frame
     + " fps=" + fps + " (" + medMs.toFixed(1) + "ms)"
     + " draws=" + draws
     + " vis=" + _PERFSTATS.chunksVisible
+    + depthStr
     + " built=" + _PERFSTATS.chunksBuilt + "(" + _PERFSTATS.chunkBuildMs.toFixed(1) + "ms)"
     + " demFetch=" + _PERFSTATS.demTilesFetched
     + " demArrive=" + _PERFSTATS.demTilesArrived
@@ -65838,6 +65849,14 @@ function _ensurePlanetMeshChunks(node) {
     _PERFSTATS.chunksBuilt += phBuilt + upBuilt;
     _PERFSTATS.chunkBuildMs += phMs + upMs;
     _PERFSTATS.totalChunksBuilt += phBuilt + upBuilt;
+    // §bonus-perf-foot-8 -- chunk-depth distribution. Tells us whether
+    // foot frame is dominated by lots of tiny depth-16 chunks (bad
+    // for rasterizer) or a balanced spread.
+    if (!_PERFSTATS.depthHist) _PERFSTATS.depthHist = {};
+    for (const info of visible.values()) {
+      const d = info && typeof info.depth === "number" ? info.depth : -1;
+      _PERFSTATS.depthHist[d] = (_PERFSTATS.depthHist[d] || 0) + 1;
+    }
   }
 
   // Aggregate AABB for the outer (whole-mesh) frustum cull.
