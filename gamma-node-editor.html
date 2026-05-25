@@ -62049,6 +62049,124 @@ function _svtWritePageTable(face, pageX, pageY, slotX, slotY) {
   );
 }
 
+/* Sprint 10-5c-b: generate the RGBA content for a single SVT page.
+ * Reuses the existing biome + climate + procedural texture pipeline
+ * so the SVT atlas content matches what the per-fragment fallback
+ * would have computed -- but baked once per page instead of every
+ * frame. Returns a Uint8ClampedArray(128 * 128 * 4) or null on
+ * failure. */
+function _svtGeneratePage(face, pageX, pageY, pmap) {
+  if (face < 0 || face > 5) return null;
+  const cubemap = pmap ? _ensurePlanetMapCubemap(pmap) : null;
+  const seaLevel = (pmap && pmap.params && typeof pmap.params.seaLevel === "number")
+                   ? pmap.params.seaLevel : 0.5;
+  const out = new Uint8ClampedArray(_SVT.PAGE_SIZE * _SVT.PAGE_SIZE * 4);
+  const faceData = _PLANET_FACES[face];
+  const nX = faceData.n[0], nY = faceData.n[1], nZ = faceData.n[2];
+  const tX = faceData.t[0], tY = faceData.t[1], tZ = faceData.t[2];
+  const bX = faceData.b[0], bY = faceData.b[1], bZ = faceData.b[2];
+  // Page covers (u, v) sub-range of the face.
+  const uPageMin = -1 + 2 * pageX / _SVT.PAGES_PER_FACE_EDGE;
+  const vPageMin = -1 + 2 * pageY / _SVT.PAGES_PER_FACE_EDGE;
+  const uStep = 2 / (_SVT.PAGES_PER_FACE_EDGE * _SVT.PAGE_SIZE);
+  const vStep = 2 / (_SVT.PAGES_PER_FACE_EDGE * _SVT.PAGE_SIZE);
+  let writeIdx = 0;
+  for (let py = 0; py < _SVT.PAGE_SIZE; py++) {
+    const v = vPageMin + (py + 0.5) * vStep;
+    for (let px = 0; px < _SVT.PAGE_SIZE; px++) {
+      const u = uPageMin + (px + 0.5) * uStep;
+      // Cube position → unit sphere (matches _buildEarthCubemap).
+      const cx = nX + tX*u + bX*v;
+      const cy = nY + tY*u + bY*v;
+      const cz = nZ + tZ*u + bZ*v;
+      const cxx = cx*cx, cyy = cy*cy, czz = cz*cz;
+      const sx = cx * Math.sqrt(Math.max(0, 1 - cyy*0.5 - czz*0.5 + cyy*czz/3));
+      const sy = cy * Math.sqrt(Math.max(0, 1 - cxx*0.5 - czz*0.5 + cxx*czz/3));
+      const sz = cz * Math.sqrt(Math.max(0, 1 - cxx*0.5 - cyy*0.5 + cxx*cyy/3));
+      const inv = 1 / Math.max(1e-12, Math.sqrt(sx*sx + sy*sy + sz*sz));
+      const ux = sx*inv, uy = sy*inv, uz = sz*inv;
+      // Macro elevation from cubemap (fallback to mid value if not baked).
+      const elev = cubemap ? _samplePlanetMapCubemap(cubemap, ux, uy, uz) : 0.5;
+      // Lat/lon -- east-west flip from sprint 10-6 v6 so the page content
+      // matches what fs_unlit_vc samples for the same world direction.
+      const latDeg = Math.asin(Math.max(-1, Math.min(1, uy))) * 180 / Math.PI;
+      const lonDeg = -Math.atan2(uz, ux) * 180 / Math.PI;
+      const col = _earthSurfaceColorAt(latDeg, lonDeg, elev, seaLevel);
+      out[writeIdx++] = Math.max(0, Math.min(255, Math.floor(col[0] * 255)));
+      out[writeIdx++] = Math.max(0, Math.min(255, Math.floor(col[1] * 255)));
+      out[writeIdx++] = Math.max(0, Math.min(255, Math.floor(col[2] * 255)));
+      out[writeIdx++] = 255;
+    }
+  }
+  return out;
+}
+
+/* End-to-end: allocate slot, generate page pixels, upload to atlas,
+ * update page table. Returns true on success, false on failure
+ * (atlas full -- 10-5c-e LRU eviction lands later). */
+function _svtUploadPage(face, pageX, pageY, pmap) {
+  if (!_SVT.atlasTexture || !Visual.device) return false;
+  const slot = _svtAllocateSlot(face, pageX, pageY);
+  if (!slot) return false;
+  const key = face + "/" + pageX + "/" + pageY;
+  const res = _SVT.residency.get(key);
+  if (res && res.generated) return true;        // already done
+  const t0 = (typeof performance !== "undefined") ? performance.now() : 0;
+  const pixels = _svtGeneratePage(face, pageX, pageY, pmap);
+  if (!pixels) return false;
+  Visual.device.queue.writeTexture(
+    {
+      texture: _SVT.atlasTexture,
+      origin: { x: slot.x * _SVT.PAGE_SIZE, y: slot.y * _SVT.PAGE_SIZE, z: 0 },
+    },
+    pixels,
+    { bytesPerRow: _SVT.PAGE_SIZE * 4, rowsPerImage: _SVT.PAGE_SIZE },
+    [_SVT.PAGE_SIZE, _SVT.PAGE_SIZE, 1]
+  );
+  _svtWritePageTable(face, pageX, pageY, slot.x, slot.y);
+  if (res) res.generated = true;
+  _SVT.stats.pagesGenerated++;
+  const dtMs = ((typeof performance !== "undefined") ? performance.now() : 0) - t0;
+  // Sparse log: every 16th page.
+  if (_SVT.stats.pagesGenerated % 16 === 1) {
+    console.log("[svt] generated page " + face + "/" + pageX + "/" + pageY
+              + " → slot (" + slot.x + "," + slot.y + ") in " + dtMs.toFixed(1) + "ms"
+              + " | total: " + _SVT.stats.pagesGenerated + " pages, "
+              + _SVT.residency.size + " resident, "
+              + _SVT.freeSlots.length + " free slots");
+  }
+  return true;
+}
+
+/* Convenience: console-callable test that generates a small ring of
+ * pages around the +X face center. Lets the user kick the tires
+ * without waiting for chunk-build integration (lands in 10-5c-c).
+ * Usage in DevTools: _svtTest()  or  _svtTest(2, 5)  (face, count). */
+function _svtTest(face, count) {
+  if (typeof face !== "number") face = 0;
+  if (typeof count !== "number") count = 16;
+  if (!_ensureSVT()) { console.warn("[svt-test] SVT not allocated"); return; }
+  const pmap = (typeof state !== "undefined" && state && Array.isArray(state.nodes))
+    ? state.nodes.find(n => n && n.type === "PlanetMap") : null;
+  if (!pmap) { console.warn("[svt-test] no PlanetMap node found"); return; }
+  const half = _SVT.PAGES_PER_FACE_EDGE / 2;
+  const ring = Math.ceil(Math.sqrt(count));
+  let made = 0;
+  for (let dy = -Math.floor(ring/2); dy <= Math.floor(ring/2) && made < count; dy++) {
+    for (let dx = -Math.floor(ring/2); dx <= Math.floor(ring/2) && made < count; dx++) {
+      const pageX = half + dx;
+      const pageY = half + dy;
+      if (pageX < 0 || pageX >= _SVT.PAGES_PER_FACE_EDGE) continue;
+      if (pageY < 0 || pageY >= _SVT.PAGES_PER_FACE_EDGE) continue;
+      const ok = _svtUploadPage(face, pageX, pageY, pmap);
+      if (ok) made++;
+    }
+  }
+  console.log("[svt-test] generated " + made + " pages around face " + face + " center");
+}
+// Expose to console for manual testing.
+if (typeof window !== "undefined") window._svtTest = _svtTest;
+
 function _depthToZoom(depth) {
   // Sprint 10-6 v8: bumped deepest from 14 → 15 (Mapzen's max). At
   // foot level (depth 16+) this gives ~1.2 m/px instead of ~2.4 m/px.
