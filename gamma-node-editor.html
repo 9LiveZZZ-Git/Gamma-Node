@@ -54943,6 +54943,10 @@ struct PerDraw {
 @group(0) @binding(10) var svtAtlas:       texture_2d<f32>;
 @group(0) @binding(11) var svtSampler:     sampler;
 @group(0) @binding(12) var svtPageTable:   texture_2d_array<u32>;
+// Sprint 10-5c-g: paired normal-map atlas, same 1024-slot layout as
+// svtAtlas. RGB encodes tangent-space normal (XYZ in [-1, 1] via
+// (raw - 0.5) * 2). Sampled with the same atlas UV.
+@group(0) @binding(13) var svtNormalAtlas: texture_2d<f32>;
 
 /* SVT sampling helper. Given a unit-sphere world direction, returns
  * (rgb, pageResidentFlag). Flag = 1.0 if the page was resident in
@@ -54959,7 +54963,17 @@ struct PerDraw {
  *   4. textureLoad page-table → packed slot id.
  *   5. If unresident (= 0xFFFFFFFF), return flag=0.
  *   6. Else sample atlas at slot+local UV with linear filter. */
-fn _svt_sample(dir: vec3<f32>) -> vec4<f32> {
+struct SvtSample {
+  albedo:   vec3<f32>,
+  normal:   vec3<f32>,   // tangent-space normal, normalized
+  resident: f32,         // 1.0 if page resident, 0.0 otherwise
+};
+
+fn _svt_sample(dir: vec3<f32>) -> SvtSample {
+  var out: SvtSample;
+  out.albedo = vec3<f32>(0.0);
+  out.normal = vec3<f32>(0.0, 0.0, 1.0);
+  out.resident = 0.0;
   let absX = abs(dir.x);
   let absY = abs(dir.y);
   let absZ = abs(dir.z);
@@ -54979,9 +54993,7 @@ fn _svt_sample(dir: vec3<f32>) -> vec4<f32> {
     if (dir.z > 0.0) { face = 4; u =  dir.x * inv; v = dir.y * inv; }
     else             { face = 5; u = -dir.x * inv; v = dir.y * inv; }
   }
-  // (u, v) in [-1, 1] face-local. To [0, 1] then to page coords.
   let uv01 = vec2<f32>(u * 0.5 + 0.5, v * 0.5 + 0.5);
-  // PAGES_PER_FACE_EDGE = 256 (matches JS _SVT.PAGES_PER_FACE_EDGE).
   let pagesPerEdge: f32 = 256.0;
   let pageFx = uv01.x * pagesPerEdge;
   let pageFy = uv01.y * pagesPerEdge;
@@ -54989,21 +55001,20 @@ fn _svt_sample(dir: vec3<f32>) -> vec4<f32> {
   let pageY = i32(floor(pageFy));
   let inPageU = fract(pageFx);
   let inPageV = fract(pageFy);
-  // Page table texelFetch.
   let pageEntry = textureLoad(svtPageTable, vec2<i32>(pageX, pageY), face, 0).r;
   if (pageEntry == 0xFFFFFFFFu) {
-    return vec4<f32>(0.0, 0.0, 0.0, 0.0);  // unresident
+    return out;
   }
   let slotX = pageEntry & 0xFFFFu;
   let slotY = (pageEntry >> 16u) & 0xFFFFu;
-  // Atlas UV: slot origin + within-page sub-UV. Atlas is 4096²
-  // (32×32 slots of 128² each), so each slot occupies 1/32 of the
-  // atlas in each dimension.
   let slotsPerRow: f32 = 32.0;
   let atlasU = (f32(slotX) + inPageU) / slotsPerRow;
   let atlasV = (f32(slotY) + inPageV) / slotsPerRow;
-  let rgb = textureSampleLevel(svtAtlas, svtSampler, vec2<f32>(atlasU, atlasV), 0.0).rgb;
-  return vec4<f32>(rgb, 1.0);
+  out.albedo = textureSampleLevel(svtAtlas, svtSampler, vec2<f32>(atlasU, atlasV), 0.0).rgb;
+  let nRaw = textureSampleLevel(svtNormalAtlas, svtSampler, vec2<f32>(atlasU, atlasV), 0.0).rgb;
+  out.normal = normalize((nRaw - vec3<f32>(0.5)) * 2.0);
+  out.resident = 1.0;
+  return out;
 }
 
 // Sample the multi-scattering LUT. Axes match fs_lut_multiscatter:
@@ -55575,26 +55586,42 @@ fn fs_unlit_vc(in: VsOut) -> @location(0) vec4<f32> {
       // color modulation + procedural texture styles + bump
       // perturbation REMOVED.
       let surfN = normalize(in.normal);
-      // Sprint 10-5c-c: SVT sample. Tries to fetch a pre-baked detail
-      // page from the atlas. If the page is resident, replace the
-      // per-vertex biome color with the SVT sample (mixed with the
-      // vertex color so distance fade looks natural). If not resident,
-      // fall back to the existing per-vertex color + procedural
-      // brightness + biome-texture path below.
+      // Sprint 10-5c-c/g: SVT sample. Tries to fetch a pre-baked
+      // albedo + tangent-space normal from the atlas. If the page
+      // is resident:
+      //   - blend SVT albedo over vertex color
+      //   - transform tangent-space normal to world space (via
+      //     east/north tangent basis on the sphere)
+      //   - re-light: divide out the baked vertex lambert, apply
+      //     the perturbed-normal lambert. Result: visible bump
+      //     shading without changing the rest of the lighting pipeline.
       let planetCenter2 = uS.envPlanet.xyz;
       let planetR2      = uS.envPlanet.w;
       let radial2       = in.worldPos - planetCenter2;
       let radLen2       = length(radial2);
       let svtDir        = radial2 / max(radLen2, 1.0);
       let svtSample     = _svt_sample(svtDir);
-      if (svtSample.a > 0.5) {
-        // Resident page: blend SVT detail over vertex color. The
-        // SVT page content is essentially the per-vertex color the
-        // chunk builder would have computed (same pipeline) but at
-        // page resolution. Bias toward SVT (atlas has more detail
-        // than per-vertex), but keep ~20% vertex color so distance
-        // attenuation + vertex lambert still read.
-        color = mix(color, svtSample.rgb, 0.80);
+      if (svtSample.resident > 0.5) {
+        // Albedo blend.
+        color = mix(color, svtSample.albedo, 0.80);
+        // Build tangent basis on the sphere surface. East = (-sinLon,
+        // 0, cosLon) handling our east-west flip convention. Up =
+        // radial (surfN). North = up × east.
+        let latR  = asin(clamp(svtDir.y, -1.0, 1.0));
+        let lonR  = -atan2(svtDir.z, svtDir.x);   // 10-6 east-west flip
+        let east  = vec3<f32>(-sin(lonR), 0.0, cos(lonR));
+        let upR   = svtDir;
+        let north = normalize(cross(upR, east));
+        let eastN = normalize(cross(north, upR));
+        // Transform tangent-space normal (x=east, y=north, z=up).
+        let tn = svtSample.normal;
+        let worldN = normalize(eastN * tn.x + north * tn.y + upR * tn.z);
+        // Recompute lambert with perturbed normal vs baked one.
+        let sunDir = uS.envSun.xyz;
+        let perturbLambert = max(0.18, dot(worldN, sunDir));
+        let baseLambert    = max(0.18, dot(upR, sunDir));
+        // Scale color by ratio. Clamped so dark areas don't blow out.
+        color = color * clamp(perturbLambert / baseLambert, 0.6, 1.4);
       }
       let landTexLayer = i32(uD.planetExtra.x);
       if (landTexLayer >= 0) {
@@ -56828,6 +56855,10 @@ function _ensureMeshBindGroupLayout() {
       { binding: 10, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d", multisampled: false } },
       { binding: 11, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
       { binding: 12, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "uint",  viewDimension: "2d-array", multisampled: false } },
+      // Sprint 10-5c-g: normal-map atlas. Same 4096² layout as
+      // binding 10 (albedo); slot coords matched 1:1 with albedo so
+      // the shader uses the same atlas UV for both.
+      { binding: 13, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d", multisampled: false } },
     ]
   });
   Visual.meshPipelineLayout = Visual.device.createPipelineLayout({
@@ -62010,9 +62041,15 @@ const _SVT = {
   // sharper near-camera detail.
   PAGES_PER_FACE_EDGE: 256,   // 256² = 65536 pages per face, 393216 total
   // GPU resources (allocated lazily in _ensureSVT).
-  atlasTexture: null,
+  atlasTexture: null,            // RGBA8 albedo
   atlasView:    null,
   atlasSampler: null,
+  // Sprint 10-5c-g: normal-map atlas. RGB encodes tangent-space
+  // normal (XYZ in [-1, 1] mapped to [0, 1] per channel, Z = up).
+  // Generated procedurally alongside albedo from noise gradient.
+  // Same 4096² RGBA8 size as albedo (64 MB).
+  normalAtlas:     null,
+  normalAtlasView: null,
   // Page table texture: one 256×256 R32Uint slice per face (6 layers).
   // Each texel = atlas slot ID (0..1023) for that page, or
   // _SVT.PAGE_UNRESIDENT (0xFFFFFFFF) if not resident.
@@ -62066,6 +62103,16 @@ function _ensureSVT() {
       addressModeU: "clamp-to-edge",
       addressModeV: "clamp-to-edge",
     });
+    // Sprint 10-5c-g: normal-map atlas, identical size + slot layout
+    // as the albedo atlas. Per-texel content = tangent-space normal
+    // packed RGBA8 (XYZ in [0,1] = [-1,1]; A unused for now).
+    _SVT.normalAtlas = device.createTexture({
+      label: "svt-normal-atlas",
+      size: [_SVT.ATLAS_DIM, _SVT.ATLAS_DIM, 1],
+      format: "rgba8unorm",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    _SVT.normalAtlasView = _SVT.normalAtlas.createView();
     // Page table: 6 layers (one per face), each 256×256 R32Uint.
     _SVT.pageTableTexture = device.createTexture({
       label: "svt-page-table",
@@ -62215,17 +62262,21 @@ function _svtEvictLRU() {
 }
 
 /* Sprint 10-5c-b: generate the RGBA content for a single SVT page.
- * Reuses the existing biome + climate + procedural texture pipeline
- * so the SVT atlas content matches what the per-fragment fallback
- * would have computed -- but baked once per page instead of every
- * frame. Returns a Uint8ClampedArray(128 * 128 * 4) or null on
- * failure. */
+ * Sprint 10-5c-g: also generates a tangent-space normal map from
+ * noise gradient. Returns { albedo, normal } as Uint8ClampedArrays
+ * sized PAGE_SIZE² × 4 each, or null on failure.
+ *
+ * Normal computation: sample a high-frequency value-noise at two
+ * tiny offsets along the page's local tangent + bitangent, finite-
+ * difference to get the gradient, pack into RGB as [(N.x+1)/2,
+ * (N.y+1)/2, N.z] with N.z reconstructed = sqrt(1 - x² - y²). */
 function _svtGeneratePage(face, pageX, pageY, pmap) {
   if (face < 0 || face > 5) return null;
   const cubemap = pmap ? _ensurePlanetMapCubemap(pmap) : null;
   const seaLevel = (pmap && pmap.params && typeof pmap.params.seaLevel === "number")
                    ? pmap.params.seaLevel : 0.5;
-  const out = new Uint8ClampedArray(_SVT.PAGE_SIZE * _SVT.PAGE_SIZE * 4);
+  const albedo = new Uint8ClampedArray(_SVT.PAGE_SIZE * _SVT.PAGE_SIZE * 4);
+  const normal = new Uint8ClampedArray(_SVT.PAGE_SIZE * _SVT.PAGE_SIZE * 4);
   const faceData = _PLANET_FACES[face];
   const nX = faceData.n[0], nY = faceData.n[1], nZ = faceData.n[2];
   const tX = faceData.t[0], tY = faceData.t[1], tZ = faceData.t[2];
@@ -62235,7 +62286,23 @@ function _svtGeneratePage(face, pageX, pageY, pmap) {
   const vPageMin = -1 + 2 * pageY / _SVT.PAGES_PER_FACE_EDGE;
   const uStep = 2 / (_SVT.PAGES_PER_FACE_EDGE * _SVT.PAGE_SIZE);
   const vStep = 2 / (_SVT.PAGES_PER_FACE_EDGE * _SVT.PAGE_SIZE);
-  let writeIdx = 0;
+  // Bump-noise wavelength + amplitude. Noise samples at world-space
+  // position to stay consistent across pages.
+  const bumpFreq = 0.5;     // 2 m wavelength
+  const bumpAmp  = 0.4;     // tangent-space normal slope range
+  // Reuse simple value noise from existing pipeline (cheap, ~2-axis).
+  const _bumpNoise = function(wx, wy, wz) {
+    // 2-octave value noise. ~3-4ns/call -> 50ns per pixel, 800k/page = ~40ms.
+    const n1 = _terrainValueNoise3D(wx * bumpFreq,        wy * bumpFreq,        wz * bumpFreq,        37.1);
+    const n2 = _terrainValueNoise3D(wx * bumpFreq * 4.0,  wy * bumpFreq * 4.0,  wz * bumpFreq * 4.0,  91.7);
+    return n1 * 0.6 + n2 * 0.4;
+  };
+  // Approximate Earth-scale world position per page sample. Each
+  // page covers ~40 km of terrain, each texel ~300 m. Use a fixed
+  // world-scale offset (in meters) for the gradient samples.
+  const planetR = (pmap && pmap.params && typeof pmap.params.radius === "number") ? pmap.params.radius : 6378000;
+  const gradEpsilon = 1.5;  // 1.5 m offset for finite difference
+  let aIdx = 0, nIdx = 0;
   for (let py = 0; py < _SVT.PAGE_SIZE; py++) {
     const v = vPageMin + (py + 0.5) * vStep;
     for (let px = 0; px < _SVT.PAGE_SIZE; px++) {
@@ -62250,20 +62317,40 @@ function _svtGeneratePage(face, pageX, pageY, pmap) {
       const sz = cz * Math.sqrt(Math.max(0, 1 - cxx*0.5 - cyy*0.5 + cxx*cyy/3));
       const inv = 1 / Math.max(1e-12, Math.sqrt(sx*sx + sy*sy + sz*sz));
       const ux = sx*inv, uy = sy*inv, uz = sz*inv;
-      // Macro elevation from cubemap (fallback to mid value if not baked).
+      // Macro elevation from cubemap.
       const elev = cubemap ? _samplePlanetMapCubemap(cubemap, ux, uy, uz) : 0.5;
-      // Lat/lon -- east-west flip from sprint 10-6 v6 so the page content
-      // matches what fs_unlit_vc samples for the same world direction.
       const latDeg = Math.asin(Math.max(-1, Math.min(1, uy))) * 180 / Math.PI;
       const lonDeg = -Math.atan2(uz, ux) * 180 / Math.PI;
       const col = _earthSurfaceColorAt(latDeg, lonDeg, elev, seaLevel);
-      out[writeIdx++] = Math.max(0, Math.min(255, Math.floor(col[0] * 255)));
-      out[writeIdx++] = Math.max(0, Math.min(255, Math.floor(col[1] * 255)));
-      out[writeIdx++] = Math.max(0, Math.min(255, Math.floor(col[2] * 255)));
-      out[writeIdx++] = 255;
+      albedo[aIdx++] = Math.max(0, Math.min(255, Math.floor(col[0] * 255)));
+      albedo[aIdx++] = Math.max(0, Math.min(255, Math.floor(col[1] * 255)));
+      albedo[aIdx++] = Math.max(0, Math.min(255, Math.floor(col[2] * 255)));
+      albedo[aIdx++] = 255;
+      // Normal from noise gradient. Sample at world position +ε along
+      // east + north tangents; finite-difference gives bump slope.
+      // East tangent: (-sinLon, 0, cosLon). North tangent: roughly +Y projection.
+      const wx = ux * planetR, wy = uy * planetR, wz = uz * planetR;
+      const eastX = -Math.sin(lonDeg * Math.PI / 180);
+      const eastZ =  Math.cos(lonDeg * Math.PI / 180);
+      const h0  = _bumpNoise(wx, wy, wz);
+      const hEx = _bumpNoise(wx + eastX*gradEpsilon, wy, wz + eastZ*gradEpsilon);
+      const hNy = _bumpNoise(wx, wy + gradEpsilon, wz);
+      const gradU = (hEx - h0) * bumpAmp;
+      const gradV = (hNy - h0) * bumpAmp;
+      // Tangent-space normal: (gradU, gradV, sqrt(1 - gradU² - gradV²)).
+      // Negate gradients so heights bumping UP push the normal TOWARD camera.
+      let nxT = -gradU;
+      let nyT = -gradV;
+      let nzT = Math.sqrt(Math.max(0.01, 1.0 - nxT*nxT - nyT*nyT));
+      const nlen = Math.sqrt(nxT*nxT + nyT*nyT + nzT*nzT);
+      nxT /= nlen; nyT /= nlen; nzT /= nlen;
+      normal[nIdx++] = Math.max(0, Math.min(255, Math.floor((nxT * 0.5 + 0.5) * 255)));
+      normal[nIdx++] = Math.max(0, Math.min(255, Math.floor((nyT * 0.5 + 0.5) * 255)));
+      normal[nIdx++] = Math.max(0, Math.min(255, Math.floor((nzT * 0.5 + 0.5) * 255)));
+      normal[nIdx++] = 255;
     }
   }
-  return out;
+  return { albedo: albedo, normal: normal };
 }
 
 /* End-to-end: allocate slot, generate page pixels, upload to atlas,
@@ -62277,17 +62364,30 @@ function _svtUploadPage(face, pageX, pageY, pmap) {
   const res = _SVT.residency.get(key);
   if (res && res.generated) return true;        // already done
   const t0 = (typeof performance !== "undefined") ? performance.now() : 0;
-  const pixels = _svtGeneratePage(face, pageX, pageY, pmap);
-  if (!pixels) return false;
+  const data = _svtGeneratePage(face, pageX, pageY, pmap);
+  if (!data) return false;
+  // Albedo upload.
   Visual.device.queue.writeTexture(
     {
       texture: _SVT.atlasTexture,
       origin: { x: slot.x * _SVT.PAGE_SIZE, y: slot.y * _SVT.PAGE_SIZE, z: 0 },
     },
-    pixels,
+    data.albedo,
     { bytesPerRow: _SVT.PAGE_SIZE * 4, rowsPerImage: _SVT.PAGE_SIZE },
     [_SVT.PAGE_SIZE, _SVT.PAGE_SIZE, 1]
   );
+  // Sprint 10-5c-g: normal-map upload to the paired atlas slot.
+  if (_SVT.normalAtlas && data.normal) {
+    Visual.device.queue.writeTexture(
+      {
+        texture: _SVT.normalAtlas,
+        origin: { x: slot.x * _SVT.PAGE_SIZE, y: slot.y * _SVT.PAGE_SIZE, z: 0 },
+      },
+      data.normal,
+      { bytesPerRow: _SVT.PAGE_SIZE * 4, rowsPerImage: _SVT.PAGE_SIZE },
+      [_SVT.PAGE_SIZE, _SVT.PAGE_SIZE, 1]
+    );
+  }
   _svtWritePageTable(face, pageX, pageY, slot.x, slot.y);
   if (res) res.generated = true;
   _SVT.stats.pagesGenerated++;
@@ -67423,9 +67523,10 @@ function _ensureSceneInstance(sceneNode) {
     // pixels, which the sample-site smartly treats as 'unresident').
     if (!_SVT.atlasView && Visual.device) _ensureSVT();
     _ensureSVTDefaultPageTable();
-    const svtAtlasView    = _SVT.atlasView     || Visual.envTextureView;  // any 2d float texture
-    const svtAtlasSampler = _SVT.atlasSampler  || Visual.envSampler;
-    const svtPageTableV   = _SVT.pageTableView || Visual.svtPageTableDefaultView;
+    const svtAtlasView    = _SVT.atlasView       || Visual.envTextureView;  // any 2d float texture
+    const svtAtlasSampler = _SVT.atlasSampler    || Visual.envSampler;
+    const svtPageTableV   = _SVT.pageTableView   || Visual.svtPageTableDefaultView;
+    const svtNormalView   = _SVT.normalAtlasView || Visual.envTextureView;  // fallback: same default
     const makeBindGroup = (scratchView, parity) =>
       Visual.device.createBindGroup({
         label: "scene-bg-" + sceneNode.id + "-slot" + i + "-" + parity,
@@ -67443,7 +67544,8 @@ function _ensureSceneInstance(sceneNode) {
           { binding: 9, resource: skyViewView },
           { binding: 10, resource: svtAtlasView },
           { binding: 11, resource: svtAtlasSampler },
-          { binding: 12, resource: svtPageTableV }
+          { binding: 12, resource: svtPageTableV },
+          { binding: 13, resource: svtNormalView }
         ]
       });
     const bindGroupA = makeBindGroup(Visual.scratchArrayViewA, "a");
