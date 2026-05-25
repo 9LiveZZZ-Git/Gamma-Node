@@ -54949,6 +54949,10 @@ struct PerDraw {
 @group(0) @binding(13) var svtNormalAtlas: texture_2d<f32>;
 // Sprint 10-5c-h: PBR material atlas. R=rough, G=metal, B=AO, A=reserved.
 @group(0) @binding(14) var svtMaterialAtlas: texture_2d<f32>;
+// Sprint 10-5c-h2: fine-zoom page table (1024² pages per face, 6 layers).
+// Sampled first; base table (binding 12) used as fallback when fine
+// page is unresident.
+@group(0) @binding(15) var svtPageTableFine: texture_2d_array<u32>;
 
 /* SVT sampling helper. Given a unit-sphere world direction, returns
  * (rgb, pageResidentFlag). Flag = 1.0 if the page was resident in
@@ -54974,47 +54978,34 @@ struct SvtSample {
   resident:  f32,         // 1.0 if page resident, 0.0 otherwise
 };
 
-fn _svt_sample(dir: vec3<f32>) -> SvtSample {
-  var out: SvtSample;
-  out.albedo    = vec3<f32>(0.0);
-  out.normal    = vec3<f32>(0.0, 0.0, 1.0);
-  out.roughness = 0.78;
-  out.metallic  = 0.0;
-  out.ao        = 1.0;
-  out.resident  = 0.0;
+/* Cube direction → (face, faceUV in [-1,1]). Shared by both base and
+ * fine zoom samplers. */
+fn _svt_face_uv(dir: vec3<f32>) -> vec3<f32> {
   let absX = abs(dir.x);
   let absY = abs(dir.y);
   let absZ = abs(dir.z);
-  var face: i32 = 0;
+  var face: f32 = 0.0;
   var u: f32 = 0.0;
   var v: f32 = 0.0;
   if (absX >= absY && absX >= absZ) {
     let inv = 1.0 / absX;
-    if (dir.x > 0.0) { face = 0; u = -dir.z * inv; v = dir.y * inv; }
-    else             { face = 1; u =  dir.z * inv; v = dir.y * inv; }
+    if (dir.x > 0.0) { face = 0.0; u = -dir.z * inv; v = dir.y * inv; }
+    else             { face = 1.0; u =  dir.z * inv; v = dir.y * inv; }
   } else if (absY >= absZ) {
     let inv = 1.0 / absY;
-    if (dir.y > 0.0) { face = 2; u = dir.x * inv; v =  dir.z * inv; }
-    else             { face = 3; u = dir.x * inv; v = -dir.z * inv; }
+    if (dir.y > 0.0) { face = 2.0; u = dir.x * inv; v =  dir.z * inv; }
+    else             { face = 3.0; u = dir.x * inv; v = -dir.z * inv; }
   } else {
     let inv = 1.0 / absZ;
-    if (dir.z > 0.0) { face = 4; u =  dir.x * inv; v = dir.y * inv; }
-    else             { face = 5; u = -dir.x * inv; v = dir.y * inv; }
+    if (dir.z > 0.0) { face = 4.0; u =  dir.x * inv; v = dir.y * inv; }
+    else             { face = 5.0; u = -dir.x * inv; v = dir.y * inv; }
   }
-  let uv01 = vec2<f32>(u * 0.5 + 0.5, v * 0.5 + 0.5);
-  let pagesPerEdge: f32 = 256.0;
-  let pageFx = uv01.x * pagesPerEdge;
-  let pageFy = uv01.y * pagesPerEdge;
-  let pageX = i32(floor(pageFx));
-  let pageY = i32(floor(pageFy));
-  let inPageU = fract(pageFx);
-  let inPageV = fract(pageFy);
-  let pageEntry = textureLoad(svtPageTable, vec2<i32>(pageX, pageY), face, 0).r;
-  if (pageEntry == 0xFFFFFFFFu) {
-    return out;
-  }
-  let slotX = pageEntry & 0xFFFFu;
-  let slotY = (pageEntry >> 16u) & 0xFFFFu;
+  return vec3<f32>(u, v, face);
+}
+
+/* Common atlas sample given a slot + within-page UV. */
+fn _svt_read_atlas(slotX: u32, slotY: u32, inPageU: f32, inPageV: f32) -> SvtSample {
+  var out: SvtSample;
   let slotsPerRow: f32 = 32.0;
   let atlasU = (f32(slotX) + inPageU) / slotsPerRow;
   let atlasV = (f32(slotY) + inPageV) / slotsPerRow;
@@ -55027,6 +55018,57 @@ fn _svt_sample(dir: vec3<f32>) -> SvtSample {
   out.ao        = mRaw.b;
   out.resident  = 1.0;
   return out;
+}
+
+/* Try the fine page table first (1024² per face = ~78 m/texel); if
+ * unresident, fall back to the base page table (256² per face =
+ * ~300 m/texel). Caller checks .resident and falls back further
+ * to per-fragment procedural if both miss. */
+fn _svt_sample(dir: vec3<f32>) -> SvtSample {
+  var out: SvtSample;
+  out.albedo    = vec3<f32>(0.0);
+  out.normal    = vec3<f32>(0.0, 0.0, 1.0);
+  out.roughness = 0.78;
+  out.metallic  = 0.0;
+  out.ao        = 1.0;
+  out.resident  = 0.0;
+
+  let fuv = _svt_face_uv(dir);
+  let u = fuv.x; let v = fuv.y; let face = i32(fuv.z);
+  let uv01 = vec2<f32>(u * 0.5 + 0.5, v * 0.5 + 0.5);
+
+  // FINE first: 1024 pages per face.
+  let pagesFine: f32 = 1024.0;
+  let pageFineFx = uv01.x * pagesFine;
+  let pageFineFy = uv01.y * pagesFine;
+  let pageFineX = i32(floor(pageFineFx));
+  let pageFineY = i32(floor(pageFineFy));
+  let inPageFineU = fract(pageFineFx);
+  let inPageFineV = fract(pageFineFy);
+  let fineEntry = textureLoad(svtPageTableFine,
+                              vec2<i32>(pageFineX, pageFineY), face, 0).r;
+  if (fineEntry != 0xFFFFFFFFu) {
+    let slotX = fineEntry & 0xFFFFu;
+    let slotY = (fineEntry >> 16u) & 0xFFFFu;
+    return _svt_read_atlas(slotX, slotY, inPageFineU, inPageFineV);
+  }
+
+  // BASE fallback: 256 pages per face.
+  let pagesBase: f32 = 256.0;
+  let pageBaseFx = uv01.x * pagesBase;
+  let pageBaseFy = uv01.y * pagesBase;
+  let pageBaseX = i32(floor(pageBaseFx));
+  let pageBaseY = i32(floor(pageBaseFy));
+  let inPageBaseU = fract(pageBaseFx);
+  let inPageBaseV = fract(pageBaseFy);
+  let baseEntry = textureLoad(svtPageTable,
+                              vec2<i32>(pageBaseX, pageBaseY), face, 0).r;
+  if (baseEntry == 0xFFFFFFFFu) {
+    return out;   // both unresident
+  }
+  let baseSlotX = baseEntry & 0xFFFFu;
+  let baseSlotY = (baseEntry >> 16u) & 0xFFFFu;
+  return _svt_read_atlas(baseSlotX, baseSlotY, inPageBaseU, inPageBaseV);
 }
 
 /* Sprint 10-5c-h: standard GGX/Smith/Schlick microfacet BRDF.
@@ -56916,6 +56958,10 @@ function _ensureMeshBindGroupLayout() {
       { binding: 13, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d", multisampled: false } },
       // Sprint 10-5c-h: PBR material atlas. R=rough, G=metal, B=AO.
       { binding: 14, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d", multisampled: false } },
+      // Sprint 10-5c-h2: fine-zoom page table. Same format as binding 12
+      // (R32Uint array, 6 layers, one per face) but at 1024² entries
+      // per layer instead of 256² for ~4× finer resolution per page.
+      { binding: 15, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "uint", viewDimension: "2d-array", multisampled: false } },
     ]
   });
   Visual.meshPipelineLayout = Visual.device.createPipelineLayout({
@@ -62091,12 +62137,12 @@ const _SVT = {
   SLOTS_PER_ROW: 32,     // ATLAS_DIM / PAGE_SIZE
   TOTAL_SLOTS:  1024,    // SLOTS_PER_ROW²
   // Virtual texture per face: PAGES_PER_FACE_EDGE² pages per cube face.
-  // 10-5c-f-2 reverted 1024 → 256 (user reported slow load times --
-  // the 25 MB page-table init + per-page-table-write overhead added
-  // up). Single high-zoom is the wrong way to scale; multi-zoom
-  // mipmap pyramid (10-5c-h or later) is the proper answer for
-  // sharper near-camera detail.
-  PAGES_PER_FACE_EDGE: 256,   // 256² = 65536 pages per face, 393216 total
+  // 10-5c-h2 adds a fine zoom alongside this base. BASE stays at 256
+  // (zoom 8, ~300 m/texel) for orbital + mid-range; fine zoom is
+  // 1024² (zoom 10, ~78 m/texel) for near-camera.
+  PAGES_PER_FACE_EDGE: 256,   // BASE zoom 8: 256² = 65536 pages/face
+  // Multi-zoom additions (sprint 10-5c-h2).
+  FINE_PAGES_PER_FACE_EDGE: 1024,  // FINE zoom 10: 1024² pages/face
   // GPU resources (allocated lazily in _ensureSVT).
   atlasTexture: null,            // RGBA8 albedo
   atlasView:    null,
@@ -62116,11 +62162,15 @@ const _SVT = {
   // 64 MB GPU. Total SVT footprint with all three atlases: ~200 MB.
   materialAtlas:     null,
   materialAtlasView: null,
-  // Page table texture: one 256×256 R32Uint slice per face (6 layers).
-  // Each texel = atlas slot ID (0..1023) for that page, or
-  // _SVT.PAGE_UNRESIDENT (0xFFFFFFFF) if not resident.
+  // Base page table: 256×256 R32Uint × 6 face layers. ~6 MB.
+  // Each texel = (slotY << 16) | slotX, or PAGE_UNRESIDENT.
   pageTableTexture: null,
   pageTableView:    null,
+  // Sprint 10-5c-h2: fine-zoom page table (1024² × 6 R32Uint, ~25 MB).
+  // Same encoding as the base. Atlas slots are SHARED -- a page from
+  // either zoom takes one of the 1024 slots.
+  finePageTableTexture: null,
+  finePageTableView:    null,
   // JS-side residency state.
   // residency: Map "face/x/y" → { slotX, slotY, lastFrame, generated }
   residency: new Map(),
@@ -62138,9 +62188,11 @@ const _SVT = {
   // _svtQueueIfNew O(1) dedupe.
   generationQueue: [],
   queueKeys: new Set(),
-  // SVT virtual texture zoom level. log2(PAGES_PER_FACE_EDGE) = 8.
-  // Reverted from 10 in 10-5c-f-2 because of slow load. Multi-zoom
-  // pyramid is the proper path to finer texels (deferred sprint).
+  // SVT virtual texture zoom levels. 10-5c-h2 adds the FINE level for
+  // near-camera detail; BASE keeps long-range coverage cheap.
+  BASE_ZOOM: 8,
+  FINE_ZOOM: 10,
+  // Legacy alias for code that still references TARGET_ZOOM.
   TARGET_ZOOM: 8,
 };
 
@@ -62187,9 +62239,9 @@ function _ensureSVT() {
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     });
     _SVT.materialAtlasView = _SVT.materialAtlas.createView();
-    // Page table: 6 layers (one per face), each 256×256 R32Uint.
+    // Base page table: 6 layers, each 256×256 R32Uint = ~6 MB.
     _SVT.pageTableTexture = device.createTexture({
-      label: "svt-page-table",
+      label: "svt-page-table-base",
       size: [_SVT.PAGES_PER_FACE_EDGE, _SVT.PAGES_PER_FACE_EDGE, 6],
       format: "r32uint",
       usage: GPUTextureUsage.TEXTURE_BINDING |
@@ -62198,7 +62250,18 @@ function _ensureSVT() {
       dimension: "2d",
     });
     _SVT.pageTableView = _SVT.pageTableTexture.createView({ dimension: "2d-array" });
-    // Initialize page table to all-unresident.
+    // Sprint 10-5c-h2: fine page table, 6 layers × 1024² R32Uint = ~25 MB.
+    _SVT.finePageTableTexture = device.createTexture({
+      label: "svt-page-table-fine",
+      size: [_SVT.FINE_PAGES_PER_FACE_EDGE, _SVT.FINE_PAGES_PER_FACE_EDGE, 6],
+      format: "r32uint",
+      usage: GPUTextureUsage.TEXTURE_BINDING |
+             GPUTextureUsage.COPY_DST |
+             GPUTextureUsage.STORAGE_BINDING,
+      dimension: "2d",
+    });
+    _SVT.finePageTableView = _SVT.finePageTableTexture.createView({ dimension: "2d-array" });
+    // Initialize base page table to all-unresident.
     const unresidentBuf = new Uint32Array(
       _SVT.PAGES_PER_FACE_EDGE * _SVT.PAGES_PER_FACE_EDGE * 6
     );
@@ -62209,6 +62272,20 @@ function _ensureSVT() {
       { bytesPerRow: _SVT.PAGES_PER_FACE_EDGE * 4,
         rowsPerImage: _SVT.PAGES_PER_FACE_EDGE },
       [_SVT.PAGES_PER_FACE_EDGE, _SVT.PAGES_PER_FACE_EDGE, 6]
+    );
+    // Initialize fine page table to all-unresident. ~25 MB upload --
+    // one-time at startup; if this slows things noticeably we can
+    // defer to first-use (e.g., when camera approaches surface).
+    const fineUnresidentBuf = new Uint32Array(
+      _SVT.FINE_PAGES_PER_FACE_EDGE * _SVT.FINE_PAGES_PER_FACE_EDGE * 6
+    );
+    fineUnresidentBuf.fill(_SVT.PAGE_UNRESIDENT);
+    device.queue.writeTexture(
+      { texture: _SVT.finePageTableTexture },
+      fineUnresidentBuf,
+      { bytesPerRow: _SVT.FINE_PAGES_PER_FACE_EDGE * 4,
+        rowsPerImage: _SVT.FINE_PAGES_PER_FACE_EDGE },
+      [_SVT.FINE_PAGES_PER_FACE_EDGE, _SVT.FINE_PAGES_PER_FACE_EDGE, 6]
     );
     // Build free-slot pool (all slots free initially).
     _SVT.freeSlots = [];
@@ -62234,17 +62311,13 @@ function _ensureSVT() {
  * Returns { slotX, slotY } or null if atlas is full (10-5c-e will add
  * LRU eviction; for now we just return null which means "no slot,
  * fall back to procedural"). */
-function _svtAllocateSlot(face, pageX, pageY) {
-  const key = face + "/" + pageX + "/" + pageY;
+function _svtAllocateSlot(face, zoom, pageX, pageY) {
+  const key = face + "/" + zoom + "/" + pageX + "/" + pageY;
   const existing = _SVT.residency.get(key);
   if (existing) {
     existing.lastFrame = _SVT.frame;
     return { slotX: existing.slotX, slotY: existing.slotY };
   }
-  // Sprint 10-5c-e: when atlas full, evict the LRU page to free a slot.
-  // Bounded loop: if eviction fails (e.g., everything was touched this
-  // frame -- shouldn't happen with reasonable visible set size), give
-  // up and return null.
   if (_SVT.freeSlots.length === 0) {
     if (!_svtEvictLRU()) return null;
   }
@@ -62254,21 +62327,27 @@ function _svtAllocateSlot(face, pageX, pageY) {
     slotY: slot.y,
     lastFrame: _SVT.frame,
     generated: false,
-    face: face, pageX: pageX, pageY: pageY,
+    face: face, zoom: zoom, pageX: pageX, pageY: pageY,
   });
   return slot;
 }
 
-/* Update the page table texture for a single (face, pageX, pageY) entry.
- * Encodes slot as `(slotY << 16) | slotX` so the shader can unpack both
- * coordinates from a single R32Uint read. */
-function _svtWritePageTable(face, pageX, pageY, slotX, slotY) {
-  if (!_SVT.pageTableTexture || !Visual.device) return;
+/* Pick the correct page-table texture for a given zoom level. */
+function _svtTableForZoom(zoom) {
+  if (zoom === _SVT.FINE_ZOOM) return _SVT.finePageTableTexture;
+  return _SVT.pageTableTexture;
+}
+
+/* Update a single page-table entry. Sprint 10-5c-h2: takes zoom too
+ * to pick which of the two page tables to write to. */
+function _svtWritePageTable(face, zoom, pageX, pageY, slotX, slotY) {
+  const tex = _svtTableForZoom(zoom);
+  if (!tex || !Visual.device) return;
   const packed = ((slotY & 0xFFFF) << 16) | (slotX & 0xFFFF);
   const buf = new Uint32Array([packed]);
   Visual.device.queue.writeTexture(
     {
-      texture: _SVT.pageTableTexture,
+      texture: tex,
       origin: { x: pageX, y: pageY, z: face },
     },
     buf,
@@ -62277,14 +62356,13 @@ function _svtWritePageTable(face, pageX, pageY, slotX, slotY) {
   );
 }
 
-/* Mark a page table entry as unresident (PAGE_UNRESIDENT sentinel).
- * Shader reads this and falls back to per-fragment procedural. */
-function _svtMarkUnresident(face, pageX, pageY) {
-  if (!_SVT.pageTableTexture || !Visual.device) return;
+function _svtMarkUnresident(face, zoom, pageX, pageY) {
+  const tex = _svtTableForZoom(zoom);
+  if (!tex || !Visual.device) return;
   const buf = new Uint32Array([_SVT.PAGE_UNRESIDENT]);
   Visual.device.queue.writeTexture(
     {
-      texture: _SVT.pageTableTexture,
+      texture: tex,
       origin: { x: pageX, y: pageY, z: face },
     },
     buf,
@@ -62319,15 +62397,14 @@ function _svtEvictLRU() {
   if (!oldestKey) return false;
   const evict = _SVT.residency.get(oldestKey);
   _SVT.residency.delete(oldestKey);
-  _svtMarkUnresident(evict.face, evict.pageX, evict.pageY);
+  // Sprint 10-5c-h2: zoom-aware unresident write.
+  _svtMarkUnresident(evict.face, evict.zoom || _SVT.BASE_ZOOM, evict.pageX, evict.pageY);
   _SVT.freeSlots.push({ x: evict.slotX, y: evict.slotY });
   _SVT.stats.pagesEvicted++;
-  // Sparse-but-visible eviction log so users can confirm LRU is working
-  // when atlas fills + camera moves. First eviction logged always; then
-  // every 64th to avoid spam.
   if (_SVT.stats.pagesEvicted === 1 ||
       _SVT.stats.pagesEvicted % 64 === 0) {
-    console.log("[svt-evict] page " + evict.face + "/" + evict.pageX + "/" + evict.pageY
+    console.log("[svt-evict] page " + evict.face + "/z" + (evict.zoom || _SVT.BASE_ZOOM)
+              + "/" + evict.pageX + "/" + evict.pageY
               + " (lastFrame=" + evict.lastFrame + ", now=" + _SVT.frame
               + ") → freed slot (" + evict.slotX + "," + evict.slotY + ")"
               + " | total evictions: " + _SVT.stats.pagesEvicted);
@@ -62344,7 +62421,7 @@ function _svtEvictLRU() {
  * tiny offsets along the page's local tangent + bitangent, finite-
  * difference to get the gradient, pack into RGB as [(N.x+1)/2,
  * (N.y+1)/2, N.z] with N.z reconstructed = sqrt(1 - x² - y²). */
-function _svtGeneratePage(face, pageX, pageY, pmap) {
+function _svtGeneratePage(face, zoom, pageX, pageY, pmap) {
   if (face < 0 || face > 5) return null;
   const cubemap = pmap ? _ensurePlanetMapCubemap(pmap) : null;
   const seaLevel = (pmap && pmap.params && typeof pmap.params.seaLevel === "number")
@@ -62356,11 +62433,14 @@ function _svtGeneratePage(face, pageX, pageY, pmap) {
   const nX = faceData.n[0], nY = faceData.n[1], nZ = faceData.n[2];
   const tX = faceData.t[0], tY = faceData.t[1], tZ = faceData.t[2];
   const bX = faceData.b[0], bY = faceData.b[1], bZ = faceData.b[2];
-  // Page covers (u, v) sub-range of the face.
-  const uPageMin = -1 + 2 * pageX / _SVT.PAGES_PER_FACE_EDGE;
-  const vPageMin = -1 + 2 * pageY / _SVT.PAGES_PER_FACE_EDGE;
-  const uStep = 2 / (_SVT.PAGES_PER_FACE_EDGE * _SVT.PAGE_SIZE);
-  const vStep = 2 / (_SVT.PAGES_PER_FACE_EDGE * _SVT.PAGE_SIZE);
+  // Sprint 10-5c-h2: zoom determines how much of the face one page covers.
+  // pagesPerEdge differs between base (256) and fine (1024).
+  const pagesPerEdge = (zoom === _SVT.FINE_ZOOM)
+    ? _SVT.FINE_PAGES_PER_FACE_EDGE : _SVT.PAGES_PER_FACE_EDGE;
+  const uPageMin = -1 + 2 * pageX / pagesPerEdge;
+  const vPageMin = -1 + 2 * pageY / pagesPerEdge;
+  const uStep = 2 / (pagesPerEdge * _SVT.PAGE_SIZE);
+  const vStep = 2 / (pagesPerEdge * _SVT.PAGE_SIZE);
   // Bump-noise wavelength + amplitude. Noise samples at world-space
   // position to stay consistent across pages.
   const bumpFreq = 0.5;     // 2 m wavelength
@@ -62460,15 +62540,15 @@ function _svtGeneratePage(face, pageX, pageY, pmap) {
 /* End-to-end: allocate slot, generate page pixels, upload to atlas,
  * update page table. Returns true on success, false on failure
  * (atlas full -- 10-5c-e LRU eviction lands later). */
-function _svtUploadPage(face, pageX, pageY, pmap) {
+function _svtUploadPage(face, zoom, pageX, pageY, pmap) {
   if (!_SVT.atlasTexture || !Visual.device) return false;
-  const slot = _svtAllocateSlot(face, pageX, pageY);
+  const slot = _svtAllocateSlot(face, zoom, pageX, pageY);
   if (!slot) return false;
-  const key = face + "/" + pageX + "/" + pageY;
+  const key = face + "/" + zoom + "/" + pageX + "/" + pageY;
   const res = _SVT.residency.get(key);
   if (res && res.generated) return true;        // already done
   const t0 = (typeof performance !== "undefined") ? performance.now() : 0;
-  const data = _svtGeneratePage(face, pageX, pageY, pmap);
+  const data = _svtGeneratePage(face, zoom, pageX, pageY, pmap);
   if (!data) return false;
   // Albedo upload.
   Visual.device.queue.writeTexture(
@@ -62504,13 +62584,12 @@ function _svtUploadPage(face, pageX, pageY, pmap) {
       [_SVT.PAGE_SIZE, _SVT.PAGE_SIZE, 1]
     );
   }
-  _svtWritePageTable(face, pageX, pageY, slot.x, slot.y);
+  _svtWritePageTable(face, zoom, pageX, pageY, slot.x, slot.y);
   if (res) res.generated = true;
   _SVT.stats.pagesGenerated++;
   const dtMs = ((typeof performance !== "undefined") ? performance.now() : 0) - t0;
-  // Sparse log: every 16th page.
   if (_SVT.stats.pagesGenerated % 16 === 1) {
-    console.log("[svt] generated page " + face + "/" + pageX + "/" + pageY
+    console.log("[svt] generated page " + face + "/z" + zoom + "/" + pageX + "/" + pageY
               + " → slot (" + slot.x + "," + slot.y + ") in " + dtMs.toFixed(1) + "ms"
               + " | total: " + _SVT.stats.pagesGenerated + " pages, "
               + _SVT.residency.size + " resident, "
@@ -62539,7 +62618,7 @@ function _svtTest(face, count) {
       const pageY = half + dy;
       if (pageX < 0 || pageX >= _SVT.PAGES_PER_FACE_EDGE) continue;
       if (pageY < 0 || pageY >= _SVT.PAGES_PER_FACE_EDGE) continue;
-      const ok = _svtUploadPage(face, pageX, pageY, pmap);
+      const ok = _svtUploadPage(face, _SVT.BASE_ZOOM, pageX, pageY, pmap);
       if (ok) made++;
     }
   }
@@ -62556,39 +62635,50 @@ if (typeof window !== "undefined") window._svtTest = _svtTest;
  * SVT zoom 8 (256² pages per face). Deep chunks (depth ≥ 8) fall in
  * one page; shallow chunks span multiple pages. Add unique entries
  * to a FIFO queue and process under a per-frame ms budget. */
-function _svtQueueIfNew(face, pageX, pageY) {
-  if (pageX < 0 || pageX >= _SVT.PAGES_PER_FACE_EDGE) return;
-  if (pageY < 0 || pageY >= _SVT.PAGES_PER_FACE_EDGE) return;
-  const key = face + "/" + pageX + "/" + pageY;
+function _svtQueueIfNew(face, zoom, pageX, pageY) {
+  const pagesPerEdge = (zoom === _SVT.FINE_ZOOM)
+    ? _SVT.FINE_PAGES_PER_FACE_EDGE : _SVT.PAGES_PER_FACE_EDGE;
+  if (pageX < 0 || pageX >= pagesPerEdge) return;
+  if (pageY < 0 || pageY >= pagesPerEdge) return;
+  const key = face + "/" + zoom + "/" + pageX + "/" + pageY;
   const existing = _SVT.residency.get(key);
   if (existing && existing.generated) {
-    existing.lastFrame = _SVT.frame;   // touch for future LRU
+    existing.lastFrame = _SVT.frame;
     return;
   }
   if (_SVT.queueKeys.has(key)) return;
   _SVT.queueKeys.add(key);
-  _SVT.generationQueue.push({ face: face, pageX: pageX, pageY: pageY });
+  _SVT.generationQueue.push({ face: face, zoom: zoom, pageX: pageX, pageY: pageY });
 }
 
+/* Sprint 10-5c-h2: per-chunk page queueing across BOTH zoom levels.
+ * Base (Z=8) page always queued so coarse fallback exists even at
+ * orbit. Fine (Z=10) page queued only when the chunk is deep enough
+ * that fine pages would meaningfully resolve (depth ≥ 10). Deeper
+ * chunks share pages with neighbors automatically since we round
+ * ix/iy down by stepFactor. */
 function _svtQueueChunkPages(face, depth, ix, iy) {
-  const Z = _SVT.TARGET_ZOOM;
-  if (depth >= Z) {
-    // Chunk fits inside one page (or smaller). One page covers it.
-    const stepFactor = 1 << (depth - Z);
-    const pageX = Math.floor(ix / stepFactor);
-    const pageY = Math.floor(iy / stepFactor);
-    _svtQueueIfNew(face, pageX, pageY);
+  // Always queue base.
+  const baseZ = _SVT.BASE_ZOOM;
+  if (depth >= baseZ) {
+    const stepBase = 1 << (depth - baseZ);
+    _svtQueueIfNew(face, baseZ, Math.floor(ix / stepBase), Math.floor(iy / stepBase));
   } else {
-    // Chunk spans multiple pages -- enqueue them all. Rare at
-    // typical visible sets (most chunks are deeper than zoom 8).
-    const pagesPerChunkEdge = 1 << (Z - depth);
-    const startX = ix * pagesPerChunkEdge;
-    const startY = iy * pagesPerChunkEdge;
-    for (let dy = 0; dy < pagesPerChunkEdge; dy++) {
-      for (let dx = 0; dx < pagesPerChunkEdge; dx++) {
-        _svtQueueIfNew(face, startX + dx, startY + dy);
+    // Chunk spans multiple base pages -- enqueue all of them.
+    const span = 1 << (baseZ - depth);
+    const startX = ix * span, startY = iy * span;
+    for (let dy = 0; dy < span; dy++) {
+      for (let dx = 0; dx < span; dx++) {
+        _svtQueueIfNew(face, baseZ, startX + dx, startY + dy);
       }
     }
+  }
+  // Queue fine only when chunk is at least as deep as fine zoom.
+  // depth 10+ chunks map 1:1 to fine pages; deeper chunks share.
+  const fineZ = _SVT.FINE_ZOOM;
+  if (depth >= fineZ) {
+    const stepFine = 1 << (depth - fineZ);
+    _svtQueueIfNew(face, fineZ, Math.floor(ix / stepFine), Math.floor(iy / stepFine));
   }
 }
 
@@ -62599,12 +62689,11 @@ function _svtTickGeneration(pmap, budgetMs) {
   let processed = 0;
   while (_SVT.generationQueue.length > 0) {
     const item = _SVT.generationQueue.shift();
-    const key = item.face + "/" + item.pageX + "/" + item.pageY;
+    const key = item.face + "/" + item.zoom + "/" + item.pageX + "/" + item.pageY;
     _SVT.queueKeys.delete(key);
-    // Already generated since enqueue? skip.
     const existing = _SVT.residency.get(key);
     if (existing && existing.generated) continue;
-    const ok = _svtUploadPage(item.face, item.pageX, item.pageY, pmap);
+    const ok = _svtUploadPage(item.face, item.zoom, item.pageX, item.pageY, pmap);
     if (!ok) {
       // _svtAllocateSlot returns null only if LRU eviction couldn't
       // find a candidate (all 1024 slots touched this frame --
@@ -67644,6 +67733,7 @@ function _ensureSceneInstance(sceneNode) {
     const svtPageTableV   = _SVT.pageTableView   || Visual.svtPageTableDefaultView;
     const svtNormalView   = _SVT.normalAtlasView   || Visual.envTextureView;
     const svtMaterialView = _SVT.materialAtlasView || Visual.envTextureView;
+    const svtFinePageV    = _SVT.finePageTableView || Visual.svtPageTableDefaultView;
     const makeBindGroup = (scratchView, parity) =>
       Visual.device.createBindGroup({
         label: "scene-bg-" + sceneNode.id + "-slot" + i + "-" + parity,
@@ -67663,7 +67753,8 @@ function _ensureSceneInstance(sceneNode) {
           { binding: 11, resource: svtAtlasSampler },
           { binding: 12, resource: svtPageTableV },
           { binding: 13, resource: svtNormalView },
-          { binding: 14, resource: svtMaterialView }
+          { binding: 14, resource: svtMaterialView },
+          { binding: 15, resource: svtFinePageV }
         ]
       });
     const bindGroupA = makeBindGroup(Visual.scratchArrayViewA, "a");
