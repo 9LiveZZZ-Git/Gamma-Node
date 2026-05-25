@@ -64479,7 +64479,7 @@ function _planetChunkKey(face, depth, ix, iy) {
   return face + "|" + depth + "|" + ix + "|" + iy;
 }
 
-function _planetVisibleChunks(camPos, radius, heightScale, maxDepth, splitFactor) {
+function _planetVisibleChunks(camPos, radius, heightScale, maxDepth, splitFactor, localTerrainR) {
   const out = [];
   // §planet-spec Phase 4.d -- horizon-occlusion cull. The visible cap
   // of a sphere with center O, radius R from a camera at distance d
@@ -64502,17 +64502,19 @@ function _planetVisibleChunks(camPos, radius, heightScale, maxDepth, splitFactor
   // so this is safe.
   const cs2  = camPos.x*camPos.x + camPos.y*camPos.y + camPos.z*camPos.z;
   const cMag = Math.sqrt(cs2);
-  const camOutside = cMag > radius;
-  // §bonus-perf-foot-10 (2026-05-25) -- horizon angle from camera as
-  // an actual ANGLE (radians). At low altitude this is tiny: at 100 m
-  // AGL on Earth, horizon = sqrt(2Rh)/R ≈ 0.0056 rad ≈ 0.32°. The
-  // foot-9 cull compared cosines (`sphDot < horizonDot - chunkArc`)
-  // where chunkArc was treated as a cosine-space subtraction; but
-  // chunkArc was authored as 0.15 = 8.6° = an ANGLE. At small
-  // horizon angles the cosine-space shift is way too generous --
-  // 0.15 cosine-space corresponds to acos(1-0.15) = ~32° angular,
-  // not 8.6°. Fix: do the cull in angle space.
-  const horizonAngle = camOutside ? Math.acos(Math.max(-1, Math.min(1, radius / cMag))) : Math.PI;
+  // §bonus-perf-foot-11 -- AGL-correct horizon. localTerrainR (passed
+  // in) = mean sphere radius + local terrain elevation under the
+  // camera. The camera's effective altitude for horizon purposes is
+  // (cMag - localTerrainR) = AGL. Horizon angle uses localTerrainR
+  // as the visible-cap reference, so a camera 100m above a 5km
+  // mountain gets a horizon cone matching 100m AGL (~0.32°), not
+  // 5.1km MSL (~2.3°). Fixes the cliff where MSL inflated chunk
+  // count over terrain. Falls back to `radius` when caller didn't
+  // pass localTerrainR (other call sites unchanged).
+  const refR = (typeof localTerrainR === "number" && localTerrainR > 0) ? localTerrainR : radius;
+  const camOutside = cMag > refR;
+  // §bonus-perf-foot-10 -- angle-space horizon (radians).
+  const horizonAngle = camOutside ? Math.acos(Math.max(-1, Math.min(1, refR / cMag))) : Math.PI;
   const camDX = camOutside ? camPos.x / cMag : 0;
   const camDY = camOutside ? camPos.y / cMag : 0;
   const camDZ = camOutside ? camPos.z / cMag : 0;
@@ -65776,13 +65778,39 @@ function _ensurePlanetMeshChunks(node) {
   }
 
   const geom = _resolvePlanetMeshGeom(node.params || {});
+  // §bonus-perf-foot-11 -- sample terrain elevation under the camera
+  // so the horizon cull can use AGL (altitude above local ground)
+  // instead of MSL (altitude above mean sphere). When the camera is
+  // 100m above a 5km mountain plateau, MSL says 5100m of altitude and
+  // the horizon cone is 2.3° wide → ~70 d6 chunks slip through. AGL
+  // says 100m and the cone shrinks to 0.32° → 1-2 chunks. The latter
+  // is what the camera can ACTUALLY see.
+  const pmapCubemap = pmap ? _ensurePlanetMapCubemap(pmap) : null;
+  const seaLevel = (pmap && pmap.params && typeof pmap.params.seaLevel === "number") ? pmap.params.seaLevel : 0.5;
   const camPosWorld = _planetCameraPos(node);
   const camPos = {
     x: camPosWorld.x - geom.cxC,
     y: camPosWorld.y - geom.cyC,
     z: camPosWorld.z - geom.czC
   };
-  const visList = _planetVisibleChunks(camPos, geom.r, geom.hs, geom.maxDepth, geom.splitFactor);
+  // §bonus-perf-foot-11 -- compute local terrain elevation under the
+  // camera (radial sub-camera direction → sample cubemap → meters).
+  // Used by the cull for AGL-correct horizon math.
+  let localTerrainR = geom.r;
+  if (pmapCubemap) {
+    const cMagJs = Math.sqrt(camPos.x*camPos.x + camPos.y*camPos.y + camPos.z*camPos.z);
+    if (cMagJs > 1) {
+      const sx = camPos.x / cMagJs, sy = camPos.y / cMagJs, sz = camPos.z / cMagJs;
+      const elev01 = _planetSampleElevationCached(pmapCubemap, sx, sy, sz);
+      // Match the chunk-builder's elev → meters convention:
+      // above sea level: (elev - seaLevel) / (1 - seaLevel) * heightScale
+      const aboveSea = elev01 > seaLevel
+        ? (elev01 - seaLevel) / Math.max(1e-6, 1 - seaLevel) * geom.hs
+        : 0;
+      localTerrainR = geom.r + aboveSea;
+    }
+  }
+  const visList = _planetVisibleChunks(camPos, geom.r, geom.hs, geom.maxDepth, geom.splitFactor, localTerrainR);
   const visible = new Map();
   for (const v of visList) {
     visible.set(_planetChunkKey(v.face, v.depth, v.ix, v.iy), v);
