@@ -54063,25 +54063,24 @@ fn _surface_tex_snow(p: vec3<f32>) -> vec3<f32> {
 // amplitude (detail_noise consumes it as a per-octave amp scale).
 fn _detail_octaves(altitude_m: f32) -> f32 {
   let logAlt = log2(max(altitude_m, 1.0));
-  // §bonus-perf-foot-2 (2026-05-25) -- the original spec ramp returned
-  // 10 octaves at <10m altitude (pebble-scale features). That was the
-  // foot-level 9 fps floor: 1200 visible chunks × 289 verts × 10
-  // octaves = ~3.5M value-noise calls per frame just in the vertex
-  // shader. AND those high octaves can't even be resolved at 9 m
-  // vertex spacing (Earth circumference / 2^16 / 16 segments) -- by
-  // Nyquist the mesh aliases anything finer than ~18 m. We were
-  // burning cycles computing detail the mesh literally cannot show.
-  //
-  // New cap: 6 octaves max. At baseFreq ~0.01 cycles/m + lacunarity
-  // 2, octave 6 = ~64 cycles base = ~16 m features. Right at the
-  // chunk Nyquist limit, no aliasing, no waste. The pebble-scale
-  // detail belongs in the SVT normal map (per-fragment, not per-
-  // vertex) and in §10-5d ground scatter when that ships.
-  if (logAlt <= 3.32)  { return 6.0; }
-  if (logAlt <= 6.64)  { return  6.0 - (logAlt -  3.32) / 3.32 * 1.0; }
-  if (logAlt <= 9.97)  { return  5.0 - (logAlt -  6.64) / 3.33 * 1.0; }
-  if (logAlt <= 13.29) { return  4.0 - (logAlt -  9.97) / 3.32 * 1.5; }
-  if (logAlt <= 16.61) { return  2.5 - (logAlt - 13.29) / 3.32 * 2.5; }
+  // §revert-suppression (2026-05-25) -- foot-2 capped this at 6
+  // octaves based on a Nyquist argument that was moot for the
+  // PlanetMesh path (vs_planet_cdlod doesn't call detail_noise).
+  // Real foot-perf bug was horizon-cull (fixed foot-9/10/11/12).
+  // Restored to the original §8.4 spec ramp so other shaders that
+  // DO call detail_noise (vs_main, vs_planet_detail, etc.) get
+  // full feature resolution at foot.
+  //   > 100km  : 0  (orbital -- base cubemap only)
+  //    10-100km: 2  (1km features)
+  //     1-10km : 4  (100m features)
+  //   100m-1km : 6  (10m features)
+  //    10-100m: 8  (1m features)
+  //        <10m: 10 (0.1m pebbles)
+  if (logAlt <= 3.32)  { return 10.0; }
+  if (logAlt <= 6.64)  { return 10.0 - (logAlt -  3.32) / 3.32 * 2.0; }
+  if (logAlt <= 9.97)  { return  8.0 - (logAlt -  6.64) / 3.33 * 2.0; }
+  if (logAlt <= 13.29) { return  6.0 - (logAlt -  9.97) / 3.32 * 2.0; }
+  if (logAlt <= 16.61) { return  4.0 - (logAlt - 13.29) / 3.32 * 4.0; }
   return 0.0;
 }
 
@@ -56294,17 +56293,23 @@ fn fs_unlit_vc(in: VsOut) -> @location(0) vec4<f32> {
       // original gate; cost is elsewhere (suspect: rasterizer
       // efficiency on the 1100+ tiny chunks at foot, see foot-8).
       if (svtSample.resident < 0.5) {
+        // §revert-suppression (2026-05-25) -- multi-scale detail
+        // restored to 4 octaves (was cut to 2 chasing the 9 fps
+        // bug; foot-7 binary diag proved fragment cost wasn't it).
         let camDistL = length(uS.eye.xyz - in.worldPos);
         let macroFade = 1.0 - smoothstep(500.0,  2000.0, camDistL);
         let midFade   = 1.0 - smoothstep(150.0,   500.0, camDistL);
         let nearFade  = 1.0 - smoothstep(50.0,    200.0, camDistL);
+        let microFade = 1.0 - smoothstep(15.0,     50.0, camDistL);
         if (macroFade > 0.001) {
-          // Two-octave detail. n2 = mid-scale brightness, n3 = near-
-          // scale fine grain. Sum-of-amplitudes preserved so the
-          // visible character at foot is similar to the 4-octave.
+          let n1 = _value_noise_3d(in.worldPos * 0.02)  - 0.5;
           let n2 = _value_noise_3d(in.worldPos * 0.125) - 0.5;
           let n3 = _value_noise_3d(in.worldPos * 0.66)  - 0.5;
-          let det = n2 * 0.07 * midFade + n3 * 0.10 * nearFade;
+          let n4 = _value_noise_3d(in.worldPos * 3.30)  - 0.5;
+          let det =  n1 * 0.03 * macroFade
+                   + n2 * 0.05 * midFade
+                   + n3 * 0.06 * nearFade
+                   + n4 * 0.07 * microFade;
           color = color * (1.0 + det);
         }
         if (midFade > 0.001) {
@@ -56328,24 +56333,14 @@ fn fs_unlit_vc(in: VsOut) -> @location(0) vec4<f32> {
           let sandW = clamp((_T - 18.0) / 6.0, 0.0, 1.0) * clamp((0.30 - _P) / 0.10, 0.0, 1.0);
           let rockW = clamp((_elevMSL - 2000.0) / 1500.0, 0.0, 1.0);
           let grassW = max(0.0, 1.0 - snowW - sandW - rockW);
-          // §bonus-perf-foot-6 -- dominant-only pick. Only the
-          // largest-weight biome contributes its texture. Across a
-          // chunk you see crisp biome boundaries instead of smooth
-          // blends, but at foot that's invisible -- the climate
-          // field varies on the 10s-of-km scale and dominant pick
-          // changes at the same boundaries the weighted blend would
-          // have shown the transition.
-          let maxW = max(max(grassW, sandW), max(rockW, snowW));
-          var texW: vec3<f32>;
-          if (snowW >= maxW) {
-            texW = _surface_tex_snow(in.worldPos);
-          } else if (rockW >= maxW) {
-            texW = _surface_tex_rock(in.worldPos);
-          } else if (sandW >= maxW) {
-            texW = _surface_tex_sand(in.worldPos);
-          } else {
-            texW = _surface_tex_grass(in.worldPos);
-          }
+          // §revert-suppression -- 4-way weighted blend restored
+          // (was dominant-only pick in foot-6). Smooth transitions
+          // between biomes rather than crisp boundaries.
+          let tg = _surface_tex_grass(in.worldPos);
+          let tr = _surface_tex_rock(in.worldPos);
+          let ts = _surface_tex_sand(in.worldPos);
+          let tw = _surface_tex_snow(in.worldPos);
+          let texW = tg * grassW + tr * rockW + ts * sandW + tw * snowW;
           color = color * mix(vec3<f32>(1.0), texW, midFade);
         }
       }
@@ -63119,13 +63114,16 @@ function _svtGeneratePage(face, zoom, pageX, pageY, pmap) {
   // position to stay consistent across pages.
   const bumpFreq = 0.5;     // 2 m wavelength
   const bumpAmp  = 0.4;     // tangent-space normal slope range
-  // §bonus-perf (2026-05-25) -- was 2-octave (~40ms/page on M4). Cut
-  // to 1-octave (~20ms/page) since the bump only drives normal-map
-  // detail; the second octave was barely visible and added a hash
-  // call per pixel. Combined with the §bonus-perf 6 ms SVT budget,
-  // pages drain 3× faster while letting the frame render.
+  // §revert-suppression (2026-05-25) -- foot-perf cut from 2-oct to
+  // 1-oct chasing the 9 fps bug. Real bug was horizon cull. Restored
+  // to 2-octave so SVT normal maps regain the fine bump detail. Cost:
+  // ~40 ms/page (vs 20 ms at 1-oct). Combined with the bumped 12 ms
+  // SVT budget, pages still drain ~1.5× faster than the pre-revert
+  // baseline because the budget grew more than the per-page cost.
   const _bumpNoise = function(wx, wy, wz) {
-    return _terrainValueNoise3D(wx * bumpFreq, wy * bumpFreq, wz * bumpFreq, 37.1);
+    const n1 = _terrainValueNoise3D(wx * bumpFreq,        wy * bumpFreq,        wz * bumpFreq,        37.1);
+    const n2 = _terrainValueNoise3D(wx * bumpFreq * 4.0,  wy * bumpFreq * 4.0,  wz * bumpFreq * 4.0,  91.7);
+    return n1 * 0.6 + n2 * 0.4;
   };
   // Approximate Earth-scale world position per page sample. Each
   // page covers ~40 km of terrain, each texel ~300 m. Use a fixed
@@ -65837,15 +65835,14 @@ function _ensurePlanetMeshChunks(node) {
   // manual _svtTest console trigger.
   if (_SVT.atlasTexture) {
     for (const v of visList) _svtQueueChunkPages(v.face, v.depth, v.ix, v.iy);
-    // §bonus-perf (2026-05-25) -- was 30 ms which alone capped frame
-    // rate at 33 fps before render even started. 6 ms keeps SVT a
-    // secondary cost so the main render budget (~10 ms at 60 fps,
-    // ~25 ms at 30 fps) is preserved. Pages still backfill within
-    // a few seconds when the camera moves into new territory; the
-    // shader's per-fragment procedural fallback hides the gap until
-    // pages catch up. If queue depth becomes a problem we can move
-    // generation to a Worker (deferred -- larger refactor).
-    _svtTickGeneration(pmap, 6);
+    // §revert-suppression (2026-05-25) -- was 30 ms (too much: capped
+    // fps at 33), dropped to 6 ms chasing the 9 fps foot bug. Real
+    // bug was horizon cull; SVT budget at 6 ms was overly cautious
+    // and the queue rarely drained. 12 ms is the middle ground --
+    // 2x more pages per frame so foot-level SVT actually catches up,
+    // without the 30 ms cap. Worker-side generation still the proper
+    // long-term fix.
+    _svtTickGeneration(pmap, 12);
   }
 
   // Drop chunks that left the visible set.
