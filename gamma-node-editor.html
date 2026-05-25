@@ -54947,6 +54947,8 @@ struct PerDraw {
 // svtAtlas. RGB encodes tangent-space normal (XYZ in [-1, 1] via
 // (raw - 0.5) * 2). Sampled with the same atlas UV.
 @group(0) @binding(13) var svtNormalAtlas: texture_2d<f32>;
+// Sprint 10-5c-h: PBR material atlas. R=rough, G=metal, B=AO, A=reserved.
+@group(0) @binding(14) var svtMaterialAtlas: texture_2d<f32>;
 
 /* SVT sampling helper. Given a unit-sphere world direction, returns
  * (rgb, pageResidentFlag). Flag = 1.0 if the page was resident in
@@ -54964,16 +54966,22 @@ struct PerDraw {
  *   5. If unresident (= 0xFFFFFFFF), return flag=0.
  *   6. Else sample atlas at slot+local UV with linear filter. */
 struct SvtSample {
-  albedo:   vec3<f32>,
-  normal:   vec3<f32>,   // tangent-space normal, normalized
-  resident: f32,         // 1.0 if page resident, 0.0 otherwise
+  albedo:    vec3<f32>,
+  normal:    vec3<f32>,   // tangent-space normal, normalized
+  roughness: f32,         // 0 = mirror, 1 = matte
+  metallic:  f32,         // 0 = dielectric, 1 = pure metal
+  ao:        f32,         // 1 = no occlusion
+  resident:  f32,         // 1.0 if page resident, 0.0 otherwise
 };
 
 fn _svt_sample(dir: vec3<f32>) -> SvtSample {
   var out: SvtSample;
-  out.albedo = vec3<f32>(0.0);
-  out.normal = vec3<f32>(0.0, 0.0, 1.0);
-  out.resident = 0.0;
+  out.albedo    = vec3<f32>(0.0);
+  out.normal    = vec3<f32>(0.0, 0.0, 1.0);
+  out.roughness = 0.78;
+  out.metallic  = 0.0;
+  out.ao        = 1.0;
+  out.resident  = 0.0;
   let absX = abs(dir.x);
   let absY = abs(dir.y);
   let absZ = abs(dir.z);
@@ -55013,8 +55021,41 @@ fn _svt_sample(dir: vec3<f32>) -> SvtSample {
   out.albedo = textureSampleLevel(svtAtlas, svtSampler, vec2<f32>(atlasU, atlasV), 0.0).rgb;
   let nRaw = textureSampleLevel(svtNormalAtlas, svtSampler, vec2<f32>(atlasU, atlasV), 0.0).rgb;
   out.normal = normalize((nRaw - vec3<f32>(0.5)) * 2.0);
-  out.resident = 1.0;
+  let mRaw = textureSampleLevel(svtMaterialAtlas, svtSampler, vec2<f32>(atlasU, atlasV), 0.0);
+  out.roughness = mRaw.r;
+  out.metallic  = mRaw.g;
+  out.ao        = mRaw.b;
+  out.resident  = 1.0;
   return out;
+}
+
+/* Sprint 10-5c-h: standard GGX/Smith/Schlick microfacet BRDF.
+ * Used by fs_unlit_vc when SVT material data is resident, layered
+ * over the existing baked-lambert vertex color. Adds proper
+ * specular highlight that responds to view angle + sun direction
+ * + material roughness. */
+fn _pbr_specular(N: vec3<f32>, V: vec3<f32>, L: vec3<f32>,
+                 albedo: vec3<f32>, roughness: f32, metallic: f32) -> vec3<f32> {
+  let H = normalize(V + L);
+  let NoH = max(0.0, dot(N, H));
+  let NoV = max(0.0, dot(N, V));
+  let NoL = max(0.0, dot(N, L));
+  let VoH = max(0.0, dot(V, H));
+  // GGX / Trowbridge-Reitz normal distribution.
+  let a  = max(0.01, roughness * roughness);
+  let a2 = a * a;
+  let NoH2 = NoH * NoH;
+  let denom = NoH2 * (a2 - 1.0) + 1.0;
+  let D = a2 / (3.14159265 * denom * denom);
+  // Smith Schlick GGX geometric occlusion.
+  let k = (roughness + 1.0) * (roughness + 1.0) / 8.0;
+  let GV = NoV / (NoV * (1.0 - k) + k + 0.0001);
+  let GL = NoL / (NoL * (1.0 - k) + k + 0.0001);
+  let G  = GV * GL;
+  // Schlick Fresnel. F0=0.04 for dielectric, albedo for metallic.
+  let F0 = mix(vec3<f32>(0.04), albedo, metallic);
+  let F  = F0 + (vec3<f32>(1.0) - F0) * pow(1.0 - VoH, 5.0);
+  return (D * G * F) / max(4.0 * NoV * NoL, 0.001);
 }
 
 // Sample the multi-scattering LUT. Axes match fs_lut_multiscatter:
@@ -55622,6 +55663,20 @@ fn fs_unlit_vc(in: VsOut) -> @location(0) vec4<f32> {
         let baseLambert    = max(0.18, dot(upR, sunDir));
         // Scale color by ratio. Clamped so dark areas don't blow out.
         color = color * clamp(perturbLambert / baseLambert, 0.6, 1.4);
+        // Sprint 10-5c-h: PBR specular term layered on top. Uses the
+        // SVT material atlas (roughness + metallic) and the perturbed
+        // surface normal. Specular highlight reads as a glint where
+        // the sun reflects toward the camera through the half-vector.
+        // AO multiplied into the diffuse component (darkens corners).
+        let viewDir = normalize(uS.eye.xyz - in.worldPos);
+        let spec = _pbr_specular(worldN, viewDir, sunDir,
+                                  svtSample.albedo,
+                                  svtSample.roughness,
+                                  svtSample.metallic);
+        // Scaled down so spec stays subtle on natural terrain. PBR
+        // peak can be very bright; clamp keeps it grounded.
+        let specStrength = 0.6;
+        color = color * svtSample.ao + spec * perturbLambert * specStrength;
       }
       let landTexLayer = i32(uD.planetExtra.x);
       if (landTexLayer >= 0) {
@@ -56859,6 +56914,8 @@ function _ensureMeshBindGroupLayout() {
       // binding 10 (albedo); slot coords matched 1:1 with albedo so
       // the shader uses the same atlas UV for both.
       { binding: 13, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d", multisampled: false } },
+      // Sprint 10-5c-h: PBR material atlas. R=rough, G=metal, B=AO.
+      { binding: 14, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d", multisampled: false } },
     ]
   });
   Visual.meshPipelineLayout = Visual.device.createPipelineLayout({
@@ -62050,6 +62107,15 @@ const _SVT = {
   // Same 4096² RGBA8 size as albedo (64 MB).
   normalAtlas:     null,
   normalAtlasView: null,
+  // Sprint 10-5c-h: PBR material atlas. Packs roughness + metallic +
+  // ambient occlusion into RGBA8 for one atlas sample:
+  //   R = roughness (0 = mirror, 1 = matte)
+  //   G = metallic  (0 = dielectric, 1 = pure metal)
+  //   B = AO        (1 = no occlusion, 0 = fully occluded)
+  //   A = reserved
+  // 64 MB GPU. Total SVT footprint with all three atlases: ~200 MB.
+  materialAtlas:     null,
+  materialAtlasView: null,
   // Page table texture: one 256×256 R32Uint slice per face (6 layers).
   // Each texel = atlas slot ID (0..1023) for that page, or
   // _SVT.PAGE_UNRESIDENT (0xFFFFFFFF) if not resident.
@@ -62113,6 +62179,14 @@ function _ensureSVT() {
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     });
     _SVT.normalAtlasView = _SVT.normalAtlas.createView();
+    // Sprint 10-5c-h: PBR material atlas. R=rough, G=metal, B=AO.
+    _SVT.materialAtlas = device.createTexture({
+      label: "svt-material-atlas",
+      size: [_SVT.ATLAS_DIM, _SVT.ATLAS_DIM, 1],
+      format: "rgba8unorm",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    _SVT.materialAtlasView = _SVT.materialAtlas.createView();
     // Page table: 6 layers (one per face), each 256×256 R32Uint.
     _SVT.pageTableTexture = device.createTexture({
       label: "svt-page-table",
@@ -62275,8 +62349,9 @@ function _svtGeneratePage(face, pageX, pageY, pmap) {
   const cubemap = pmap ? _ensurePlanetMapCubemap(pmap) : null;
   const seaLevel = (pmap && pmap.params && typeof pmap.params.seaLevel === "number")
                    ? pmap.params.seaLevel : 0.5;
-  const albedo = new Uint8ClampedArray(_SVT.PAGE_SIZE * _SVT.PAGE_SIZE * 4);
-  const normal = new Uint8ClampedArray(_SVT.PAGE_SIZE * _SVT.PAGE_SIZE * 4);
+  const albedo   = new Uint8ClampedArray(_SVT.PAGE_SIZE * _SVT.PAGE_SIZE * 4);
+  const normal   = new Uint8ClampedArray(_SVT.PAGE_SIZE * _SVT.PAGE_SIZE * 4);
+  const material = new Uint8ClampedArray(_SVT.PAGE_SIZE * _SVT.PAGE_SIZE * 4);
   const faceData = _PLANET_FACES[face];
   const nX = faceData.n[0], nY = faceData.n[1], nZ = faceData.n[2];
   const tX = faceData.t[0], tY = faceData.t[1], tZ = faceData.t[2];
@@ -62302,7 +62377,7 @@ function _svtGeneratePage(face, pageX, pageY, pmap) {
   // world-scale offset (in meters) for the gradient samples.
   const planetR = (pmap && pmap.params && typeof pmap.params.radius === "number") ? pmap.params.radius : 6378000;
   const gradEpsilon = 1.5;  // 1.5 m offset for finite difference
-  let aIdx = 0, nIdx = 0;
+  let aIdx = 0, nIdx = 0, mIdx = 0;
   for (let py = 0; py < _SVT.PAGE_SIZE; py++) {
     const v = vPageMin + (py + 0.5) * vStep;
     for (let px = 0; px < _SVT.PAGE_SIZE; px++) {
@@ -62348,9 +62423,38 @@ function _svtGeneratePage(face, pageX, pageY, pmap) {
       normal[nIdx++] = Math.max(0, Math.min(255, Math.floor((nyT * 0.5 + 0.5) * 255)));
       normal[nIdx++] = Math.max(0, Math.min(255, Math.floor((nzT * 0.5 + 0.5) * 255)));
       normal[nIdx++] = 255;
+      // Sprint 10-5c-h: PBR material. Biome-aware roughness.
+      //   Snow / ice (cold):   0.65 -- slightly rough
+      //   Rock (high elev):    0.40 -- smoother, can glint
+      //   Sand (hot + dry):    0.55 -- moderate
+      //   Forest (temp + wet): 0.88 -- very diffuse
+      //   Grassland (default): 0.78
+      // Metallic stays 0 (natural terrain isn't metallic). AO = 1
+      // (no occlusion baked yet; future: derive from elev curvature).
+      const elevMSL_m = Math.max(0, (elev - seaLevel) / Math.max(0.001, 1 - seaLevel) * 8848);
+      const absLatRad = Math.abs(latDeg) * Math.PI / 180;
+      const T_base = 30 * Math.cos(absLatRad) - 5;
+      const T = T_base - 6.5 * (elevMSL_m / 1000);
+      let _matP = 0.45;
+      const absLatLoc = Math.abs(latDeg);
+      _matP += 0.45 * Math.exp(-Math.pow((absLatLoc -  0) / 12, 2));
+      _matP -= 0.35 * Math.exp(-Math.pow((absLatLoc - 25) / 10, 2));
+      _matP += 0.25 * Math.exp(-Math.pow((absLatLoc - 55) / 12, 2));
+      _matP -= 0.30 * Math.exp(-Math.pow((absLatLoc - 80) / 12, 2));
+      _matP = Math.max(0, Math.min(1, _matP));
+      let rough;
+      if (T < -5)                            rough = 0.65;  // snow/ice
+      else if (elevMSL_m > 2000)             rough = 0.40;  // high rock
+      else if (T > 18 && _matP < 0.3)        rough = 0.55;  // hot desert
+      else if (T > 0  && _matP > 0.6)        rough = 0.88;  // forest
+      else                                   rough = 0.78;  // default grassland
+      material[mIdx++] = Math.max(0, Math.min(255, Math.floor(rough * 255)));
+      material[mIdx++] = 0;     // metallic = 0
+      material[mIdx++] = 255;   // AO = 1
+      material[mIdx++] = 255;   // reserved
     }
   }
-  return { albedo: albedo, normal: normal };
+  return { albedo: albedo, normal: normal, material: material };
 }
 
 /* End-to-end: allocate slot, generate page pixels, upload to atlas,
@@ -62384,6 +62488,18 @@ function _svtUploadPage(face, pageX, pageY, pmap) {
         origin: { x: slot.x * _SVT.PAGE_SIZE, y: slot.y * _SVT.PAGE_SIZE, z: 0 },
       },
       data.normal,
+      { bytesPerRow: _SVT.PAGE_SIZE * 4, rowsPerImage: _SVT.PAGE_SIZE },
+      [_SVT.PAGE_SIZE, _SVT.PAGE_SIZE, 1]
+    );
+  }
+  // Sprint 10-5c-h: PBR material upload (R=rough, G=metal, B=AO).
+  if (_SVT.materialAtlas && data.material) {
+    Visual.device.queue.writeTexture(
+      {
+        texture: _SVT.materialAtlas,
+        origin: { x: slot.x * _SVT.PAGE_SIZE, y: slot.y * _SVT.PAGE_SIZE, z: 0 },
+      },
+      data.material,
       { bytesPerRow: _SVT.PAGE_SIZE * 4, rowsPerImage: _SVT.PAGE_SIZE },
       [_SVT.PAGE_SIZE, _SVT.PAGE_SIZE, 1]
     );
@@ -67526,7 +67642,8 @@ function _ensureSceneInstance(sceneNode) {
     const svtAtlasView    = _SVT.atlasView       || Visual.envTextureView;  // any 2d float texture
     const svtAtlasSampler = _SVT.atlasSampler    || Visual.envSampler;
     const svtPageTableV   = _SVT.pageTableView   || Visual.svtPageTableDefaultView;
-    const svtNormalView   = _SVT.normalAtlasView || Visual.envTextureView;  // fallback: same default
+    const svtNormalView   = _SVT.normalAtlasView   || Visual.envTextureView;
+    const svtMaterialView = _SVT.materialAtlasView || Visual.envTextureView;
     const makeBindGroup = (scratchView, parity) =>
       Visual.device.createBindGroup({
         label: "scene-bg-" + sceneNode.id + "-slot" + i + "-" + parity,
@@ -67545,7 +67662,8 @@ function _ensureSceneInstance(sceneNode) {
           { binding: 10, resource: svtAtlasView },
           { binding: 11, resource: svtAtlasSampler },
           { binding: 12, resource: svtPageTableV },
-          { binding: 13, resource: svtNormalView }
+          { binding: 13, resource: svtNormalView },
+          { binding: 14, resource: svtMaterialView }
         ]
       });
     const bindGroupA = makeBindGroup(Visual.scratchArrayViewA, "a");
