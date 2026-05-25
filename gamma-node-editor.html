@@ -10562,7 +10562,57 @@ public:
       cullEnable: 1
     },
     methods: {},
-    description: "3D scene sink. Wire up to four `mesh` inputs (Box/Sphere/Plane/Torus/Cylinder/Cone via sprint 7.5.3b primitives, or DebugTriangle for the simplest smoke test) and one `camera` input from a Camera node. Renders the meshes through the camera into a framebuffer layer; output is `texture`-typed so the result flows into the existing post-processing graph (CRT, Bloom, BlendShader, etc.). clearR/G/B is the background color (default a deep navy). Depth-tested; meshes farther from the camera are correctly occluded. Sprint 7.5.3c adds materials + lighting; until then the pipeline is unlit + uses per-vertex colors."
+    description: "3D scene sink. Wire up to four `mesh` inputs (Box/Sphere/Plane/Torus/Cylinder/Cone via sprint 7.5.3b primitives, or DebugTriangle for the simplest smoke test) and one `camera` input from a Camera node. Renders the meshes through the camera into a framebuffer layer; output is `texture`-typed so the result flows into the existing post-processing graph (CRT, Bloom, BlendShader, etc.). clearR/G/B is the background color (default a deep navy). Depth-tested; meshes farther from the camera are correctly occluded. Sprint 7.5.3c adds materials + lighting; until then the pipeline is unlit + uses per-vertex colors. **Naming note (§8.0.2-b):** the canonical name going forward is `Scene3D` — `Scene2D` + `Scene25D` ship in §8.0.2-c/d. `Scene` remains supported as a backward-compat alias; existing patches keep working without migration."
+  },
+
+  /* Sprint 8.0.2-b -- Scene3D. Canonical name for the 3D raster
+   * scene sink, alongside the upcoming Scene2D (§8.0.2-c) and
+   * Scene25D (§8.0.2-d). Internally identical to Scene -- same
+   * ins, outs, params, render kind. Encoder dispatches by
+   * `kind: "scene"`, not by type name, so both names route into
+   * the exact same pipeline with zero divergence. Old patches
+   * with `type: "Scene"` keep loading; new content + demos use
+   * Scene3D for symmetry with the 2D/2.5D variants. */
+  Scene3D: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "scene",
+    ins: [
+      { n: "mesh1",       t: "mesh" },
+      { n: "mesh2",       t: "mesh" },
+      { n: "mesh3",       t: "mesh" },
+      { n: "mesh4",       t: "mesh" },
+      { n: "camera",      t: "camera" },
+      { n: "light1",      t: "light" },
+      { n: "light2",      t: "light" },
+      { n: "light3",      t: "light" },
+      { n: "light4",      t: "light" },
+      { n: "environment", t: "environment" },
+      { n: "hud1",        t: "hud" },
+      { n: "hud2",        t: "hud" },
+      { n: "hud3",        t: "hud" },
+      { n: "hud4",        t: "hud" },
+      { n: "clearR",      t: "param" },
+      { n: "clearG",      t: "param" },
+      { n: "clearB",      t: "param" },
+      { n: "fogDensity",  t: "param" },
+      { n: "fogStart",    t: "param" },
+      { n: "fogHeight",   t: "param" },
+      { n: "fogAuto",     t: "param" },
+      { n: "fogR",        t: "param" },
+      { n: "fogG",        t: "param" },
+      { n: "fogB",        t: "param" },
+      { n: "cullEnable",  t: "param" }
+    ],
+    outs: [{ n: "out", t: "texture" }],
+    params: {
+      clearR: 0.04, clearG: 0.05, clearB: 0.09,
+      fogDensity: 0.0, fogStart: 5.0, fogHeight: 0.0, fogAuto: 1.0,
+      fogR: 0.65, fogG: 0.70, fogB: 0.78,
+      cullEnable: 1
+    },
+    methods: {},
+    description: "Sprint 8.0.2-b -- canonical name for the raster 3D scene sink. Identical to the older `Scene` node (kept as backward-compat alias); same inputs (4 meshes / camera / 4 lights / env / 4 HUDs / fog / clear / cullEnable), same render path (kind: 'scene'), same output texture. New demos + patches should use Scene3D for symmetry with Scene2D (§8.0.2-c) and Scene25D (§8.0.2-d). When you want hardware ray tracing instead, swap for `RayTracedScene` -- same input surface (§8.0.1 parity sprint), same downstream texture output."
   },
 
   /* RayTracedScene -- the hardware ray-tracing alternative to Scene.
@@ -11048,7 +11098,13 @@ public:
       { n: "octaves",     t: "param" },
       { n: "lacunarity",  t: "param" },
       { n: "gain",        t: "param" },
-      { n: "ridges",      t: "param" }
+      { n: "ridges",      t: "param" },
+      // §bonus-parity (2026-05-25) -- plateau remap. Matches the
+      // TiledTerrain param of the same name so a noise-tuned design
+      // ports cleanly between the two nodes. 0 = pure fBm (existing
+      // behavior); 1 = strongly remapped toward "isolated peaks in
+      // flat plain" via h^(1 + 4*plateau).
+      { n: "plateau",     t: "param" }
     ],
     outs: [{ n: "mesh", t: "mesh" }],
     params: {
@@ -11062,7 +11118,8 @@ public:
       octaves:     5,
       lacunarity:  2.0,
       gain:        0.5,
-      ridges:      0.0
+      ridges:      0.0,
+      plateau:     0.0
     },
     paramOptions: { sizeMode: ["custom", "small", "medium", "large", "infinite"] },
     methods: {},
@@ -33404,13 +33461,17 @@ const _demos = [
         // pixel below ~885 m: Amazon basin, most of Africa, Himalayan
         // foothills all rendered as ocean even though they're land.
         seaLevel:         0.5,
-        // Sprint 10-4 v10: dropped 128/22 → 64/20 per user. Sweet
-        // spot: 65² = 4225 verts/chunk × ~1200 visible chunks =
-        // ~5M verts, ~250 MB GPU. Vertex spacing ~0.6 m at foot
-        // level. Still well past Outerra-tier mesh density without
-        // the 4x chunk build cost of 128².
-        segments:         64,
-        maxDepth:         20,
+        // §bonus-perf (2026-05-25) -- dropped 64/20 → 16/16 per
+        // user. 17² = 289 verts/chunk × ~1200 visible chunks ≈
+        // 350k verts, ~17 MB GPU. Vertex spacing ~9 m at foot
+        // level (vs 0.6 m at 64/20) -- the silhouette is coarser
+        // up close but the demo runs at 60 fps instead of 9 fps,
+        // and the SVT albedo + normal-map detail compensates for
+        // the mesh resolution loss at typical viewing distances.
+        // Crank to 32/18 or 64/20 once we move SVT generation to
+        // a Worker so it doesn't compete for the main-thread budget.
+        segments:         16,
+        maxDepth:         16,
         subdivide:        1  // one Loop subdivision pass -- smooths cell-faceting
       });
 
@@ -47205,6 +47266,46 @@ function _terrainColliderHeightAt(wx, wz, opts) {
     return _tiledFinalY(wx, wz, noise, hs, yOff);
   };
 
+  /* §bonus-parity (2026-05-25) -- Terrain query. Maps world (wx, wz)
+   * back into Terrain's (u, v) noise coords. Works only when no
+   * heightmap is wired (CPU-noise path); when wired, the GPU shader
+   * does displacement and CPU has no cheap query against the texture.
+   * Out-of-extent points (|wx| > w/2 or |wz| > w/2) return null. */
+  const tryTerrain = (n) => {
+    if (!n || !n.params) return null;
+    const p = n.params;
+    const hmWired = state.edges && state.edges.some(e =>
+      e && e.to && e.to.node === n.id && e.to.port === "heightmap"
+    );
+    if (hmWired) return null;
+    const sizePresets = { small: 20, medium: 100, large: 1000, infinite: 10000 };
+    const mode = (typeof p.sizeMode === "string") ? p.sizeMode : "medium";
+    const customSize = (typeof p.worldSize === "number") ? p.worldSize : 100;
+    const w = (mode === "custom") ? customSize : (sizePresets[mode] || customSize);
+    const hw = w * 0.5;
+    if (wx < -hw || wx > hw || wz < -hw || wz > hw) return null;
+    const u = (wx + hw) / w;
+    const v = (wz + hw) / w;
+    const noise = {
+      seed:       (typeof p.seed       === "number") ? p.seed       : 1.234,
+      frequency:  (typeof p.frequency  === "number") ? p.frequency  : 2.0,
+      octaves:    (typeof p.octaves    === "number") ? p.octaves    : 5,
+      lacunarity: (typeof p.lacunarity === "number") ? p.lacunarity : 2.0,
+      gain:       (typeof p.gain       === "number") ? p.gain       : 0.5,
+      ridges:     (typeof p.ridges     === "number") ? p.ridges     : 0.0
+    };
+    let h01 = _terrainFBM(u, v, noise);
+    const plateau = Math.max(0, Math.min(1, (typeof p.plateau === "number") ? p.plateau : 0));
+    if (plateau > 0) {
+      const k = 1 + plateau * 4;
+      h01 = Math.pow(Math.max(0, Math.min(1, h01)), k);
+    }
+    const hsRaw = (typeof p.heightScale === "number") ? p.heightScale : 12;
+    const hs = hsRaw * (w / 100);
+    const yOff = (typeof p.yOffset === "number") ? p.yOffset : 0;
+    return (h01 - 1) * hs + yOff;
+  };
+
   const tryPlanetMesh = (n) => {
     const pl = _findPlanetInfo();
     if (!pl) return null;
@@ -47224,15 +47325,23 @@ function _terrainColliderHeightAt(wx, wz, opts) {
 
   if (explicit) {
     if (matchType(explicit, "TiledTerrain"))                  return tryTiled(explicit);
+    if (matchType(explicit, "Terrain"))                       return tryTerrain(explicit);
     if (matchType(explicit, "PlanetMesh"))                    return tryPlanetMesh(explicit);
     if (matchType(explicit, "Planet"))                        return tryPlanet(explicit);
     // Unknown explicit source -- fall through to auto.
   }
 
-  // Auto-resolve: TiledTerrain → PlanetMesh → Planet.
+  // Auto-resolve: TiledTerrain → Terrain → PlanetMesh → Planet. Tiled
+  // takes priority since it's the "infinite-world" path; Terrain is
+  // the finite single-mesh, queried in second place.
   const tt = state.nodes.find(n => matchType(n, "TiledTerrain"));
   if (tt) {
     const y = tryTiled(tt);
+    if (y !== null && Number.isFinite(y)) return y;
+  }
+  const ter = state.nodes.find(n => matchType(n, "Terrain"));
+  if (ter) {
+    const y = tryTerrain(ter);
     if (y !== null && Number.isFinite(y)) return y;
   }
   const pmesh = state.nodes.find(n => matchType(n, "PlanetMesh"));
@@ -62873,12 +62982,13 @@ function _svtGeneratePage(face, zoom, pageX, pageY, pmap) {
   // position to stay consistent across pages.
   const bumpFreq = 0.5;     // 2 m wavelength
   const bumpAmp  = 0.4;     // tangent-space normal slope range
-  // Reuse simple value noise from existing pipeline (cheap, ~2-axis).
+  // §bonus-perf (2026-05-25) -- was 2-octave (~40ms/page on M4). Cut
+  // to 1-octave (~20ms/page) since the bump only drives normal-map
+  // detail; the second octave was barely visible and added a hash
+  // call per pixel. Combined with the §bonus-perf 6 ms SVT budget,
+  // pages drain 3× faster while letting the frame render.
   const _bumpNoise = function(wx, wy, wz) {
-    // 2-octave value noise. ~3-4ns/call -> 50ns per pixel, 800k/page = ~40ms.
-    const n1 = _terrainValueNoise3D(wx * bumpFreq,        wy * bumpFreq,        wz * bumpFreq,        37.1);
-    const n2 = _terrainValueNoise3D(wx * bumpFreq * 4.0,  wy * bumpFreq * 4.0,  wz * bumpFreq * 4.0,  91.7);
-    return n1 * 0.6 + n2 * 0.4;
+    return _terrainValueNoise3D(wx * bumpFreq, wy * bumpFreq, wz * bumpFreq, 37.1);
   };
   // Approximate Earth-scale world position per page sample. Each
   // page covers ~40 km of terrain, each texel ~300 m. Use a fixed
@@ -65495,7 +65605,15 @@ function _ensurePlanetMeshChunks(node) {
   // manual _svtTest console trigger.
   if (_SVT.atlasTexture) {
     for (const v of visList) _svtQueueChunkPages(v.face, v.depth, v.ix, v.iy);
-    _svtTickGeneration(pmap, 30);   // 30 ms budget = ~10 pages/frame
+    // §bonus-perf (2026-05-25) -- was 30 ms which alone capped frame
+    // rate at 33 fps before render even started. 6 ms keeps SVT a
+    // secondary cost so the main render budget (~10 ms at 60 fps,
+    // ~25 ms at 30 fps) is preserved. Pages still backfill within
+    // a few seconds when the camera moves into new territory; the
+    // shader's per-fragment procedural fallback hides the gap until
+    // pages catch up. If queue depth becomes a problem we can move
+    // generation to a Worker (deferred -- larger refactor).
+    _svtTickGeneration(pmap, 6);
   }
 
   // Drop chunks that left the visible set.
@@ -66362,11 +66480,21 @@ function _buildTerrain(node) {
   // Y mapping: fBm returns 0..1, we map to -hs..0 so peaks (fBm=1)
   // land at Y = 0 and valleys (fBm=0) descend to Y = -hs. yOffset
   // shifts the whole stack so users can re-position vertically.
+  // §bonus-parity (2026-05-25) -- plateau remap matches TiledTerrain's
+  // _tiledBaseHeight. k = 1 + plateau*4: pow(h, k) compresses the lower
+  // band of the height field, leaving sharper isolated peaks rising
+  // out of a flatter plain. plateau=0 is a no-op (existing behavior).
+  const plateau = Math.max(0, Math.min(1, (typeof p.plateau === "number") ? p.plateau : 0));
+  const plateauK = 1 + plateau * 4;
   const heights = new Float32Array(N * N);
   if (!hmWired) {
     for (let j = 0; j < N; j++) {
       for (let i = 0; i < N; i++) {
-        heights[j * N + i] = (_terrainFBM(i / segs, j / segs, noise) - 1) * hs + yOff;
+        let h01 = _terrainFBM(i / segs, j / segs, noise);
+        if (plateau > 0) {
+          h01 = Math.pow(Math.max(0, Math.min(1, h01)), plateauK);
+        }
+        heights[j * N + i] = (h01 - 1) * hs + yOff;
       }
     }
   } else {
