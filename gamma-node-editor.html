@@ -55457,19 +55457,33 @@ fn fs_unlit_vc(in: VsOut) -> @location(0) vec4<f32> {
         let tinted = tex.rgb * color * 2.0;
         color = mix(color, tinted, texMix);
       }
-      // Sprint 10-4 v3 follow-up: per-fragment surface variation.
-      // Close-range only (faded out beyond 200m camera distance) so
-      // it doesn't speckle orbital views the way the old per-pixel
-      // detail_noise did. Two octaves of 3D value noise modulate
-      // brightness ±10% to simulate sub-vertex bump shading without
-      // needing a real normal-map texture or per-fragment relight.
+      // Sprint 10-4 v4: multi-scale procedural detail texture.
+      // Earlier v3 was 2 octaves at 50-200 m range -- too local.
+      // v4 adds a far-range macro octave (50 m wavelength visible
+      // out to 2 km) plus tighter near octaves, so terrain looks
+      // textured at ALL viewing distances except space. Faded with
+      // a 4-step falloff so the noise doesn't read at orbital:
+      //   far octave  : 50 m wavelength, visible 0-2000 m
+      //   mid octave  : 8 m,             0-500 m
+      //   near octave : 1.5 m,           0-200 m
+      //   micro octave: 0.3 m,           0-50 m
+      // Total amplitude per octave capped so even at full overlap
+      // the modulation stays under ±15% (no noise dominance).
       let camDistL = length(uS.eye.xyz - in.worldPos);
-      let bumpFade = 1.0 - smoothstep(50.0, 200.0, camDistL);
-      if (bumpFade > 0.001) {
-        let bumpN1 = _value_noise_3d(in.worldPos * 0.30);   // 3 m wavelength
-        let bumpN2 = _value_noise_3d(in.worldPos * 1.20);   // 0.8 m wavelength
-        let bumpMix = (bumpN1 - 0.5) * 0.66 + (bumpN2 - 0.5) * 0.34;
-        color = color * (1.0 + bumpMix * 0.20 * bumpFade);
+      let macroFade = 1.0 - smoothstep(500.0,  2000.0, camDistL);
+      let midFade   = 1.0 - smoothstep(150.0,   500.0, camDistL);
+      let nearFade  = 1.0 - smoothstep(50.0,    200.0, camDistL);
+      let microFade = 1.0 - smoothstep(15.0,     50.0, camDistL);
+      if (macroFade > 0.001) {
+        let n1 = _value_noise_3d(in.worldPos * 0.02)  - 0.5;   // 50 m
+        let n2 = _value_noise_3d(in.worldPos * 0.125) - 0.5;   // 8 m
+        let n3 = _value_noise_3d(in.worldPos * 0.66)  - 0.5;   // 1.5 m
+        let n4 = _value_noise_3d(in.worldPos * 3.30)  - 0.5;   // 0.3 m
+        let det =  n1 * 0.06 * macroFade
+                 + n2 * 0.10 * midFade
+                 + n3 * 0.12 * nearFade
+                 + n4 * 0.14 * microFade;
+        color = color * (1.0 + det);
       }
     }
 
@@ -59115,7 +59129,7 @@ function _planetMapCacheKey(node) {
     p.resolution, p.cellCount,
     p.seed, p.frequency, p.octaves,
     p.lacunarity, p.gain, p.ridges,
-    "v" + ver, "p13c", "src=earth-amp-biomeaware",
+    "v" + ver, "p13d", "src=earth-amp-densepoly",
     _EARTH_DEM.loaded ? "dem=real" : "dem=ellipse"
   ].join(",");
 }
@@ -63234,16 +63248,16 @@ function _resolvePlanetMeshGeom(p) {
     cxC: (typeof p.centerX === "number") ? p.centerX : 0,
     cyC: (typeof p.centerY === "number") ? p.centerY : 0,
     czC: (typeof p.centerZ === "number") ? p.centerZ : 0,
-    segs:        Math.max(2, Math.min(64, Math.floor((typeof p.segments === "number") ? p.segments : 16))),
-    // Sprint 9-6: maxDepth default bumped 12 -> 16 so foot-level
-    // chunks get small enough to resolve detail-noise features.
-    // At Earth radius with depth 16 the deepest leaf is ~152m wide
-    // (segs=16 → vertex spacing 9.5m); depth 20 gets to ~9m wide
-    // (vertex spacing 0.6m, sub-foot). cuberact ships maxDepth ~18
-    // and the angular-size split rule keeps total visible-chunk
-    // count near constant (only chunks UNDER the camera split deep
-    // -- distant chunks stay coarse).
-    maxDepth:    Math.max(0, Math.min(20, Math.floor((typeof p.maxDepth    === "number") ? p.maxDepth    : 16))),
+    // Sprint 10-4 v4: defaults bumped for modern game-tier mesh
+    // density. segs 16->32 quadruples per-chunk vert count
+    // (17²=289 → 33²=1089), and maxDepth 16->18 quadruples the
+    // visible chunk count near the camera (~9.5 m vertex spacing
+    // at Earth surface drops to ~2.4 m). Combined effect: ~16x
+    // more verts under the camera, eliminates most of the visible
+    // Phong-triangle facets at close range. Cap raised 64→128 /
+    // 20→22 for users who want to push it further.
+    segs:        Math.max(2, Math.min(128, Math.floor((typeof p.segments === "number") ? p.segments : 32))),
+    maxDepth:    Math.max(0, Math.min(22, Math.floor((typeof p.maxDepth    === "number") ? p.maxDepth    : 18))),
     splitFactor: Math.max(0.1, Math.min(50, (typeof p.splitFactor === "number") ? p.splitFactor : 5.0)),
     hs:       (typeof p.heightScale === "number") ? p.heightScale : 0,
     seaLevel: Math.max(0, Math.min(1, (typeof p.seaLevel === "number") ? p.seaLevel : 0.5))
