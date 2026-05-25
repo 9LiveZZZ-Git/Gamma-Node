@@ -57283,6 +57283,8 @@ function _perfFrameReset() {
   _PERFSTATS.chunksVisible = 0;
   _PERFSTATS.chunksBuilt = 0;
   _PERFSTATS.chunkBuildMs = 0;
+  _PERFSTATS.chunkPhQueue = 0;
+  _PERFSTATS.chunkUpQueue = 0;
   _PERFSTATS.demTilesFetched = 0;
   _PERFSTATS.demTilesArrived = 0;
   _PERFSTATS.chunksInvalidated = 0;
@@ -57322,6 +57324,7 @@ function _perfFrameDump() {
     + " vis=" + _PERFSTATS.chunksVisible
     + depthStr
     + " built=" + _PERFSTATS.chunksBuilt + "(" + _PERFSTATS.chunkBuildMs.toFixed(1) + "ms)"
+    + " qPh=" + _PERFSTATS.chunkPhQueue + " qUp=" + _PERFSTATS.chunkUpQueue
     + " demFetch=" + _PERFSTATS.demTilesFetched
     + " demArrive=" + _PERFSTATS.demTilesArrived
     + " invald=" + _PERFSTATS.chunksInvalidated
@@ -65863,13 +65866,39 @@ function _ensurePlanetMeshChunks(node) {
   // Two-phase incremental build under per-frame time budgets. Phase 1
   // = segs=2 placeholder so every visible chunk has SOMETHING within a
   // frame. Phase 2 = upgrade to full segs. Same shape as legacy Planet.
+  // §bonus-sub5k (2026-05-25) -- per-chunk distance to camera. The
+  // previous sort by depth was a rough proxy (deeper = usually closer)
+  // but broke down near LOD boundaries; foreground gaps were filled
+  // alongside far-away background chunks. Sort by ACTUAL distance from
+  // camera so the visible disc fills outward from feet, not arbitrarily.
+  // Reuses _planetSpherify to get the sphere-surface position.
+  const _distSq = function(info) {
+    if (typeof info._dSq === "number") return info._dSq;
+    const uMid = (info.uMin !== undefined && info.uMax !== undefined) ? (info.uMin + info.uMax) * 0.5 : 0;
+    const vMid = (info.vMin !== undefined && info.vMax !== undefined) ? (info.vMin + info.vMax) * 0.5 : 0;
+    const f = _PLANET_FACES[info.face];
+    const cx = f.n[0] + f.t[0] * uMid + f.b[0] * vMid;
+    const cy = f.n[1] + f.t[1] * uMid + f.b[1] * vMid;
+    const cz = f.n[2] + f.t[2] * uMid + f.b[2] * vMid;
+    const sph = _planetSpherify(cx, cy, cz);
+    const wx = sph[0] * geom.r, wy = sph[1] * geom.r, wz = sph[2] * geom.r;
+    const dx = camPos.x - wx, dy = camPos.y - wy, dz = camPos.z - wz;
+    info._dSq = dx*dx + dy*dy + dz*dz;
+    return info._dSq;
+  };
+
   const phPending = [];
   for (const [key, info] of visible) {
     if (entry.chunks.has(key)) continue;
     phPending.push({ key, info });
   }
-  phPending.sort((a, b) => b.info.depth - a.info.depth);
-  const PH_BUDGET_MS = 8;
+  // Nearest first -- foreground gets a placeholder ASAP.
+  phPending.sort((a, b) => _distSq(a.info) - _distSq(b.info));
+  // §bonus-sub5k -- 8 → 14 ms. At 32-seg quality the 5 km disc needs
+  // ~670 chunks built; old budget = 2 chunks/frame = 5.6 sec full fill.
+  // 14 ms eats more frame budget but the cull keeps the camera at
+  // 60 fps headroom and the LOD pyramid fills 2× faster.
+  const PH_BUDGET_MS = 14;
   const phStart = performance.now();
   let phBuilt = 0;
   for (let i = 0; i < phPending.length; i++) {
@@ -65890,8 +65919,11 @@ function _ensurePlanetMeshChunks(node) {
     if (!c || c.currentLod === geom.segs) continue;
     upPending.push({ key, info, c });
   }
-  upPending.sort((a, b) => b.info.depth - a.info.depth);
-  const UP_BUDGET_MS = 12;
+  // Nearest first for upgrade too -- the placeholder mesh under your
+  // feet must become full-res before far chunks get upgraded.
+  upPending.sort((a, b) => _distSq(a.info) - _distSq(b.info));
+  // §bonus-sub5k -- 12 → 18 ms. Same reasoning as PH bump.
+  const UP_BUDGET_MS = 18;
   const upStart = performance.now();
   let upBuilt = 0;
   for (let i = 0; i < upPending.length; i++) {
@@ -65907,6 +65939,11 @@ function _ensurePlanetMeshChunks(node) {
     if (performance.now() - upStart > UP_BUDGET_MS) break;
   }
   const upMs = performance.now() - upStart;
+  // §bonus-sub5k -- queue depth into perf so we see backlog draining.
+  if (typeof _PERFSTATS !== "undefined") {
+    _PERFSTATS.chunkPhQueue = phPending.length - phBuilt;
+    _PERFSTATS.chunkUpQueue = upPending.length - upBuilt;
+  }
 
   if (typeof _PERFSTATS !== "undefined") {
     _PERFSTATS.chunksVisible += visible.size;
