@@ -54661,6 +54661,102 @@ fn sample_aerial_perspective_lut(camPos: vec3<f32>, fragPos: vec3<f32>) -> AtmRe
   return AtmResult(inScatter, transmittanceScaled);
 }
 
+/* ---- Sprint 7.6.a-night: photorealistic stars + Milky Way helpers.
+ *
+ * Three components combined per fragment:
+ *  1) Multi-magnitude starfield  -- 3 grid scales = 3 magnitude bands,
+ *     density boosted near the galactic plane (Hipparcos density rises
+ *     ~5× inside |b|<10°).
+ *  2) Galactic-frame Milky Way   -- band intensity from |sin(b)|,
+ *     center-vs-anticenter asymmetry, 3-octave cloud fbm + threshold-
+ *     cut dust lanes, warm bulge → cool disk color gradient.
+ *  3) HII nebula highlights      -- rare reddish-pink blobs gated by a
+ *     low-freq mask, only on the bright side of the band.
+ *
+ * All in pure WGSL; no textures, no CPU upload. Uses smooth value
+ * noise instead of raw lattice hash because the Milky Way needs
+ * cloud-like continuity across the visible band.
+ */
+
+fn _sky_hash3(p: vec3<f32>) -> f32 {
+  return fract(sin(dot(p, vec3<f32>(127.1, 311.7, 74.7))) * 43758.5453);
+}
+
+fn _sky_vnoise3(p: vec3<f32>) -> f32 {
+  let i = floor(p);
+  let f = fract(p);
+  let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);   // smootherstep
+  let c000 = _sky_hash3(i + vec3<f32>(0.0, 0.0, 0.0));
+  let c100 = _sky_hash3(i + vec3<f32>(1.0, 0.0, 0.0));
+  let c010 = _sky_hash3(i + vec3<f32>(0.0, 1.0, 0.0));
+  let c110 = _sky_hash3(i + vec3<f32>(1.0, 1.0, 0.0));
+  let c001 = _sky_hash3(i + vec3<f32>(0.0, 0.0, 1.0));
+  let c101 = _sky_hash3(i + vec3<f32>(1.0, 0.0, 1.0));
+  let c011 = _sky_hash3(i + vec3<f32>(0.0, 1.0, 1.0));
+  let c111 = _sky_hash3(i + vec3<f32>(1.0, 1.0, 1.0));
+  let x00 = mix(c000, c100, u.x);
+  let x10 = mix(c010, c110, u.x);
+  let x01 = mix(c001, c101, u.x);
+  let x11 = mix(c011, c111, u.x);
+  let y0  = mix(x00, x10, u.y);
+  let y1  = mix(x01, x11, u.y);
+  return mix(y0, y1, u.z);
+}
+
+fn _sky_fbm3(p: vec3<f32>, octaves: i32) -> f32 {
+  var amp:  f32 = 0.5;
+  var freq: f32 = 1.0;
+  var sum:  f32 = 0.0;
+  var norm: f32 = 0.0;
+  for (var i: i32 = 0; i < octaves; i = i + 1) {
+    sum  = sum  + amp * _sky_vnoise3(p * freq);
+    norm = norm + amp;
+    amp  = amp  * 0.5;
+    freq = freq * 2.03;      // jittered to break axis-aligned pulses
+  }
+  return sum / max(norm, 1e-6);
+}
+
+/* Star color from a temperature hash in [0,1]. Skewed toward cool
+ * reds (real stellar IMF: most stars are M-class) with rare blue
+ * giants -- pow(0.55) remaps a uniform hash so the bulk of stars
+ * land in the warm half. */
+fn _sky_star_color(tIn: f32) -> vec3<f32> {
+  let t = pow(clamp(tIn, 0.0, 1.0), 0.55);
+  if (t < 0.30) {
+    return mix(vec3<f32>(1.00, 0.55, 0.32),     // M red
+               vec3<f32>(1.00, 0.78, 0.55),     // K orange
+               t / 0.30);
+  } else if (t < 0.55) {
+    return mix(vec3<f32>(1.00, 0.78, 0.55),
+               vec3<f32>(1.00, 1.00, 0.96),     // G/F yellow-white
+               (t - 0.30) / 0.25);
+  } else if (t < 0.80) {
+    return mix(vec3<f32>(1.00, 1.00, 0.96),
+               vec3<f32>(0.86, 0.92, 1.00),     // A white-blue
+               (t - 0.55) / 0.25);
+  } else {
+    return mix(vec3<f32>(0.86, 0.92, 1.00),
+               vec3<f32>(0.62, 0.74, 1.00),     // B/O blue
+               (t - 0.80) / 0.20);
+  }
+}
+
+/* Galactic frame projection. Returns vec2(sin(galLat), cos(galLon))
+ * where galLat = 0 on the plane, ±π/2 at the poles, and galLon = 0
+ * pointing toward the galactic center. The Gram-Schmidt step keeps
+ * the center direction perpendicular to the pole regardless of how
+ * the pole guess is normalized. */
+fn _sky_galactic(dir: vec3<f32>) -> vec2<f32> {
+  let galPole = normalize(vec3<f32>(0.45, 0.75, -0.48));
+  let guess   = vec3<f32>(0.80, 0.10, 0.59);
+  let center  = normalize(guess - galPole * dot(guess, galPole));
+  let sinLat  = dot(dir, galPole);
+  let inPlane = normalize(dir - galPole * sinLat);
+  let lonCos  = dot(inPlane, center);
+  return vec2<f32>(sinLat, lonCos);
+}
+
 fn sample_procedural_sky_features(dir: vec3<f32>) -> vec3<f32> {
   let sunDir    = uS.envSun.xyz;
   let sunVis    = uS.envSun.w;
@@ -54747,43 +54843,87 @@ fn sample_procedural_sky_features(dir: vec3<f32>) -> vec3<f32> {
   let moon_color = vec3<f32>(0.92, 0.95, 1.00);
   col = col + (moon_disk + moon_halo) * moon_color;
 
-  // --- Stars: denser grid + temperature-varied color. Hash grid
-  //     bumped 220 -> 360 so individual stars stay tiny at larger
-  //     pixel counts. Threshold lowered 0.997 -> 0.989 (~3x more
-  //     stars). Each star gets a "temperature hash" mapped from
-  //     hot-blue to cool-orange.
-  // §planet-spec Phase 5+ -- view_y > 0 gate removed: in space the
+  // --- Sprint 7.6.a-night: photoreal starfield + galactic Milky Way.
+  //
+  // Three components rolled into one if-block. Helpers are above the
+  // function: _sky_hash3 (lattice hash), _sky_vnoise3 (smooth value
+  // noise -- needed because raw lattice hash repeats visibly across
+  // the Milky Way's wide band), _sky_fbm3 (3-octave fbm for cloud
+  // structure), _sky_star_color (stellar-IMF biased temperature →
+  // color), _sky_galactic (returns sin(b), cos(l) in galactic frame).
+  //
+  // §planet-spec Phase 5+: view_y > 0 gate removed -- in space the
   // user looks DOWN at the planet and stars are visible everywhere
-  // not occluded by the planet itself. Planet's depth-tested mesh
-  // does the occlusion correctly via the sky pass's farthest-Z.
+  // not occluded by it; planet mesh depth-tests against the sky.
   if (star_vis > 0.001) {
-    let p = floor(dir * 360.0);
-    let h = fract(sin(dot(p, vec3<f32>(127.1, 311.7, 74.7))) * 43758.5453);
-    let star_amt = smoothstep(0.989, 1.0, h) * star_vis;
-    let temp_h = fract(sin(dot(p, vec3<f32>(89.3, 47.7, 31.1))) * 76123.4);
-    var starColor: vec3<f32>;
-    if (temp_h < 0.5) {
-      starColor = mix(vec3<f32>(0.62, 0.78, 1.00),
-                      vec3<f32>(1.00, 0.98, 0.95),
-                      smoothstep(0.0, 0.5, temp_h));
-    } else {
-      starColor = mix(vec3<f32>(1.00, 0.98, 0.95),
-                      vec3<f32>(1.00, 0.72, 0.45),
-                      smoothstep(0.5, 1.0, temp_h));
-    }
-    let twinkle = 0.55 + 0.45 * fract(sin(dot(p, vec3<f32>(19.7, 41.3, 7.1))) * 12345.6);
-    col = col + starColor * star_amt * twinkle * 1.4;
+    let gal     = _sky_galactic(dir);
+    let sinLat  = gal.x;                         // sin(galactic lat)
+    let lonCos  = gal.y;                         // cos(galactic lon)
+    let absLat  = abs(sinLat);
+    let bandFalloff = exp(-absLat * absLat * 28.0);   // ~10° band
+    let densityBoost = 1.0 + 3.0 * bandFalloff;       // plane bias
 
-    // --- Milky Way band. Tilted reference axis (~galactic pole),
-    //     soft glow + low-freq noise for clumpy dust-lane look.
-    //     Night-only, above-horizon-only.
-    let galacticAxis = normalize(vec3<f32>(0.45, 0.55, 0.70));
-    let bandDist = abs(dot(dir, galacticAxis));
-    let bandIntensity = smoothstep(0.35, 0.05, bandDist);
-    let nhash = fract(sin(dot(floor(dir * 24.0), vec3<f32>(17.3, 91.2, 53.5))) * 8194.7);
-    let bandTex = 0.45 + 0.55 * nhash;
-    let bandColor = vec3<f32>(0.22, 0.20, 0.32);
-    col = col + bandColor * bandIntensity * bandTex * star_vis * 0.65;
+    // --- 1) BRIGHT stars (rare, coarse grid). m≈1 magnitude class.
+    let p1 = floor(dir * 80.0);
+    let h1 = _sky_hash3(p1);
+    let t1 = _sky_hash3(p1 + vec3<f32>(7.0, 13.0, 19.0));
+    let tw1 = 0.65 + 0.35 * _sky_hash3(p1 + vec3<f32>(91.0, 53.0, 11.0));
+    let amt1 = smoothstep(0.998, 1.0, h1) * star_vis * 3.5;
+    col = col + _sky_star_color(t1) * amt1 * tw1;
+
+    // --- 2) MID stars (medium grid). m≈3 magnitude class.
+    let p2 = floor(dir * 220.0);
+    let h2 = _sky_hash3(p2);
+    let t2 = _sky_hash3(p2 + vec3<f32>(7.0, 13.0, 19.0));
+    let tw2 = 0.60 + 0.40 * _sky_hash3(p2 + vec3<f32>(91.0, 53.0, 11.0));
+    let thr2 = 0.995 - 0.005 * bandFalloff;          // looser near plane
+    let amt2 = smoothstep(thr2, 1.0, h2) * star_vis * 1.5 * densityBoost;
+    col = col + _sky_star_color(t2) * amt2 * tw2;
+
+    // --- 3) DIM stars (fine grid). m≈5+ magnitude class. The bulk
+    //     of visible stars on a dark site come from this layer.
+    let p3 = floor(dir * 520.0);
+    let h3 = _sky_hash3(p3);
+    let t3 = _sky_hash3(p3 + vec3<f32>(7.0, 13.0, 19.0));
+    let tw3 = 0.60 + 0.40 * _sky_hash3(p3 + vec3<f32>(91.0, 53.0, 11.0));
+    let thr3 = 0.992 - 0.010 * bandFalloff;
+    let amt3 = smoothstep(thr3, 1.0, h3) * star_vis * 0.7 * densityBoost;
+    col = col + _sky_star_color(t3) * amt3 * tw3;
+
+    // --- 4) Milky Way: galactic-plane glow with center bias, multi-
+    //     octave cloud noise, threshold-cut dust lanes carved into
+    //     the band, and warm bulge → cool disk color gradient.
+    //     pow(centerBias, 1.6) so the Sagittarius-direction bulge
+    //     dominates and the anticenter side is just a faint glow.
+    let centerBias = 0.5 + 0.5 * lonCos;             // [0,1]
+    let centerW    = pow(centerBias, 1.6);
+
+    let cloud = _sky_fbm3(dir * 6.0, 3);
+    let dustN = _sky_vnoise3(dir * 14.0
+                             + vec3<f32>(0.3, 1.7, -2.1));
+    let dust  = smoothstep(0.42, 0.78, dustN);
+
+    let bandStr = bandFalloff
+                * (0.30 + 0.70 * cloud)
+                * (0.25 + 0.75 * centerW)
+                * (1.0 - 0.65 * dust);
+    let warmCol = vec3<f32>(0.55, 0.42, 0.28);       // bulge + dust
+    let coolCol = vec3<f32>(0.20, 0.28, 0.48);       // disk + OB stars
+    let mwColor = mix(coolCol, warmCol, centerW);
+    col = col + mwColor * bandStr * star_vis * 1.8;
+
+    // --- 5) HII / nebula highlights: rare reddish-pink blobs on the
+    //     bright side of the band. Low-freq mask gates these to a
+    //     few spots (think Orion, Eta Carinae, Lagoon). Hash on the
+    //     coarse cell determines pink-vs-blue (emission vs reflect).
+    let nebMask = smoothstep(0.78, 0.92,
+                             _sky_vnoise3(dir * 3.2
+                                          + vec3<f32>(11.1, 4.3, 7.7)));
+    let nebCol = mix(vec3<f32>(0.80, 0.30, 0.45),
+                     vec3<f32>(0.50, 0.65, 1.00),
+                     _sky_hash3(floor(dir * 3.2)));
+    col = col + nebCol * nebMask * bandFalloff * centerW
+              * star_vis * 0.55;
   }
 
   return col * intensity;
@@ -68895,9 +69035,30 @@ function _resolveLightNode(lightNode) {
  * The +Z tilt is cosmetic -- a perfectly polar arc looks flat. */
 function _sunDirFromTime(t) {
   const wrapped = ((t % 1) + 1) % 1;        // wrap to [0, 1)
+  // On the spherical planet, world +Y is the NORTH POLE; the local up
+  // at the equator (where the demo camera lands) is radial-outward,
+  // NOT +Y. So the sun must arc in the EQUATORIAL plane (XZ), with
+  // a small +Y tilt for axial-tilt cosmetics. The old XY-plane sweep
+  // made the sun visibly traverse north-to-south because +Y is the
+  // polar axis on a sphere.
+  const planetMode = !!(typeof state !== "undefined"
+    && state && Array.isArray(state.nodes)
+    && state.nodes.some(n => n && (n.type === "Planet" || n.type === "PlanetMesh")));
+  if (planetMode) {
+    // t=0.5 (noon)    → +X    (up for the demo cam)
+    // t=0.25 (sunrise)→ +Z    (east tangent)
+    // t=0.75 (sunset) → -Z    (west tangent)
+    // t=0 / t=1       → -X    (below horizon — night)
+    const theta = (0.5 - wrapped) * Math.PI * 2;
+    const sx = Math.cos(theta);
+    const sz = Math.sin(theta);
+    const sy = 0.30;                  // ~17° axial-tilt cosmetic
+    const len = Math.hypot(sx, sy, sz) || 1.0;
+    return [sx / len, sy / len, sz / len];
+  }
+  // Legacy flat-terrain mode kept verbatim: scene up = +Y, so a sun
+  // arc in the XY plane gives the expected zenith pass.
   const theta = (wrapped - 0.25) * Math.PI * 2;
-  // Pre-normalization: cos(theta) is the X sweep, sin(theta) is the Y
-  // elevation, Z is the small cosmetic forward tilt.
   const sx = Math.cos(theta);
   const sy = Math.sin(theta);
   const sz = 0.3;
