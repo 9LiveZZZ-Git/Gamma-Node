@@ -10559,12 +10559,15 @@ public:
     cppType: "",
     kind: "game-body",
     ins: [
+      { n: "tilemap",    t: "mesh"  },
       { n: "inputX",     t: "param" },
       { n: "jump",       t: "param" },
       { n: "walkSpeed",  t: "param" },
       { n: "gravity",    t: "param" },
       { n: "jumpForce",  t: "param" },
       { n: "airControl", t: "param" },
+      { n: "width",      t: "param" },
+      { n: "height",     t: "param" },
       { n: "groundY",    t: "param" },
       { n: "initX",      t: "param" },
       { n: "initY",      t: "param" },
@@ -10581,7 +10584,8 @@ public:
     params: {
       inputX: 0, jump: 0,
       walkSpeed: 6, gravity: 22, jumpForce: 11, airControl: 1,
-      groundY: 0,
+      width: 0.6, height: 1.0,
+      groundY: -100,
       initX: 0, initY: 1, reset: 0,
       // Internal state + outputs. Written by tick.
       x: 0, y: 1, vx: 0, vy: 0, grounded: 0, facing: 1,
@@ -10589,7 +10593,7 @@ public:
     },
     methods: {},
     uiOnlyParams: ["x", "y", "vx", "vy", "grounded", "facing", "_inited", "_prevReset"],
-    description: "2D platformer character body. Takes inputX (-1..1, e.g. KeyAxis2D.x) + jump (one-frame edge, e.g. KeyAxis2D.jump) + tuning params (walkSpeed m/s, gravity m/s², jumpForce m/s impulse, airControl 0..1 multiplier when not grounded), runs the standard platformer integration each frame, outputs the resulting (x, y, vx, vy) + grounded flag + facing direction (-1 = left, 1 = right). Wire x/y into a Translate driving the player Sprite. groundY clamps the lowest the player can fall to (set negative for a deeper pit, set to the visible floor's top for a flat level)."
+    description: "2D platformer character body. Takes inputX (-1..1, e.g. KeyAxis2D.x) + jump (one-frame edge, e.g. KeyAxis2D.jump) + tuning params (walkSpeed m/s, gravity m/s², jumpForce m/s impulse, airControl 0..1 multiplier when not grounded), runs the standard platformer integration each frame, outputs the resulting (x, y, vx, vy) + grounded flag + facing direction (-1 = left, 1 = right). Wire x/y into a Translate driving the player Sprite. width/height define the player AABB (anchored bottom-center: y is the FEET line). When a Tilemap2D is wired into `tilemap` (or auto-discovered as the first Tilemap2D in the patch), the body collides AABB-vs-tiles per axis: walks into walls, lands on platform tops, bonks ceilings. groundY is a safety floor for when the player walks off the tilemap (default -100, set to your level's actual floor for tighter behavior)."
   },
 
   /* Sprint platformer-1 -- Tilemap2D. Grid-based mesh primitive.
@@ -10632,7 +10636,7 @@ public:
       color4R: 0.85, color4G: 0.75, color4B: 0.30    // gold-coin
     },
     methods: {},
-    description: "2D tilemap mesh. tileData is a multi-line string -- each char is a cell (space or '.' = empty; '1'/'#' = color1, '2' = color2, '3' = color3, '4' = color4). Cell pitch = tileSize world units. Emits one mesh = one quad per non-empty cell so Scene2D draws the whole level in a single call. originX/Y shifts the grid origin (default: cell (cols/2, rows/2) at world (0,0))."
+    description: "2D tilemap mesh. tileData is a multi-line string -- each char is a cell (space or '.' = empty; '1'/'#' = color1, '2' = color2, '3' = color3, '4' = color4). Cell pitch = tileSize world units. Emits one mesh = one quad per non-empty cell so Scene2D draws the whole level in a single call. originX/Y shifts the grid origin (default: cell (cols/2, rows/2) at world (0,0)). **Collision** (when wired into PlatformerBody2D.tilemap): solid = any rendered cell EXCEPT '4' (coin / collectible marker, passable). Use '4' for decorative + passable cells, other chars for walls / platforms / floor."
   },
 
   /* Phase 7 §5.5.g -- Minimap HUD node. First member of a planned
@@ -36313,11 +36317,13 @@ const _demos = [
         gravity:   22,
         jumpForce: 11,
         airControl: 0.85,
-        groundY:   -3,
+        width: 0.6, height: 1.0,
+        groundY:   -10,          // safety net well below the tilemap
         initX: -4, initY: 0
       });
       state.edges.push({ from: { node: keys, port: "x"    }, to: { node: body, port: "inputX" } });
       state.edges.push({ from: { node: keys, port: "jump" }, to: { node: body, port: "jump"   } });
+      // tilemap wire added BELOW once `level` exists -- see after Tilemap2D.
 
       // ─── Level (tilemap) ──────────────────────────────────────
       // 32×9 grid. '.' = sky, '1' = grass (top), '2' = dirt (under),
@@ -36341,6 +36347,10 @@ const _demos = [
         color3R: 0.62, color3G: 0.62, color3B: 0.72,   // stone-platform
         color4R: 0.95, color4G: 0.82, color4B: 0.30    // coin-gold
       });
+      // Tilemap → body for collision. Solid chars '1', '2', '3', '#'
+      // by default (PlatformerBody2D.solidChars = "123#"); '4' (coin)
+      // and '.' / ' ' are passable.
+      state.edges.push({ from: { node: level, port: "mesh" }, to: { node: body, port: "tilemap" } });
 
       // ─── Player ───────────────────────────────────────────────
       const player = makeNode("Sprite", 280, 240, {
@@ -48491,6 +48501,87 @@ function _tickGameInputs(dt) {
     const v = node.params ? node.params[port] : undefined;
     return (typeof v === "number") ? v : fallback;
   };
+  // Helper: locate the Tilemap2D node that backs this body's
+  // collision. Order: wire on `tilemap` input → first Tilemap2D in
+  // the patch. Returns null if no tilemap exists (body falls back to
+  // groundY-only behavior).
+  const _findTilemap = (bodyNode) => {
+    if (Array.isArray(state.edges)) {
+      const wire = state.edges.find(e =>
+        e && e.to && e.to.node === bodyNode.id && e.to.port === "tilemap"
+      );
+      if (wire && wire.from) {
+        const src = state.nodes.find(n => n && n.id === wire.from.node);
+        if (src && src.type === "Tilemap2D") return src;
+      }
+    }
+    return state.nodes.find(n => n && n.type === "Tilemap2D") || null;
+  };
+  // Helper: parse a Tilemap2D's tileData into a {rows, cols, grid,
+  // tileSize, originX, originY, solidSet} object cached on the
+  // tilemap node so we re-parse only when params change.
+  const _parseTilemap = (tnode) => {
+    const tp = tnode.params || {};
+    const data = (typeof tp.tileData === "string") ? tp.tileData : "";
+    const ts   = (typeof tp.tileSize === "number" && tp.tileSize > 0) ? tp.tileSize : 1;
+    const ox   = (typeof tp.originX  === "number") ? tp.originX  : 0;
+    const oy   = (typeof tp.originY  === "number") ? tp.originY  : 0;
+    const key = data + "|" + ts + "|" + ox + "|" + oy;
+    if (tnode._collisionCacheKey === key) return tnode._collisionCache;
+    const rowsArr = data.split(/\r?\n/);
+    const rows = rowsArr.length;
+    const cols = rowsArr.reduce((m, r) => Math.max(m, r.length), 0);
+    tnode._collisionCacheKey = key;
+    tnode._collisionCache = {
+      rows, cols, ts, ox, oy,
+      cx: (cols - 1) * 0.5,
+      cy: (rows - 1) * 0.5,
+      rowsArr
+    };
+    return tnode._collisionCache;
+  };
+  // Helper: is the given (col, row) a SOLID tile in tilemap? Passable
+  // chars: '.', ' ', '' (empty), and '4' (coin marker -- collectible,
+  // not blocking). Everything else solid. Out-of-bounds = passable so
+  // the player can walk off the side of the map; groundY catches the
+  // fall.
+  const _isSolid = (tcache, col, row) => {
+    if (col < 0 || row < 0 || row >= tcache.rows) return false;
+    const line = tcache.rowsArr[row];
+    if (col >= line.length) return false;
+    const ch = line[col];
+    return ch !== "." && ch !== " " && ch !== "" && ch !== "4";
+  };
+  // Helper: does the AABB at (cx, cyf, halfW, halfH) overlap any solid
+  // tile in tilemap? cyf = AABB center y. Returns true on first hit
+  // for early exit. Iterates only the col/row range covering the AABB.
+  const _aabbOverlaps = (tcache, axLo, axHi, ayLo, ayHi) => {
+    const halfTS = tcache.ts * 0.5;
+    // Cell containing worldX: col = floor((x - ox)/ts + cx + 0.5).
+    // Cell containing worldY: row = floor(cy - (y - oy)/ts + 0.5)
+    //   (row 0 = top of grid, so higher world-Y = lower row).
+    // Iterate one cell beyond the floor/ceil to absorb any edge-case
+    // misalignment; the AABB overlap test inside filters out the slack.
+    const colMin = Math.floor((axLo - tcache.ox) / tcache.ts + tcache.cx) - 1;
+    const colMax = Math.floor((axHi - tcache.ox) / tcache.ts + tcache.cx) + 1;
+    const rowMin = Math.floor(tcache.cy - (ayHi - tcache.oy) / tcache.ts) - 1;
+    const rowMax = Math.floor(tcache.cy - (ayLo - tcache.oy) / tcache.ts) + 1;
+    for (let r = rowMin; r <= rowMax; r++) {
+      for (let c = colMin; c <= colMax; c++) {
+        if (!_isSolid(tcache, c, r)) continue;
+        // Cell AABB
+        const tx = (c - tcache.cx) * tcache.ts + tcache.ox;
+        const ty = (tcache.cy - r) * tcache.ts + tcache.oy;
+        const tLo_x = tx - halfTS, tHi_x = tx + halfTS;
+        const tLo_y = ty - halfTS, tHi_y = ty + halfTS;
+        if (axHi > tLo_x && axLo < tHi_x && ayHi > tLo_y && ayLo < tHi_y) {
+          return { col: c, row: r, tx, ty, tLo_x, tHi_x, tLo_y, tHi_y };
+        }
+      }
+    }
+    return null;
+  };
+
   for (const node of state.nodes) {
     if (!node || node.type !== "PlatformerBody2D") continue;
     const p = node.params = node.params || {};
@@ -48511,7 +48602,10 @@ function _tickGameInputs(dt) {
     const gravity    = _resolveNumIn(node, "gravity",    22);
     const jumpForce  = _resolveNumIn(node, "jumpForce",  11);
     const airControl = _resolveNumIn(node, "airControl", 1);
-    const groundY    = _resolveNumIn(node, "groundY",    0);
+    const width      = _resolveNumIn(node, "width",      0.6);
+    const height     = _resolveNumIn(node, "height",     1.0);
+    const groundY    = _resolveNumIn(node, "groundY",    -100);
+    const halfW      = width * 0.5;
     // Horizontal: snap velocity to inputX * walkSpeed, scaled by
     // airControl when not grounded. (Arcade feel; no acceleration.)
     const ctrl = (p.grounded >= 0.5) ? 1 : airControl;
@@ -48519,16 +48613,50 @@ function _tickGameInputs(dt) {
     // Vertical: gravity always; jump impulse only if grounded.
     if (jump >= 0.5 && p.grounded >= 0.5) p.vy = jumpForce;
     p.vy -= gravity * dt;
-    // Integrate position.
-    p.x += p.vx * dt;
-    p.y += p.vy * dt;
-    // Ground collision -- clamp y to groundY, kill downward velocity.
+    // Resolve collision against tilemap (if any). Anchor is BOTTOM-
+    // CENTER so y is the feet line; AABB = (x - halfW, y) → (x + halfW, y + height).
+    const tnode = _findTilemap(node);
+    const tcache = tnode ? _parseTilemap(tnode) : null;
+    // -- X axis movement + push-back --
+    const intendedX = p.x + p.vx * dt;
+    let newX = intendedX;
+    if (tcache) {
+      const ayLo = p.y, ayHi = p.y + height;
+      const hit = _aabbOverlaps(tcache, newX - halfW, newX + halfW, ayLo, ayHi);
+      if (hit) {
+        if (p.vx > 0)      newX = hit.tLo_x - halfW - 0.0001;
+        else if (p.vx < 0) newX = hit.tHi_x + halfW + 0.0001;
+        p.vx = 0;
+      }
+    }
+    p.x = newX;
+    // -- Y axis movement + push-back --
+    const intendedY = p.y + p.vy * dt;
+    let newY = intendedY;
+    let groundedFromTile = false;
+    if (tcache) {
+      const axLo = p.x - halfW, axHi = p.x + halfW;
+      const hit = _aabbOverlaps(tcache, axLo, axHi, newY, newY + height);
+      if (hit) {
+        if (p.vy < 0) {
+          // Falling onto tile top -- land. Push feet up to tile top.
+          newY = hit.tHi_y + 0.0001;
+          groundedFromTile = true;
+        } else if (p.vy > 0) {
+          // Rising into tile bottom -- bonk head. Push top down.
+          newY = hit.tLo_y - height - 0.0001;
+        }
+        p.vy = 0;
+      }
+    }
+    p.y = newY;
+    // Safety-net ground (when off the tilemap, or no tilemap at all).
     if (p.y <= groundY) {
       p.y = groundY;
       if (p.vy < 0) p.vy = 0;
       p.grounded = 1;
     } else {
-      p.grounded = 0;
+      p.grounded = groundedFromTile ? 1 : 0;
     }
     // Facing follows last non-zero inputX.
     if (inputX > 0.1)      p.facing = 1;
