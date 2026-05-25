@@ -54757,6 +54757,86 @@ fn _sky_galactic(dir: vec3<f32>) -> vec2<f32> {
   return vec2<f32>(sinLat, lonCos);
 }
 
+/* Standard HSV→RGB (Sam Hocevar's branchless form). Used by the
+ * mantis-shrimp nebula pass to cycle through the full color wheel
+ * instead of mixing two anchor colors. */
+fn _sky_hsv_to_rgb(c: vec3<f32>) -> vec3<f32> {
+  let K = vec4<f32>(1.0, 2.0/3.0, 1.0/3.0, 3.0);
+  let p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+  return c.z * mix(K.xxx,
+                   clamp(p - K.xxx, vec3<f32>(0.0), vec3<f32>(1.0)),
+                   c.y);
+}
+
+/* Volumetric Milky Way + unrealistic nebula raymarch.
+ *
+ * Earlier sprint baked the band analytically (single sample per
+ * fragment of bandFalloff × cloudNoise × dustMask). That reads as
+ * a flat painted streak -- no depth. This pass marches the view
+ * ray through a 3D density field constrained near the galactic
+ * plane, so overlapping cloud structures actually composite over
+ * each other and the band gets the parallax-y feel of clouds at
+ * different distances. Hue is sampled per-step from an independent
+ * fbm and run through HSV with full-wheel cycling, giving the
+ * mantis-shrimp palette (cyan / magenta / lime / hot pink / violet
+ * / electric blue) rather than the realistic warm-bulge → cool-
+ * disk gradient.
+ *
+ * Cost: ~16 steps × (3-oct density fbm + 2-oct hue fbm + 1 vnoise)
+ * per ray that touches the band. Early-outs aggressively when far
+ * from the plane (|sin b| > 0.42) and on alpha saturation. */
+fn _sky_volumetric_band(dir: vec3<f32>,
+                        sinLat: f32,
+                        lonCos: f32,
+                        starVis: f32) -> vec3<f32> {
+  let absLat = abs(sinLat);
+  if (absLat > 0.42) {
+    return vec3<f32>(0.0);
+  }
+  let bandCore = exp(-absLat * absLat * 22.0);
+  let centerW  = pow(clamp(0.5 + 0.5 * lonCos, 0.0, 1.0), 1.4);
+
+  var accum    = vec3<f32>(0.0);
+  var alpha:   f32 = 0.0;
+  let STEPS:   i32 = 16;
+  let TSTART:  f32 = 1.0;
+  let TSTEP:   f32 = 0.14;
+
+  for (var i: i32 = 0; i < STEPS; i = i + 1) {
+    let t = TSTART + TSTEP * f32(i);
+    let p = dir * t;
+
+    // Density. Carved into band shape so wide cutoff doesn't paint
+    // a uniform glow above the disk. (dN - 0.40) * 2.5 gives a
+    // sharper edge than raw fbm.
+    let dN = _sky_fbm3(p * 2.2 + vec3<f32>(7.3, 1.1, 4.9), 3);
+    let density = clamp((dN - 0.40) * 2.5, 0.0, 1.0)
+                * bandCore
+                * (0.35 + 0.65 * centerW);
+    if (density < 0.003) { continue; }
+
+    // Hue: independent low-freq fbm + a high-freq detail term
+    // + small per-step phase to give different depths different
+    // hues (parallax-color illusion). lonCos pushes the hue across
+    // the band so the center isn't the same shade as the wings.
+    let hueN1 = _sky_fbm3(p * 1.3 + vec3<f32>(11.7, -3.4, 8.8), 2);
+    let hueN2 = _sky_vnoise3(p * 5.1 + vec3<f32>(0.7, 4.2, -1.6));
+    let hue   = fract(hueN1 * 1.9
+                      + hueN2 * 0.40
+                      + lonCos * 0.18
+                      + f32(i) * 0.011);
+    let sat   = mix(0.70, 1.00, smoothstep(0.0, 1.0, density));
+    let val   = 1.0 + 0.7 * smoothstep(0.55, 0.95, density);
+    let stepCol = _sky_hsv_to_rgb(vec3<f32>(hue, sat, val));
+
+    accum = accum + stepCol * density * (1.0 - alpha);
+    alpha = min(1.0, alpha + density * 0.45);
+    if (alpha > 0.97) { break; }
+  }
+
+  return accum * starVis * 1.5;
+}
+
 fn sample_procedural_sky_features(dir: vec3<f32>) -> vec3<f32> {
   let sunDir    = uS.envSun.xyz;
   let sunVis    = uS.envSun.w;
@@ -54890,40 +54970,15 @@ fn sample_procedural_sky_features(dir: vec3<f32>) -> vec3<f32> {
     let amt3 = smoothstep(thr3, 1.0, h3) * star_vis * 0.7 * densityBoost;
     col = col + _sky_star_color(t3) * amt3 * tw3;
 
-    // --- 4) Milky Way: galactic-plane glow with center bias, multi-
-    //     octave cloud noise, threshold-cut dust lanes carved into
-    //     the band, and warm bulge → cool disk color gradient.
-    //     pow(centerBias, 1.6) so the Sagittarius-direction bulge
-    //     dominates and the anticenter side is just a faint glow.
-    let centerBias = 0.5 + 0.5 * lonCos;             // [0,1]
-    let centerW    = pow(centerBias, 1.6);
-
-    let cloud = _sky_fbm3(dir * 6.0, 3);
-    let dustN = _sky_vnoise3(dir * 14.0
-                             + vec3<f32>(0.3, 1.7, -2.1));
-    let dust  = smoothstep(0.42, 0.78, dustN);
-
-    let bandStr = bandFalloff
-                * (0.30 + 0.70 * cloud)
-                * (0.25 + 0.75 * centerW)
-                * (1.0 - 0.65 * dust);
-    let warmCol = vec3<f32>(0.55, 0.42, 0.28);       // bulge + dust
-    let coolCol = vec3<f32>(0.20, 0.28, 0.48);       // disk + OB stars
-    let mwColor = mix(coolCol, warmCol, centerW);
-    col = col + mwColor * bandStr * star_vis * 1.8;
-
-    // --- 5) HII / nebula highlights: rare reddish-pink blobs on the
-    //     bright side of the band. Low-freq mask gates these to a
-    //     few spots (think Orion, Eta Carinae, Lagoon). Hash on the
-    //     coarse cell determines pink-vs-blue (emission vs reflect).
-    let nebMask = smoothstep(0.78, 0.92,
-                             _sky_vnoise3(dir * 3.2
-                                          + vec3<f32>(11.1, 4.3, 7.7)));
-    let nebCol = mix(vec3<f32>(0.80, 0.30, 0.45),
-                     vec3<f32>(0.50, 0.65, 1.00),
-                     _sky_hash3(floor(dir * 3.2)));
-    col = col + nebCol * nebMask * bandFalloff * centerW
-              * star_vis * 0.55;
+    // --- 4) Volumetric Milky Way + mantis-shrimp nebulas.
+    //     Replaces the previous flat painted band + separate HII
+    //     blob pass. Raymarches the view ray through a 3D density
+    //     field constrained near the galactic plane and accumulates
+    //     emissive color from independent hue fbm sampled per step.
+    //     Full HSV-wheel cycling gives the saturated cyan / magenta
+    //     / lime / hot-pink / violet palette instead of the realistic
+    //     warm-brown / cool-blue duo.
+    col = col + _sky_volumetric_band(dir, sinLat, lonCos, star_vis);
   }
 
   return col * intensity;
