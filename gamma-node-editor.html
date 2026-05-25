@@ -62027,6 +62027,14 @@ const _SVT = {
   // Bytes-per-pixel for the page table indirection. Pack atlas slot
   // ID (10 bits) + future flags (lod level, channel mask) into uint32.
   PAGE_UNRESIDENT: 0xFFFFFFFF,
+  // Sprint 10-5c-d: pages waiting to be generated. Queue ordered
+  // FIFO (chunks visible earliest get pages first); keys set lets
+  // _svtQueueIfNew O(1) dedupe.
+  generationQueue: [],
+  queueKeys: new Set(),
+  // SVT virtual texture zoom level. log2(PAGES_PER_FACE_EDGE) = 8.
+  // 10-5c-f will add the multi-zoom pyramid; for now single zoom.
+  TARGET_ZOOM: 8,
 };
 
 /* Allocate the SVT atlas + page table + initialize the free-slot pool.
@@ -62255,6 +62263,86 @@ function _svtTest(face, count) {
 }
 // Expose to console for manual testing.
 if (typeof window !== "undefined") window._svtTest = _svtTest;
+
+/* Sprint 10-5c-d: queue + tick for automatic page residency based
+ * on chunk visibility. Replaces the manual _svtTest trigger with
+ * "pages auto-generate for visible chunks within a per-frame budget."
+ *
+ * Per chunk in the visible set, figure out which page(s) it spans at
+ * SVT zoom 8 (256² pages per face). Deep chunks (depth ≥ 8) fall in
+ * one page; shallow chunks span multiple pages. Add unique entries
+ * to a FIFO queue and process under a per-frame ms budget. */
+function _svtQueueIfNew(face, pageX, pageY) {
+  if (pageX < 0 || pageX >= _SVT.PAGES_PER_FACE_EDGE) return;
+  if (pageY < 0 || pageY >= _SVT.PAGES_PER_FACE_EDGE) return;
+  const key = face + "/" + pageX + "/" + pageY;
+  const existing = _SVT.residency.get(key);
+  if (existing && existing.generated) {
+    existing.lastFrame = _SVT.frame;   // touch for future LRU
+    return;
+  }
+  if (_SVT.queueKeys.has(key)) return;
+  _SVT.queueKeys.add(key);
+  _SVT.generationQueue.push({ face: face, pageX: pageX, pageY: pageY });
+}
+
+function _svtQueueChunkPages(face, depth, ix, iy) {
+  const Z = _SVT.TARGET_ZOOM;
+  if (depth >= Z) {
+    // Chunk fits inside one page (or smaller). One page covers it.
+    const stepFactor = 1 << (depth - Z);
+    const pageX = Math.floor(ix / stepFactor);
+    const pageY = Math.floor(iy / stepFactor);
+    _svtQueueIfNew(face, pageX, pageY);
+  } else {
+    // Chunk spans multiple pages -- enqueue them all. Rare at
+    // typical visible sets (most chunks are deeper than zoom 8).
+    const pagesPerChunkEdge = 1 << (Z - depth);
+    const startX = ix * pagesPerChunkEdge;
+    const startY = iy * pagesPerChunkEdge;
+    for (let dy = 0; dy < pagesPerChunkEdge; dy++) {
+      for (let dx = 0; dx < pagesPerChunkEdge; dx++) {
+        _svtQueueIfNew(face, startX + dx, startY + dy);
+      }
+    }
+  }
+}
+
+function _svtTickGeneration(pmap, budgetMs) {
+  if (!pmap || !_SVT.atlasTexture) return;
+  if (_SVT.generationQueue.length === 0) return;
+  const t0 = (typeof performance !== "undefined") ? performance.now() : 0;
+  let processed = 0;
+  while (_SVT.generationQueue.length > 0) {
+    const item = _SVT.generationQueue.shift();
+    const key = item.face + "/" + item.pageX + "/" + item.pageY;
+    _SVT.queueKeys.delete(key);
+    // Already generated since enqueue? skip.
+    const existing = _SVT.residency.get(key);
+    if (existing && existing.generated) continue;
+    const ok = _svtUploadPage(item.face, item.pageX, item.pageY, pmap);
+    if (!ok && _SVT.freeSlots.length === 0) {
+      // Atlas full -- stop processing. Future pages won't get
+      // slots until 10-5c-e LRU lands. Drop the rest of the queue
+      // for this frame; next frame's visibility set will re-queue
+      // the still-needed ones (typically a smaller set than what
+      // we just emptied).
+      _SVT.generationQueue.length = 0;
+      _SVT.queueKeys.clear();
+      break;
+    }
+    processed++;
+    if (((typeof performance !== "undefined") ? performance.now() : 0) - t0 > budgetMs) break;
+  }
+  _SVT.frame++;
+  if (processed > 0 && _SVT.frame % 60 === 0) {
+    // Sparse log so the user can see residency growing without
+    // log spam every frame.
+    console.log("[svt] residency: " + _SVT.residency.size + "/" + _SVT.TOTAL_SLOTS
+              + " slots, " + _SVT.generationQueue.length + " queued, "
+              + _SVT.stats.pagesGenerated + " generated total");
+  }
+}
 
 /* Sprint 10-5c-c: a tiny all-unresident page table texture used by
  * the bind group when the real SVT page table isn't allocated yet
@@ -64590,6 +64678,15 @@ function _ensurePlanetMeshChunks(node) {
   const visible = new Map();
   for (const v of visList) {
     visible.set(_planetChunkKey(v.face, v.depth, v.ix, v.iy), v);
+  }
+
+  // Sprint 10-5c-d: queue SVT page generation for each visible chunk.
+  // Pages are uploaded in _svtTickGeneration below within a per-frame
+  // ms budget so we don't stall the chunk build pass. Replaces the
+  // manual _svtTest console trigger.
+  if (_SVT.atlasTexture) {
+    for (const v of visList) _svtQueueChunkPages(v.face, v.depth, v.ix, v.iy);
+    _svtTickGeneration(pmap, 30);   // 30 ms budget = ~10 pages/frame
   }
 
   // Drop chunks that left the visible set.
