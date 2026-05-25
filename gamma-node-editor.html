@@ -45272,6 +45272,15 @@ async function ensureGPUDevice() {
     // per draw which is in the noise vs. the actual GPU work.
     _installPerfEncoderWrap(Visual.device);
 
+    // Sprint 10-5c-a: SVT atlas + page table allocation. Lazy --
+    // _ensureSVT is idempotent so calling it once at device creation
+    // is the cheapest way to log the initial allocation. Failure here
+    // is non-fatal: the SVT path falls back to per-fragment procedural
+    // when atlasTexture is null.
+    try {
+      if (typeof _ensureSVT === "function") _ensureSVT();
+    } catch (_) {}
+
     // Device-loss handler — surfaces in the pill so the user sees
     // why visuals stopped. Most often happens on system sleep / GPU
     // driver crash; a page reload re-acquires.
@@ -61861,6 +61870,184 @@ const _EARTH_TILES = {
   loadCount: 0,              // bumped on every successful load (chunk cache key)
   maxEntries: 500,
 };
+
+/* =========================================================================
+ * Sprint 10-5c -- Sparse Virtual Texturing (SVT) for planet surface
+ * detail. Phase 10-5c-a: data structures + GPU resource allocation.
+ *
+ * The big idea: instead of computing surface detail per-fragment every
+ * frame (or per-vertex once), maintain a small fixed-size GPU "atlas"
+ * that holds the currently-visible pages of a much larger logical
+ * "virtual" texture. Pages are 128×128 texels; the atlas is 4096×4096
+ * (= 32×32 = 1024 page slots). The virtual texture per cube face is
+ * 256×256 pages = 32768×32768 texels (~300m/texel at Earth scale at
+ * the deepest single-zoom version; multi-zoom mipmap pyramid added in
+ * 10-5c-f gets us down to ~1-10 m/texel near camera).
+ *
+ * Per-fragment cost in shader: one page-table indirection sample, one
+ * atlas sample. The indirection lets us decouple GPU memory (~70 MB
+ * atlas + page table) from the addressable detail surface (theoretical
+ * many-GB virtual texture). Same pattern as id Tech 5 MegaTexture,
+ * Frostbite/Unreal SVT, Far Cry 5/6.
+ *
+ * Phased breakdown:
+ *   10-5c-a  THIS COMMIT: allocate atlas + page table + residency
+ *            tracking. Pages all empty, no shader integration yet --
+ *            verifies infrastructure stands up.
+ *   10-5c-b  Procedural page fill (CPU first, GPU compute later) using
+ *            existing biome + climate functions. Pages have content
+ *            but aren't sampled by shader yet.
+ *   10-5c-c  Shader bindings + virtual UV → page table → atlas sample,
+ *            with fallback to existing per-fragment procedural when
+ *            page not resident. First visible SVT.
+ *   10-5c-d  Feedback render pass: only generate pages the camera
+ *            actually needs.
+ *   10-5c-e  LRU eviction (cap atlas memory).
+ *   10-5c-f  Multi-zoom mipmap pyramid (proper LOD across distance).
+ *   10-5c-g  Normal + roughness channels + PBR lighting.
+ */
+const _SVT = {
+  // Atlas configuration. Tuned for 4096² atlas with 128² pages.
+  // 32×32 = 1024 page slots, RGBA8 = 64 MB GPU.
+  ATLAS_DIM:    4096,    // atlas texture is ATLAS_DIM × ATLAS_DIM
+  PAGE_SIZE:    128,     // each page is PAGE_SIZE × PAGE_SIZE texels
+  SLOTS_PER_ROW: 32,     // ATLAS_DIM / PAGE_SIZE
+  TOTAL_SLOTS:  1024,    // SLOTS_PER_ROW²
+  // Virtual texture per face: PAGES_PER_FACE_EDGE² pages per cube face.
+  // For 10-5c-a we run a SINGLE zoom level (the highest); 10-5c-f
+  // adds the mipmap pyramid.
+  PAGES_PER_FACE_EDGE: 256,   // 256² = 65536 pages per face, 393216 total
+  // GPU resources (allocated lazily in _ensureSVT).
+  atlasTexture: null,
+  atlasView:    null,
+  atlasSampler: null,
+  // Page table texture: one 256×256 R32Uint slice per face (6 layers).
+  // Each texel = atlas slot ID (0..1023) for that page, or
+  // _SVT.PAGE_UNRESIDENT (0xFFFFFFFF) if not resident.
+  pageTableTexture: null,
+  pageTableView:    null,
+  // JS-side residency state.
+  // residency: Map "face/x/y" → { slotX, slotY, lastFrame, generated }
+  residency: new Map(),
+  // freeSlots: pool of unused (slotX, slotY) pairs.
+  freeSlots: [],
+  // Frame counter for LRU.
+  frame: 0,
+  // Statistics for logging / diagnostics.
+  stats: { pagesGenerated: 0, pagesEvicted: 0, atlasSamples: 0 },
+  // Bytes-per-pixel for the page table indirection. Pack atlas slot
+  // ID (10 bits) + future flags (lod level, channel mask) into uint32.
+  PAGE_UNRESIDENT: 0xFFFFFFFF,
+};
+
+/* Allocate the SVT atlas + page table + initialize the free-slot pool.
+ * Idempotent: returns immediately if already allocated. Returns true
+ * on success, false on failure (e.g., no device). */
+function _ensureSVT() {
+  if (_SVT.atlasTexture) return true;
+  if (!Visual.device) return false;
+  const device = Visual.device;
+  try {
+    _SVT.atlasTexture = device.createTexture({
+      label: "svt-atlas",
+      size: [_SVT.ATLAS_DIM, _SVT.ATLAS_DIM, 1],
+      format: "rgba8unorm",
+      usage: GPUTextureUsage.TEXTURE_BINDING |
+             GPUTextureUsage.COPY_DST |
+             GPUTextureUsage.STORAGE_BINDING,
+    });
+    _SVT.atlasView = _SVT.atlasTexture.createView();
+    _SVT.atlasSampler = device.createSampler({
+      label: "svt-atlas-sampler",
+      magFilter: "linear",
+      minFilter: "linear",
+      mipmapFilter: "nearest",
+      addressModeU: "clamp-to-edge",
+      addressModeV: "clamp-to-edge",
+    });
+    // Page table: 6 layers (one per face), each 256×256 R32Uint.
+    _SVT.pageTableTexture = device.createTexture({
+      label: "svt-page-table",
+      size: [_SVT.PAGES_PER_FACE_EDGE, _SVT.PAGES_PER_FACE_EDGE, 6],
+      format: "r32uint",
+      usage: GPUTextureUsage.TEXTURE_BINDING |
+             GPUTextureUsage.COPY_DST |
+             GPUTextureUsage.STORAGE_BINDING,
+      dimension: "2d",
+    });
+    _SVT.pageTableView = _SVT.pageTableTexture.createView({ dimension: "2d-array" });
+    // Initialize page table to all-unresident.
+    const unresidentBuf = new Uint32Array(
+      _SVT.PAGES_PER_FACE_EDGE * _SVT.PAGES_PER_FACE_EDGE * 6
+    );
+    unresidentBuf.fill(_SVT.PAGE_UNRESIDENT);
+    device.queue.writeTexture(
+      { texture: _SVT.pageTableTexture },
+      unresidentBuf,
+      { bytesPerRow: _SVT.PAGES_PER_FACE_EDGE * 4,
+        rowsPerImage: _SVT.PAGES_PER_FACE_EDGE },
+      [_SVT.PAGES_PER_FACE_EDGE, _SVT.PAGES_PER_FACE_EDGE, 6]
+    );
+    // Build free-slot pool (all slots free initially).
+    _SVT.freeSlots = [];
+    for (let sy = _SVT.SLOTS_PER_ROW - 1; sy >= 0; sy--) {
+      for (let sx = _SVT.SLOTS_PER_ROW - 1; sx >= 0; sx--) {
+        _SVT.freeSlots.push({ x: sx, y: sy });
+      }
+    }
+    console.log("[svt] allocated atlas " + _SVT.ATLAS_DIM + "² (" + _SVT.TOTAL_SLOTS
+              + " slots × " + _SVT.PAGE_SIZE + "² = "
+              + (_SVT.ATLAS_DIM * _SVT.ATLAS_DIM * 4 / 1024 / 1024).toFixed(0) + " MB)"
+              + ", page table 6 × " + _SVT.PAGES_PER_FACE_EDGE + "² R32Uint ("
+              + (_SVT.PAGES_PER_FACE_EDGE * _SVT.PAGES_PER_FACE_EDGE * 6 * 4 / 1024 / 1024).toFixed(1)
+              + " MB)");
+    return true;
+  } catch (err) {
+    console.warn("[svt] allocation failed:", err);
+    return false;
+  }
+}
+
+/* Allocate a free atlas slot for a logical page (face, pageX, pageY).
+ * Returns { slotX, slotY } or null if atlas is full (10-5c-e will add
+ * LRU eviction; for now we just return null which means "no slot,
+ * fall back to procedural"). */
+function _svtAllocateSlot(face, pageX, pageY) {
+  const key = face + "/" + pageX + "/" + pageY;
+  const existing = _SVT.residency.get(key);
+  if (existing) {
+    existing.lastFrame = _SVT.frame;
+    return { slotX: existing.slotX, slotY: existing.slotY };
+  }
+  if (_SVT.freeSlots.length === 0) return null;
+  const slot = _SVT.freeSlots.pop();
+  _SVT.residency.set(key, {
+    slotX: slot.x,
+    slotY: slot.y,
+    lastFrame: _SVT.frame,
+    generated: false,
+    face: face, pageX: pageX, pageY: pageY,
+  });
+  return slot;
+}
+
+/* Update the page table texture for a single (face, pageX, pageY) entry.
+ * Encodes slot as `(slotY << 16) | slotX` so the shader can unpack both
+ * coordinates from a single R32Uint read. */
+function _svtWritePageTable(face, pageX, pageY, slotX, slotY) {
+  if (!_SVT.pageTableTexture || !Visual.device) return;
+  const packed = ((slotY & 0xFFFF) << 16) | (slotX & 0xFFFF);
+  const buf = new Uint32Array([packed]);
+  Visual.device.queue.writeTexture(
+    {
+      texture: _SVT.pageTableTexture,
+      origin: { x: pageX, y: pageY, z: face },
+    },
+    buf,
+    { bytesPerRow: 4, rowsPerImage: 1 },
+    [1, 1, 1]
+  );
+}
 
 function _depthToZoom(depth) {
   // Sprint 10-6 v8: bumped deepest from 14 → 15 (Mapzen's max). At
