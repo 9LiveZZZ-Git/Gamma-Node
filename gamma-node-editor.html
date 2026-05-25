@@ -11314,6 +11314,42 @@ public:
     description: "Flat 2D quad in the XZ plane (Y = 0 by default; wrap in a Translate to lift it). width / depth in world units. 4 verts, 6 indices -- the cheapest primitive. Vertex color is a soft cyan→teal→violet gradient by corner so the surface reads as more than a flat blob under the unlit shader. Common use: ground plane, billboard, reflection target."
   },
 
+  /* Sprint platformer-2a -- ImageURL. Loads an image (URL, data URL,
+   * or built-in preset name) and exposes it as a `texture` output for
+   * downstream Sprite / future textured-mesh nodes to consume. Async:
+   * starts loading on first frame the node is evaluated; subsequent
+   * frames return the cached GPU texture. Failures (404, decode error)
+   * leave the output null + log once to the console.
+   *
+   * Built-in presets (use 'preset:' prefix in the url param):
+   *   preset:test4x4   -- 4x4 colorful checkerboard, useful for debugging
+   *                       UV orientation / texture sampling.
+   *   preset:testgrid  -- 64x64 black-on-white 8x8 grid lines.
+   *
+   * filterMode: "linear" (default; smooth) or "nearest" (pixel-art
+   * crisp edges).
+   *
+   * Used at design time; texture stays resident on the GPU until the
+   * node is deleted (or the URL changes). The CPU image is discarded
+   * after upload. */
+  ImageURL: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "image-source",
+    ins: [
+      { n: "url",        t: "param" },
+      { n: "filterMode", t: "param" }
+    ],
+    outs: [{ n: "texture", t: "texture" }],
+    params: {
+      url: "preset:test4x4",
+      filterMode: "nearest"
+    },
+    methods: {},
+    paramOptions: { filterMode: ["nearest", "linear"] },
+    description: "Load an image into a GPU texture. url can be an http(s):// URL, a data:image/... URL, or a 'preset:NAME' built-in (preset:test4x4 = 2×2 color grid, preset:testgrid = 8×8 line grid). filterMode 'nearest' = pixel-art crisp, 'linear' = smooth bilinear. Wire output `texture` into Sprite.texture for a textured sprite. Async load: first 1-2 frames after creation may show the Sprite as untextured while the image fetches; once loaded the texture stays cached."
+  },
+
   /* Sprint 8.0.2-f -- Sprite. Flat XY quad centered on origin,
    * facing +Z by default. The "2D" face plane (vs Plane's XZ
    * footprint) -- positioning a Sprite at world (x, y, 0) drops
@@ -11342,25 +11378,32 @@ public:
     cppType: "",
     kind: "mesh-gen",
     ins: [
-      { n: "width",   t: "param" },
-      { n: "height",  t: "param" },
-      { n: "anchorX", t: "param" },
-      { n: "anchorY", t: "param" },
-      { n: "tintR",   t: "param" },
-      { n: "tintG",   t: "param" },
-      { n: "tintB",   t: "param" },
-      { n: "tintA",   t: "param" },
-      { n: "pivotZ",  t: "param" }
+      { n: "texture",  t: "texture" },
+      { n: "width",    t: "param" },
+      { n: "height",   t: "param" },
+      { n: "anchorX",  t: "param" },
+      { n: "anchorY",  t: "param" },
+      { n: "tintR",    t: "param" },
+      { n: "tintG",    t: "param" },
+      { n: "tintB",    t: "param" },
+      { n: "tintA",    t: "param" },
+      { n: "pivotZ",   t: "param" },
+      { n: "frame",    t: "param" },
+      { n: "framesX",  t: "param" },
+      { n: "framesY",  t: "param" },
+      { n: "flipX",    t: "param" }
     ],
     outs: [{ n: "mesh", t: "mesh" }],
     params: {
       width: 1, height: 1,
       anchorX: 0.5, anchorY: 0.5,
       tintR: 1, tintG: 1, tintB: 1, tintA: 1,
-      pivotZ: 0
+      pivotZ: 0,
+      frame: 0, framesX: 1, framesY: 1,
+      flipX: 0
     },
     methods: {},
-    description: "2D sprite quad in the XY plane (facing +Z). The 2D-native primitive: drop a Sprite into a Scene2D and position it directly with Translate(x, y, 0). anchorX/anchorY (0..1) controls where the quad's origin sits -- anchorX=0.5 / anchorY=0.5 = center (default); anchorX=0.5 / anchorY=0 = pin-by-feet (use with Scene25D for proper Y-sort). tintR/G/B/A is a vertex-color multiplier (1,1,1,1 = white identity). pivotZ is a Scene25D-only sort hint (sprites with larger pivotZ draw in front of those with smaller). Use with OrthoCamera2D (pixel-perfect 2D) or OrthoCamera25D (iso / Hades-style)."
+    description: "2D sprite quad in the XY plane (facing +Z). The 2D-native primitive: drop a Sprite into a Scene2D and position it directly with Translate(x, y, 0). anchorX/anchorY (0..1) controls where the quad's origin sits -- anchorX=0.5 / anchorY=0.5 = center (default); anchorX=0.5 / anchorY=0 = pin-by-feet (use with Scene25D for proper Y-sort). tintR/G/B/A is a vertex-color multiplier (1,1,1,1 = white identity). pivotZ is a Scene25D-only sort hint. **Textured mode (platformer-2a):** wire an ImageURL into `texture` to map an image onto the quad; frame / framesX / framesY pick a sub-rect from a spritesheet (frame=0..framesX*framesY-1, walks the grid left-to-right then top-to-bottom). flipX=1 mirrors the texture horizontally (use facing direction from PlatformerBody2D for left/right walk animation)."
   },
 
   Torus: {
@@ -45875,6 +45918,13 @@ const Visual = {
   // we pack into each frame and queue.writeBuffer to the uniform.
   shaderInstances: new Map(),
 
+  // Sprint platformer-2a -- image texture cache. Key = url string
+  // (http/data/preset:). Value = { state: "loading"|"ready"|"error",
+  // texture: GPUTexture | null, view: GPUTextureView | null,
+  // width, height, error?: string }. Shared across ImageURL nodes so
+  // multiple nodes with the same URL upload only once.
+  imageTextures: new Map(),
+
   // Sprint 7.5.3a -- 3D rendering state.
   // depthTexture covers (fbWidth, fbHeight) at depth32float; shared
   // across every Scene render in a single frame (each pass clears it
@@ -46093,10 +46143,150 @@ window.addEventListener("resize", () => {
  * memory before the new one allocates (matters for 8K → 1080p where
  * ~125 MB is at stake).
  *
- * Phase 6.5.5: layer count tracks state.rig.displays.length, so a
- * template swap reallocates here. Per-layer views are created up
- * front so render passes can target them by index without
- * recreating the view object every frame. */
+/* Sprint platformer-2a -- ImageURL texture loading. Async fetches an
+ * image (URL / data URL / preset:NAME) into a GPU texture, caches
+ * indefinitely. Subsequent calls with the same URL return the cached
+ * entry. The first call kicks off the load; the texture becomes
+ * available 1-2 frames later when the fetch + decode finishes.
+ *
+ * Returns the cache entry. Callers should check `state === "ready"`
+ * before using `texture` / `view`.
+ *
+ * Built-in presets render into an OffscreenCanvas at first call.
+ *   preset:test4x4   -- 2×2 colorful blocks (debug UV orientation).
+ *                       Top-left = red, top-right = green,
+ *                       bottom-left = blue, bottom-right = yellow.
+ *                       64×64 px so it's clearly visible.
+ *   preset:testgrid  -- 64×64 black-on-white 8×8 grid lines. */
+function _ensureImageURLTexture(url) {
+  if (typeof url !== "string" || url.length === 0) return null;
+  if (!Visual.device) return null;
+  const cached = Visual.imageTextures.get(url);
+  if (cached) return cached;
+  const entry = { state: "loading", texture: null, view: null, width: 0, height: 0 };
+  Visual.imageTextures.set(url, entry);
+  // Preset URLs: render the bitmap synchronously via OffscreenCanvas,
+  // then upload. Still async overall to keep the API uniform.
+  if (url.indexOf("preset:") === 0) {
+    const preset = url.substring("preset:".length);
+    let bitmap;
+    try {
+      bitmap = _renderPresetBitmap(preset);
+    } catch (e) {
+      console.warn("[image-url] preset render failed:", preset, e);
+      entry.state = "error";
+      entry.error = String(e);
+      return entry;
+    }
+    if (!bitmap) {
+      entry.state = "error";
+      entry.error = "unknown preset: " + preset;
+      console.warn("[image-url] " + entry.error);
+      return entry;
+    }
+    _uploadImageBitmapToTexture(entry, bitmap, url);
+    return entry;
+  }
+  // Real URL (http/https/data). Async fetch via createImageBitmap.
+  const isDataURL = url.indexOf("data:") === 0;
+  const promise = isDataURL
+    ? fetch(url).then(r => r.blob()).then(b => createImageBitmap(b))
+    : fetch(url, { mode: "cors" }).then(r => {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.blob();
+      }).then(b => createImageBitmap(b));
+  promise.then(bitmap => {
+    _uploadImageBitmapToTexture(entry, bitmap, url);
+  }).catch(err => {
+    entry.state = "error";
+    entry.error = String(err);
+    console.warn("[image-url] load failed " + url + ":", err);
+  });
+  return entry;
+}
+
+function _uploadImageBitmapToTexture(entry, bitmap, url) {
+  if (!Visual.device) return;
+  const w = bitmap.width, h = bitmap.height;
+  const tex = Visual.device.createTexture({
+    label: "imageurl-" + url.substring(0, 32),
+    size: [w, h, 1],
+    format: "rgba8unorm",
+    usage: GPUTextureUsage.TEXTURE_BINDING
+         | GPUTextureUsage.COPY_DST
+         | GPUTextureUsage.RENDER_ATTACHMENT
+  });
+  Visual.device.queue.copyExternalImageToTexture(
+    { source: bitmap, flipY: false },
+    { texture: tex },
+    [w, h, 1]
+  );
+  entry.texture = tex;
+  entry.view = tex.createView();
+  entry.width = w;
+  entry.height = h;
+  entry.state = "ready";
+  console.log("[image-url] loaded " + url + " (" + w + "×" + h + ")");
+  // bitmap.close() is supported on most browsers; gracefully no-op if not.
+  if (bitmap && typeof bitmap.close === "function") {
+    try { bitmap.close(); } catch (_) {}
+  }
+}
+
+/* Paint a small built-in test pattern to an OffscreenCanvas and return
+ * an ImageBitmap. Used by ImageURL presets so the editor ships with
+ * known-good debug textures (UV orientation, sampler behavior). */
+function _renderPresetBitmap(preset) {
+  let canvas, ctx;
+  if (preset === "test4x4") {
+    canvas = new OffscreenCanvas(64, 64);
+    ctx = canvas.getContext("2d");
+    // Four colored 32×32 quadrants. UV (0,0) is top-left of the
+    // texture; standard 2D image coords. After WebGPU's UV-flip on
+    // sample (top-left origin), the bottom-left of the screen-aligned
+    // sprite should show RED (this verifies UV / flip orientation).
+    ctx.fillStyle = "#ff3030"; ctx.fillRect(0,   0,  32, 32);   // TL
+    ctx.fillStyle = "#30ff30"; ctx.fillRect(32,  0,  32, 32);   // TR
+    ctx.fillStyle = "#3060ff"; ctx.fillRect(0,  32,  32, 32);   // BL
+    ctx.fillStyle = "#ffff30"; ctx.fillRect(32, 32,  32, 32);   // BR
+    return canvas.transferToImageBitmap();
+  }
+  if (preset === "testgrid") {
+    canvas = new OffscreenCanvas(64, 64);
+    ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, 64, 64);
+    ctx.strokeStyle = "#000000"; ctx.lineWidth = 1;
+    for (let i = 0; i <= 64; i += 8) {
+      ctx.beginPath(); ctx.moveTo(i + 0.5, 0); ctx.lineTo(i + 0.5, 64); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, i + 0.5); ctx.lineTo(64, i + 0.5); ctx.stroke();
+    }
+    return canvas.transferToImageBitmap();
+  }
+  return null;
+}
+
+/* Walk a Sprite node's `texture` wire to its source ImageURL, then
+ * ensure the texture is loaded. Returns the cache entry (state may be
+ * "loading"/"ready"/"error") or null if no wire or non-ImageURL
+ * source. Called by the sprite encoder dispatch in plat-2a-render. */
+function _resolveSpriteTextureEntry(spriteNode) {
+  if (!spriteNode || !state || !Array.isArray(state.edges)) return null;
+  const wire = state.edges.find(e =>
+    e && e.to && e.to.node === spriteNode.id && e.to.port === "texture"
+  );
+  if (!wire || !wire.from) return null;
+  const src = state.nodes.find(n => n && n.id === wire.from.node);
+  if (!src || src.type !== "ImageURL") return null;
+  const sp = _resolveNodeParams(src);
+  const url = (typeof sp.url === "string") ? sp.url : "";
+  if (!url) return null;
+  return _ensureImageURLTexture(url);
+}
+
+ /* Phase 6.5.5: layer count tracks state.rig.displays.length, so a
+  * template swap reallocates here. Per-layer views are created up
+  * front so render passes can target them by index without
+  * recreating the view object every frame. */
 function _allocateFramebuffer() {
   if (!Visual.device) return;
   // v0.2.21 — abort an in-flight per-display recording before
