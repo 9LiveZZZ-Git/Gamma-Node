@@ -56298,42 +56298,43 @@ fn fs_unlit_vc(in: VsOut) -> @location(0) vec4<f32> {
       //                run the full procedural so the surface
       //                stays detailed during the brief load window.
       if (svtSample.resident < 0.5) {
-        // Sprint 10-4 v4: multi-scale procedural detail brightness
-        // modulation (4 octaves at 4 distance bands).
+        // §bonus-perf-foot-6 (2026-05-25) -- per-fragment procedural
+        // is the foot-level bottleneck (data: fps 50 -> 9.7 cliff at
+        // the camDistL=500/2000 m thresholds while draws barely
+        // changed). Original path ran ~12 noise + ~10 exp/pow per
+        // pixel; the trick is that 4 of the noise calls were a
+        // multi-scale brightness modulation that's barely visible
+        // and 8 of them were a 4-way texture blend where only the
+        // dominant biome shows visibly anyway. Cut both:
+        //   multi-scale: 4 noise → 2 noise (drop micro + macro,
+        //                keep mid + near where it's actually visible)
+        //   biome blend: 4 surface_tex calls → 1 dominant-pick.
+        //                Surface_tex is 2 noise each, so 8 -> 2.
+        // Total: 12 noise -> 4 noise (3× cheaper). Climate exp/pow
+        // still per-fragment for now; moving it to vertex shader is
+        // the proper architectural fix and ships as foot-7 if more
+        // is needed.
         let camDistL = length(uS.eye.xyz - in.worldPos);
         let macroFade = 1.0 - smoothstep(500.0,  2000.0, camDistL);
         let midFade   = 1.0 - smoothstep(150.0,   500.0, camDistL);
         let nearFade  = 1.0 - smoothstep(50.0,    200.0, camDistL);
-        let microFade = 1.0 - smoothstep(15.0,     50.0, camDistL);
-        // Sprint 10-4 v9: amplitudes halved per user 'noise is too much'.
         if (macroFade > 0.001) {
-          let n1 = _value_noise_3d(in.worldPos * 0.02)  - 0.5;
+          // Two-octave detail. n2 = mid-scale brightness, n3 = near-
+          // scale fine grain. Sum-of-amplitudes preserved so the
+          // visible character at foot is similar to the 4-octave.
           let n2 = _value_noise_3d(in.worldPos * 0.125) - 0.5;
           let n3 = _value_noise_3d(in.worldPos * 0.66)  - 0.5;
-          let n4 = _value_noise_3d(in.worldPos * 3.30)  - 0.5;
-          let det =  n1 * 0.03 * macroFade
-                   + n2 * 0.05 * midFade
-                   + n3 * 0.06 * nearFade
-                   + n4 * 0.07 * microFade;
+          let det = n2 * 0.07 * midFade + n3 * 0.10 * nearFade;
           color = color * (1.0 + det);
         }
-        // Sprint 10-4 v7: biome-aware procedural surface textures.
-        // Computes climate (T, P, elevMSL) per-fragment from the
-        // worldPos relative to planet center, then blends between 4
-        // biome textures (grass / sand / rock / snow). Fades with
-        // distance using the existing midFade so orbital views see
-        // only the per-vertex biome color, ground-level views get
-        // the textured surface character.
         if (midFade > 0.001) {
           let planetCenter = uS.envPlanet.xyz;
           let planetRrad   = uS.envPlanet.w;
           let radialVec = in.worldPos - planetCenter;
           let radLen    = length(radialVec);
           let radDir    = radialVec / max(radLen, 1.0);
-          // Latitude (degrees) from radial Y. Match JS convention.
           let _absLat = abs(degrees(asin(clamp(radDir.y, -1.0, 1.0))));
           let _elevMSL = max(0.0, radLen - planetRrad);
-          // Climate -- same formulas as JS _earthClimateAt.
           let _Tbase = 30.0 * cos(radians(_absLat)) - 5.0;
           let _T     = _Tbase - 6.5 * (_elevMSL / 1000.0);
           var _P: f32 = 0.45;
@@ -56342,25 +56343,29 @@ fn fs_unlit_vc(in: VsOut) -> @location(0) vec4<f32> {
           _P = _P + 0.25 * exp(-pow((_absLat - 55.0) / 12.0, 2.0));
           _P = _P - 0.30 * exp(-pow((_absLat - 80.0) / 12.0, 2.0));
           _P = clamp(_P, 0.0, 1.0);
-          // Texture weights from (T, P, elev):
-          //   snow: T < 0 OR elevMSL > snowLine
-          //   sand: T > 18 AND P < 0.3
-          //   rock: elevMSL > 2000 OR very steep (skipped here -- already
-          //         handled by chunk-builder slope-modulated color)
-          //   grass: default
           let snowLineAlt = select(select(1500.0, 3000.0, _T > 0.0), 4500.0, _T > 10.0);
           let snowW = clamp((-_T) / 10.0 + max(0.0, (_elevMSL - snowLineAlt) / 1500.0), 0.0, 1.0);
           let sandW = clamp((_T - 18.0) / 6.0, 0.0, 1.0) * clamp((0.30 - _P) / 0.10, 0.0, 1.0);
           let rockW = clamp((_elevMSL - 2000.0) / 1500.0, 0.0, 1.0);
           let grassW = max(0.0, 1.0 - snowW - sandW - rockW);
-          // Sample each texture and weight-blend.
-          let tg = _surface_tex_grass(in.worldPos);
-          let tr = _surface_tex_rock(in.worldPos);
-          let ts = _surface_tex_sand(in.worldPos);
-          let tw = _surface_tex_snow(in.worldPos);
-          let texW = tg * grassW + tr * rockW + ts * sandW + tw * snowW;
-          // texW is centered around 1.0; blend toward it by midFade
-          // so orbital views see no texturing.
+          // §bonus-perf-foot-6 -- dominant-only pick. Only the
+          // largest-weight biome contributes its texture. Across a
+          // chunk you see crisp biome boundaries instead of smooth
+          // blends, but at foot that's invisible -- the climate
+          // field varies on the 10s-of-km scale and dominant pick
+          // changes at the same boundaries the weighted blend would
+          // have shown the transition.
+          let maxW = max(max(grassW, sandW), max(rockW, snowW));
+          var texW: vec3<f32>;
+          if (snowW >= maxW) {
+            texW = _surface_tex_snow(in.worldPos);
+          } else if (rockW >= maxW) {
+            texW = _surface_tex_rock(in.worldPos);
+          } else if (sandW >= maxW) {
+            texW = _surface_tex_sand(in.worldPos);
+          } else {
+            texW = _surface_tex_grass(in.worldPos);
+          }
           color = color * mix(vec3<f32>(1.0), texW, midFade);
         }
       }
