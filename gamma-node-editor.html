@@ -57255,6 +57255,94 @@ function _updateMsaaPill() {
 const _SCENE_DIAG = { pipeline: false, instance: false, encode: false, draw: false, cull: false };
 
 /* =========================================================================
+ * §bonus-perf-diag (2026-05-25) -- focused per-frame perf counters for
+ * the SVT/DEM transition slow zone. User reports 9 fps at foot, drop
+ * happens "exactly where SVT ends and DEM begins". This block makes
+ * the suspect hot paths visible:
+ *
+ *   chunksVisible   -- total visible chunks this frame (cull-pass count)
+ *   chunksBuilt     -- chunks rebuilt this frame (CPU vertex noise +
+ *                      DEM resample + GPU upload)
+ *   chunkBuildMs    -- ms spent in chunk build this frame
+ *   demTilesFetched -- DEM tile fetches kicked off this frame
+ *   demTilesArrived -- DEM tile arrivals this frame (each triggers
+ *                      _invalidateChunksForTile → chunk rebuilds)
+ *   chunksInvalidated -- chunks killed by tile arrivals this frame
+ *   svtPagesGenThisFrame -- pages drained from SVT queue this frame
+ *
+ * Updated by the chunk-build path + DEM loader + SVT tick. Dumped to
+ * console every 60 frames if any counter > 0. Also surfaced via
+ * window.__PERFSTATS so user can poll from console:
+ *   __PERFSTATS.snapshot()
+ */
+const _PERFSTATS = {
+  frame: 0,
+  chunksVisible: 0,
+  chunksBuilt: 0,
+  chunkBuildMs: 0,
+  demTilesFetched: 0,
+  demTilesArrived: 0,
+  chunksInvalidated: 0,
+  svtPagesGenThisFrame: 0,
+  // Rolling totals so a snapshot has the cumulative picture too.
+  totalChunksBuilt: 0,
+  totalDemTilesFetched: 0,
+  totalDemTilesArrived: 0,
+  totalChunksInvalidated: 0,
+  // Frame-time stats (rolling 60-frame window).
+  frameMs: 0,
+  frameMsWindow: [],
+};
+function _perfFrameReset() {
+  _PERFSTATS.frame++;
+  _PERFSTATS.chunksVisible = 0;
+  _PERFSTATS.chunksBuilt = 0;
+  _PERFSTATS.chunkBuildMs = 0;
+  _PERFSTATS.demTilesFetched = 0;
+  _PERFSTATS.demTilesArrived = 0;
+  _PERFSTATS.chunksInvalidated = 0;
+  _PERFSTATS.svtPagesGenThisFrame = 0;
+}
+function _perfFrameDump() {
+  if (_PERFSTATS.frame % 60 !== 0) return;
+  // Skip noiseless reports.
+  if (_PERFSTATS.chunksBuilt === 0
+      && _PERFSTATS.demTilesFetched === 0
+      && _PERFSTATS.demTilesArrived === 0
+      && _PERFSTATS.svtPagesGenThisFrame === 0) return;
+  console.log("[perf] f=" + _PERFSTATS.frame
+    + " vis=" + _PERFSTATS.chunksVisible
+    + " built=" + _PERFSTATS.chunksBuilt + "(" + _PERFSTATS.chunkBuildMs.toFixed(1) + "ms)"
+    + " demFetch=" + _PERFSTATS.demTilesFetched
+    + " demArrive=" + _PERFSTATS.demTilesArrived
+    + " invald=" + _PERFSTATS.chunksInvalidated
+    + " svtPg=" + _PERFSTATS.svtPagesGenThisFrame
+    + " | cumDEM=" + _PERFSTATS.totalDemTilesArrived
+    + "/" + _PERFSTATS.totalDemTilesFetched);
+}
+if (typeof window !== "undefined") {
+  window.__PERFSTATS = _PERFSTATS;
+  window.__PERFSTATS.snapshot = function () {
+    return {
+      frame: _PERFSTATS.frame,
+      chunksVisible: _PERFSTATS.chunksVisible,
+      chunksBuilt: _PERFSTATS.chunksBuilt,
+      chunkBuildMs: _PERFSTATS.chunkBuildMs,
+      demTilesFetched: _PERFSTATS.demTilesFetched,
+      demTilesArrived: _PERFSTATS.demTilesArrived,
+      chunksInvalidated: _PERFSTATS.chunksInvalidated,
+      svtPagesGenThisFrame: _PERFSTATS.svtPagesGenThisFrame,
+      total: {
+        chunksBuilt: _PERFSTATS.totalChunksBuilt,
+        demTilesFetched: _PERFSTATS.totalDemTilesFetched,
+        demTilesArrived: _PERFSTATS.totalDemTilesArrived,
+        chunksInvalidated: _PERFSTATS.totalChunksInvalidated,
+      }
+    };
+  };
+}
+
+/* =========================================================================
  * Sprint 7.5.3c -- ShaderMat preset library
  *
  * Each preset is a WGSL function body defining
@@ -63281,6 +63369,9 @@ function _svtTickGeneration(pmap, budgetMs) {
     processed++;
     if (((typeof performance !== "undefined") ? performance.now() : 0) - t0 > budgetMs) break;
   }
+  if (typeof _PERFSTATS !== "undefined" && processed > 0) {
+    _PERFSTATS.svtPagesGenThisFrame += processed;
+  }
   _SVT.frame++;
   if (processed > 0 && _SVT.frame % 60 === 0) {
     // Sparse log so the user can see residency growing without
@@ -63341,6 +63432,10 @@ function _loadHighResTile(z, x, y) {
     _EARTH_TILES.cache.delete(firstKey);
   }
   _EARTH_TILES.pending.add(key);
+  if (typeof _PERFSTATS !== "undefined") {
+    _PERFSTATS.demTilesFetched++;
+    _PERFSTATS.totalDemTilesFetched++;
+  }
   _loadEarthDEMTile(z, x, y).then((imgData) => {
     const meters = new Float32Array(256 * 256);
     const px = imgData.data;
@@ -63353,6 +63448,10 @@ function _loadHighResTile(z, x, y) {
     _EARTH_TILES.cache.set(key, { meters, z: z, x: x, y: y, t: performance.now() });
     _EARTH_TILES.pending.delete(key);
     _EARTH_TILES.loadCount++;
+    if (typeof _PERFSTATS !== "undefined") {
+      _PERFSTATS.demTilesArrived++;
+      _PERFSTATS.totalDemTilesArrived++;
+    }
     // Logged sparingly (every 16 tiles) so progress is visible without spam.
     if (_EARTH_TILES.loadCount % 16 === 1) {
       console.log("[earth-dem-hires] cached " + _EARTH_TILES.cache.size + " tiles ("
@@ -63541,6 +63640,10 @@ function _invalidateChunksForTile(z, tx, ty) {
       entry.chunks.delete(k);
       droppedTotal++;
     }
+  }
+  if (typeof _PERFSTATS !== "undefined" && droppedTotal > 0) {
+    _PERFSTATS.chunksInvalidated += droppedTotal;
+    _PERFSTATS.totalChunksInvalidated += droppedTotal;
   }
   // Log only when we actually dropped something AND it's a sparse event
   // (every 32 tiles for the noisy startup phase).
@@ -65679,15 +65782,18 @@ function _ensurePlanetMeshChunks(node) {
   phPending.sort((a, b) => b.info.depth - a.info.depth);
   const PH_BUDGET_MS = 8;
   const phStart = performance.now();
+  let phBuilt = 0;
   for (let i = 0; i < phPending.length; i++) {
     const item = phPending[i];
     const ph = _buildSinglePlanetMeshChunk(node, Object.assign({}, item.info, { segs: 2 }), camPos, sun, ambient, pmap, cells);
     if (ph) {
       ph.currentLod = 2;
       entry.chunks.set(item.key, ph);
+      phBuilt++;
     }
     if (performance.now() - phStart > PH_BUDGET_MS) break;
   }
+  const phMs = performance.now() - phStart;
 
   const upPending = [];
   for (const [key, info] of visible) {
@@ -65698,6 +65804,7 @@ function _ensurePlanetMeshChunks(node) {
   upPending.sort((a, b) => b.info.depth - a.info.depth);
   const UP_BUDGET_MS = 12;
   const upStart = performance.now();
+  let upBuilt = 0;
   for (let i = 0; i < upPending.length; i++) {
     const item = upPending[i];
     const proper = _buildSinglePlanetMeshChunk(node, Object.assign({}, item.info, { segs: geom.segs }), camPos, sun, ambient, pmap, cells);
@@ -65706,8 +65813,17 @@ function _ensurePlanetMeshChunks(node) {
       try { item.c.indexBuffer  && item.c.indexBuffer.destroy();  } catch (_) {}
       proper.currentLod = geom.segs;
       entry.chunks.set(item.key, proper);
+      upBuilt++;
     }
     if (performance.now() - upStart > UP_BUDGET_MS) break;
+  }
+  const upMs = performance.now() - upStart;
+
+  if (typeof _PERFSTATS !== "undefined") {
+    _PERFSTATS.chunksVisible += visible.size;
+    _PERFSTATS.chunksBuilt += phBuilt + upBuilt;
+    _PERFSTATS.chunkBuildMs += phMs + upMs;
+    _PERFSTATS.totalChunksBuilt += phBuilt + upBuilt;
   }
 
   // Aggregate AABB for the outer (whole-mesh) frustum cull.
@@ -72093,6 +72209,16 @@ function renderVisualFrame() {
 
   const now = performance.now();
   const dtSec = Visual.lastFrameT > 0 ? (now - Visual.lastFrameT) * 0.001 : 0;
+  // §bonus-perf-diag (2026-05-25) -- per-frame counter reset + last-
+  // frame ms capture for the perf overlay / __PERFSTATS snapshot.
+  if (typeof _perfFrameReset === "function") _perfFrameReset();
+  if (typeof _PERFSTATS !== "undefined") {
+    if (Visual.lastFrameT > 0) {
+      _PERFSTATS.frameMs = now - Visual.lastFrameT;
+      _PERFSTATS.frameMsWindow.push(_PERFSTATS.frameMs);
+      if (_PERFSTATS.frameMsWindow.length > 60) _PERFSTATS.frameMsWindow.shift();
+    }
+  }
   Visual.lastFrameT = now;
 
   // v0.3.1 — clear the per-frame external-texture cache. Video-source
@@ -72242,6 +72368,11 @@ function renderVisualFrame() {
   }
 
   Visual.device.queue.submit([enc.finish()]);
+
+  // §bonus-perf-diag (2026-05-25) -- dump the per-frame counters.
+  // Sparse (every 60 frames) and only when something changed, so
+  // the console doesn't spam when idle.
+  if (typeof _perfFrameDump === "function") _perfFrameDump();
 }
 
 function _visualRenderTick(t) {
