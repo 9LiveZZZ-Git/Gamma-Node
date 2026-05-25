@@ -65807,10 +65807,37 @@ function _ensurePlanetMeshChunks(node) {
       const aboveSea = elev01 > seaLevel
         ? (elev01 - seaLevel) / Math.max(1e-6, 1 - seaLevel) * geom.hs
         : 0;
-      localTerrainR = geom.r + aboveSea;
+      // §bonus-perf-foot-12 -- CLAMP terrain elev so camera is always
+      // at least 1m above it. The low-res cubemap (~10 km/texel) can
+      // return mountain-peak averages for valley locations, which would
+      // give localTerrainR > cMag → camOutside=false → horizon cull
+      // DISABLED → all chunks pass → 9 fps. The clamp keeps the cull
+      // engaged even when the elev sample lies; worst case is a
+      // slightly bigger horizon cone than reality, which over-includes
+      // but doesn't over-exclude.
+      localTerrainR = Math.min(geom.r + aboveSea, cMagJs - 1.0);
     }
   }
   const visList = _planetVisibleChunks(camPos, geom.r, geom.hs, geom.maxDepth, geom.splitFactor, localTerrainR);
+  // §bonus-perf-foot-12 -- one-shot AGL diag. Logs when AGL is suspect
+  // (sample-vs-camera mismatch caused localTerrainR clamping). Helps
+  // see if the low-res cubemap is over-reporting terrain elevation.
+  if (typeof _PLANETMESH_AGL_DIAG === "undefined") {
+    const cMagJs = Math.sqrt(camPos.x*camPos.x + camPos.y*camPos.y + camPos.z*camPos.z);
+    if (pmapCubemap && cMagJs > geom.r) {
+      const sx = camPos.x / cMagJs, sy = camPos.y / cMagJs, sz = camPos.z / cMagJs;
+      const elev01 = _planetSampleElevationCached(pmapCubemap, sx, sy, sz);
+      const aboveSea = elev01 > seaLevel
+        ? (elev01 - seaLevel) / Math.max(1e-6, 1 - seaLevel) * geom.hs : 0;
+      const camMSL = cMagJs - geom.r;
+      console.log("[agl-diag] camMSL=" + camMSL.toFixed(1) + "m"
+        + " sampledTerrain=" + aboveSea.toFixed(1) + "m"
+        + " AGL=" + (camMSL - aboveSea).toFixed(1) + "m"
+        + " clampedAGL=" + (cMagJs - localTerrainR).toFixed(1) + "m"
+        + " (elev01=" + elev01.toFixed(3) + ", seaLevel=" + seaLevel + ")");
+      window._PLANETMESH_AGL_DIAG = true;
+    }
+  }
   const visible = new Map();
   for (const v of visList) {
     visible.set(_planetChunkKey(v.face, v.depth, v.ix, v.iy), v);
