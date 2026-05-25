@@ -36669,26 +36669,94 @@ function brRenderAssetGrid() {
     return;
   }
 
-  grid.innerHTML = list.map(a => `
-    <div class="asset-card" draggable="true" data-asset-id="${escapeAttr(a.id)}" title="${escapeAttr(a.name + ' — drag onto a SamplePlayer / GranularPlayer node')}">
+  grid.innerHTML = list.map(a => {
+    const dragTitle = (a.type === "sprite")
+      ? a.name + ' — drag onto the patch canvas to drop in an ImageURL + Sprite pair'
+      : a.name + ' — drag onto a SamplePlayer / GranularPlayer node';
+    // §8.A.2 -- sprite metadata inline editor: framesX / framesY / fps
+    // inputs below the thumbnail. Renders only for sprite-type cards.
+    const meta = (a.type === "sprite" && a.asset) ? `
+      <div class="asset-spr-meta" style="display:flex; gap:4px; margin-top:4px; font-size:9.5px; font-family:var(--font-mono); color:var(--text-3);">
+        <label style="display:flex; align-items:center; gap:2px;">cols
+          <input type="number" min="1" max="64" value="${a.asset.framesX || 1}" data-spr-field="framesX" data-asset-id="${escapeAttr(a.id)}" style="width:34px; padding:1px 3px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--text-3); border-radius:2px; font-family:inherit; font-size:9.5px;"/>
+        </label>
+        <label style="display:flex; align-items:center; gap:2px;">rows
+          <input type="number" min="1" max="64" value="${a.asset.framesY || 1}" data-spr-field="framesY" data-asset-id="${escapeAttr(a.id)}" style="width:34px; padding:1px 3px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--text-3); border-radius:2px; font-family:inherit; font-size:9.5px;"/>
+        </label>
+        <label style="display:flex; align-items:center; gap:2px;">fps
+          <input type="number" min="0.5" max="60" step="0.5" value="${a.asset.fps || 1}" data-spr-field="fps" data-asset-id="${escapeAttr(a.id)}" style="width:34px; padding:1px 3px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--text-3); border-radius:2px; font-family:inherit; font-size:9.5px;"/>
+        </label>
+      </div>` : "";
+    return `
+    <div class="asset-card" draggable="true" data-asset-id="${escapeAttr(a.id)}" data-asset-type="${escapeAttr(a.type)}" title="${escapeAttr(dragTitle)}">
+      <button class="asset-del" data-del-id="${escapeAttr(a.id)}" title="Delete this asset (irreversible)" style="position:absolute; top:3px; right:3px; width:18px; height:18px; padding:0; line-height:16px; border-radius:50%; background:rgba(40,12,12,0.85); color:#ffb0a0; border:1px solid rgba(200,80,80,0.4); cursor:pointer; font-size:12px; font-weight:600; z-index:2;">×</button>
       <div class="asset-thumb">${brAssetThumb(a)}</div>
       <div class="asset-meta">
         <span class="asset-name">${escapeText(a.name)}</span>
         <span class="asset-sub">${escapeText(a.sub)}</span>
+        ${meta}
       </div>
       <span class="asset-badge ${a.type}">${escapeText(a.type)}</span>
     </div>
-  `).join("");
+  `;
+  }).join("");
 
   // Wire dragstart so the card can carry the asset id onto a node.
-  // Listen for the receiving end downstream — for v1 we just stuff
-  // the asset id into dataTransfer; existing sample-host nodes can
-  // pick it up through a registered ondrop handler when they ship.
+  // For sprite assets the patch canvas accepts the drop and creates
+  // an ImageURL + Sprite pair (see _wirePatchCanvasAssetDrop).
   grid.querySelectorAll(".asset-card").forEach(card => {
+    card.style.position = "relative";  // anchor for the delete button
     card.addEventListener("dragstart", e => {
       e.dataTransfer.setData("text/x-gamma-asset-id", card.dataset.assetId);
+      // Sprite drops also carry a type tag so the patch handler knows
+      // to create ImageURL + Sprite, not (e.g.) SamplePlayer.
+      if (card.dataset.assetType) {
+        e.dataTransfer.setData("text/x-gamma-asset-type", card.dataset.assetType);
+      }
       e.dataTransfer.effectAllowed = "copy";
     });
+  });
+  // §8.A.1 / §8.A.2 -- delete buttons.
+  grid.querySelectorAll(".asset-del").forEach(btn => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.delId;
+      const rec = Assets.get(id);
+      const label = rec ? rec.name : id;
+      if (!confirm("Delete asset '" + label + "'? This can't be undone.")) return;
+      // Revoke any cached object URL on the thumbnail to free the blob.
+      if (rec && rec._thumbUrl) {
+        try { URL.revokeObjectURL(rec._thumbUrl); } catch (_) {}
+      }
+      await Assets.delete(id);
+      console.log("[assets] deleted '" + label + "' id=" + id);
+      brRenderAssets();
+    });
+  });
+  // §8.A.2 -- sprite metadata inputs. Edit framesX/framesY/fps in place;
+  // changes persist via Assets.put. Refresh the card sub-line + any
+  // already-wired Sprite nodes via render().
+  grid.querySelectorAll("input[data-spr-field]").forEach(inp => {
+    inp.addEventListener("change", async (e) => {
+      e.stopPropagation();
+      const id = inp.dataset.assetId;
+      const field = inp.dataset.sprField;
+      const rec = Assets.get(id);
+      if (!rec) return;
+      let val = parseFloat(inp.value);
+      if (!Number.isFinite(val) || val <= 0) val = (field === "fps" ? 1 : 1);
+      rec[field] = val;
+      await Assets.put(rec);
+      brRenderAssets();
+      // Live-refresh any patches consuming this asset (so framesX/Y
+      // changes are immediately reflected without a reload).
+      if (typeof render === "function") {
+        try { render(); } catch (_) {}
+      }
+    });
+    // Don't let typing in the input start a drag-card behavior.
+    inp.addEventListener("mousedown", e => e.stopPropagation());
+    inp.addEventListener("dragstart", e => e.preventDefault());
   });
 }
 
@@ -36987,6 +37055,74 @@ function addFromPalette(type) {
   const id = makeNode(type, x, y);
   if (id) selectOne(id);
   render();
+}
+
+/* Sprint §8.A.2 -- patch-canvas drop zone for asset-typed drags from
+ * the Assets tab. Sprite asset drops create an ImageURL + Sprite +
+ * Translate trio, wired and positioned at the drop point, so the user
+ * gets a usable sprite chain with one drag gesture. Other asset types
+ * (audio, future) are no-ops here -- their hosts have their own drop
+ * paths (SamplePlayer's modal stage, etc.).
+ *
+ * dataTransfer carries text/x-gamma-asset-id and text/x-gamma-asset-type
+ * (set by brRenderAssetGrid). dragover must preventDefault to allow drop. */
+function _wirePatchCanvasAssetDrop() {
+  if (!canvas || canvas._assetDropWired) return;
+  canvas._assetDropWired = true;
+  canvas.addEventListener("dragover", e => {
+    const types = e.dataTransfer && e.dataTransfer.types;
+    if (!types || !types.indexOf) return;
+    // Only accept asset-typed drags; let other drag interactions through.
+    if (types.indexOf("text/x-gamma-asset-id") < 0) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+  });
+  canvas.addEventListener("drop", e => {
+    const id = e.dataTransfer && e.dataTransfer.getData("text/x-gamma-asset-id");
+    if (!id) return;
+    const assetType = e.dataTransfer.getData("text/x-gamma-asset-type");
+    if (assetType !== "sprite") return;  // audio etc handled by their own modals
+    e.preventDefault();
+    const rec = Assets.get(id);
+    if (!rec) {
+      console.warn("[asset-drop] sprite id not found: " + id);
+      return;
+    }
+    const w = screenToWorld(e.clientX, e.clientY);
+    pushHistory("asset-drop:" + rec.name);
+    // ImageURL → Sprite → Translate. Position the chain so the Translate
+    // sits near the drop point and the source nodes line up to its left.
+    const imgX = Math.max(0, w.x - 360);
+    const sprX = Math.max(0, w.x - 180);
+    const trX  = Math.max(0, w.x);
+    const y    = Math.max(0, w.y);
+    const imgId = makeNode("ImageURL", imgX, y, {
+      url: "asset:" + rec.name,
+      filterMode: "nearest"
+    });
+    const sprId = makeNode("Sprite", sprX, y, {
+      width: 1, height: 1,
+      anchorX: (rec.anchor && typeof rec.anchor.x === "number") ? rec.anchor.x : 0.5,
+      anchorY: (rec.anchor && typeof rec.anchor.y === "number") ? rec.anchor.y : 0.5,
+      framesX: rec.framesX || 1,
+      framesY: rec.framesY || 1,
+      frame: 0,
+      tintR: 1, tintG: 1, tintB: 1, tintA: 1
+    });
+    const trId = makeNode("Translate", trX, y, { x: 0, y: 0, z: -1 });
+    if (state && Array.isArray(state.edges)) {
+      state.edges.push({ from: { node: imgId, port: "texture" }, to: { node: sprId, port: "texture" } });
+      state.edges.push({ from: { node: sprId, port: "mesh"    }, to: { node: trId,  port: "mesh"    } });
+    }
+    selectOne(trId);
+    render();
+    console.log("[asset-drop] sprite '" + rec.name + "' → ImageURL(asset:" + rec.name + ") → Sprite → Translate at world (" + Math.round(w.x) + ", " + Math.round(w.y) + ")");
+  });
+}
+// Install on startup (canvas exists by the time this file finishes
+// executing; if not, the next addFromPalette call would also fire).
+if (typeof canvas !== "undefined" && canvas) {
+  _wirePatchCanvasAssetDrop();
 }
 
 /* =========================================================================
@@ -46296,6 +46432,30 @@ function _ensureImageURLTexture(url) {
       return entry;
     }
     _uploadImageBitmapToTexture(entry, bitmap, url);
+    return entry;
+  }
+  // §8.A.2 -- asset:NAME scheme. Resolves through the Assets store
+  // (case-insensitive sprite name match), reads the stored blob, decodes
+  // to ImageBitmap, uploads. Lets patches reference user-imported / LLM-
+  // generated sprites without hard-coding paths.
+  if (url.indexOf("asset:") === 0) {
+    const name = url.substring("asset:".length);
+    const rec = (typeof Assets !== "undefined") ? Assets.findSpriteByName(name) : null;
+    if (!rec || !rec.blob) {
+      entry.state = "error";
+      entry.error = "asset not found: " + name;
+      console.warn("[image-url] " + entry.error + " (asset library has "
+        + (typeof Assets !== "undefined" ? Assets.list({type:"sprite"}).length : 0)
+        + " sprites)");
+      return entry;
+    }
+    createImageBitmap(rec.blob).then(bitmap => {
+      _uploadImageBitmapToTexture(entry, bitmap, url);
+    }).catch(err => {
+      entry.state = "error";
+      entry.error = String(err);
+      console.warn("[image-url] asset decode failed " + name + ":", err);
+    });
     return entry;
   }
   // Real URL (http/https/data). Async fetch via createImageBitmap.
