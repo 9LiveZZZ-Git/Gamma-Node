@@ -33330,6 +33330,12 @@ const _demos = [
         // pixel below ~885 m: Amazon basin, most of Africa, Himalayan
         // foothills all rendered as ocean even though they're land.
         seaLevel:         0.5,
+        // Sprint 10-4 v9: explicit AAA-tier mesh density on the
+        // demo, fixed in the patch so reloads inherit it. cap-level
+        // values: segs=128 (16k verts/chunk) + maxDepth=22 (2.5m
+        // chunk edges at deepest LOD = sub-cm vertex spacing).
+        segments:         128,
+        maxDepth:         22,
         subdivide:        1  // one Loop subdivision pass -- smooths cell-faceting
       });
 
@@ -53650,49 +53656,45 @@ fn _value_noise_3d(p: vec3<f32>) -> f32 {
  * All four functions are cheap: 2-3 value_noise_3d samples each.
  * Output channels are loosely correlated for natural color
  * variation rather than independent RGB jitter. */
+// Sprint 10-4 v9: per-channel modulation amplitudes halved across all
+// four texture profiles. v7 was visibly noisy at high mesh density;
+// v9 reads as 'surface character' instead of 'pattern'.
 fn _surface_tex_grass(p: vec3<f32>) -> vec3<f32> {
-  // Clumpy grass: large patches + small blade-scale variation.
-  let n_patch  = _value_noise_3d(p * 0.7)  - 0.5;   // 1.4 m
-  let n_blade  = _value_noise_3d(p * 8.0)  - 0.5;   // 12 cm
+  let n_patch  = _value_noise_3d(p * 0.7)  - 0.5;
+  let n_blade  = _value_noise_3d(p * 8.0)  - 0.5;
   let mix1 = n_patch * 0.5 + n_blade * 0.4;
-  // Greener in shadow patches, yellow/dry on rises.
-  return vec3<f32>(1.0 + mix1 * 0.12,
+  return vec3<f32>(1.0 + mix1 * 0.06,
+                   1.0 + mix1 * 0.04,
+                   1.0 + mix1 * 0.03);
+}
+
+fn _surface_tex_sand(p: vec3<f32>) -> vec3<f32> {
+  let stripe = sin(p.x * 1.2) * 0.5 + 0.5;
+  let n_dune = _value_noise_3d(p * 0.3)  - 0.5;
+  let n_fine = _value_noise_3d(p * 6.0)  - 0.5;
+  let mix1 = n_dune * 0.3 + n_fine * 0.4 + (stripe - 0.5) * 0.2;
+  return vec3<f32>(1.0 + mix1 * 0.05,
+                   1.0 + mix1 * 0.05,
+                   1.0 + mix1 * 0.06);
+}
+
+fn _surface_tex_rock(p: vec3<f32>) -> vec3<f32> {
+  let n_macro = _value_noise_3d(p * 0.5)  - 0.5;
+  let n_crack = _value_noise_3d(p * 3.0)  - 0.5;
+  let cracks  = smoothstep(0.15, 0.20, abs(n_crack));
+  let mix1 = n_macro * 0.4 - (1.0 - cracks) * 0.25;
+  return vec3<f32>(1.0 + mix1 * 0.09,
                    1.0 + mix1 * 0.08,
                    1.0 + mix1 * 0.06);
 }
 
-fn _surface_tex_sand(p: vec3<f32>) -> vec3<f32> {
-  // Wind ripples + dune brightness variation. Stripe along world X.
-  let stripe = sin(p.x * 1.2) * 0.5 + 0.5;          // ~5 m wavelength
-  let n_dune = _value_noise_3d(p * 0.3)  - 0.5;     // 3 m dunes
-  let n_fine = _value_noise_3d(p * 6.0)  - 0.5;     // 16 cm grains
-  let mix1 = n_dune * 0.3 + n_fine * 0.4 + (stripe - 0.5) * 0.2;
-  return vec3<f32>(1.0 + mix1 * 0.10,
-                   1.0 + mix1 * 0.10,
-                   1.0 + mix1 * 0.13);   // slightly more blue jitter for sun-shadow
-}
-
-fn _surface_tex_rock(p: vec3<f32>) -> vec3<f32> {
-  // Cellular crack approximation. Step on a noise sample to get
-  // sharp boundaries; layered for fracture pattern.
-  let n_macro = _value_noise_3d(p * 0.5)  - 0.5;    // 2 m boulders
-  let n_crack = _value_noise_3d(p * 3.0)  - 0.5;    // 33 cm cracks
-  let cracks  = smoothstep(0.15, 0.20, abs(n_crack));  // sharp edges
-  let mix1 = n_macro * 0.4 - (1.0 - cracks) * 0.25;
-  return vec3<f32>(1.0 + mix1 * 0.18,
-                   1.0 + mix1 * 0.16,
-                   1.0 + mix1 * 0.13);
-}
-
 fn _surface_tex_snow(p: vec3<f32>) -> vec3<f32> {
-  // Subtle drift/crust pattern -- snow is mostly uniform but
-  // wind-drifts produce shallow waves.
-  let n_drift = _value_noise_3d(p * 0.4)  - 0.5;    // 2.5 m drifts
-  let n_crust = _value_noise_3d(p * 4.0)  - 0.5;    // 25 cm crust
+  let n_drift = _value_noise_3d(p * 0.4)  - 0.5;
+  let n_crust = _value_noise_3d(p * 4.0)  - 0.5;
   let mix1 = n_drift * 0.5 + n_crust * 0.3;
-  return vec3<f32>(1.0 + mix1 * 0.05,
-                   1.0 + mix1 * 0.05,
-                   1.0 + mix1 * 0.06);
+  return vec3<f32>(1.0 + mix1 * 0.025,
+                   1.0 + mix1 * 0.025,
+                   1.0 + mix1 * 0.03);
 }
 
 // Map camera altitude to detail octave count. Spec values, §8.4:
@@ -55521,15 +55523,16 @@ fn fs_unlit_vc(in: VsOut) -> @location(0) vec4<f32> {
       let midFade   = 1.0 - smoothstep(150.0,   500.0, camDistL);
       let nearFade  = 1.0 - smoothstep(50.0,    200.0, camDistL);
       let microFade = 1.0 - smoothstep(15.0,     50.0, camDistL);
+      // Sprint 10-4 v9: amplitudes halved per user 'noise is too much'.
       if (macroFade > 0.001) {
         let n1 = _value_noise_3d(in.worldPos * 0.02)  - 0.5;
         let n2 = _value_noise_3d(in.worldPos * 0.125) - 0.5;
         let n3 = _value_noise_3d(in.worldPos * 0.66)  - 0.5;
         let n4 = _value_noise_3d(in.worldPos * 3.30)  - 0.5;
-        let det =  n1 * 0.06 * macroFade
-                 + n2 * 0.10 * midFade
-                 + n3 * 0.12 * nearFade
-                 + n4 * 0.14 * microFade;
+        let det =  n1 * 0.03 * macroFade
+                 + n2 * 0.05 * midFade
+                 + n3 * 0.06 * nearFade
+                 + n4 * 0.07 * microFade;
         color = color * (1.0 + det);
       }
       // Sprint 10-4 v7: biome-aware procedural surface textures.
@@ -59222,7 +59225,7 @@ function _planetMapCacheKey(node) {
     p.resolution, p.cellCount,
     p.seed, p.frequency, p.octaves,
     p.lacunarity, p.gain, p.ridges,
-    "v" + ver, "p13g", "src=earth-densepoly-floored",
+    "v" + ver, "p13h", "src=earth-densepoly-quietnoise",
     _EARTH_DEM.loaded ? "dem=real" : "dem=ellipse"
   ].join(",");
 }
@@ -63341,20 +63344,14 @@ function _resolvePlanetMeshGeom(p) {
     cxC: (typeof p.centerX === "number") ? p.centerX : 0,
     cyC: (typeof p.centerY === "number") ? p.centerY : 0,
     czC: (typeof p.centerZ === "number") ? p.centerZ : 0,
-    // Sprint 10-4 v8: minimum density FLOOR. User's existing patches
-    // had explicit segs=16/maxDepth=16 from an old demo save, which
-    // overrode the v5/v6/v7 default bumps -- they were still rendering
-    // at original-low density without realizing. v8 makes the resolver
-    // enforce a minimum floor:
-    //   segs:      floor = 64  (well past where Phong triangles appear)
-    //   maxDepth:  floor = 20  (foot-level detail under camera)
-    // Saved values ABOVE the floor are respected (so users who tuned
-    // up to 128/24 keep that). Caps still 128/24.
-    //
-    // To go BELOW the floor for performance reasons, edit the floor
-    // values in _resolvePlanetMeshGeom directly.
-    segs:        Math.max(64, Math.min(128, Math.floor((typeof p.segments === "number") ? p.segments : 96))),
-    maxDepth:    Math.max(20, Math.min(24, Math.floor((typeof p.maxDepth    === "number") ? p.maxDepth    : 22))),
+    // Sprint 10-4 v9: floor relaxed back to original cap range.
+    // v8 hard-floored at 64/20 to fix the user's old saved patch,
+    // but the better fix was to update the demo itself (which now
+    // sets segments=128 maxDepth=22 explicitly). Floor stays low
+    // (2/0) so user-tuned-down patches still work for performance
+    // reasons.
+    segs:        Math.max(2, Math.min(128, Math.floor((typeof p.segments === "number") ? p.segments : 96))),
+    maxDepth:    Math.max(0, Math.min(24, Math.floor((typeof p.maxDepth    === "number") ? p.maxDepth    : 22))),
     splitFactor: Math.max(0.1, Math.min(50, (typeof p.splitFactor === "number") ? p.splitFactor : 5.0)),
     hs:       (typeof p.heightScale === "number") ? p.heightScale : 0,
     seaLevel: Math.max(0, Math.min(1, (typeof p.seaLevel === "number") ? p.seaLevel : 0.5))
