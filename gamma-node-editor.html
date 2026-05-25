@@ -33330,12 +33330,13 @@ const _demos = [
         // pixel below ~885 m: Amazon basin, most of Africa, Himalayan
         // foothills all rendered as ocean even though they're land.
         seaLevel:         0.5,
-        // Sprint 10-4 v9: explicit AAA-tier mesh density on the
-        // demo, fixed in the patch so reloads inherit it. cap-level
-        // values: segs=128 (16k verts/chunk) + maxDepth=22 (2.5m
-        // chunk edges at deepest LOD = sub-cm vertex spacing).
-        segments:         128,
-        maxDepth:         22,
+        // Sprint 10-4 v10: dropped 128/22 → 64/20 per user. Sweet
+        // spot: 65² = 4225 verts/chunk × ~1200 visible chunks =
+        // ~5M verts, ~250 MB GPU. Vertex spacing ~0.6 m at foot
+        // level. Still well past Outerra-tier mesh density without
+        // the 4x chunk build cost of 128².
+        segments:         64,
+        maxDepth:         20,
         subdivide:        1  // one Loop subdivision pass -- smooths cell-faceting
       });
 
@@ -54934,10 +54935,76 @@ struct PerDraw {
 // camera's planet-local frame. fs_sky samples this in one texture
 // fetch instead of running its own per-pixel atmosphere integral.
 @group(0) @binding(9) var atmSkyViewLUT:       texture_2d<f32>;
-// C.7 cleanup -- the aerial-perspective LUT pair (bindings 10/11) was
-// removed after the structural fix made sample_aerial_perspective_lut
-// read sky-view + transmittance LUTs directly. The mesh BGL has been
-// trimmed accordingly.
+// Sprint 10-5c-c: Sparse Virtual Texture bindings. Atlas is a single
+// 4096² RGBA8 texture holding 32×32 = 1024 page slots of 128² each.
+// Page table is a 256² R32Uint × 6-layer array, one layer per cube
+// face, encoding (slotY << 16) | slotX for resident pages or
+// 0xFFFFFFFF for unresident.
+@group(0) @binding(10) var svtAtlas:       texture_2d<f32>;
+@group(0) @binding(11) var svtSampler:     sampler;
+@group(0) @binding(12) var svtPageTable:   texture_2d_array<u32>;
+
+/* SVT sampling helper. Given a unit-sphere world direction, returns
+ * (rgb, pageResidentFlag). Flag = 1.0 if the page was resident in
+ * the atlas and rgb is valid sampled detail; 0.0 if not resident,
+ * caller should fall back to per-fragment procedural.
+ *
+ * Implementation:
+ *   1. Pick cube face by max-axis test.
+ *   2. Compute face-local (u, v) ∈ [0, 1] via spherify-inverse.
+ *      (For now use simple atan2-style projection -- not the exact
+ *      inverse of the bake's spherify warp. Close enough at 256²
+ *      page resolution; refine to true inverse in 10-5c-f.)
+ *   3. Compute (pageX, pageY) and local UV within page.
+ *   4. textureLoad page-table → packed slot id.
+ *   5. If unresident (= 0xFFFFFFFF), return flag=0.
+ *   6. Else sample atlas at slot+local UV with linear filter. */
+fn _svt_sample(dir: vec3<f32>) -> vec4<f32> {
+  let absX = abs(dir.x);
+  let absY = abs(dir.y);
+  let absZ = abs(dir.z);
+  var face: i32 = 0;
+  var u: f32 = 0.0;
+  var v: f32 = 0.0;
+  if (absX >= absY && absX >= absZ) {
+    let inv = 1.0 / absX;
+    if (dir.x > 0.0) { face = 0; u = -dir.z * inv; v = dir.y * inv; }
+    else             { face = 1; u =  dir.z * inv; v = dir.y * inv; }
+  } else if (absY >= absZ) {
+    let inv = 1.0 / absY;
+    if (dir.y > 0.0) { face = 2; u = dir.x * inv; v =  dir.z * inv; }
+    else             { face = 3; u = dir.x * inv; v = -dir.z * inv; }
+  } else {
+    let inv = 1.0 / absZ;
+    if (dir.z > 0.0) { face = 4; u =  dir.x * inv; v = dir.y * inv; }
+    else             { face = 5; u = -dir.x * inv; v = dir.y * inv; }
+  }
+  // (u, v) in [-1, 1] face-local. To [0, 1] then to page coords.
+  let uv01 = vec2<f32>(u * 0.5 + 0.5, v * 0.5 + 0.5);
+  // PAGES_PER_FACE_EDGE = 256 (matches JS _SVT.PAGES_PER_FACE_EDGE).
+  let pagesPerEdge: f32 = 256.0;
+  let pageFx = uv01.x * pagesPerEdge;
+  let pageFy = uv01.y * pagesPerEdge;
+  let pageX = i32(floor(pageFx));
+  let pageY = i32(floor(pageFy));
+  let inPageU = fract(pageFx);
+  let inPageV = fract(pageFy);
+  // Page table texelFetch.
+  let pageEntry = textureLoad(svtPageTable, vec2<i32>(pageX, pageY), face, 0).r;
+  if (pageEntry == 0xFFFFFFFFu) {
+    return vec4<f32>(0.0, 0.0, 0.0, 0.0);  // unresident
+  }
+  let slotX = pageEntry & 0xFFFFu;
+  let slotY = (pageEntry >> 16u) & 0xFFFFu;
+  // Atlas UV: slot origin + within-page sub-UV. Atlas is 4096²
+  // (32×32 slots of 128² each), so each slot occupies 1/32 of the
+  // atlas in each dimension.
+  let slotsPerRow: f32 = 32.0;
+  let atlasU = (f32(slotX) + inPageU) / slotsPerRow;
+  let atlasV = (f32(slotY) + inPageV) / slotsPerRow;
+  let rgb = textureSampleLevel(svtAtlas, svtSampler, vec2<f32>(atlasU, atlasV), 0.0).rgb;
+  return vec4<f32>(rgb, 1.0);
+}
 
 // Sample the multi-scattering LUT. Axes match fs_lut_multiscatter:
 //   u = sunZenithCos in [-1, 1] mapped linearly to [0, 1]
@@ -55506,17 +55573,29 @@ fn fs_unlit_vc(in: VsOut) -> @location(0) vec4<f32> {
     } else {
       // Land biome. Sprint 10-1d / 10-2 RIP-OUT: per-pixel noise
       // color modulation + procedural texture styles + bump
-      // perturbation REMOVED. These were the source of the
-      // uniformly-noisy texture wrapping every pixel the user
-      // reported -- the chunk-builder noise was removed in 10-1d
-      // but this fragment-shader noise was still firing for every
-      // visible PlanetMesh pixel, dominating the macro-only
-      // appearance the chunk path was producing. Phase 10 puts
-      // texture variation back in 10-4 as gated amplification
-      // (slope + drainage from 10-2 erosion drive it), not as
-      // unconditional per-pixel noise. Wired land textures
-      // (triplanar) still apply when planetExtra.x is set.
+      // perturbation REMOVED.
       let surfN = normalize(in.normal);
+      // Sprint 10-5c-c: SVT sample. Tries to fetch a pre-baked detail
+      // page from the atlas. If the page is resident, replace the
+      // per-vertex biome color with the SVT sample (mixed with the
+      // vertex color so distance fade looks natural). If not resident,
+      // fall back to the existing per-vertex color + procedural
+      // brightness + biome-texture path below.
+      let planetCenter2 = uS.envPlanet.xyz;
+      let planetR2      = uS.envPlanet.w;
+      let radial2       = in.worldPos - planetCenter2;
+      let radLen2       = length(radial2);
+      let svtDir        = radial2 / max(radLen2, 1.0);
+      let svtSample     = _svt_sample(svtDir);
+      if (svtSample.a > 0.5) {
+        // Resident page: blend SVT detail over vertex color. The
+        // SVT page content is essentially the per-vertex color the
+        // chunk builder would have computed (same pipeline) but at
+        // page resolution. Bias toward SVT (atlas has more detail
+        // than per-vertex), but keep ~20% vertex color so distance
+        // attenuation + vertex lambert still read.
+        color = mix(color, svtSample.rgb, 0.80);
+      }
       let landTexLayer = i32(uD.planetExtra.x);
       if (landTexLayer >= 0) {
         let tex = triplanar_sample_array(srcTexture, srcSampler,
@@ -56739,6 +56818,16 @@ function _ensureMeshBindGroupLayout() {
       // C.7 cleanup -- bindings 10/11 (the aerial-perspective LUT
       // pair) were removed when sample_aerial_perspective_lut was
       // rewritten to use the sky-view + transmittance LUTs directly.
+      // Sprint 10-5c-c: SVT bindings reuse those freed slots.
+      //   10 = SVT atlas texture (4096² RGBA8) -- procedural surface
+      //        detail, sparsely populated by _svtUploadPage.
+      //   11 = SVT atlas sampler (linear, clamp).
+      //   12 = SVT page table (256² R32Uint × 6 layers, one per face).
+      //        Encodes (slotY << 16) | slotX for resident pages,
+      //        0xFFFFFFFF for unresident.
+      { binding: 10, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d", multisampled: false } },
+      { binding: 11, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+      { binding: 12, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "uint",  viewDimension: "2d-array", multisampled: false } },
     ]
   });
   Visual.meshPipelineLayout = Visual.device.createPipelineLayout({
@@ -62167,6 +62256,33 @@ function _svtTest(face, count) {
 // Expose to console for manual testing.
 if (typeof window !== "undefined") window._svtTest = _svtTest;
 
+/* Sprint 10-5c-c: a tiny all-unresident page table texture used by
+ * the bind group when the real SVT page table isn't allocated yet
+ * (e.g., device just came up, no PlanetMap in patch). Keeps the
+ * pipeline layout valid; shader sees PAGE_UNRESIDENT and falls back
+ * to per-fragment procedural. */
+function _ensureSVTDefaultPageTable() {
+  if (Visual.svtPageTableDefaultView) return Visual.svtPageTableDefaultView;
+  if (!Visual.device) return null;
+  const tex = Visual.device.createTexture({
+    label: "svt-pagetable-default",
+    size: [1, 1, 6],
+    format: "r32uint",
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+  });
+  const buf = new Uint32Array([0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+                               0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF]);
+  Visual.device.queue.writeTexture(
+    { texture: tex },
+    buf,
+    { bytesPerRow: 4, rowsPerImage: 1 },
+    [1, 1, 6]
+  );
+  Visual.svtPageTableDefault = tex;
+  Visual.svtPageTableDefaultView = tex.createView({ dimension: "2d-array" });
+  return Visual.svtPageTableDefaultView;
+}
+
 function _depthToZoom(depth) {
   // Sprint 10-6 v8: bumped deepest from 14 → 15 (Mapzen's max). At
   // foot level (depth 16+) this gives ~1.2 m/px instead of ~2.4 m/px.
@@ -67136,6 +67252,15 @@ function _ensureSceneInstance(sceneNode) {
     const transmittanceView = Visual.atmTransmittanceLUTView || Visual.atmLut1x1DefaultView;
     const multiScatterView  = Visual.atmMultiScatterLUTView  || Visual.atmLut1x1DefaultView;
     const skyViewView       = Visual.atmSkyViewLUTView       || Visual.atmLut1x1DefaultView;
+    // Sprint 10-5c-c: SVT bindings. Allocate on first call here so the
+    // bind group always has SOMETHING to point at -- even when SVT
+    // pages are empty the shader still samples (and sees all-zero
+    // pixels, which the sample-site smartly treats as 'unresident').
+    if (!_SVT.atlasView && Visual.device) _ensureSVT();
+    _ensureSVTDefaultPageTable();
+    const svtAtlasView    = _SVT.atlasView     || Visual.envTextureView;  // any 2d float texture
+    const svtAtlasSampler = _SVT.atlasSampler  || Visual.envSampler;
+    const svtPageTableV   = _SVT.pageTableView || Visual.svtPageTableDefaultView;
     const makeBindGroup = (scratchView, parity) =>
       Visual.device.createBindGroup({
         label: "scene-bg-" + sceneNode.id + "-slot" + i + "-" + parity,
@@ -67150,7 +67275,10 @@ function _ensureSceneInstance(sceneNode) {
           { binding: 6, resource: transmittanceView },
           { binding: 7, resource: multiScatterView },
           { binding: 8, resource: Visual.atmLutSampler || Visual.envSampler },
-          { binding: 9, resource: skyViewView }
+          { binding: 9, resource: skyViewView },
+          { binding: 10, resource: svtAtlasView },
+          { binding: 11, resource: svtAtlasSampler },
+          { binding: 12, resource: svtPageTableV }
         ]
       });
     const bindGroupA = makeBindGroup(Visual.scratchArrayViewA, "a");
