@@ -64503,10 +64503,21 @@ function _planetVisibleChunks(camPos, radius, heightScale, maxDepth, splitFactor
   const cs2  = camPos.x*camPos.x + camPos.y*camPos.y + camPos.z*camPos.z;
   const cMag = Math.sqrt(cs2);
   const camOutside = cMag > radius;
+  // §bonus-perf-foot-10 (2026-05-25) -- horizon angle from camera as
+  // an actual ANGLE (radians). At low altitude this is tiny: at 100 m
+  // AGL on Earth, horizon = sqrt(2Rh)/R ≈ 0.0056 rad ≈ 0.32°. The
+  // foot-9 cull compared cosines (`sphDot < horizonDot - chunkArc`)
+  // where chunkArc was treated as a cosine-space subtraction; but
+  // chunkArc was authored as 0.15 = 8.6° = an ANGLE. At small
+  // horizon angles the cosine-space shift is way too generous --
+  // 0.15 cosine-space corresponds to acos(1-0.15) = ~32° angular,
+  // not 8.6°. Fix: do the cull in angle space.
+  const horizonAngle = camOutside ? Math.acos(Math.max(-1, Math.min(1, radius / cMag))) : Math.PI;
   const camDX = camOutside ? camPos.x / cMag : 0;
   const camDY = camOutside ? camPos.y / cMag : 0;
   const camDZ = camOutside ? camPos.z / cMag : 0;
-  const horizonDot     = camOutside ? (radius / cMag) : -2;
+  // elevationSlack: angular wiggle for the heightScale (mountain peaks
+  // above mean sphere). Same units as horizonAngle (radians).
   const elevationSlack = camOutside ? (Math.max(0, heightScale) / Math.max(1e-6, radius)) : 0;
   function recurse(face, uMin, uMax, vMin, vMax, depth, ix, iy) {
     const uMid = (uMin + uMax) * 0.5;
@@ -64522,10 +64533,17 @@ function _planetVisibleChunks(camPos, radius, heightScale, maxDepth, splitFactor
     // corners. Children are subsets of their parent so culling at a
     // parent depth is safe -- if the parent's furthest point is behind
     // horizon, every child's furthest point is too.
-    const chunkArc = (uMax - uMin) * 0.6;
+    const chunkArc = (uMax - uMin) * 0.6;   // angular half-extent (rad)
     if (camOutside) {
       const sphDot = sph[0]*camDX + sph[1]*camDY + sph[2]*camDZ;
-      if (sphDot < horizonDot - chunkArc - elevationSlack) {
+      // §bonus-perf-foot-10 -- angle-space cull. The chunk is OK if
+      // its center is within (horizonAngle + chunkArc + elevationSlack)
+      // angular distance from sub-camera point. acos(sphDot) gives that
+      // angular distance; if it's beyond the visible cap, cull. Cheap
+      // (~few thousand acos calls per frame; the depth-2/4 chunks that
+      // used to slip through were the actual GPU cost we're avoiding).
+      const sphAngle = Math.acos(Math.max(-1, Math.min(1, sphDot)));
+      if (sphAngle > horizonAngle + chunkArc + elevationSlack) {
         return;
       }
     }
