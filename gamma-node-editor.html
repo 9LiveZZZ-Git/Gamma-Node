@@ -10501,6 +10501,140 @@ public:
     description: "2.5D ortho camera. focusPoint = (posX, posY, posZ) is what the camera looks AT; the camera itself is placed `distance` away along -forward, where forward is derived from yaw + pitch. `angle` param selects a preset orientation: iso (45°/30°, classic isometric), iso-narrow (30°/45°, Diablo / Hades style), top-down (0°/90°), side (0°/0°, platformer), custom (uses yaw + pitch directly). orthoSize is world-units half-height of the viewport. Wire output into Scene25D for proper sprite Y-sorting against terrain, or any other scene's `camera` input."
   },
 
+  /* Sprint platformer-1 -- KeyAxis2D. Game-style keyboard input.
+   * Emits x/y as -1..1 axis values (released = 0; left/right combine
+   * to signed); jump/actionA/actionB as one-frame rising-edge pulses
+   * (1 on the frame the key was pressed, 0 otherwise). Default key
+   * bindings use WASD + ArrowKeys for movement, Space for jump,
+   * Z/X for the two action buttons. All bindings are params, so
+   * the user can rebind to taste. Per-frame tick lives in
+   * _tickGameInputs which lazy-wires the document listeners. */
+  KeyAxis2D: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "game-input",
+    ins: [
+      { n: "keyLeft",    t: "param" },
+      { n: "keyRight",   t: "param" },
+      { n: "keyUp",      t: "param" },
+      { n: "keyDown",    t: "param" },
+      { n: "keyJump",    t: "param" },
+      { n: "keyActionA", t: "param" },
+      { n: "keyActionB", t: "param" }
+    ],
+    outs: [
+      { n: "x",       t: "param" },
+      { n: "y",       t: "param" },
+      { n: "jump",    t: "param" },
+      { n: "actionA", t: "param" },
+      { n: "actionB", t: "param" }
+    ],
+    params: {
+      keyLeft: "KeyA",  keyRight: "KeyD",
+      keyUp:   "KeyW",  keyDown:  "KeyS",
+      keyJump: "Space", keyActionA: "KeyZ", keyActionB: "KeyX",
+      // Output values; written by tick, read by downstream.
+      x: 0, y: 0, jump: 0, actionA: 0, actionB: 0
+    },
+    methods: {},
+    uiOnlyParams: ["x", "y", "jump", "actionA", "actionB"],
+    description: "Game keyboard input. Outputs x / y as signed (-1..1) axis values combining left/right and up/down key holds; jump / actionA / actionB are one-frame triggers that fire 1 on the frame the key is pressed (rising edge) and 0 otherwise. Defaults: WASD + Space for jump, Z/X for action buttons. Also accepts ArrowLeft/ArrowRight/etc -- bind via key params using KeyboardEvent.code strings (KeyA, ArrowUp, Space, KeyZ, ...)."
+  },
+
+  /* Sprint platformer-1 -- PlatformerBody2D. Composite character
+   * controller: takes axis-style input + jump trigger + physics
+   * tuning, runs the standard 2D platformer integration each frame
+   * (horizontal velocity = input*walkSpeed, vertical velocity = grav
+   * accumulation, jump impulse on rising edge while grounded, simple
+   * AABB ground clamp), outputs the resulting x/y/vx/vy + grounded
+   * flag + facing direction. Drop this between a KeyAxis2D and the
+   * Sprite/Translate driving the player; wire 'x' and 'y' into the
+   * Translate's x/y params.
+   *
+   * groundY is the world-Y of the floor (anything below clamps to
+   * this height). For real level collision, a future sprint will
+   * add a 'platforms' input that takes a Tilemap or rect list. */
+  PlatformerBody2D: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "game-body",
+    ins: [
+      { n: "inputX",     t: "param" },
+      { n: "jump",       t: "param" },
+      { n: "walkSpeed",  t: "param" },
+      { n: "gravity",    t: "param" },
+      { n: "jumpForce",  t: "param" },
+      { n: "airControl", t: "param" },
+      { n: "groundY",    t: "param" },
+      { n: "initX",      t: "param" },
+      { n: "initY",      t: "param" },
+      { n: "reset",      t: "param" }
+    ],
+    outs: [
+      { n: "x",        t: "param" },
+      { n: "y",        t: "param" },
+      { n: "vx",       t: "param" },
+      { n: "vy",       t: "param" },
+      { n: "grounded", t: "param" },
+      { n: "facing",   t: "param" }
+    ],
+    params: {
+      inputX: 0, jump: 0,
+      walkSpeed: 6, gravity: 22, jumpForce: 11, airControl: 1,
+      groundY: 0,
+      initX: 0, initY: 1, reset: 0,
+      // Internal state + outputs. Written by tick.
+      x: 0, y: 1, vx: 0, vy: 0, grounded: 0, facing: 1,
+      _inited: 0, _prevReset: 0
+    },
+    methods: {},
+    uiOnlyParams: ["x", "y", "vx", "vy", "grounded", "facing", "_inited", "_prevReset"],
+    description: "2D platformer character body. Takes inputX (-1..1, e.g. KeyAxis2D.x) + jump (one-frame edge, e.g. KeyAxis2D.jump) + tuning params (walkSpeed m/s, gravity m/s², jumpForce m/s impulse, airControl 0..1 multiplier when not grounded), runs the standard platformer integration each frame, outputs the resulting (x, y, vx, vy) + grounded flag + facing direction (-1 = left, 1 = right). Wire x/y into a Translate driving the player Sprite. groundY clamps the lowest the player can fall to (set negative for a deeper pit, set to the visible floor's top for a flat level)."
+  },
+
+  /* Sprint platformer-1 -- Tilemap2D. Grid-based mesh primitive.
+   * tileData is a multi-line string where each character is a cell
+   * (space / '.' = empty; any other char = solid tile colored by
+   * the matching paletteR/G/B param). Emits one mesh containing
+   * one quad per non-empty cell, vertex-colored per palette index.
+   *
+   * Cell (col, row) lives at world position
+   *   x = (col - cols/2) * tileSize + originX
+   *   y = (rows/2 - row) * tileSize + originY     (row 0 at top)
+   *
+   * Tilemaps are static -- changing tileData at runtime rebuilds
+   * the mesh. For animated levels use multiple smaller Tilemaps. */
+  Tilemap2D: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "mesh-gen",
+    ins: [
+      { n: "tileData",  t: "param" },
+      { n: "tileSize",  t: "param" },
+      { n: "originX",   t: "param" },
+      { n: "originY",   t: "param" },
+      // 4-color palette. Tiles use the char to index: digit 1 → color1,
+      // 2 → color2, etc. Char '#' aliases to 1 for ergonomics. Any
+      // unknown char (besides '.' / ' ') = color1.
+      { n: "color1R", t: "param" }, { n: "color1G", t: "param" }, { n: "color1B", t: "param" },
+      { n: "color2R", t: "param" }, { n: "color2G", t: "param" }, { n: "color2B", t: "param" },
+      { n: "color3R", t: "param" }, { n: "color3G", t: "param" }, { n: "color3B", t: "param" },
+      { n: "color4R", t: "param" }, { n: "color4G", t: "param" }, { n: "color4B", t: "param" }
+    ],
+    outs: [{ n: "mesh", t: "mesh" }],
+    params: {
+      tileData: "................\n................\n................\n................\n................\n.......1........\n................\n................\n.....111........\n................\n111111111111....\n................\n2222222222222222",
+      tileSize: 1,
+      originX: 0, originY: 0,
+      color1R: 0.30, color1G: 0.55, color1B: 0.35,   // grass-green
+      color2R: 0.42, color2G: 0.28, color2B: 0.18,   // dirt-brown
+      color3R: 0.55, color3G: 0.55, color3B: 0.62,   // stone-gray
+      color4R: 0.85, color4G: 0.75, color4B: 0.30    // gold-coin
+    },
+    methods: {},
+    description: "2D tilemap mesh. tileData is a multi-line string -- each char is a cell (space or '.' = empty; '1'/'#' = color1, '2' = color2, '3' = color3, '4' = color4). Cell pitch = tileSize world units. Emits one mesh = one quad per non-empty cell so Scene2D draws the whole level in a single call. originX/Y shifts the grid origin (default: cell (cols/2, rows/2) at world (0,0))."
+  },
+
   /* Phase 7 §5.5.g -- Minimap HUD node. First member of a planned
    * "HUD" family (followed by Compass, Inventory, HealthBar, etc.).
    * Renders the patch's first TiledTerrain top-down (heightmap
@@ -36136,6 +36270,108 @@ const _demos = [
       const vo25 = makeNode("VisualOutput", 880, 280, { display: 1 });
       state.edges.push({ from: { node: sc25, port: "out" }, to: { node: vo25, port: "in" } });
     }
+  },
+
+  /* Sprint platformer-1 -- Platformer 2D demo. A single-screen
+   * platformer wired entirely from nodes:
+   *   KeyAxis2D       -- WASD + Space
+   *   PlatformerBody2D -- physics + ground clamp
+   *   Tilemap2D       -- the level
+   *   Sprite          -- the player
+   *   OrthoCamera2D   -- camera follow (posX wired to player.x)
+   *   Scene2D + VO    -- the actual render
+   * Hold A/D to walk, Space to jump. The camera tracks the player
+   * horizontally; the tilemap holds the world steady. */
+  {
+    id: "platformer-2d",
+    name: "Platformer 2D",
+    sub: "WASD + Space · camera follow",
+    type: "visual",
+    thumb: `<svg viewBox="0 0 100 44">
+      <rect width="100" height="44" fill="rgba(28,40,68,0.85)"/>
+      <g fill="rgba(85,140,90,0.95)">
+        <rect x="0"  y="30" width="40" height="6"/>
+        <rect x="48" y="30" width="20" height="6"/>
+        <rect x="76" y="22" width="24" height="6"/>
+        <rect x="30" y="22" width="10" height="4"/>
+      </g>
+      <g fill="rgba(105,68,42,0.95)">
+        <rect x="0"  y="36" width="100" height="8"/>
+      </g>
+      <rect x="20" y="22" width="6" height="8" fill="rgba(240,180,80,1)"/>
+    </svg>`,
+    build: () => {
+      // ─── Input ────────────────────────────────────────────────
+      const keys = makeNode("KeyAxis2D", 40, 60, {
+        keyLeft: "KeyA", keyRight: "KeyD",
+        keyJump: "Space"
+      });
+
+      // ─── Physics body ─────────────────────────────────────────
+      const body = makeNode("PlatformerBody2D", 280, 60, {
+        walkSpeed: 6,
+        gravity:   22,
+        jumpForce: 11,
+        airControl: 0.85,
+        groundY:   -3,
+        initX: -4, initY: 0
+      });
+      state.edges.push({ from: { node: keys, port: "x"    }, to: { node: body, port: "inputX" } });
+      state.edges.push({ from: { node: keys, port: "jump" }, to: { node: body, port: "jump"   } });
+
+      // ─── Level (tilemap) ──────────────────────────────────────
+      // 32×9 grid. '.' = sky, '1' = grass (top), '2' = dirt (under),
+      // '3' = stone platform, '4' = coin marker. Centered on world (0,0)
+      // and lifted so its bottom row sits at world y = -4 (groundY-1).
+      const level = makeNode("Tilemap2D", 40, 240, {
+        tileData:
+          "................................\n" +
+          "................................\n" +
+          "................................\n" +
+          "................3333............\n" +
+          "..........4.....................\n" +
+          ".....33333......................\n" +
+          "................................\n" +
+          "11111111111111111111111111111111\n" +
+          "22222222222222222222222222222222",
+        tileSize: 1,
+        originX: 0, originY: 0,
+        color1R: 0.30, color1G: 0.62, color1B: 0.38,   // grass-green
+        color2R: 0.42, color2G: 0.28, color2B: 0.18,   // dirt-brown
+        color3R: 0.62, color3G: 0.62, color3B: 0.72,   // stone-platform
+        color4R: 0.95, color4G: 0.82, color4B: 0.30    // coin-gold
+      });
+
+      // ─── Player ───────────────────────────────────────────────
+      const player = makeNode("Sprite", 280, 240, {
+        width: 0.6, height: 1.0,
+        anchorX: 0.5, anchorY: 0,         // pin-by-feet so y = ground line
+        tintR: 0.95, tintG: 0.55, tintB: 0.20
+      });
+      const playerT = makeNode("Translate", 460, 240, { x: 0, y: 0, z: 0 });
+      state.edges.push({ from: { node: player, port: "mesh" }, to: { node: playerT, port: "mesh" } });
+      state.edges.push({ from: { node: body,   port: "x"    }, to: { node: playerT, port: "x"    } });
+      state.edges.push({ from: { node: body,   port: "y"    }, to: { node: playerT, port: "y"    } });
+
+      // ─── Camera (follow X, fixed Y) ───────────────────────────
+      const cam = makeNode("OrthoCamera2D", 460, 60, {
+        posX: 0, posY: 0,
+        orthoSize: 5,                     // 10 world units tall view
+        pixelSnap: 0
+      });
+      state.edges.push({ from: { node: body, port: "x" }, to: { node: cam, port: "posX" } });
+
+      // ─── Scene + output ───────────────────────────────────────
+      const scene = makeNode("Scene2D", 680, 200, {
+        clearR: 0.45, clearG: 0.72, clearB: 0.88     // sky-blue
+      });
+      // mesh1 = level (back), mesh2 = player (front)
+      state.edges.push({ from: { node: level,    port: "mesh"   }, to: { node: scene, port: "mesh1"  } });
+      state.edges.push({ from: { node: playerT,  port: "mesh"   }, to: { node: scene, port: "mesh2"  } });
+      state.edges.push({ from: { node: cam,      port: "camera" }, to: { node: scene, port: "camera" } });
+      const vo = makeNode("VisualOutput", 900, 200, { display: 0 });
+      state.edges.push({ from: { node: scene, port: "out" }, to: { node: vo, port: "in" } });
+    }
   }
 ];
 
@@ -48151,6 +48387,159 @@ function _planetMeshAGL(wx, wy, wz, pl) {
  * by I/K (pitch), J/L (yaw), U/O (roll). Space/C move along the
  * planet-radial direction when a planet is in the patch, falling
  * back to world Y otherwise. */
+/* Sprint platformer-1 -- lazy game-input keyboard wiring. Separate
+ * from FPCamera input (which is gated on an FPCamera being in the
+ * patch) so 2D platformer-style patches don't require an FPCamera
+ * to sample keys. Listens at document level + capture phase, but
+ * declines to claim keys while the user is typing in a form input
+ * so the keyboard piano + text fields keep working. */
+function _wireGameInput() {
+  if (!Visual.gameInput) {
+    Visual.gameInput = {
+      keys: new Set(),       // currently-held key codes (KeyboardEvent.code)
+      pressed: new Set(),    // codes pressed THIS frame (cleared each tick)
+      released: new Set()    // codes released THIS frame (cleared each tick)
+    };
+  }
+  if (Visual.gameInputWired) return;
+  Visual.gameInputWired = true;
+  const isTypingInForm = () => {
+    const ae = document.activeElement;
+    if (!ae) return false;
+    const tag = ae.tagName;
+    return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || ae.isContentEditable;
+  };
+  // Known game keys that should NOT trigger browser default behavior
+  // (Space = page scroll, Arrow keys = scroll, etc.) when game input
+  // nodes are active. WASD doesn't have browser default behavior so
+  // no need to list it, but listing for completeness.
+  const GAME_KEYS = new Set([
+    "Space",
+    "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
+    "KeyW", "KeyA", "KeyS", "KeyD",
+    "KeyZ", "KeyX", "KeyC",
+    "KeyJ", "KeyK", "KeyL"
+  ]);
+  document.addEventListener("keydown", (e) => {
+    if (isTypingInForm()) return;
+    if (e.repeat) return; // suppress auto-repeat -- only the first press counts as "pressed"
+    if (!Visual.gameInput.keys.has(e.code)) {
+      Visual.gameInput.pressed.add(e.code);
+    }
+    Visual.gameInput.keys.add(e.code);
+    if (GAME_KEYS.has(e.code)) e.preventDefault();
+  }, true);
+  document.addEventListener("keyup", (e) => {
+    if (Visual.gameInput.keys.has(e.code)) {
+      Visual.gameInput.released.add(e.code);
+    }
+    Visual.gameInput.keys.delete(e.code);
+    if (GAME_KEYS.has(e.code) && !isTypingInForm()) e.preventDefault();
+  }, true);
+}
+
+/* Sprint platformer-1 -- per-frame tick for KeyAxis2D + PlatformerBody2D.
+ * Runs alongside _tickFPCameras in the visual frame loop. Pressed /
+ * released sets get cleared at the END of each tick so multiple
+ * downstream nodes in the same frame can read the same edge events. */
+function _tickGameInputs(dt) {
+  if (!state || !Array.isArray(state.nodes)) return;
+  let needAny = false;
+  for (const n of state.nodes) {
+    if (n && (n.type === "KeyAxis2D" || n.type === "PlatformerBody2D")) {
+      needAny = true; break;
+    }
+  }
+  if (!needAny) return;
+  _wireGameInput();
+  const gi = Visual.gameInput;
+  const held    = gi.keys;
+  const pressed = gi.pressed;
+  // Pass 1: KeyAxis2D. Read held + pressed sets, write outputs.
+  for (const node of state.nodes) {
+    if (!node || node.type !== "KeyAxis2D") continue;
+    const p = node.params = node.params || {};
+    const kL = (typeof p.keyLeft    === "string") ? p.keyLeft    : "KeyA";
+    const kR = (typeof p.keyRight   === "string") ? p.keyRight   : "KeyD";
+    const kU = (typeof p.keyUp      === "string") ? p.keyUp      : "KeyW";
+    const kD = (typeof p.keyDown    === "string") ? p.keyDown    : "KeyS";
+    const kJ = (typeof p.keyJump    === "string") ? p.keyJump    : "Space";
+    const kA = (typeof p.keyActionA === "string") ? p.keyActionA : "KeyZ";
+    const kB = (typeof p.keyActionB === "string") ? p.keyActionB : "KeyX";
+    // x: -1 if left held, +1 if right held, 0 if both/neither.
+    p.x = (held.has(kR) ? 1 : 0) - (held.has(kL) ? 1 : 0);
+    // y: +1 if up held, -1 if down held (screen-style with y-up world).
+    p.y = (held.has(kU) ? 1 : 0) - (held.has(kD) ? 1 : 0);
+    // Edge-trigger outputs: 1 the frame the key was pressed, else 0.
+    p.jump    = pressed.has(kJ) ? 1 : 0;
+    p.actionA = pressed.has(kA) ? 1 : 0;
+    p.actionB = pressed.has(kB) ? 1 : 0;
+  }
+  // Pass 2: PlatformerBody2D. Reads wired/static inputX + jump,
+  // integrates physics, writes x/y/vx/vy/grounded/facing.
+  const _resolveNumIn = (node, port, fallback) => {
+    // Walk the wire (if any) to find the source's numeric value.
+    if (Array.isArray(state.edges)) {
+      const edge = state.edges.find(e => e && e.to && e.to.node === node.id && e.to.port === port);
+      if (edge && edge.from) {
+        const src = state.nodes.find(n => n && n.id === edge.from.node);
+        if (src && src.params && typeof src.params[edge.from.port] === "number") {
+          return src.params[edge.from.port];
+        }
+      }
+    }
+    const v = node.params ? node.params[port] : undefined;
+    return (typeof v === "number") ? v : fallback;
+  };
+  for (const node of state.nodes) {
+    if (!node || node.type !== "PlatformerBody2D") continue;
+    const p = node.params = node.params || {};
+    // Init on first tick OR when reset rises.
+    const resetNow  = _resolveNumIn(node, "reset", 0);
+    const resetEdge = resetNow >= 0.5 && (p._prevReset || 0) < 0.5;
+    if (!p._inited || resetEdge) {
+      p.x = _resolveNumIn(node, "initX", 0);
+      p.y = _resolveNumIn(node, "initY", 1);
+      p.vx = 0; p.vy = 0;
+      p.grounded = 0; p.facing = 1;
+      p._inited = 1;
+    }
+    p._prevReset = resetNow;
+    const inputX     = _resolveNumIn(node, "inputX",     0);
+    const jump       = _resolveNumIn(node, "jump",       0);
+    const walkSpeed  = _resolveNumIn(node, "walkSpeed",  6);
+    const gravity    = _resolveNumIn(node, "gravity",    22);
+    const jumpForce  = _resolveNumIn(node, "jumpForce",  11);
+    const airControl = _resolveNumIn(node, "airControl", 1);
+    const groundY    = _resolveNumIn(node, "groundY",    0);
+    // Horizontal: snap velocity to inputX * walkSpeed, scaled by
+    // airControl when not grounded. (Arcade feel; no acceleration.)
+    const ctrl = (p.grounded >= 0.5) ? 1 : airControl;
+    p.vx = inputX * walkSpeed * ctrl;
+    // Vertical: gravity always; jump impulse only if grounded.
+    if (jump >= 0.5 && p.grounded >= 0.5) p.vy = jumpForce;
+    p.vy -= gravity * dt;
+    // Integrate position.
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    // Ground collision -- clamp y to groundY, kill downward velocity.
+    if (p.y <= groundY) {
+      p.y = groundY;
+      if (p.vy < 0) p.vy = 0;
+      p.grounded = 1;
+    } else {
+      p.grounded = 0;
+    }
+    // Facing follows last non-zero inputX.
+    if (inputX > 0.1)      p.facing = 1;
+    else if (inputX < -0.1) p.facing = -1;
+  }
+  // Clear edge sets so the next frame starts fresh. Done at the END
+  // so multiple consumers within this frame all see the same edges.
+  gi.pressed.clear();
+  gi.released.clear();
+}
+
 function _tickFPCameras(dt) {
   if (!state || !Array.isArray(state.nodes)) return;
   const input = Visual.fpcInput;
@@ -59584,6 +59973,11 @@ function _meshCacheKey(node) {
     }
     case "Plane":         return "pln:" + [p.width, p.depth].join(",");
     case "Sprite":        return "spr:" + [p.width, p.height, p.anchorX, p.anchorY, p.tintR, p.tintG, p.tintB, p.tintA].join(",");
+    case "Tilemap2D":     return "tmap:" + [p.tileData, p.tileSize, p.originX, p.originY,
+                                            p.color1R, p.color1G, p.color1B,
+                                            p.color2R, p.color2G, p.color2B,
+                                            p.color3R, p.color3G, p.color3B,
+                                            p.color4R, p.color4G, p.color4B].join(",");
     case "Torus":         return "tor:" + [p.majorRadius, p.minorRadius, p.majorSlices, p.minorSlices].join(",");
     case "Cylinder":      return "cyl:" + [p.radius, p.height, p.slices].join(",");
     case "Cone":          return "con:" + [p.radius, p.height, p.slices].join(",");
@@ -59662,6 +60056,7 @@ function _buildMeshData(node) {
     case "PlanetMesh":    return _buildPlanetMesh(node);
     case "Plane":         return _buildPlane(node);
     case "Sprite":        return _buildSprite(node);
+    case "Tilemap2D":     return _buildTilemap2D(node);
     case "Torus":         return _buildTorus(node);
     case "Cylinder":      return _buildCylinder(node);
     case "Cone":          return _buildCone(node);
@@ -66892,6 +67287,84 @@ function _buildSprite(node) {
   return { verts, indices };
 }
 
+/* Sprint platformer-1 -- Tilemap2D. Parses the multi-line tileData
+ * string into a 2D grid of cell indices; emits one quad per non-
+ * empty cell, vertex-colored per the palette param. Origin is the
+ * grid center (so a 10×10 tilemap spans world X ∈ [-5, 5], Y ∈ [-5, 5]
+ * before originX/originY offset). Row 0 is at the TOP of the grid in
+ * world space (positive Y), to match how level designers think about
+ * "top of the level."
+ *
+ * Cell glyphs:
+ *   '.', ' '        -- empty (no quad emitted)
+ *   '1' or '#'      -- color1 (default: grass green)
+ *   '2'             -- color2 (default: dirt brown)
+ *   '3'             -- color3 (default: stone gray)
+ *   '4'             -- color4 (default: gold)
+ *   any other char  -- color1 (lenient default) */
+function _buildTilemap2D(node) {
+  const p = node.params || {};
+  const data = (typeof p.tileData === "string") ? p.tileData : "";
+  const ts   = (typeof p.tileSize === "number" && p.tileSize > 0) ? p.tileSize : 1;
+  const ox   = (typeof p.originX === "number") ? p.originX : 0;
+  const oy   = (typeof p.originY === "number") ? p.originY : 0;
+  const palette = [
+    [(typeof p.color1R === "number") ? p.color1R : 0.30,
+     (typeof p.color1G === "number") ? p.color1G : 0.55,
+     (typeof p.color1B === "number") ? p.color1B : 0.35],
+    [(typeof p.color2R === "number") ? p.color2R : 0.42,
+     (typeof p.color2G === "number") ? p.color2G : 0.28,
+     (typeof p.color2B === "number") ? p.color2B : 0.18],
+    [(typeof p.color3R === "number") ? p.color3R : 0.55,
+     (typeof p.color3G === "number") ? p.color3G : 0.55,
+     (typeof p.color3B === "number") ? p.color3B : 0.62],
+    [(typeof p.color4R === "number") ? p.color4R : 0.85,
+     (typeof p.color4G === "number") ? p.color4G : 0.75,
+     (typeof p.color4B === "number") ? p.color4B : 0.30]
+  ];
+  const rowsArr = data.split(/\r?\n/);
+  const rows = rowsArr.length;
+  const cols = rowsArr.reduce((m, r) => Math.max(m, r.length), 0);
+  const cx = (cols - 1) * 0.5;
+  const cy = (rows - 1) * 0.5;
+  const verts = [];
+  const indices = [];
+  let vIdx = 0;
+  for (let r = 0; r < rows; r++) {
+    const line = rowsArr[r];
+    for (let c = 0; c < line.length; c++) {
+      const ch = line[c];
+      if (ch === "." || ch === " " || ch === "") continue;
+      let pi = 0;
+      if      (ch === "1" || ch === "#") pi = 0;
+      else if (ch === "2")               pi = 1;
+      else if (ch === "3")               pi = 2;
+      else if (ch === "4")               pi = 3;
+      // any other char falls through to pi=0
+      const col = palette[pi];
+      // Cell world position. Row 0 lives at the TOP (positive Y).
+      const x = (c  - cx) * ts + ox;
+      const y = (cy - r ) * ts + oy;
+      const x0 = x - ts * 0.5, x1 = x + ts * 0.5;
+      const y0 = y - ts * 0.5, y1 = y + ts * 0.5;
+      // pos.xyz  color.rgb        normal.xyz (+Z)  uv.xy
+      verts.push(
+        x0, y0, 0,   col[0], col[1], col[2],   0, 0, 1,   0, 0,
+        x1, y0, 0,   col[0], col[1], col[2],   0, 0, 1,   1, 0,
+        x1, y1, 0,   col[0], col[1], col[2],   0, 0, 1,   1, 1,
+        x0, y1, 0,   col[0], col[1], col[2],   0, 0, 1,   0, 1
+      );
+      indices.push(vIdx, vIdx + 1, vIdx + 2,
+                   vIdx, vIdx + 2, vIdx + 3);
+      vIdx += 4;
+    }
+  }
+  return {
+    verts:   new Float32Array(verts),
+    indices: new Uint32Array(indices)
+  };
+}
+
 /* Phase 7 §5.5.a — Terrain noise helpers. Same hash + value-noise +
  * fBm formula as ProceduralTerrain's WGSL (§5.5.b) so a JS-built
  * Terrain mesh with identical noise params previews what a future
@@ -72794,6 +73267,10 @@ function renderVisualFrame() {
   // setup cost is paid once when the user is actually using an FPCamera.
   _wireFPCameraInput();
   _tickFPCameras(dtSec);
+  // Sprint platformer-1 -- game-input nodes (KeyAxis2D / PlatformerBody2D).
+  // Lazy-wires its own keyboard listener on first use; no-op when no
+  // game-input nodes are in the patch.
+  _tickGameInputs(dtSec);
   // §5.5.g -- HUD overlays. Minimap is the first; future Compass /
   // HealthBar / Inventory will plug in here as separate functions.
   // Each renders only when its driving node exists in the patch.
@@ -73561,6 +74038,14 @@ function _readWireJsSideValue(wire) {
   // to the full cmath family via _isMathTemplateType.
   if (_isMathTemplateType(src.type)) {
     return _evalMathTemplateJsSide(src);
+  }
+  // Sprint platformer-1 -- game-input + game-body output ports live as
+  // numeric params on the source node (written by _tickGameInputs each
+  // frame). Read them directly so downstream Translate / OrthoCamera2D
+  // / etc. can wire to KeyAxis2D.x, PlatformerBody2D.x, etc.
+  if (src.type === "KeyAxis2D" || src.type === "PlatformerBody2D") {
+    const v = src.params && src.params[wire.from.port];
+    return typeof v === "number" ? v : null;
   }
   return null;
 }
