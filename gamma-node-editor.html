@@ -36596,7 +36596,7 @@ function brRenderTypeRail() {
   const wrap = document.getElementById("br-type-rail");
   if (!wrap) return;
   const all = brCollectAssets();
-  const counts = { audio: 0, midi: 0, video: 0, gpatch: 0, gdsp: 0 };
+  const counts = { audio: 0, midi: 0, video: 0, gpatch: 0, gdsp: 0, sprite: 0 };
   all.forEach(a => { if (counts[a.type] != null) counts[a.type]++; });
   const types = [
     { k: null,     label: "ALL",     count: all.length },
@@ -36605,6 +36605,7 @@ function brRenderTypeRail() {
     { k: "video",  label: ".MP4",    count: counts.video  },
     { k: "gpatch", label: ".GPATCH", count: counts.gpatch },
     { k: "gdsp",   label: ".GDSP",   count: counts.gdsp   },
+    { k: "sprite", label: ".SPRITE", count: counts.sprite },
   ];
   wrap.innerHTML = types.map(t => `
     <span class="type-chip ${brState.assetType === t.k ? "active" : ""}" data-type="${t.k || ""}">
@@ -36631,6 +36632,22 @@ function brCollectAssets() {
         id, name: a.name, type: "audio",
         sub: `${a.durationSec.toFixed(2)} s · ${a.sampleRate} Hz · ${a.channels >= 2 ? "stereo" : "mono"}`,
         source: "local-idb", asset: a,
+      });
+    });
+  }
+  // §8.A.1 -- include sprite assets. Sub line shows pixel dims +
+  // frames metadata; defaults frame count to 1×1 when unset.
+  if (_spriteAssets) {
+    _spriteAssets.forEach((a, id) => {
+      const fx = a.framesX || 1;
+      const fy = a.framesY || 1;
+      const nFrames = fx * fy;
+      const sub = (nFrames > 1)
+        ? `${a.width}×${a.height} · ${fx}×${fy} frames · ${a.fps || 1} fps`
+        : `${a.width}×${a.height}`;
+      out.push({
+        id, name: a.name, type: "sprite",
+        sub, source: "local-idb", asset: a,
       });
     });
   }
@@ -36742,6 +36759,21 @@ function brAssetThumb(a) {
       <text x="50" y="38" text-anchor="middle" font-family="JetBrains Mono" font-size="5" fill="#a89cff" opacity="0.6">.gdsp</text>
     </svg>`;
   }
+  // §8.A.1 -- sprite thumbnail. Lazy-build an object URL from the blob
+  // (cached on the record so we don't leak one per re-render). pixelated
+  // image-rendering keeps SNES-style art crisp at thumbnail scale.
+  if (a.type === "sprite" && a.asset && a.asset.blob) {
+    let url = a.asset._thumbUrl;
+    if (!url) {
+      try {
+        url = URL.createObjectURL(a.asset.blob);
+        a.asset._thumbUrl = url;
+      } catch (_) { url = ""; }
+    }
+    return `<div style="width:100%; height:100%; display:flex; align-items:center; justify-content:center; background:#0a0c10;">
+      <img src="${escapeAttr(url)}" style="max-width:100%; max-height:100%; image-rendering:pixelated; image-rendering:crisp-edges;" alt="${escapeAttr(a.name)}"/>
+    </div>`;
+  }
   return "";
 }
 
@@ -36829,8 +36861,17 @@ function brWireAssetDropZone() {
       if (typeof loadAudioFileToAsset === "function" && /\.(wav|mp3|ogg|flac|m4a|webm)$/i.test(f.name)) {
         try { await loadAudioFileToAsset(f); } catch (err) { console.warn("[browser] decode failed:", f.name, err); }
       }
+      // §8.A.1 -- image files → sprite assets (default 1×1 frames; the
+      // user can edit framesX/Y after upload via the sprite props panel
+      // shipping in §8.A.2). MIME-type sniff is lenient because Drag-Drop
+      // sometimes drops files with no type set.
+      else if (/\.(png|jpe?g|webp|gif|bmp)$/i.test(f.name) ||
+               (f.type && f.type.indexOf("image/") === 0)) {
+        try { await loadImageFileToSpriteAsset(f); }
+        catch (err) { console.warn("[browser] sprite import failed:", f.name, err); }
+      }
       // Other types — log a TODO; storage shape for them lands later.
-      else { console.info("[browser] skipping non-audio file (storage TBD):", f.name); }
+      else { console.info("[browser] skipping unsupported file (storage TBD):", f.name); }
     }
     brRenderAssets();
   });
@@ -85790,9 +85831,74 @@ function smInstallDropZone() {
  * wire up runtime loading on the AlloLib side.
  * ================================================================= */
 
-const _assets = new Map();          // assetId → AssetRecord
+const _assets = new Map();          // assetId → AssetRecord (audio)
+const _spriteAssets = new Map();    // assetId → SpriteAssetRecord (§8.A.1)
 let _assetIdCounter = 1;
 const ASSET_EMBED_LIMIT = 262144;   // ~5.3 sec @ 48kHz mono
+
+/* Sprint §8.A.1 -- generic Assets namespace. Wraps the existing IDB
+ * + in-memory maps so callers don't need to know which map a given
+ * asset type lives in. Audio records (no `assetType` field, written
+ * by the old `loadAudioFileToAsset` path) are treated as audio by
+ * default for backward compat. New record types must set
+ * `assetType: "sprite"` (or future "font" / "midi-clip" / etc.).
+ *
+ * API:
+ *   Assets.put(record)       async; writes IDB + in-memory map for type
+ *   Assets.get(id)           sync; returns record from whichever map holds it
+ *   Assets.list({type})      sync; returns array of records (filtered by type if given)
+ *   Assets.delete(id)        async; removes from IDB + memory
+ *   Assets.byType(type)      sync; returns the Map for that type (live ref)
+ *
+ * Records always carry { id, assetType, name, createdAt, updatedAt }.
+ * Type-specific fields live alongside (e.g. sprite has blob + framesX/Y;
+ * audio has data + sampleRate). */
+const Assets = {
+  byType(type) {
+    if (type === "sprite") return _spriteAssets;
+    return _assets;  // default = audio
+  },
+  async put(record) {
+    if (!record || !record.id) throw new Error("Assets.put: record needs an id");
+    record.updatedAt = Date.now();
+    if (!record.createdAt) record.createdAt = record.updatedAt;
+    const map = this.byType(record.assetType);
+    map.set(record.id, record);
+    try { await _idbPut(record); } catch (e) { console.warn("[assets] put IDB failed:", e); }
+    return record;
+  },
+  get(id) {
+    if (_spriteAssets.has(id)) return _spriteAssets.get(id);
+    if (_assets.has(id))       return _assets.get(id);
+    return null;
+  },
+  list(opts) {
+    const type = opts && opts.type;
+    if (type === "sprite") return Array.from(_spriteAssets.values());
+    if (type === "audio")  return Array.from(_assets.values());
+    // No type filter: everything.
+    return Array.from(_assets.values()).concat(Array.from(_spriteAssets.values()));
+  },
+  async delete(id) {
+    let found = false;
+    if (_spriteAssets.has(id)) { _spriteAssets.delete(id); found = true; }
+    if (_assets.has(id))       { _assets.delete(id);       found = true; }
+    if (!found) return false;
+    try { await _idbDelete(id); } catch (e) { console.warn("[assets] delete IDB failed:", e); }
+    return true;
+  },
+  // Find sprite by user-facing name (case-insensitive). Used by the
+  // upcoming `asset:NAME` ImageURL resolver in §8.A.2.
+  findSpriteByName(name) {
+    if (typeof name !== "string") return null;
+    const lower = name.toLowerCase();
+    for (const rec of _spriteAssets.values()) {
+      if ((rec.name || "").toLowerCase() === lower) return rec;
+    }
+    return null;
+  }
+};
+if (typeof window !== "undefined") window.Assets = Assets;
 
 /* Globally-held mic MediaStream + cached device label. One grant per
  * session shared across all MicInput nodes (browsers only need one
@@ -85863,15 +85969,78 @@ async function loadAssetsFromIdb() {
   _assetsLoaded = true;
   try {
     const records = await _idbLoadAll();
-    records.forEach(r => _assets.set(r.id, r));
+    let nAudio = 0, nSprite = 0;
+    records.forEach(r => {
+      // §8.A.1 dispatch: bucket by assetType. Old audio records (written
+      // before §8.A.1) have no assetType field; default them to "audio"
+      // for backward compatibility.
+      if (r.assetType === "sprite") { _spriteAssets.set(r.id, r); nSprite++; }
+      else                          { _assets.set(r.id, r);       nAudio++; }
+    });
+    if (nAudio + nSprite > 0) {
+      console.log("[assets] loaded from IDB: " + nAudio + " audio, " + nSprite + " sprite");
+    }
     // Refresh any open props pane so file-name labels appear.
     if (typeof renderProps === "function") renderProps();
+    // Refresh the Assets tab if it's currently open.
+    if (typeof brRenderAssets === "function") {
+      try { brRenderAssets(); } catch (_) {}
+    }
   } catch (e) {
     console.warn("[assets] IDB load failed:", e);
   }
 }
 // Kick off the load — no need to await; UI fills in as data arrives.
 loadAssetsFromIdb();
+
+/* ── Sprite asset creation (§8.A.1) ─────────────────────────────── */
+/* Take a dropped/selected image file (PNG/JPEG/WebP/GIF), read its
+ * pixel dimensions, generate a unique id + name, and store it as a
+ * sprite asset (in IDB + _spriteAssets). Returns the asset record so
+ * callers can immediately wire it into an ImageURL node.
+ *
+ * Default metadata: framesX=1, framesY=1, fps=1, anchor center. The
+ * SpriteCreator UI (§8.A.2 followup) will let users edit those after
+ * upload. Animation framing has to come from the user because we can't
+ * auto-detect grid layout from a single PNG. */
+async function loadImageFileToSpriteAsset(file, opts) {
+  if (!file) return null;
+  opts = opts || {};
+  const buf = await file.arrayBuffer();
+  const blob = new Blob([buf], { type: file.type || "image/png" });
+  // Read dimensions via createImageBitmap (faster than HTMLImageElement).
+  let width = 0, height = 0;
+  try {
+    const bmp = await createImageBitmap(blob);
+    width = bmp.width; height = bmp.height;
+    if (bmp.close) try { bmp.close(); } catch (_) {}
+  } catch (e) {
+    console.warn("[assets] sprite decode failed for " + file.name + ":", e);
+    return null;
+  }
+  // Derive a clean name: strip extension + collapse non-name chars.
+  const baseName = (typeof opts.name === "string" && opts.name)
+    ? opts.name
+    : file.name.replace(/\.[^/.]+$/, "").replace(/[^A-Za-z0-9_-]+/g, "-");
+  const rec = {
+    id: "spr_" + Date.now() + "_" + Math.floor(Math.random() * 1e6),
+    assetType: "sprite",
+    name: baseName,
+    blob,
+    mimeType: blob.type,
+    width, height,
+    framesX: (typeof opts.framesX === "number" && opts.framesX > 0) ? opts.framesX : 1,
+    framesY: (typeof opts.framesY === "number" && opts.framesY > 0) ? opts.framesY : 1,
+    fps: (typeof opts.fps === "number" && opts.fps > 0) ? opts.fps : 1,
+    anchor: opts.anchor || { x: 0.5, y: 0.5 },
+    hitbox: opts.hitbox || null,
+    palette: opts.palette || [],
+    source: opts.source || "drop",   // "drop" / "creator" / "batch" / "asset:NAME"
+  };
+  await Assets.put(rec);
+  console.log("[assets] added sprite '" + rec.name + "' (" + width + "×" + height + ") id=" + rec.id);
+  return rec;
+}
 
 /* ── Audio file decode + asset creation ─────────────────────────── */
 async function loadAudioFileToAsset(file) {
