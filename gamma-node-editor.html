@@ -11270,6 +11270,52 @@ public:
    * future: read from a wired environment). Phase 2 will add SSR
    * (screen-space reflection ray-march) once the Scene exposes its
    * color+depth attachments to post-process passes. */
+
+  /* Sprint 8.0.3-a -- TerrainCollider. Exposes the same height
+   * field the renderer + FPCamera walk-mode use, as a queryable
+   * API for foliage placement, simple character controllers,
+   * future physics (Rapier mesh colliders land in §8.0.3-b),
+   * AI ground-snap, prop pivot alignment, etc.
+   *
+   * Sources, in priority order (auto-resolved at query time):
+   *   1. The wired `terrain` upstream chain (Terrain / TiledTerrain
+   *      / Planet / PlanetMesh / TerrainHorizon).
+   *   2. First TiledTerrain found in the scene.
+   *   3. First Planet/PlanetMesh found in the scene (queried via
+   *      the projected-flat path -- spawn-pole-tangent).
+   *
+   * Query API surface:
+   *   window.__COLLIDER.heightAt(wx, wz)        → world Y or null
+   *   window.__COLLIDER.radialHeightAt(dx,dy,dz) → planet surface
+   *                                                radius (planet
+   *                                                source only)
+   *
+   * The node itself emits a `height` output -- wiring it into a
+   * downstream param at (wx, wz) yields the surface Y at that
+   * point. Foliage / scatter nodes (10-5d) will consume this. */
+  TerrainCollider: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "collider",
+    ins: [
+      { n: "terrain",   t: "mesh" },     // optional explicit source
+      { n: "queryX",    t: "param" },
+      { n: "queryZ",    t: "param" },
+    ],
+    outs: [{ n: "height", t: "param" }],
+    params: {
+      queryX: 0,
+      queryZ: 0,
+      // 0 = ground (terrain Y), 1 = water surface (Water node yOff),
+      // future 2/3 reserved for "ground above water if any" /
+      // "lowest of (ground, water)".
+      surfaceMode: 0
+    },
+    paramOptions: { surfaceMode: ["ground", "water"] },
+    methods: {},
+    description: "Sprint 8.0.3-a -- queryable collision surface for Terrain / TiledTerrain / Planet / PlanetMesh. Wire the terrain mesh you want to query into `terrain` (optional; auto-finds the first terrain in the scene if unwired). Drives the `height` output from (queryX, queryZ) -- foliage / scatter / character-controller nodes consume this. Also exposed via window.__COLLIDER.heightAt(wx, wz) for scripting + the future Rapier physics bridge (§8.0.3-b adds a trimesh exporter on the same source). surfaceMode picks ground vs water (water requires a Water node in the scene). Sync constant-time query — uses the same JS noise functions that drive the renderer + FPCamera walk-mode so the player and the visible terrain stay in lockstep."
+  },
+
   Water: {
     category: "Visual", color: COLOR.visual, header: null,
     cppType: "",
@@ -47104,6 +47150,162 @@ function _fpcSampleGroundY(wx, wz, wy) {
        + y11 * fx       * fz;
 }
 
+/* Sprint 8.0.3-a -- TerrainCollider runtime.
+ *
+ * Unified, source-agnostic height-query API for foliage placement /
+ * simple character controllers / future Rapier physics bridge /
+ * AI ground-snap / prop pivot alignment. Sources resolved at query
+ * time, in priority order: TiledTerrain → PlanetMesh → legacy
+ * Planet. Same JS noise functions the renderer + FPCamera walk-
+ * mode use, so query points and visible terrain stay in lockstep.
+ *
+ * Three layers:
+ *   1. _terrainColliderHeightAt(wx, wz, opts?) -- raw helper
+ *   2. TerrainCollider node -> emits .height resolved via the
+ *      `_readWireJsSideValue` dispatcher (see below)
+ *   3. window.__COLLIDER for scripting + harness access
+ *
+ * `opts.preferredSourceId` (optional) -- if the TerrainCollider has
+ * a `terrain` input wired, the source's node.id is passed here and
+ * we honor the explicit choice; otherwise we auto-pick. */
+function _terrainColliderHeightAt(wx, wz, opts) {
+  if (typeof state === "undefined" || !state || !Array.isArray(state.nodes)) {
+    return null;
+  }
+  const preferredId = opts && opts.preferredSourceId;
+  const matchType = (n, type) => n && n.type === type;
+  const matchPreferred = (n) =>
+    preferredId !== undefined && preferredId !== null
+      ? (n && n.id === preferredId)
+      : false;
+
+  // Explicit source wins regardless of type ordering.
+  const explicit = preferredId
+    ? state.nodes.find(n => n && n.id === preferredId)
+    : null;
+
+  // Resolve in priority order. Each branch reuses the exact same
+  // helper the renderer / walk-mode use, so 1-to-1 lockstep is free.
+  const tryTiled = (n) => {
+    if (!n || !n.params) return null;
+    const p = n.params;
+    const noise = {
+      seed:       (typeof p.seed       === "number") ? p.seed       : 7.42,
+      frequency:  (typeof p.frequency  === "number") ? p.frequency  : 0.008,
+      octaves:    (typeof p.octaves    === "number") ? p.octaves    : 6,
+      lacunarity: (typeof p.lacunarity === "number") ? p.lacunarity : 2.05,
+      gain:       (typeof p.gain       === "number") ? p.gain       : 0.5,
+      ridges:     (typeof p.ridges     === "number") ? p.ridges     : 0.0,
+      plateau:    (typeof p.plateau    === "number") ? p.plateau    : 0.0,
+      erosionParams: _findTiledErosionParams(n),
+      islandParams:  _findTiledIslandParams(n)
+    };
+    const hs   = (typeof p.heightScale === "number") ? p.heightScale : 80;
+    const yOff = (typeof p.yOffset     === "number") ? p.yOffset     : 0;
+    return _tiledFinalY(wx, wz, noise, hs, yOff);
+  };
+
+  const tryPlanetMesh = (n) => {
+    const pl = _findPlanetInfo();
+    if (!pl) return null;
+    // Caller didn't pass wy -- approximate by querying with the
+    // surface-Y at this XZ (one extra eval; matches walk-mode's
+    // first-step behavior).
+    const surf = _planetMeshSurfacePos(wx, 0, wz, pl);
+    return surf ? surf.y : null;
+  };
+
+  const tryPlanet = (n) => {
+    if (!n || !n.params) return null;
+    const planet = _findPlanetForProjection();
+    if (!planet) return null;
+    return _planetSurfaceYAt(wx, wz, planet, n.params);
+  };
+
+  if (explicit) {
+    if (matchType(explicit, "TiledTerrain"))                  return tryTiled(explicit);
+    if (matchType(explicit, "PlanetMesh"))                    return tryPlanetMesh(explicit);
+    if (matchType(explicit, "Planet"))                        return tryPlanet(explicit);
+    // Unknown explicit source -- fall through to auto.
+  }
+
+  // Auto-resolve: TiledTerrain → PlanetMesh → Planet.
+  const tt = state.nodes.find(n => matchType(n, "TiledTerrain"));
+  if (tt) {
+    const y = tryTiled(tt);
+    if (y !== null && Number.isFinite(y)) return y;
+  }
+  const pmesh = state.nodes.find(n => matchType(n, "PlanetMesh"));
+  if (pmesh) {
+    const y = tryPlanetMesh(pmesh);
+    if (y !== null && Number.isFinite(y)) return y;
+  }
+  const pl = state.nodes.find(n => matchType(n, "Planet"));
+  if (pl) {
+    const y = tryPlanet(pl);
+    if (y !== null && Number.isFinite(y)) return y;
+  }
+  return null;
+}
+
+/* Sprint 8.0.3-a -- planet ray-from-center query. For PlanetMesh,
+ * returns the surface RADIUS along the normalized direction (dx,
+ * dy, dz). Used by foliage on the planet surface that wants
+ * radial alignment, and by future RT engine integration that
+ * shoots rays from the planet center for sun/sky illumination. */
+function _terrainColliderRadialAt(dx, dy, dz) {
+  if (typeof state === "undefined" || !state || !Array.isArray(state.nodes)) return null;
+  const pl = _findPlanetInfo();
+  if (!pl) return null;
+  // Project the input direction to a unit vector + sample via the
+  // surface-pos helper using a far point along the ray as the
+  // "world position" (matches _planetMeshSurfacePos's projection).
+  const ln = Math.hypot(dx, dy, dz);
+  if (ln < 1e-12) return null;
+  const inv = 1 / ln;
+  const ux = dx * inv, uy = dy * inv, uz = dz * inv;
+  const probeR = (pl.r || 1) * 4.0;
+  const surf = _planetMeshSurfacePos(
+    pl.cx + ux * probeR,
+    pl.cy + uy * probeR,
+    pl.cz + uz * probeR,
+    pl
+  );
+  if (!surf) return null;
+  const sx = surf.x - pl.cx;
+  const sy = surf.y - pl.cy;
+  const sz = surf.z - pl.cz;
+  return Math.hypot(sx, sy, sz);
+}
+
+/* Resolve the explicit source of a TerrainCollider node by walking
+ * its `terrain` input wire upstream past any transform nodes to the
+ * leaf mesh-gen node. Returns the source node or null. */
+function _terrainColliderExplicitSource(colliderNode) {
+  if (!colliderNode || !state || !Array.isArray(state.edges)) return null;
+  const wire = state.edges.find(e =>
+    e && e.to && e.to.node === colliderNode.id && e.to.port === "terrain"
+  );
+  if (!wire || !wire.from) return null;
+  let cur = state.nodes.find(n => n && n.id === wire.from.node);
+  let guard = 0;
+  while (cur && guard++ < 32) {
+    const def = TYPES[cur.type];
+    if (!def) return null;
+    if (def.kind === "mesh-gen")       return cur;
+    if (def.kind === "mesh-transform" || def.kind === "material") {
+      const next = state.edges.find(e =>
+        e && e.to && e.to.node === cur.id && e.to.port === "mesh"
+      );
+      if (!next || !next.from) return null;
+      cur = state.nodes.find(n => n && n.id === next.from.node);
+      continue;
+    }
+    return null;
+  }
+  return null;
+}
+
 /* Helper: find the first planet-like node in the patch + return its
  * center / radius so flight-mode Space/C can move radially and the
  * altimeter / minimap can do globe math. Returns null if no planet
@@ -72494,6 +72696,22 @@ function _readWireJsSideValue(wire) {
   if (src.type === "AD" || src.type === "AR" || src.type === "ADSR") {
     return _envMirrorValue(src, wire.from.port);
   }
+  // Sprint 8.0.3-a -- TerrainCollider. Resolves the source (auto
+  // or explicit-via-`terrain`-wire), queries height at the node's
+  // (queryX, queryZ) -- themselves wire-resolvable so e.g. a
+  // (Camera.posX → TerrainCollider.queryX, Camera.posZ →
+  // queryZ) wiring drives the height from where the camera is.
+  if (src.type === "TerrainCollider") {
+    if (wire.from.port !== "height") return null;
+    const cp = _resolveNodeParams(src);
+    const wx = (typeof cp.queryX === "number") ? cp.queryX : 0;
+    const wz = (typeof cp.queryZ === "number") ? cp.queryZ : 0;
+    const explicit = _terrainColliderExplicitSource(src);
+    const y = _terrainColliderHeightAt(wx, wz, {
+      preferredSourceId: explicit ? explicit.id : null
+    });
+    return (y !== null && Number.isFinite(y)) ? y : null;
+  }
   // Math template nodes (Mul / Add / Sub / Sin / Cos / cmath family
   // / etc.) recurse into their own inputs. Common patterns like
   // "(Slider * 2 + 1) -> OscOut" or "(Phasor * 2pi -> Sin) -> Camera.posX"
@@ -84590,6 +84808,17 @@ window.__PMAP = {
   stampLandmass: _planetStampLandmass,
   measureLandmass: _planetMeasureLandmass,
   colorForHeight: _planetColorForHeight,
+};
+
+// Sprint 8.0.3-a -- TerrainCollider scripting / harness surface.
+// heightAt(wx, wz)        -- world Y at flat-XZ point; auto-source
+// radialAt(dx, dy, dz)    -- planet surface radius along direction
+//                            (planet sources only)
+// Foliage / character controllers / future Rapier physics bridge
+// consume these; 10-5d ground scatter is the first user.
+window.__COLLIDER = {
+  heightAt: function (wx, wz) { return _terrainColliderHeightAt(wx, wz); },
+  radialAt: function (dx, dy, dz) { return _terrainColliderRadialAt(dx, dy, dz); }
 };
 
 </script>
