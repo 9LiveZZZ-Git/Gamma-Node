@@ -7661,6 +7661,48 @@
     </div>
   </div>
 
+  <!-- Sprint asset-folders -- Folder editor modal. Opens when the user
+       clicks an existing folder card OR creates a new folder via the
+       Assets-tab "+ FOLDER" chip. Layout:
+         Header: name (editable) + function dropdown + close
+         Body:   one row per slot (label + drop-target preview + clear)
+         Footer: Auto-Sort button (LLM), Save, Done.
+       Drag sprites from the Assets tab into a slot to assign. -->
+  <div class="modal-backdrop" id="folder-modal" style="display:none;">
+    <div class="modal" style="width: 720px; max-width: 95vw; max-height: 90vh; display:flex; flex-direction:column;">
+      <div class="modal-head" style="display:flex; align-items:center; gap:10px;">
+        <span class="modal-title" style="font-family:var(--font-instr); letter-spacing:0.20em; color:var(--phosphor); text-transform:lowercase;">asset folder</span>
+        <span id="folder-status" style="font-family:var(--font-mono); font-size:10px; color:var(--text-3); flex:1;"></span>
+        <button class="btn modal-x" id="folder-close" type="button">×</button>
+      </div>
+      <div style="padding:12px 14px; border-top:1px solid var(--instr-rule); display:flex; flex-direction:column; gap:10px; flex:1; min-height:0; overflow:auto;">
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+          <div>
+            <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); letter-spacing:0.06em; margin-bottom:4px;">NAME</div>
+            <input type="text" id="folder-name" style="width:100%; padding:5px 6px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:11px;"/>
+          </div>
+          <div>
+            <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); letter-spacing:0.06em; margin-bottom:4px;">FUNCTION</div>
+            <select id="folder-function" style="width:100%; padding:5px 6px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:11px;">
+              <!-- Populated dynamically from _ASSET_FUNCTIONS -->
+            </select>
+          </div>
+        </div>
+        <div id="folder-func-desc" style="font-family:var(--font-mono); font-size:10px; color:var(--text-3); line-height:1.5; font-style:italic;"></div>
+        <div style="display:flex; gap:8px; align-items:center;">
+          <button class="btn primary" id="folder-autosort" title="Use the LLM to assign existing sprites to slots based on their names and the slot descriptions">⚡ Auto-Sort (LLM)</button>
+          <span id="folder-autosort-status" style="font-family:var(--font-mono); font-size:10px; color:var(--text-3);"></span>
+        </div>
+        <div id="folder-slots" style="display:flex; flex-direction:column; gap:6px;">
+          <!-- Slot rows rendered dynamically -->
+        </div>
+        <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); line-height:1.5; padding:6px 0;">
+          Tip: drag sprites from the Assets tab onto a slot. The Auto-Sort button uses your configured LLM (User DSP → ⚙) to match sprite names against slot descriptions.
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Sample waveform editor — opens for SamplePlayer / Stereo /
        Granular nodes. Shows the loaded asset's waveform (downsampled
        min/max envelope, cached per-asset), handles for the relevant
@@ -36763,7 +36805,7 @@ function brRenderTypeRail() {
   const wrap = document.getElementById("br-type-rail");
   if (!wrap) return;
   const all = brCollectAssets();
-  const counts = { audio: 0, midi: 0, video: 0, gpatch: 0, gdsp: 0, sprite: 0 };
+  const counts = { audio: 0, midi: 0, video: 0, gpatch: 0, gdsp: 0, sprite: 0, folder: 0 };
   all.forEach(a => { if (counts[a.type] != null) counts[a.type]++; });
   const types = [
     { k: null,     label: "ALL",     count: all.length },
@@ -36773,17 +36815,29 @@ function brRenderTypeRail() {
     { k: "gpatch", label: ".GPATCH", count: counts.gpatch },
     { k: "gdsp",   label: ".GDSP",   count: counts.gdsp   },
     { k: "sprite", label: ".SPRITE", count: counts.sprite },
+    { k: "folder", label: ".FOLDER", count: counts.folder },
   ];
   wrap.innerHTML = types.map(t => `
     <span class="type-chip ${brState.assetType === t.k ? "active" : ""}" data-type="${t.k || ""}">
       ${escapeText(t.label)}<span class="count">${t.count}</span>
     </span>
-  `).join("");
+  `).join("")
+  // asset-folders -- + Folder shortcut next to the type chips. Opens
+  // the folder editor on a freshly-created blank folder.
+  + `<span class="type-chip" id="br-new-folder-btn" data-action="new-folder" title="Create a new asset folder (group related sprites by function: character / enemy / item / etc.)" style="cursor:pointer; background:rgba(255,200,100,0.15); color:#ffd080;">+ FOLDER</span>`;
   wrap.querySelectorAll(".type-chip").forEach(c => {
-    c.addEventListener("click", () => {
-      brState.assetType = c.dataset.type || null;
-      brRenderAssets();
-    });
+    if (c.dataset.action === "new-folder") {
+      c.addEventListener("click", async () => {
+        const rec = await createFolderAsset("", "decoration", { source: "manual" });
+        brRenderAssets();
+        if (typeof _folderOpen === "function") _folderOpen(rec.id);
+      });
+    } else {
+      c.addEventListener("click", () => {
+        brState.assetType = c.dataset.type || null;
+        brRenderAssets();
+      });
+    }
   });
 }
 
@@ -36814,6 +36868,20 @@ function brCollectAssets() {
         : `${a.width}×${a.height}`;
       out.push({
         id, name: a.name, type: "sprite",
+        sub, source: "local-idb", asset: a,
+      });
+    });
+  }
+  // asset-folders -- include folder assets. Sub line shows function +
+  // filled / total slots so the user can see how complete a folder is.
+  if (_folderAssets) {
+    _folderAssets.forEach((a, id) => {
+      const fdef = _ASSET_FUNCTIONS[a.functionKey] || _ASSET_FUNCTIONS["decoration"];
+      const totalSlots = fdef.slots.length;
+      const filled = Object.values(a.slots || {}).filter(v => v).length;
+      const sub = `${fdef.label} · ${filled}/${totalSlots} slots`;
+      out.push({
+        id, name: a.name, type: "folder",
         sub, source: "local-idb", asset: a,
       });
     });
@@ -36878,13 +36946,26 @@ function brRenderAssetGrid() {
     card.style.position = "relative";  // anchor for the delete button
     card.addEventListener("dragstart", e => {
       e.dataTransfer.setData("text/x-gamma-asset-id", card.dataset.assetId);
-      // Sprite drops also carry a type tag so the patch handler knows
-      // to create ImageURL + Sprite, not (e.g.) SamplePlayer.
+      // Drops also carry a type tag so the patch handler knows whether
+      // to spawn ImageURL+Sprite (sprite), a SpriteFolder node (folder),
+      // or something else.
       if (card.dataset.assetType) {
         e.dataTransfer.setData("text/x-gamma-asset-type", card.dataset.assetType);
       }
       e.dataTransfer.effectAllowed = "copy";
     });
+    // asset-folders -- folder cards open the editor on click.
+    if (card.dataset.assetType === "folder") {
+      card.addEventListener("click", e => {
+        // Don't trigger when the click was on the × delete button or an
+        // input. Both stop propagation in their own handlers, but
+        // guard defensively in case markup changes.
+        if (e.target.closest("button.asset-del")) return;
+        if (e.target.tagName === "INPUT") return;
+        if (typeof _folderOpen === "function") _folderOpen(card.dataset.assetId);
+      });
+      card.style.cursor = "pointer";
+    }
   });
   // §8.A.1 / §8.A.2 -- delete buttons.
   grid.querySelectorAll(".asset-del").forEach(btn => {
@@ -37049,6 +37130,30 @@ function brAssetThumb(a) {
       <text x="50" y="28" text-anchor="middle" font-family="JetBrains Mono" font-size="9" fill="#a89cff" font-weight="600">{ }</text>
       <text x="50" y="38" text-anchor="middle" font-family="JetBrains Mono" font-size="5" fill="#a89cff" opacity="0.6">.gdsp</text>
     </svg>`;
+  }
+  // asset-folders -- folder thumbnail. Shows a 2×2 mini-grid of the
+  // folder's first 4 filled slots so the user can scan the contents at
+  // a glance. Empty slots get a "+" placeholder.
+  if (a.type === "folder" && a.asset) {
+    const slots = a.asset.slots || {};
+    const filled = Object.entries(slots).filter(([k, v]) => v).slice(0, 4);
+    const cells = [0, 1, 2, 3].map(i => {
+      const entry = filled[i];
+      if (!entry) {
+        return `<div style="background:#0a0c10; border:1px dashed rgba(255,255,255,0.08); display:flex; align-items:center; justify-content:center; color:rgba(255,255,255,0.18); font-size:14px;">+</div>`;
+      }
+      const sid = entry[1];
+      const srec = _spriteAssets.get(sid);
+      if (!srec || !srec.blob) {
+        return `<div style="background:#0a0c10; border:1px solid rgba(255,80,80,0.4); color:#ff8060; font-size:8px; padding:1px;" title="sprite deleted">${escapeText(entry[0])}</div>`;
+      }
+      let url = srec._thumbUrl;
+      if (!url) {
+        try { url = URL.createObjectURL(srec.blob); srec._thumbUrl = url; } catch (_) { url = ""; }
+      }
+      return `<div style="background:#0a0c10; overflow:hidden; display:flex; align-items:center; justify-content:center;"><img src="${escapeAttr(url)}" style="max-width:100%; max-height:100%; image-rendering:pixelated; image-rendering:crisp-edges;"/></div>`;
+    }).join("");
+    return `<div style="width:100%; height:100%; display:grid; grid-template-columns:1fr 1fr; grid-template-rows:1fr 1fr; gap:1px; background:rgba(255,200,100,0.10);">${cells}</div>`;
   }
   // §8.A.1 -- sprite thumbnail. Lazy-build an object URL from the blob
   // (cached on the record so we don't leak one per re-render). pixelated
@@ -37304,12 +37409,35 @@ function _wirePatchCanvasAssetDrop() {
     const id = e.dataTransfer && e.dataTransfer.getData("text/x-gamma-asset-id");
     if (!id) return;
     const assetType = e.dataTransfer.getData("text/x-gamma-asset-type");
-    if (assetType !== "sprite") return;  // audio etc handled by their own modals
+    if (assetType !== "sprite" && assetType !== "folder") return;  // audio etc handled elsewhere
     e.preventDefault();
-    const rec = Assets.get(id);
+    let rec = Assets.get(id);
     if (!rec) {
-      console.warn("[asset-drop] sprite id not found: " + id);
+      console.warn("[asset-drop] " + assetType + " id not found: " + id);
       return;
+    }
+    // asset-folders / scene-bulk -- folder drops resolve to the folder's
+    // PRIMARY sprite (first filled slot in the function's slot order)
+    // and spawn the ImageURL+Sprite+Translate chain for THAT sprite.
+    // The full "animation state machine" wiring for a folder is the
+    // fox-wire sprint; for now a folder drop = first-sprite drop.
+    if (assetType === "folder") {
+      const fdef = _ASSET_FUNCTIONS[rec.functionKey] || _ASSET_FUNCTIONS["decoration"];
+      let primarySprite = null;
+      for (const s of fdef.slots) {
+        const sid = (rec.slots || {})[s.name];
+        if (sid) {
+          const srec = Assets.get(sid);
+          if (srec && srec.assetType === "sprite") { primarySprite = srec; break; }
+        }
+      }
+      if (!primarySprite) {
+        console.warn("[asset-drop] folder '" + rec.name + "' has no filled slots");
+        alert("Folder '" + rec.name + "' has no filled slots yet. Open it (click the card in Assets) and assign sprites first.");
+        return;
+      }
+      console.log("[asset-drop] folder '" + rec.name + "' → primary slot sprite '" + primarySprite.name + "'");
+      rec = primarySprite;   // fall through to the sprite-drop path below
     }
     const w = screenToWorld(e.clientX, e.clientY);
     pushHistory("asset-drop:" + rec.name);
@@ -86258,7 +86386,104 @@ function smInstallDropZone() {
 
 const _assets = new Map();          // assetId → AssetRecord (audio)
 const _spriteAssets = new Map();    // assetId → SpriteAssetRecord (§8.A.1)
+const _folderAssets = new Map();    // assetId → AssetFolderRecord (asset-folders sprint)
 let _assetIdCounter = 1;
+
+/* Sprint asset-folders -- function registry. Each function defines the
+ * slots a folder of that function exposes. Slot list is fixed per
+ * function (so a Playable Character folder always has the same slots),
+ * but optional slots are marked with `optional: true` -- the LLM
+ * auto-sort honors that when deciding which sprites get assigned.
+ *
+ * Adding a new function: add an entry here, the editor + LLM prompt
+ * pick it up automatically. The function name is the IDB-stored
+ * key on the folder record.
+ *
+ * Slot descriptions are sent to the LLM during auto-sort to help it
+ * pick the right sprite for each slot. Keep them concise + literal
+ * (the LLM matches sprite NAMES against descriptions). */
+const _ASSET_FUNCTIONS = {
+  "playable-character": {
+    label: "Playable Character",
+    description: "Player-controlled hero. Wires into PlatformerBody2D for movement.",
+    slots: [
+      { name: "idle",     desc: "Standing still pose; small ambient motion (breathing, tail sway)" },
+      { name: "walk",     desc: "Walking sideways, 6-8 frame cycle" },
+      { name: "run",      desc: "Running sideways, faster than walk with forward lean", optional: true },
+      { name: "jump-up",  desc: "Crouch + leap, body compressing then extending upward" },
+      { name: "jump-apex",desc: "Mid-air arc peak, body stretched", optional: true },
+      { name: "fall",     desc: "Falling downward, arms/limbs spread" },
+      { name: "land",     desc: "Brief crouch on landing impact", optional: true },
+      { name: "crouch",   desc: "Held crouch / duck pose", optional: true },
+      { name: "attack",   desc: "Attack swing / punch / shoot pose", optional: true },
+      { name: "hurt",     desc: "Damage reaction frame", optional: true }
+    ]
+  },
+  "enemy": {
+    label: "Enemy",
+    description: "Hostile NPC. Same slots as Character but with simpler AI defaults.",
+    slots: [
+      { name: "idle",     desc: "Default pose when not actively threatening" },
+      { name: "patrol",   desc: "Walking back and forth" },
+      { name: "attack",   desc: "Striking the player" },
+      { name: "hurt",     desc: "Damage reaction", optional: true },
+      { name: "die",      desc: "Death frame" }
+    ]
+  },
+  "npc": {
+    label: "NPC (non-combat)",
+    description: "Friendly or neutral. Often dialog hooks.",
+    slots: [
+      { name: "idle",     desc: "Standing still" },
+      { name: "talk",     desc: "Talking / gesturing pose", optional: true },
+      { name: "walk",     desc: "Walking", optional: true }
+    ]
+  },
+  "decoration": {
+    label: "Terrain Decoration",
+    description: "Static (or looping) scenery — trees, rocks, signs, banners. No interaction.",
+    slots: [
+      { name: "main",     desc: "The decoration itself" }
+    ]
+  },
+  "item": {
+    label: "Item / Collectible",
+    description: "Pickups, power-ups, coins. Usually has a looping idle + a one-shot collect.",
+    slots: [
+      { name: "idle",     desc: "Looping idle frames (twinkle, bob, sparkle)" },
+      { name: "collect",  desc: "One-shot collected animation (poof, fade)", optional: true }
+    ]
+  },
+  "interactive": {
+    label: "Interactive Object",
+    description: "Switches, buttons, levers. Two states + optional transition.",
+    slots: [
+      { name: "off",      desc: "Inactive / default state" },
+      { name: "on",       desc: "Activated state" },
+      { name: "transition", desc: "Animation between off and on", optional: true }
+    ]
+  },
+  "door": {
+    label: "Door / Portal",
+    description: "Opens and closes; the player passes through. Often locked → unlocked.",
+    slots: [
+      { name: "closed",   desc: "Fully closed" },
+      { name: "opening",  desc: "Mid-animation opening", optional: true },
+      { name: "open",     desc: "Fully open" },
+      { name: "closing",  desc: "Mid-animation closing", optional: true }
+    ]
+  },
+  "effect": {
+    label: "Effect (particles / hits)",
+    description: "One-shot VFX: explosions, sparkles, hit-flashes. Frames play once.",
+    slots: [
+      { name: "frame0",   desc: "First frame of the effect" },
+      { name: "frame1",   desc: "Second frame", optional: true },
+      { name: "frame2",   desc: "Third frame", optional: true },
+      { name: "frame3",   desc: "Fourth frame", optional: true }
+    ]
+  }
+};
 const ASSET_EMBED_LIMIT = 262144;   // ~5.3 sec @ 48kHz mono
 
 /* Sprint §8.A.1 -- generic Assets namespace. Wraps the existing IDB
@@ -86281,6 +86506,7 @@ const ASSET_EMBED_LIMIT = 262144;   // ~5.3 sec @ 48kHz mono
 const Assets = {
   byType(type) {
     if (type === "sprite") return _spriteAssets;
+    if (type === "folder") return _folderAssets;
     return _assets;  // default = audio
   },
   async put(record) {
@@ -86294,26 +86520,31 @@ const Assets = {
   },
   get(id) {
     if (_spriteAssets.has(id)) return _spriteAssets.get(id);
+    if (_folderAssets.has(id)) return _folderAssets.get(id);
     if (_assets.has(id))       return _assets.get(id);
     return null;
   },
   list(opts) {
     const type = opts && opts.type;
     if (type === "sprite") return Array.from(_spriteAssets.values());
+    if (type === "folder") return Array.from(_folderAssets.values());
     if (type === "audio")  return Array.from(_assets.values());
     // No type filter: everything.
-    return Array.from(_assets.values()).concat(Array.from(_spriteAssets.values()));
+    return Array.from(_assets.values())
+      .concat(Array.from(_spriteAssets.values()))
+      .concat(Array.from(_folderAssets.values()));
   },
   async delete(id) {
     let found = false;
     if (_spriteAssets.has(id)) { _spriteAssets.delete(id); found = true; }
+    if (_folderAssets.has(id)) { _folderAssets.delete(id); found = true; }
     if (_assets.has(id))       { _assets.delete(id);       found = true; }
     if (!found) return false;
     try { await _idbDelete(id); } catch (e) { console.warn("[assets] delete IDB failed:", e); }
     return true;
   },
   // Find sprite by user-facing name (case-insensitive). Used by the
-  // upcoming `asset:NAME` ImageURL resolver in §8.A.2.
+  // `asset:NAME` ImageURL resolver in §8.A.2.
   findSpriteByName(name) {
     if (typeof name !== "string") return null;
     const lower = name.toLowerCase();
@@ -86321,6 +86552,24 @@ const Assets = {
       if ((rec.name || "").toLowerCase() === lower) return rec;
     }
     return null;
+  },
+  // Find folder by user-facing name (case-insensitive). Used by the
+  // scene-bulk drop handler + future SpriteCollection nodes.
+  findFolderByName(name) {
+    if (typeof name !== "string") return null;
+    const lower = name.toLowerCase();
+    for (const rec of _folderAssets.values()) {
+      if ((rec.name || "").toLowerCase() === lower) return rec;
+    }
+    return null;
+  },
+  // Resolve a slot in a folder to the underlying sprite asset record.
+  // Returns null if the slot is empty or the assigned sprite was deleted.
+  resolveFolderSlot(folder, slotName) {
+    if (!folder || !folder.slots) return null;
+    const sid = folder.slots[slotName];
+    if (!sid) return null;
+    return _spriteAssets.get(sid) || null;
   }
 };
 if (typeof window !== "undefined") window.Assets = Assets;
@@ -86394,16 +86643,17 @@ async function loadAssetsFromIdb() {
   _assetsLoaded = true;
   try {
     const records = await _idbLoadAll();
-    let nAudio = 0, nSprite = 0;
+    let nAudio = 0, nSprite = 0, nFolder = 0;
     records.forEach(r => {
-      // §8.A.1 dispatch: bucket by assetType. Old audio records (written
-      // before §8.A.1) have no assetType field; default them to "audio"
-      // for backward compatibility.
-      if (r.assetType === "sprite") { _spriteAssets.set(r.id, r); nSprite++; }
-      else                          { _assets.set(r.id, r);       nAudio++; }
+      // §8.A.1 + asset-folders dispatch: bucket by assetType. Old audio
+      // records (written before §8.A.1) have no assetType field; default
+      // them to "audio" for backward compatibility.
+      if      (r.assetType === "sprite") { _spriteAssets.set(r.id, r); nSprite++; }
+      else if (r.assetType === "folder") { _folderAssets.set(r.id, r); nFolder++; }
+      else                               { _assets.set(r.id, r);       nAudio++; }
     });
-    if (nAudio + nSprite > 0) {
-      console.log("[assets] loaded from IDB: " + nAudio + " audio, " + nSprite + " sprite");
+    if (nAudio + nSprite + nFolder > 0) {
+      console.log("[assets] loaded from IDB: " + nAudio + " audio, " + nSprite + " sprite, " + nFolder + " folder");
     }
     // Refresh any open props pane so file-name labels appear.
     if (typeof renderProps === "function") renderProps();
@@ -87045,6 +87295,343 @@ if (typeof document !== "undefined") {
     document.addEventListener("DOMContentLoaded", _ssInstall);
   } else {
     _ssInstall();
+  }
+}
+
+/* ── Asset folder creation (asset-folders sprint) ───────────────── */
+/* Create a folder asset. function must be one of _ASSET_FUNCTIONS;
+ * defaults to 'decoration' (single-slot, lowest friction). Slots are
+ * pre-populated empty (each slot value = null) so the editor can
+ * render placeholders without checking for missing keys.
+ *
+ * `slots` arg lets the caller pre-fill assignments (LLM auto-sort uses
+ * this). Format: {slotName: spriteAssetId}. Anything not in the
+ * function's slot list is dropped (with a warning) so a relabel later
+ * doesn't leave orphan keys behind. */
+async function createFolderAsset(name, functionKey, opts) {
+  opts = opts || {};
+  const fdef = _ASSET_FUNCTIONS[functionKey] || _ASSET_FUNCTIONS["decoration"];
+  const slotMap = {};
+  for (const s of fdef.slots) slotMap[s.name] = null;
+  if (opts.slots) {
+    for (const k of Object.keys(opts.slots)) {
+      if (k in slotMap) slotMap[k] = opts.slots[k];
+      else console.warn("[folder] dropping unknown slot '" + k + "' for function " + functionKey);
+    }
+  }
+  const baseName = (typeof name === "string" && name.length)
+    ? name.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "")
+    : "folder-" + Date.now().toString(36).slice(-5);
+  const rec = {
+    id: "fold_" + Date.now() + "_" + Math.floor(Math.random() * 1e6),
+    assetType: "folder",
+    name: baseName,
+    functionKey: functionKey || "decoration",
+    slots: slotMap,            // slotName → spriteAssetId | null
+    notes: opts.notes || "",
+    source: opts.source || "manual"
+  };
+  await Assets.put(rec);
+  console.log("[assets] created folder '" + rec.name + "' (" + rec.functionKey + ") id=" + rec.id);
+  return rec;
+}
+
+/* ── Folder editor modal (asset-folders sprint) ─────────────────── */
+/* Edits a single AssetFolder record. Opens via _folderOpen(id);
+ * everything writes back to the in-memory map immediately and Persists
+ * via Assets.put on field changes. No explicit Save button — every
+ * input edit is autosaved. */
+
+function _folderOpen(folderId) {
+  const modal = document.getElementById("folder-modal");
+  if (!modal) return;
+  modal._folderId = folderId;
+  modal.style.display = "flex";
+  _folderRender();
+}
+function _folderClose() {
+  const modal = document.getElementById("folder-modal");
+  if (!modal) return;
+  modal.style.display = "none";
+  modal._folderId = null;
+  // Re-render the Assets tab so the card sub-line (filled/total slots)
+  // reflects the latest assignments.
+  if (typeof brRenderAssets === "function") brRenderAssets();
+}
+function _folderStatus(msg, kind) {
+  const el = document.getElementById("folder-status");
+  if (!el) return;
+  el.textContent = msg || "";
+  el.style.color = kind === "err" ? "#ff8060"
+                 : kind === "ok"  ? "#80ff80"
+                 : kind === "thinking" ? "var(--phosphor)"
+                 : "var(--text-3)";
+}
+function _folderAutoStatus(msg, kind) {
+  const el = document.getElementById("folder-autosort-status");
+  if (!el) return;
+  el.textContent = msg || "";
+  el.style.color = kind === "err" ? "#ff8060"
+                 : kind === "ok"  ? "#80ff80"
+                 : kind === "thinking" ? "var(--phosphor)"
+                 : "var(--text-3)";
+}
+
+function _folderRender() {
+  const modal = document.getElementById("folder-modal");
+  if (!modal || !modal._folderId) return;
+  const rec = Assets.get(modal._folderId);
+  if (!rec) { _folderStatus("folder not found", "err"); return; }
+  const fdef = _ASSET_FUNCTIONS[rec.functionKey] || _ASSET_FUNCTIONS["decoration"];
+
+  // Name
+  const nameEl = document.getElementById("folder-name");
+  if (nameEl && document.activeElement !== nameEl) nameEl.value = rec.name;
+
+  // Function dropdown (populate options once; preserve selection across renders).
+  const funcEl = document.getElementById("folder-function");
+  if (funcEl && funcEl.options.length === 0) {
+    funcEl.innerHTML = Object.keys(_ASSET_FUNCTIONS).map(k =>
+      `<option value="${escapeAttr(k)}">${escapeText(_ASSET_FUNCTIONS[k].label)}</option>`
+    ).join("");
+  }
+  if (funcEl) funcEl.value = rec.functionKey;
+  const descEl = document.getElementById("folder-func-desc");
+  if (descEl) descEl.textContent = fdef.description;
+
+  // Slot rows
+  const slotsEl = document.getElementById("folder-slots");
+  if (!slotsEl) return;
+  slotsEl.innerHTML = fdef.slots.map(slot => {
+    const sid = (rec.slots || {})[slot.name];
+    const srec = sid ? _spriteAssets.get(sid) : null;
+    let preview;
+    if (srec && srec.blob) {
+      let url = srec._thumbUrl;
+      if (!url) { try { url = URL.createObjectURL(srec.blob); srec._thumbUrl = url; } catch (_) {} }
+      preview = `<img src="${escapeAttr(url)}" style="max-width:42px; max-height:42px; image-rendering:pixelated; image-rendering:crisp-edges;"/>`;
+    } else if (sid && !srec) {
+      preview = `<span style="color:#ff8060; font-size:9.5px;">(deleted)</span>`;
+    } else {
+      preview = `<span style="color:var(--text-3); font-size:18px; opacity:0.4;">+</span>`;
+    }
+    return `
+      <div class="folder-slot-row" data-slot="${escapeAttr(slot.name)}" style="display:flex; gap:10px; align-items:center; padding:6px 8px; background:var(--bg-1); border:1px solid var(--instr-rule); border-radius:3px;">
+        <div class="folder-slot-drop" style="width:50px; height:50px; flex-shrink:0; background:#0a0c10; border:1px dashed rgba(255,255,255,0.15); border-radius:2px; display:flex; align-items:center; justify-content:center;">${preview}</div>
+        <div style="flex:1; min-width:0;">
+          <div style="font-family:var(--font-mono); font-size:10.5px; color:var(--text-1); font-weight:600; display:flex; align-items:center; gap:6px;">
+            ${escapeText(slot.name)}
+            ${slot.optional ? '<span style="font-weight:400; font-size:8.5px; color:var(--text-3); letter-spacing:0.05em;">OPTIONAL</span>' : ""}
+          </div>
+          <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); line-height:1.4; margin-top:1px;">${escapeText(slot.desc)}</div>
+          ${srec ? `<div style="font-family:var(--font-mono); font-size:9px; color:#80ff80; margin-top:2px;">→ ${escapeText(srec.name)}</div>` : ""}
+        </div>
+        ${sid ? `<button class="folder-slot-clear" data-slot="${escapeAttr(slot.name)}" title="Unassign this slot" style="padding:2px 6px; background:var(--bg-1); color:var(--text-3); border:1px solid var(--text-3); border-radius:2px; cursor:pointer; font-family:var(--font-mono); font-size:9.5px;">clear</button>` : ""}
+      </div>
+    `;
+  }).join("");
+
+  // Wire drop targets on slot rows. Accept text/x-gamma-asset-id with
+  // type=sprite; refuse anything else.
+  slotsEl.querySelectorAll(".folder-slot-row").forEach(row => {
+    const slotName = row.dataset.slot;
+    row.addEventListener("dragover", e => {
+      const types = e.dataTransfer && e.dataTransfer.types;
+      if (!types || !types.indexOf) return;
+      if (types.indexOf("text/x-gamma-asset-id") < 0) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "copy";
+      row.style.borderColor = "var(--phosphor)";
+    });
+    row.addEventListener("dragleave", () => { row.style.borderColor = "var(--instr-rule)"; });
+    row.addEventListener("drop", async e => {
+      row.style.borderColor = "var(--instr-rule)";
+      const id = e.dataTransfer.getData("text/x-gamma-asset-id");
+      const type = e.dataTransfer.getData("text/x-gamma-asset-type");
+      if (!id || (type && type !== "sprite")) return;
+      e.preventDefault();
+      const fid = modal._folderId;
+      const folder = Assets.get(fid);
+      if (!folder) return;
+      folder.slots[slotName] = id;
+      await Assets.put(folder);
+      _folderRender();
+    });
+  });
+  slotsEl.querySelectorAll(".folder-slot-clear").forEach(btn => {
+    btn.addEventListener("click", async e => {
+      e.stopPropagation();
+      const fid = modal._folderId;
+      const folder = Assets.get(fid);
+      if (!folder) return;
+      folder.slots[btn.dataset.slot] = null;
+      await Assets.put(folder);
+      _folderRender();
+    });
+  });
+}
+
+/* LLM-driven slot assignment. Sends sprite names + slot descriptions
+ * to the configured provider; parses JSON response of the form
+ *   {slotName: spriteName, ...}
+ * and applies. Only assigns slots that are currently empty (preserves
+ * the user's manual picks); set the FOLDER_AUTOSORT_OVERWRITE flag
+ * if/when we want a "Re-sort everything" affordance. */
+async function _folderAutoSort() {
+  const modal = document.getElementById("folder-modal");
+  if (!modal || !modal._folderId) return;
+  const rec = Assets.get(modal._folderId);
+  if (!rec) return;
+  const fdef = _ASSET_FUNCTIONS[rec.functionKey] || _ASSET_FUNCTIONS["decoration"];
+  const sprites = Assets.list({ type: "sprite" });
+  if (sprites.length === 0) {
+    _folderAutoStatus("no sprites in the library to sort", "err");
+    return;
+  }
+  const provider = PROVIDERS[aiSettings.provider];
+  if (!provider) { _folderAutoStatus("no LLM provider (User DSP → ⚙)", "err"); return; }
+  let key = "";
+  if (provider.requiresKey) {
+    key = aiSettings.anthropicKey;
+    if (!key) { _folderAutoStatus("API key required (User DSP → ⚙)", "err"); return; }
+  }
+
+  const slotLines = fdef.slots.map(s =>
+    "  " + s.name + (s.optional ? " (optional)" : "") + " — " + s.desc
+  ).join("\n");
+  const spriteNames = sprites.map(s => "  " + s.name).join("\n");
+
+  const system = [
+    "You are organizing pixel-art sprite assets for a 2D game.",
+    "Given a function and its slots, plus a list of available sprite names,",
+    "match each sprite to the slot it best fits. Slot names are fixed;",
+    "sprite names are user-provided. Match by name semantics (e.g. a sprite",
+    "called 'fox-idle' fits the 'idle' slot).",
+    "",
+    "OUTPUT RULES:",
+    "- Output ONLY a JSON object, no markdown fences, no comments.",
+    "- Keys are slot names from the provided list.",
+    "- Values are sprite names from the provided list.",
+    "- Omit slots that don't have a clear match. Don't invent slot names.",
+    "- Don't reuse the same sprite for multiple slots unless it genuinely fits both.",
+    "- Sprites that don't fit any slot are ignored."
+  ].join("\n");
+
+  const user = [
+    "Folder function: " + fdef.label,
+    "Function description: " + fdef.description,
+    "",
+    "Slots:",
+    slotLines,
+    "",
+    "Available sprites (by name):",
+    spriteNames,
+    "",
+    "Return the JSON object now:"
+  ].join("\n");
+
+  _folderAutoStatus("asking " + aiSettings.provider + "…", "thinking");
+  let reply;
+  try {
+    reply = await provider.call({ system, user, key, model: aiSettings.model,
+      temperature: 0.2, maxTokens: 1024 });
+  } catch (e) {
+    _folderAutoStatus("LLM call failed: " + (e.message || e), "err");
+    return;
+  }
+  // Extract JSON (strip markdown fences if Claude wrapped it).
+  let raw = reply.trim();
+  const fence = raw.match(/```(?:json)?\s*\n?([\s\S]*?)```/);
+  if (fence) raw = fence[1].trim();
+  let map;
+  try {
+    map = JSON.parse(raw);
+  } catch (e) {
+    _folderAutoStatus("LLM returned invalid JSON: " + e.message, "err");
+    console.warn("[folder-autosort] reply was:", reply);
+    return;
+  }
+  // Apply: for each entry, find a sprite by name (case-insensitive) and
+  // assign IF the slot is currently empty. Tracks how many were assigned.
+  let n = 0;
+  for (const [slotName, spriteName] of Object.entries(map)) {
+    if (!(slotName in rec.slots)) continue;            // unknown slot
+    if (rec.slots[slotName]) continue;                 // already filled (preserve manual)
+    const srec = Assets.findSpriteByName(spriteName);
+    if (!srec) continue;
+    rec.slots[slotName] = srec.id;
+    n++;
+  }
+  await Assets.put(rec);
+  _folderAutoStatus("assigned " + n + " slot" + (n === 1 ? "" : "s"), n > 0 ? "ok" : "err");
+  _folderRender();
+}
+
+function _folderInstallHandlers() {
+  const closeBtn = document.getElementById("folder-close");
+  if (closeBtn && !closeBtn._folderWired) {
+    closeBtn._folderWired = true;
+    closeBtn.addEventListener("click", _folderClose);
+  }
+  const modal = document.getElementById("folder-modal");
+  if (modal && !modal._folderWired) {
+    modal._folderWired = true;
+    modal.addEventListener("click", e => { if (e.target === modal) _folderClose(); });
+  }
+  const nameEl = document.getElementById("folder-name");
+  if (nameEl && !nameEl._folderWired) {
+    nameEl._folderWired = true;
+    let commitTimer = null;
+    nameEl.addEventListener("input", () => {
+      // Debounced commit so we're not writing IDB on every keystroke.
+      if (commitTimer) clearTimeout(commitTimer);
+      commitTimer = setTimeout(async () => {
+        const fid = document.getElementById("folder-modal")._folderId;
+        const rec = Assets.get(fid);
+        if (!rec) return;
+        const raw = nameEl.value.trim();
+        const clean = raw.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+        if (clean && clean !== rec.name) {
+          rec.name = clean;
+          await Assets.put(rec);
+        }
+      }, 250);
+    });
+  }
+  const funcEl = document.getElementById("folder-function");
+  if (funcEl && !funcEl._folderWired) {
+    funcEl._folderWired = true;
+    funcEl.addEventListener("change", async () => {
+      const fid = document.getElementById("folder-modal")._folderId;
+      const rec = Assets.get(fid);
+      if (!rec) return;
+      const newFunc = funcEl.value;
+      if (newFunc === rec.functionKey) return;
+      // Keep slot assignments that exist in BOTH old and new function;
+      // drop anything else. Preserves user effort when relabeling
+      // between similar functions (e.g. character ↔ enemy share 'idle').
+      const newDef = _ASSET_FUNCTIONS[newFunc] || _ASSET_FUNCTIONS["decoration"];
+      const newSlots = {};
+      for (const s of newDef.slots) {
+        newSlots[s.name] = (rec.slots && rec.slots[s.name]) || null;
+      }
+      rec.functionKey = newFunc;
+      rec.slots = newSlots;
+      await Assets.put(rec);
+      _folderRender();
+    });
+  }
+  const autoBtn = document.getElementById("folder-autosort");
+  if (autoBtn && !autoBtn._folderWired) {
+    autoBtn._folderWired = true;
+    autoBtn.addEventListener("click", _folderAutoSort);
+  }
+}
+if (typeof document !== "undefined") {
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", _folderInstallHandlers);
+  } else {
+    _folderInstallHandlers();
   }
 }
 
