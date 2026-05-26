@@ -32771,56 +32771,44 @@ async function _makeParallaxForestSprite() {
   ctx.clearRect(0, 0, W, H);
   let s = 0x9911;
   const rand = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 0xffffffff; };
-  // Background fill: very dark green band along the bottom (treeline floor).
-  ctx.fillStyle = "#1f3a26";
-  ctx.fillRect(0, H - 14, W, 14);
-  // Tree row: triangles spaced roughly evenly with jitter. Each tree
-  // = triangular body + small trunk. To tile seamlessly we wrap any
-  // trees crossing the right edge to the left.
-  const treeCount = 18;
+  // Sparser horizon-strip treeline. ONLY 6 short trees across 512px
+  // (was 18 ~tall ones), confined to the BOTTOM 30% of the texture
+  // so a thin layer (scaleY ~0.25) places them as a peek-above-the-
+  // horizon silhouette band rather than a wall of foliage that
+  // covers half the screen.
+  const baselineY = H - 4;          // trunk floor near bottom of texture
+  const treeCount = 6;
   const slot = W / treeCount;
-  for (let i = 0; i < treeCount; i++) {
-    const cx = (i + 0.5) * slot + (rand() - 0.5) * slot * 0.4;
-    const baseY = H - 12 - rand() * 4;
-    const height = 32 + rand() * 22;
-    const width  = 14 + rand() * 8;
-    const tipY = baseY - height;
+  function drawTreeAt(cx, baseY, height, width) {
     // Trunk
     ctx.fillStyle = "#3a2210";
-    ctx.fillRect(cx - 1.5, baseY, 3, 4);
-    // Tree triangle (dark green)
-    function drawTreeAt(centerX) {
-      ctx.fillStyle = "#2c5436";
-      ctx.beginPath();
-      ctx.moveTo(centerX - width * 0.5, baseY);
-      ctx.lineTo(centerX + width * 0.5, baseY);
-      ctx.lineTo(centerX,                tipY);
-      ctx.closePath();
-      ctx.fill();
-      // Subtle inner highlight
-      ctx.fillStyle = "#3a6845";
-      ctx.beginPath();
-      ctx.moveTo(centerX - width * 0.35, baseY - 2);
-      ctx.lineTo(centerX + width * 0.15, baseY - 2);
-      ctx.lineTo(centerX - width * 0.05, tipY + 4);
-      ctx.closePath();
-      ctx.fill();
-      // Tiny snow tip
-      if (rand() > 0.45) {
-        ctx.fillStyle = "#e8eef5";
-        ctx.beginPath();
-        ctx.moveTo(centerX - 2, tipY + 4);
-        ctx.lineTo(centerX + 2, tipY + 4);
-        ctx.lineTo(centerX,     tipY);
-        ctx.closePath();
-        ctx.fill();
-      }
-    }
-    drawTreeAt(cx);
-    // Tile-wrap: if tree spans the right edge, draw a mirror copy at
-    // cx - W on the left so the seam is invisible. (Same for left.)
-    if (cx + width * 0.5 > W) drawTreeAt(cx - W);
-    if (cx - width * 0.5 < 0) drawTreeAt(cx + W);
+    ctx.fillRect(cx - 1.5, baseY, 3, 3);
+    // Triangle body
+    ctx.fillStyle = "#2c5436";
+    ctx.beginPath();
+    ctx.moveTo(cx - width * 0.5, baseY);
+    ctx.lineTo(cx + width * 0.5, baseY);
+    ctx.lineTo(cx,                baseY - height);
+    ctx.closePath();
+    ctx.fill();
+    // Subtle inner highlight
+    ctx.fillStyle = "#3a6845";
+    ctx.beginPath();
+    ctx.moveTo(cx - width * 0.30, baseY - 2);
+    ctx.lineTo(cx + width * 0.12, baseY - 2);
+    ctx.lineTo(cx - width * 0.05, baseY - height + 4);
+    ctx.closePath();
+    ctx.fill();
+  }
+  for (let i = 0; i < treeCount; i++) {
+    const cx = (i + 0.5) * slot + (rand() - 0.5) * slot * 0.3;
+    const baseY = baselineY - rand() * 2;
+    const height = 18 + rand() * 8;   // 18-26 (was 32-54)
+    const width  = 12 + rand() * 4;   // 12-16 (was 14-22)
+    drawTreeAt(cx, baseY, height, width);
+    // Tile-wrap for seamless horizontal cycling.
+    if (cx + width * 0.5 > W) drawTreeAt(cx - W, baseY, height, width);
+    if (cx - width * 0.5 < 0) drawTreeAt(cx + W, baseY, height, width);
   }
   return await c.convertToBlob({ type: "image/png" });
 }
@@ -32829,6 +32817,9 @@ async function _makeParallaxForestSprite() {
  * forest) all in one 'parallax-background' folder so they ship as
  * a related set. Functions identically to the hero / egg / flag
  * bootstraps: idempotent, runs on DOMContentLoaded. */
+// Bump on any meaningful parallax-bg art change so users on the
+// previous version get the new sprites instead of stale IDB blobs.
+const PARALLAX_BG_VERSION = 2;
 async function _ensureParallaxBgAssets() {
   if (typeof Assets === "undefined" || typeof Assets.findSpriteByName !== "function") return null;
   try {
@@ -32841,6 +32832,17 @@ async function _ensureParallaxBgAssets() {
     let createdAny = false;
     for (const layer of layers) {
       let sprite = Assets.findSpriteByName(layer.name);
+      // Stale-art replacement: if the existing record was created by
+      // an older version of this bootstrap, delete it so the new
+      // generator output gets saved this run.
+      if (sprite && (sprite.parallaxBgVersion || 0) < PARALLAX_BG_VERSION) {
+        console.log("[default-assets] replacing stale " + layer.name +
+          " (v" + (sprite.parallaxBgVersion || 0) + " -> v" + PARALLAX_BG_VERSION + ")");
+        try { await Assets.delete(sprite.id); } catch (e) {
+          console.warn("[default-assets] delete failed:", e);
+        }
+        sprite = null;
+      }
       if (!sprite) {
         const blob = await layer.generator();
         const file = new File([blob], layer.name + ".png", { type: "image/png" });
@@ -32850,8 +32852,13 @@ async function _ensureParallaxBgAssets() {
           fps: 1, scale: 32,
           source: "default:parallax-bg"
         });
-        if (sprite && sprite.blob) {
-          console.log("[default-assets] " + layer.name + " sprite saved (" + sprite.blob.size + " bytes)");
+        if (sprite) {
+          sprite.parallaxBgVersion = PARALLAX_BG_VERSION;
+          try { await Assets.put(sprite); } catch (e) { console.warn("[default-assets] version-tag put failed:", e); }
+          if (sprite.blob) {
+            console.log("[default-assets] " + layer.name + " v" + PARALLAX_BG_VERSION +
+              " sprite saved (" + sprite.blob.size + " bytes)");
+          }
         }
         createdAny = true;
       }
@@ -37830,14 +37837,13 @@ const _demos = [
       const mtnLayer = makeNode("ParallaxLayer2D", 280, 720, {
         parallaxX: 0.12,          // slow distant drift
         texWorldWidth: 36,
-        // Anchor mountains so their silhouette bases sit at the
-        // horizon (top of ground row 11, world y ≈ -3.5). With
-        // orthoSize=6 and camera posY=-1 the screen spans y=[-7,+5].
-        // anchorY=0.47 places the quad center at y=-1.36, halfH=4.2,
-        // bottom at y=-5.56 -- mountain silhouettes (bottom 25% of
-        // texture) land roughly on the horizon line.
+        // Mountains: silhouette bases at the horizon (ground top
+        // y ≈ -3.5). Texture has mountain BASES at pixel y≈96 (out
+        // of 128). With scaleY=0.7 (halfH=4.2) and anchorY=0.42,
+        // quad center=-1.96, top=+2.24, bottom=-6.16. Base maps to
+        // y = 2.24 - (96/128)*8.4 = -4.06 -- close to horizon.
         screenScaleY: 0.7,
-        screenAnchorY: 0.47,
+        screenAnchorY: 0.42,
         worldOffsetY: 0,
         tintR: 1, tintG: 1, tintB: 1, tintA: 1
       });
@@ -37855,14 +37861,14 @@ const _demos = [
       const fstLayer = makeNode("ParallaxLayer2D", 280, 860, {
         parallaxX: 0.35,          // moderate midground drift
         texWorldWidth: 28,
-        // Anchor forest so tree TIPS rise above the ground line.
-        // Trees in the texture have their tips around pixel y=68
-        // (out of 128). With anchorY=0.45 the quad center sits at
-        // y=-1.6, halfH=3.3, top at y=+1.7. Tree tips land near
-        // y=-1.0 -- well above the horizon at y=-3.5 -- so the
-        // treeline reads as "in front of distant terrain".
-        screenScaleY: 0.55,
-        screenAnchorY: 0.45,
+        // Forest v2 texture: 6 small trees clustered in the bottom
+        // 20% of the 128-px-tall texture. Thin layer (scaleY=0.32)
+        // so the tree band reads as a horizon silhouette peeking
+        // above the ground, not a wall of foliage. anchorY=0.38
+        // places the quad bottom near y=-5 and tree TIPS just
+        // above the horizon at y≈-2.5.
+        screenScaleY: 0.32,
+        screenAnchorY: 0.38,
         worldOffsetY: 0,
         tintR: 1, tintG: 1, tintB: 1, tintA: 1
       });
