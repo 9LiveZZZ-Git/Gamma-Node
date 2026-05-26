@@ -10769,6 +10769,70 @@ public:
     description: "2D platformer character body. Takes inputX (-1..1, e.g. KeyAxis2D.x) + jump (one-frame edge, e.g. KeyAxis2D.jump) + tuning params (walkSpeed m/s, gravity m/s², jumpForce m/s impulse, airControl 0..1 multiplier when not grounded), runs the standard platformer integration each frame, outputs the resulting (x, y, vx, vy) + grounded flag + facing direction (-1 = left, 1 = right). Wire x/y into a Translate driving the player Sprite. width/height define the player AABB (anchored bottom-center: y is the FEET line). When a Tilemap2D is wired into `tilemap` (or auto-discovered as the first Tilemap2D in the patch), the body collides AABB-vs-tiles per axis: walks into walls, lands on platform tops, bonks ceilings. groundY is a safety floor for when the player walks off the tilemap (default -100, set to your level's actual floor for tighter behavior)."
   },
 
+  /* Sprint AnimationState2D -- universal sprite state machine. Reads
+   * velocity + grounded + facing signals (typically from a
+   * PlatformerBody2D, but anything that writes numeric vx/vy/grounded
+   * works), derives a state name (idle / walk / jump / fall), advances
+   * a per-state frame loop at configurable fps, outputs a frame index
+   * suitable for wiring straight into Sprite.frame.
+   *
+   * Frame ranges are declared as comma + range strings per state slot:
+   *   "0"          → single frame
+   *   "0,1,2"      → loop those three
+   *   "0-3"        → 0,1,2,3 (range expansion)
+   *   "0,1,2,3,2,1" → ping-pong by listing both directions
+   * Out-of-range frames (past framesX*framesY-1) are clamped at the
+   * Sprite shader so a misconfigured cycle never crashes -- you'll
+   * just see the last valid frame stuck on.
+   *
+   * Character-agnostic by design: the same node drives players,
+   * enemies, NPCs, projectiles -- anything with a sprite sheet that
+   * needs state-driven frame playback. "Fox-wire" was just the first
+   * use site; nothing in this node knows about foxes. */
+  AnimationState2D: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "game-anim",
+    ins: [
+      { n: "vx",            t: "param" },
+      { n: "vy",            t: "param" },
+      { n: "grounded",      t: "param" },
+      { n: "facing",        t: "param" },
+      { n: "fps",           t: "param" },
+      { n: "walkThreshold", t: "param" },
+      { n: "idleFrames",    t: "param" },
+      { n: "walkFrames",    t: "param" },
+      { n: "jumpFrames",    t: "param" },
+      { n: "fallFrames",    t: "param" }
+    ],
+    outs: [
+      { n: "frame",    t: "param" },
+      { n: "flipX",    t: "param" },
+      { n: "stateIdx", t: "param" }
+    ],
+    params: {
+      vx: 0, vy: 0, grounded: 1, facing: 1,
+      fps: 8,
+      // Magnitude of vx above which idle → walk. 0.1 m/s catches
+      // analog-stick deadzone overflow + integer rounding noise
+      // without false-triggering on a stationary character.
+      walkThreshold: 0.1,
+      // Default ranges assume a 4-frame walk sheet laid out
+      // [idle, walk-a, walk-b, jump] in row-major order. Tweak
+      // per-character; framesX/framesY come from the Sprite.
+      idleFrames: "0",
+      walkFrames: "1,2,1,3",
+      jumpFrames: "4",
+      fallFrames: "5",
+      // Outputs + internal state. Written by tick.
+      frame: 0, flipX: 0, stateIdx: 0,
+      _animTime: 0, _lastState: ""
+    },
+    methods: {},
+    uiOnlyParams: ["vx", "vy", "grounded", "facing", "frame", "flipX", "stateIdx", "_animTime", "_lastState"],
+    description: "Universal sprite-sheet state machine. Reads vx/vy/grounded/facing (typically from PlatformerBody2D's outputs) and picks a state: !grounded + vy>0 → jump, !grounded + vy≤0 → fall, |vx|>walkThreshold → walk, else idle. Each state has a frame-range param (e.g. \"0\", \"0,1,2,3,2,1\", \"0-5\"); the node advances through the active cycle at `fps` and emits the current frame index, ready to wire into Sprite.frame. `flipX` is derived from `facing` (-1 → 1, +1 → 0), assuming sprites face right by default. `stateIdx` (0=idle, 1=walk, 2=jump, 3=fall) is exposed for downstream wiring (e.g. trigger different audio per state). State changes restart the cycle at frame 0 so transitions look snappy."
+  },
+
   /* Sprint platformer-1 -- Tilemap2D. Grid-based mesh primitive.
    * tileData is a multi-line string where each character is a cell
    * (space / '.' = empty; any other char = solid tile colored by
@@ -49325,7 +49389,7 @@ function _tickGameInputs(dt) {
   if (!state || !Array.isArray(state.nodes)) return;
   let needAny = false;
   for (const n of state.nodes) {
-    if (n && (n.type === "KeyAxis2D" || n.type === "PlatformerBody2D")) {
+    if (n && (n.type === "KeyAxis2D" || n.type === "PlatformerBody2D" || n.type === "AnimationState2D")) {
       needAny = true; break;
     }
   }
@@ -49537,10 +49601,78 @@ function _tickGameInputs(dt) {
     if (inputX > 0.1)      p.facing = 1;
     else if (inputX < -0.1) p.facing = -1;
   }
+  // Pass 3: AnimationState2D. Reads vx/vy/grounded/facing (wired or
+  // static), derives state, advances frame loop, writes frame/flipX/
+  // stateIdx. Runs after PlatformerBody2D so it sees this frame's
+  // physics outputs, not last frame's.
+  for (const node of state.nodes) {
+    if (!node || node.type !== "AnimationState2D") continue;
+    const p = node.params = node.params || {};
+    const vx       = _resolveNumIn(node, "vx",       0);
+    const vy       = _resolveNumIn(node, "vy",       0);
+    const grounded = _resolveNumIn(node, "grounded", 1);
+    const facing   = _resolveNumIn(node, "facing",   1);
+    const fps      = Math.max(0.5, _resolveNumIn(node, "fps", 8));
+    const wThresh  = _resolveNumIn(node, "walkThreshold", 0.1);
+    // Pick state.
+    let stateName, stateIdx;
+    if (grounded < 0.5) {
+      if (vy > 0.1) { stateName = "jump"; stateIdx = 2; }
+      else          { stateName = "fall"; stateIdx = 3; }
+    } else if (Math.abs(vx) > wThresh) {
+      stateName = "walk"; stateIdx = 1;
+    } else {
+      stateName = "idle"; stateIdx = 0;
+    }
+    // Restart cycle on state transition so a freshly-entered state
+    // always shows frame 0 of its loop, not a stale mid-cycle frame.
+    if (p._lastState !== stateName) {
+      p._animTime = 0;
+      p._lastState = stateName;
+    } else {
+      p._animTime = (p._animTime || 0) + dt;
+    }
+    // Look up the active state's frame spec + parse.
+    const specKey = stateName + "Frames";
+    const spec    = (typeof p[specKey] === "string") ? p[specKey] : "0";
+    const frames  = _parseFrameSpec(spec);
+    const idx     = Math.floor(p._animTime * fps) % frames.length;
+    p.frame    = frames[idx] | 0;
+    p.flipX    = facing < 0 ? 1 : 0;
+    p.stateIdx = stateIdx;
+  }
   // Clear edge sets so the next frame starts fresh. Done at the END
   // so multiple consumers within this frame all see the same edges.
   gi.pressed.clear();
   gi.released.clear();
+}
+
+/* Parse a frame-range spec used by AnimationState2D.
+ *   "5"            → [5]
+ *   "0,1,2"        → [0, 1, 2]
+ *   "0-3"          → [0, 1, 2, 3]      (range)
+ *   "0,1,2,3,2,1"  → ping-pong sequence
+ * Negative / NaN segments are skipped; empty input → [0]. */
+function _parseFrameSpec(s) {
+  if (!s || typeof s !== "string") return [0];
+  const out = [];
+  for (const part of s.split(",")) {
+    const seg = part.trim();
+    if (!seg) continue;
+    const range = seg.match(/^(\d+)\s*-\s*(\d+)$/);
+    if (range) {
+      const a = parseInt(range[1], 10);
+      const b = parseInt(range[2], 10);
+      if (Number.isFinite(a) && Number.isFinite(b)) {
+        const step = a <= b ? 1 : -1;
+        for (let i = a; step > 0 ? i <= b : i >= b; i += step) out.push(i);
+      }
+    } else {
+      const n = parseInt(seg, 10);
+      if (Number.isFinite(n) && n >= 0) out.push(n);
+    }
+  }
+  return out.length ? out : [0];
 }
 
 function _tickFPCameras(dt) {
@@ -75368,7 +75500,9 @@ function _readWireJsSideValue(wire) {
   // numeric params on the source node (written by _tickGameInputs each
   // frame). Read them directly so downstream Translate / OrthoCamera2D
   // / etc. can wire to KeyAxis2D.x, PlatformerBody2D.x, etc.
-  if (src.type === "KeyAxis2D" || src.type === "PlatformerBody2D") {
+  // Sprint AnimationState2D extends the same pattern -- frame/flipX/
+  // stateIdx are tick-written params that Sprite reads via wires.
+  if (src.type === "KeyAxis2D" || src.type === "PlatformerBody2D" || src.type === "AnimationState2D") {
     const v = src.params && src.params[wire.from.port];
     return typeof v === "number" ? v : null;
   }
