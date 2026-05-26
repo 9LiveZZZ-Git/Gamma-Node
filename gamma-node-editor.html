@@ -32226,6 +32226,138 @@ function brSwitchTab(name) {
  * normal patch construction. The thumbnails are inline SVG glyphs
  * sized to match the asset-card .asset-thumb dimensions. Add more
  * demos here as Phase 6.5.5+ ships canonical examples. */
+
+/* Programmatic sprite-sheet generator for the animated platformer
+ * demo. 6 frames at 32×32, laid out horizontally (sheet 192×32):
+ *   [0] idle    [1] walk-A    [2] walk-mid    [3] walk-B    [4] jump    [5] fall
+ * Matches the AnimationState2D node's default frame specs
+ *   idleFrames:"0", walkFrames:"1,2,1,3", jumpFrames:"4", fallFrames:"5"
+ * so a fresh AnimationState2D wires up against this sheet with no
+ * tweaking. Cheap-and-cheerful "orange blob with eyes" -- a stand-in
+ * for whatever character the user generates via SpriteCreator later.
+ */
+async function _makePlaceholderHeroSheet() {
+  const FW = 32, FH = 32, NF = 6;
+  const W = FW * NF, H = FH;
+  const c = new OffscreenCanvas(W, H);
+  const ctx = c.getContext("2d");
+  ctx.imageSmoothingEnabled = false;
+  ctx.clearRect(0, 0, W, H);
+  // Palette -- low-saturation pixel-art friendly.
+  const C_BODY    = "#e85a3a";
+  const C_DARK    = "#a83a20";
+  const C_OUT     = "#3a1a10";
+  const C_EYE     = "#ffffff";
+  const C_PUPIL   = "#101010";
+  const C_FOOT    = "#5a2a1a";
+  function px(x, y, w, h, color) {
+    ctx.fillStyle = color;
+    ctx.fillRect(x | 0, y | 0, w | 0, h | 0);
+  }
+  function drawHero(ox, p) {
+    const bx = ox + 8;
+    const by = 8 + (p.bobY || 0);
+    const bw = 16, bh = 16;
+    // Body fill
+    px(bx + 1, by + 1, bw - 2, bh - 2, C_BODY);
+    // Outline
+    px(bx, by + 1, 1, bh - 2, C_OUT);
+    px(bx + bw - 1, by + 1, 1, bh - 2, C_OUT);
+    px(bx + 1, by, bw - 2, 1, C_OUT);
+    px(bx + 1, by + bh - 1, bw - 2, 1, C_OUT);
+    // Shading (lower-right)
+    px(bx + bw - 3, by + 3, 1, bh - 5, C_DARK);
+    px(bx + 3, by + bh - 3, bw - 5, 1, C_DARK);
+    // Eyes
+    const eyeY = by + 4;
+    const eyeL = bx + 3, eyeR = bx + 10;
+    px(eyeL, eyeY, 3, 3, C_EYE);
+    px(eyeR, eyeY, 3, 3, C_EYE);
+    const pdx = (p.lookRight ? 2 : (p.lookLeft ? 0 : 1));
+    const pdy = (p.lookUp ? 0 : (p.lookDown ? 2 : 1));
+    px(eyeL + pdx, eyeY + pdy, 1, 1, C_PUPIL);
+    px(eyeR + pdx, eyeY + pdy, 1, 1, C_PUPIL);
+    // Mouth (subtle dark notch)
+    px(bx + 7, by + 10, 2, 1, C_OUT);
+    // Feet -- two small rects below body
+    const fyBase = by + bh;
+    const lf = p.leftFoot  || { dx: -2, dy: 0 };
+    const rf = p.rightFoot || { dx: 1,  dy: 0 };
+    px(bx + 2 + lf.dx, fyBase + lf.dy, 4, 2, C_FOOT);
+    px(bx + bw - 6 + rf.dx, fyBase + rf.dy, 4, 2, C_FOOT);
+  }
+  // Frame 0 -- idle (neutral stance, looking forward)
+  drawHero(0 * FW, { leftFoot: { dx: -2, dy: 0 }, rightFoot: { dx: 1, dy: 0 } });
+  // Frame 1 -- walk pose A (right foot forward, lifted)
+  drawHero(1 * FW, { leftFoot: { dx: -3, dy: 0 }, rightFoot: { dx: 2, dy: -1 }, lookRight: true });
+  // Frame 2 -- walk pose mid (both feet close, body up a hair)
+  drawHero(2 * FW, { bobY: -1, leftFoot: { dx: -1, dy: 0 }, rightFoot: { dx: 0, dy: 0 } });
+  // Frame 3 -- walk pose B (left foot forward, lifted)
+  drawHero(3 * FW, { leftFoot: { dx: -1, dy: -1 }, rightFoot: { dx: 0, dy: 0 }, lookRight: true });
+  // Frame 4 -- jump (body raised, feet tucked, eyes up)
+  drawHero(4 * FW, { bobY: -3, leftFoot: { dx: -1, dy: -2 }, rightFoot: { dx: 0, dy: -2 }, lookUp: true });
+  // Frame 5 -- fall (body lowered, feet down, eyes down)
+  drawHero(5 * FW, { bobY: 1,  leftFoot: { dx: -2, dy: 1 },  rightFoot: { dx: 1, dy: 1 },  lookDown: true });
+  return await c.convertToBlob({ type: "image/png" });
+}
+
+/* Idempotent. If a sprite named 'hero-placeholder' already exists in
+ * the asset library, this is a no-op. Otherwise it generates the
+ * placeholder sheet, registers it as a 6-frame sprite, and creates
+ * a 'hero-placeholder-folder' (playable-character function) with the
+ * sprite assigned to the idle / walk / jump-up / fall slots so the
+ * user can drag the folder onto a Scene2D to spawn a wired character. */
+async function _ensureHeroPlaceholderAsset() {
+  // Skip if Assets isn't ready yet (very early bootstrap).
+  if (typeof Assets === "undefined" || typeof Assets.findSpriteByName !== "function") return null;
+  try {
+    let sprite = Assets.findSpriteByName("hero-placeholder");
+    let createdSprite = false;
+    if (!sprite) {
+      const blob = await _makePlaceholderHeroSheet();
+      const file = new File([blob], "hero-placeholder.png", { type: "image/png" });
+      sprite = await loadImageFileToSpriteAsset(file, {
+        name: "hero-placeholder",
+        framesX: 6, framesY: 1,
+        fps: 8, scale: 32,
+        source: "default:platformer"
+      });
+      createdSprite = true;
+      if (sprite && sprite.blob) {
+        console.log("[default-assets] hero-placeholder sprite saved ("
+          + sprite.blob.size + " bytes PNG, 6 frames @ 32×32)");
+      }
+    }
+    if (!sprite) return null;
+    // Folder is keyed by name independently of the sprite -- if the
+    // user nuked the folder but kept the sprite, recreate the folder.
+    let folder = Assets.findFolderByName("hero-placeholder-folder");
+    if (!folder) {
+      folder = await createFolderAsset("hero-placeholder-folder", "playable-character", {
+        slots: {
+          idle:        sprite.id,
+          walk:        sprite.id,
+          "jump-up":   sprite.id,
+          fall:        sprite.id
+        },
+        notes: "Default placeholder bundled with the editor. 6-frame sprite-sheet (idle / walk-A / walk-mid / walk-B / jump / fall) auto-generated on first launch. Replace via SpriteCreator when you've generated a real character — the demo will pick up the new sprite as long as you rename it 'hero-placeholder' or wire ImageURL to your asset name.",
+        source: "default:platformer"
+      });
+    }
+    if (createdSprite || folder) {
+      // Refresh the Assets tab if it's currently rendered so the new
+      // entries show up without requiring a tab-switch.
+      if (typeof brRenderAssets === "function") {
+        try { brRenderAssets(); } catch (_) {}
+      }
+    }
+    return sprite;
+  } catch (e) {
+    console.warn("[default-assets] hero placeholder bootstrap failed:", e);
+    return null;
+  }
+}
+
 const _demos = [
   {
     id: "audio-basic",
@@ -36768,6 +36900,150 @@ const _demos = [
       state.edges.push({ from: { node: playerT,  port: "mesh"   }, to: { node: scene, port: "mesh2"  } });
       state.edges.push({ from: { node: cam,      port: "camera" }, to: { node: scene, port: "camera" } });
       const vo = makeNode("VisualOutput", 900, 200, { display: 0 });
+      state.edges.push({ from: { node: scene, port: "out" }, to: { node: vo, port: "in" } });
+    }
+  },
+
+  /* Sprint sheet-batch + AnimationState2D -- Platformer 2D w/ Sprite
+   * animation. Same level + physics as platformer-2d, plus:
+   *   ImageURL          -- loads the hero-placeholder sprite asset
+   *   AnimationState2D  -- reads body's vx/vy/grounded/facing, drives frame
+   *   Sprite            -- now textured, 6-frame sheet, flipX-aware
+   * The placeholder sprite + folder are auto-created on first load via
+   * _ensureHeroPlaceholderAsset (idempotent). To swap in a real
+   * character: open Assets tab, replace the 'hero-placeholder' sprite
+   * with one from SpriteCreator, or change the ImageURL.url to
+   * 'asset:<your-sprite-name>'. */
+  {
+    id: "platformer-2d-animated",
+    name: "Platformer 2D · Animated",
+    sub: "WASD + Space · animated sprite · folder-grouped",
+    type: "visual",
+    thumb: `<svg viewBox="0 0 100 44">
+      <rect width="100" height="44" fill="rgba(28,40,68,0.85)"/>
+      <g fill="rgba(85,140,90,0.95)">
+        <rect x="0"  y="30" width="40" height="6"/>
+        <rect x="48" y="30" width="20" height="6"/>
+        <rect x="76" y="22" width="24" height="6"/>
+        <rect x="30" y="22" width="10" height="4"/>
+      </g>
+      <g fill="rgba(105,68,42,0.95)">
+        <rect x="0"  y="36" width="100" height="8"/>
+      </g>
+      <g fill="rgba(232,90,58,1)">
+        <rect x="20" y="22" width="6" height="6"/>
+        <rect x="20" y="28" width="2" height="2"/>
+        <rect x="24" y="28" width="2" height="2"/>
+      </g>
+      <g fill="rgba(255,255,255,1)">
+        <rect x="21" y="23" width="1" height="1"/>
+        <rect x="24" y="23" width="1" height="1"/>
+      </g>
+    </svg>`,
+    build: () => {
+      // Kick off the placeholder-sprite + folder bootstrap. This runs
+      // async; the ImageURL below will start with an unresolved asset
+      // and pick up the blob the moment _ensureHeroPlaceholderAsset
+      // finishes saving (typically within ~50ms of demo load).
+      _ensureHeroPlaceholderAsset();
+
+      // ─── Input ────────────────────────────────────────────────
+      const keys = makeNode("KeyAxis2D", 40, 60, {
+        keyLeft: "KeyA", keyRight: "KeyD",
+        keyJump: "Space"
+      });
+
+      // ─── Physics body ─────────────────────────────────────────
+      const body = makeNode("PlatformerBody2D", 280, 60, {
+        walkSpeed: 6,
+        gravity:   22,
+        jumpForce: 11,
+        airControl: 0.85,
+        width: 0.5, height: 0.9,
+        groundY:   -10,
+        initX: -4, initY: 0
+      });
+      state.edges.push({ from: { node: keys, port: "x"    }, to: { node: body, port: "inputX" } });
+      state.edges.push({ from: { node: keys, port: "jump" }, to: { node: body, port: "jump"   } });
+
+      // ─── Level (tilemap) ──────────────────────────────────────
+      const level = makeNode("Tilemap2D", 40, 280, {
+        tileData:
+          "................................\n" +
+          "................................\n" +
+          "................................\n" +
+          "................3333............\n" +
+          "..........4.....................\n" +
+          ".....33333......................\n" +
+          "................................\n" +
+          "11111111111111111111111111111111\n" +
+          "22222222222222222222222222222222",
+        tileSize: 1,
+        originX: 0, originY: 0,
+        color1R: 0.30, color1G: 0.62, color1B: 0.38,
+        color2R: 0.42, color2G: 0.28, color2B: 0.18,
+        color3R: 0.62, color3G: 0.62, color3B: 0.72,
+        color4R: 0.95, color4G: 0.82, color4B: 0.30
+      });
+      state.edges.push({ from: { node: level, port: "mesh" }, to: { node: body, port: "tilemap" } });
+
+      // ─── Animation state machine ──────────────────────────────
+      // Defaults match the placeholder sheet's frame layout, so no
+      // per-state frame string tweaks needed for the demo.
+      const anim = makeNode("AnimationState2D", 520, 60, {
+        fps: 10,
+        walkThreshold: 0.2,
+        idleFrames: "0",
+        walkFrames: "1,2,3,2",
+        jumpFrames: "4",
+        fallFrames: "5"
+      });
+      state.edges.push({ from: { node: body, port: "vx"       }, to: { node: anim, port: "vx"       } });
+      state.edges.push({ from: { node: body, port: "vy"       }, to: { node: anim, port: "vy"       } });
+      state.edges.push({ from: { node: body, port: "grounded" }, to: { node: anim, port: "grounded" } });
+      state.edges.push({ from: { node: body, port: "facing"   }, to: { node: anim, port: "facing"   } });
+
+      // ─── Texture (placeholder sprite sheet) ───────────────────
+      const tex = makeNode("ImageURL", 40, 460, {
+        url: "asset:hero-placeholder",
+        filterMode: "nearest",
+        scale: 32
+      });
+
+      // ─── Player sprite ────────────────────────────────────────
+      const player = makeNode("Sprite", 280, 280, {
+        width: 0.6, height: 0.9,
+        anchorX: 0.5, anchorY: 0,
+        framesX: 6, framesY: 1,
+        // Tint stays neutral (1,1,1,1) so the sheet's own colors show.
+        tintR: 1, tintG: 1, tintB: 1, tintA: 1
+      });
+      state.edges.push({ from: { node: tex,  port: "texture" }, to: { node: player, port: "texture" } });
+      state.edges.push({ from: { node: anim, port: "frame"   }, to: { node: player, port: "frame"   } });
+      state.edges.push({ from: { node: anim, port: "flipX"   }, to: { node: player, port: "flipX"   } });
+
+      // ─── Translate player to body position ────────────────────
+      const playerT = makeNode("Translate", 760, 280, { x: 0, y: 0, z: -1 });
+      state.edges.push({ from: { node: player, port: "mesh" }, to: { node: playerT, port: "mesh" } });
+      state.edges.push({ from: { node: body,   port: "x"    }, to: { node: playerT, port: "x"    } });
+      state.edges.push({ from: { node: body,   port: "y"    }, to: { node: playerT, port: "y"    } });
+
+      // ─── Camera ───────────────────────────────────────────────
+      const cam = makeNode("OrthoCamera2D", 760, 60, {
+        posX: 0, posY: 0,
+        orthoSize: 5,
+        pixelSnap: 0
+      });
+      state.edges.push({ from: { node: body, port: "x" }, to: { node: cam, port: "posX" } });
+
+      // ─── Scene + output ───────────────────────────────────────
+      const scene = makeNode("Scene2D", 1000, 200, {
+        clearR: 0.45, clearG: 0.72, clearB: 0.88
+      });
+      state.edges.push({ from: { node: level,   port: "mesh"   }, to: { node: scene, port: "mesh1"  } });
+      state.edges.push({ from: { node: playerT, port: "mesh"   }, to: { node: scene, port: "mesh2"  } });
+      state.edges.push({ from: { node: cam,     port: "camera" }, to: { node: scene, port: "camera" } });
+      const vo = makeNode("VisualOutput", 1220, 200, { display: 0 });
       state.edges.push({ from: { node: scene, port: "out" }, to: { node: vo, port: "in" } });
     }
   }
@@ -75753,6 +76029,13 @@ function _onOscPatchChange() {
 if (typeof window !== "undefined") {
   window.addEventListener("DOMContentLoaded", () => {
     setTimeout(_ensureOscConnection, 300);
+    // Default ship-with-app assets. Idempotent -- skips immediately
+    // if the user already has them. Delayed past app-init so Assets
+    // namespace has finished hydrating from IDB before we check.
+    // PNG output goes through Canvas convertToBlob (DEFLATE-compressed
+    // by the browser); a 192×32 6-frame placeholder lands at ~600-900
+    // bytes in IDB. No additional compression layer needed.
+    setTimeout(_ensureHeroPlaceholderAsset, 600);
     const pill = document.getElementById("osc-pill");
     if (pill) {
       pill.addEventListener("click", (e) => {
