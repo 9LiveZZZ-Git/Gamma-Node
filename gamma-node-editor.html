@@ -6501,7 +6501,6 @@
       </span>
       <button class="btn primary" id="btn-gen" title="Open the Generated C++ tab">Generate C++</button>
       <button class="btn" id="btn-export-open" title="Export center — patch, frame/video capture (composite or per-display), rig calibration bundles">Export ▾</button>
-      <button class="btn" id="btn-sprite-studio" title="Sprite Studio — LLM-driven sprite creator. Generates pixel art from text prompts via Claude API. Output goes to the asset library.">Sprite Studio</button>
       <button class="btn icon-btn" id="btn-live-mode" title="Live Mode — hide the editor, show only the visual layer (Ctrl+L)" aria-label="Toggle Live Mode">◐</button>
       <button class="btn icon-btn" id="btn-help" title="Keyboard shortcuts">?</button>
     </div>
@@ -11443,6 +11442,48 @@ public:
     methods: {},
     paramOptions: { filterMode: ["nearest", "linear"] },
     description: "Load an image into a GPU texture. url can be an http(s):// URL, a data:image/... URL, an 'asset:NAME' reference to an Assets-library sprite, or 'preset:NAME' built-in (preset:test4x4 = 2×2 color grid, preset:testgrid = 8×8 line grid). filterMode 'nearest' = pixel-art crisp, 'linear' = smooth bilinear. **scale** (pixels per world unit, default 32) is a hint used when this ImageURL is dropped into a patch via an asset drag: Sprite.width = (texW / framesX) / scale and height = (texH / framesY) / scale. A 32×32 sprite at scale=32 → 1×1 world units; halve scale to double the rendered size. After-drop edits to scale don't auto-update existing Sprites (Sprite.width/height are independent); edit Sprite directly for live resize, or re-drop the asset to apply the new scale. Wire output `texture` into Sprite.texture for a textured sprite. Async load: first 1-2 frames after creation may show the Sprite as untextured while the image fetches; once loaded the texture stays cached."
+  },
+
+  /* Sprint SpriteCreator-1 -- SpriteCreator. A "sprite project" node:
+   * holds defaults for prompt + style + size + frames + fps + scale
+   * for generating one or more related sprites. Click its gear handle
+   * (⚙) to open the Sprite Studio modal preloaded with these defaults.
+   * On save, the node remembers the last-created asset name so future
+   * patches can wire `ImageURL("asset:" + node.params.lastAssetName)`
+   * directly into a Sprite.
+   *
+   * No runtime behavior: this is a design-time node. The actual texture
+   * delivery still flows through ImageURL + Sprite as usual. Output
+   * port `lastAsset` (string) emits the most recently saved asset's
+   * name so downstream nodes can react to "studio just generated X". */
+  SpriteCreator: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "sprite-creator",
+    ins: [
+      { n: "prompt",   t: "param" },
+      { n: "style",    t: "param" },
+      { n: "width",    t: "param" },
+      { n: "height",   t: "param" },
+      { n: "framesX",  t: "param" },
+      { n: "framesY",  t: "param" },
+      { n: "fps",      t: "param" },
+      { n: "scale",    t: "param" }
+    ],
+    outs: [{ n: "lastAsset", t: "param" }],
+    params: {
+      prompt: "small red fox, side view, idle pose",
+      style: "snes",
+      width: 32, height: 32,
+      framesX: 1, framesY: 1,
+      fps: 8, scale: 32,
+      // Set by the modal's Save flow. uiOnly so codegen ignores it.
+      lastAssetName: ""
+    },
+    methods: {},
+    paramOptions: { style: ["snes", "nes", "gameboy", "modern"] },
+    uiOnlyParams: ["lastAssetName"],
+    description: "Sprite Studio launcher node. Click the ⚙ gear handle below the node to open the Sprite Studio modal preloaded with these defaults. prompt is the description sent to the LLM; style picks a palette/aesthetic preset (snes = 16-bit, nes = 8-bit 4-color, gameboy = 4-green palette, modern = free); width/height are PIXEL dimensions of the sheet; framesX/framesY split the sheet into a grid for animation; fps is the animation rate (used at Sprite-creation time); scale is pixels per world unit (used at asset-drop time). Saved sprites go to the asset library (Assets tab); lastAssetName output emits the most recently saved name so downstream nodes can wire ImageURL.url to 'asset:<lastAssetName>'."
   },
 
   /* Sprint 8.0.2-f -- Sprite. Flat XY quad centered on origin,
@@ -37507,6 +37548,28 @@ function render() {
           openPlanetMapEditor(node.id);
         });
         el.appendChild(gear);
+      }
+      // SpriteCreator-1 -- gear opens the Sprite Studio modal preloaded
+      // with this node's params (prompt / style / width / height /
+      // framesX/Y / fps / scale). On save, modal writes back the new
+      // asset name + the final values.
+      if (node.type === "SpriteCreator") {
+        const gear = document.createElement("button");
+        gear.className = "node-edit-handle node-tiling-handle";
+        gear.title = "Open Sprite Studio (generate sprite from this node's defaults)";
+        gear.textContent = "⚙";
+        gear.style.left = "calc(50% - 16px)";
+        gear.addEventListener("pointerdown", (ev) => {
+          ev.stopPropagation();
+          ev.preventDefault();
+        });
+        gear.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          ev.preventDefault();
+          if (typeof _ssOpen === "function") _ssOpen(node.id);
+        });
+        el.appendChild(gear);
+        // Shift the ✎ handle right when both are present.
         handle.style.left = "calc(50% + 16px)";
       }
     }
@@ -86442,12 +86505,35 @@ async function _ssExecutePaintCode(code, width, height, framesX, framesY) {
   return await canvas.convertToBlob({ type: "image/png" });
 }
 
-/* Open / close the Sprite Studio modal. */
-function _ssOpen() {
+/* Open / close the Sprite Studio modal.
+ *
+ * When called with a SpriteCreator nodeId, preload the modal's inputs
+ * from the node's params (prompt / style / size / frames / fps / scale)
+ * and remember the nodeId so Save writes the new asset name back to
+ * node.params.lastAssetName. When called without a nodeId (e.g. from
+ * a future topbar button or REPL), the modal opens with whatever
+ * inputs are already in place. */
+function _ssOpen(nodeId) {
   const modal = document.getElementById("spritestudio-modal");
   if (!modal) return;
   modal.style.display = "flex";
-  // Default name to a slugified prompt-ish placeholder.
+  modal._ssSourceNodeId = nodeId || null;
+  // Prefill from the SpriteCreator node's params if one was supplied.
+  if (nodeId) {
+    const node = (typeof nodeById === "function") ? nodeById(nodeId) : null;
+    if (node && node.params) {
+      const p = node.params;
+      if (typeof p.prompt   === "string") document.getElementById("ss-prompt").value = p.prompt;
+      if (typeof p.style    === "string") document.getElementById("ss-preset").value = p.style;
+      if (typeof p.width    === "number") document.getElementById("ss-width").value  = p.width;
+      if (typeof p.height   === "number") document.getElementById("ss-height").value = p.height;
+      if (typeof p.framesX  === "number") document.getElementById("ss-framesX").value = p.framesX;
+      if (typeof p.framesY  === "number") document.getElementById("ss-framesY").value = p.framesY;
+      if (typeof p.fps      === "number") document.getElementById("ss-fps").value    = p.fps;
+      if (typeof p.scale    === "number") document.getElementById("ss-scale").value  = p.scale;
+    }
+  }
+  // Default name to a slugified prompt-ish placeholder if empty.
   const nameEl = document.getElementById("ss-name");
   if (nameEl && !nameEl.value) nameEl.value = "sprite-" + Date.now().toString(36).slice(-5);
   _ssRedrawPreview(null);  // clear preview if any
@@ -86456,7 +86542,10 @@ function _ssOpen() {
 }
 function _ssClose() {
   const modal = document.getElementById("spritestudio-modal");
-  if (modal) modal.style.display = "none";
+  if (modal) {
+    modal.style.display = "none";
+    modal._ssSourceNodeId = null;
+  }
 }
 
 /* Draw the result blob into the preview canvas, sized to the chosen
@@ -86500,13 +86589,10 @@ function _ssStatus(msg, kind) {
                  : "var(--text-3)";
 }
 
-/* Wire the Sprite Studio: topbar button, modal close, generate, save. */
+/* Wire the Sprite Studio: modal close, generate, save. Entry point is
+ * the SpriteCreator node's ⚙ gear handle, which calls _ssOpen(nodeId)
+ * directly from the node render code in render(). */
 function _ssInstall() {
-  const openBtn = document.getElementById("btn-sprite-studio");
-  if (openBtn && !openBtn._ssWired) {
-    openBtn._ssWired = true;
-    openBtn.addEventListener("click", _ssOpen);
-  }
   const closeBtn = document.getElementById("ss-close");
   if (closeBtn && !closeBtn._ssWired) {
     closeBtn._ssWired = true;
@@ -86587,6 +86673,28 @@ function _ssInstall() {
           source: "creator"
         });
         if (!rec) throw new Error("asset create returned null");
+        // Write back to the source SpriteCreator node (if opened from one)
+        // so its defaults reflect the latest generation and downstream
+        // nodes wired to `lastAsset` see the new name.
+        const modal = document.getElementById("spritestudio-modal");
+        const sourceNodeId = modal && modal._ssSourceNodeId;
+        if (sourceNodeId) {
+          const node = (typeof nodeById === "function") ? nodeById(sourceNodeId) : null;
+          if (node && node.params) {
+            node.params.prompt   = document.getElementById("ss-prompt").value.trim();
+            node.params.style    = document.getElementById("ss-preset").value;
+            node.params.width    = w;
+            node.params.height   = h;
+            node.params.framesX  = fx;
+            node.params.framesY  = fy;
+            node.params.fps      = fps;
+            node.params.scale    = scale;
+            node.params.lastAssetName = rec.name;
+            if (typeof render === "function") {
+              try { render(); } catch (_) {}
+            }
+          }
+        }
         _ssStatus("Saved as '" + rec.name + "'.", "ok");
         // Refresh Assets tab so the new sprite shows up immediately.
         if (typeof brRenderAssets === "function") brRenderAssets();
