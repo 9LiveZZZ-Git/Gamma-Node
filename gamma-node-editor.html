@@ -7614,9 +7614,12 @@
             Uses the LLM provider set in <em>User DSP → ⚙</em>. Default: Claude API. Output runs as JS canvas paint code in this page. No corporate-IP references in the prompt.
           </div>
         </div>
-        <!-- Center: preview -->
+        <!-- Center: preview. CSS checkerboard via layered 45° gradients
+             so the user can see transparency (after _ssChromaKeyWhite).
+             Canvas display size pinned to 320 CSS px so a 32px sprite
+             is visible at 10×; larger sprites scale to fit via max-*. -->
         <div style="background:#0a0c10; display:flex; align-items:center; justify-content:center; overflow:hidden; min-height:300px; position:relative;">
-          <canvas id="ss-canvas" width="32" height="32" style="image-rendering:pixelated; image-rendering:crisp-edges; background:checkerboard; max-width:90%; max-height:90%;"></canvas>
+          <canvas id="ss-canvas" width="32" height="32" style="image-rendering:pixelated; image-rendering:crisp-edges; width:320px; height:320px; max-width:90%; max-height:90%; background-color:#2a2d35; background-image: linear-gradient(45deg, #3a3d45 25%, transparent 25%), linear-gradient(-45deg, #3a3d45 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #3a3d45 75%), linear-gradient(-45deg, transparent 75%, #3a3d45 75%); background-size:16px 16px; background-position:0 0, 0 8px, 8px -8px, 8px 0px;"></canvas>
           <div id="ss-empty" style="position:absolute; color:var(--text-3); font-family:var(--font-mono); font-size:10.5px; text-align:center; pointer-events:none;">
             Empty preview.<br/>Type a description and click Generate.
           </div>
@@ -86848,13 +86851,20 @@ async function _ssRefreshModelStatus() {
  *   - Prepend pixel-art keywords matching the chosen style preset.
  *   - Append a strong negative prompt (blur / AA / gradient / artifacts).
  *   - Don't enrich with corporate IP terms; respect the system rule. */
-const _SS_SD_NEGATIVE = "blurry, smooth, anti-aliased, soft, gradient, low quality, watermark, text, signature, jpeg artifacts, motion blur, dithered, noisy";
+const _SS_SD_NEGATIVE = "blurry, smooth, anti-aliased, soft, gradient, low quality, watermark, text, signature, jpeg artifacts, motion blur, dithered, noisy, scenery, environment, landscape, background details, props, multiple subjects, tiny subject, distant subject, cropped";
 const _SS_SD_STYLE_PROMPTS = {
   snes:    "pixel art, 16-bit SNES style, crisp pixels, limited 16-color palette, hard edges, no anti-aliasing",
   nes:     "pixel art, 8-bit NES style, 4 colors, blocky, hard edges, no anti-aliasing",
   gameboy: "pixel art, Game Boy DMG style, 4-shade green palette (#0f380f, #306230, #8bac0f, #9bbc0f), hard edges",
   modern:  "pixel art, modern indie game style, crisp pixels, limited palette"
 };
+/* Composition tail appended to every SD prompt. The key things this
+ * does: push subject to fill the frame (otherwise the model loves
+ * to leave 60% empty space around it -- looks fine in art galleries,
+ * useless for a 32×32 sprite where the subject ends up 8px tall),
+ * and lock the background to plain white so the chroma-key in
+ * _ssDownsampleBlob can isolate the sprite cleanly. */
+const _SS_SD_COMPOSITION = "subject fills entire frame, full body in view, large centered subject, isolated subject, on plain pure white background #ffffff, no scenery, no decoration";
 /* Sprint sprite-sd-2 -- call the compile-server's /sprite-gen route,
  * which proxies to a persistent Python SD worker. The server returns a
  * raw PNG; we just package it into a Blob.
@@ -86867,7 +86877,7 @@ const _SS_SD_STYLE_PROMPTS = {
  * `height`, `steps?`, `seed?`, and the server fills the rest. */
 async function _ssCallCompileServerSD(serverBase, model, prompt, stylePreset, nativeSize, steps) {
   const styleNote = _SS_SD_STYLE_PROMPTS[stylePreset] || _SS_SD_STYLE_PROMPTS.snes;
-  const fullPrompt = styleNote + ", " + prompt + ", centered, plain background";
+  const fullPrompt = styleNote + ", " + prompt + ", " + _SS_SD_COMPOSITION;
   const url = serverBase.replace(/\/+$/, "") + "/sprite-gen";
   const body = {
     model,
@@ -86907,7 +86917,7 @@ async function _ssCallCompileServerSD(serverBase, model, prompt, stylePreset, na
 async function _ssCallA1111(endpoint, prompt, stylePreset, nativeSize, steps, sampler) {
   const url = (endpoint || "http://localhost:7860").replace(/\/+$/, "") + "/sdapi/v1/txt2img";
   const styleNote = _SS_SD_STYLE_PROMPTS[stylePreset] || _SS_SD_STYLE_PROMPTS.snes;
-  const fullPrompt = styleNote + ", " + prompt + ", centered, plain background";
+  const fullPrompt = styleNote + ", " + prompt + ", " + _SS_SD_COMPOSITION;
   const body = {
     prompt: fullPrompt,
     negative_prompt: _SS_SD_NEGATIVE,
@@ -86944,7 +86954,10 @@ async function _ssCallA1111(endpoint, prompt, stylePreset, nativeSize, steps, sa
 
 /* Downsample a Blob (PNG) to the target sprite dimensions using
  * nearest-neighbor filtering, returning a new PNG Blob. This is what
- * makes 512×512 SD output land on a 32×32 sprite as crisp pixels. */
+ * makes 1024×1024 SD output land on a 32×32 sprite as crisp pixels.
+ * Also strips the (prompted) white background via a chroma-key so the
+ * resulting sprite has a transparent background and can be composited
+ * straight into a Scene2D without a halo. */
 async function _ssDownsampleBlob(srcBlob, targetW, targetH) {
   const bmp = await createImageBitmap(srcBlob);
   const canvas = new OffscreenCanvas(targetW, targetH);
@@ -86953,7 +86966,32 @@ async function _ssDownsampleBlob(srcBlob, targetW, targetH) {
   ctx.clearRect(0, 0, targetW, targetH);
   ctx.drawImage(bmp, 0, 0, bmp.width, bmp.height, 0, 0, targetW, targetH);
   if (bmp.close) try { bmp.close(); } catch (_) {}
+  // Chroma-key the prompted white background. We push hard for
+  // "plain pure white background" in _SS_SD_COMPOSITION, so a tight
+  // threshold cleanly isolates the sprite without eating its own
+  // highlights (white-on-fur is rare and usually <230 in practice).
+  _ssChromaKeyWhite(canvas, ctx, 232);
   return await canvas.convertToBlob({ type: "image/png" });
+}
+
+/* Mark every pixel whose RGB channels are all ≥ `threshold` as
+ * transparent. The threshold is tuned for SD's "plain white" output:
+ * 232 catches near-white halos around the subject while preserving
+ * the sprite's own light tones (which usually fall in the 180-220
+ * range after the pixel-art LoRA/prompt collapses the palette). */
+function _ssChromaKeyWhite(canvas, ctx, threshold) {
+  const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const d = img.data;
+  const t = threshold ?? 232;
+  let cleared = 0;
+  for (let i = 0; i < d.length; i += 4) {
+    if (d[i] >= t && d[i + 1] >= t && d[i + 2] >= t) {
+      d[i + 3] = 0;
+      cleared++;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  return cleared;
 }
 
 /* Strip markdown fences if Claude wrapped the code despite instructions. */
@@ -87215,7 +87253,13 @@ function _ssInstall() {
             ? localServerEndpoint
             : "http://127.0.0.1:8765";
           const sheetW = w, sheetH = h;
-          const nativeSize = Math.min(1024, Math.max(256, _ssNextPow2(Math.max(sheetW, sheetH) * 4)));
+          // Always generate at the model's native training resolution
+          // (1024 for Z-Image / SDXL). The earlier "scale with sprite
+          // size" heuristic capped tiny sprites at 256, which is well
+          // below the model's native res and produced muddy / off-model
+          // output. Downsample to the sprite size happens client-side
+          // in _ssDownsampleBlob (nearest-neighbor).
+          const nativeSize = 1024;
           const model = (document.getElementById("ss-sd-model").value)
             || aiSettings.sdModel || "z-image-turbo";
           aiSettings.sdModel = model;
