@@ -37769,12 +37769,17 @@ function _wirePatchCanvasAssetDrop() {
       return;
     }
     // asset-folders / scene-bulk -- folder drops resolve to the folder's
-    // PRIMARY sprite (first filled slot in the function's slot order)
-    // and spawn the ImageURL+Sprite+Translate chain for THAT sprite.
-    // The full "animation state machine" wiring for a folder is the
-    // fox-wire sprint; for now a folder drop = first-sprite drop.
+    // PRIMARY sprite (first filled slot in the function's slot order),
+    // then optionally spawn an animation/behavior chain wrapping it
+    // based on the folder's functionKey:
+    //   playable-character / enemy → AnimationState2D wrapper,
+    //     auto-wired to any existing PlatformerBody2D in the patch
+    //   decoration / item / npc / door / interactive / effect → plain
+    //     sprite chain (single-frame display, no state machine)
+    let folderFunction = null;
     if (assetType === "folder") {
-      const fdef = _ASSET_FUNCTIONS[rec.functionKey] || _ASSET_FUNCTIONS["decoration"];
+      folderFunction = rec.functionKey || "decoration";
+      const fdef = _ASSET_FUNCTIONS[folderFunction] || _ASSET_FUNCTIONS["decoration"];
       let primarySprite = null;
       for (const s of fdef.slots) {
         const sid = (rec.slots || {})[s.name];
@@ -37788,7 +37793,7 @@ function _wirePatchCanvasAssetDrop() {
         alert("Folder '" + rec.name + "' has no filled slots yet. Open it (click the card in Assets) and assign sprites first.");
         return;
       }
-      console.log("[asset-drop] folder '" + rec.name + "' → primary slot sprite '" + primarySprite.name + "'");
+      console.log("[asset-drop] folder '" + rec.name + "' (" + folderFunction + ") → primary slot sprite '" + primarySprite.name + "'");
       rec = primarySprite;   // fall through to the sprite-drop path below
     }
     const w = screenToWorld(e.clientX, e.clientY);
@@ -37813,10 +37818,15 @@ function _wirePatchCanvasAssetDrop() {
       filterMode: "nearest",
       scale: scale
     });
+    // Anchor: playable-character / enemy folder-drops use bottom-center
+    // (anchorY=0) so the sprite's feet sit on the body's y position --
+    // matches PlatformerBody2D's convention. Other drops default to
+    // sprite-center per asset metadata.
+    const wantsAnim = (folderFunction === "playable-character" || folderFunction === "enemy");
     const sprId = makeNode("Sprite", sprX, y, {
       width: sprW, height: sprH,
       anchorX: (rec.anchor && typeof rec.anchor.x === "number") ? rec.anchor.x : 0.5,
-      anchorY: (rec.anchor && typeof rec.anchor.y === "number") ? rec.anchor.y : 0.5,
+      anchorY: wantsAnim ? 0 : ((rec.anchor && typeof rec.anchor.y === "number") ? rec.anchor.y : 0.5),
       framesX: framesX,
       framesY: framesY,
       frame: 0,
@@ -37827,9 +37837,49 @@ function _wirePatchCanvasAssetDrop() {
       state.edges.push({ from: { node: imgId, port: "texture" }, to: { node: sprId, port: "texture" } });
       state.edges.push({ from: { node: sprId, port: "mesh"    }, to: { node: trId,  port: "mesh"    } });
     }
-    selectOne(trId);
+    // Animation chain for character / enemy folders. Slots the
+    // AnimationState2D between the (would-be) PlatformerBody2D and
+    // the Sprite. Frame defaults assume a 6-frame sheet layout
+    // (idle / walk-A / walk-mid / walk-B / jump / fall) -- matches
+    // the default placeholder. User retunes per-sheet via the node UI.
+    let animId = null;
+    if (wantsAnim) {
+      animId = makeNode("AnimationState2D", sprX, y + 200, {
+        fps: 10,
+        walkThreshold: 0.2,
+        idleFrames: "0",
+        walkFrames: "1,2,3,2",
+        jumpFrames: "4",
+        fallFrames: "5"
+      });
+      if (state && Array.isArray(state.edges)) {
+        state.edges.push({ from: { node: animId, port: "frame" }, to: { node: sprId, port: "frame" } });
+        state.edges.push({ from: { node: animId, port: "flipX" }, to: { node: sprId, port: "flipX" } });
+      }
+      // Auto-wire to an existing PlatformerBody2D if the patch has
+      // one. This is the "drag the folder into your already-built
+      // scene and it joins the rig" case. Picks the FIRST body in
+      // the patch -- if there are multiple, user re-wires manually.
+      const body = state && Array.isArray(state.nodes)
+        ? state.nodes.find(n => n && n.type === "PlatformerBody2D")
+        : null;
+      if (body && state && Array.isArray(state.edges)) {
+        state.edges.push({ from: { node: body.id, port: "vx"       }, to: { node: animId, port: "vx"       } });
+        state.edges.push({ from: { node: body.id, port: "vy"       }, to: { node: animId, port: "vy"       } });
+        state.edges.push({ from: { node: body.id, port: "grounded" }, to: { node: animId, port: "grounded" } });
+        state.edges.push({ from: { node: body.id, port: "facing"   }, to: { node: animId, port: "facing"   } });
+        state.edges.push({ from: { node: body.id, port: "x"        }, to: { node: trId,   port: "x"        } });
+        state.edges.push({ from: { node: body.id, port: "y"        }, to: { node: trId,   port: "y"        } });
+        console.log("[asset-drop] auto-wired AnimationState2D + Translate to existing PlatformerBody2D node=" + body.id);
+      } else {
+        console.log("[asset-drop] AnimationState2D spawned but no PlatformerBody2D in patch yet -- wire vx/vy/grounded/facing manually, or drop a Platformer 2D · Animated demo first");
+      }
+    }
+    selectOne(animId || trId);
     render();
-    console.log("[asset-drop] sprite '" + rec.name + "' → ImageURL(asset:" + rec.name + ") → Sprite → Translate at world (" + Math.round(w.x) + ", " + Math.round(w.y) + ")");
+    console.log("[asset-drop] " + (folderFunction || "sprite") + " '" + rec.name + "' → "
+      + (animId ? "ImageURL + AnimationState2D + Sprite + Translate" : "ImageURL + Sprite + Translate")
+      + " at world (" + Math.round(w.x) + ", " + Math.round(w.y) + ")");
   });
 }
 // Install on startup (canvas exists by the time this file finishes
