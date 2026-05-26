@@ -10960,6 +10960,65 @@ public:
     description: "Renders one textured quad per cell in a wired Tilemap2D matching `tileChar`. All quads share the same texture + sampler so the whole overlay batches into a single draw call. Pair with Tilemap2D.skipRenderChars (set to the same tileChar) so the colored-square underneath doesn't show through. `scale` = sprite world size (1.0 = one tile cell). anchorX/Y position the sprite within its cell (0.5,0.5=centered, 0.5,0=bottom-pinned). frame / framesX / framesY work like Sprite for multi-frame sheets. bobAmplitude > 0 makes sprites bob up and down with a per-cell phase offset for a 'floating pickup' feel."
   },
 
+  /* Sprint platformer-parallax -- ParallaxLayer2D. Single textured
+   * quad that follows the wired camera horizontally + scrolls its
+   * UV based on camera position × parallaxX. Snow-White-style
+   * multi-plane scrolling: at parallaxX=0 the texture is locked
+   * to the screen (skybox); at parallaxX=1 it's locked to world
+   * coords (no parallax); in between, the bg appears to drift
+   * slower than the foreground.
+   *
+   * Repeat-mode sampling is required so the bg tiles cleanly as
+   * the camera moves through the level -- wire the texture from
+   * an ImageURL with wrapMode='repeat-x' (or 'repeat').
+   *
+   * The quad SHARES the sprite pipeline (one textured pass, same
+   * BGL); cache key includes the camera's quantized posX so the
+   * mesh rebuilds whenever the camera moves > 0.05 world units. */
+  ParallaxLayer2D: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "mesh-gen",
+    ins: [
+      { n: "texture",       t: "texture" },
+      { n: "camera",        t: "camera"  },
+      // 0 = static skybox (texture locked to screen).
+      // 1 = world-locked (no parallax; texture moves with the world).
+      // 0.05 = very distant; 0.4 = midground; 0.7 = near.
+      { n: "parallaxX",     t: "param" },
+      // Texture's apparent world width = how far the camera has to
+      // move for the bg to cycle one full texture width. Smaller =
+      // more visible scroll per camera unit.
+      { n: "texWorldWidth", t: "param" },
+      // Vertical placement + size. screenScaleY clamps the quad to
+      // a fraction of the visible screen height; e.g. 0.5 = bottom
+      // half only (good for ground-level layers like grass / bushes).
+      // 1.0 covers full screen height.
+      { n: "screenScaleY",  t: "param" },
+      // Vertical anchor inside the screen (0..1, 0 = bottom, 1 = top).
+      { n: "screenAnchorY", t: "param" },
+      // Vertical world offset added on top of the anchor; useful for
+      // pinning a layer to a specific world-Y range regardless of
+      // where the camera is looking.
+      { n: "worldOffsetY",  t: "param" },
+      { n: "tintR",         t: "param" },
+      { n: "tintG",         t: "param" },
+      { n: "tintB",         t: "param" },
+      { n: "tintA",         t: "param" }
+    ],
+    outs: [{ n: "mesh", t: "mesh" }],
+    params: {
+      parallaxX:     0.30,
+      texWorldWidth: 30,
+      screenScaleY:  1.0,
+      screenAnchorY: 0.5,
+      worldOffsetY:  0,
+      tintR: 1, tintG: 1, tintB: 1, tintA: 1
+    },
+    methods: {},
+    description: "2D parallax background layer -- a screen-spanning textured quad that follows the wired camera and scrolls its UV by `cameraX * parallaxX / texWorldWidth`. parallaxX=0 locks to screen (sky / clouds); 1.0 locks to world (no parallax); 0.1-0.4 = distant layers, 0.4-0.7 = midground, 0.7-0.9 = foreground accents. Wire the texture through an ImageURL with wrapMode='repeat-x' so the bg tiles cleanly as the camera moves. screenScaleY + screenAnchorY confine the layer vertically (e.g. screenScaleY=0.4 screenAnchorY=0.0 for a foreground bushes strip along the bottom). Mesh rebuilds on every camera move > 0.05 world units."
+  },
+
   /* Sprint platformer-1 -- Tilemap2D. Grid-based mesh primitive.
    * tileData is a multi-line string where each character is a cell
    * (space / '.' = empty; any other char = solid tile colored by
@@ -11761,16 +11820,22 @@ public:
     ins: [
       { n: "url",        t: "param" },
       { n: "filterMode", t: "param" },
+      { n: "wrapMode",   t: "param" },
       { n: "scale",      t: "param" }
     ],
     outs: [{ n: "texture", t: "texture" }],
     params: {
       url: "preset:test4x4",
       filterMode: "nearest",
+      // Sprint platformer-parallax -- wrap mode controls the sprite
+      // sampler's addressModeU/V. 'clamp' (default) for normal sprites,
+      // 'repeat' for parallax bg layers that need the texture to tile
+      // as the camera moves. 'repeat-x' / 'repeat-y' for single-axis.
+      wrapMode: "clamp",
       scale: 32
     },
     methods: {},
-    paramOptions: { filterMode: ["nearest", "linear"] },
+    paramOptions: { filterMode: ["nearest", "linear"], wrapMode: ["clamp", "repeat", "repeat-x", "repeat-y"] },
     description: "Load an image into a GPU texture. url can be an http(s):// URL, a data:image/... URL, an 'asset:NAME' reference to an Assets-library sprite, or 'preset:NAME' built-in (preset:test4x4 = 2×2 color grid, preset:testgrid = 8×8 line grid). filterMode 'nearest' = pixel-art crisp, 'linear' = smooth bilinear. **scale** (pixels per world unit, default 32) is a hint used when this ImageURL is dropped into a patch via an asset drag: Sprite.width = (texW / framesX) / scale and height = (texH / framesY) / scale. A 32×32 sprite at scale=32 → 1×1 world units; halve scale to double the rendered size. After-drop edits to scale don't auto-update existing Sprites (Sprite.width/height are independent); edit Sprite directly for live resize, or re-drop the asset to apply the new scale. Wire output `texture` into Sprite.texture for a textured sprite. Async load: first 1-2 frames after creation may show the Sprite as untextured while the image fetches; once loaded the texture stays cached."
   },
 
@@ -32592,6 +32657,215 @@ async function _makeGoalFlagSprite() {
   return await c.convertToBlob({ type: "image/png" });
 }
 
+/* Programmatic parallax background -- sky layer. 256×128 PNG with
+ * a soft vertical gradient (deep blue top → light haze bottom) plus
+ * scattered subtle clouds. Width chosen to tile horizontally
+ * seamlessly when the sampler is set to repeat-x. parallaxX=0 means
+ * the sky doesn't actually scroll, but we still want it to look
+ * "right" if someone wires it with parallaxX>0. */
+async function _makeParallaxSkySprite() {
+  const W = 256, H = 128;
+  const c = new OffscreenCanvas(W, H);
+  const ctx = c.getContext("2d");
+  ctx.imageSmoothingEnabled = true;
+  // Vertical gradient: top deeper blue → bottom haze.
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0,   "#4a7dc0");
+  grad.addColorStop(0.6, "#82b6d8");
+  grad.addColorStop(1,   "#c9dceb");
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, W, H);
+  // Distant clouds -- soft ellipses, transparent. Deterministic
+  // placement via seeded random so the look is stable across loads.
+  let seed = 0x4c1d;
+  const rand = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 0xffffffff; };
+  ctx.fillStyle = "rgba(255,255,255,0.22)";
+  for (let i = 0; i < 6; i++) {
+    const x = rand() * W;
+    const y = 12 + rand() * 36;
+    const rx = 18 + rand() * 26;
+    const ry = 5  + rand() * 4;
+    ctx.beginPath();
+    ctx.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // Tile-safe: if cloud crosses right edge, redraw at x-W so the
+    // texture loops cleanly.
+    if (x + rx > W)  { ctx.beginPath(); ctx.ellipse(x - W, y, rx, ry, 0, 0, Math.PI * 2); ctx.fill(); }
+    if (x - rx < 0)  { ctx.beginPath(); ctx.ellipse(x + W, y, rx, ry, 0, 0, Math.PI * 2); ctx.fill(); }
+  }
+  return await c.convertToBlob({ type: "image/png" });
+}
+
+/* Programmatic parallax background -- distant mountains. 512×128.
+ * Two overlapping silhouette ranges in muted purple-gray; tile-safe
+ * horizontally. Transparent above the ridges so the sky shows
+ * through. parallaxX ~0.10-0.15 for "far distance" feel. */
+async function _makeParallaxMountainsSprite() {
+  const W = 512, H = 128;
+  const c = new OffscreenCanvas(W, H);
+  const ctx = c.getContext("2d");
+  ctx.imageSmoothingEnabled = true;
+  ctx.clearRect(0, 0, W, H);
+  // Ridge generator: triangular peaks at quasi-random columns. Use
+  // a closed path that wraps to tile cleanly: ensure the last point's
+  // y matches the first point's y, and the path stays inside [0, W].
+  function drawRidge(color, peakColor, baseY, peakHeight, peakCount, seed) {
+    let s = seed >>> 0;
+    const rand = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 0xffffffff; };
+    const peaks = [];
+    // Force matching endpoints so the texture seams cleanly.
+    peaks.push({ x: 0,   y: baseY });
+    for (let i = 0; i < peakCount; i++) {
+      const px = ((i + 0.5) / peakCount) * W + (rand() - 0.5) * (W / peakCount) * 0.6;
+      const ph = peakHeight * (0.6 + rand() * 0.4);
+      peaks.push({ x: px, y: baseY - ph });
+      // Add a saddle between peaks for variation
+      if (i < peakCount - 1) {
+        const sx = ((i + 1) / peakCount) * W;
+        const sh = peakHeight * (0.2 + rand() * 0.3);
+        peaks.push({ x: sx, y: baseY - sh });
+      }
+    }
+    peaks.push({ x: W,   y: baseY });
+    // Body fill
+    ctx.beginPath();
+    ctx.moveTo(0, H);
+    for (const p of peaks) ctx.lineTo(p.x, p.y);
+    ctx.lineTo(W, H);
+    ctx.closePath();
+    ctx.fillStyle = color;
+    ctx.fill();
+    // Ridge highlight (thin lighter line along the top edge)
+    ctx.beginPath();
+    ctx.moveTo(peaks[0].x, peaks[0].y);
+    for (let i = 1; i < peaks.length; i++) ctx.lineTo(peaks[i].x, peaks[i].y);
+    ctx.strokeStyle = peakColor;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+  // Far ridge (lighter, higher up the image)
+  drawRidge("#7a8aa8", "#a4b3cd", 78, 48, 7, 0x8a14);
+  // Near ridge (darker, lower down + taller peaks)
+  drawRidge("#54678a", "#7d92b3", 96, 60, 5, 0x3221);
+  return await c.convertToBlob({ type: "image/png" });
+}
+
+/* Programmatic parallax background -- midground forest. 512×128.
+ * Row of conifer-tree silhouettes with snow caps + subtle variation
+ * in height. Tile-safe. Sits in front of the mountains, behind the
+ * level. parallaxX ~0.30-0.45 for "midground" feel. */
+async function _makeParallaxForestSprite() {
+  const W = 512, H = 128;
+  const c = new OffscreenCanvas(W, H);
+  const ctx = c.getContext("2d");
+  ctx.imageSmoothingEnabled = false;
+  ctx.clearRect(0, 0, W, H);
+  let s = 0x9911;
+  const rand = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 0xffffffff; };
+  // Background fill: very dark green band along the bottom (treeline floor).
+  ctx.fillStyle = "#1f3a26";
+  ctx.fillRect(0, H - 14, W, 14);
+  // Tree row: triangles spaced roughly evenly with jitter. Each tree
+  // = triangular body + small trunk. To tile seamlessly we wrap any
+  // trees crossing the right edge to the left.
+  const treeCount = 18;
+  const slot = W / treeCount;
+  for (let i = 0; i < treeCount; i++) {
+    const cx = (i + 0.5) * slot + (rand() - 0.5) * slot * 0.4;
+    const baseY = H - 12 - rand() * 4;
+    const height = 32 + rand() * 22;
+    const width  = 14 + rand() * 8;
+    const tipY = baseY - height;
+    // Trunk
+    ctx.fillStyle = "#3a2210";
+    ctx.fillRect(cx - 1.5, baseY, 3, 4);
+    // Tree triangle (dark green)
+    function drawTreeAt(centerX) {
+      ctx.fillStyle = "#2c5436";
+      ctx.beginPath();
+      ctx.moveTo(centerX - width * 0.5, baseY);
+      ctx.lineTo(centerX + width * 0.5, baseY);
+      ctx.lineTo(centerX,                tipY);
+      ctx.closePath();
+      ctx.fill();
+      // Subtle inner highlight
+      ctx.fillStyle = "#3a6845";
+      ctx.beginPath();
+      ctx.moveTo(centerX - width * 0.35, baseY - 2);
+      ctx.lineTo(centerX + width * 0.15, baseY - 2);
+      ctx.lineTo(centerX - width * 0.05, tipY + 4);
+      ctx.closePath();
+      ctx.fill();
+      // Tiny snow tip
+      if (rand() > 0.45) {
+        ctx.fillStyle = "#e8eef5";
+        ctx.beginPath();
+        ctx.moveTo(centerX - 2, tipY + 4);
+        ctx.lineTo(centerX + 2, tipY + 4);
+        ctx.lineTo(centerX,     tipY);
+        ctx.closePath();
+        ctx.fill();
+      }
+    }
+    drawTreeAt(cx);
+    // Tile-wrap: if tree spans the right edge, draw a mirror copy at
+    // cx - W on the left so the seam is invisible. (Same for left.)
+    if (cx + width * 0.5 > W) drawTreeAt(cx - W);
+    if (cx - width * 0.5 < 0) drawTreeAt(cx + W);
+  }
+  return await c.convertToBlob({ type: "image/png" });
+}
+
+/* Default-ship bootstrap: parallax bg layers (sky + mountains +
+ * forest) all in one 'parallax-background' folder so they ship as
+ * a related set. Functions identically to the hero / egg / flag
+ * bootstraps: idempotent, runs on DOMContentLoaded. */
+async function _ensureParallaxBgAssets() {
+  if (typeof Assets === "undefined" || typeof Assets.findSpriteByName !== "function") return null;
+  try {
+    const layers = [
+      { name: "parallax-sky",       generator: _makeParallaxSkySprite,       slot: "sky" },
+      { name: "parallax-mountains", generator: _makeParallaxMountainsSprite, slot: "far" },
+      { name: "parallax-forest",    generator: _makeParallaxForestSprite,    slot: "mid" }
+    ];
+    const slots = {};
+    let createdAny = false;
+    for (const layer of layers) {
+      let sprite = Assets.findSpriteByName(layer.name);
+      if (!sprite) {
+        const blob = await layer.generator();
+        const file = new File([blob], layer.name + ".png", { type: "image/png" });
+        sprite = await loadImageFileToSpriteAsset(file, {
+          name: layer.name,
+          framesX: 1, framesY: 1,
+          fps: 1, scale: 32,
+          source: "default:parallax-bg"
+        });
+        if (sprite && sprite.blob) {
+          console.log("[default-assets] " + layer.name + " sprite saved (" + sprite.blob.size + " bytes)");
+        }
+        createdAny = true;
+      }
+      if (sprite) slots[layer.slot] = sprite.id;
+    }
+    let folder = Assets.findFolderByName("parallax-bg-folder");
+    if (!folder) {
+      folder = await createFolderAsset("parallax-bg-folder", "decoration", {
+        slots: { main: slots.sky || null },   // decoration has 'main' slot
+        notes: "Default parallax background set bundled with the editor. Three layers (sky / mountains / forest) for Snow-White-style multi-plane scrolling in Scene2D demos. Wire each into a ParallaxLayer2D with an ImageURL(wrapMode='repeat-x'), then into Scene2D.mesh1..mesh3 (back-to-front). See the Platformer 2D · Animated demo for the canonical layout.",
+        source: "default:parallax-bg"
+      });
+    }
+    if (createdAny) {
+      if (typeof brRenderAssets === "function") { try { brRenderAssets(); } catch (_) {} }
+    }
+    return slots;
+  } catch (e) {
+    console.warn("[default-assets] parallax bg bootstrap failed:", e);
+    return null;
+  }
+}
+
 /* Default-ship bootstrap for the egg pickup. Same idempotency
  * contract as the hero. Saved as a 1-frame sprite in the asset
  * library + wrapped in a single-slot 'item' folder. */
@@ -37320,6 +37594,7 @@ const _demos = [
       // into custom levels.
       _ensureEggPickupAsset();
       _ensureGoalFlagAsset();
+      _ensureParallaxBgAssets();
 
       // ─── Input ────────────────────────────────────────────────
       const keys = makeNode("KeyAxis2D", 40, 60, {
@@ -37489,18 +37764,86 @@ const _demos = [
       state.edges.push({ from: { node: level,   port: "mesh"    }, to: { node: flagOverlay, port: "tilemap" } });
       state.edges.push({ from: { node: flagTex, port: "texture" }, to: { node: flagOverlay, port: "texture" } });
 
+      // ─── Parallax background layers (Snow-White multi-plane) ──
+      // Three layers stacked back-to-front: sky (locked to screen) →
+      // distant mountains (slow drift) → midground forest (moderate
+      // drift). Each is a single textured quad following the camera,
+      // with UVs that scroll horizontally based on cameraX × parallaxX.
+      // ImageURL.wrapMode='repeat-x' so the texture tiles across the
+      // level instead of stretching at edges.
+      const skyTex = makeNode("ImageURL", 40, 580, {
+        url: "asset:parallax-sky",
+        filterMode: "linear",
+        wrapMode: "repeat-x",
+        scale: 32
+      });
+      const skyLayer = makeNode("ParallaxLayer2D", 280, 580, {
+        parallaxX: 0.0,           // locked to screen
+        texWorldWidth: 30,
+        screenScaleY: 1.0,
+        screenAnchorY: 0.5,
+        worldOffsetY: 0,
+        tintR: 1, tintG: 1, tintB: 1, tintA: 1
+      });
+      state.edges.push({ from: { node: skyTex, port: "texture" }, to: { node: skyLayer, port: "texture" } });
+      state.edges.push({ from: { node: cam,    port: "camera"  }, to: { node: skyLayer, port: "camera"  } });
+
+      const mtnTex = makeNode("ImageURL", 40, 720, {
+        url: "asset:parallax-mountains",
+        filterMode: "linear",
+        wrapMode: "repeat-x",
+        scale: 32
+      });
+      const mtnLayer = makeNode("ParallaxLayer2D", 280, 720, {
+        parallaxX: 0.12,          // slow distant drift
+        texWorldWidth: 36,
+        // Mountains live in the upper-mid band; trim the layer to
+        // the top 70% of view so it doesn't draw across the ground.
+        screenScaleY: 0.7,
+        screenAnchorY: 0.65,
+        worldOffsetY: 0,
+        tintR: 1, tintG: 1, tintB: 1, tintA: 1
+      });
+      state.edges.push({ from: { node: mtnTex, port: "texture" }, to: { node: mtnLayer, port: "texture" } });
+      state.edges.push({ from: { node: cam,    port: "camera"  }, to: { node: mtnLayer, port: "camera"  } });
+
+      const fstTex = makeNode("ImageURL", 40, 860, {
+        url: "asset:parallax-forest",
+        filterMode: "nearest",     // pixel-art-style forest
+        wrapMode: "repeat-x",
+        scale: 32
+      });
+      const fstLayer = makeNode("ParallaxLayer2D", 280, 860, {
+        parallaxX: 0.35,          // moderate midground drift
+        texWorldWidth: 28,
+        // Treeline sits along the bottom half of the view.
+        screenScaleY: 0.55,
+        screenAnchorY: 0.32,
+        worldOffsetY: 0,
+        tintR: 1, tintG: 1, tintB: 1, tintA: 1
+      });
+      state.edges.push({ from: { node: fstTex, port: "texture" }, to: { node: fstLayer, port: "texture" } });
+      state.edges.push({ from: { node: cam,    port: "camera"  }, to: { node: fstLayer, port: "camera"  } });
+
       // ─── Scene + output ───────────────────────────────────────
-      // Mesh slot order = paint order (mesh1 back, mesh8 front).
-      // Pre-parallax layout: level → egg overlay → flag → player.
-      // After push B (parallax), bg layers will occupy mesh1..mesh3
-      // and this layout shifts to mesh4..mesh7.
+      // Mesh slot order = paint order (mesh1 back, mesh8 front):
+      //   mesh1 sky          (parallax 0,  back)
+      //   mesh2 mountains    (parallax 0.12)
+      //   mesh3 forest       (parallax 0.35)
+      //   mesh4 level tilemap
+      //   mesh5 egg overlay
+      //   mesh6 flag overlay
+      //   mesh7 player
       const scene = makeNode("Scene2D", 1240, 200, {
         clearR: 0.45, clearG: 0.72, clearB: 0.88
       });
-      state.edges.push({ from: { node: level,       port: "mesh"   }, to: { node: scene, port: "mesh1"  } });
-      state.edges.push({ from: { node: eggOverlay,  port: "mesh"   }, to: { node: scene, port: "mesh2"  } });
-      state.edges.push({ from: { node: flagOverlay, port: "mesh"   }, to: { node: scene, port: "mesh3"  } });
-      state.edges.push({ from: { node: playerT,     port: "mesh"   }, to: { node: scene, port: "mesh4"  } });
+      state.edges.push({ from: { node: skyLayer,    port: "mesh"   }, to: { node: scene, port: "mesh1"  } });
+      state.edges.push({ from: { node: mtnLayer,    port: "mesh"   }, to: { node: scene, port: "mesh2"  } });
+      state.edges.push({ from: { node: fstLayer,    port: "mesh"   }, to: { node: scene, port: "mesh3"  } });
+      state.edges.push({ from: { node: level,       port: "mesh"   }, to: { node: scene, port: "mesh4"  } });
+      state.edges.push({ from: { node: eggOverlay,  port: "mesh"   }, to: { node: scene, port: "mesh5"  } });
+      state.edges.push({ from: { node: flagOverlay, port: "mesh"   }, to: { node: scene, port: "mesh6"  } });
+      state.edges.push({ from: { node: playerT,     port: "mesh"   }, to: { node: scene, port: "mesh7"  } });
       state.edges.push({ from: { node: cam,         port: "camera" }, to: { node: scene, port: "camera" } });
       const vo = makeNode("VisualOutput", 1460, 200, { display: 0 });
       state.edges.push({ from: { node: scene, port: "out" }, to: { node: vo, port: "in" } });
@@ -61208,17 +61551,27 @@ function _ensureSpritePipeline(sampleCount) {
  * "linear" gets bilinear-filtered smooth sampling. Both clamp at
  * the texture edge (sprite UV is always 0..cellW × 0..cellH, never
  * sampled outside its frame's sub-rect). */
-function _ensureSpriteSampler(filterMode) {
-  const key = (filterMode === "linear") ? "linear" : "nearest";
+function _ensureSpriteSampler(filterMode, wrapMode) {
+  const fk = (filterMode === "linear") ? "linear" : "nearest";
+  // Sprint platformer-parallax -- per-axis wrap mode. Parallax layers
+  // need repeat-U so the bg can cycle indefinitely as the camera moves
+  // through the level without UV running off the texture edge. Default
+  // stays clamp so existing Sprite / TileSpriteOverlay behavior doesn't
+  // change. wrapMode = "clamp" | "repeat" | "repeat-x" | "repeat-y".
+  let wU = "clamp-to-edge", wV = "clamp-to-edge";
+  if (wrapMode === "repeat") { wU = "repeat"; wV = "repeat"; }
+  else if (wrapMode === "repeat-x") { wU = "repeat"; }
+  else if (wrapMode === "repeat-y") { wV = "repeat"; }
+  const key = fk + ":" + wU + ":" + wV;
   if (Visual.spriteSamplers.has(key)) return Visual.spriteSamplers.get(key);
   if (!Visual.device) return null;
   const sampler = Visual.device.createSampler({
     label: "sprite-sampler-" + key,
-    magFilter: key,
-    minFilter: key,
-    mipmapFilter: key,
-    addressModeU: "clamp-to-edge",
-    addressModeV: "clamp-to-edge"
+    magFilter: fk,
+    minFilter: fk,
+    mipmapFilter: fk,
+    addressModeU: wU,
+    addressModeV: wV
   });
   Visual.spriteSamplers.set(key, sampler);
   return sampler;
@@ -62459,6 +62812,36 @@ function _meshCacheKey(node) {
         p.bobAmplitude, p.bobSpeed, bobBucket
       ].join(",");
     }
+    case "ParallaxLayer2D": {
+      // Mesh follows the camera, so the cache key includes the
+      // (quantized) camera position. 0.05 world-unit quantum is
+      // small enough that scroll feels smooth + large enough that
+      // we don't rebuild the mesh every render frame for static
+      // cameras. Also include canvas dims so a resize rebuilds.
+      let cposX = 0, cposY = 0;
+      if (state && Array.isArray(state.edges)) {
+        const wire = state.edges.find(e =>
+          e && e.to && e.to.node === node.id && e.to.port === "camera"
+        );
+        if (wire && wire.from) {
+          const src = state.nodes.find(n => n && n.id === wire.from.node);
+          if (src && src.params) {
+            cposX = src.params.posX || 0;
+            cposY = src.params.posY || 0;
+          }
+        }
+      }
+      const qX = Math.round(cposX * 20) / 20;   // 0.05 unit quantum
+      const qY = Math.round(cposY * 20) / 20;
+      const cw = (typeof Visual !== "undefined" && Visual.canvas) ? (Visual.canvas.width  | 0) : 0;
+      const ch = (typeof Visual !== "undefined" && Visual.canvas) ? (Visual.canvas.height | 0) : 0;
+      return "plx:" + [
+        qX, qY, cw, ch,
+        p.parallaxX, p.texWorldWidth,
+        p.screenScaleY, p.screenAnchorY, p.worldOffsetY,
+        p.tintR, p.tintG, p.tintB, p.tintA
+      ].join(",");
+    }
     case "Torus":         return "tor:" + [p.majorRadius, p.minorRadius, p.majorSlices, p.minorSlices].join(",");
     case "Cylinder":      return "cyl:" + [p.radius, p.height, p.slices].join(",");
     case "Cone":          return "con:" + [p.radius, p.height, p.slices].join(",");
@@ -62539,6 +62922,7 @@ function _buildMeshData(node) {
     case "Sprite":        return _buildSprite(node);
     case "Tilemap2D":         return _buildTilemap2D(node);
     case "TileSpriteOverlay": return _buildTileSpriteOverlay(node);
+    case "ParallaxLayer2D":   return _buildParallaxLayer2D(node);
     case "Torus":         return _buildTorus(node);
     case "Cylinder":      return _buildCylinder(node);
     case "Cone":          return _buildCone(node);
@@ -69857,6 +70241,84 @@ function _buildTileSpriteOverlay(node) {
   };
 }
 
+/* Sprint platformer-parallax -- ParallaxLayer2D mesh build.
+ *
+ * Outputs a single screen-spanning quad at the wired camera's world
+ * position. UVs are computed so that:
+ *   - U sweeps [0, 1] across the screen at any moment
+ *   - U also shifts by `cameraX * parallaxX / texWorldWidth` as the
+ *     camera moves, causing the bg to scroll
+ *   - At parallaxX=0 the shift is zero -> classic locked skybox
+ *   - At parallaxX=1 the bg scrolls at world speed -> no parallax
+ *
+ * The repeat-mode sampler (configured upstream on ImageURL via
+ * wrapMode='repeat-x') handles UVs outside [0,1] by tiling, so the
+ * texture cycles seamlessly through the level.
+ *
+ * Vertical: the quad height = orthoSize * 2 * screenScaleY, anchored
+ * at screenAnchorY (0..1, 0=bottom of camera view). worldOffsetY
+ * adds a fixed world-space shift on top of that for layers that
+ * want to be pinned to specific world Y bands. */
+function _buildParallaxLayer2D(node) {
+  const p = node.params || {};
+  // Find wired camera (or first OrthoCamera2D in patch).
+  let camNode = null;
+  if (state && Array.isArray(state.edges)) {
+    const wire = state.edges.find(e =>
+      e && e.to && e.to.node === node.id && e.to.port === "camera"
+    );
+    if (wire && wire.from) {
+      const src = state.nodes.find(n => n && n.id === wire.from.node);
+      if (src && (src.type === "OrthoCamera2D" || src.type === "Camera" || src.type === "FPCamera")) {
+        camNode = src;
+      }
+    }
+  }
+  if (!camNode && state && Array.isArray(state.nodes)) {
+    camNode = state.nodes.find(n => n && n.type === "OrthoCamera2D");
+  }
+  const cp = camNode ? camNode.params || {} : {};
+  const camX = (typeof cp.posX === "number") ? cp.posX : 0;
+  const camY = (typeof cp.posY === "number") ? cp.posY : 0;
+  const orthoSize = (typeof cp.orthoSize === "number" && cp.orthoSize > 0) ? cp.orthoSize : 5;
+  // Aspect from current visual canvas (falls back to 16:9 if not ready).
+  let aspect = 16 / 9;
+  if (typeof Visual !== "undefined" && Visual.canvas && Visual.canvas.width > 0 && Visual.canvas.height > 0) {
+    aspect = Visual.canvas.width / Visual.canvas.height;
+  }
+  const halfW = orthoSize * aspect;
+  const halfH = orthoSize;
+  // Tunables
+  const parallaxX     = (typeof p.parallaxX     === "number") ? p.parallaxX     : 0.3;
+  const texWorldWidth = (typeof p.texWorldWidth === "number" && p.texWorldWidth > 0) ? p.texWorldWidth : 30;
+  const scaleY        = (typeof p.screenScaleY  === "number" && p.screenScaleY  > 0) ? p.screenScaleY  : 1.0;
+  const anchorY       = (typeof p.screenAnchorY === "number") ? p.screenAnchorY : 0.5;
+  const offsetY       = (typeof p.worldOffsetY  === "number") ? p.worldOffsetY  : 0;
+  const tR = (typeof p.tintR === "number") ? p.tintR : 1;
+  const tG = (typeof p.tintG === "number") ? p.tintG : 1;
+  const tB = (typeof p.tintB === "number") ? p.tintB : 1;
+  // Quad position: centered on camX horizontally, vertically anchored
+  // within the camera frustum + offset.
+  const quadHalfH = halfH * scaleY;
+  // anchorY=0.5 centers on camY; 0=bottom of view; 1=top.
+  const quadCenterY = camY + (anchorY - 0.5) * 2 * halfH + offsetY;
+  const x0 = camX - halfW, x1 = camX + halfW;
+  const y0 = quadCenterY - quadHalfH, y1 = quadCenterY + quadHalfH;
+  // UV: U shifts with camera × parallax; V always [0,1] across quad.
+  const uShift = (camX * parallaxX) / texWorldWidth;
+  const u0 = uShift;
+  const u1 = uShift + 1;
+  // pos.xyz  color.rgb       normal.xyz (+Z)  uv.xy
+  const verts = new Float32Array([
+    x0, y0, 0,   tR, tG, tB,   0, 0, 1,   u0, 0,
+    x1, y0, 0,   tR, tG, tB,   0, 0, 1,   u1, 0,
+    x1, y1, 0,   tR, tG, tB,   0, 0, 1,   u1, 1,
+    x0, y1, 0,   tR, tG, tB,   0, 0, 1,   u0, 1
+  ]);
+  const indices = new Uint32Array([0, 1, 2,  0, 2, 3]);
+  return { verts, indices };
+}
+
 /* Sprint platformer-1 -- Tilemap2D. Parses the multi-line tileData
  * string into a 2D grid of cell indices; emits one quad per non-
  * empty cell, vertex-colored per the palette param. Origin is the
@@ -72525,7 +72987,7 @@ function _encodeScenePass(enc, entry) {
     // through the dedicated sprite pipeline (3-binding BGL: drawU,
     // texture, sampler). After the draw, curMaterialType is cleared
     // so the next mesh in the loop re-sets its own pipeline state.
-    if (m.node && (m.node.type === "Sprite" || m.node.type === "TileSpriteOverlay") && buf && buf.vertexBuffer) {
+    if (m.node && (m.node.type === "Sprite" || m.node.type === "TileSpriteOverlay" || m.node.type === "ParallaxLayer2D") && buf && buf.vertexBuffer) {
       const texEntry = (typeof _resolveSpriteTextureEntry === "function")
         ? _resolveSpriteTextureEntry(m.node) : null;
       if (texEntry && texEntry.state === "ready" && texEntry.view) {
@@ -72535,16 +72997,18 @@ function _encodeScenePass(enc, entry) {
           // Sampler filter follows the upstream ImageURL's filterMode
           // (default nearest = pixel-art crisp).
           let filterMode = "nearest";
+          let wrapMode   = "clamp";
           const texWire = state && Array.isArray(state.edges) && state.edges.find(e =>
             e && e.to && e.to.node === m.node.id && e.to.port === "texture"
           );
           if (texWire && texWire.from) {
             const imgNode = state.nodes.find(n => n && n.id === texWire.from.node);
-            if (imgNode && imgNode.params && typeof imgNode.params.filterMode === "string") {
-              filterMode = imgNode.params.filterMode;
+            if (imgNode && imgNode.params) {
+              if (typeof imgNode.params.filterMode === "string") filterMode = imgNode.params.filterMode;
+              if (typeof imgNode.params.wrapMode   === "string") wrapMode   = imgNode.params.wrapMode;
             }
           }
-          const sampler = _ensureSpriteSampler(filterMode);
+          const sampler = _ensureSpriteSampler(filterMode, wrapMode);
           const inst = _ensureSpriteInstance(m.node, texEntry.view, sampler);
           if (inst) {
             // Pack uniform: modelViewProj (16) + tint (4) + frameMeta (4) = 24 floats.
@@ -76958,6 +77422,7 @@ if (typeof window !== "undefined") {
     setTimeout(_ensureHeroPlaceholderAsset, 600);
     setTimeout(_ensureEggPickupAsset, 650);
     setTimeout(_ensureGoalFlagAsset,  700);
+    setTimeout(_ensureParallaxBgAssets, 750);
     const pill = document.getElementById("osc-pill");
     if (pill) {
       pill.addEventListener("click", (e) => {
