@@ -87087,7 +87087,17 @@ function _ssStatus(msg, kind) {
 /* Generation progress poll. Drives the thin bar under the modal head
  * and updates the status line with step / elapsed / ETA while the
  * compile-server worker is running a diffusion. Returns a cancel fn
- * the caller invokes on success/failure to tear it down. */
+ * the caller invokes on success/failure to tear it down.
+ *
+ * Poll cadence: Chrome's Local Network Access (LNA) gate flags every
+ * file:// → 127.0.0.1 request as a CSRF concern; a tight poll racks
+ * up hundreds of DevTools issues per minute. We poll at 1.2 s, skip
+ * when the tab is hidden, and delay the first poll 1.2 s to skip
+ * the warm-up window when nothing has been emitted yet. (Switching
+ * to SSE / WebSocket would drop this to 1 connection per gen but is
+ * a bigger change -- file an issue if the slow poll feels laggy.) */
+const _SS_POLL_INTERVAL_MS = 1200;
+const _SS_POLL_FIRST_DELAY_MS = 1200;
 function _ssStartProgressPoll(serverBase, label) {
   const wrap = document.getElementById("ss-progress-wrap");
   const bar  = document.getElementById("ss-progress-bar");
@@ -87102,6 +87112,12 @@ function _ssStartProgressPoll(serverBase, label) {
   let stalledSince = t0;
   async function poll() {
     if (cancelled) return;
+    // Skip the fetch when the tab is hidden -- the user can't see the
+    // bar anyway, and these add up to ~1 LNA flag per second otherwise.
+    if (document.hidden) {
+      setTimeout(poll, _SS_POLL_INTERVAL_MS);
+      return;
+    }
     try {
       const r = await fetch(url, { cache: "no-store" });
       if (r.ok) {
@@ -87146,9 +87162,11 @@ function _ssStartProgressPoll(serverBase, label) {
     } catch (_) {
       // Polling failures are non-fatal -- the bar just freezes briefly.
     }
-    if (!cancelled) setTimeout(poll, 400);
+    if (!cancelled) setTimeout(poll, _SS_POLL_INTERVAL_MS);
   }
-  poll();
+  // Defer the first poll past the worker's typical "no-op warm-up"
+  // window so the very first frame doesn't show an empty `step 0/M`.
+  setTimeout(poll, _SS_POLL_FIRST_DELAY_MS);
   return () => {
     cancelled = true;
     wrap.style.display = "none";
