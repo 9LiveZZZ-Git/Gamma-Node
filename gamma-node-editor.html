@@ -10935,6 +10935,51 @@ public:
     description: "HUD altimeter overlay. Live readout of the patch's first FPCamera/Camera altitude (posY) in meters, plus optional speed/sprint indicator. Useful for the planet-scale archipelago demo where you need to know if you're at curve altitude (8km+) or in space (80km+). corner picks the screen anchor; margin is gap from edge; opacity is overlay alpha; showSpeed (0/1) toggles the secondary speed readout. Drop the node into a patch + wire `hud` into Scene.hud1..hud4 to make it appear in live mode."
   },
 
+  /* Sprint hud-text -- HUDText. Generic text overlay. Renders a single
+   * line of text in one of the four screen corners, drawn to its own
+   * canvas so it composites cleanly with the rest of the HUD stack.
+   * Value-wired use: connect a numeric param (score, health, timer)
+   * to `value`; the node formats it with `prefix`/`suffix`/`decimals`.
+   * Static-text use: leave `value` at NaN and set `text` directly.
+   * Sample wirings:
+   *   "Score: " + player.score          prefix="Score: " value=score
+   *   "HP 100 / 100"                    text="HP 100 / 100" (static)
+   *   "Time 1.23s"                      prefix="Time " suffix="s" decimals=2 */
+  HUDText: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "hud",
+    ins: [
+      { n: "text",     t: "param" },
+      { n: "value",    t: "param" },
+      { n: "prefix",   t: "param" },
+      { n: "suffix",   t: "param" },
+      { n: "decimals", t: "param" },
+      { n: "corner",   t: "param" },
+      { n: "fontSize", t: "param" },
+      { n: "color",    t: "param" },
+      { n: "opacity",  t: "param" },
+      { n: "margin",   t: "param" }
+    ],
+    outs: [{ n: "hud", t: "hud" }],
+    params: {
+      text:     "HUD",
+      // NaN signals "use static text instead of formatting a number".
+      value:    NaN,
+      prefix:   "",
+      suffix:   "",
+      decimals: 0,
+      corner:   "top-left",
+      fontSize: 16,
+      color:    "#ffffff",
+      opacity:  0.95,
+      margin:   18
+    },
+    paramOptions: { corner: ["top-right", "top-left", "bottom-right", "bottom-left"] },
+    methods: {},
+    description: "Generic HUD text overlay. Renders one line of text in a screen corner. Two modes: (1) static text -- leave `value` at NaN and set `text` directly; (2) numeric readout -- wire a number into `value`, optional prefix/suffix and decimals format it (e.g. prefix='Score: ' decimals=0 -> 'Score: 42'). corner picks the anchor; fontSize is in CSS px; color accepts any CSS color (named or hex); margin is gap from screen edge; opacity is the overlay alpha. Multiple HUDText nodes in the same corner stack vertically. Drop + wire the `hud` output into Scene2D.hud1..hud4 to make it appear in live mode -- and yes, the text is now included in screenshots and video recordings as of v0.3.440."
+  },
+
   /* Sprint 7.5.3a -- DebugTriangle. Smoke-test mesh source. Emits a
    * single colored triangle (RGB vertices) as a `mesh` output, used
    * to validate the Scene render pipeline end-to-end. Disappears
@@ -37045,6 +37090,25 @@ const _demos = [
       state.edges.push({ from: { node: cam,     port: "camera" }, to: { node: scene, port: "camera" } });
       const vo = makeNode("VisualOutput", 1220, 200, { display: 0 });
       state.edges.push({ from: { node: scene, port: "out" }, to: { node: vo, port: "in" } });
+
+      // ─── HUD (debug readout) ──────────────────────────────────
+      // Live readout of player X position; demonstrates HUDText
+      // numeric mode + verifies the capture compositor includes
+      // HUDs in screenshots/video. Wires to scene.hud2 (hud1
+      // reserved for a future Minimap drop-in).
+      const hud = makeNode("HUDText", 1000, 460, {
+        text: "",
+        prefix: "X ",
+        suffix: " m",
+        decimals: 1,
+        corner: "top-left",
+        fontSize: 14,
+        color: "#9bf",
+        opacity: 0.90,
+        margin: 18
+      });
+      state.edges.push({ from: { node: body, port: "x" },  to: { node: hud, port: "value" } });
+      state.edges.push({ from: { node: hud,  port: "hud" }, to: { node: scene, port: "hud1" } });
     }
   }
 ];
@@ -51153,6 +51217,128 @@ function _tickAltimeterNodes() {
   } else {
     flyPanel.style.display = "none";
   }
+}
+
+/* Sprint hud-text -- per-node canvas factory for HUDText. Each node
+ * gets its own canvas keyed by node id so multiple HUDText nodes
+ * coexist without trampling each other. position:fixed lets us pin
+ * to a screen corner regardless of viewport scroll / layout. */
+function _ensureHudTextCanvas(nodeId) {
+  const id = "hud-text-" + nodeId;
+  let c = document.getElementById(id);
+  if (c) return c;
+  c = document.createElement("canvas");
+  c.id = id;
+  c.style.cssText =
+    "position:fixed;z-index:84;border:1px solid rgba(120,140,170,0.35);" +
+    "border-radius:6px;background:rgba(8,11,16,0.55);" +
+    "backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);" +
+    "box-shadow:0 4px 18px rgba(0,0,0,0.45);pointer-events:none;display:none;";
+  document.body.appendChild(c);
+  return c;
+}
+
+function _tickHudTextNodes() {
+  if (!state || !Array.isArray(state.nodes)) return;
+  const live = (typeof isLiveMode === "function") ? isLiveMode() : true;
+  // Track stacking offsets per-corner so multiple HUDText nodes in
+  // the same corner don't overlap. Reset every tick.
+  const cornerStack = { "top-left": 0, "top-right": 0, "bottom-left": 0, "bottom-right": 0 };
+  const STACK_GAP = 4;
+  // Also: collect ids we touched so we can hide canvases for deleted
+  // HUDText nodes from a previous patch state.
+  const touchedIds = new Set();
+  for (const node of state.nodes) {
+    if (!node || node.type !== "HUDText") continue;
+    const canvas = _ensureHudTextCanvas(node.id);
+    touchedIds.add("hud-text-" + node.id);
+    if (!live) { canvas.style.display = "none"; continue; }
+    // Require a wire from this node's `hud` output -- matches the
+    // Minimap/Altimeter convention so unwired HUDs stay invisible
+    // and unobtrusive in the patch editor view.
+    const hudWire = state.edges && state.edges.find(e =>
+      e && e.from && e.from.node === node.id && e.from.port === "hud"
+    );
+    if (!hudWire || !hudWire.to) { canvas.style.display = "none"; continue; }
+    const p = node.params || {};
+    // Resolve text. If value is a finite number, format it with
+    // prefix/suffix/decimals; otherwise use the static text param.
+    const value = _resolveHudTextValue(node, "value");
+    const prefix = (typeof p.prefix === "string") ? p.prefix : "";
+    const suffix = (typeof p.suffix === "string") ? p.suffix : "";
+    let body;
+    if (Number.isFinite(value)) {
+      const decimals = Math.max(0, Math.min(6, (typeof p.decimals === "number") ? p.decimals : 0));
+      body = value.toFixed(decimals);
+    } else {
+      body = (typeof p.text === "string") ? p.text : "";
+    }
+    const display = prefix + body + suffix;
+    const fontSize = Math.max(8, Math.min(96, (typeof p.fontSize === "number") ? p.fontSize : 16));
+    const color    = (typeof p.color === "string" && p.color) ? p.color : "#ffffff";
+    const opacity  = Math.max(0.05, Math.min(1.0, (typeof p.opacity === "number") ? p.opacity : 0.95));
+    const margin   = Math.max(0, (typeof p.margin === "number") ? p.margin : 18);
+    const corner   = (typeof p.corner === "string" && cornerStack[p.corner] !== undefined) ? p.corner : "top-left";
+    // Measure with a temp ctx so the canvas can be sized to the text.
+    // dpr-aware so the text stays crisp on retina displays.
+    const dpr = (typeof window !== "undefined" && window.devicePixelRatio) ? window.devicePixelRatio : 1;
+    const pad = Math.round(fontSize * 0.5);
+    // Temp canvas for measurement -- reuse the node's canvas at a
+    // dummy size first, then resize.
+    const tctx = canvas.getContext("2d");
+    tctx.font = fontSize + "px ui-monospace, 'SF Mono', Menlo, monospace";
+    const metrics = tctx.measureText(display);
+    const textW = Math.ceil(metrics.width);
+    const cssW = textW + pad * 2;
+    const cssH = Math.ceil(fontSize * 1.4) + Math.round(pad * 0.5);
+    // Set both the backing-store size (dpr-scaled) and the CSS size.
+    if (canvas.width  !== Math.round(cssW * dpr)) canvas.width  = Math.round(cssW * dpr);
+    if (canvas.height !== Math.round(cssH * dpr)) canvas.height = Math.round(cssH * dpr);
+    canvas.style.width  = cssW + "px";
+    canvas.style.height = cssH + "px";
+    // Redraw -- transform to dpr-scaled space so text crisps.
+    tctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    tctx.clearRect(0, 0, cssW, cssH);
+    tctx.fillStyle = color;
+    tctx.font = fontSize + "px ui-monospace, 'SF Mono', Menlo, monospace";
+    tctx.textBaseline = "middle";
+    tctx.fillText(display, pad, cssH * 0.5);
+    // Stack at the chosen corner -- offset by sum of previously
+    // placed HUDText canvases in this corner.
+    const stackOffset = cornerStack[corner];
+    canvas.style.top = canvas.style.bottom = canvas.style.left = canvas.style.right = "";
+    if (corner === "top-left")     { canvas.style.top    = (margin + stackOffset) + "px"; canvas.style.left  = margin + "px"; }
+    else if (corner === "top-right")    { canvas.style.top    = (margin + stackOffset) + "px"; canvas.style.right = margin + "px"; }
+    else if (corner === "bottom-left")  { canvas.style.bottom = (margin + stackOffset) + "px"; canvas.style.left  = margin + "px"; }
+    else                                 { canvas.style.bottom = (margin + stackOffset) + "px"; canvas.style.right = margin + "px"; }
+    cornerStack[corner] += cssH + STACK_GAP;
+    canvas.style.opacity = String(opacity);
+    canvas.style.display = "block";
+  }
+  // Clean up canvases for deleted nodes
+  document.querySelectorAll('canvas[id^="hud-text-"]').forEach(c => {
+    if (!touchedIds.has(c.id)) {
+      c.style.display = "none";
+    }
+  });
+}
+
+/* Resolve a HUDText input -- walks the wire (if any) to find the
+ * upstream numeric value. Returns the upstream value or the param's
+ * static value if no wire is present. Returns NaN to signal
+ * "use static text instead". */
+function _resolveHudTextValue(node, port) {
+  if (Array.isArray(state.edges)) {
+    const edge = state.edges.find(e => e && e.to && e.to.node === node.id && e.to.port === port);
+    if (edge && edge.from) {
+      const src = state.nodes.find(n => n && n.id === edge.from.node);
+      if (src && src.params && typeof src.params[edge.from.port] === "number") {
+        return src.params[edge.from.port];
+      }
+    }
+  }
+  const v = node.params ? node.params[port] : undefined;
+  return (typeof v === "number") ? v : NaN;
 }
 
 /* Phase 6.6.13 — virtual on-screen sticks for touch navigation.
@@ -75059,6 +75245,10 @@ function renderVisualFrame() {
   // Each renders only when its driving node exists in the patch.
   _tickMinimapNodes();
   _tickAltimeterNodes();
+  _tickHudTextNodes();
+  // Sprint hud-text -- composite Visual.canvas + visible HUDs into
+  // the video compositor IF a recording is active. No-op otherwise.
+  _tickCaptureCompositor();
 
   const enc = Visual.device.createCommandEncoder({ label: "visual-frame" });
 
@@ -76310,6 +76500,53 @@ function toggleGraphHidden() { setGraphHidden(!graphHidden); }
  * by default with `preserveDrawingBuffer` semantics handled via
  * `alphaMode: "premultiplied"` configure. We wait one rAF so the
  * canvas has the freshest frame, then `toBlob('image/png')`. */
+/* Sprint hud-text -- composite Visual.canvas + all visible HUD
+ * overlays onto a target 2D canvas. Used by both screenshot
+ * (captureVisualFrame) and video (startVideoCapture) so HUDs
+ * appear in saved frames + recordings the same way they appear
+ * on screen. Before this, HUDs lived on separate position:fixed
+ * canvases that Visual.canvas.toBlob / .captureStream couldn't see.
+ *
+ * Coordinate mapping: HUD canvases position themselves in screen-space
+ * (px from screen edge). Visual.canvas has its own CSS size +
+ * backing-store size; we scale HUD positions by the same ratio so
+ * the HUD lands at the same RELATIVE position in the output. */
+function _compositeFrameWithHuds(target) {
+  if (!target || !Visual.canvas) return;
+  const tctx = target.getContext("2d");
+  if (!tctx) return;
+  tctx.setTransform(1, 0, 0, 1, 0, 0);
+  tctx.clearRect(0, 0, target.width, target.height);
+  // Base: the WebGPU canvas. drawImage supports HTMLCanvasElement
+  // including WebGPU-backed ones in modern browsers.
+  tctx.drawImage(Visual.canvas, 0, 0, target.width, target.height);
+  // Overlays: every visible #hud-* canvas. Compute each one's
+  // bounding rect relative to Visual.canvas + scale to target.
+  const vRect = Visual.canvas.getBoundingClientRect();
+  if (vRect.width === 0 || vRect.height === 0) return;
+  const sx = target.width  / vRect.width;
+  const sy = target.height / vRect.height;
+  const huds = document.querySelectorAll('canvas[id^="hud-"]');
+  for (const h of huds) {
+    if (!h || h.style.display === "none") continue;
+    if (h.offsetWidth === 0 || h.offsetHeight === 0) continue;
+    const hr = h.getBoundingClientRect();
+    // Skip HUDs that don't overlap the visual canvas (e.g., a HUD
+    // pinned to a corner that's off-screen on a tiny viewport).
+    if (hr.right < vRect.left || hr.left > vRect.right) continue;
+    if (hr.bottom < vRect.top || hr.top > vRect.bottom) continue;
+    const x = (hr.left - vRect.left) * sx;
+    const y = (hr.top  - vRect.top)  * sy;
+    const w = hr.width  * sx;
+    const z = hr.height * sy;
+    // Respect HUD's opacity (set inline via style.opacity).
+    const op = parseFloat(h.style.opacity);
+    tctx.globalAlpha = Number.isFinite(op) ? op : 1.0;
+    tctx.drawImage(h, x, y, w, z);
+  }
+  tctx.globalAlpha = 1.0;
+}
+
 async function captureVisualFrame() {
   if (!Visual.canvas) return;
   // One rAF tick so the canvas has the latest rendered frame.
@@ -76320,9 +76557,16 @@ async function captureVisualFrame() {
   const pill = document.getElementById("snap-btn");
   const original = pill ? pill.textContent : null;
   if (pill) { pill.textContent = "…"; pill.classList.add("active"); }
+  // Composite Visual.canvas + HUDs onto a one-shot canvas, then
+  // toBlob from that. Falls back to direct Visual.canvas if any HUDs
+  // are present and compositing seems to have failed (defensive).
+  const composite = document.createElement("canvas");
+  composite.width  = Visual.canvas.width;
+  composite.height = Visual.canvas.height;
+  _compositeFrameWithHuds(composite);
   try {
     await new Promise((resolve, reject) => {
-      Visual.canvas.toBlob((blob) => {
+      composite.toBlob((blob) => {
         if (!blob) { reject(new Error("toBlob returned null")); return; }
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
@@ -76369,6 +76613,18 @@ let _videoStartT = 0;
 let _videoTimer = null;
 let _videoAudioTap = null;   // { dest, srcNode } so we can disconnect on stop
 let _videoMimeType = "video/webm";
+// Sprint hud-text -- persistent compositor for video capture. Created
+// on startVideoCapture, updated each render frame via _tickCaptureCompositor,
+// fed to MediaRecorder via captureStream so HUDs end up in the .webm.
+let _captureCompositor = null;
+
+/* Called from the visual render tick after all HUDs have updated.
+ * No-op when no recording is in flight, so the per-frame cost is
+ * a single null check during normal runs. */
+function _tickCaptureCompositor() {
+  if (!_videoRecorder || !_captureCompositor) return;
+  _compositeFrameWithHuds(_captureCompositor);
+}
 
 function _pickWebmMimeType() {
   if (typeof MediaRecorder === "undefined") return null;
@@ -76401,11 +76657,21 @@ function startVideoCapture() {
     return;
   }
   _videoMimeType = mime;
+  // Build the compositor canvas at the same backing-store size as
+  // Visual.canvas so HUD geometry maps 1:1 and bitrate budget isn't
+  // wasted upscaling. captureStream gives us a 60 fps track of the
+  // composite (Visual.canvas + HUDs) rather than the raw WebGPU canvas.
+  if (!_captureCompositor) _captureCompositor = document.createElement("canvas");
+  _captureCompositor.width  = Visual.canvas.width;
+  _captureCompositor.height = Visual.canvas.height;
+  // Prime the compositor BEFORE captureStream so the first frame has
+  // valid pixels instead of blank.
+  _compositeFrameWithHuds(_captureCompositor);
   let stream;
   try {
-    stream = Visual.canvas.captureStream(60);
+    stream = _captureCompositor.captureStream(60);
   } catch (e) {
-    console.warn("[capture] canvas.captureStream failed:", e);
+    console.warn("[capture] compositor.captureStream failed:", e);
     return;
   }
   // Tap the audio worklet if a preview is running. dest is in the same
