@@ -7581,8 +7581,17 @@
               <option value="llm-canvas">LLM → JS canvas (low quality, free)</option>
             </select>
           </div>
+          <div id="ss-model-row">
+            <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); letter-spacing:0.06em; margin-bottom:4px;">SD MODEL</div>
+            <select id="ss-sd-model" style="width:100%; padding:5px 6px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10.5px;">
+              <option value="z-image-turbo" selected>Z-Image-Turbo (Apache 2.0, ~6 GB)</option>
+              <option value="sdxl">SDXL + Pixel Art XL LoRA (~7 GB)</option>
+              <option value="flux2-klein">Flux.2 klein (Apache 2.0, ~12 GB)</option>
+            </select>
+            <div id="ss-model-status" style="font-family:var(--font-mono); font-size:8.5px; color:var(--text-3); margin-top:3px;"></div>
+          </div>
           <div id="ss-sd-config" style="display:none;">
-            <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); letter-spacing:0.06em; margin-bottom:4px;">SD ENDPOINT</div>
+            <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); letter-spacing:0.06em; margin-bottom:4px;">A1111 ENDPOINT</div>
             <input type="text" id="ss-sd-endpoint" placeholder="http://localhost:7860" style="width:100%; padding:5px 6px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10.5px;"/>
             <div style="display:flex; gap:6px; margin-top:6px;">
               <div style="flex:1;">
@@ -86519,6 +86528,60 @@ function _ssNextPow2(n) {
   return v;
 }
 
+/* §sd-polish -- poll /sprite-gen/info to mark installed models in the
+ * dropdown and surface the current worker state. Updates the
+ * #ss-model-status line below the dropdown.
+ *
+ * Output shapes (small bits, all defensive):
+ *   server unreachable:  "compile-server not detected (defaults shown)"
+ *   server ok, none installed: "no models installed -- run scripts/install-sd.sh"
+ *   server ok, X installed:    "installed: z-image-turbo, sdxl • worker: idle"
+ *   worker loaded:             "installed: z-image-turbo • worker: z-image-turbo (ready)" */
+async function _ssRefreshModelStatus() {
+  const statusEl = document.getElementById("ss-model-status");
+  const modelEl  = document.getElementById("ss-sd-model");
+  if (!statusEl || !modelEl) return;
+  statusEl.textContent = "checking compile-server…";
+  const base = (typeof localServerEndpoint === "string" && localServerEndpoint)
+    ? localServerEndpoint
+    : "http://127.0.0.1:8765";
+  try {
+    const res = await fetch(base.replace(/\/+$/, "") + "/sprite-gen/info", {
+      method: "GET",
+      cache: "no-store"
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const info = await res.json();
+    if (!info || !info.models) throw new Error("missing models field");
+    // Decorate dropdown options with an installed marker.
+    const opts = modelEl.querySelectorAll("option");
+    const installed = [];
+    opts.forEach(opt => {
+      const m = info.models[opt.value];
+      const ok = m && m.installed;
+      // Strip any previous prefix added by us, then prepend new marker.
+      const label = (opt.textContent || "").replace(/^(✓ |• )/, "");
+      opt.textContent = (ok ? "✓ " : "• ") + label;
+      if (ok) installed.push(opt.value);
+    });
+    let line = "";
+    if (installed.length === 0) {
+      line = "no models installed — run scripts/install-sd.sh in the compile-server";
+    } else {
+      line = "installed: " + installed.join(", ");
+    }
+    if (info.currentWorker) {
+      line += " • worker: " + info.currentWorker.model +
+              (info.currentWorker.ready ? " (ready)" : " (loading…)");
+    } else {
+      line += " • worker: idle";
+    }
+    statusEl.textContent = line;
+  } catch (e) {
+    statusEl.textContent = "compile-server not detected (defaults shown)";
+  }
+}
+
 /* Sprint sprite-sd-1 -- call AUTOMATIC1111 webui's txt2img endpoint.
  * Returns a Blob (PNG) on success. Throws on network / API errors.
  *
@@ -86706,6 +86769,13 @@ function _ssOpen(nodeId) {
   if (sdStepsEl) sdStepsEl.value = aiSettings.sdSteps || 20;
   const sdSamplerEl = document.getElementById("ss-sd-sampler");
   if (sdSamplerEl) sdSamplerEl.value = aiSettings.sdSampler || "DPM++ 2M Karras";
+  // §sd-polish -- model dropdown for the compile-server SD backend.
+  const sdModelEl = document.getElementById("ss-sd-model");
+  if (sdModelEl) sdModelEl.value = aiSettings.sdModel || "z-image-turbo";
+  // Fetch /sprite-gen/info to mark which models are actually downloaded
+  // on the server. Async; no spinner -- status line updates when reply
+  // arrives (typically 10-50 ms for the compile-server probe).
+  _ssRefreshModelStatus();
   _ssRedrawPreview(null);  // clear preview if any
   const promptEl = document.getElementById("ss-prompt");
   if (promptEl) setTimeout(() => promptEl.focus(), 50);
@@ -86800,7 +86870,10 @@ function _ssInstall() {
             : "http://127.0.0.1:8765";
           const sheetW = w, sheetH = h;
           const nativeSize = Math.min(1024, Math.max(256, _ssNextPow2(Math.max(sheetW, sheetH) * 4)));
-          const model = aiSettings.sdModel || "z-image-turbo";
+          const model = (document.getElementById("ss-sd-model").value)
+            || aiSettings.sdModel || "z-image-turbo";
+          aiSettings.sdModel = model;
+          saveAiSettings();
           const steps = parseInt(document.getElementById("ss-sd-steps").value, 10) || 9;
           _ssStatus("compile-server SD (" + model + ") rendering " + nativeSize + "×" + nativeSize + "…", "thinking");
           const raw = await _ssCallCompileServerSD(serverBase, model, description, stylePreset, nativeSize, steps);
@@ -86954,6 +87027,17 @@ function _ssInstall() {
       el.addEventListener("change", () => _ssRedrawPreview(null));
     }
   });
+  // §sd-polish -- model dropdown persists to aiSettings + re-probes the
+  // server so the installed marker stays accurate after a fresh install.
+  const sdModelEl = document.getElementById("ss-sd-model");
+  if (sdModelEl && !sdModelEl._ssWired) {
+    sdModelEl._ssWired = true;
+    sdModelEl.addEventListener("change", () => {
+      aiSettings.sdModel = sdModelEl.value;
+      saveAiSettings();
+      _ssRefreshModelStatus();
+    });
+  }
 }
 // Install on next tick (DOM is ready by the time this script tag runs).
 if (typeof document !== "undefined") {
