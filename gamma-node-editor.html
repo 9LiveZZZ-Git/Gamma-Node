@@ -7573,8 +7573,29 @@
               <option value="modern">Modern pixel art (free palette)</option>
             </select>
           </div>
+          <div>
+            <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); letter-spacing:0.06em; margin-bottom:4px;">BACKEND</div>
+            <select id="ss-backend" style="width:100%; padding:5px 6px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10.5px;">
+              <option value="llm-canvas">LLM → JS canvas (low quality, free)</option>
+              <option value="local-sd-a1111">Local SD (A1111 webui)</option>
+            </select>
+          </div>
+          <div id="ss-sd-config" style="display:none;">
+            <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); letter-spacing:0.06em; margin-bottom:4px;">SD ENDPOINT</div>
+            <input type="text" id="ss-sd-endpoint" placeholder="http://localhost:7860" style="width:100%; padding:5px 6px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10.5px;"/>
+            <div style="display:flex; gap:6px; margin-top:6px;">
+              <div style="flex:1;">
+                <div style="font-family:var(--font-mono); font-size:9px; color:var(--text-3); margin-bottom:2px;">STEPS</div>
+                <input type="number" id="ss-sd-steps" min="5" max="100" step="1" value="20" style="width:100%; padding:3px 5px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10px;"/>
+              </div>
+              <div style="flex:2;">
+                <div style="font-family:var(--font-mono); font-size:9px; color:var(--text-3); margin-bottom:2px;">SAMPLER</div>
+                <input type="text" id="ss-sd-sampler" placeholder="DPM++ 2M Karras" style="width:100%; padding:3px 5px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10px;"/>
+              </div>
+            </div>
+          </div>
           <button class="btn primary" id="ss-generate" style="width:100%; padding:8px;">Generate</button>
-          <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); line-height:1.5;">
+          <div id="ss-help" style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); line-height:1.5;">
             Uses the LLM provider set in <em>User DSP → ⚙</em>. Default: Claude API. Output runs as JS canvas paint code in this page. No corporate-IP references in the prompt.
           </div>
         </div>
@@ -42186,7 +42207,12 @@ function defaultAiSettings() {
     provider: "gemma",
     model: "onnx-community/gemma-4-E2B-it-ONNX",
     anthropicKey: "",
-    compileServerUrl: ""
+    compileServerUrl: "",
+    // Sprite Studio settings (SpriteCreator-1 / sd-1).
+    spriteBackend: "llm-canvas",                  // 'llm-canvas' | 'local-sd-a1111'
+    sdEndpoint:    "http://localhost:7860",       // A1111 webui base URL
+    sdSteps:       20,                             // sampling steps (quality vs speed)
+    sdSampler:     "DPM++ 2M Karras"              // A1111 sampler name
   };
 }
 function saveAiSettings() {
@@ -86481,6 +86507,82 @@ function _ssBuildUserPrompt(description, stylePreset, width, height, framesX, fr
   ].join("\n");
 }
 
+function _ssNextPow2(n) {
+  let v = 256;
+  while (v < n) v *= 2;
+  return v;
+}
+
+/* Sprint sprite-sd-1 -- call AUTOMATIC1111 webui's txt2img endpoint.
+ * Returns a Blob (PNG) on success. Throws on network / API errors.
+ *
+ * A1111 native generation size is set per-call (we use 512×512 for
+ * fidelity); the result is downsampled to the user's target sprite
+ * dims via nearest-neighbor in _ssDownsampleBlob.
+ *
+ * Prompt construction:
+ *   - Prepend pixel-art keywords matching the chosen style preset.
+ *   - Append a strong negative prompt (blur / AA / gradient / artifacts).
+ *   - Don't enrich with corporate IP terms; respect the system rule. */
+const _SS_SD_NEGATIVE = "blurry, smooth, anti-aliased, soft, gradient, low quality, watermark, text, signature, jpeg artifacts, motion blur, dithered, noisy";
+const _SS_SD_STYLE_PROMPTS = {
+  snes:    "pixel art, 16-bit SNES style, crisp pixels, limited 16-color palette, hard edges, no anti-aliasing",
+  nes:     "pixel art, 8-bit NES style, 4 colors, blocky, hard edges, no anti-aliasing",
+  gameboy: "pixel art, Game Boy DMG style, 4-shade green palette (#0f380f, #306230, #8bac0f, #9bbc0f), hard edges",
+  modern:  "pixel art, modern indie game style, crisp pixels, limited palette"
+};
+async function _ssCallA1111(endpoint, prompt, stylePreset, nativeSize, steps, sampler) {
+  const url = (endpoint || "http://localhost:7860").replace(/\/+$/, "") + "/sdapi/v1/txt2img";
+  const styleNote = _SS_SD_STYLE_PROMPTS[stylePreset] || _SS_SD_STYLE_PROMPTS.snes;
+  const fullPrompt = styleNote + ", " + prompt + ", centered, plain background";
+  const body = {
+    prompt: fullPrompt,
+    negative_prompt: _SS_SD_NEGATIVE,
+    width: nativeSize,
+    height: nativeSize,
+    steps: Math.max(5, Math.min(100, Math.floor(steps))),
+    sampler_name: sampler || "DPM++ 2M Karras",
+    cfg_scale: 7.0,
+    seed: -1
+  };
+  let res;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
+    });
+  } catch (e) {
+    throw new Error("Cannot reach A1111 at " + endpoint + " (is the webui running with --api?). " + (e.message || e));
+  }
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error("A1111 " + res.status + ": " + (txt || res.statusText));
+  }
+  const data = await res.json();
+  if (!data.images || !data.images.length) throw new Error("A1111 returned no images");
+  // images[0] is a base64 PNG (no data: prefix).
+  const b64 = data.images[0];
+  const bin = atob(b64);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return new Blob([arr], { type: "image/png" });
+}
+
+/* Downsample a Blob (PNG) to the target sprite dimensions using
+ * nearest-neighbor filtering, returning a new PNG Blob. This is what
+ * makes 512×512 SD output land on a 32×32 sprite as crisp pixels. */
+async function _ssDownsampleBlob(srcBlob, targetW, targetH) {
+  const bmp = await createImageBitmap(srcBlob);
+  const canvas = new OffscreenCanvas(targetW, targetH);
+  const ctx = canvas.getContext("2d");
+  ctx.imageSmoothingEnabled = false;
+  ctx.clearRect(0, 0, targetW, targetH);
+  ctx.drawImage(bmp, 0, 0, bmp.width, bmp.height, 0, 0, targetW, targetH);
+  if (bmp.close) try { bmp.close(); } catch (_) {}
+  return await canvas.convertToBlob({ type: "image/png" });
+}
+
 /* Strip markdown fences if Claude wrapped the code despite instructions. */
 function _ssExtractJsFromResponse(text) {
   if (!text) return "";
@@ -86536,6 +86638,19 @@ function _ssOpen(nodeId) {
   // Default name to a slugified prompt-ish placeholder if empty.
   const nameEl = document.getElementById("ss-name");
   if (nameEl && !nameEl.value) nameEl.value = "sprite-" + Date.now().toString(36).slice(-5);
+  // §sd-1 -- prefill SD endpoint / steps / sampler / chosen backend
+  // from persisted aiSettings so the user's last picks come back.
+  const backendEl = document.getElementById("ss-backend");
+  if (backendEl) {
+    backendEl.value = aiSettings.spriteBackend || "llm-canvas";
+    if (backendEl._ssUpdateUI) backendEl._ssUpdateUI();
+  }
+  const sdEndpointEl = document.getElementById("ss-sd-endpoint");
+  if (sdEndpointEl) sdEndpointEl.value = aiSettings.sdEndpoint || "http://localhost:7860";
+  const sdStepsEl = document.getElementById("ss-sd-steps");
+  if (sdStepsEl) sdStepsEl.value = aiSettings.sdSteps || 20;
+  const sdSamplerEl = document.getElementById("ss-sd-sampler");
+  if (sdSamplerEl) sdSamplerEl.value = aiSettings.sdSampler || "DPM++ 2M Karras";
   _ssRedrawPreview(null);  // clear preview if any
   const promptEl = document.getElementById("ss-prompt");
   if (promptEl) setTimeout(() => promptEl.focus(), 50);
@@ -86610,30 +86725,57 @@ function _ssInstall() {
       const description = document.getElementById("ss-prompt").value.trim();
       if (!description) { _ssStatus("Enter a description first.", "err"); return; }
       const stylePreset = document.getElementById("ss-preset").value;
+      const backend     = document.getElementById("ss-backend").value;
       const w = parseInt(document.getElementById("ss-width").value, 10) || 32;
       const h = parseInt(document.getElementById("ss-height").value, 10) || 32;
       const fx = parseInt(document.getElementById("ss-framesX").value, 10) || 1;
       const fy = parseInt(document.getElementById("ss-framesY").value, 10) || 1;
-      const provider = PROVIDERS[aiSettings.provider];
-      if (!provider) { _ssStatus("No LLM provider configured (User DSP → ⚙).", "err"); return; }
-      let key = "";
-      if (provider.requiresKey) {
-        key = aiSettings.anthropicKey;
-        if (!key) { _ssStatus("API key required — set in User DSP → ⚙.", "err"); return; }
-      }
+      // Persist the backend choice across opens.
+      aiSettings.spriteBackend = backend;
+      saveAiSettings();
       genBtn.disabled = true;
-      _ssStatus("Asking " + aiSettings.provider + "…", "thinking");
       try {
-        const system = _ssBuildSystemPrompt();
-        const user = _ssBuildUserPrompt(description, stylePreset, w, h, fx, fy);
-        const reply = await provider.call({
-          system, user, key, model: aiSettings.model,
-          temperature: 0.4, maxTokens: 4096
-        });
-        const code = _ssExtractJsFromResponse(reply);
-        document.getElementById("ss-code").value = code;
-        _ssStatus("Painting…", "thinking");
-        const blob = await _ssExecutePaintCode(code, w, h, fx, fy);
+        let blob = null;
+        if (backend === "local-sd-a1111") {
+          // Persist endpoint + sampler settings.
+          const endpoint = document.getElementById("ss-sd-endpoint").value.trim() || "http://localhost:7860";
+          const steps = parseInt(document.getElementById("ss-sd-steps").value, 10) || 20;
+          const sampler = document.getElementById("ss-sd-sampler").value.trim() || "DPM++ 2M Karras";
+          aiSettings.sdEndpoint = endpoint;
+          aiSettings.sdSteps = steps;
+          aiSettings.sdSampler = sampler;
+          saveAiSettings();
+          // SD native size: power-of-two ≥ max(w*fx, h*fy), capped at 768
+          // for M4 perf. Final downsample maps to user's sprite dims.
+          const sheetW = w; // for now: single-frame; spritesheets need
+          const sheetH = h; // a per-frame loop, deferred to sd-2.
+          const nativeSize = Math.min(768, Math.max(256, _ssNextPow2(Math.max(sheetW, sheetH) * 4)));
+          _ssStatus("SD rendering at " + nativeSize + "×" + nativeSize + " (steps=" + steps + ")…", "thinking");
+          const raw = await _ssCallA1111(endpoint, description, stylePreset, nativeSize, steps, sampler);
+          _ssStatus("Downsampling to " + sheetW + "×" + sheetH + "…", "thinking");
+          blob = await _ssDownsampleBlob(raw, sheetW, sheetH);
+          document.getElementById("ss-code").value = "// SD output from " + endpoint + "\n// prompt: " + description + "\n// style: " + stylePreset + "\n// native " + nativeSize + " → sprite " + sheetW + "×" + sheetH;
+        } else {
+          // Default: LLM → JS canvas code path (the v1 cheap+free option).
+          const provider = PROVIDERS[aiSettings.provider];
+          if (!provider) { throw new Error("No LLM provider configured (User DSP → ⚙)."); }
+          let key = "";
+          if (provider.requiresKey) {
+            key = aiSettings.anthropicKey;
+            if (!key) { throw new Error("API key required — set in User DSP → ⚙."); }
+          }
+          _ssStatus("Asking " + aiSettings.provider + "…", "thinking");
+          const system = _ssBuildSystemPrompt();
+          const user = _ssBuildUserPrompt(description, stylePreset, w, h, fx, fy);
+          const reply = await provider.call({
+            system, user, key, model: aiSettings.model,
+            temperature: 0.4, maxTokens: 4096
+          });
+          const code = _ssExtractJsFromResponse(reply);
+          document.getElementById("ss-code").value = code;
+          _ssStatus("Painting…", "thinking");
+          blob = await _ssExecutePaintCode(code, w, h, fx, fy);
+        }
         await _ssRedrawPreview(blob);
         _ssStatus("Generated (" + Math.round(blob.size / 1024) + " KB). Click Save.", "ok");
       } catch (e) {
@@ -86644,6 +86786,22 @@ function _ssInstall() {
         genBtn.disabled = false;
       }
     });
+  }
+  // Toggle SD config row based on backend selector + persist choice.
+  const backendEl = document.getElementById("ss-backend");
+  if (backendEl && !backendEl._ssWired) {
+    backendEl._ssWired = true;
+    const sdConfig = document.getElementById("ss-sd-config");
+    const helpEl = document.getElementById("ss-help");
+    const updateBackendUI = () => {
+      const isSD = backendEl.value === "local-sd-a1111";
+      if (sdConfig) sdConfig.style.display = isSD ? "block" : "none";
+      if (helpEl) helpEl.innerHTML = isSD
+        ? "Calls AUTOMATIC1111 webui at the endpoint above. Make sure it's running with <code>--api</code> (and <code>--cors-allow-origins=*</code> if browser blocks it). Output renders at native size then downsamples to the sprite dims using nearest-neighbor."
+        : "Uses the LLM provider set in <em>User DSP → ⚙</em>. Default: Claude API. Output runs as JS canvas paint code in this page. No corporate-IP references in the prompt.";
+    };
+    backendEl.addEventListener("change", updateBackendUI);
+    backendEl._ssUpdateUI = updateBackendUI;
   }
   const saveBtn = document.getElementById("ss-save");
   if (saveBtn && !saveBtn._ssWired) {
