@@ -38154,6 +38154,178 @@ function loadDemo(id) {
   renderProps && renderProps();
 }
 
+/* ───────────────────────────────────────────────────────────────
+ * Sprint platformer-debug -- console-callable diagnostics.
+ * Drop "gammaDebug.all()" into the browser console to dump every
+ * angle of the current patch state in one shot:
+ *   - body position vs tilemap collision tiles around it
+ *   - camera position + visible world rect
+ *   - each Scene2D's mesh inputs with their type, vert count,
+ *     bounding box (so you can see if they're off-screen), depthZ
+ *     baked into verts, and texture-load state
+ *   - asset library snapshot (which asset:NAME urls are resolved)
+ *
+ * Individual functions also available:
+ *   gammaDebug.body(), gammaDebug.camera(), gammaDebug.scene(),
+ *   gammaDebug.assets(), gammaDebug.meshes()
+ * ─────────────────────────────────────────────────────────────── */
+const gammaDebug = (function() {
+  function _findNodes(type) {
+    if (!state || !Array.isArray(state.nodes)) return [];
+    return state.nodes.filter(n => n && n.type === type);
+  }
+  function fmt(n) { return (typeof n === "number") ? n.toFixed(3) : String(n); }
+
+  function body() {
+    const bodies = _findNodes("PlatformerBody2D");
+    if (bodies.length === 0) { console.log("[debug.body] no PlatformerBody2D in patch"); return null; }
+    const out = [];
+    for (const b of bodies) {
+      const p = b.params || {};
+      out.push({
+        id:       b.id,
+        x:        p.x, y: p.y,
+        vx:       p.vx, vy: p.vy,
+        grounded: p.grounded,
+        facing:   p.facing,
+        width:    p.width, height: p.height,
+        groundY:  p.groundY,
+        initX:    p.initX, initY: p.initY,
+        inited:   p._inited
+      });
+      console.log("[debug.body] " + b.id + ": pos=(" + fmt(p.x) + "," + fmt(p.y) +
+        ")  vel=(" + fmt(p.vx) + "," + fmt(p.vy) + ")  grounded=" + p.grounded +
+        "  facing=" + p.facing + "  groundY=" + p.groundY);
+      if (typeof p.y === "number" && typeof p.groundY === "number" && p.y < p.groundY + 0.5) {
+        console.warn("  !! body is AT or BELOW groundY -- it may have fallen through");
+      }
+    }
+    return out;
+  }
+
+  function camera() {
+    const cams = (state.nodes || []).filter(n => n && (n.type === "OrthoCamera2D" || n.type === "Camera" || n.type === "FPCamera"));
+    if (!cams.length) { console.log("[debug.camera] no camera in patch"); return null; }
+    const out = [];
+    for (const c of cams) {
+      const p = c.params || {};
+      const halfH = (typeof p.orthoSize === "number") ? p.orthoSize : 5;
+      const aspect = (typeof Visual !== "undefined" && Visual.canvas) ? Visual.canvas.width / Math.max(1, Visual.canvas.height) : 16/9;
+      const halfW = halfH * aspect;
+      const info = {
+        id: c.id, type: c.type,
+        posX: p.posX, posY: p.posY, posZ: p.posZ,
+        orthoSize: p.orthoSize, near: p.near, far: p.far,
+        worldRect: {
+          xMin: (p.posX || 0) - halfW, xMax: (p.posX || 0) + halfW,
+          yMin: (p.posY || 0) - halfH, yMax: (p.posY || 0) + halfH
+        }
+      };
+      console.log("[debug.camera] " + c.id + " " + c.type +
+        ": pos=(" + fmt(p.posX) + "," + fmt(p.posY) + ")  orthoSize=" + fmt(p.orthoSize) +
+        "  visible x=[" + fmt(info.worldRect.xMin) + "," + fmt(info.worldRect.xMax) + "]" +
+        " y=[" + fmt(info.worldRect.yMin) + "," + fmt(info.worldRect.yMax) + "]");
+      out.push(info);
+    }
+    return out;
+  }
+
+  function meshes() {
+    // Walk every Scene2D's mesh inputs + dump what's wired in.
+    const scenes = _findNodes("Scene2D");
+    if (!scenes.length) { console.log("[debug.meshes] no Scene2D"); return null; }
+    const out = [];
+    for (const scn of scenes) {
+      console.log("[debug.meshes] Scene2D " + scn.id + ":");
+      const def = TYPES[scn.type];
+      const meshPorts = def.ins.filter(p => p.t === "mesh").map(p => p.n);
+      for (const port of meshPorts) {
+        const wire = state.edges.find(e => e && e.to && e.to.node === scn.id && e.to.port === port);
+        if (!wire) { console.log("  " + port + ": (unwired)"); continue; }
+        const resolved = _walkMeshChain(wire.from.node, _mat4Identity(), null, 0);
+        if (!resolved) { console.log("  " + port + ": (resolution failed)"); continue; }
+        const leaf = resolved.node;
+        const lp = leaf.params || {};
+        // Build the mesh to inspect vert data (cheap, cached).
+        let buf = null;
+        try { buf = (typeof _buildMeshData === "function") ? _buildMeshData(leaf) : null; } catch (_) {}
+        let vc = 0, zMin = NaN, zMax = NaN, xMin = NaN, xMax = NaN, yMin = NaN, yMax = NaN;
+        if (buf && buf.verts) {
+          vc = buf.verts.length / 11;
+          for (let i = 0; i < buf.verts.length; i += 11) {
+            const x = buf.verts[i], y = buf.verts[i + 1], z = buf.verts[i + 2];
+            if (i === 0) { xMin = xMax = x; yMin = yMax = y; zMin = zMax = z; }
+            else {
+              if (x < xMin) xMin = x; if (x > xMax) xMax = x;
+              if (y < yMin) yMin = y; if (y > yMax) yMax = y;
+              if (z < zMin) zMin = z; if (z > zMax) zMax = z;
+            }
+          }
+        }
+        // Translate-from-transform: read xyz components of the
+        // 4x4 (column-major) transform matrix.
+        const tx = resolved.transform ? resolved.transform[12] : 0;
+        const ty = resolved.transform ? resolved.transform[13] : 0;
+        const tz = resolved.transform ? resolved.transform[14] : 0;
+        const finalZ = (zMin + zMax) * 0.5 + tz;
+        // Texture state for sprite-pipeline mesh types.
+        let texInfo = "—";
+        if (leaf.type === "Sprite" || leaf.type === "TileSpriteOverlay" ||
+            leaf.type === "ParallaxLayer2D" || leaf.type === "SpriteScatter2D") {
+          const e = (typeof _resolveSpriteTextureEntry === "function") ? _resolveSpriteTextureEntry(leaf) : null;
+          if (!e) texInfo = "(no wire)";
+          else texInfo = e.state + (e.view ? " " + e.width + "×" + e.height : "");
+        }
+        console.log("  " + port + ": " + leaf.type + "#" + leaf.id +
+          "  verts=" + vc +
+          "  vertZ=[" + fmt(zMin) + "," + fmt(zMax) + "]" +
+          (tz !== 0 ? "  +tz=" + fmt(tz) : "") +
+          " => final≈" + fmt(finalZ) +
+          "  x=[" + fmt(xMin + tx) + "," + fmt(xMax + tx) + "]" +
+          "  y=[" + fmt(yMin + ty) + "," + fmt(yMax + ty) + "]" +
+          "  tex=" + texInfo);
+        out.push({
+          port, leafType: leaf.type, leafId: leaf.id, vertCount: vc,
+          zMin, zMax, tx, ty, tz, finalZ,
+          worldRect: { xMin: xMin + tx, xMax: xMax + tx, yMin: yMin + ty, yMax: yMax + ty },
+          texture: texInfo
+        });
+      }
+    }
+    return out;
+  }
+
+  function assets() {
+    if (typeof Assets === "undefined") { console.log("[debug.assets] Assets not initialized"); return null; }
+    const sprites = Assets.list({ type: "sprite" }) || [];
+    const folders = Assets.list({ type: "folder" }) || [];
+    console.log("[debug.assets] " + sprites.length + " sprites, " + folders.length + " folders");
+    for (const s of sprites) {
+      console.log("  sprite '" + s.name + "' " + s.width + "×" + s.height +
+        "  framesX=" + s.framesX + " framesY=" + s.framesY +
+        "  blob=" + (s.blob ? s.blob.size + "B" : "missing") +
+        "  source=" + (s.source || "?"));
+    }
+    return { sprites: sprites.length, folders: folders.length };
+  }
+
+  function scene() {
+    body();
+    camera();
+    assets();
+    meshes();
+  }
+
+  function all() {
+    console.group("gammaDebug.all()");
+    scene();
+    console.groupEnd();
+  }
+
+  return { body, camera, meshes, assets, scene, all };
+})();
+if (typeof window !== "undefined") window.gammaDebug = gammaDebug;
+
 /* ─── Assets tab ────────────────────────────────────────────────── */
 /* Connection registry. "local-idb" is always-on — represents the
  * IDB-stored audio assets the rest of the editor already manages.
