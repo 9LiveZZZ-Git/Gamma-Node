@@ -71311,6 +71311,27 @@ function _buildSpriteScatter2D(node) {
  *   '3'             -- color3 (default: stone gray)
  *   '4'             -- color4 (default: gold)
  *   any other char  -- color1 (lenient default) */
+/* True iff a Tilemap2D node's params resolve to the encoder's
+ * "textured tileset" path. Mirrors the decision in _buildTilemap2D
+ * (tileset URL non-empty AND tileMap parses to a non-array object).
+ * The sprite-pipeline dispatch in _encodeScenePass uses this so the
+ * pipeline selection always matches the UVs the mesh was built with
+ * -- otherwise a mismatch routes vertex-color [0,1]^2 UVs through
+ * the texture sampler and renders the whole sheet per cell. */
+function _tilemap2dUsesTileset(node) {
+  if (!node || node.type !== "Tilemap2D") return false;
+  const p = node.params;
+  if (!p || typeof p.tileset !== "string" || !p.tileset.length) return false;
+  if (p.tileMap && typeof p.tileMap === "object" && !Array.isArray(p.tileMap)) return true;
+  if (typeof p.tileMap === "string" && p.tileMap.length > 0) {
+    try {
+      const parsed = JSON.parse(p.tileMap);
+      return !!(parsed && typeof parsed === "object" && !Array.isArray(parsed));
+    } catch (_) { return false; }
+  }
+  return false;
+}
+
 function _buildTilemap2D(node) {
   const p = node.params || {};
   const data = (typeof p.tileData === "string") ? p.tileData : "";
@@ -71408,8 +71429,32 @@ function _buildTilemap2D(node) {
           x1, y1, zPos,   1, 1, 1,   0, 0, 1,   u1, topV,
           x0, y1, zPos,   1, 1, 1,   0, 0, 1,   u0, topV
         );
+      } else if (useTileset) {
+        // Bug fix v0.3.458 -- when the mesh is textured (sprite
+        // pipeline) but this char isn't in tileMap, we MUST NOT emit
+        // full [0,1] UVs: that would sample the entire tileset sheet
+        // into the cell and tint it with the palette color, producing
+        // the "every cell shows the whole sheet" glitch. Instead emit
+        // a degenerate point-UV at (0,0): the sprite shader samples a
+        // single pixel of the sheet, multiplied by the palette tint,
+        // giving a recognisable solid-color marker quad (still visible
+        // as a '4'/'5' pickup/goal hint) without bleeding the sheet.
+        let pi = 0;
+        if      (ch === "1" || ch === "#") pi = 0;
+        else if (ch === "2")               pi = 1;
+        else if (ch === "3")               pi = 2;
+        else if (ch === "4")               pi = 3;
+        else if (ch === "5")               pi = 4;
+        const col = palette[pi];
+        verts.push(
+          x0, y0, zPos,   col[0], col[1], col[2],   0, 0, 1,   0, 0,
+          x1, y0, zPos,   col[0], col[1], col[2],   0, 0, 1,   0, 0,
+          x1, y1, zPos,   col[0], col[1], col[2],   0, 0, 1,   0, 0,
+          x0, y1, zPos,   col[0], col[1], col[2],   0, 0, 1,   0, 0
+        );
       } else {
-        // Vertex-color path (legacy / fallback for chars not in tileMap).
+        // Vertex-color path (no tileset configured). Goes through the
+        // mesh pipeline downstream so full [0,1] UVs are harmless.
         let pi = 0;
         if      (ch === "1" || ch === "#") pi = 0;
         else if (ch === "2")               pi = 1;
@@ -74022,7 +74067,7 @@ function _encodeScenePass(enc, entry) {
         || m.node.type === "TileSpriteOverlay"
         || m.node.type === "ParallaxLayer2D"
         || m.node.type === "SpriteScatter2D"
-        || (m.node.type === "Tilemap2D" && m.node.params && typeof m.node.params.tileset === "string" && m.node.params.tileset.length)
+        || (m.node.type === "Tilemap2D" && _tilemap2dUsesTileset(m.node))
       ) && buf && buf.vertexBuffer) {
       const texEntry = (typeof _resolveSpriteTextureEntry === "function")
         ? _resolveSpriteTextureEntry(m.node) : null;
@@ -90488,8 +90533,21 @@ function _lvlOpen(nodeId) {
     layers: JSON.parse(JSON.stringify(layers)),
     // Per-layer-idx painter state (active brush, painting flag).
     // Lives only while the modal is open; not persisted to the patch.
-    paintState: {}
+    paintState: {},
+    // Per-layer-idx scatter canvas state (drag/hover, cached bitmap).
+    scatterState: {},
+    // Per-layer-idx ephemeral state. _prevTileSize is captured here
+    // (not on layer itself) so it doesn't leak into the saved JSON.
+    layerState: {}
   };
+  // Seed _prevTileSize for tilemap layers so the first tileSize edit
+  // can compare against the open-time value (Phase 3.1 auto-resize).
+  for (let i = 0; i < layers.length; i++) {
+    const l = layers[i];
+    if (l && l.type === "tilemap") {
+      modal._lvl.layerState[i] = { _prevTileSize: (typeof l.tileSize === "number" && l.tileSize > 0) ? l.tileSize : 1 };
+    }
+  }
   document.getElementById("lvl-status").textContent =
     "Level2D#" + node.id + " — " + layers.length + " layer(s)";
   _lvlRenderList();
@@ -90767,6 +90825,25 @@ function _lvlWireCard(idx) {
       if (Number.isFinite(v)) _lvlSetField(idx, "depthZ", v);
     });
   });
+  // Phase 3.1 auto-resize: on tileSize blur, if value changed since
+  // open/last-commit, nearest-neighbor rescale tileData so the world
+  // extent (cols*ts × rows*ts) is preserved. tileSize=1 -> 0.1 grows
+  // a 17x8 grid to 170x80 etc. Uses change event so we don't fire
+  // mid-keystroke ("0.1" passes through "0" first).
+  if (lvl && lvl.layers[idx] && lvl.layers[idx].type === "tilemap") {
+    const tsInp = card.querySelector('input[data-field="tileSize"]');
+    if (tsInp) {
+      tsInp.addEventListener("change", () => {
+        const newSize = parseFloat(tsInp.value);
+        if (!Number.isFinite(newSize) || newSize <= 0) return;
+        const layerState = (lvl.layerState && lvl.layerState[idx]) || null;
+        const oldSize = layerState ? layerState._prevTileSize : newSize;
+        if (Math.abs(newSize / oldSize - 1) < 1e-6) return;
+        _lvlResizeTileDataForTileSize(idx, oldSize, newSize);
+        if (layerState) layerState._prevTileSize = newSize;
+      });
+    }
+  }
   // Generic field inputs (data-field on each input)
   card.querySelectorAll(".lvl-x-in").forEach(inp => {
     const field = inp.dataset.field;
@@ -90796,22 +90873,35 @@ function _lvlWireCard(idx) {
       _lvlSetField(idx, field, v);
       // Painter re-render hooks for tilemap fields that affect the
       // visual canvases. Cheap (~1-2ms each).
+      let touchedTilemap = false;
       if (inp.classList.contains("lvl-tileset-in")) {
         _lvlHydrateTilemapPainter(idx);
+        touchedTilemap = true;
       } else if (inp.classList.contains("lvl-tileset-shape-in")) {
         _lvlRenderTilesetPalette(idx);
         _lvlRenderTilemapPaint(idx);
+        touchedTilemap = true;
       } else if (inp.classList.contains("lvl-tilemap-in")) {
         _lvlRenderTilesetPalette(idx);
         _lvlRenderTilemapPaint(idx);
+        touchedTilemap = true;
       } else if (inp.classList.contains("lvl-tiledata-in")) {
         _lvlRenderTilemapPaint(idx);
+        touchedTilemap = true;
       } else if (inp.classList.contains("lvl-scatter-tex-in")) {
         _lvlHydrateScatterCanvas(idx);
       } else if (inp.classList.contains("lvl-scatter-cfg-in")) {
         _lvlRenderScatterCanvas(idx);
       } else if (inp.classList.contains("lvl-scatter-positions-in")) {
         _lvlRenderScatterCanvas(idx);
+      }
+      // Phase 3.2: tilemap changes invalidate scatter backdrops in
+      // the same Level2D. Refresh them so the user sees the latest
+      // terrain while placing sprites.
+      if (touchedTilemap) {
+        for (let li = 0; li < lvl.layers.length; li++) {
+          if (lvl.layers[li] && lvl.layers[li].type === "scatter") _lvlRenderScatterCanvas(li);
+        }
       }
     });
   });
@@ -90874,6 +90964,7 @@ function _lvlSave() {
  * ──────────────────────────────────────────────────────────────── */
 
 const _LVL_TILESET_BITMAP_CACHE = new Map();  // url -> Promise<ImageBitmap|null>
+const _LVL_TILESET_BITMAP_SYNC  = new Map();  // url -> ImageBitmap|null (after resolve, for sync render paths)
 
 /* Chars to auto-allocate when the user clicks a palette tile that
  * isn't yet bound to any char in tileMap. Skips '.' and ' ' (used
@@ -90886,26 +90977,92 @@ function _lvlLoadTilesetBitmap(url) {
   if (_LVL_TILESET_BITMAP_CACHE.has(url)) return _LVL_TILESET_BITMAP_CACHE.get(url);
   const p = (async () => {
     try {
+      let bmp = null;
       if (url.indexOf("asset:") === 0) {
         const name = url.substring("asset:".length);
         const rec = (typeof Assets !== "undefined" && Assets.findSpriteByName)
           ? Assets.findSpriteByName(name) : null;
-        if (!rec || !rec.blob) return null;
-        return await createImageBitmap(rec.blob);
+        if (!rec || !rec.blob) {
+          _LVL_TILESET_BITMAP_SYNC.set(url, null);
+          return null;
+        }
+        bmp = await createImageBitmap(rec.blob);
+      } else {
+        const res = await fetch(url);
+        if (!res.ok) { _LVL_TILESET_BITMAP_SYNC.set(url, null); return null; }
+        const blob = await res.blob();
+        bmp = await createImageBitmap(blob);
       }
-      // Real URL fallback (http/https/data). Same path as the
-      // editor's runtime _ensureImageURLTexture, just CPU-side.
-      const res = await fetch(url);
-      if (!res.ok) return null;
-      const blob = await res.blob();
-      return await createImageBitmap(blob);
+      _LVL_TILESET_BITMAP_SYNC.set(url, bmp);
+      return bmp;
     } catch (e) {
       console.warn("[level-editor] tileset bitmap load failed for " + url + ": " + e.message);
+      _LVL_TILESET_BITMAP_SYNC.set(url, null);
       return null;
     }
   })();
   _LVL_TILESET_BITMAP_CACHE.set(url, p);
   return p;
+}
+
+/* Sync accessor for render paths that can't await. Returns the
+ * ImageBitmap once the loader's Promise has resolved, null before. */
+function _lvlGetTilesetBitmapSync(url) {
+  if (!url) return null;
+  return _LVL_TILESET_BITMAP_SYNC.get(url) || null;
+}
+
+/* Phase 3.1 -- nearest-neighbor rescale of a tilemap layer's tileData
+ * when its tileSize changes, preserving world extent (cols*ts × rows*ts).
+ * Skips the resize if the result would exceed 1024 in either dimension
+ * (a hard cap so a typo like ts=0.001 doesn't churn a million cells). */
+function _lvlResizeTileDataForTileSize(idx, oldSize, newSize) {
+  const modal = document.getElementById("level2d-editor-modal");
+  const lvl = modal && modal._lvl;
+  if (!lvl) return;
+  const layer = lvl.layers[idx];
+  if (!layer) return;
+  if (!Number.isFinite(oldSize) || oldSize <= 0) return;
+  if (!Number.isFinite(newSize) || newSize <= 0) return;
+  const factor = oldSize / newSize;
+  if (Math.abs(factor - 1) < 1e-6) return;
+  const lines = (layer.tileData || "").split("\n");
+  const oldRows = Math.max(1, lines.length);
+  const oldCols = Math.max(1, lines.reduce((m, r) => Math.max(m, r.length), 1));
+  const newRows = Math.max(1, Math.round(oldRows * factor));
+  const newCols = Math.max(1, Math.round(oldCols * factor));
+  const MAX_DIM = 1024;
+  if (newRows > MAX_DIM || newCols > MAX_DIM) {
+    console.warn("[level-editor] tileSize " + oldSize + " -> " + newSize +
+      " would resize " + oldCols + "x" + oldRows + " -> " + newCols + "x" + newRows +
+      " (exceeds " + MAX_DIM + " cap); accepting size change without grid resize");
+    _lvlRenderTilemapPaint(idx);
+    return;
+  }
+  const newLines = new Array(newRows);
+  for (let r = 0; r < newRows; r++) {
+    const srcR = Math.min(oldRows - 1, Math.floor(r / factor));
+    const srcLine = lines[srcR] || "";
+    let outLine = "";
+    for (let c = 0; c < newCols; c++) {
+      const srcC = Math.min(oldCols - 1, Math.floor(c / factor));
+      outLine += srcLine[srcC] || ".";
+    }
+    newLines[r] = outLine;
+  }
+  layer.tileData = newLines.join("\n");
+  // Reflect into the RAW textarea (if mounted).
+  const ta = document.querySelector('textarea.lvl-tiledata-in[data-idx="' + idx + '"]');
+  if (ta) ta.value = layer.tileData;
+  _lvlRenderTilemapPaint(idx);
+  // Phase 3.2 -- if there's a scatter layer in this Level2D the
+  // backdrop just got bigger/smaller; re-render those canvases too.
+  for (let li = 0; li < lvl.layers.length; li++) {
+    if (lvl.layers[li] && lvl.layers[li].type === "scatter") _lvlRenderScatterCanvas(li);
+  }
+  console.log("[level-editor] tileSize " + oldSize + " -> " + newSize +
+    ": resized " + oldCols + "x" + oldRows + " -> " + newCols + "x" + newRows +
+    " (factor " + factor.toFixed(3) + ")");
 }
 
 function _lvlGetLayerPaintState(idx) {
@@ -91111,6 +91268,75 @@ function _lvlRenderTilemapPaint(idx) {
   ctx.stroke();
 }
 
+/* Phase 3.2 -- draw a tilemap layer into the scatter canvas using
+ * the scatter's world->screen projection. Used as a faded backdrop
+ * so the user can place scatter sprites onto the visible terrain.
+ * Mirrors _buildTilemap2D's world-position math: row 0 at +Y, cells
+ * centered on (c-cx)*ts + ox, (cy-r)*ts + oy with ts=tileSize. */
+function _lvlDrawTilemapBackdrop(ctx, layer, proj) {
+  const lines = (layer.tileData || "").split("\n");
+  const rows = lines.length;
+  if (rows === 0) return;
+  const cols = lines.reduce((m, r) => Math.max(m, r.length), 0);
+  if (cols === 0) return;
+  const ts = (typeof layer.tileSize === "number" && layer.tileSize > 0) ? layer.tileSize : 1;
+  const ox = (typeof layer.originX === "number") ? layer.originX : 0;
+  const oy = (typeof layer.originY === "number") ? layer.originY : 0;
+  const cx = (cols - 1) * 0.5;
+  const cy = (rows - 1) * 0.5;
+  let bmp = null, framesX = 1, framesY = 1, tileMap = null;
+  if (layer.tileset && layer.tileset.length) {
+    bmp = _lvlGetTilesetBitmapSync(layer.tileset);
+    framesX = Math.max(1, (layer.tilesetFramesX | 0) || 4);
+    framesY = Math.max(1, (layer.tilesetFramesY | 0) || 2);
+    if (layer.tileMap && typeof layer.tileMap === "object" && !Array.isArray(layer.tileMap)) {
+      tileMap = layer.tileMap;
+    } else if (typeof layer.tileMap === "string" && layer.tileMap.length) {
+      try { tileMap = JSON.parse(layer.tileMap); } catch (_) { tileMap = null; }
+    }
+  }
+  const palette = {
+    color1R: layer.color1R, color1G: layer.color1G, color1B: layer.color1B,
+    color2R: layer.color2R, color2G: layer.color2G, color2B: layer.color2B,
+    color3R: layer.color3R, color3G: layer.color3G, color3B: layer.color3B,
+    color4R: layer.color4R, color4G: layer.color4G, color4B: layer.color4B,
+    color5R: layer.color5R, color5G: layer.color5G, color5B: layer.color5B
+  };
+  const tileW = bmp ? bmp.width  / framesX : 0;
+  const tileH = bmp ? bmp.height / framesY : 0;
+  for (let r = 0; r < rows; r++) {
+    const line = lines[r] || "";
+    for (let c = 0; c < line.length; c++) {
+      const ch = line[c];
+      if (ch === "." || ch === " ") continue;
+      const wx = (c  - cx) * ts + ox;
+      const wy = (cy - r ) * ts + oy;
+      const wx0 = wx - ts * 0.5, wx1 = wx + ts * 0.5;
+      const wy0 = wy - ts * 0.5, wy1 = wy + ts * 0.5;
+      const a = proj.wToS(wx0, wy1);
+      const b = proj.wToS(wx1, wy0);
+      const sx0 = Math.min(a.sx, b.sx);
+      const sy0 = Math.min(a.sy, b.sy);
+      const ww  = Math.abs(b.sx - a.sx);
+      const hh  = Math.abs(b.sy - a.sy);
+      // Cull cells fully outside the canvas (cheap; matters when
+      // tileSize is tiny and the grid is huge).
+      if (sx0 + ww < 0 || sy0 + hh < 0 || sx0 > proj.W || sy0 > proj.H) continue;
+      if (bmp && tileMap && Object.prototype.hasOwnProperty.call(tileMap, ch)) {
+        const tIdx = tileMap[ch] | 0;
+        if (tIdx >= 0 && tIdx < framesX * framesY) {
+          const trow = Math.floor(tIdx / framesX);
+          const tcol = tIdx % framesX;
+          ctx.drawImage(bmp, tcol * tileW, trow * tileH, tileW, tileH, sx0, sy0, ww, hh);
+          continue;
+        }
+      }
+      ctx.fillStyle = _tmeColorForChar(ch, palette);
+      ctx.fillRect(sx0, sy0, ww, hh);
+    }
+  }
+}
+
 function _lvlUpdateBrushReadout(idx) {
   const ps = _lvlGetLayerPaintState(idx);
   const el = document.getElementById("lvl-brush-" + idx);
@@ -91303,8 +91529,18 @@ function _lvlSerializeScatterInstances(insts) {
  * since we don't apply DPR scaling for the editor canvases). */
 function _lvlScatterProjection(layer, insts, canvas) {
   const W = canvas.width, H = canvas.height;
+  // Phase 3.2 -- also fold tilemap-layer extents into the auto-fit
+  // bounds so the canvas frames the actual world even when this
+  // scatter layer has zero instances yet. Looks at sibling layers
+  // on the same Level2D via the open modal's working copy.
+  const modal = document.getElementById("level2d-editor-modal");
+  const lvl = modal && modal._lvl;
+  const sibTilemaps = (lvl && Array.isArray(lvl.layers))
+    ? lvl.layers.filter(l => l && l.type === "tilemap" && (l.tileData || "").length > 0)
+    : [];
+  const haveAnchors = insts.length > 0 || sibTilemaps.length > 0;
   let minX = -20, maxX = 20, minY = -4, maxY = 6;
-  if (insts.length) {
+  if (haveAnchors) {
     minX =  Infinity; maxX = -Infinity;
     minY =  Infinity; maxY = -Infinity;
     const defScale = (typeof layer.scale === "number" && layer.scale > 0) ? layer.scale : 1;
@@ -91312,6 +91548,18 @@ function _lvlScatterProjection(layer, insts, canvas) {
       const s = (i.scale != null) ? i.scale : defScale;
       minX = Math.min(minX, i.x - s); maxX = Math.max(maxX, i.x + s);
       minY = Math.min(minY, i.y);     maxY = Math.max(maxY, i.y + s);
+    }
+    for (const tm of sibTilemaps) {
+      const lines = (tm.tileData || "").split("\n");
+      const tRows = lines.length;
+      const tCols = lines.reduce((m, r) => Math.max(m, r.length), 0);
+      const ts = (typeof tm.tileSize === "number" && tm.tileSize > 0) ? tm.tileSize : 1;
+      const ox = (typeof tm.originX === "number") ? tm.originX : 0;
+      const oy = (typeof tm.originY === "number") ? tm.originY : 0;
+      const halfW = tCols * ts * 0.5;
+      const halfH = tRows * ts * 0.5;
+      minX = Math.min(minX, ox - halfW); maxX = Math.max(maxX, ox + halfW);
+      minY = Math.min(minY, oy - halfH); maxY = Math.max(maxY, oy + halfH);
     }
     const pad = 4;
     minX -= pad; maxX += pad;
@@ -91358,15 +91606,23 @@ async function _lvlHydrateScatterCanvas(idx) {
   const canvas = document.getElementById("lvl-scatter-" + idx);
   if (!canvas) return;
   const ss = _lvlGetLayerScatterState(idx);
+  // Load scatter texture + all tilemap backdrop tilesets in parallel.
+  // The sync bitmap cache is populated as each promise resolves, so
+  // the next _lvlRenderScatterCanvas pass can drawImage them.
+  const loads = [];
   if (layer.texture && layer.texture.length) {
-    const bmp = await _lvlLoadTilesetBitmap(layer.texture);
-    if (!document.getElementById("lvl-scatter-" + idx)) return;  // modal closed
-    ss.bitmap = bmp;
-    ss.bitmapURL = layer.texture;
+    loads.push(_lvlLoadTilesetBitmap(layer.texture).then(bmp => { ss.bitmap = bmp; ss.bitmapURL = layer.texture; }));
   } else {
     ss.bitmap = null;
     ss.bitmapURL = "";
   }
+  for (const other of lvl.layers) {
+    if (other && other.type === "tilemap" && other.tileset && other.tileset.length) {
+      loads.push(_lvlLoadTilesetBitmap(other.tileset));
+    }
+  }
+  await Promise.all(loads);
+  if (!document.getElementById("lvl-scatter-" + idx)) return;
   _lvlRenderScatterCanvas(idx);
 }
 
@@ -91429,6 +91685,18 @@ function _lvlRenderScatterCanvas(idx) {
     ctx.moveTo(0, sy + 0.5); ctx.lineTo(canvas.width, sy + 0.5);
   }
   ctx.stroke();
+  // Phase 3.2 -- tilemap backdrop. Faded so scatter sprites read
+  // clearly on top. Drawn in layer order (matches in-game depth
+  // sort, roughly) so parallax-style stacks make sense visually.
+  ctx.save();
+  ctx.globalAlpha = 0.55;
+  for (let li = 0; li < lvl.layers.length; li++) {
+    const other = lvl.layers[li];
+    if (other && other.type === "tilemap") {
+      _lvlDrawTilemapBackdrop(ctx, other, proj);
+    }
+  }
+  ctx.restore();
   // Each instance.
   const defScale = (typeof layer.scale === "number" && layer.scale > 0) ? layer.scale : 1;
   const defAx    = (typeof layer.anchorX === "number") ? layer.anchorX : 0.5;
