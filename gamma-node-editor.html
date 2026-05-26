@@ -11459,6 +11459,67 @@ public:
    *
    * Cameras: pair with OrthoCamera2D for pixel-perfect output,
    * or a Camera with mode=ortho for non-snapped scrolling. */
+
+  /* Sprint Level2D Phase 1a -- unified level container. One node
+   * holds an ordered list of layers (parallax / tilemap / scatter /
+   * future: objects). The encoder expansion in _resolveSceneMeshes
+   * detects Level2D and emits N synthetic per-layer mesh entries,
+   * so a single mesh1 wire to Scene2D draws the whole level instead
+   * of consuming 7+ mesh ports. depthZ + parallax + collide all in
+   * the per-layer JSON so the user controls z-ordering centrally.
+   *
+   * `layers` is a JSON string. Each layer object has at minimum
+   * `type` and `depthZ`; per-type fields mirror the existing
+   * ParallaxLayer2D / Tilemap2D / SpriteScatter2D params so the
+   * mesh builders work unchanged. Texture URLs live inline in the
+   * layer config (e.g. "texture": "asset:parallax-sky"); no need
+   * to wire ImageURL nodes per layer.
+   *
+   * Phase 1a ships the data model + encoder expansion only. Phases
+   * 1b -> 5 add the visual editor modal, tileset assets, scatter
+   * placement UI, chunked loading, and per-tile collision shapes. */
+  Level2D: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "mesh-gen",
+    ins: [
+      // The camera the parallax layers in this Level2D follow. If
+      // unwired, the parallax expansion auto-discovers the first
+      // OrthoCamera2D / Camera in the patch (same fallback the
+      // existing ParallaxLayer2D node uses).
+      { n: "camera", t: "camera" },
+      // JSON string. See _LEVEL2D_EXAMPLE for shape. Phase 1b will
+      // hide this behind a visual layer-list modal.
+      { n: "layers", t: "param" }
+    ],
+    outs: [{ n: "mesh", t: "mesh" }],
+    params: {
+      // Default: a single tilemap layer at z=0 with a small 16×8
+      // grid showing the data shape. User can replace via the
+      // upcoming Level Editor modal OR by editing the JSON in the
+      // props panel.
+      layers: JSON.stringify([
+        {
+          type: "tilemap",
+          name: "ground",
+          depthZ: 0,
+          collides: true,
+          tileSize: 1,
+          originX: 0, originY: 0,
+          tileData: "................\n................\n................\n................\n................\n................\n11111111111111111\n22222222222222222",
+          color1R: 0.30, color1G: 0.55, color1B: 0.35,
+          color2R: 0.42, color2G: 0.28, color2B: 0.18,
+          color3R: 0.55, color3G: 0.55, color3B: 0.62,
+          color4R: 0.96, color4G: 0.90, color4B: 0.78,
+          color5R: 0.92, color5G: 0.25, color5B: 0.30,
+          skipRenderChars: ""
+        }
+      ], null, 2)
+    },
+    methods: {},
+    description: "Unified 2D level container. One JSON-driven node holds an ordered list of layers (parallax bg / tilemap / scatter), each with its own depthZ + collision + parallax settings. The renderer expands it into per-layer meshes at draw time, so a single mesh1 wire to Scene2D draws the whole level (no more juggling 8 mesh slots). Phase 1a (this sprint) ships the data model + render expansion; Phase 1b+ will add the visual Level Editor modal, tileset assets, scatter placement UI, chunked loading for 1000+ col worlds, and per-tile collision shapes. Edit the `layers` JSON in the props pane to test before the modal lands."
+  },
+
   Scene2D: {
     category: "Visual", color: COLOR.visual, header: null,
     cppType: "",
@@ -48612,9 +48673,19 @@ function _renderPresetBitmap(preset) {
 /* Walk a Sprite node's `texture` wire to its source ImageURL, then
  * ensure the texture is loaded. Returns the cache entry (state may be
  * "loading"/"ready"/"error") or null if no wire or non-ImageURL
- * source. Called by the sprite encoder dispatch in plat-2a-render. */
+ * source. Called by the sprite encoder dispatch in plat-2a-render.
+ *
+ * Sprint Level2D Phase 1a: synthetic Level2D layer nodes don't have
+ * a `texture` wire -- the URL lives inline in the layer config.
+ * Detect via _levelLayer and resolve the URL directly. */
 function _resolveSpriteTextureEntry(spriteNode) {
-  if (!spriteNode || !state || !Array.isArray(state.edges)) return null;
+  if (!spriteNode) return null;
+  if (spriteNode._levelLayer && typeof spriteNode._levelLayer.texture === "string") {
+    const url = spriteNode._levelLayer.texture;
+    if (!url) return null;
+    return _ensureImageURLTexture(url);
+  }
+  if (!state || !Array.isArray(state.edges)) return null;
   const wire = state.edges.find(e =>
     e && e.to && e.to.node === spriteNode.id && e.to.port === "texture"
   );
@@ -57058,6 +57129,100 @@ function _buildMaterialDescriptor(matNode) {
   return null;
 }
 
+/* Sprint Level2D Phase 1a -- expand a Level2D into per-layer
+ * synthetic mesh entries. Each entry looks (to the rest of the
+ * encoder) like a regular Tilemap2D / ParallaxLayer2D / SpriteScatter2D
+ * node, so all existing mesh + sprite pipeline paths work unchanged.
+ * Synthetic node IDs are stable per (parentId, layerIdx) so
+ * Visual.meshBufferCache keys stay stable across renders.
+ *
+ * Returns an array of mesh entries (same shape as `resolved` in
+ * _resolveSceneMeshes). Empty array if the layers JSON is empty
+ * or malformed (logs the parse error once per node). */
+function _expandLevel2DLayers(levelNode, baseTransform, baseMaterial) {
+  if (!levelNode) return [];
+  const def = TYPES[levelNode.type];
+  if (!def) return [];
+  const layersRaw = (levelNode.params && typeof levelNode.params.layers === "string")
+    ? levelNode.params.layers : "[]";
+  let layers;
+  try {
+    layers = JSON.parse(layersRaw);
+  } catch (e) {
+    if (!levelNode._lvlParseErrLogged) {
+      levelNode._lvlParseErrLogged = true;
+      console.warn("[Level2D " + levelNode.id + "] layers JSON parse failed: " + e.message);
+    }
+    return [];
+  }
+  if (!Array.isArray(layers)) return [];
+  // Camera resolution: if Level2D.camera is wired, use it; else
+  // fall back to the first OrthoCamera2D / Camera in the patch.
+  // (Same fallback logic ParallaxLayer2D used standalone.)
+  let camNodeId = null;
+  if (Array.isArray(state.edges)) {
+    const wire = state.edges.find(e =>
+      e && e.to && e.to.node === levelNode.id && e.to.port === "camera"
+    );
+    if (wire && wire.from) {
+      const src = state.nodes.find(n => n && n.id === wire.from.node);
+      if (src) camNodeId = src.id;
+    }
+  }
+  if (!camNodeId) {
+    const cam = state.nodes.find(n => n && (n.type === "OrthoCamera2D" || n.type === "Camera" || n.type === "FPCamera"));
+    if (cam) camNodeId = cam.id;
+  }
+  const out = [];
+  const TYPE_MAP = {
+    tilemap:  "Tilemap2D",
+    parallax: "ParallaxLayer2D",
+    scatter:  "SpriteScatter2D"
+  };
+  for (let i = 0; i < layers.length; i++) {
+    const layer = layers[i];
+    if (!layer || typeof layer !== "object") continue;
+    const synthType = TYPE_MAP[layer.type];
+    if (!synthType) {
+      console.warn("[Level2D " + levelNode.id + "] layer " + i + " unknown type: " + layer.type);
+      continue;
+    }
+    // Synthetic node id: stable per (parent, layerIdx, type). The
+    // mesh cache uses this to key its GPU buffers.
+    const synthId = levelNode.id + ":lyr" + i + ":" + synthType;
+    // Build the synthetic params by copying the layer fields. The
+    // existing build functions (_buildTilemap2D etc.) read these by
+    // name, so as long as the per-type fields are present this Just
+    // Works.
+    const synthParams = Object.assign({}, layer);
+    // Strip non-param fields so the cache key is clean.
+    delete synthParams.type;
+    delete synthParams.name;
+    delete synthParams.collides;
+    // Synthetic node object. Marked with _levelLayer so the sprite
+    // encoder + texture resolver can find the embedded URL / camera
+    // ref without walking wires.
+    const synthNode = {
+      id: synthId,
+      type: synthType,
+      params: synthParams,
+      _isSynthetic: true,
+      _levelLayer: layer,
+      _levelParentId: levelNode.id,
+      _levelCameraNodeId: camNodeId   // for ParallaxLayer2D builds
+    };
+    out.push({
+      node: synthNode,
+      def: TYPES[synthType],
+      transform: baseTransform,
+      material: baseMaterial,
+      _level2DLayer: true,
+      _level2DLayerName: layer.name || ("layer" + i)
+    });
+  }
+  return out;
+}
+
 function _resolveSceneMeshes(sceneNode) {
   const meshes = [];
   const def = TYPES[sceneNode.type];
@@ -57070,6 +57235,15 @@ function _resolveSceneMeshes(sceneNode) {
     if (!wire || !wire.from) continue;
     const resolved = _walkMeshChain(wire.from.node, _mat4Identity(), null, 0);
     if (!resolved) continue;
+    // Level2D Phase 1a: expand into per-layer synthetic entries.
+    // The Level2D node itself emits nothing; its layers become
+    // independent mesh entries that the existing sprite + mesh
+    // pipelines handle as if they were wired one-per-slot.
+    if (resolved.node && resolved.node.type === "Level2D") {
+      const layerEntries = _expandLevel2DLayers(resolved.node, resolved.transform, resolved.material);
+      for (const e of layerEntries) meshes.push(e);
+      continue;
+    }
     meshes.push(resolved);
 
     // Phase 8 sprint 8-7b: when the resolved leaf is a PlanetMesh,
@@ -63266,17 +63440,20 @@ function _meshCacheKey(node) {
       // we don't rebuild the mesh every render frame for static
       // cameras. Also include canvas dims so a resize rebuilds.
       let cposX = 0, cposY = 0;
-      if (state && Array.isArray(state.edges)) {
+      let camSrc = null;
+      if (node._levelCameraNodeId) {
+        camSrc = state.nodes.find(n => n && n.id === node._levelCameraNodeId);
+      } else if (state && Array.isArray(state.edges)) {
         const wire = state.edges.find(e =>
           e && e.to && e.to.node === node.id && e.to.port === "camera"
         );
         if (wire && wire.from) {
-          const src = state.nodes.find(n => n && n.id === wire.from.node);
-          if (src && src.params) {
-            cposX = src.params.posX || 0;
-            cposY = src.params.posY || 0;
-          }
+          camSrc = state.nodes.find(n => n && n.id === wire.from.node);
         }
+      }
+      if (camSrc && camSrc.params) {
+        cposX = camSrc.params.posX || 0;
+        cposY = camSrc.params.posY || 0;
       }
       const qX = Math.round(cposX * 20) / 20;   // 0.05 unit quantum
       const qY = Math.round(cposY * 20) / 20;
@@ -70718,9 +70895,15 @@ function _buildTileSpriteOverlay(node) {
  * want to be pinned to specific world Y bands. */
 function _buildParallaxLayer2D(node) {
   const p = node.params || {};
-  // Find wired camera (or first OrthoCamera2D in patch).
+  // Find wired camera (or first OrthoCamera2D in patch). For
+  // synthetic Level2D layers, the parent Level2D already resolved
+  // the camera once -- node._levelCameraNodeId points at it so we
+  // don't re-walk wires per layer.
   let camNode = null;
-  if (state && Array.isArray(state.edges)) {
+  if (node._levelCameraNodeId) {
+    camNode = state.nodes.find(n => n && n.id === node._levelCameraNodeId);
+  }
+  if (!camNode && state && Array.isArray(state.edges)) {
     const wire = state.edges.find(e =>
       e && e.to && e.to.node === node.id && e.to.port === "camera"
     );
@@ -73541,14 +73724,22 @@ function _encodeScenePass(enc, entry) {
           // (default nearest = pixel-art crisp).
           let filterMode = "nearest";
           let wrapMode   = "clamp";
-          const texWire = state && Array.isArray(state.edges) && state.edges.find(e =>
-            e && e.to && e.to.node === m.node.id && e.to.port === "texture"
-          );
-          if (texWire && texWire.from) {
-            const imgNode = state.nodes.find(n => n && n.id === texWire.from.node);
-            if (imgNode && imgNode.params) {
-              if (typeof imgNode.params.filterMode === "string") filterMode = imgNode.params.filterMode;
-              if (typeof imgNode.params.wrapMode   === "string") wrapMode   = imgNode.params.wrapMode;
+          // Level2D Phase 1a: synthetic layer nodes carry filter/wrap
+          // inline in their _levelLayer config; everything else walks
+          // the texture wire to the upstream ImageURL.
+          if (m.node._levelLayer) {
+            if (typeof m.node._levelLayer.filterMode === "string") filterMode = m.node._levelLayer.filterMode;
+            if (typeof m.node._levelLayer.wrapMode   === "string") wrapMode   = m.node._levelLayer.wrapMode;
+          } else {
+            const texWire = state && Array.isArray(state.edges) && state.edges.find(e =>
+              e && e.to && e.to.node === m.node.id && e.to.port === "texture"
+            );
+            if (texWire && texWire.from) {
+              const imgNode = state.nodes.find(n => n && n.id === texWire.from.node);
+              if (imgNode && imgNode.params) {
+                if (typeof imgNode.params.filterMode === "string") filterMode = imgNode.params.filterMode;
+                if (typeof imgNode.params.wrapMode   === "string") wrapMode   = imgNode.params.wrapMode;
+              }
             }
           }
           const sampler = _ensureSpriteSampler(filterMode, wrapMode);
