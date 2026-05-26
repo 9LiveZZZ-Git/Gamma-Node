@@ -7576,8 +7576,9 @@
           <div>
             <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); letter-spacing:0.06em; margin-bottom:4px;">BACKEND</div>
             <select id="ss-backend" style="width:100%; padding:5px 6px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10.5px;">
-              <option value="llm-canvas">LLM → JS canvas (low quality, free)</option>
+              <option value="compile-server-sd">Compile-server SD (Z-Image-Turbo)</option>
               <option value="local-sd-a1111">Local SD (A1111 webui)</option>
+              <option value="llm-canvas">LLM → JS canvas (low quality, free)</option>
             </select>
           </div>
           <div id="ss-sd-config" style="display:none;">
@@ -42208,9 +42209,14 @@ function defaultAiSettings() {
     model: "onnx-community/gemma-4-E2B-it-ONNX",
     anthropicKey: "",
     compileServerUrl: "",
-    // Sprite Studio settings (SpriteCreator-1 / sd-1).
-    spriteBackend: "llm-canvas",                  // 'llm-canvas' | 'local-sd-a1111'
-    sdEndpoint:    "http://localhost:7860",       // A1111 webui base URL
+    // Sprite Studio settings (SpriteCreator-1 / sd-1 / sd-2).
+    // Default = compile-server-sd because it's the bundled path; users
+    // who installed via scripts/install-sd.sh get one-click generation.
+    // A1111 / LLM remain as fallbacks if the compile-server doesn't have
+    // the SD worker installed yet.
+    spriteBackend: "compile-server-sd",           // 'compile-server-sd' | 'local-sd-a1111' | 'llm-canvas'
+    sdModel:       "z-image-turbo",               // compile-server model name (z-image-turbo | sdxl | flux2-klein)
+    sdEndpoint:    "http://localhost:7860",       // A1111 webui base URL (a1111 backend only)
     sdSteps:       20,                             // sampling steps (quality vs speed)
     sdSampler:     "DPM++ 2M Karras"              // A1111 sampler name
   };
@@ -86531,6 +86537,55 @@ const _SS_SD_STYLE_PROMPTS = {
   gameboy: "pixel art, Game Boy DMG style, 4-shade green palette (#0f380f, #306230, #8bac0f, #9bbc0f), hard edges",
   modern:  "pixel art, modern indie game style, crisp pixels, limited palette"
 };
+/* Sprint sprite-sd-2 -- call the compile-server's /sprite-gen route,
+ * which proxies to a persistent Python SD worker. The server returns a
+ * raw PNG; we just package it into a Blob.
+ *
+ * Endpoint URL: compile-server's base (auto-detected by the existing
+ * compileServer.detect path; default http://127.0.0.1:8765).
+ *
+ * Model + LoRA defaults live server-side per the MODELS map in
+ * sd-route.js; the browser only sends `model`, `prompt`, `width`,
+ * `height`, `steps?`, `seed?`, and the server fills the rest. */
+async function _ssCallCompileServerSD(serverBase, model, prompt, stylePreset, nativeSize, steps) {
+  const styleNote = _SS_SD_STYLE_PROMPTS[stylePreset] || _SS_SD_STYLE_PROMPTS.snes;
+  const fullPrompt = styleNote + ", " + prompt + ", centered, plain background";
+  const url = serverBase.replace(/\/+$/, "") + "/sprite-gen";
+  const body = {
+    model,
+    prompt: fullPrompt,
+    negative: _SS_SD_NEGATIVE,
+    width: nativeSize,
+    height: nativeSize,
+    steps: Math.max(1, Math.floor(steps))
+  };
+  let res;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
+    });
+  } catch (e) {
+    throw new Error("Cannot reach compile-server at " + serverBase
+      + " — is `gamma-compile-server` running and has scripts/install-sd.sh been run? " + (e.message || e));
+  }
+  if (!res.ok) {
+    let detail = res.statusText;
+    try {
+      const j = await res.json();
+      detail = j.error || JSON.stringify(j);
+    } catch (_) {}
+    throw new Error("compile-server /sprite-gen " + res.status + ": " + detail);
+  }
+  const elapsedMs = res.headers.get("X-SD-Elapsed-Ms");
+  const device = res.headers.get("X-SD-Device");
+  if (elapsedMs || device) {
+    console.log("[sprite-studio] SD generated in " + elapsedMs + "ms on " + device);
+  }
+  return await res.blob();
+}
+
 async function _ssCallA1111(endpoint, prompt, stylePreset, nativeSize, steps, sampler) {
   const url = (endpoint || "http://localhost:7860").replace(/\/+$/, "") + "/sdapi/v1/txt2img";
   const styleNote = _SS_SD_STYLE_PROMPTS[stylePreset] || _SS_SD_STYLE_PROMPTS.snes;
@@ -86736,7 +86791,23 @@ function _ssInstall() {
       genBtn.disabled = true;
       try {
         let blob = null;
-        if (backend === "local-sd-a1111") {
+        if (backend === "compile-server-sd") {
+          // Bundled SD via compile-server (the default for users who
+          // ran scripts/install-sd.sh). Uses model defaults set
+          // server-side; here we just send prompt + dims + steps.
+          const serverBase = (typeof localServerEndpoint === "string" && localServerEndpoint)
+            ? localServerEndpoint
+            : "http://127.0.0.1:8765";
+          const sheetW = w, sheetH = h;
+          const nativeSize = Math.min(1024, Math.max(256, _ssNextPow2(Math.max(sheetW, sheetH) * 4)));
+          const model = aiSettings.sdModel || "z-image-turbo";
+          const steps = parseInt(document.getElementById("ss-sd-steps").value, 10) || 9;
+          _ssStatus("compile-server SD (" + model + ") rendering " + nativeSize + "×" + nativeSize + "…", "thinking");
+          const raw = await _ssCallCompileServerSD(serverBase, model, description, stylePreset, nativeSize, steps);
+          _ssStatus("Downsampling to " + sheetW + "×" + sheetH + "…", "thinking");
+          blob = await _ssDownsampleBlob(raw, sheetW, sheetH);
+          document.getElementById("ss-code").value = "// compile-server SD\n// model: " + model + "\n// prompt: " + description + "\n// native " + nativeSize + " → sprite " + sheetW + "×" + sheetH;
+        } else if (backend === "local-sd-a1111") {
           // Persist endpoint + sampler settings.
           const endpoint = document.getElementById("ss-sd-endpoint").value.trim() || "http://localhost:7860";
           const steps = parseInt(document.getElementById("ss-sd-steps").value, 10) || 20;
@@ -86794,11 +86865,19 @@ function _ssInstall() {
     const sdConfig = document.getElementById("ss-sd-config");
     const helpEl = document.getElementById("ss-help");
     const updateBackendUI = () => {
-      const isSD = backendEl.value === "local-sd-a1111";
-      if (sdConfig) sdConfig.style.display = isSD ? "block" : "none";
-      if (helpEl) helpEl.innerHTML = isSD
-        ? "Calls AUTOMATIC1111 webui at the endpoint above. Make sure it's running with <code>--api</code> (and <code>--cors-allow-origins=*</code> if browser blocks it). Output renders at native size then downsamples to the sprite dims using nearest-neighbor."
-        : "Uses the LLM provider set in <em>User DSP → ⚙</em>. Default: Claude API. Output runs as JS canvas paint code in this page. No corporate-IP references in the prompt.";
+      const b = backendEl.value;
+      const isA1111 = b === "local-sd-a1111";
+      const isCSSD  = b === "compile-server-sd";
+      if (sdConfig) sdConfig.style.display = isA1111 ? "block" : "none";
+      if (helpEl) {
+        if (isCSSD) {
+          helpEl.innerHTML = "Calls the local <strong>gamma-compile-server</strong>'s <code>/sprite-gen</code> route. Uses bundled <strong>Z-Image-Turbo</strong> + Pixel Art LoRA. Make sure you ran <code>scripts/install-sd.sh</code> in the compile-server checkout. First gen pays the model-load cost (~30–60s on Apple Silicon); subsequent ones are fast.";
+        } else if (isA1111) {
+          helpEl.innerHTML = "Calls AUTOMATIC1111 webui at the endpoint above. Make sure it's running with <code>--api</code> (and <code>--cors-allow-origins=*</code> if browser blocks it). Output renders at native size then downsamples to the sprite dims using nearest-neighbor.";
+        } else {
+          helpEl.innerHTML = "Uses the LLM provider set in <em>User DSP → ⚙</em>. Default: Claude API. Output runs as JS canvas paint code in this page. No corporate-IP references in the prompt.";
+        }
+      }
     };
     backendEl.addEventListener("change", updateBackendUI);
     backendEl._ssUpdateUI = updateBackendUI;
