@@ -90485,7 +90485,10 @@ function _lvlOpen(nodeId) {
   modal._lvl = {
     nodeId,
     // Deep clone so cancel discards changes.
-    layers: JSON.parse(JSON.stringify(layers))
+    layers: JSON.parse(JSON.stringify(layers)),
+    // Per-layer-idx painter state (active brush, painting flag).
+    // Lives only while the modal is open; not persisted to the patch.
+    paintState: {}
   };
   document.getElementById("lvl-status").textContent =
     "Level2D#" + node.id + " — " + layers.length + " layer(s)";
@@ -90571,6 +90574,15 @@ function _lvlRenderList() {
   wrap.innerHTML = lvl.layers.map((layer, idx) => _lvlRenderCard(layer, idx)).join("");
   // Wire reorder / delete / field-edit handlers on each card.
   for (let idx = 0; idx < lvl.layers.length; idx++) _lvlWireCard(idx);
+  // Phase 2b: async-hydrate the tilemap painter for any tilemap
+  // layer. Fire-and-forget; await happens inside the hydrate fn.
+  for (let idx = 0; idx < lvl.layers.length; idx++) {
+    const layer = lvl.layers[idx];
+    if (layer && layer.type === "tilemap") {
+      _lvlWireTilemapPainter(idx);
+      _lvlHydrateTilemapPainter(idx);
+    }
+  }
 }
 
 function _lvlRenderCard(layer, idx) {
@@ -90639,13 +90651,15 @@ function _lvlRenderTilemapFields(layer, idx) {
   const data = (layer.tileData || "");
   const rows = data.split("\n").length;
   const cols = data.split("\n").reduce((m, r) => Math.max(m, r.length), 0);
-  // Phase 2 -- tileMap is a JSON object {"1":0, "2":1, ...}. Show
-  // it as a single-line JSON string in the UI; user can re-edit
-  // directly until Phase 2b lands the click-paint palette.
   const tileMapStr = (typeof layer.tileMap === "object" && layer.tileMap !== null)
     ? JSON.stringify(layer.tileMap)
     : (typeof layer.tileMap === "string" ? layer.tileMap : "");
   const tilesetEnabled = !!(layer.tileset && layer.tileset.length);
+  // Phase 2b -- visual painter. Two canvases (palette + paint grid).
+  // Hydrated asynchronously by _lvlHydrateTilemapPainter once the
+  // tileset bitmap loads. Always emit the painter container so
+  // toggling tileset on/off rebinds without a full card rerender;
+  // hydrate writes a "set tileset" placeholder when empty.
   return '<div style="margin-top:6px;">' +
     '<div style="display:grid; grid-template-columns: 1fr 1fr; gap:6px 12px;">' +
       '<div><div class="lvl-label">TILE SIZE (world units)</div><input class="lvl-x-in" data-idx="' + idx + '" data-field="tileSize" type="number" step="0.1" value="' + (layer.tileSize ?? 1) + '" /></div>' +
@@ -90659,21 +90673,39 @@ function _lvlRenderTilemapFields(layer, idx) {
       '<div><div class="lvl-label">SKIP RENDER CHARS</div><input class="lvl-x-in" data-idx="' + idx + '" data-field="skipRenderChars" type="text" value="' + escapeAttr(layer.skipRenderChars || "") + '" /></div>' +
     '</div>' +
     '<div style="margin-top:8px; padding:8px; border:1px dashed var(--instr-rule); border-radius:3px; background:rgba(80,120,80,0.05);">' +
-      '<div style="font-family:var(--font-mono); font-size:9.5px; color:' + (tilesetEnabled ? "#9bd0a0" : "var(--text-3)") + '; letter-spacing:0.06em; margin-bottom:6px;">TILESET  (Phase 2 textured rendering ' + (tilesetEnabled ? "ACTIVE" : "OFF -- clear tileset for vertex-color squares") + ')</div>' +
+      '<div style="font-family:var(--font-mono); font-size:9.5px; color:' + (tilesetEnabled ? "#9bd0a0" : "var(--text-3)") + '; letter-spacing:0.06em; margin-bottom:6px;">TILESET  ·  textured rendering ' + (tilesetEnabled ? "ACTIVE" : "OFF (clear tileset URL = vertex-color squares)") + '</div>' +
       '<div style="display:grid; grid-template-columns: 2fr 1fr 1fr; gap:6px 12px;">' +
-        '<div><div class="lvl-label">TILESET (asset URL)</div><input class="lvl-x-in" data-idx="' + idx + '" data-field="tileset" type="text" placeholder="asset:demo-tileset" value="' + escapeAttr(layer.tileset || "") + '" /></div>' +
-        '<div><div class="lvl-label">FRAMES-X</div><input class="lvl-x-in" data-idx="' + idx + '" data-field="tilesetFramesX" type="number" step="1" min="1" value="' + (layer.tilesetFramesX ?? 4) + '" /></div>' +
-        '<div><div class="lvl-label">FRAMES-Y</div><input class="lvl-x-in" data-idx="' + idx + '" data-field="tilesetFramesY" type="number" step="1" min="1" value="' + (layer.tilesetFramesY ?? 2) + '" /></div>' +
+        '<div><div class="lvl-label">TILESET (asset URL)</div><input class="lvl-x-in lvl-tileset-in" data-idx="' + idx + '" data-field="tileset" type="text" placeholder="asset:demo-tileset" value="' + escapeAttr(layer.tileset || "") + '" /></div>' +
+        '<div><div class="lvl-label">FRAMES-X</div><input class="lvl-x-in lvl-tileset-shape-in" data-idx="' + idx + '" data-field="tilesetFramesX" type="number" step="1" min="1" value="' + (layer.tilesetFramesX ?? 4) + '" /></div>' +
+        '<div><div class="lvl-label">FRAMES-Y</div><input class="lvl-x-in lvl-tileset-shape-in" data-idx="' + idx + '" data-field="tilesetFramesY" type="number" step="1" min="1" value="' + (layer.tilesetFramesY ?? 2) + '" /></div>' +
       '</div>' +
+    '</div>' +
+    '<div id="lvl-painter-' + idx + '" style="margin-top:8px;">' +
+      '<div style="display:flex; align-items:flex-start; gap:14px; flex-wrap:wrap;">' +
+        '<div style="flex:0 0 auto;">' +
+          '<div class="lvl-label">PALETTE  ·  click to pick brush  ·  green = active</div>' +
+          '<canvas id="lvl-pal-' + idx + '" style="display:block; image-rendering:pixelated; cursor:pointer; background:#0e1218; border:1px solid var(--instr-rule); border-radius:2px;"></canvas>' +
+          '<div id="lvl-brush-' + idx + '" style="margin-top:4px; font-family:var(--font-mono); font-size:9.5px; color:var(--text-3);">brush: —</div>' +
+        '</div>' +
+        '<div style="flex:1 1 auto; min-width:240px;">' +
+          '<div class="lvl-label">CANVAS  ·  click/drag = paint  ·  right-click/drag = erase  ·  ' + cols + ' × ' + rows + '</div>' +
+          '<div style="overflow:auto; max-width:100%; max-height:280px; background:#101820; border:1px solid var(--instr-rule); border-radius:2px;">' +
+            '<canvas id="lvl-paint-' + idx + '" style="display:block; image-rendering:pixelated; cursor:crosshair;"></canvas>' +
+          '</div>' +
+        '</div>' +
+      '</div>' +
+    '</div>' +
+    '<details style="margin-top:8px;">' +
+      '<summary style="cursor:pointer; font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); letter-spacing:0.05em;">RAW  ·  tileMap JSON + tileData (advanced)</summary>' +
       '<div style="margin-top:6px;">' +
-        '<div class="lvl-label">TILE MAP  ·  JSON: char -> tile index in the sheet  (Phase 2b will replace with click-paint palette)</div>' +
+        '<div class="lvl-label">TILE MAP  ·  JSON: char -> tile index (painter writes here; edit to fine-tune)</div>' +
         '<input class="lvl-x-in lvl-tilemap-in" data-idx="' + idx + '" data-field="tileMap" type="text" placeholder=\'{"1":0,"2":1,"3":2}\' value="' + escapeAttr(tileMapStr) + '" style="font-family:ui-monospace,monospace;" />' +
       '</div>' +
-    '</div>' +
-    '<div style="margin-top:8px;">' +
-      '<div class="lvl-label">TILE DATA  ·  ' + cols + ' × ' + rows + '  (Phase 2b: click-paint canvas with active brush from TileMap)</div>' +
-      '<textarea class="lvl-x-in" data-idx="' + idx + '" data-field="tileData" spellcheck="false" wrap="off" style="width:100%; height:140px; padding:4px 6px; background:var(--bg-2); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:ui-monospace, monospace; font-size:10px; resize:vertical; white-space:pre;">' + escapeText(data) + '</textarea>' +
-    '</div>' +
+      '<div style="margin-top:6px;">' +
+        '<div class="lvl-label">TILE DATA  ·  ' + cols + ' × ' + rows + '  (painter writes here; edit to bulk-paste or resize)</div>' +
+        '<textarea class="lvl-x-in lvl-tiledata-in" data-idx="' + idx + '" data-field="tileData" spellcheck="false" wrap="off" style="width:100%; height:140px; padding:4px 6px; background:var(--bg-2); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:ui-monospace, monospace; font-size:10px; resize:vertical; white-space:pre;">' + escapeText(data) + '</textarea>' +
+      '</div>' +
+    '</details>' +
   '</div>';
 }
 
@@ -90726,13 +90758,39 @@ function _lvlWireCard(idx) {
     const evt = (inp.tagName === "SELECT") ? "change" : "input";
     inp.addEventListener(evt, () => {
       let v = inp.value;
-      // Coerce numeric fields by type=number; coerce "true"/"false" for collides.
-      if (inp.type === "number") {
+      // tileMap input holds a JSON object stringified; parse before
+      // storing so the layer's tileMap stays an object (otherwise the
+      // saved patch double-encodes it as a JSON-in-JSON string).
+      if (inp.classList.contains("lvl-tilemap-in")) {
+        try {
+          const parsed = JSON.parse(v);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            v = parsed;
+          } else {
+            return;  // not an object, don't clobber the layer
+          }
+        } catch (_) {
+          return;  // mid-edit JSON; wait for valid input
+        }
+      } else if (inp.type === "number") {
         const n = parseFloat(v);
         v = Number.isFinite(n) ? n : 0;
       } else if (v === "true")  v = true;
       else if (v === "false") v = false;
       _lvlSetField(idx, field, v);
+      // Painter re-render hooks for tilemap fields that affect the
+      // visual canvases. Cheap (~1-2ms each).
+      if (inp.classList.contains("lvl-tileset-in")) {
+        _lvlHydrateTilemapPainter(idx);
+      } else if (inp.classList.contains("lvl-tileset-shape-in")) {
+        _lvlRenderTilesetPalette(idx);
+        _lvlRenderTilemapPaint(idx);
+      } else if (inp.classList.contains("lvl-tilemap-in")) {
+        _lvlRenderTilesetPalette(idx);
+        _lvlRenderTilemapPaint(idx);
+      } else if (inp.classList.contains("lvl-tiledata-in")) {
+        _lvlRenderTilemapPaint(idx);
+      }
     });
   });
 }
@@ -90770,6 +90828,388 @@ function _lvlSave() {
   _lvlClose();
   if (typeof render      === "function") render();
   if (typeof renderProps === "function") renderProps();
+}
+
+/* ── Phase 2b: per-tilemap-layer visual painter ──────────────────
+ *
+ * Two canvases per tilemap layer card:
+ *   lvl-pal-IDX   -- the tileset sprite-sheet drawn as a grid.
+ *                    Click a tile to pick it as the active brush.
+ *                    If the tile isn't yet in tileMap, a free char
+ *                    (1..9, a..z, A..Z) is auto-allocated.
+ *   lvl-paint-IDX -- the level cells, drawn with the bitmap for any
+ *                    char that's in tileMap, vertex-color palette
+ *                    for any char that isn't. Click+drag paints
+ *                    with active brush; right-click drags erase to '.'.
+ *
+ * Both canvases live inline in the card (no second modal). The raw
+ * tileData textarea + tileMap JSON input are still present in a
+ * <details> disclosure for bulk edit / paste.
+ *
+ * Bitmap loading is async (createImageBitmap from the asset blob);
+ * results are cached in _LVL_TILESET_BITMAP_CACHE so re-opening the
+ * modal or hydrating multiple layers with the same tileset is fast.
+ * ──────────────────────────────────────────────────────────────── */
+
+const _LVL_TILESET_BITMAP_CACHE = new Map();  // url -> Promise<ImageBitmap|null>
+
+/* Chars to auto-allocate when the user clicks a palette tile that
+ * isn't yet bound to any char in tileMap. Skips '.' and ' ' (used
+ * as "empty"), and starts at '1' so the default {"1":0,...} pattern
+ * stays natural. */
+const _LVL_BRUSH_ALLOC_CHARS = "123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+function _lvlLoadTilesetBitmap(url) {
+  if (!url) return Promise.resolve(null);
+  if (_LVL_TILESET_BITMAP_CACHE.has(url)) return _LVL_TILESET_BITMAP_CACHE.get(url);
+  const p = (async () => {
+    try {
+      if (url.indexOf("asset:") === 0) {
+        const name = url.substring("asset:".length);
+        const rec = (typeof Assets !== "undefined" && Assets.findSpriteByName)
+          ? Assets.findSpriteByName(name) : null;
+        if (!rec || !rec.blob) return null;
+        return await createImageBitmap(rec.blob);
+      }
+      // Real URL fallback (http/https/data). Same path as the
+      // editor's runtime _ensureImageURLTexture, just CPU-side.
+      const res = await fetch(url);
+      if (!res.ok) return null;
+      const blob = await res.blob();
+      return await createImageBitmap(blob);
+    } catch (e) {
+      console.warn("[level-editor] tileset bitmap load failed for " + url + ": " + e.message);
+      return null;
+    }
+  })();
+  _LVL_TILESET_BITMAP_CACHE.set(url, p);
+  return p;
+}
+
+function _lvlGetLayerPaintState(idx) {
+  const modal = document.getElementById("level2d-editor-modal");
+  const lvl = modal && modal._lvl;
+  if (!lvl) return null;
+  lvl.paintState = lvl.paintState || {};
+  if (!lvl.paintState[idx]) {
+    lvl.paintState[idx] = {
+      activeTileIdx: 0,
+      activeBrush: null,
+      bitmap: null,
+      tilesetURL: "",
+      painting: false,
+      eraseMode: false,
+      paintCellPx: 14,
+      paletteCellPx: 32
+    };
+  }
+  return lvl.paintState[idx];
+}
+
+function _lvlFreeBrushChar(tileMap) {
+  const used = new Set(Object.keys(tileMap || {}));
+  for (const c of _LVL_BRUSH_ALLOC_CHARS) {
+    if (!used.has(c)) return c;
+  }
+  return null;
+}
+
+async function _lvlHydrateTilemapPainter(idx) {
+  const modal = document.getElementById("level2d-editor-modal");
+  const lvl = modal && modal._lvl;
+  if (!lvl) return;
+  const layer = lvl.layers[idx];
+  if (!layer || layer.type !== "tilemap") return;
+  const palCanvas   = document.getElementById("lvl-pal-"   + idx);
+  const paintCanvas = document.getElementById("lvl-paint-" + idx);
+  if (!palCanvas || !paintCanvas) return;
+  const ps = _lvlGetLayerPaintState(idx);
+  // No tileset -> draw a placeholder, render paint canvas using the
+  // vertex-color fallback only.
+  if (!layer.tileset || !layer.tileset.length) {
+    ps.bitmap = null;
+    ps.tilesetURL = "";
+    palCanvas.width = 160;
+    palCanvas.height = 40;
+    const pctx = palCanvas.getContext("2d");
+    pctx.fillStyle = "#1a1f28";
+    pctx.fillRect(0, 0, palCanvas.width, palCanvas.height);
+    pctx.fillStyle = "#888";
+    pctx.font = "10px ui-monospace, monospace";
+    pctx.fillText("(no tileset)", 10, 24);
+    _lvlRenderTilemapPaint(idx);
+    _lvlUpdateBrushReadout(idx);
+    return;
+  }
+  const bmp = await _lvlLoadTilesetBitmap(layer.tileset);
+  // Modal may have closed during the await; bail if so.
+  if (!document.getElementById("lvl-pal-" + idx)) return;
+  if (!bmp) {
+    palCanvas.width = 200;
+    palCanvas.height = 40;
+    const pctx = palCanvas.getContext("2d");
+    pctx.fillStyle = "#3a2424";
+    pctx.fillRect(0, 0, palCanvas.width, palCanvas.height);
+    pctx.fillStyle = "#ff8060";
+    pctx.font = "11px ui-monospace, monospace";
+    pctx.fillText("tileset load failed", 6, 24);
+    return;
+  }
+  ps.bitmap = bmp;
+  ps.tilesetURL = layer.tileset;
+  _lvlRenderTilesetPalette(idx);
+  _lvlRenderTilemapPaint(idx);
+  _lvlUpdateBrushReadout(idx);
+}
+
+function _lvlRenderTilesetPalette(idx) {
+  const modal = document.getElementById("level2d-editor-modal");
+  const lvl = modal && modal._lvl;
+  if (!lvl) return;
+  const layer = lvl.layers[idx];
+  const ps = _lvlGetLayerPaintState(idx);
+  const canvas = document.getElementById("lvl-pal-" + idx);
+  if (!canvas || !ps || !ps.bitmap || !layer) return;
+  const framesX = Math.max(1, (layer.tilesetFramesX | 0) || 4);
+  const framesY = Math.max(1, (layer.tilesetFramesY | 0) || 2);
+  const cell = ps.paletteCellPx;
+  const W = framesX * cell;
+  const H = framesY * cell;
+  if (canvas.width  !== W) canvas.width  = W;
+  if (canvas.height !== H) canvas.height = H;
+  const ctx = canvas.getContext("2d");
+  ctx.imageSmoothingEnabled = false;
+  ctx.fillStyle = "#0e1218";
+  ctx.fillRect(0, 0, W, H);
+  const tileW = ps.bitmap.width  / framesX;
+  const tileH = ps.bitmap.height / framesY;
+  const tileMap = (layer.tileMap && typeof layer.tileMap === "object") ? layer.tileMap : {};
+  for (let row = 0; row < framesY; row++) {
+    for (let col = 0; col < framesX; col++) {
+      const tileIdx = row * framesX + col;
+      ctx.drawImage(ps.bitmap,
+        col * tileW, row * tileH, tileW, tileH,
+        col * cell,  row * cell,  cell,  cell);
+      // Label with the char(s) currently mapped to this index.
+      const mapped = [];
+      for (const k of Object.keys(tileMap)) if ((tileMap[k] | 0) === tileIdx) mapped.push(k);
+      if (mapped.length) {
+        const text = mapped.join("");
+        ctx.fillStyle = "rgba(0,0,0,0.7)";
+        ctx.fillRect(col * cell, row * cell + cell - 12, cell, 12);
+        ctx.fillStyle = "#cfe9ff";
+        ctx.font = "9px ui-monospace, monospace";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(text, col * cell + cell / 2, row * cell + cell - 6);
+        ctx.textAlign = "start";
+        ctx.textBaseline = "alphabetic";
+      }
+      ctx.strokeStyle = "rgba(255,255,255,0.10)";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(col * cell + 0.5, row * cell + 0.5, cell - 1, cell - 1);
+    }
+  }
+  // Highlight active tile.
+  if (ps.activeTileIdx != null && ps.activeTileIdx >= 0 && ps.activeTileIdx < framesX * framesY) {
+    const ar = Math.floor(ps.activeTileIdx / framesX);
+    const ac = ps.activeTileIdx % framesX;
+    ctx.strokeStyle = "#67ff80";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(ac * cell + 1, ar * cell + 1, cell - 2, cell - 2);
+  }
+}
+
+function _lvlRenderTilemapPaint(idx) {
+  const modal = document.getElementById("level2d-editor-modal");
+  const lvl = modal && modal._lvl;
+  if (!lvl) return;
+  const layer = lvl.layers[idx];
+  const ps = _lvlGetLayerPaintState(idx);
+  const canvas = document.getElementById("lvl-paint-" + idx);
+  if (!canvas || !ps || !layer) return;
+  const lines = (layer.tileData || "").split("\n");
+  const nRows = Math.max(1, lines.length);
+  const nCols = Math.max(1, lines.reduce((m, r) => Math.max(m, r.length), 1));
+  const cell = ps.paintCellPx;
+  const W = nCols * cell;
+  const H = nRows * cell;
+  if (canvas.width  !== W) canvas.width  = W;
+  if (canvas.height !== H) canvas.height = H;
+  const ctx = canvas.getContext("2d");
+  ctx.imageSmoothingEnabled = false;
+  ctx.fillStyle = "#1a2840";
+  ctx.fillRect(0, 0, W, H);
+  const tileMap = (layer.tileMap && typeof layer.tileMap === "object") ? layer.tileMap : {};
+  const framesX = Math.max(1, (layer.tilesetFramesX | 0) || 4);
+  const framesY = Math.max(1, (layer.tilesetFramesY | 0) || 2);
+  const bmp = ps.bitmap;
+  const tileW = bmp ? bmp.width  / framesX : 0;
+  const tileH = bmp ? bmp.height / framesY : 0;
+  // Color palette for vertex-color fallback (chars not in tileMap).
+  const p = {
+    color1R: layer.color1R, color1G: layer.color1G, color1B: layer.color1B,
+    color2R: layer.color2R, color2G: layer.color2G, color2B: layer.color2B,
+    color3R: layer.color3R, color3G: layer.color3G, color3B: layer.color3B,
+    color4R: layer.color4R, color4G: layer.color4G, color4B: layer.color4B,
+    color5R: layer.color5R, color5G: layer.color5G, color5B: layer.color5B
+  };
+  for (let r = 0; r < nRows; r++) {
+    const line = lines[r] || "";
+    for (let c = 0; c < nCols; c++) {
+      const ch = line[c] || ".";
+      if (ch === "." || ch === " ") continue;
+      if (bmp && Object.prototype.hasOwnProperty.call(tileMap, ch)) {
+        const tIdx = tileMap[ch] | 0;
+        if (tIdx >= 0 && tIdx < framesX * framesY) {
+          const trow = Math.floor(tIdx / framesX);
+          const tcol = tIdx % framesX;
+          ctx.drawImage(bmp,
+            tcol * tileW, trow * tileH, tileW, tileH,
+            c * cell, r * cell, cell, cell);
+          continue;
+        }
+      }
+      ctx.fillStyle = _tmeColorForChar(ch, p);
+      ctx.fillRect(c * cell, r * cell, cell, cell);
+    }
+  }
+  // Gridlines.
+  ctx.strokeStyle = "rgba(255,255,255,0.06)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let r = 0; r <= nRows; r++) { ctx.moveTo(0, r * cell + 0.5); ctx.lineTo(W, r * cell + 0.5); }
+  for (let c = 0; c <= nCols; c++) { ctx.moveTo(c * cell + 0.5, 0); ctx.lineTo(c * cell + 0.5, H); }
+  ctx.stroke();
+  // Stronger every-5th for orientation.
+  ctx.strokeStyle = "rgba(150,180,210,0.18)";
+  ctx.beginPath();
+  for (let r = 0; r <= nRows; r += 5) { ctx.moveTo(0, r * cell + 0.5); ctx.lineTo(W, r * cell + 0.5); }
+  for (let c = 0; c <= nCols; c += 5) { ctx.moveTo(c * cell + 0.5, 0); ctx.lineTo(c * cell + 0.5, H); }
+  ctx.stroke();
+}
+
+function _lvlUpdateBrushReadout(idx) {
+  const ps = _lvlGetLayerPaintState(idx);
+  const el = document.getElementById("lvl-brush-" + idx);
+  if (!ps || !el) return;
+  if (ps.activeBrush) {
+    el.textContent = "brush: '" + ps.activeBrush + "' → tile " + ps.activeTileIdx;
+    el.style.color = "#67ff80";
+  } else {
+    el.textContent = "brush: — (click a palette tile)";
+    el.style.color = "var(--text-3)";
+  }
+}
+
+function _lvlPickPaletteTile(idx, tileIdx) {
+  const modal = document.getElementById("level2d-editor-modal");
+  const lvl = modal && modal._lvl;
+  if (!lvl) return;
+  const layer = lvl.layers[idx];
+  const ps = _lvlGetLayerPaintState(idx);
+  if (!layer || !ps) return;
+  ps.activeTileIdx = tileIdx;
+  if (!layer.tileMap || typeof layer.tileMap !== "object" || Array.isArray(layer.tileMap)) {
+    layer.tileMap = {};
+  }
+  // Find existing char mapped to this tile, else allocate one.
+  let brush = null;
+  for (const k of Object.keys(layer.tileMap)) {
+    if ((layer.tileMap[k] | 0) === tileIdx) { brush = k; break; }
+  }
+  if (!brush) {
+    brush = _lvlFreeBrushChar(layer.tileMap);
+    if (brush) {
+      layer.tileMap[brush] = tileIdx;
+      // Reflect into the raw tileMap JSON input (if mounted).
+      const inp = document.querySelector('.lvl-tilemap-in[data-idx="' + idx + '"]');
+      if (inp) inp.value = JSON.stringify(layer.tileMap);
+    }
+  }
+  ps.activeBrush = brush;
+  _lvlRenderTilesetPalette(idx);
+  _lvlUpdateBrushReadout(idx);
+}
+
+function _lvlPaintCell(idx, col, row, eraseMode) {
+  const modal = document.getElementById("level2d-editor-modal");
+  const lvl = modal && modal._lvl;
+  if (!lvl) return;
+  const layer = lvl.layers[idx];
+  const ps = _lvlGetLayerPaintState(idx);
+  if (!layer || !ps) return;
+  if (col < 0 || row < 0) return;
+  const lines = (layer.tileData || "").split("\n");
+  if (row >= lines.length) return;
+  let line = lines[row];
+  if (col >= line.length) line = line.padEnd(col + 1, ".");
+  const newCh = eraseMode ? "." : (ps.activeBrush || ".");
+  if (line[col] === newCh) return;
+  lines[row] = line.substring(0, col) + newCh + line.substring(col + 1);
+  layer.tileData = lines.join("\n");
+  // Reflect into raw textarea (if mounted in the <details> disclosure).
+  const ta = document.querySelector('textarea.lvl-tiledata-in[data-idx="' + idx + '"]');
+  if (ta) ta.value = layer.tileData;
+  // Re-render the paint canvas. ~1-2ms for typical sizes; cheap.
+  _lvlRenderTilemapPaint(idx);
+}
+
+function _lvlWireTilemapPainter(idx) {
+  const palCanvas   = document.getElementById("lvl-pal-"   + idx);
+  const paintCanvas = document.getElementById("lvl-paint-" + idx);
+  if (palCanvas && !palCanvas._lvlWired) {
+    palCanvas._lvlWired = true;
+    palCanvas.addEventListener("click", (e) => {
+      const modal = document.getElementById("level2d-editor-modal");
+      const lvl = modal && modal._lvl;
+      if (!lvl) return;
+      const layer = lvl.layers[idx];
+      const ps = _lvlGetLayerPaintState(idx);
+      if (!layer || !ps || !ps.bitmap) return;
+      const framesX = Math.max(1, (layer.tilesetFramesX | 0) || 4);
+      const framesY = Math.max(1, (layer.tilesetFramesY | 0) || 2);
+      const cell = ps.paletteCellPx;
+      const rect = palCanvas.getBoundingClientRect();
+      const c = Math.floor((e.clientX - rect.left) * (palCanvas.width  / rect.width)  / cell);
+      const r = Math.floor((e.clientY - rect.top)  * (palCanvas.height / rect.height) / cell);
+      if (c < 0 || c >= framesX || r < 0 || r >= framesY) return;
+      _lvlPickPaletteTile(idx, r * framesX + c);
+    });
+  }
+  if (paintCanvas && !paintCanvas._lvlWired) {
+    paintCanvas._lvlWired = true;
+    paintCanvas.addEventListener("contextmenu", e => e.preventDefault());
+    paintCanvas.addEventListener("pointerdown", e => {
+      const ps = _lvlGetLayerPaintState(idx); if (!ps) return;
+      e.preventDefault();
+      try { paintCanvas.setPointerCapture(e.pointerId); } catch (_) {}
+      ps.painting = true;
+      ps.eraseMode = (e.button === 2);
+      const rect = paintCanvas.getBoundingClientRect();
+      const col = Math.floor((e.clientX - rect.left) * (paintCanvas.width  / rect.width)  / ps.paintCellPx);
+      const row = Math.floor((e.clientY - rect.top)  * (paintCanvas.height / rect.height) / ps.paintCellPx);
+      _lvlPaintCell(idx, col, row, ps.eraseMode);
+    });
+    paintCanvas.addEventListener("pointermove", e => {
+      const ps = _lvlGetLayerPaintState(idx); if (!ps || !ps.painting) return;
+      const rect = paintCanvas.getBoundingClientRect();
+      const col = Math.floor((e.clientX - rect.left) * (paintCanvas.width  / rect.width)  / ps.paintCellPx);
+      const row = Math.floor((e.clientY - rect.top)  * (paintCanvas.height / rect.height) / ps.paintCellPx);
+      _lvlPaintCell(idx, col, row, ps.eraseMode);
+    });
+    paintCanvas.addEventListener("pointerup", e => {
+      const ps = _lvlGetLayerPaintState(idx); if (!ps) return;
+      ps.painting = false;
+      ps.eraseMode = false;
+      try { paintCanvas.releasePointerCapture(e.pointerId); } catch (_) {}
+    });
+    paintCanvas.addEventListener("pointercancel", e => {
+      const ps = _lvlGetLayerPaintState(idx); if (!ps) return;
+      ps.painting = false;
+      ps.eraseMode = false;
+    });
+  }
 }
 
 function _lvlInstall() {
