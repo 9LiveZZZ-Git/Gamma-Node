@@ -7678,6 +7678,54 @@
     </div>
   </div>
 
+  <!-- Sprint tilemap-painter -- visual click-paint editor for Tilemap2D
+       nodes. Opens via the ⚙ gear handle on a Tilemap2D node and
+       loads its tileData / palette / dims into the painter. Each cell
+       is a 16-px swatch on the canvas; click + drag paints with the
+       active brush; Save writes the modified string back to tileData
+       and triggers a mesh rebuild via the existing meshCacheKey path.
+       Hand-counting dots is over. -->
+  <div class="modal-backdrop" id="tilemap-editor-modal" style="display:none;">
+    <div class="modal" style="width: 1100px; max-width: 95vw; max-height: 95vh; display:flex; flex-direction:column;">
+      <div class="modal-head" style="display:flex; align-items:center; gap:10px;">
+        <span class="modal-title" style="font-family:var(--font-instr); letter-spacing:0.20em; color:var(--phosphor); text-transform:lowercase;">tilemap painter</span>
+        <span id="tme-status" style="font-family:var(--font-mono); font-size:10px; color:var(--text-3); flex:1;">no tilemap open</span>
+        <button class="btn modal-x" id="tme-close" type="button">×</button>
+      </div>
+      <div style="display:grid; grid-template-columns: 200px 1fr; gap:0; flex:1; min-height:0; border-top:1px solid var(--instr-rule);">
+        <!-- Brush palette -->
+        <div style="padding:12px; border-right:1px solid var(--instr-rule); display:flex; flex-direction:column; gap:6px; overflow:auto;">
+          <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); letter-spacing:0.06em;">BRUSH</div>
+          <div id="tme-palette" style="display:flex; flex-direction:column; gap:4px;">
+            <!-- Brush buttons rendered dynamically from the tilemap's palette -->
+          </div>
+          <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); letter-spacing:0.06em; margin-top:12px;">DIMENSIONS</div>
+          <div style="display:grid; grid-template-columns: 1fr 1fr; gap:6px;">
+            <div>
+              <div style="font-family:var(--font-mono); font-size:9px; color:var(--text-3); margin-bottom:2px;">COLS</div>
+              <input type="number" id="tme-cols" min="1" max="200" step="1" style="width:100%; padding:3px 5px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10px;"/>
+            </div>
+            <div>
+              <div style="font-family:var(--font-mono); font-size:9px; color:var(--text-3); margin-bottom:2px;">ROWS</div>
+              <input type="number" id="tme-rows" min="1" max="100" step="1" style="width:100%; padding:3px 5px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10px;"/>
+            </div>
+          </div>
+          <button class="btn" id="tme-resize" style="width:100%; padding:5px;">Resize</button>
+          <div style="flex:1;"></div>
+          <div style="font-family:var(--font-mono); font-size:9px; color:var(--text-3); line-height:1.5;">
+            Left-click to paint. Drag to paint a stroke. Right-click to erase (set to '.'). Resize crops/pads the grid.
+          </div>
+          <button class="btn primary" id="tme-save" style="width:100%; padding:8px;">Save</button>
+          <button class="btn" id="tme-cancel" style="width:100%; padding:6px;">Cancel</button>
+        </div>
+        <!-- Grid canvas (scrolls if larger than viewport) -->
+        <div style="overflow:auto; background:#0a0c10;">
+          <canvas id="tme-grid" style="display:block; image-rendering:pixelated; image-rendering:crisp-edges;"></canvas>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Sprint asset-folders -- Folder editor modal. Opens when the user
        clicks an existing folder card OR creates a new folder via the
        Assets-tab "+ FOLDER" chip. Layout:
@@ -39340,6 +39388,27 @@ function render() {
         });
         el.appendChild(gear);
         // Shift the ✎ handle right when both are present.
+        handle.style.left = "calc(50% + 16px)";
+      }
+      // Sprint tilemap-painter -- gear handle opens the visual click-
+      // paint editor for the wired Tilemap2D's tileData. Stops the
+      // ASCII-counting madness.
+      if (node.type === "Tilemap2D") {
+        const gear = document.createElement("button");
+        gear.className = "node-edit-handle node-tiling-handle";
+        gear.title = "Open Tilemap Painter (click-paint cells with a brush)";
+        gear.textContent = "⚙";
+        gear.style.left = "calc(50% - 16px)";
+        gear.addEventListener("pointerdown", (ev) => {
+          ev.stopPropagation();
+          ev.preventDefault();
+        });
+        gear.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          ev.preventDefault();
+          if (typeof _tmeOpen === "function") _tmeOpen(node.id);
+        });
+        el.appendChild(gear);
         handle.style.left = "calc(50% + 16px)";
       }
     }
@@ -89511,6 +89580,298 @@ function _ssClose() {
     modal.style.display = "none";
     modal._ssSourceNodeId = null;
   }
+}
+
+/* ───────────────────────────────────────────────────────────────
+ * Sprint tilemap-painter -- visual click-paint editor for
+ * Tilemap2D nodes. Opens via the ⚙ gear handle on a Tilemap2D
+ * node. Loads tileData + palette + dims into a canvas grid;
+ * user paints with brush '.', '1'..'5'; Save writes the modified
+ * tileData back to the node and triggers a mesh rebuild via the
+ * existing meshCacheKey path.
+ *
+ * State held on the DOM modal element itself (modal._tme):
+ *   nodeId    -- the source Tilemap2D
+ *   rows[]    -- working copy of tileData split into row strings
+ *   brush     -- active paint character
+ *   cellPx    -- canvas-side cell size (16 px)
+ *   palette   -- [{ch, color}] for swatch rendering
+ *   painting  -- true while pointer is down (paint stroke)
+ *   eraseMode -- true if right button held (paints '.')
+ * ─────────────────────────────────────────────────────────────── */
+const _TME_BRUSH_CHARS = [".", "1", "2", "3", "4", "5"];
+const _TME_BRUSH_LABELS = {
+  ".": "empty (sky)",
+  "1": "grass / color1",
+  "2": "dirt / color2",
+  "3": "stone / color3",
+  "4": "pickup '4'",
+  "5": "goal '5'"
+};
+
+function _tmeOpen(nodeId) {
+  if (!state || !Array.isArray(state.nodes)) return;
+  const node = state.nodes.find(n => n && n.id === nodeId);
+  if (!node || node.type !== "Tilemap2D") {
+    console.warn("[tilemap-painter] node not found or not Tilemap2D: " + nodeId);
+    return;
+  }
+  const modal = document.getElementById("tilemap-editor-modal");
+  if (!modal) return;
+  const p = node.params || {};
+  const data = (typeof p.tileData === "string") ? p.tileData : "";
+  // Split into mutable row array. Pad short rows so the grid is
+  // rectangular (avoids ragged-edge clicks landing in undefined col).
+  let rows = data.split(/\r?\n/);
+  const maxLen = rows.reduce((m, r) => Math.max(m, r.length), 0);
+  rows = rows.map(r => r.padEnd(maxLen, "."));
+  // Build palette swatches from the node's current color params.
+  const palette = _TME_BRUSH_CHARS.map(ch => ({
+    ch,
+    color: _tmeColorForChar(ch, p)
+  }));
+  modal._tme = {
+    nodeId,
+    rows,
+    cols: maxLen,
+    nRows: rows.length,
+    brush: "1",
+    cellPx: 16,
+    palette,
+    painting: false,
+    eraseMode: false
+  };
+  document.getElementById("tme-cols").value = maxLen;
+  document.getElementById("tme-rows").value = rows.length;
+  document.getElementById("tme-status").textContent =
+    "Tilemap2D#" + node.id + " — " + maxLen + " × " + rows.length;
+  _tmeRenderPalette();
+  _tmeRenderGrid();
+  modal.style.display = "flex";
+}
+
+function _tmeClose() {
+  const modal = document.getElementById("tilemap-editor-modal");
+  if (modal) {
+    modal.style.display = "none";
+    modal._tme = null;
+  }
+}
+
+/* Convert a tile char to a CSS hex color using the node's palette
+ * params (color1R/G/B etc). For '.' returns transparent-marker dark
+ * gray so the brush UI shows it as the "empty" choice. */
+function _tmeColorForChar(ch, p) {
+  if (ch === "." || ch === " " || ch === "") return "#1a1f28";
+  let r = 0.3, g = 0.55, b = 0.35;   // default = color1
+  if (ch === "1" || ch === "#") { r = p.color1R ?? 0.30; g = p.color1G ?? 0.55; b = p.color1B ?? 0.35; }
+  else if (ch === "2")          { r = p.color2R ?? 0.42; g = p.color2G ?? 0.28; b = p.color2B ?? 0.18; }
+  else if (ch === "3")          { r = p.color3R ?? 0.55; g = p.color3G ?? 0.55; b = p.color3B ?? 0.62; }
+  else if (ch === "4")          { r = p.color4R ?? 0.96; g = p.color4G ?? 0.90; b = p.color4B ?? 0.78; }
+  else if (ch === "5")          { r = p.color5R ?? 0.92; g = p.color5G ?? 0.25; b = p.color5B ?? 0.30; }
+  return "#" +
+    [r, g, b].map(c => Math.max(0, Math.min(255, Math.round(c * 255))).toString(16).padStart(2, "0")).join("");
+}
+
+function _tmeRenderPalette() {
+  const wrap = document.getElementById("tme-palette");
+  const modal = document.getElementById("tilemap-editor-modal");
+  const tme = modal && modal._tme;
+  if (!wrap || !tme) return;
+  wrap.innerHTML = tme.palette.map(({ ch, color }) => {
+    const active = (ch === tme.brush);
+    const label = _TME_BRUSH_LABELS[ch] || ch;
+    const border = active ? "var(--phosphor)" : "var(--instr-rule)";
+    return '<button class="tme-brush-btn" data-brush="' + escapeAttr(ch) +
+      '" style="display:flex; align-items:center; gap:8px; padding:5px 8px; ' +
+      'background:var(--bg-1); color:var(--text-1); border:2px solid ' + border + '; ' +
+      'border-radius:3px; cursor:pointer; font-family:var(--font-mono); font-size:10.5px; text-align:left;">' +
+      '<span style="display:inline-block; width:18px; height:18px; background:' + color +
+      '; border:1px solid var(--instr-rule); border-radius:2px;"></span>' +
+      '<span style="opacity:0.92;">' + escapeText(ch) + '</span>' +
+      '<span style="opacity:0.6; font-size:9.5px;">' + escapeText(label) + '</span>' +
+      '</button>';
+  }).join("");
+  // Wire click handlers
+  wrap.querySelectorAll(".tme-brush-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const tme2 = document.getElementById("tilemap-editor-modal")._tme;
+      if (!tme2) return;
+      tme2.brush = btn.dataset.brush;
+      _tmeRenderPalette();
+    });
+  });
+}
+
+function _tmeRenderGrid() {
+  const canvas = document.getElementById("tme-grid");
+  const modal = document.getElementById("tilemap-editor-modal");
+  const tme = modal && modal._tme;
+  if (!canvas || !tme) return;
+  const node = state.nodes.find(n => n && n.id === tme.nodeId);
+  const p = (node && node.params) || {};
+  const cell = tme.cellPx;
+  const W = tme.cols * cell;
+  const H = tme.nRows * cell;
+  if (canvas.width !== W) canvas.width = W;
+  if (canvas.height !== H) canvas.height = H;
+  const ctx = canvas.getContext("2d");
+  ctx.imageSmoothingEnabled = false;
+  // Background: dark sky gradient so '.' cells read as background.
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, "#1a2840"); grad.addColorStop(1, "#2a3850");
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, W, H);
+  // Render each cell
+  for (let r = 0; r < tme.nRows; r++) {
+    const row = tme.rows[r];
+    for (let c = 0; c < tme.cols; c++) {
+      const ch = row[c] || ".";
+      if (ch === "." || ch === " " || ch === "") continue;   // background already drawn
+      ctx.fillStyle = _tmeColorForChar(ch, p);
+      ctx.fillRect(c * cell, r * cell, cell, cell);
+    }
+  }
+  // Grid lines (subtle)
+  ctx.strokeStyle = "rgba(255,255,255,0.06)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let r = 0; r <= tme.nRows; r++) { ctx.moveTo(0, r * cell + 0.5); ctx.lineTo(W, r * cell + 0.5); }
+  for (let c = 0; c <= tme.cols;  c++) { ctx.moveTo(c * cell + 0.5, 0); ctx.lineTo(c * cell + 0.5, H); }
+  ctx.stroke();
+  // Highlight every-10th gridline + center marker so the user has
+  // a sense of position (col 39.5 = world x=0 for a 80-col map).
+  ctx.strokeStyle = "rgba(150,180,210,0.18)";
+  ctx.beginPath();
+  for (let r = 0; r <= tme.nRows; r += 5) { ctx.moveTo(0, r * cell + 0.5); ctx.lineTo(W, r * cell + 0.5); }
+  for (let c = 0; c <= tme.cols;  c += 5) { ctx.moveTo(c * cell + 0.5, 0); ctx.lineTo(c * cell + 0.5, H); }
+  ctx.stroke();
+}
+
+function _tmePaintCell(col, row, eraseMode) {
+  const modal = document.getElementById("tilemap-editor-modal");
+  const tme = modal && modal._tme;
+  if (!tme) return;
+  if (col < 0 || col >= tme.cols || row < 0 || row >= tme.nRows) return;
+  const newCh = eraseMode ? "." : tme.brush;
+  const line = tme.rows[row];
+  if (line[col] === newCh) return;   // no-op
+  tme.rows[row] = line.substring(0, col) + newCh + line.substring(col + 1);
+  // Redraw just this cell for snappy paint feel.
+  const canvas = document.getElementById("tme-grid");
+  const ctx = canvas.getContext("2d");
+  const cell = tme.cellPx;
+  const node = state.nodes.find(n => n && n.id === tme.nodeId);
+  const p = (node && node.params) || {};
+  // Clear cell + repaint background sliver under it
+  ctx.fillStyle = "#1f2e44";
+  ctx.fillRect(col * cell, row * cell, cell, cell);
+  if (newCh !== "." && newCh !== " ") {
+    ctx.fillStyle = _tmeColorForChar(newCh, p);
+    ctx.fillRect(col * cell, row * cell, cell, cell);
+  }
+  // Re-stroke the cell's borders so gridlines stay visible
+  ctx.strokeStyle = "rgba(255,255,255,0.06)";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(col * cell + 0.5, row * cell + 0.5, cell - 1, cell - 1);
+}
+
+function _tmeResize(newCols, newRows) {
+  const modal = document.getElementById("tilemap-editor-modal");
+  const tme = modal && modal._tme;
+  if (!tme) return;
+  newCols = Math.max(1, Math.min(200, newCols | 0));
+  newRows = Math.max(1, Math.min(100, newRows | 0));
+  // Truncate or pad each existing row to newCols
+  const newRowArr = [];
+  for (let r = 0; r < newRows; r++) {
+    if (r < tme.rows.length) {
+      const old = tme.rows[r];
+      newRowArr.push(old.length >= newCols ? old.substring(0, newCols) : old.padEnd(newCols, "."));
+    } else {
+      newRowArr.push(".".repeat(newCols));
+    }
+  }
+  tme.rows = newRowArr;
+  tme.cols = newCols;
+  tme.nRows = newRows;
+  document.getElementById("tme-status").textContent =
+    "Tilemap2D#" + tme.nodeId + " — " + newCols + " × " + newRows + " (resized)";
+  _tmeRenderGrid();
+}
+
+function _tmeSave() {
+  const modal = document.getElementById("tilemap-editor-modal");
+  const tme = modal && modal._tme;
+  if (!tme) return;
+  const node = state.nodes.find(n => n && n.id === tme.nodeId);
+  if (!node) return;
+  pushHistory("tilemap-painter:save:" + tme.nodeId);
+  node.params = node.params || {};
+  node.params.tileData = tme.rows.join("\n");
+  console.log("[tilemap-painter] saved " + tme.cols + "×" + tme.nRows +
+    " tilemap to " + tme.nodeId + " (" + node.params.tileData.length + " chars)");
+  _tmeClose();
+  if (typeof render === "function") render();
+}
+
+/* Wire up DOM event handlers once at startup. Click + drag paints
+ * with the brush; right-click drags erase to '.'. */
+function _tmeInstall() {
+  const modal = document.getElementById("tilemap-editor-modal");
+  if (!modal || modal._tmeWired) return;
+  modal._tmeWired = true;
+  const closeBtn  = document.getElementById("tme-close");
+  const cancelBtn = document.getElementById("tme-cancel");
+  const saveBtn   = document.getElementById("tme-save");
+  const resizeBtn = document.getElementById("tme-resize");
+  const canvas    = document.getElementById("tme-grid");
+  if (closeBtn)  closeBtn.addEventListener("click", _tmeClose);
+  if (cancelBtn) cancelBtn.addEventListener("click", _tmeClose);
+  if (saveBtn)   saveBtn.addEventListener("click", _tmeSave);
+  if (resizeBtn) resizeBtn.addEventListener("click", () => {
+    const c = parseInt(document.getElementById("tme-cols").value, 10) || 1;
+    const r = parseInt(document.getElementById("tme-rows").value, 10) || 1;
+    _tmeResize(c, r);
+  });
+  if (canvas) {
+    canvas.addEventListener("contextmenu", e => e.preventDefault());
+    canvas.addEventListener("pointerdown", e => {
+      const tme = modal._tme; if (!tme) return;
+      e.preventDefault();
+      canvas.setPointerCapture(e.pointerId);
+      tme.painting = true;
+      tme.eraseMode = (e.button === 2);
+      const rect = canvas.getBoundingClientRect();
+      const col = Math.floor((e.clientX - rect.left) * (canvas.width / rect.width)  / tme.cellPx);
+      const row = Math.floor((e.clientY - rect.top)  * (canvas.height / rect.height) / tme.cellPx);
+      _tmePaintCell(col, row, tme.eraseMode);
+    });
+    canvas.addEventListener("pointermove", e => {
+      const tme = modal._tme; if (!tme || !tme.painting) return;
+      const rect = canvas.getBoundingClientRect();
+      const col = Math.floor((e.clientX - rect.left) * (canvas.width / rect.width)  / tme.cellPx);
+      const row = Math.floor((e.clientY - rect.top)  * (canvas.height / rect.height) / tme.cellPx);
+      _tmePaintCell(col, row, tme.eraseMode);
+    });
+    canvas.addEventListener("pointerup", e => {
+      const tme = modal._tme; if (!tme) return;
+      tme.painting = false;
+      tme.eraseMode = false;
+      try { canvas.releasePointerCapture(e.pointerId); } catch (_) {}
+    });
+  }
+  // ESC closes
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && modal.style.display !== "none") _tmeClose();
+  });
+  // Backdrop click closes
+  modal.addEventListener("click", (e) => {
+    if (e.target === modal) _tmeClose();
+  });
+}
+if (typeof window !== "undefined") {
+  window.addEventListener("DOMContentLoaded", _tmeInstall);
 }
 
 /* Draw the result blob into the preview canvas, sized to the chosen
