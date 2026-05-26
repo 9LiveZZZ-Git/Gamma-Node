@@ -7557,6 +7557,11 @@
         <span id="ss-status" style="font-family: var(--font-mono); font-size: 10px; color: var(--text-3); flex: 1;">ready</span>
         <button class="btn modal-x" id="ss-close" type="button">×</button>
       </div>
+      <!-- Generation progress bar: hidden when idle, shows fill % during a /sprite-gen call.
+           Driven by polling /sprite-gen/progress every 400 ms (sd-progress sprint). -->
+      <div id="ss-progress-wrap" style="display:none; height:3px; background:var(--bg-2); border-top:1px solid var(--instr-rule); overflow:hidden;">
+        <div id="ss-progress-bar" style="height:100%; width:0%; background:var(--phosphor); transition:width 0.18s linear;"></div>
+      </div>
       <div style="display:grid; grid-template-columns: 280px 1fr 220px; gap:0; flex:1; min-height:0; border-top:1px solid var(--instr-rule);">
         <!-- Left: prompt panel -->
         <div style="padding:12px; border-right:1px solid var(--instr-rule); display:flex; flex-direction:column; gap:10px; overflow:auto;">
@@ -87079,6 +87084,79 @@ function _ssStatus(msg, kind) {
                  : "var(--text-3)";
 }
 
+/* Generation progress poll. Drives the thin bar under the modal head
+ * and updates the status line with step / elapsed / ETA while the
+ * compile-server worker is running a diffusion. Returns a cancel fn
+ * the caller invokes on success/failure to tear it down. */
+function _ssStartProgressPoll(serverBase, label) {
+  const wrap = document.getElementById("ss-progress-wrap");
+  const bar  = document.getElementById("ss-progress-bar");
+  if (!wrap || !bar) return () => {};
+  wrap.style.display = "block";
+  bar.style.width = "0%";
+  bar.style.background = "var(--phosphor)";
+  const t0 = performance.now();
+  const url = serverBase.replace(/\/+$/, "") + "/sprite-gen/progress";
+  let cancelled = false;
+  let lastStep = 0;
+  let stalledSince = t0;
+  async function poll() {
+    if (cancelled) return;
+    try {
+      const r = await fetch(url, { cache: "no-store" });
+      if (r.ok) {
+        const j = await r.json();
+        const browserElapsed = Math.round(performance.now() - t0);
+        const total = Math.max(1, j.total | 0);
+        const step  = Math.max(0, Math.min(total, j.step | 0));
+        // Bar fills proportional to steps. Before the first callback
+        // (warm-up / LoRA swap) we creep to 8% so the user sees motion.
+        let pct;
+        if (step === 0) {
+          pct = Math.min(8, browserElapsed / 200);
+        } else {
+          pct = 8 + (92 * step) / total;
+        }
+        bar.style.width = pct.toFixed(1) + "%";
+        // ETA: extrapolate from elapsed-per-step. Reasonable once step ≥ 2.
+        let etaTxt = "";
+        if (step >= 2 && j.elapsedMs > 0) {
+          const perStep = j.elapsedMs / step;
+          const remainMs = perStep * (total - step);
+          etaTxt = " · ~" + (remainMs / 1000).toFixed(1) + "s left";
+        }
+        // Detect stalls -- if step doesn't move for >12s after step 1,
+        // turn the bar amber so the user knows something's off (model
+        // loading / OS swapping / etc).
+        if (step !== lastStep) {
+          stalledSince = performance.now();
+          lastStep = step;
+        }
+        if (step >= 1 && performance.now() - stalledSince > 12000) {
+          bar.style.background = "#e0b060";
+        }
+        const elapsedSec = (browserElapsed / 1000).toFixed(1);
+        _ssStatus(
+          (label || "rendering") +
+          " · step " + step + "/" + total +
+          " · " + elapsedSec + "s" + etaTxt,
+          "thinking"
+        );
+      }
+    } catch (_) {
+      // Polling failures are non-fatal -- the bar just freezes briefly.
+    }
+    if (!cancelled) setTimeout(poll, 400);
+  }
+  poll();
+  return () => {
+    cancelled = true;
+    wrap.style.display = "none";
+    bar.style.width = "0%";
+    bar.style.background = "var(--phosphor)";
+  };
+}
+
 /* Wire the Sprite Studio: modal close, generate, save. Entry point is
  * the SpriteCreator node's ⚙ gear handle, which calls _ssOpen(nodeId)
  * directly from the node render code in render(). */
@@ -87126,7 +87204,16 @@ function _ssInstall() {
           saveAiSettings();
           const steps = parseInt(document.getElementById("ss-sd-steps").value, 10) || 9;
           _ssStatus("compile-server SD (" + model + ") rendering " + nativeSize + "×" + nativeSize + "…", "thinking");
-          const raw = await _ssCallCompileServerSD(serverBase, model, description, stylePreset, nativeSize, steps);
+          const stopPoll = _ssStartProgressPoll(
+            serverBase,
+            "SD (" + model + ") " + nativeSize + "×" + nativeSize
+          );
+          let raw;
+          try {
+            raw = await _ssCallCompileServerSD(serverBase, model, description, stylePreset, nativeSize, steps);
+          } finally {
+            stopPoll();
+          }
           _ssStatus("Downsampling to " + sheetW + "×" + sheetH + "…", "thinking");
           blob = await _ssDownsampleBlob(raw, sheetW, sheetH);
           document.getElementById("ss-code").value = "// compile-server SD\n// model: " + model + "\n// prompt: " + description + "\n// native " + nativeSize + " → sprite " + sheetW + "×" + sheetH;
