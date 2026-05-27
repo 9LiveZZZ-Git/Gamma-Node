@@ -51359,16 +51359,29 @@ function _tickGameInputs(dt) {
   // the patch. Returns null if no tilemap exists (body falls back to
   // groundY-only behavior).
   const _findTilemap = (bodyNode) => {
+    // Phase 5a -- accept Level2D as a collision source; synth proxy
+    // backed by its first collidable tilemap layer. Same identity
+    // across frames so _parseTilemap's per-node cache stays warm.
     if (Array.isArray(state.edges)) {
       const wire = state.edges.find(e =>
         e && e.to && e.to.node === bodyNode.id && e.to.port === "tilemap"
       );
       if (wire && wire.from) {
         const src = state.nodes.find(n => n && n.id === wire.from.node);
-        if (src && src.type === "Tilemap2D") return src;
+        if (src) {
+          if (src.type === "Tilemap2D") return src;
+          if (src.type === "Level2D")  {
+            const synth = _level2dCollidableTilemap(src);
+            if (synth) return synth;
+          }
+        }
       }
     }
-    return state.nodes.find(n => n && n.type === "Tilemap2D") || null;
+    const direct = state.nodes.find(n => n && n.type === "Tilemap2D");
+    if (direct) return direct;
+    const lvl = state.nodes.find(n => n && n.type === "Level2D");
+    if (lvl) return _level2dCollidableTilemap(lvl);
+    return null;
   };
   // Helper: parse a Tilemap2D's tileData into a {rows, cols, grid,
   // tileSize, originX, originY, solidSet} object cached on the
@@ -51572,18 +51585,87 @@ function _tickGameInputs(dt) {
  * inline the AABB math here (it's small) instead of hoisting the
  * scoped helper out of _tickGameInputs. */
 function _findWiredOrFirst(consumerNode, portName, sourceType) {
+  // Phase 5a -- when callers ask for "Tilemap2D", also accept a
+  // Level2D and synthesize a tilemap proxy backed by its first
+  // collidable tilemap layer. Lets PlatformerBody2D / PickupCollector
+  // / LevelGoal2D treat Level2D as a level container without each
+  // tick function needing its own Level2D parse path.
+  const _maybeLvlSynth = (n) =>
+    (n && n.type === "Level2D" && sourceType === "Tilemap2D")
+      ? _level2dCollidableTilemap(n) : null;
   if (state && Array.isArray(state.edges)) {
     const wire = state.edges.find(e =>
       e && e.to && e.to.node === consumerNode.id && e.to.port === portName
     );
     if (wire && wire.from) {
       const src = state.nodes.find(n => n && n.id === wire.from.node);
-      if (src && src.type === sourceType) return src;
+      if (src) {
+        if (src.type === sourceType) return src;
+        const synth = _maybeLvlSynth(src);
+        if (synth) return synth;
+      }
     }
   }
-  return state && Array.isArray(state.nodes)
-    ? state.nodes.find(n => n && n.type === sourceType) || null
-    : null;
+  if (state && Array.isArray(state.nodes)) {
+    const direct = state.nodes.find(n => n && n.type === sourceType);
+    if (direct) return direct;
+    if (sourceType === "Tilemap2D") {
+      const lvl = state.nodes.find(n => n && n.type === "Level2D");
+      if (lvl) {
+        const synth = _level2dCollidableTilemap(lvl);
+        if (synth) return synth;
+      }
+    }
+  }
+  return null;
+}
+
+/* Phase 5a -- parse a Level2D's params.layers string ONCE per change
+ * and cache the parsed array on the node. The cached array is the
+ * source-of-truth for gameplay-tick mutations (PickupCollector
+ * clearing '4' cells, etc), so re-parsing every frame would discard
+ * those mutations. Cache invalidates whenever the raw string changes
+ * (modal save serializes back to params.layers). */
+function _level2dParsedLayers(levelNode) {
+  const raw = (levelNode.params && typeof levelNode.params.layers === "string")
+    ? levelNode.params.layers : "[]";
+  if (levelNode._cachedLayersKey === raw && Array.isArray(levelNode._cachedLayers)) {
+    return levelNode._cachedLayers;
+  }
+  let layers;
+  try { layers = JSON.parse(raw); } catch (_) { layers = []; }
+  if (!Array.isArray(layers)) layers = [];
+  levelNode._cachedLayersKey  = raw;
+  levelNode._cachedLayers     = layers;
+  // The synth proxy is layer-identity-bound; rebuild on next request.
+  levelNode._collisionLayerSynth = null;
+  return layers;
+}
+
+/* Phase 5a -- return a Tilemap2D-shaped node backed by the FIRST
+ * tilemap layer with collides!==false. The synth's params IS the
+ * layer object (shared reference), so mutations the gameplay tick
+ * does to params.tileData write through to the cached layer array
+ * and the next frame's mesh build picks them up. Cached on the
+ * Level2D for stable identity (so _parseTilemap's per-node cache
+ * persists across frames). Returns null if no collidable tilemap. */
+function _level2dCollidableTilemap(levelNode) {
+  const layers = _level2dParsedLayers(levelNode);
+  const lyr = layers.find(l => l && l.type === "tilemap" && l.collides !== false);
+  if (!lyr) return null;
+  if (levelNode._collisionLayerSynth && levelNode._collisionLayerSynth._levelLayer === lyr) {
+    return levelNode._collisionLayerSynth;
+  }
+  const synth = {
+    id: levelNode.id + ":collision",
+    type: "Tilemap2D",
+    params: lyr,
+    _isSynthetic: true,
+    _levelLayer: lyr,
+    _levelParentId: levelNode.id
+  };
+  levelNode._collisionLayerSynth = synth;
+  return synth;
 }
 
 function _tilemapCellsMatching(tilemapNode, ch) {
@@ -57381,19 +57463,11 @@ function _expandLevel2DLayers(levelNode, baseTransform, baseMaterial) {
   if (!levelNode) return [];
   const def = TYPES[levelNode.type];
   if (!def) return [];
-  const layersRaw = (levelNode.params && typeof levelNode.params.layers === "string")
-    ? levelNode.params.layers : "[]";
-  let layers;
-  try {
-    layers = JSON.parse(layersRaw);
-  } catch (e) {
-    if (!levelNode._lvlParseErrLogged) {
-      levelNode._lvlParseErrLogged = true;
-      console.warn("[Level2D " + levelNode.id + "] layers JSON parse failed: " + e.message);
-    }
-    return [];
-  }
-  if (!Array.isArray(layers)) return [];
+  // Phase 5a -- use the cached parsed layers so gameplay-tick
+  // mutations (PickupCollector clearing '4' cells, etc) persist
+  // across frames instead of being overwritten by a fresh parse.
+  const layers = _level2dParsedLayers(levelNode);
+  if (!Array.isArray(layers) || layers.length === 0) return [];
   // Camera resolution: if Level2D.camera is wired, use it; else
   // fall back to the first OrthoCamera2D / Camera in the patch.
   // (Same fallback logic ParallaxLayer2D used standalone.)
