@@ -57425,21 +57425,24 @@ function _expandLevel2DLayers(levelNode, baseTransform, baseMaterial) {
       console.warn("[Level2D " + levelNode.id + "] layer " + i + " unknown type: " + layer.type);
       continue;
     }
-    // Synthetic node id: stable per (parent, layerIdx, type). The
-    // mesh cache uses this to key its GPU buffers.
+    // Phase 4a -- chunk tilemap layers above the threshold. Each
+    // chunk becomes its own synthetic Tilemap2D node with its own
+    // mesh cache entry, so a 1000-col level only rebuilds the
+    // chunks the user actually edits, and empty chunks (all '.')
+    // emit no mesh at all -- the cheap part of sparse maps.
+    if (layer.type === "tilemap") {
+      const chunked = _expandTilemapLayerChunks(levelNode, layer, i, camNodeId, baseTransform, baseMaterial);
+      if (chunked) {
+        for (const e of chunked) out.push(e);
+        continue;
+      }
+    }
+    // Default path: emit a single synthetic node for the whole layer.
     const synthId = levelNode.id + ":lyr" + i + ":" + synthType;
-    // Build the synthetic params by copying the layer fields. The
-    // existing build functions (_buildTilemap2D etc.) read these by
-    // name, so as long as the per-type fields are present this Just
-    // Works.
     const synthParams = Object.assign({}, layer);
-    // Strip non-param fields so the cache key is clean.
     delete synthParams.type;
     delete synthParams.name;
     delete synthParams.collides;
-    // Synthetic node object. Marked with _levelLayer so the sprite
-    // encoder + texture resolver can find the embedded URL / camera
-    // ref without walking wires.
     const synthNode = {
       id: synthId,
       type: synthType,
@@ -57447,7 +57450,7 @@ function _expandLevel2DLayers(levelNode, baseTransform, baseMaterial) {
       _isSynthetic: true,
       _levelLayer: layer,
       _levelParentId: levelNode.id,
-      _levelCameraNodeId: camNodeId   // for ParallaxLayer2D builds
+      _levelCameraNodeId: camNodeId
     };
     out.push({
       node: synthNode,
@@ -57457,6 +57460,121 @@ function _expandLevel2DLayers(levelNode, baseTransform, baseMaterial) {
       _level2DLayer: true,
       _level2DLayerName: layer.name || ("layer" + i)
     });
+  }
+  return out;
+}
+
+/* Phase 4a -- split a tilemap layer's tileData into fixed-size
+ * cell chunks, each emitted as its own synthetic Tilemap2D node.
+ *
+ * Returns:
+ *   null               -- layer is small enough to stay single-mesh
+ *   [synthEntries...]  -- one entry per non-empty chunk
+ *
+ * Chunk size is 64x64 cells (~4 KB of verts in the worst case);
+ * threshold to chunk at all is 4096 cells total (so a typical
+ * 17x8 demo map stays single-mesh, but a 170x80 or 1000x80 map
+ * splits into manageable buffers).
+ *
+ * Empty chunks (every cell is '.' or ' ') emit nothing -- crucial
+ * for sparse maps where most of the world is sky. */
+const _LVL_TILEMAP_CHUNK_THRESHOLD = 4096;   // total cells; below this stay single-mesh
+const _LVL_TILEMAP_CHUNK_W = 64;
+const _LVL_TILEMAP_CHUNK_H = 64;
+
+function _expandTilemapLayerChunks(levelNode, layer, layerIdx, camNodeId, baseTransform, baseMaterial) {
+  const tileData = (typeof layer.tileData === "string") ? layer.tileData : "";
+  if (!tileData.length) return null;
+  const rowsArr = tileData.split("\n");
+  const parentRows = rowsArr.length;
+  const parentCols = rowsArr.reduce((m, r) => Math.max(m, r.length), 0);
+  if (parentCols === 0) return null;
+  if (parentRows * parentCols <= _LVL_TILEMAP_CHUNK_THRESHOLD) return null;
+  const ts = (typeof layer.tileSize === "number" && layer.tileSize > 0) ? layer.tileSize : 1;
+  const ox = (typeof layer.originX === "number") ? layer.originX : 0;
+  const oy = (typeof layer.originY === "number") ? layer.originY : 0;
+  const cxParent = (parentCols - 1) * 0.5;
+  const cyParent = (parentRows - 1) * 0.5;
+  const chunkW = _LVL_TILEMAP_CHUNK_W;
+  const chunkH = _LVL_TILEMAP_CHUNK_H;
+  const nChunkX = Math.ceil(parentCols / chunkW);
+  const nChunkY = Math.ceil(parentRows / chunkH);
+  const out = [];
+  let emitted = 0, skipped = 0;
+  for (let cr = 0; cr < nChunkY; cr++) {
+    const r0 = cr * chunkH;
+    const r1 = Math.min(parentRows, r0 + chunkH);
+    const thisChunkH = r1 - r0;
+    for (let cc = 0; cc < nChunkX; cc++) {
+      const c0 = cc * chunkW;
+      const c1 = Math.min(parentCols, c0 + chunkW);
+      const thisChunkW = c1 - c0;
+      // Slice tileData for this chunk + check for empty.
+      let chunkNonEmpty = false;
+      const chunkLines = new Array(thisChunkH);
+      for (let rr = 0; rr < thisChunkH; rr++) {
+        const srcLine = rowsArr[r0 + rr] || "";
+        const sub = srcLine.substring(c0, c1).padEnd(thisChunkW, ".");
+        chunkLines[rr] = sub;
+        if (!chunkNonEmpty) {
+          for (let k = 0; k < sub.length; k++) {
+            const ch = sub[k];
+            if (ch !== "." && ch !== " ") { chunkNonEmpty = true; break; }
+          }
+        }
+      }
+      if (!chunkNonEmpty) { skipped++; continue; }
+      // World origin for this chunk: position its center cell so that
+      // the chunk's cells land at the SAME world positions as the
+      // un-chunked parent would. Derivation in CLAUDE.md / Phase 4
+      // commit: chunkOX = (cc*chunkW - cxParent + cxChunk) * ts + ox.
+      const cxChunk = (thisChunkW - 1) * 0.5;
+      const cyChunk = (thisChunkH - 1) * 0.5;
+      const chunkOX = (c0 - cxParent + cxChunk) * ts + ox;
+      const chunkOY = (cyParent - r0 - cyChunk) * ts + oy;
+      const synthParams = Object.assign({}, layer);
+      delete synthParams.type;
+      delete synthParams.name;
+      delete synthParams.collides;
+      synthParams.tileData = chunkLines.join("\n");
+      synthParams.originX  = chunkOX;
+      synthParams.originY  = chunkOY;
+      const synthId = levelNode.id + ":lyr" + layerIdx + ":c" + cr + "_" + cc + ":Tilemap2D";
+      const synthNode = {
+        id: synthId,
+        type: "Tilemap2D",
+        params: synthParams,
+        _isSynthetic: true,
+        _levelLayer: layer,
+        _levelParentId: levelNode.id,
+        _levelCameraNodeId: camNodeId,
+        // Hooks for the upcoming Phase 4b frustum culling: precomputed
+        // world AABB for this chunk so the dispatch can early-out
+        // without re-parsing tileData. minY/maxY computed assuming
+        // row 0 is at +Y (matches _buildTilemap2D's convention).
+        _levelChunkBounds: {
+          minX: chunkOX - thisChunkW * 0.5 * ts,
+          maxX: chunkOX + thisChunkW * 0.5 * ts,
+          minY: chunkOY - thisChunkH * 0.5 * ts,
+          maxY: chunkOY + thisChunkH * 0.5 * ts
+        }
+      };
+      out.push({
+        node: synthNode,
+        def: TYPES["Tilemap2D"],
+        transform: baseTransform,
+        material: baseMaterial,
+        _level2DLayer: true,
+        _level2DLayerName: (layer.name || ("layer" + layerIdx)) + ":c" + cr + "_" + cc
+      });
+      emitted++;
+    }
+  }
+  if (!levelNode._lvlChunkLogged || levelNode._lvlChunkLogged !== parentRows + "x" + parentCols) {
+    levelNode._lvlChunkLogged = parentRows + "x" + parentCols;
+    console.log("[Level2D " + levelNode.id + "] lyr" + layerIdx + " chunked " +
+      parentCols + "x" + parentRows + " into " + emitted + " non-empty + " + skipped + " empty (" +
+      chunkW + "x" + chunkH + " cells per chunk)");
   }
   return out;
 }
