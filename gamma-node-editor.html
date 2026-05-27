@@ -73664,11 +73664,19 @@ function _ensureSceneInstance(sceneNode) {
       addressModeU: "repeat", addressModeV: "repeat"
     });
   }
-  const SLOT_COUNT = 4;
-  const slots = [];
-  for (let i = 0; i < SLOT_COUNT; i++) {
+  // Phase 4b -- slot allocation extracted into a closure so we can
+  // grow the slot array on demand (e.g. a chunked Level2D with 32
+  // tilemap chunks needs more than the original 4-slot cap). The
+  // closure captures perSceneBuffer + sceneNode.id; Visual.* views
+  // are re-resolved per call so newly-allocated slots reference the
+  // current atm/svt/scratch views.
+  _ensureEnvTextureDefault();
+  _ensureAtmosphereLUTs();
+  if (!_SVT.atlasView && Visual.device) _ensureSVT();
+  _ensureSVTDefaultPageTable();
+  const _allocSceneSlot = (slotIdx) => {
     const perDrawBuffer = Visual.device.createBuffer({
-      label: "scene-perdraw-" + sceneNode.id + "-slot" + i,
+      label: "scene-perdraw-" + sceneNode.id + "-slot" + slotIdx,
       // v0.3.123 -- grown 96 → 160 for TerrainMaterial bands.
       // v0.3.126 §5.5.c-3 -- grown 160 → 192 for vsParams.
       // v0.3.129 TerrainMaterial v2 -- grown 192 → 224 for
@@ -73679,25 +73687,10 @@ function _ensureSceneInstance(sceneNode) {
       size: 256,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
     });
-    // Sprint 7.5.4.b -- env texture (HDRI / Skybox) at bindings 4+5.
-    // Default to a 1x1 mid-gray when no HDRI is loaded; sample_env's
-    // mode dispatch only reads it when mode == 3.
-    _ensureEnvTextureDefault();
-    // Sprint 7.6.b-atm Tier-C.1 -- atmosphere LUTs at bindings 6/7/8.
-    // _ensureAtmosphereLUTs creates the textures + sampler + the 1x1
-    // default once; bind groups capture the views so they're rebuilt
-    // automatically when sceneInstances is cleared (e.g. msaa toggle).
-    _ensureAtmosphereLUTs();
     const transmittanceView = Visual.atmTransmittanceLUTView || Visual.atmLut1x1DefaultView;
     const multiScatterView  = Visual.atmMultiScatterLUTView  || Visual.atmLut1x1DefaultView;
     const skyViewView       = Visual.atmSkyViewLUTView       || Visual.atmLut1x1DefaultView;
-    // Sprint 10-5c-c: SVT bindings. Allocate on first call here so the
-    // bind group always has SOMETHING to point at -- even when SVT
-    // pages are empty the shader still samples (and sees all-zero
-    // pixels, which the sample-site smartly treats as 'unresident').
-    if (!_SVT.atlasView && Visual.device) _ensureSVT();
-    _ensureSVTDefaultPageTable();
-    const svtAtlasView    = _SVT.atlasView       || Visual.envTextureView;  // any 2d float texture
+    const svtAtlasView    = _SVT.atlasView       || Visual.envTextureView;
     const svtAtlasSampler = _SVT.atlasSampler    || Visual.envSampler;
     const svtPageTableV   = _SVT.pageTableView   || Visual.svtPageTableDefaultView;
     const svtNormalView   = _SVT.normalAtlasView   || Visual.envTextureView;
@@ -73705,7 +73698,7 @@ function _ensureSceneInstance(sceneNode) {
     const svtFinePageV    = _SVT.finePageTableView || Visual.svtPageTableDefaultView;
     const makeBindGroup = (scratchView, parity) =>
       Visual.device.createBindGroup({
-        label: "scene-bg-" + sceneNode.id + "-slot" + i + "-" + parity,
+        label: "scene-bg-" + sceneNode.id + "-slot" + slotIdx + "-" + parity,
         layout: Visual.meshBindGroupLayout,
         entries: [
           { binding: 0, resource: { buffer: perSceneBuffer } },
@@ -73728,14 +73721,15 @@ function _ensureSceneInstance(sceneNode) {
       });
     const bindGroupA = makeBindGroup(Visual.scratchArrayViewA, "a");
     const bindGroupB = makeBindGroup(Visual.scratchArrayViewB, "b");
-    // Keep `bindGroup` as an alias for parity "a" so any caller that
-    // doesn't pass a readKey (legacy paths) gets the same view it
-    // used to. _encodeScenePass picks A or B by entry.readKey.
-    slots.push({ perDrawBuffer, bindGroup: bindGroupA, bindGroupA, bindGroupB });
-  }
+    return { perDrawBuffer, bindGroup: bindGroupA, bindGroupA, bindGroupB };
+  };
+  const SLOT_COUNT_INITIAL = 4;
+  const slots = [];
+  for (let i = 0; i < SLOT_COUNT_INITIAL; i++) slots.push(_allocSceneSlot(i));
   inst = {
     perSceneBuffer,
     slots,
+    _allocSlot: _allocSceneSlot,   // grow on demand from _encodeScenePass
     sceneScratch: new Float32Array(264),  // 1056 bytes (sprint 9-3 -- + proj matrix at end)
     // v0.3.123 -- 40 floats / 160 B for TerrainMaterial band slots.
     // v0.3.126 §5.5.c-3 -- bumped 40 → 48 / 192 B; slots [40..43]
@@ -74118,6 +74112,21 @@ function _encodeScenePass(enc, entry) {
   const _aabbMinScratch = new Float32Array(3);
   const _aabbMaxScratch = new Float32Array(3);
   let curMaterialType = null;
+  // Phase 4b -- grow per-draw slots if the mesh list exceeds the
+  // initial 4-slot allocation. Each Level2D tilemap chunk needs its
+  // own slot; without growth the encoder would silently drop chunks
+  // past slot[3], leaving a 4-chunk visible square in a larger map.
+  if (meshes.length > inst.slots.length && typeof inst._allocSlot === "function") {
+    const oldCount = inst.slots.length;
+    while (inst.slots.length < meshes.length) {
+      inst.slots.push(inst._allocSlot(inst.slots.length));
+    }
+    if (!Visual._slotGrowLogged || Visual._slotGrowLogged < inst.slots.length) {
+      Visual._slotGrowLogged = inst.slots.length;
+      console.log("[scene] grew per-draw slots: " + node.id + " " + oldCount + " -> " + inst.slots.length +
+        " (meshes=" + meshes.length + ")");
+    }
+  }
   for (let i = 0; i < meshes.length && i < inst.slots.length; i++) {
     const m = meshes[i];
     const slot = inst.slots[i];
