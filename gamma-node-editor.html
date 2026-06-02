@@ -6822,6 +6822,13 @@
               <span class="tool-menu-sub">Preview the exact image sent to OCR / the AI after each Recognize — to verify handwriting isn't clipped</span>
             </span>
           </button>
+          <button class="tool-menu-item" id="tool-hwr-stroke-match">
+            <span class="tool-menu-icon tool-menu-check">☐</span>
+            <span>
+              <strong>Match against learned handwriting (experimental)</strong>
+              <span class="tool-menu-sub">Try the offline stroke-template matcher (HW.4) before OCR / the VLM. Off by default — the current chamfer metric over-matches once you've stored a single template, so it tends to spawn the same node for everything until the matcher is redesigned.</span>
+            </span>
+          </button>
           <button class="tool-menu-item" id="tool-hwr-clear">
             <span class="tool-menu-icon">⌫</span>
             <span>
@@ -8082,7 +8089,7 @@
  * Pages deploy workflow (.github/workflows/pages.yml). The string
  * after the equals sign is what the workflow's sed targets — don't
  * change the format of this line. */
-const APP_VERSION = "0.3.626";
+const APP_VERSION = "0.3.627";
 
 /* =========================================================================
  * Node type registry — covers ~55 Gamma DSP classes
@@ -52950,6 +52957,31 @@ if (_hwrDebugBtn) {
     }
   });
 }
+/* HW.4 -- offline stroke-template matcher. Disabled by default: the
+ * current chamfer-distance metric on resampled point clouds isn't
+ * discriminating enough for word-shaped handwriting — once a single
+ * template is stored, almost any new word lands within the threshold
+ * and gets misclassified as that one. Until the matcher is redesigned
+ * (trajectory features + DTW, aspect-ratio gating), users opt in
+ * explicitly. Persisted to localStorage; when OFF, the recognize
+ * cascade also skips the auto-learn step so the library stays clean. */
+let _hwrStrokeMatchOn = false;
+try { _hwrStrokeMatchOn = localStorage.getItem("gamma-hwr-stroke-match-v1") === "1"; } catch (_) {}
+const _hwrStrokeBtn = document.getElementById("tool-hwr-stroke-match");
+if (_hwrStrokeBtn) {
+  const _syncHwrStroke = () => {
+    const chk = _hwrStrokeBtn.querySelector(".tool-menu-check");
+    if (chk) chk.textContent = _hwrStrokeMatchOn ? "☑" : "☐";
+  };
+  _syncHwrStroke();
+  _hwrStrokeBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    _hwrStrokeMatchOn = !_hwrStrokeMatchOn;
+    try { localStorage.setItem("gamma-hwr-stroke-match-v1", _hwrStrokeMatchOn ? "1" : "0"); } catch (_) {}
+    _syncHwrStroke();
+  });
+}
+
 const _hwrClearBtn = document.getElementById("tool-hwr-clear");
 if (_hwrClearBtn) {
   _hwrClearBtn.addEventListener("click", (e) => {
@@ -54821,16 +54853,22 @@ async function _recognizeInkStrokes(strokes, box, key, opts) {
     render();
     return { matched: shape, lastReply: "" };
   }
-  // HW.4 -- online stroke-template match (offline, personalized).
-  const hit = _hwrStrokeRecognize(strokes);
-  if (hit && hit.dist <= HWR_MATCH_THRESHOLD && TYPES[hit.name]) {
-    console.log("[hwr] stroke match:", hit.name, "dist=" + hit.dist.toFixed(3));
-    pushHistory("hwr:add");
-    const id = makeNode(hit.name, Math.round(box.x), Math.round(box.y));
-    if (id) selectOne(id);
-    _hwrLearnTemplate(hit.name, strokes);
-    render();
-    return { matched: hit.name, lastReply: "", learnedHand: true };
+  // HW.4 -- online stroke-template match. Disabled by default behind
+  // _hwrStrokeMatchOn — see the menu toggle. The chamfer-distance metric
+  // on resampled point clouds isn't discriminating enough for word-shaped
+  // handwriting, so one bad template can match everything until the
+  // matcher is redesigned.
+  if (typeof _hwrStrokeMatchOn !== "undefined" && _hwrStrokeMatchOn) {
+    const hit = _hwrStrokeRecognize(strokes);
+    if (hit && hit.dist <= HWR_MATCH_THRESHOLD && TYPES[hit.name]) {
+      console.log("[hwr] stroke match:", hit.name, "dist=" + hit.dist.toFixed(3));
+      pushHistory("hwr:add");
+      const id = makeNode(hit.name, Math.round(box.x), Math.round(box.y));
+      if (id) selectOne(id);
+      _hwrLearnTemplate(hit.name, strokes);
+      render();
+      return { matched: hit.name, lastReply: "", learnedHand: true };
+    }
   }
   // Image cascade (HW.1 raster → Tesseract → VLM).
   const { dataUrl, base64 } = strokesToPng(box, strokes);
@@ -54842,7 +54880,13 @@ async function _recognizeInkStrokes(strokes, box, key, opts) {
     console.log("[hwr] tesseract reply:", JSON.stringify(ocrText), "conf=" + Math.round(ocrConf));
     if (ocrText && !_looksLikeChain(ocrText) && ocrConf >= HWR_OCR_CONF_FLOOR) {
       matched = tryCreateFromLabel(ocrText, box, /*silent*/ true);
-      if (matched && TYPES[matched]) _hwrLearnTemplate(matched, strokes);   // HW.4 auto-learn
+      // HW.4 auto-learn — only when the stroke matcher is opted in AND
+      // the OCR confidence is very high (>=80), so a borderline read
+      // can't seed a sticky template.
+      if (typeof _hwrStrokeMatchOn !== "undefined" && _hwrStrokeMatchOn
+          && matched && TYPES[matched] && ocrConf >= 80) {
+        _hwrLearnTemplate(matched, strokes);
+      }
     } else if (ocrText) {
       console.log("[hwr] routing to VLM (" + (_looksLikeChain(ocrText) ? "looks like a chain" : "low conf") + ")");
     }
@@ -54873,8 +54917,12 @@ async function _recognizeInkStrokes(strokes, box, key, opts) {
           if (cands.length) { setGemmaProgressHook(null); return { matched: null, lastReply, deferred: true, candidates: cands }; }
         }
         matched = _applyVisionResult(result, box, /*silent*/ false);
-        if (matched && TYPES[matched] && _lastHwrCandidates && _lastHwrCandidates.confidence >= 0.7) {
-          _hwrLearnTemplate(matched, strokes);   // HW.4 auto-learn from confident classify
+        // HW.4 auto-learn from a confident classify — only when the stroke
+        // matcher is opted in AND Claude is very sure (>=0.85, was 0.7).
+        if (typeof _hwrStrokeMatchOn !== "undefined" && _hwrStrokeMatchOn
+            && matched && TYPES[matched]
+            && _lastHwrCandidates && _lastHwrCandidates.confidence >= 0.85) {
+          _hwrLearnTemplate(matched, strokes);
         }
       }
     } catch (err) {
@@ -55031,7 +55079,7 @@ function _looksLikeChain(text) {
  * Canvas-only: the touchscreen popup posts an image, not strokes. */
 const HWR_TPL_KEY = "gamma-hwr-templates-v1";
 const HWR_PCLOUD_N = 48;            // point-cloud resample resolution
-const HWR_MATCH_THRESHOLD = 0.10;   // normalized chamfer dist below which a template is trusted
+const HWR_MATCH_THRESHOLD = 0.06;   // normalized chamfer dist below which a template is trusted (tightened from 0.10 — chamfer over-matches on word-shaped clouds)
 const HWR_TPL_PER_NAME = 6;         // keep the most recent N samples per node name
 let _hwrTemplates = {};             // { name: [ { pts:[{x,y}...] }, ... ] }
 try { _hwrTemplates = JSON.parse(localStorage.getItem(HWR_TPL_KEY) || "{}") || {}; } catch (_) { _hwrTemplates = {}; }
@@ -55252,9 +55300,14 @@ async function callVision(pngBase64, key) {
 `You read short handwriting on a small canvas (white background, black ink) and map it to an audio DSP node from a fixed list.
 
 Return ONLY a JSON object — no prose, no markdown, no code fence. Use exactly one of these shapes:
-- single node: {"text":"<exactly what is written>","name":"<closest node name from the list, or null if nothing fits>","confidence":<0..1>,"alternates":["<2nd closest name>","<3rd closest name>"]}
+- single node: {"text":"<exactly what is written>","name":"<exact node name from the list, or null>","confidence":<0..1>,"alternates":["<2nd plausible>","<3rd plausible>"]}
 - a chain (several names written left-to-right separated by "|" or an arrow → / >): {"chain":["<name1>","<name2>", ...]}
 - unreadable: {"text":"","name":null,"confidence":0,"alternates":[]}
+
+IMPORTANT:
+- Only set "name" when the handwriting CLEARLY reads as one of the listed node names. If you're not sure, return name:null with confidence 0 — the system has a UI to suggest alternates, so guessing is worse than admitting uncertainty.
+- Calibrate "confidence" honestly: use >=0.9 only when you're nearly certain; 0.5–0.8 when the writing is partially legible; below 0.4 when it's a guess.
+- Do NOT default to alphabetically-early names (e.g. "AutomationLane", "AD") when the writing is ambiguous — those become a sticky failure mode. Return null instead.
 
 Node names — use this exact CamelCase spelling (e.g. "MultibandComp", "KeyboardIn", "Sine"):
 ${nodeList}`;
