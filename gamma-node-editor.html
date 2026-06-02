@@ -8082,7 +8082,7 @@
  * Pages deploy workflow (.github/workflows/pages.yml). The string
  * after the equals sign is what the workflow's sed targets — don't
  * change the format of this line. */
-const APP_VERSION = "0.3.624";
+const APP_VERSION = "0.3.625";
 
 /* =========================================================================
  * Node type registry — covers ~55 Gamma DSP classes
@@ -39638,38 +39638,95 @@ const _demos = [
       const freq = makeNode("Mul", 1000, 340, { b: 110 });
       state.edges.push({ from: { node: ratio, port: "out" }, to: { node: freq, port: "a" } });
 
-      // ── Pinch gate: pinch≈0 (thumb+index touching) → gate=1; pinch≥0.08
-      // (fingers apart) → gate=0. Smoothstep gives a clickless transition.
-      const pNorm = makeNode("Mul", 520, 460, { b: 12.5 });   // 0.08 pinch → 1.0
+      // ── Pinch gate: pinch≈0 (thumb+index touching) → gate=1; pinch≥~0.17
+      // (fingers apart) → gate=0. Wider continuous response than a hard
+      // threshold gives the feel of a real theremin's volume antenna —
+      // a smoothly modulated loudness, not an on/off switch.
+      const pNorm = makeNode("Mul", 520, 460, { b: 6 });
       state.edges.push({ from: { node: gatePinch, port: "out" }, to: { node: pNorm, port: "a" } });
       const sm = makeNode("Smoothstep", 680, 460);
       state.edges.push({ from: { node: pNorm, port: "out" }, to: { node: sm, port: "in" } });
       const pinchGate = makeNode("Sub", 840, 460, { a: 1 });   // 1 − smoothstep
       state.edges.push({ from: { node: sm, port: "out" }, to: { node: pinchGate, port: "b" } });
+      // Gate slew: a 5 Hz lowpass (~30 ms time constant) gives the audible
+      // soft swell of a theremin's volume hand instead of a discrete click.
+      // It's the single most "theremin-y" thing after vibrato.
+      const gateSmooth = makeNode("BiquadLP", 1000, 460, { cutoff: 5, q: 0.7 });
+      state.edges.push({ from: { node: pinchGate, port: "out" }, to: { node: gateSmooth, port: "in" } });
 
       // ── Both-hands-present guard: silent unless numHands ≥ 2.
-      // (numHands − 1.99) × 100, then Smoothstep clamps to 0 or 1.
       const nhSub = makeNode("Sub", 40, 580, { b: 1.99 });
       state.edges.push({ from: { node: hands, port: "numHands" }, to: { node: nhSub, port: "a" } });
       const nhScale = makeNode("Mul", 200, 580, { b: 100 });
       state.edges.push({ from: { node: nhSub, port: "out" }, to: { node: nhScale, port: "a" } });
       const bothPresent = makeNode("Smoothstep", 360, 580);
       state.edges.push({ from: { node: nhScale, port: "out" }, to: { node: bothPresent, port: "in" } });
-      const fullGate = makeNode("Mul", 1000, 500);
-      state.edges.push({ from: { node: pinchGate, port: "out" }, to: { node: fullGate, port: "a" } });
+      const fullGate = makeNode("Mul", 1160, 520);
+      state.edges.push({ from: { node: gateSmooth, port: "out" }, to: { node: fullGate, port: "a" } });
       state.edges.push({ from: { node: bothPresent, port: "out" }, to: { node: fullGate, port: "b" } });
 
-      // ── Voice: Sine × gate × amplitude → stereo Output
-      const sine = makeNode("Sine", 1160, 340, { freq: 220 });
-      state.edges.push({ from: { node: freq, port: "out" }, to: { node: sine, port: "freq" } });
-      const gated = makeNode("Mul", 1320, 400);
-      state.edges.push({ from: { node: sine, port: "out" }, to: { node: gated, port: "a" } });
-      state.edges.push({ from: { node: fullGate, port: "out" }, to: { node: gated, port: "b" } });
-      const amp = makeNode("Mul", 1480, 400, { b: 0.4 });
-      state.edges.push({ from: { node: gated, port: "out" }, to: { node: amp, port: "a" } });
-      const out = makeNode("Output", 1640, 400);
-      state.edges.push({ from: { node: amp, port: "out" }, to: { node: out, port: "L" } });
-      state.edges.push({ from: { node: amp, port: "out" }, to: { node: out, port: "R" } });
+      // ── Pitch smoothing: lowpass the per-frame freq updates so the
+      // pitch glides instead of stair-stepping at MediaPipe's ~60 Hz
+      // refresh rate. 22 Hz cutoff ≈ 7 ms time constant — responsive
+      // but zipper-free.
+      const freqSmooth = makeNode("BiquadLP", 1160, 340, { cutoff: 22, q: 0.7 });
+      state.edges.push({ from: { node: freq, port: "out" }, to: { node: freqSmooth, port: "in" } });
+
+      // ── Vibrato — the defining theremin sonic feature. Without it,
+      // even a perfect sine sounds like a tone generator. ~5.5 Hz at
+      // ±1.8% (~31 cents) is gentle, always-on, performer-like.
+      // vibFactor = 1 + 0.018 · sin(2π · 5.5 t) ∈ [0.982, 1.018]
+      const vibLFO = makeNode("Sine", 40, 760, { freq: 5.5 });
+      const vibDepth = makeNode("Mul", 220, 760, { b: 0.018 });
+      state.edges.push({ from: { node: vibLFO, port: "out" }, to: { node: vibDepth, port: "a" } });
+      const vibFactor = makeNode("Add", 400, 760, { b: 1 });
+      state.edges.push({ from: { node: vibDepth, port: "out" }, to: { node: vibFactor, port: "a" } });
+      const modFreq = makeNode("Mul", 1320, 340);
+      state.edges.push({ from: { node: freqSmooth, port: "out" }, to: { node: modFreq, port: "a" } });
+      state.edges.push({ from: { node: vibFactor, port: "out" }, to: { node: modFreq, port: "b" } });
+
+      // ── Fundamental + gentle 2nd harmonic for theremin warmth. A pure
+      // sine sounds clinical; a small dose (~13%) of 2nd harmonic
+      // approximates the soft heterodyne overtones of a real theremin
+      // circuit without making it brassy.
+      const fund = makeNode("Sine", 1480, 340, { freq: 220 });
+      state.edges.push({ from: { node: modFreq, port: "out" }, to: { node: fund, port: "freq" } });
+      const h2Freq = makeNode("Mul", 1320, 440, { b: 2 });
+      state.edges.push({ from: { node: modFreq, port: "out" }, to: { node: h2Freq, port: "a" } });
+      const h2 = makeNode("Sine", 1480, 440, { freq: 440 });
+      state.edges.push({ from: { node: h2Freq, port: "out" }, to: { node: h2, port: "freq" } });
+      const h2Scaled = makeNode("Mul", 1640, 440, { b: 0.13 });
+      state.edges.push({ from: { node: h2, port: "out" }, to: { node: h2Scaled, port: "a" } });
+      const blended = makeNode("Add", 1640, 340);
+      state.edges.push({ from: { node: fund, port: "out" }, to: { node: blended, port: "a" } });
+      state.edges.push({ from: { node: h2Scaled, port: "out" }, to: { node: blended, port: "b" } });
+
+      // ── Soft tube-style saturation. 1.3× pre-boost, Tanh rounds the
+      // peaks for vacuum-tube warmth without audible clipping.
+      const preSat = makeNode("Mul", 1800, 340, { b: 1.3 });
+      state.edges.push({ from: { node: blended, port: "out" }, to: { node: preSat, port: "a" } });
+      const warmed = makeNode("Tanh", 1960, 340);
+      state.edges.push({ from: { node: preSat, port: "out" }, to: { node: warmed, port: "in" } });
+
+      // ── Apply the gate
+      const voice = makeNode("Mul", 2120, 340);
+      state.edges.push({ from: { node: warmed, port: "out" }, to: { node: voice, port: "a" } });
+      state.edges.push({ from: { node: fullGate, port: "out" }, to: { node: voice, port: "b" } });
+
+      // ── PlateReverb — theremins almost always perform with reverb.
+      // Decay 0.85, damping 0.45, mix 0.32 = a medium-hall character that
+      // smooths the sustain without washing out the pitch articulation.
+      const preRev = makeNode("Mul", 2280, 340, { b: 0.5 });
+      state.edges.push({ from: { node: voice, port: "out" }, to: { node: preRev, port: "a" } });
+      const reverb = makeNode("PlateReverb", 2440, 340, { decay: 0.85, damping: 0.45, mix: 0.32 });
+      state.edges.push({ from: { node: preRev, port: "out" }, to: { node: reverb, port: "in" } });
+
+      // ── Final level + stereo Output
+      const finalAmp = makeNode("Mul", 2600, 340, { b: 0.7 });
+      state.edges.push({ from: { node: reverb, port: "out" }, to: { node: finalAmp, port: "a" } });
+      const out = makeNode("Output", 2760, 340);
+      state.edges.push({ from: { node: finalAmp, port: "out" }, to: { node: out, port: "L" } });
+      state.edges.push({ from: { node: finalAmp, port: "out" }, to: { node: out, port: "R" } });
     }
   },
 
