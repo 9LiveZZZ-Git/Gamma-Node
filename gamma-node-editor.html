@@ -8082,7 +8082,7 @@
  * Pages deploy workflow (.github/workflows/pages.yml). The string
  * after the equals sign is what the workflow's sed targets — don't
  * change the format of this line. */
-const APP_VERSION = "0.3.622";
+const APP_VERSION = "0.3.623";
 
 /* =========================================================================
  * Node type registry — covers ~55 Gamma DSP classes
@@ -39525,6 +39525,151 @@ const _demos = [
       const out  = makeNode("Output",   780, 240);
       state.edges.push({ from: { node: amp,  port: "out" }, to: { node: filt, port: "in" } });
       state.edges.push({ from: { node: filt, port: "out" }, to: { node: out,  port: "L"  } });
+    }
+  },
+
+  /* 2-Hand Theremin — true gestural theremin. Right hand height controls
+   * pitch (exponential, ~3 octaves A2→A5, musically natural); left hand
+   * pinch acts as the volume-antenna's gate — notes only sound when the
+   * left thumb + index touch. Both hands must be visible. Hand assignment
+   * is SPATIAL (rightmost-on-screen hand = pitch hand) so it works
+   * regardless of which hand MediaPipe detects first, AND the user can
+   * see what the detector sees via the live skeleton overlay
+   * (phosphor=left, cyan=right). Smoothstep on the pinch gate avoids
+   * zipper clicks; both-present guard keeps it silent when a hand
+   * leaves the frame. */
+  {
+    id: "two-hand-theremin",
+    name: "2-Hand Theremin",
+    sub: "right=pitch · left pinch=gate",
+    type: "advanced",
+    thumb: `<svg viewBox="0 0 100 44">
+      <rect width="100" height="44" fill="rgba(8,10,14,0.95)"/>
+      <!-- gate hand (left, phosphor) pinching -->
+      <g stroke="rgba(200,232,90,0.95)" stroke-width="0.7" stroke-linecap="round" fill="rgba(200,232,90,0.95)">
+        <circle cx="20" cy="28" r="1.3"/>
+        <line x1="20" y1="28" x2="16" y2="22"/>
+        <line x1="20" y1="28" x2="22" y2="22"/>
+        <circle cx="16" cy="22" r="0.9"/>
+        <circle cx="22" cy="22" r="0.9"/>
+        <line x1="16" y1="22" x2="22" y2="22" stroke-dasharray="1 1.4"/>
+      </g>
+      <!-- pitch hand (right, cyan) high -->
+      <g stroke="rgba(131,232,255,0.95)" stroke-width="0.7" stroke-linecap="round" fill="rgba(131,232,255,0.95)">
+        <circle cx="80" cy="14" r="1.3"/>
+        <line x1="80" y1="14" x2="74" y2="6"/>
+        <line x1="80" y1="14" x2="80" y2="5"/>
+        <line x1="80" y1="14" x2="86" y2="6"/>
+        <line x1="80" y1="14" x2="88" y2="11"/>
+        <circle cx="74" cy="6" r="0.7"/>
+        <circle cx="80" cy="5" r="0.7"/>
+        <circle cx="86" cy="6" r="0.7"/>
+        <circle cx="88" cy="11" r="0.7"/>
+      </g>
+      <!-- waveform between -->
+      <path d="M 36 32 Q 41 26 46 32 T 56 32 T 66 32"
+            stroke="rgba(178,100,200,0.85)" stroke-width="1.0" fill="none" stroke-linecap="round"/>
+      <text x="50" y="42" text-anchor="middle"
+            font-family="monospace" font-size="4.2" fill="rgba(178,100,200,0.85)"
+            letter-spacing="0.12em">THEREMIN</text>
+    </svg>`,
+    build: () => {
+      // ── Vision: MediaPipe hand landmarker + live preview into VisualOutput
+      const hands = makeNode("HandLandmarker", 40, 60, {
+        maxHands: 2, minConfidence: 0.5, bgMode: 1, mirrored: 1
+      });
+      const vo = makeNode("VisualOutput", 360, 60, { display: 0 });
+      state.edges.push({ from: { node: hands, port: "out" }, to: { node: vo, port: "in" } });
+
+      // ── Spatial hand assignment. MediaPipe returns hands by detection
+      // order, not handedness — so we sort by horizontal position.
+      // MediaPipe's x is the RAW camera coord (the `mirrored` flag only
+      // flips the visualization, not the data). In selfie view the user's
+      // RIGHT hand therefore has the LOWER h_x. So:
+      //   diff = h2_x − h1_x  → positive when h1 is the user's right hand
+      //   selH1R = (Sign(diff) + 1) / 2  → 1 if h1 is right hand, 0 else
+      //   selH2R = 1 − selH1R
+      const xDiff = makeNode("Sub", 40, 200);
+      state.edges.push({ from: { node: hands, port: "h2_x" }, to: { node: xDiff, port: "a" } });
+      state.edges.push({ from: { node: hands, port: "h1_x" }, to: { node: xDiff, port: "b" } });
+      const xSign = makeNode("Sign", 200, 200);
+      state.edges.push({ from: { node: xDiff, port: "out" }, to: { node: xSign, port: "in" } });
+      const selBias = makeNode("Add", 360, 200, { b: 1 });
+      state.edges.push({ from: { node: xSign, port: "out" }, to: { node: selBias, port: "a" } });
+      const selH1R = makeNode("Mul", 520, 200, { b: 0.5 });
+      state.edges.push({ from: { node: selBias, port: "out" }, to: { node: selH1R, port: "a" } });
+      const selH2R = makeNode("Sub", 680, 200, { a: 1 });
+      state.edges.push({ from: { node: selH1R, port: "out" }, to: { node: selH2R, port: "b" } });
+
+      // ── Pitch-hand Y = weighted blend of h1_y and h2_y, picked spatially.
+      const w1y = makeNode("Mul", 40, 340);
+      state.edges.push({ from: { node: hands, port: "h1_y" }, to: { node: w1y, port: "a" } });
+      state.edges.push({ from: { node: selH1R, port: "out" }, to: { node: w1y, port: "b" } });
+      const w2y = makeNode("Mul", 200, 340);
+      state.edges.push({ from: { node: hands, port: "h2_y" }, to: { node: w2y, port: "a" } });
+      state.edges.push({ from: { node: selH2R, port: "out" }, to: { node: w2y, port: "b" } });
+      const pitchY = makeNode("Add", 360, 340);
+      state.edges.push({ from: { node: w1y, port: "out" }, to: { node: pitchY, port: "a" } });
+      state.edges.push({ from: { node: w2y, port: "out" }, to: { node: pitchY, port: "b" } });
+
+      // ── Gate-hand pinch = the OTHER hand's pinch (user's left). When h1
+      // is the right hand (selH1R=1), the gate-hand is h2, so use h2_pinch.
+      const w1p = makeNode("Mul", 40, 460);
+      state.edges.push({ from: { node: hands, port: "h1_pinch" }, to: { node: w1p, port: "a" } });
+      state.edges.push({ from: { node: selH2R, port: "out" }, to: { node: w1p, port: "b" } });
+      const w2p = makeNode("Mul", 200, 460);
+      state.edges.push({ from: { node: hands, port: "h2_pinch" }, to: { node: w2p, port: "a" } });
+      state.edges.push({ from: { node: selH1R, port: "out" }, to: { node: w2p, port: "b" } });
+      const gatePinch = makeNode("Add", 360, 460);
+      state.edges.push({ from: { node: w1p, port: "out" }, to: { node: gatePinch, port: "a" } });
+      state.edges.push({ from: { node: w2p, port: "out" }, to: { node: gatePinch, port: "b" } });
+
+      // ── Pitch curve: freq = 110 · exp((1 − pitchY) · ln 8)
+      //   pitchY=1 (hand at bottom) → 110 Hz (A2)
+      //   pitchY=0 (hand at top)    → 880 Hz (A5)   — three octaves of glide
+      // Exponential mapping is musically natural — same #semitones per cm
+      // at any height, like a real theremin antenna's field.
+      const yInv = makeNode("Sub", 520, 340, { a: 1 });
+      state.edges.push({ from: { node: pitchY, port: "out" }, to: { node: yInv, port: "b" } });
+      const expArg = makeNode("Mul", 680, 340, { b: 2.0794 });   // ln(8) ≈ 3 octaves
+      state.edges.push({ from: { node: yInv, port: "out" }, to: { node: expArg, port: "a" } });
+      const ratio = makeNode("Exp", 840, 340);
+      state.edges.push({ from: { node: expArg, port: "out" }, to: { node: ratio, port: "in" } });
+      const freq = makeNode("Mul", 1000, 340, { b: 110 });
+      state.edges.push({ from: { node: ratio, port: "out" }, to: { node: freq, port: "a" } });
+
+      // ── Pinch gate: pinch≈0 (thumb+index touching) → gate=1; pinch≥0.08
+      // (fingers apart) → gate=0. Smoothstep gives a clickless transition.
+      const pNorm = makeNode("Mul", 520, 460, { b: 12.5 });   // 0.08 pinch → 1.0
+      state.edges.push({ from: { node: gatePinch, port: "out" }, to: { node: pNorm, port: "a" } });
+      const sm = makeNode("Smoothstep", 680, 460);
+      state.edges.push({ from: { node: pNorm, port: "out" }, to: { node: sm, port: "in" } });
+      const pinchGate = makeNode("Sub", 840, 460, { a: 1 });   // 1 − smoothstep
+      state.edges.push({ from: { node: sm, port: "out" }, to: { node: pinchGate, port: "b" } });
+
+      // ── Both-hands-present guard: silent unless numHands ≥ 2.
+      // (numHands − 1.99) × 100, then Smoothstep clamps to 0 or 1.
+      const nhSub = makeNode("Sub", 40, 580, { b: 1.99 });
+      state.edges.push({ from: { node: hands, port: "numHands" }, to: { node: nhSub, port: "a" } });
+      const nhScale = makeNode("Mul", 200, 580, { b: 100 });
+      state.edges.push({ from: { node: nhSub, port: "out" }, to: { node: nhScale, port: "a" } });
+      const bothPresent = makeNode("Smoothstep", 360, 580);
+      state.edges.push({ from: { node: nhScale, port: "out" }, to: { node: bothPresent, port: "in" } });
+      const fullGate = makeNode("Mul", 1000, 500);
+      state.edges.push({ from: { node: pinchGate, port: "out" }, to: { node: fullGate, port: "a" } });
+      state.edges.push({ from: { node: bothPresent, port: "out" }, to: { node: fullGate, port: "b" } });
+
+      // ── Voice: Sine × gate × amplitude → stereo Output
+      const sine = makeNode("Sine", 1160, 340, { freq: 220 });
+      state.edges.push({ from: { node: freq, port: "out" }, to: { node: sine, port: "freq" } });
+      const gated = makeNode("Mul", 1320, 400);
+      state.edges.push({ from: { node: sine, port: "out" }, to: { node: gated, port: "a" } });
+      state.edges.push({ from: { node: fullGate, port: "out" }, to: { node: gated, port: "b" } });
+      const amp = makeNode("Mul", 1480, 400, { b: 0.4 });
+      state.edges.push({ from: { node: gated, port: "out" }, to: { node: amp, port: "a" } });
+      const out = makeNode("Output", 1640, 400);
+      state.edges.push({ from: { node: amp, port: "out" }, to: { node: out, port: "L" } });
+      state.edges.push({ from: { node: amp, port: "out" }, to: { node: out, port: "R" } });
     }
   },
 
