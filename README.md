@@ -1,8 +1,19 @@
+<div align="center">
+
 # Gamma Node Editor
 
-A browser-native visual programming environment for real-time audio + visuals. Patches compile to [Gamma](https://github.com/AlloSphere-Research-Group/Gamma) DSP C++ on demand and run as live WebAssembly in the page. Single self-contained HTML file, no framework, no build step.
+**Browser-native visual programming environment for real-time audio + visuals. Patches compile to [Gamma](https://github.com/AlloSphere-Research-Group/Gamma) DSP C++ on demand and run as live WebAssembly in the page.**
 
-**[Try it live →](https://9livezzz-git.github.io/Gamma-Node/)**  ·  [Specification](SPEC.md)  ·  [Compile server](https://github.com/9LiveZZZ-Git/gamma-compile-server)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-0.3.631-green.svg)](VERSION)
+[![WebGPU](https://img.shields.io/badge/WebGPU-required-success.svg)]()
+[![Hardware RT](https://img.shields.io/badge/Hardware%20RT-Apple%20Silicon-success.svg)]()
+[![Vulkan RT](https://img.shields.io/badge/Vulkan%20RT-in%20development-yellow.svg)]()
+[![Single artifact](https://img.shields.io/badge/ship-single%20HTML%20file-informational.svg)]()
+
+[**Launch app**](https://9livezzz-git.github.io/Gamma-Node/) · [**Compile server**](https://github.com/9LiveZZZ-Git/gamma-compile-server) · [**Specification**](SPEC.md) · [**Report bug**](https://github.com/9LiveZZZ-Git/Gamma-Node/issues)
+
+</div>
 
 <!-- A screenshot or short GIF of the editor would belong here. -->
 
@@ -194,7 +205,7 @@ The rendering itself happens in a separate native binary, `gamma-rt-engine` (Rus
 | Apple M1 / M2 | Metal-RT software traversal (MPS) + MetalFX | Preview-quality at `draft` preset. Software traversal is the bottleneck |
 | Anything else | Falls back to raster `Scene` automatically | RT node displays a status-coded fallback color (no engine = dark navy; engine error = red) |
 
-PC (NVIDIA / AMD / Intel Arc) Vulkan-RT support is planned but not yet shipped.
+PC (NVIDIA / AMD / Intel Arc) **Vulkan-RT support is in active development** — the engine is being extended with a Vulkan backend alongside the existing Metal one, with the same `RayTracedScene` node + per-frame streaming protocol so editor patches don't change. Linux + Windows hardware traversal first, with Intel Arc XeSS / NVIDIA DLSS / AMD FSR slotting in where MetalFX TDS sits on the Mac path.
 
 ### Installing the engine
 
@@ -338,4 +349,4 @@ The editor implements (or stands on the shoulders of) the following published wo
 
 ## License
 
-To be decided. Until a license is published, the code is © the author; this repository is public for evaluation and demonstration. Open an issue if you need clarity on a specific use case.
+Released under the [MIT License](LICENSE). The third-party libraries, models, and asset sources listed in [Acknowledgments](#acknowledgments) each carry their own licenses; using them in a derived work means complying with those terms in addition to this project's MIT license.
