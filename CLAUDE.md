@@ -4,7 +4,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository shape
 
-This is a **single-file web application**, not a typical Node project. There is no build, no package manager, no test runner, no lint config. Everything ships in `gamma-node-editor.html` (~3700 lines: HTML + inline CSS + inline vanilla JS, no framework). External libraries (`@huggingface/transformers`) are pulled from a CDN via dynamic `import()` at runtime when the AI panel is first used.
+This is a **single-file web application** built from a `src/` tree by a zero-dependency `build.mjs`. The shipped/Pages/emailable artifact is the single `gamma-node-editor.html` at the repo root; the source you edit lives under `src/`. No package manager, no test runner, no lint config. External libraries (`@huggingface/transformers`, `three`, `@dimforge/rapier3d-compat`, etc.) are pulled from a CDN via dynamic `import()` at runtime when the relevant feature is first used.
+
+**Workflow (post-M0):**
+
+```
+src/shell.html          HTML skeleton with INLINE_CSS, INLINE_JS, APP_VERSION placeholders
+src/styles/app.css      CSS (one file today; will be split by area later)
+src/_monolith.js        the inline JS (one file today; will be carved into
+                        nodes/, codegen/, visual/, physics/, ... per docs/MODULARIZATION.md)
+src/build-order.json    concatenation order manifest
+VERSION                 root file = source of truth for APP_VERSION
+build.mjs               read manifest -> concat -> inline -> write gamma-node-editor.html
+```
+
+To edit: change files under `src/`, run `node build.mjs`, commit BOTH the `src/` changes AND the regenerated `gamma-node-editor.html`. **Don't hand-edit `gamma-node-editor.html`** — it's a build artifact (regeneration will overwrite hand edits). The `<!-- GENERATED FROM src/ -->` comment at the top of the built file is the reminder.
+
+**The byte-identical invariant.** Splitting code into more files (peeling subsystems out of `_monolith.js`) must be a *pure relocation* — never reorder, rewrite, or split a function across files. After a pure split, `node build.mjs` must regenerate a `gamma-node-editor.html` byte-identical to the pre-split one (modulo the APP_VERSION token). `git diff gamma-node-editor.html` should be empty. A non-empty diff after a "split" commit means the split was wrong. Code *changes* are a separate kind of commit from splits, with a reviewable diff. See `docs/MODULARIZATION.md` §4 + §7 for the full safety contract.
 
 **Running it:** open `gamma-node-editor.html` in a Chromium-based browser (Chrome/Edge for WebGPU). For local development, just double-click the file or serve the directory with any static server (`python -m http.server`, `npx serve`, etc.). No install step.
 

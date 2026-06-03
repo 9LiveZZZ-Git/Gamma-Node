@@ -1,0 +1,1742 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Gamma Node Editor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Inter:wght@400;500&family=Major+Mono+Display&family=Fragment+Mono&display=swap" rel="stylesheet" />
+
+<!-- Cross-origin isolation via service worker. Required for the Phase 4
+     real-time audio preview: Wasmer JS SDK uses SharedArrayBuffer +
+     threads via WASIX, which only work when the page is served with
+     COOP=same-origin and COEP=require-corp. GitHub Pages can't set
+     custom headers, so coi-serviceworker installs a SW that re-fetches
+     the page through itself with those headers attached.
+
+     The script MUST be served from the same origin as the page —
+     browsers refuse to register a SW from a foreign origin. Don't
+     swap this back to a CDN URL. First load reloads once on install;
+     subsequent loads are instant. -->
+<script src="coi-serviceworker.min.js"></script>
+
+<!-- CodeMirror 5 for the User DSP source editor. Loaded from CDN; the
+     editor falls back to a plain textarea if these fail. -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/lib/codemirror.min.css" />
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/theme/material-darker.min.css" />
+<script defer src="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/lib/codemirror.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/mode/clike/clike.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/addon/edit/matchbrackets.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/addon/edit/closebrackets.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/addon/comment/comment.min.js"></script>
+
+<style>/*__INLINE_CSS__*/</style>
+</head>
+<body>
+
+<!-- Phase 6.1.1 — Visual canvas. Sits behind the entire editor at
+     z-index 0 with pointer-events: none so node-graph hit-testing is
+     unaffected. NOT inside any pan/zoom transform — stays full-
+     viewport at all times so the visual content is independent of
+     the node graph's pan/zoom state. WebGPU is configured against
+     this canvas in ensureGPUDevice(); see Visual.* below. -->
+<canvas id="visual-bg"></canvas>
+<!-- Phase 6.6.4b — 2D overlay canvas for the RigGizmo node. Sits
+     directly on top of #visual-bg in DOM order so labels/highlights
+     layer above the WebGPU output. Inert (no pointer events). -->
+<canvas id="visual-overlay"></canvas>
+
+<!-- Phase 6.6.13 — touch-screen pads for theater navigation. Visible
+     only when the rig is in theater preview AND the device reports
+     touch capability. Two analog "sticks" — left = move, right = look.
+     Use pointer events so iPad / Android / touch-laptop all hit the
+     same code path. -->
+<div id="theater-pad-move" class="theater-pad" data-pad="move">
+  <div class="theater-pad-knob"></div>
+  <div class="theater-pad-label">MOVE</div>
+</div>
+<div id="theater-pad-look" class="theater-pad" data-pad="look">
+  <div class="theater-pad-knob"></div>
+  <div class="theater-pad-label">LOOK</div>
+</div>
+
+<!-- Phase 6.6.9 — mesh warp editor modal. One display at a time;
+     drag control points on a checkerboard test pattern to deform
+     the calibration mesh. Live preview happens through the existing
+     visual pipeline behind a semi-transparent backdrop so the user
+     watches the rig update as they drag. -->
+<div id="warp-editor" style="display: none;" role="dialog" aria-modal="true" aria-labelledby="warp-editor-title">
+  <div class="warp-editor-backdrop"></div>
+  <div class="warp-editor-panel">
+    <div class="warp-editor-head">
+      <span class="warp-editor-title" id="warp-editor-title">Warp editor — Display 0</span>
+      <span class="warp-editor-tools">
+        <label title="Mesh = drag every grid vertex (max local control). Bezier = drag a small control polygon for smooth C^∞ warps (Sajadi & Majumder 2012).">Mode
+          <select id="warp-editor-mode">
+            <option value="mesh" selected>Mesh</option>
+            <option value="bezier">Bezier</option>
+          </select>
+        </label>
+        <label id="warp-editor-res-label">Resolution
+          <select id="warp-editor-res">
+            <option value="4">4 × 4</option>
+            <option value="8" selected>8 × 8</option>
+            <option value="12">12 × 12</option>
+            <option value="16">16 × 16</option>
+            <option value="24">24 × 24</option>
+            <option value="32">32 × 32</option>
+            <option value="custom">Custom…</option>
+          </select>
+        </label>
+        <label id="warp-editor-degree-label" style="display: none;" title="Bezier control-grid size. Higher = more local control but more points to drag. AlloSphere-class warps need 5×5 or 7×7.">Degree
+          <select id="warp-editor-degree">
+            <option value="3">3 × 3 (cubic)</option>
+            <option value="4" selected>5 × 5 (quartic)</option>
+            <option value="6">7 × 7 (sextic)</option>
+            <option value="8">9 × 9 (octic)</option>
+          </select>
+        </label>
+        <label class="warp-editor-tri" id="warp-editor-tri-label" title="Offset alternate rows by half a cell so quads triangulate as equilateral-ish triangles instead of rectangles. Useful for warps that need diagonal flexibility.">
+          <input type="checkbox" id="warp-editor-triangular">
+          Triangular
+        </label>
+        <button class="btn warp-editor-reset" id="warp-editor-reset" title="Reset to identity (no warp)">Reset</button>
+        <button class="warp-editor-close" id="warp-editor-close" title="Save &amp; close">×</button>
+      </span>
+    </div>
+    <canvas id="warp-editor-canvas" width="1024" height="768"></canvas>
+    <div class="warp-editor-foot">
+      <span class="warp-editor-hint" id="warp-editor-hint">Drag a point to warp · Right-click resets one point · × or Save commits · Esc / Cancel discards · Live preview visible behind</span>
+      <span class="warp-editor-actions">
+        <button class="btn" id="warp-editor-cancel">Cancel</button>
+        <button class="btn primary" id="warp-editor-save">Save</button>
+      </span>
+    </div>
+  </div>
+</div>
+
+<!-- Phase 6.6.20.10 — AI calibration corrections diff modal.
+     Shows the AI's per-display proposed corrections (Δyaw, Δpitch,
+     ΔfovH, ΔfovV) with confidence scores, lets the user uncheck any
+     they don't trust, then applies the rest in one history entry. -->
+<div id="ai-calibration-modal" class="ai-calib-overlay" style="display: none;" role="dialog" aria-modal="true" aria-labelledby="ai-calibration-title">
+  <div class="ai-calib-backdrop"></div>
+  <div class="ai-calib-panel">
+    <div class="ai-calib-head">
+      <span class="ai-calib-title" id="ai-calibration-title">AI calibration corrections</span>
+      <span class="ai-calib-tools">
+        <button class="btn" id="ai-calibration-select-all">Select all</button>
+        <button class="btn" id="ai-calibration-select-none">Select none</button>
+        <button class="warp-editor-close" id="ai-calibration-close" title="Cancel">×</button>
+      </span>
+    </div>
+    <div class="ai-calib-body" id="ai-calibration-list">
+      <!-- rows injected dynamically by showAICalibrationModal() -->
+    </div>
+    <div class="ai-calib-foot">
+      <span class="ai-calib-hint">High-confidence non-zero corrections are pre-checked. Uncheck any you don't trust. Reasoning shown per row.</span>
+      <span>
+        <button class="btn" id="ai-calibration-export" title="Download a ZIP containing report.md (human-readable summary of both AI phases, per-display reasoning + cumulative deltas) and corrections.json (full structured diff). Useful for documenting calibration runs, sharing with collaborators, or feeding into a follow-up analysis.">Export report…</button>
+        <button class="btn" id="ai-calibration-cancel">Cancel</button>
+        <button class="btn primary" id="ai-calibration-apply">Apply selected</button>
+      </span>
+    </div>
+  </div>
+</div>
+
+<!-- Live Mode overlay — visible only when body.live-mode is set.
+     Floating "exit" affordance in the corner: discreet enough to
+     stay out of the visual content, obvious enough that the user
+     can find their way back. Auto-fades after a few seconds of
+     mouse stillness; reappears on any pointer movement. -->
+<div id="live-mode-overlay">
+  <!-- Standalone-viewer play button. CSS hides it outside viewer
+       mode + once playback has begun. -->
+  <button id="btn-viewer-play" type="button"
+          title="Play — start audio + visual playback (browser autoplay requires this user gesture)">▶</button>
+  <button class="btn live-exit" id="btn-live-exit" type="button"
+          title="Exit Live Mode (L or Esc)">↩ Exit Live</button>
+</div>
+<!-- Standalone-viewer attribution. Hidden outside viewer mode. -->
+<div class="viewer-credit">
+  Built with <a href="https://github.com/9LiveZZZ-Git/Gamma-Node" target="_blank" rel="noopener">Gamma Node</a>
+  · press <kbd style="background:rgba(255,255,255,0.07);padding:0 4px;border-radius:2px;">L</kbd> to inspect the patch
+</div>
+
+<!-- Phase 6.5.16 — 3D rig wireframe gizmo. Inset minimap in the
+     top-right corner of the visual canvas showing each display's
+     frustum in 3D space, color-coded by index. Click-drag to orbit
+     the camera, wheel to zoom. Toggled via the ⬢ HUD pill. -->
+<div id="rig-gizmo" style="display: none;" title="3D rig gizmo · drag to orbit · wheel to zoom · ⬢ to hide">
+  <canvas id="rig-gizmo-canvas" width="360" height="360"></canvas>
+</div>
+
+<div id="app">
+
+  <header>
+    <div class="brand">
+      <span class="mark"><span class="mark-sq"></span>Gamma<span class="mark-sub">node editor</span></span>
+      <a class="ver-pill" id="app-version" href="https://github.com/9LiveZZZ-Git/Gamma-Node/commits/main" target="_blank" rel="noopener" title="Auto-bumped on every push to main. Click to see commit history."></a>
+      <span class="gpu-pill" id="gpu-status" data-state="probing" title="WebGPU device — required for the upcoming visual layer (Phase 6+)">GPU</span>
+      <span class="file" id="filename" title="Click to rename. Updates the .gpatch filename and the generated C++ class name." tabindex="0">untitled.gpatch</span>
+      <span class="stats" id="stats">5 nodes · 4 connections</span>
+    </div>
+    <div class="toolbar">
+      <div class="btn-group" role="group" aria-label="File">
+        <button class="btn" id="btn-load" title="Open .gpatch file — auto-detects prefabMeta and offers to drop as PrefabInstance">Open</button>
+        <button class="btn" id="btn-save" title="Save .gpatch">Save</button>
+        <button class="btn" id="btn-save-prefab" title="Save selected nodes as a reusable prefab (.gpatch with prefabMeta)" disabled>Save Prefab</button>
+        <button class="btn" id="btn-drop-prefab" title="Drop a PrefabInstance from the IDB prefab asset store">Drop Prefab</button>
+      </div>
+      <div class="btn-group" role="group" aria-label="Edit">
+        <button class="btn" id="btn-reset" title="Reset to demo patch">Reset</button>
+        <button class="btn" id="btn-clear" title="Clear graph — leave canvas empty">Clear</button>
+        <button class="btn danger" id="btn-delete" disabled title="Delete selected node (⌫)">Delete</button>
+      </div>
+      <div class="btn-group preview-group" role="group" aria-label="Preview">
+        <button class="btn preview-btn" id="btn-preview-play" title="Compile patch and start playback">▶</button>
+        <button class="btn preview-btn" id="btn-preview-stop" title="Stop playback / cancel compile" disabled>■</button>
+        <button class="btn preview-btn" id="btn-preview-smoke" title="Smoke-test the compile pipeline with a trivial program (no Gamma). Use this to verify the toolchain works end-to-end before debugging real patches.">★</button>
+      </div>
+      <span class="preview-status" id="preview-status" title="Real-time audio preview status">idle</span>
+      <button class="btn icon-btn copy-status-btn" id="btn-copy-status" title="Copy error message to clipboard" style="display:none;">⧉</button>
+      <span class="preview-progress" id="preview-progress" style="display:none;">
+        <span class="preview-progress-bar"><span class="preview-progress-fill" id="preview-progress-fill"></span></span>
+        <span class="preview-progress-meta" id="preview-progress-meta"></span>
+      </span>
+      <button class="btn primary" id="btn-gen" title="Open the Generated C++ tab">Generate C++</button>
+      <button class="btn" id="btn-export-open" title="Export center — patch, frame/video capture (composite or per-display), rig calibration bundles">Export ▾</button>
+      <button class="btn icon-btn" id="btn-live-mode" title="Live Mode — hide the editor, show only the visual layer (Ctrl+L)" aria-label="Toggle Live Mode">◐</button>
+      <button class="btn icon-btn" id="btn-help" title="Keyboard shortcuts">?</button>
+    </div>
+  </header>
+
+  <main>
+    <aside class="palette browser" id="palette-aside">
+      <!-- Tab rail. NODES (registry browser) + ASSETS (IDB-backed
+           sample / patch / .gdsp store). PATCHES tab is reserved for
+           a later wave. The collapse button + status LED live in the
+           tab rail's right-hand section so the panel keeps a single
+           top strip even when narrow. -->
+      <div class="br-tabs">
+        <button class="br-tab active" id="br-tab-nodes" data-br-tab="nodes" type="button">
+          <span class="br-tab-num">01</span><span>Nodes</span>
+        </button>
+        <button class="br-tab" id="br-tab-assets" data-br-tab="assets" type="button">
+          <span class="br-tab-num">02</span><span>Assets</span>
+        </button>
+        <button class="br-tab" id="br-tab-demos" data-br-tab="demos" type="button">
+          <span class="br-tab-num">03</span><span>Demos</span>
+        </button>
+        <button class="br-tab" id="br-tab-prefabs" data-br-tab="prefabs" type="button">
+          <span class="br-tab-num">04</span><span>Prefabs</span>
+        </button>
+        <span class="br-tab-spacer"></span>
+        <span class="br-tab-status">
+          <span class="br-status-led"></span>
+          <span id="br-tab-status">REG · 0</span>
+        </span>
+        <button class="pal-min-btn" id="btn-palette-min" title="Collapse panel">‹</button>
+      </div>
+
+      <!-- Nodes view. The toolbar (search + op chips + view-modes)
+           sits above the body grid (vertical category rail + node
+           list). The list still uses #palette as its container so
+           every existing handler keeps wiring up unchanged. -->
+      <div class="br-view" id="br-view-nodes">
+        <div class="br-toolbar">
+          <div class="pal-search">
+            <input id="search" placeholder="filter nodes…" />
+            <kbd class="kbd-hint" id="kbd-hint">/</kbd>
+          </div>
+          <div class="br-search-ops" id="br-search-ops">
+            <span class="br-op" data-op="cat:"><span class="br-op-key">cat:</span>name</span>
+            <span class="br-op" data-op="tag:"><span class="br-op-key">tag:</span>tag</span>
+            <span class="br-op" data-op="port:"><span class="br-op-key">port:</span>type</span>
+            <span class="br-op" data-op="new"><span class="br-op-key">new</span></span>
+          </div>
+        </div>
+
+        <div class="br-body">
+          <div class="br-rail" id="br-cat-rail"></div>
+          <div class="pal-list" id="palette"></div>
+        </div>
+
+        <!-- Detail drawer. Slides up from the bottom; collapsed
+             default so the list keeps its full height until the
+             user clicks an item. -->
+        <div class="br-drawer collapsed" id="br-drawer">
+          <div class="br-drawer-head" id="br-drawer-head">
+            <span class="br-drawer-mark"></span>
+            <span class="br-drawer-title" id="br-drawer-title">
+              nothing selected <span class="ref">REG · —</span>
+            </span>
+            <button class="br-drawer-add" id="br-drawer-add" type="button">＋ Add</button>
+            <span class="br-drawer-toggle" id="br-drawer-toggle">▼</span>
+          </div>
+          <div class="br-drawer-body" id="br-drawer-body"></div>
+        </div>
+      </div>
+
+      <!-- Demos view. Card grid of curated example patches.
+           Click a card to load the patch. Same visual language
+           as the Assets grid for consistency: thumbnail + name +
+           sub-description + type badge. -->
+      <div class="br-view" id="br-view-demos" hidden>
+        <div class="br-assets">
+          <div class="type-rail" id="br-demo-type-rail"></div>
+          <div class="assets-list">
+            <div class="demos-toolbar" style="display:flex;gap:8px;align-items:center;padding:6px 10px;border-bottom:1px solid var(--instr-rule);">
+              <input type="search" id="br-demo-search" placeholder="search demos..." autocomplete="off" spellcheck="false"
+                style="flex:1;background:var(--instr-bg);color:var(--text);border:1px solid var(--instr-rule);border-radius:4px;padding:4px 8px;font:11px var(--font-body-m);outline:none;" />
+              <select id="br-demo-sort" style="background:var(--instr-bg);color:var(--text-2);border:1px solid var(--instr-rule);border-radius:4px;padding:3px 6px;font:10px var(--font-body-m);outline:none;">
+                <option value="default">order: default</option>
+                <option value="az">order: A → Z</option>
+                <option value="za">order: Z → A</option>
+              </select>
+            </div>
+            <div class="assets-grid" id="br-demos-grid"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Prefabs view. Stock + IDB-saved prefab templates. Clicking a
+           card drops a PrefabInstance into the canvas (same as the
+           toolbar's Drop Prefab button, but a persistent browsable
+           panel). "Save Selection" mirrors the toolbar Save Prefab. -->
+      <div class="br-view" id="br-view-prefabs" hidden>
+        <div class="br-assets">
+          <div class="type-rail" id="br-prefab-type-rail"></div>
+          <div class="assets-list">
+            <div class="demos-toolbar" style="display:flex;gap:8px;align-items:center;padding:6px 10px;border-bottom:1px solid var(--instr-rule);">
+              <input type="search" id="br-prefab-search" placeholder="search prefabs..." autocomplete="off" spellcheck="false"
+                style="flex:1;background:var(--instr-bg);color:var(--text);border:1px solid var(--instr-rule);border-radius:4px;padding:4px 8px;font:11px var(--font-body-m);outline:none;" />
+              <button class="btn" id="br-prefab-save-sel" type="button" title="Save the currently selected nodes as a new prefab"
+                style="white-space:nowrap;font-size:10px;padding:4px 8px;">＋ Save Selection</button>
+            </div>
+            <div class="assets-grid" id="br-prefabs-grid"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Assets view. Source rail (Local / Drive / GitHub
+           connection chips) + type filter rail (.WAV / .MID /
+           .MP4 / .GPATCH / .GDSP) + asset card grid + drop-zone
+           overlay for drag-and-drop import from the OS. -->
+      <div class="br-view" id="br-view-assets" hidden>
+        <div class="br-assets">
+          <div class="src-rail">
+            <div class="src-rail-label">sources</div>
+            <div id="br-src-list"></div>
+            <button class="src-add" id="br-src-add" type="button">＋ Connect a source</button>
+          </div>
+          <div class="type-rail" id="br-type-rail"></div>
+          <div class="assets-list" id="br-assets-list">
+            <div class="drop-overlay">
+              <div class="drop-overlay-text">drop to import<span class="sub">.wav · .mid · .mp4 · .gpatch · .gdsp</span></div>
+            </div>
+            <div class="assets-grid" id="br-assets-grid"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Footer telemetry strip. #pal-foot-count kept for the
+           existing renderPalette code path; .foot-stat-val cells
+           are populated alongside it. -->
+      <div class="pal-foot">
+        <span class="foot-stat">
+          <span class="foot-stat-key">REG</span>
+          <span class="foot-stat-val" id="br-foot-reg">0</span>
+        </span>
+        <span class="foot-stat">
+          <span class="foot-stat-key">SHOWN</span>
+          <span class="foot-stat-val pal-foot-count" id="pal-foot-count">0</span>
+        </span>
+        <span class="foot-stat">
+          <span class="foot-stat-key">CAT</span>
+          <span class="foot-stat-val" id="br-foot-cat">0</span>
+        </span>
+        <span class="foot-spacer"></span>
+        <span class="foot-version" id="br-foot-version">GAMMA · v—</span>
+      </div>
+
+      <div class="palette-collapse-strip" id="palette-collapse-strip" title="Click to expand panel">PALETTE ›</div>
+    </aside>
+
+    <!-- Connect-a-source modal — opened from the Assets tab. Local
+         folder uses the File System Access API (Chromium); Drive +
+         GitHub fields stub until OAuth lands. The modal reuses the
+         existing .modal-backdrop / .modal CSS shell from the rest
+         of the editor. -->
+    <div class="modal-backdrop" id="connect-modal" style="display:none;">
+      <div class="modal" style="width: 480px;">
+        <div class="modal-head">
+          <span class="modal-title" style="font-family: var(--font-instr); letter-spacing: 0.20em; color: var(--phosphor); text-transform: lowercase;">connect a source</span>
+          <button class="btn modal-x" id="connect-close" type="button">×</button>
+        </div>
+        <div style="padding: 14px 16px;">
+          <div class="provider-grid" id="connect-providers">
+            <div class="provider selected" data-provider="local">
+              <div class="provider-icon">⌂</div>
+              <div class="provider-name">Local Folder</div>
+              <div class="provider-sub">file system api</div>
+            </div>
+            <div class="provider" data-provider="gdrive">
+              <div class="provider-icon">◐</div>
+              <div class="provider-name">Google Drive</div>
+              <div class="provider-sub">oauth 2.0</div>
+            </div>
+            <div class="provider" data-provider="github">
+              <div class="provider-icon">⬡</div>
+              <div class="provider-name">GitHub Repo</div>
+              <div class="provider-sub">contents api</div>
+            </div>
+          </div>
+
+          <div id="connect-form-local">
+            <div class="modal-note">Picks a folder on your disk via the File System Access API. Files appear in the Assets grid alongside what's already in IDB. Chromium-only for now.</div>
+            <div class="modal-field" style="margin-top:10px;">
+              <div class="modal-field-label">Display label</div>
+              <input type="text" id="connect-local-name" placeholder="e.g. Field Recordings — 2026" />
+            </div>
+          </div>
+          <div id="connect-form-gdrive" style="display:none;">
+            <div class="modal-note">Google Drive integration ships in v0.1 — needs an OAuth client ID + Drive API authorization. The connect button below is currently a no-op. Vote it up if it'd unblock you.</div>
+            <div class="modal-field" style="margin-top:10px;">
+              <div class="modal-field-label">Display label</div>
+              <input type="text" placeholder="My Sample Library" />
+            </div>
+            <div class="modal-field">
+              <div class="modal-field-label">Folder ID or Drive URL</div>
+              <input type="text" placeholder="https://drive.google.com/drive/folders/…" />
+            </div>
+          </div>
+          <div id="connect-form-github" style="display:none;">
+            <div class="modal-note">Reads files from any public GitHub repo via the Contents API. Add a personal access token only if you need a private repo.</div>
+            <div class="modal-field" style="margin-top:10px;">
+              <div class="modal-field-label">Repository (owner/name)</div>
+              <input type="text" id="connect-gh-repo" placeholder="9livezzz-git/gamma-community-gdsp" />
+            </div>
+            <div class="modal-field">
+              <div class="modal-field-label">Path inside repo (optional)</div>
+              <input type="text" id="connect-gh-path" placeholder="/gdsp" />
+            </div>
+            <div class="modal-field">
+              <div class="modal-field-label">Personal access token (private repos only)</div>
+              <input type="password" id="connect-gh-token" placeholder="ghp_…" />
+            </div>
+          </div>
+
+          <div style="display:flex; justify-content:flex-end; gap:8px; padding-top:10px; border-top:1px solid var(--instr-rule); margin-top:6px;">
+            <button class="btn" id="connect-cancel" type="button">Cancel</button>
+            <button class="btn primary" id="connect-go" type="button">Connect</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="palette-resize" id="palette-resize" title="Drag to resize palette"></div>
+    <div class="canvas-wrap">
+      <button class="mobile-pal-btn" id="mobile-pal-btn" title="Show palette">☰</button>
+      <div class="canvas-tools">
+        <button class="tool-btn active" data-tool="select" title="Select / move (V)">▦</button>
+        <button class="tool-btn" data-tool="draw" title="Draw box for new node (D)">✎</button>
+        <!-- Sprint 5.handwriting-multimonitor -- companion dropdown next
+             to the draw tool. Same family of "handwrite into a box"
+             but the input surface lives in a popup window the user
+             can drag to a touchscreen secondary monitor. -->
+        <button class="tool-btn tool-btn-aux" id="tool-draw-menu"
+                title="Handwriting / touchscreen options">▾</button>
+        <div class="tool-menu" id="tool-draw-menu-popup" style="display:none;">
+          <button class="tool-menu-item" id="tool-touchscreen-open">
+            <span class="tool-menu-icon">↗</span>
+            <span>
+              <strong>Open touchscreen window</strong>
+              <span class="tool-menu-sub">Drag to a 2nd monitor; handwrite there to spawn nodes here</span>
+            </span>
+          </button>
+          <button class="tool-menu-item" id="tool-auto-wire">
+            <span class="tool-menu-icon">⟶</span>
+            <span>
+              <strong>Auto-wire selection (W)</strong>
+              <span class="tool-menu-sub">Connect 2+ selected nodes left-to-right by spatial X order</span>
+            </span>
+          </button>
+          <button class="tool-menu-item" id="tool-ai-auto-wire">
+            <span class="tool-menu-icon">✦</span>
+            <span>
+              <strong>AI auto-wire (Shift+W)</strong>
+              <span class="tool-menu-sub">Ask the AI to propose edges for the whole patch; optional guidance from the User DSP prompt</span>
+            </span>
+          </button>
+          <button class="tool-menu-item" id="tool-hwr-debug">
+            <span class="tool-menu-icon tool-menu-check">☐</span>
+            <span>
+              <strong>Show recognizer image</strong>
+              <span class="tool-menu-sub">Preview the exact image sent to OCR / the AI after each Recognize — to verify handwriting isn't clipped</span>
+            </span>
+          </button>
+          <button class="tool-menu-item" id="tool-hwr-stroke-match">
+            <span class="tool-menu-icon tool-menu-check">☐</span>
+            <span>
+              <strong>Match against learned handwriting (experimental)</strong>
+              <span class="tool-menu-sub">Try the offline stroke-template matcher (HW.4) before OCR / the VLM. Off by default — the current chamfer metric over-matches once you've stored a single template, so it tends to spawn the same node for everything until the matcher is redesigned.</span>
+            </span>
+          </button>
+          <button class="tool-menu-item" id="tool-hwr-clear">
+            <span class="tool-menu-icon">⌫</span>
+            <span>
+              <strong>Clear learned handwriting</strong>
+              <span class="tool-menu-sub">Forget the stroke templates the recognizer has learned from your confident reads</span>
+            </span>
+          </button>
+        </div>
+        <button class="tool-btn" id="tool-voice" title="Voice → AI prompt (microphone)">🎤</button>
+      </div>
+      <div class="canvas" id="canvas">
+        <div id="canvas-world">
+          <svg class="wires" id="wires" overflow="visible"></svg>
+        </div>
+        <div class="marquee" id="marquee" style="display:none;"></div>
+        <svg class="ink" id="ink"></svg>
+        <div class="ink-finalize" id="ink-finalize" style="display:none;">
+          <button class="btn primary" id="btn-ink-go" title="Recognize handwriting → create node">✓ Recognize</button>
+          <button class="btn" id="btn-ink-clear" title="Clear strokes (keep box, redo handwriting)">↻ Redo</button>
+          <button class="btn" id="btn-ink-cancel" title="Discard the box entirely">× Cancel</button>
+        </div>
+        <!-- Phase 6.1.5 — Visual HUD (resolution / fps / freeze). Sits
+             above the existing zoom HUD when WebGPU is acquired. -->
+        <div class="visual-hud" id="visual-hud">
+          <button class="visual-hud-pill" id="res-pill" type="button"
+                  title="Render resolution — click to cycle 1080p → 1440p → 4K → 8K. Affects framebuffer size, not browser window size.">1080p</button>
+          <button class="visual-hud-pill" id="msaa-pill" type="button"
+                  title="MSAA disabled (1x). Click to cycle 1x -> 4x -> 8x. Affects only 3D Scene passes; existing shader-frag passes stay single-sample.">1x MSAA</button>
+          <button class="visual-hud-pill" id="proj-pill" type="button"
+                  title="Operator preview projection — click to cycle Tile-flat → Cylinder → Equirect → Fisheye. Same content, different unwrap of the multi-display rig onto your screen.">Tile</button>
+          <button class="visual-hud-pill visual-hud-icon" id="gizmo-pill" type="button"
+                  title="Toggle 3D rig wireframe overlay — see every display's frustum in 3D space, color-coded by index. Click-drag to orbit, wheel to zoom.">⬢</button>
+          <span class="visual-hud-pill visual-hud-readout" id="fps-readout"
+                title="Frame rate (rAF cadence). Stays at — fps until shader nodes drive an animation loop in Phase 6.1.7+.">— fps</span>
+          <button class="visual-hud-pill visual-hud-icon" id="perf-pill" type="button"
+                  title="Toggle performance overlay (Shift+P) — live frame time, draw calls, render passes, pipeline cache. Informational; zero cost when closed.">📊</button>
+          <button class="visual-hud-pill visual-hud-icon osc-pill" id="osc-pill" type="button"
+                  title="OSC bridge idle. Start gamma-compile-server (>=0.3.0) and the editor will auto-connect.">📡</button>
+          <button class="visual-hud-pill visual-hud-icon" id="freeze-btn" type="button"
+                  title="Freeze visual updates (audio keeps running). Useful for inspecting a single frame mid-set.">❄</button>
+          <button class="visual-hud-pill visual-hud-icon" id="graph-hide-pill" type="button"
+                  title="Hide node graph (H) — drops the graph surface, keeps header / palette / HUD visible. Lighter than Live Mode.">⊟</button>
+          <button class="visual-hud-pill visual-hud-icon" id="snap-btn" type="button"
+                  title="Capture composite preview → PNG. Quick shortcut for the current rig-composite (whichever mode is active). For per-display capture at target resolution use Export ▾.">📷</button>
+          <button class="visual-hud-pill visual-hud-icon" id="video-rec-pill" type="button"
+                  title="Record composite preview → WebM. Click again to stop. Captures the visible canvas (+ audio if a preview is playing). Per-display target-resolution recording is on the roadmap.">●</button>
+        </div>
+        <!-- Phase 6.7.4 — Performance overlay. Toggled via the 📊 pill
+             or Shift+P. Pure informational readouts: frame time (CPU),
+             draw calls + render passes per frame (counted by an
+             encoder-level monkey-patch installed in ensureGPUDevice),
+             pipeline cache size, and GPU time (— when timestamp-query
+             unavailable). Updates throttled to ~5 Hz so the overlay
+             itself doesn't drag perf. -->
+        <div class="perf-overlay" id="perf-overlay" aria-hidden="true">
+          <h4>Performance</h4>
+          <div class="perf-row"><span class="perf-k">FPS</span><span class="perf-v" id="perf-fps">—</span></div>
+          <div class="perf-row"><span class="perf-k">Frame</span><span class="perf-v" id="perf-frame">—</span></div>
+          <div class="perf-row"><span class="perf-k">GPU</span><span class="perf-v muted" id="perf-gpu">—</span></div>
+          <div class="perf-row"><span class="perf-k">Draws</span><span class="perf-v" id="perf-draws">—</span></div>
+          <div class="perf-row"><span class="perf-k">Passes</span><span class="perf-v" id="perf-passes">—</span></div>
+          <div class="perf-row"><span class="perf-k">Pipelines</span><span class="perf-v" id="perf-pipelines">—</span></div>
+          <div class="perf-row"><span class="perf-k">Nodes</span><span class="perf-v" id="perf-nodes">—</span></div>
+          <div class="perf-foot" id="perf-foot">CPU timing only. GPU timing requires the timestamp-query feature.</div>
+        </div>
+        <div class="view-hud" id="view-hud" title="Click to reset view (or press 0)">100%</div>
+      </div>
+      <div class="canvas-hint">
+        drag node header to move · drag port-to-port to wire · click input port to disconnect · ⌫ to delete
+      </div>
+      <div class="voice-status" id="voice-status" style="display:none;"></div>
+    </div>
+  </main>
+
+  <footer id="bottom-footer">
+    <div class="footer-resize" id="footer-resize" title="Drag to resize bottom panel"></div>
+    <div class="tabs">
+      <div class="tab active" data-tab="props">Properties</div>
+      <div class="tab" data-tab="codepreview">Code preview</div>
+      <div class="tab" data-tab="udsp">User DSP</div>
+      <div class="tab" data-tab="monitor">Monitor</div>
+      <div class="tab-actions">
+        <button class="btn" id="btn-copy" style="display: none;">Copy</button>
+        <button class="panel-ctl-btn minimize-btn" id="btn-footer-min" title="Collapse / expand bottom panel"><span class="ico">▾</span></button>
+        <button class="panel-ctl-btn maximize-btn" id="btn-footer-max" title="Maximize bottom panel (fill viewport)">⛶</button>
+        <button class="panel-ctl-btn exit" id="btn-footer-exit" title="Exit full screen">✕</button>
+      </div>
+    </div>
+    <div class="pane" id="pane-props">
+      <div class="empty" id="empty">Select a node to edit its parameters and choose what to expose</div>
+      <div id="props"></div>
+    </div>
+    <!-- Code preview pane — three sub-tabs (C++ / .gpatch / Build).
+         The sub-pane IDs (pane-code / pane-json / pane-build) are
+         preserved so existing renderers (renderCode, renderJson,
+         renderBuildPane) keep working unchanged. -->
+    <div class="pane pane-codepreview" id="pane-codepreview" style="display:none;">
+      <div class="subtabs" id="codepreview-subtabs">
+        <div class="subtab active" data-subtab="code">Generated C++</div>
+        <div class="subtab"        data-subtab="json">.gpatch · JSON</div>
+        <div class="subtab"        data-subtab="build">Build</div>
+      </div>
+      <div class="subpanes">
+        <div class="pane" id="pane-code">
+          <pre class="code" id="code-out"></pre>
+        </div>
+        <div class="pane" id="pane-json" style="display:none;">
+          <pre class="code" id="json-out"></pre>
+        </div>
+        <div class="pane build-pane" id="pane-build" style="display:none;">
+          <div class="build-summary" id="build-summary">
+            Real-time preview compiles your patch with in-browser <code>clang</code> (Wasmer JS SDK) and runs the resulting WebAssembly in an <code>AudioWorklet</code>. Click ▶ in the header to compile and play.
+            <br><br>
+            First Play downloads the compiler (~100 MB, cached after) plus the pre-built Gamma archive (~3 MB). See <code>wasm-build/README.md</code> in the repo for the recipe to produce the Gamma archive locally.
+          </div>
+          <div class="build-section">
+            <div class="build-section-head">Wrapped patch C++ <span id="build-wrap-info" class="build-meta"></span></div>
+            <pre class="code" id="build-wrap-out"></pre>
+          </div>
+          <div class="build-section" id="build-stderr-section" style="display:none;">
+            <div class="build-section-head">
+              Compile output
+              <button class="btn copy-build-btn" id="btn-copy-stderr" title="Copy compile output to clipboard">⧉ Copy</button>
+            </div>
+            <pre class="code" id="build-stderr"></pre>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="pane udsp-pane" id="pane-udsp" style="display:none;">
+      <div class="udsp-list" id="udsp-list"></div>
+      <div class="udsp-editor">
+        <div class="ai-panel" id="ai-panel" style="display:none;">
+          <div class="ai-row">
+            <select id="ai-mode" class="ai-select" title="What the AI should do">
+              <option value="generate">Generate from scratch</option>
+              <option value="modify">Modify current source</option>
+              <option value="fix">Fix validation error</option>
+              <option value="explain">Explain current source</option>
+            </select>
+            <input id="ai-prompt" class="ai-prompt" placeholder='Describe the DSP you want, e.g. "soft-clipping wavefolder with two stages"' />
+            <button class="btn primary" id="btn-ai-go">Run</button>
+            <button class="btn" id="btn-ai-close" title="Close AI panel">×</button>
+          </div>
+          <div class="ai-status" id="ai-status"></div>
+          <div class="ai-result" id="ai-result" style="display:none;">
+            <div class="ai-result-head">
+              <span id="ai-result-label">AI suggestion</span>
+              <button class="btn primary" id="btn-ai-apply">Apply</button>
+              <button class="btn" id="btn-ai-discard">Discard</button>
+            </div>
+            <pre class="ai-result-body" id="ai-result-body"></pre>
+          </div>
+        </div>
+        <textarea class="udsp-source" id="udsp-source" spellcheck="false"></textarea>
+        <div class="udsp-actions">
+          <button class="btn primary" id="btn-udsp-save">Save & Add</button>
+          <button class="btn" id="btn-udsp-validate">Validate</button>
+          <button class="btn" id="btn-udsp-export">Export .gdsp</button>
+          <button class="btn" id="btn-udsp-submit" title="Open a PR to the community library">↗ Submit</button>
+          <button class="btn" id="btn-udsp-ai" title="Ask AI to write/modify .gdsp">✨ AI</button>
+          <button class="btn model-badge" id="btn-model-badge" title="Switch AI provider" aria-haspopup="true" aria-expanded="false">
+            <span class="model-badge-tag" id="model-badge-tag">…</span>
+            <span class="model-badge-name" id="model-badge-name">…</span>
+            <span class="model-badge-caret">▾</span>
+          </button>
+          <div class="model-popover" id="model-popover" role="menu" style="display:none;"></div>
+          <button class="btn" id="btn-udsp-settings" title="API key settings">⚙</button>
+          <span class="udsp-status" id="udsp-status"></span>
+        </div>
+      </div>
+    </div>
+    <div class="pane pane-monitor" id="pane-monitor" style="display:none;">
+      <div class="monitor-grid">
+        <section class="monitor-section" id="monitor-output">
+          <div class="monitor-section-head">
+            <span class="monitor-section-title">Output</span>
+            <div class="monitor-mode-tabs" role="tablist">
+              <button class="monitor-mode-tab active" data-mode="vu"    role="tab">VU</button>
+              <button class="monitor-mode-tab"        data-mode="scope" role="tab">Scope</button>
+              <button class="monitor-mode-tab"        data-mode="fft"   role="tab">FFT</button>
+            </div>
+          </div>
+          <div class="monitor-display" id="monitor-display">
+            <span class="monitor-display-corner" id="meter-overlay-corner">−∞</span>
+            <canvas id="meter-canvas" width="960" height="240"></canvas>
+          </div>
+          <div class="monitor-readouts">
+            <div class="monitor-readout"><span class="k">peak L</span><span class="v" id="meter-db-l">−∞</span></div>
+            <div class="monitor-readout"><span class="k">peak R</span><span class="v" id="meter-db-r">−∞</span></div>
+            <div class="monitor-readout"><span class="k">status</span><span class="v" id="monitor-status">idle</span></div>
+          </div>
+        </section>
+        <section class="monitor-section" id="monitor-keyboard">
+          <div class="monitor-section-head">
+            <span class="monitor-section-title">Keyboard input</span>
+            <span class="monitor-readout-inline">
+              <span id="piano-octave-readout" class="dim">octave 0</span>
+              <span class="dim"> · </span>
+              <span id="piano-readout"><span class="dim">no note</span></span>
+              <button class="panel-ctl-btn" id="btn-keymap-edit" title="Edit per-key frequencies" style="margin-left:8px;">edit</button>
+            </span>
+          </div>
+          <div class="piano-keys" id="piano-keys"></div>
+          <div class="monitor-section-foot">
+            QWERTY plays into the patch's <code>KeyboardIn</code> node — <kbd>A</kbd>–<kbd>K</kbd> white, <kbd>W</kbd> <kbd>E</kbd> <kbd>T</kbd> <kbd>Y</kbd> <kbd>U</kbd> black. <kbd>Z</kbd>/<kbd>X</kbd> shift octave. Click any key to play with mouse.
+          </div>
+          <div class="monitor-controls" id="monitor-controls"></div>
+        </section>
+      </div>
+    </div>
+  </footer>
+
+  <!-- Phase 6.7.x v0.2.19 — Export center modal. Single place for
+       every kind of export the editor produces: patch JSON, visual
+       capture (composite + per-display + all-displays), rig calibration
+       bundles. Avoids the previous scatter where each subsystem grew
+       its own button in its own panel. Source labels distinguish
+       "Composite preview" (the on-screen rig-composite, whatever
+       preview mode is active), "Single display" (one rig display's
+       raw framebuffer at target resolution), and "Theater camera" (the
+       3D explorable view) — see the action sub-lines for the full
+       contract. Future "Scene cameras" (in-world cameras from a Scene
+       graph, post-Phase 7) drop into a new section here without
+       disturbing the existing layout. -->
+  <div class="modal-backdrop" id="export-modal" style="display:none;">
+    <div class="modal">
+      <div class="modal-head">
+        <span>Export</span>
+        <button class="btn modal-x" id="btn-export-close">×</button>
+      </div>
+      <div class="modal-body">
+
+        <!-- Patch ------------------------------------------------------- -->
+        <div class="export-section">
+          <div class="export-section-header">Patch</div>
+          <button class="export-action" id="exp-save-gpatch">
+            <span class="export-action-name">Save patch as .gpatch</span>
+            <span class="export-action-sub">JSON document — nodes, edges, exposed setters, groups. Restores the full editor state on Open. Sidecar <code>.assets.json</code> manifest is written for any referenced sample/MIDI/video files.</span>
+          </button>
+          <button class="export-action" id="exp-save-header">
+            <span class="export-action-name">Save generated C++ as <code id="exp-header-name">.h</code></span>
+            <span class="export-action-sub">Just the patch class as emitted by codegen — drop into an AlloLib project's audio callback or any host that follows the SPEC §4 contract. Errors surface as a <code>// ❌</code> comment block in the file (cycle without Delay1, etc).</span>
+          </button>
+          <button class="export-action" id="exp-standalone-html">
+            <span class="export-action-name">Export standalone <code>.html</code> (viewer — bundled, no server needed)</span>
+            <span class="export-action-sub">Self-contained <code>.html</code> with patch JSON + compiled wasm baked in as base64 + the editor stripped to a fullscreen "▶ Play" disc. Recipients press <kbd style="background:rgba(255,255,255,0.07);padding:0 4px;">L</kbd> if they want to inspect the patch. Requires a compiled wasm — click ▶ once in the editor first.<br><strong style="color:#ff9d4d;">⚠ Known issue (v0.2.28):</strong> the bundled-viewer path is currently flaky on <code>file://</code> — Chrome emits cross-origin warnings that may block playback, and SharedArrayBuffer (needed for audio-reactive shaders) is unavailable on <code>file://</code> regardless. <strong>For reliable playback today, serve the exported file via any static HTTP server</strong> (<code>python -m http.server</code>, GitHub Pages, Netlify Drop, etc). Phase 11 polish ticket.</span>
+          </button>
+          <div class="export-display-row">
+            <label style="display:flex;align-items:center;gap:6px;color:var(--text-2);font-size:11px;flex:1;font-family:var(--font-mono);">
+              <input type="checkbox" id="exp-standalone-livemode" checked style="width:14px;height:14px;" />
+              Auto-enter Live Mode on open
+            </label>
+            <label style="display:flex;align-items:center;gap:6px;color:var(--text-2);font-size:11px;flex:1;font-family:var(--font-mono);">
+              <input type="checkbox" id="exp-standalone-viewer" checked style="width:14px;height:14px;" />
+              Viewer mode (uncheck for full editor)
+            </label>
+          </div>
+        </div>
+
+        <!-- Visual capture --------------------------------------------- -->
+        <div class="export-section">
+          <div class="export-section-header">Visual capture</div>
+
+          <button class="export-action" id="exp-snap-composite">
+            <span class="export-action-name">Composite preview → PNG</span>
+            <span class="export-action-sub">What's on the visible canvas right now — the rig composite (current mode: <span id="exp-preview-mode">tile</span>) at viewport DPR. For 3D-explorable theater preview, this captures the camera view.</span>
+          </button>
+
+          <div class="export-display-row">
+            <select id="exp-display-pick"></select>
+            <button class="export-action" id="exp-snap-display" title="Capture the chosen display's framebuffer layer at target resolution">PNG</button>
+          </div>
+
+          <button class="export-action" id="exp-snap-all-displays">
+            <span class="export-action-name">All displays → ZIP (target resolution)</span>
+            <span class="export-action-sub">Every rig display's raw framebuffer layer at <code id="exp-fb-dims">1920×1080</code> bundled as <code>display-NN-id.png</code>. Real pixels each projector receives — independent of preview mode + viewport size.</span>
+          </button>
+
+          <button class="export-action" id="exp-rec-composite">
+            <span class="export-action-name">Record composite preview → WebM <span id="exp-rec-state-tag" style="display:none;" class="recording-tag">REC</span></span>
+            <span class="export-action-sub">Continuous video of the visible canvas (60 fps) via MediaRecorder, plus audio if a preview is playing. Click again to stop + download. Mirrors what an operator sees.</span>
+          </button>
+
+          <button class="export-action" id="exp-rec-composite-timed">
+            <span class="export-action-name">Record composite preview → WebM (timed)</span>
+            <span class="export-action-sub">Same as above, but prompts for a duration and auto-stops + downloads after N seconds. Useful when you know the take length up front. <em>Note: this is real-time; faster-than-realtime offline render-with-visual needs a WebCodecs + container-muxing pipeline — on the roadmap.</em></span>
+          </button>
+
+          <button class="export-action" id="exp-rec-perdisplay">
+            <span class="export-action-name"><span>Record per-display → ZIP </span><span id="exp-rec-pd-tag" style="display:none;" class="recording-tag">REC</span></span>
+            <span class="export-action-sub">N parallel MediaRecorders, one per rig display at <code id="exp-rec-pd-dims">1920×1080</code>. Each display's framebuffer layer goes to its own canvas + MediaRecorder; outputs <code>display-NN-id.webm</code> for each + <code>meta.json</code>. Audio captured per recorder if a preview is playing. Heavy GPU/memory — keep an eye on the fps readout at large rig sizes (4K × 26 = ~850 MB swapchain).</span>
+          </button>
+        </div>
+
+        <!-- Audio render ----------------------------------------------- -->
+        <div class="export-section">
+          <div class="export-section-header">Audio render</div>
+          <div class="export-action" style="cursor:default;">
+            <span class="export-action-name">Offline render — high-quality, faster-than-realtime when CPU allows</span>
+            <span class="export-action-sub">Runs the patch through an <code>OfflineAudioContext</code> at <code id="exp-audio-sr">48000</code> Hz × stereo. Live runtime is 32-bit float end-to-end (Web Audio + Gamma DSP); 16/24-bit WAV options quantize from that source, 32-bit float WAV is the native source verbatim. Duration prompted on click (1–3600 s). Needs a compiled patch — click ▶ once first so the editor can cache the wasm.</span>
+          </div>
+          <div class="export-display-row">
+            <select id="exp-audio-format">
+              <option value="wav16">WAV 16-bit PCM     (lossless · CD quality · ~10 MB/min)</option>
+              <option value="wav24">WAV 24-bit PCM     (lossless · DAW-friendly · ~15 MB/min)</option>
+              <option value="wav32f">WAV 32-bit float  (archival · no clipping · ~20 MB/min · native runtime depth)</option>
+              <option value="mp3">MP3 320 kbps          (compressed · share · ~2.4 MB/min · loads lamejs from CDN)</option>
+            </select>
+            <button class="export-action" id="exp-audio-render" title="Run the offline render at the selected format + prompted duration">Render</button>
+          </div>
+        </div>
+
+        <!-- Rig + calibration ------------------------------------------ -->
+        <div class="export-section">
+          <div class="export-section-header">Rig &amp; calibration</div>
+          <button class="export-action" id="exp-mpcdi" title="Open the rig editor's MPCDI export action">
+            <span class="export-action-name">MPCDI bundle (.mpcdi)</span>
+            <span class="export-action-sub">VESA MPCDI 2.0 — XML manifest + per-display Bourke <code>.csv</code> warp meshes (+ optional <code>.pfm</code>). Industry-standard interchange for multi-projector rigs.</span>
+          </button>
+          <button class="export-action" id="exp-auto-cap">
+            <span class="export-action-name">Auto-capture calibration walk (.zip)</span>
+            <span class="export-action-sub">Theater-walks the camera through 6 cardinal directions + one shot per display, packages PNGs + <code>calibration-meta.json</code> + README. Used by the AI calibration loop.</span>
+          </button>
+        </div>
+
+        <p class="export-status" id="exp-status"></p>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="settings-modal" style="display:none;">
+    <div class="modal">
+      <div class="modal-head">
+        <span>Settings</span>
+        <button class="btn modal-x" id="btn-settings-close">×</button>
+      </div>
+      <div class="modal-body">
+
+        <!-- AI section ------------------------------------------------- -->
+        <div class="settings-section-header" style="font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 10px;">AI provider</div>
+
+        <p class="modal-note" id="settings-note-api">
+          API keys are stored in this browser's localStorage in plain text and used only to call the chosen provider directly.
+          They never leave your machine via this editor. Clear them any time with the button below.
+        </p>
+        <p class="modal-note" id="settings-note-local" style="display:none;">
+          Local models run entirely in your browser via WebGPU. No data leaves your machine. The first time you Run, the model
+          weights download (~1.5 GB for E4B, ~500 MB for E2B) and are cached in the browser; subsequent runs are offline. Requires a
+          WebGPU-capable browser (Chrome, Edge, recent Safari) and a discrete GPU or unified-memory machine with at least 4 GB free.
+        </p>
+        <div class="settings-grid">
+          <label>Provider</label>
+          <select id="settings-provider">
+            <option value="gemma">Local model (Gemma 4)</option>
+            <option value="anthropic">Anthropic (Claude) — optional</option>
+          </select>
+
+          <label>Model</label>
+          <input id="settings-model" placeholder="claude-sonnet-4-5" />
+          <select id="settings-model-local" style="display:none;">
+            <option value="onnx-community/gemma-4-E2B-it-ONNX">Gemma 4 E2B · ~500 MB · text (recommended)</option>
+            <option value="onnx-community/gemma-4-E4B-it-ONNX">Gemma 4 E4B · ~1.5 GB · text (higher quality)</option>
+          </select>
+
+          <label id="settings-key-label">API key</label>
+          <input id="settings-key" type="password" placeholder="sk-ant-…" />
+        </div>
+
+        <!-- Local-model status panel: only shown when Provider == gemma -->
+        <div id="gemma-status-panel" style="display:none; margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border);">
+          <div class="settings-grid" style="grid-template-columns: 110px 1fr;">
+            <label>WebGPU</label>
+            <span id="gemma-webgpu-state" style="font-size: 11.5px; font-family: var(--font-mono);">checking…</span>
+            <label>Model</label>
+            <span id="gemma-model-state" style="font-size: 11.5px; font-family: var(--font-mono);">not loaded</span>
+          </div>
+          <div class="modal-actions" style="margin-top: 12px; justify-content: flex-start;">
+            <button class="btn" id="btn-gemma-preload">Preload model</button>
+          </div>
+          <p class="modal-note" id="gemma-preload-note" style="margin: 10px 0 0; min-height: 18px;"></p>
+        </div>
+
+        <!-- Compile server section ------------------------------------- -->
+        <div class="settings-section-header" style="font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin: 22px 0 10px; padding-top: 16px; border-top: 1px solid var(--border);">Compile server</div>
+
+        <p class="modal-note">
+          By default the editor probes <code>127.0.0.1:8765</code> for the local <code>gamma-compile-server</code> daemon. Set a custom URL to point at a daemon running on another machine on your LAN — e.g. patch on an iPad against a Mac running the daemon.
+        </p>
+        <p class="modal-note" style="margin-top: 6px;">
+          <strong>Mixed-content note:</strong> if you're loading the editor from <code>https://</code>, browsers block requests to non-<code>localhost</code> <code>http://</code> URLs. Workaround: serve the editor over <code>http://</code> from the same machine (e.g. <code>python -m http.server</code>), or run the daemon behind HTTPS.
+        </p>
+        <div class="settings-grid">
+          <label>Server URL</label>
+          <input id="settings-compile-url" placeholder="http://192.168.1.42:8765" />
+        </div>
+        <div class="modal-actions" style="margin-top: 10px; justify-content: flex-start;">
+          <button class="btn" id="btn-settings-test-server">Test connection</button>
+          <span id="settings-server-result" style="font-size: 11.5px; font-family: var(--font-mono); margin-left: 4px; align-self: center;"></span>
+        </div>
+
+        <div class="modal-actions" style="margin-top: 18px;">
+          <button class="btn primary" id="btn-settings-save">Save</button>
+          <button class="btn danger" id="btn-settings-clear">Clear key</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Per-key custom frequency editor. Each QWERTY key can be assigned
+       a fixed Hz that overrides the default MIDI mapping (and ignores
+       octave shift while overridden). Stored in localStorage so it
+       persists across sessions. -->
+  <div class="modal-backdrop" id="keymap-modal" style="display:none;">
+    <div class="modal" style="width: 540px;">
+      <div class="modal-head">
+        <span>Edit key mapping</span>
+        <button class="btn modal-x" id="btn-keymap-close">×</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-note">
+          Override individual key frequencies. Type a number (Hz) into any row to pin that key to a fixed pitch — overrides the default MIDI mapping and ignores octave shift while set. Leave blank to fall back to default. Stored locally in this browser.
+        </p>
+        <div class="keymap-grid" id="keymap-grid"></div>
+        <div class="modal-actions" style="margin-top: 14px;">
+          <button class="btn primary" id="btn-keymap-done">Done</button>
+          <button class="btn danger" id="btn-keymap-reset">Reset all</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Per-node code editor: edits one node's helperClass + ports in
+       place via node.override. Opens with E on a single selected node
+       (when no group is selected) or the ✎ handle on the bottom edge
+       of the selected node. All main hotkeys are gated while open
+       via a capture-phase listener that intercepts keydown events. -->
+  <div class="modal-backdrop" id="node-edit-modal" style="display:none;">
+    <div class="modal">
+      <div class="modal-head">
+        <span id="node-edit-title">Edit node</span>
+        <button class="btn node-edit-mode-toggle" id="btn-node-edit-mode" title="Toggle between fields view and a single .gdsp source (User DSP format)">.gdsp →</button>
+        <button class="btn modal-x" id="btn-node-edit-close">×</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-note">
+          Per-node override of helperClass code and ports. Changes apply to <em>this instance only</em>; other nodes of the same type stay on the registry default. Recompile (▶) after saving to see the new C++ in action.
+        </p>
+
+        <!-- "raw" mode: fields view -->
+        <div id="node-edit-raw-view">
+          <div class="node-edit-section">
+            <div class="node-edit-section-head">class name (cppType)</div>
+            <input id="node-edit-cppType" class="node-edit-classfield" type="text" placeholder="e.g. gam::Sine&lt;&gt; or MyCustomClass" />
+          </div>
+
+          <div class="node-edit-section">
+            <div class="node-edit-section-head">inputs</div>
+            <div class="node-port-rows" id="node-edit-ins"></div>
+            <button class="node-port-add" id="btn-node-add-in">+ add input</button>
+          </div>
+
+          <div class="node-edit-section">
+            <div class="node-edit-section-head">outputs</div>
+            <div class="node-port-rows" id="node-edit-outs"></div>
+            <button class="node-port-add" id="btn-node-add-out">+ add output</button>
+          </div>
+
+          <div class="node-edit-section">
+            <div class="node-edit-section-head">helper class (C++ source)</div>
+            <div class="node-edit-cm-wrap">
+              <textarea id="node-edit-code" class="node-edit-codearea" spellcheck="false"></textarea>
+            </div>
+          </div>
+        </div>
+
+        <!-- ".gdsp" mode: single textarea with metadata + class body -->
+        <div id="node-edit-gdsp-view" style="display:none;">
+          <div class="node-edit-section">
+            <div class="node-edit-section-head">.gdsp source (metadata + class)</div>
+            <div class="node-edit-cm-wrap">
+              <textarea id="node-edit-gdsp" class="node-edit-codearea" spellcheck="false"></textarea>
+            </div>
+          </div>
+        </div>
+
+        <div class="node-edit-warn" id="node-edit-warn"></div>
+
+        <div class="modal-actions">
+          <button class="btn node-edit-revert" id="btn-node-edit-revert" title="Remove the override and restore the registry default">↺ revert to default</button>
+          <button class="btn"         id="btn-node-edit-validate" title="Run the same checks save runs, without committing">validate</button>
+          <button class="btn"         id="btn-node-edit-export"   title="Download the .gdsp source as a file">export .gdsp</button>
+          <button class="btn"         id="btn-node-edit-cancel">cancel</button>
+          <button class="btn primary" id="btn-node-edit-save">save</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Ramp editor — picks how a Slider's drag position maps to its
+       output (linear / log / exp / sCurve) or a Button's gate-output
+       envelope shape (pulse / linRamp / expDecay). Same modal, two
+       option sets — opened from the Monitor controls panel via the
+       little "≈" button on each row. -->
+  <div class="modal-backdrop" id="ramp-modal" style="display:none;">
+    <div class="modal" style="width: 520px;">
+      <div class="modal-head">
+        <span id="ramp-modal-title">Edit slider curve</span>
+        <button class="btn modal-x" id="btn-ramp-close">×</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-note" id="ramp-modal-note">
+          Pick how the slider's drag position maps to its output. Linear is 1:1; log gives finer control at the bottom (good for frequency / amplitude); exp gives finer control at the top (good for time / decay); s-curve eases in and out.
+        </p>
+        <div class="ramp-grid" id="ramp-grid"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Automation lane editor — opened from an AutomationLane or
+       MultiAutomationLane node's props pane. Drawable curve(s) with
+       beat / bar grid markers; multi-lane variant adds tab buttons
+       at the top to switch which lane the canvas edits. Saves into
+       node.params.curveTable (single) or node.params.lanes[i]
+       .curveTable (multi). -->
+  <div class="modal-backdrop" id="auto-lane-modal" style="display:none;">
+    <div class="modal" style="width: 720px;">
+      <div class="modal-head">
+        <span id="auto-lane-modal-title">Edit automation lane</span>
+        <button class="btn modal-x" id="btn-auto-lane-close">×</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-note">
+          Click + drag to draw the curve. The vertical grid lines mark beats; the bolder ones mark bars (4 beats / bar in 4/4). Total length = bars × 4 beats at the wired BPM. Click a lane tab (multi-lane node only) to switch which curve you're editing.
+        </p>
+        <div id="auto-lane-tabs"></div>
+        <div id="auto-lane-pane"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Drawable ADSR — opened from an EnvDraw node's props pane. Free-
+       draw the full envelope shape with a movable sustain marker. The
+       attack region (left of sustain) and release region (right) are
+       tinted differently so the user can see where the held part sits.
+       Saves into node.params.curveTable + node.params.sustainIdx. -->
+  <div class="modal-backdrop" id="envdraw-modal" style="display:none;">
+    <div class="modal" style="width: 560px;">
+      <div class="modal-head">
+        <span id="envdraw-modal-title">Edit envelope</span>
+        <button class="btn modal-x" id="btn-envdraw-close">×</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-note">
+          Click+drag to draw the envelope shape. The amber dashed line is the sustain marker — drag it left/right to choose where the curve holds while the gate is active. Indices left of the marker play during attack; the value at the marker is held; indices right play during release.
+        </p>
+        <div id="envdraw-pane"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- v0.3.28 — Color curves editor for ColorCurves nodes. Four 16-
+       point curves (Master, R, G, B). Tab strip selects which curve
+       is being edited; inactive curves show as faint overlays in
+       their channel color so the user sees the full grade in context.
+       Reset returns the active curve to identity; Reset All clears
+       every curve. Done closes the modal. -->
+  <div class="modal-backdrop" id="colorcurves-modal" style="display:none;">
+    <div class="modal" style="width: 600px;">
+      <div class="modal-head">
+        <span id="colorcurves-modal-title">Edit color curves</span>
+        <button class="btn modal-x" id="btn-colorcurves-close">×</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-note">
+          Drag the 16 control points to reshape the curve. Master applies first to all three channels; R / G / B then apply per-channel. Identity (linear ramp) is the default — drag a single point up for a brightness lift, S-curve the midtones for contrast.
+        </p>
+        <div id="colorcurves-pane"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Piano-roll editor — opened from a PianoRoll node's props pane.
+       Pro-grade time × pitch sequencer with dedicated piano-keyboard
+       sidebar, beat ruler, velocity lane, tool modes, snap, zoom, and
+       multi-select. Notes persist into node.params.notes and codegen
+       emits clearNotes + addNote at constructor time. The {start,
+       dur, midi, vel} schema is unchanged; runtime _id is added on
+       open for selection persistence and stripped on save. -->
+  <div class="modal-backdrop" id="pianoroll-modal" style="display:none;">
+    <div class="modal pr-modal">
+      <div class="modal-head pr-modal-head">
+        <span class="pr-title-mark">PIANO ROLL</span>
+        <span class="pr-title-id" id="pianoroll-modal-title">[—]</span>
+        <span class="pr-title-spacer"></span>
+        <span class="pr-readout" id="pianoroll-readout">PITCH —    POS —.—.—</span>
+        <button class="btn modal-x" id="btn-pianoroll-close">×</button>
+      </div>
+
+      <div class="pr-toolbar" id="pr-toolbar">
+        <div class="pr-tool-group">
+          <span class="pr-tool-label">TOOL</span>
+          <button class="pr-tool" data-tool="draw"   title="Pencil — click+drag to draw notes (B)">✎</button>
+          <button class="pr-tool" data-tool="select" title="Select — marquee or click; drag to move; drag right edge to resize (V)">▭</button>
+          <button class="pr-tool" data-tool="erase"  title="Erase — click a note to remove (E)">⌫</button>
+        </div>
+        <div class="pr-tool-group pr-track-group" title="Track selector — click to switch which track you're editing. Inactive tracks render dimly for context. Shortcut: 1/2/3/4">
+          <span class="pr-tool-label">TRACK</span>
+          <button class="pr-track" data-track="0" style="--track-c: var(--accent);">1</button>
+          <button class="pr-track" data-track="1" style="--track-c: var(--info);">2</button>
+          <button class="pr-track" data-track="2" style="--track-c: var(--param);">3</button>
+          <button class="pr-track" data-track="3" style="--track-c: var(--gate);">4</button>
+        </div>
+        <div class="pr-tool-group">
+          <span class="pr-tool-label">GRID</span>
+          <select id="pr-snap" class="pr-select" title="Snap drawing/move to this resolution">
+            <option value="0">1/16</option>
+            <option value="1">1/8</option>
+            <option value="2">1/4</option>
+            <option value="3">1/2</option>
+            <option value="4">1/1</option>
+          </select>
+        </div>
+        <div class="pr-tool-group">
+          <span class="pr-tool-label">LENGTH</span>
+          <input id="pianoroll-len" type="number" min="1" max="64" step="1" />
+          <span class="pr-tool-suffix">STEPS</span>
+        </div>
+        <div class="pr-tool-group">
+          <span class="pr-tool-label">VEL</span>
+          <input id="pianoroll-vel" type="number" min="0" max="1" step="0.05" title="Default velocity for newly-drawn notes" />
+        </div>
+        <div class="pr-tool-group">
+          <span class="pr-tool-label">ZOOM</span>
+          <button class="pr-zoom-btn" data-zoom="hout" title="Zoom out horizontally">⇤</button>
+          <button class="pr-zoom-btn" data-zoom="hin"  title="Zoom in horizontally">⇥</button>
+          <span class="pr-zoom-sep"></span>
+          <button class="pr-zoom-btn" data-zoom="vout" title="Zoom out vertically">⤓</button>
+          <button class="pr-zoom-btn" data-zoom="vin"  title="Zoom in vertically">⤒</button>
+        </div>
+        <div class="pr-tool-group">
+          <span class="pr-tool-label">OCTAVE</span>
+          <button class="pr-zoom-btn" data-oct="-1" title="Scroll down an octave">⇩</button>
+          <button class="pr-zoom-btn" data-oct="+1" title="Scroll up an octave">⇧</button>
+        </div>
+        <span class="pr-tool-spacer"></span>
+        <button class="btn pr-btn" id="btn-pianoroll-duplicate" title="Duplicate selection (⌘ D)">DUPLICATE</button>
+        <button class="btn pr-btn" id="btn-pianoroll-clear" title="Remove all notes">CLEAR</button>
+        <button class="btn pr-btn pr-btn-primary" id="btn-pianoroll-done">DONE</button>
+      </div>
+
+      <div class="pr-stage">
+        <div class="pr-corner">
+          <span class="pr-corner-mark">PITCH</span>
+          <span class="pr-corner-mark">TIME →</span>
+        </div>
+        <div class="pr-ruler-wrap"><svg id="pr-ruler" class="pr-ruler"></svg></div>
+        <div class="pr-keys-wrap"><svg id="pr-keys" class="pr-keys"></svg></div>
+        <div class="pr-grid-wrap" id="pr-grid-wrap" data-tool="draw"><svg id="pr-grid" class="pr-grid"></svg></div>
+        <div class="pr-vel-corner">VEL</div>
+        <div class="pr-vel-wrap"><svg id="pr-vel" class="pr-vel"></svg></div>
+      </div>
+
+      <div class="pr-status">
+        <span class="pr-status-cell">
+          <span class="pr-stat-key">NOTES</span>
+          <span class="pr-stat-val" id="pr-stat-count">0</span>
+        </span>
+        <span class="pr-status-cell">
+          <span class="pr-stat-key">SELECTED</span>
+          <span class="pr-stat-val" id="pr-stat-selected">0</span>
+        </span>
+        <span class="pr-status-cell">
+          <span class="pr-stat-key">SNAP</span>
+          <span class="pr-stat-val" id="pr-stat-snap">1/16</span>
+        </span>
+        <span class="pr-status-cell pr-status-cell-grow"></span>
+        <span class="pr-status-cell">
+          <span class="pr-stat-key">SHORTCUTS</span>
+          <span class="pr-stat-val muted">B PEN · V SEL · E ERASE · ⌫ DEL · ↑↓ TRANSPOSE · ⇧↑↓ OCT · ⌘D DUP · ⌘A ALL · ESC CLOSE</span>
+        </span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Wavetable single-cycle editor — drawable 256-sample waveform.
+       Opened from WavetableOsc (mode="single") to edit node.params.table,
+       OR from WavetableScan (mode="frame") to edit one of the 512 frames
+       in node.params.customFrames[idx]. Save-on-release: every drag
+       commit writes back so the codegen + monitor reflects changes
+       without a separate save step. -->
+  <div class="modal-backdrop" id="wavetable-modal" style="display:none;">
+    <div class="modal wt-modal">
+      <div class="modal-head wt-modal-head">
+        <span class="wt-title-mark">WAVEFORM</span>
+        <span class="wt-title-id" id="wavetable-modal-title">[—]</span>
+        <span class="wt-title-spacer"></span>
+        <span class="wt-readout" id="wavetable-readout">SAMPLE —    AMP —</span>
+        <button class="btn modal-x" id="btn-wavetable-close">×</button>
+      </div>
+      <div class="wt-toolbar">
+        <div class="wt-tool-group">
+          <span class="wt-tool-label">PRESET</span>
+          <button class="wt-preset-btn" data-preset="sine">SINE</button>
+          <button class="wt-preset-btn" data-preset="saw">SAW</button>
+          <button class="wt-preset-btn" data-preset="square">SQUARE</button>
+          <button class="wt-preset-btn" data-preset="triangle">TRI</button>
+          <button class="wt-preset-btn" data-preset="halfSine">½SINE</button>
+          <button class="wt-preset-btn" data-preset="hollow">HOLLOW</button>
+          <button class="wt-preset-btn" data-preset="random">NOISE</button>
+        </div>
+        <div class="wt-tool-group">
+          <span class="wt-tool-label">SHAPE</span>
+          <button class="wt-tool-btn" data-op="smooth"     title="Box-blur smoothing (low-pass the waveform)">SMOOTH</button>
+          <button class="wt-tool-btn" data-op="normalize"  title="Scale max amplitude to ±1.0">NORM</button>
+          <button class="wt-tool-btn" data-op="invert"     title="Flip vertically">INVERT</button>
+          <button class="wt-tool-btn" data-op="reverse"    title="Reverse left-to-right">REVERSE</button>
+          <button class="wt-tool-btn" data-op="symmetrize" title="Mirror the left half over the right (forces symmetry)">SYM</button>
+          <button class="wt-tool-btn" data-op="zero"       title="Zero out the table">ZERO</button>
+        </div>
+        <span class="wt-tool-spacer"></span>
+        <button class="btn pr-btn" id="btn-wavetable-revert" title="Revert to the values at modal-open">REVERT</button>
+        <button class="btn pr-btn pr-btn-primary" id="btn-wavetable-done">DONE</button>
+      </div>
+      <div class="wt-stage">
+        <svg id="wt-canvas" class="wt-canvas"></svg>
+      </div>
+      <div class="pr-status">
+        <span class="pr-status-cell">
+          <span class="pr-stat-key">SAMPLES</span>
+          <span class="pr-stat-val" id="wt-stat-len">256</span>
+        </span>
+        <span class="pr-status-cell">
+          <span class="pr-stat-key">RMS</span>
+          <span class="pr-stat-val" id="wt-stat-rms">—</span>
+        </span>
+        <span class="pr-status-cell">
+          <span class="pr-stat-key">PEAK</span>
+          <span class="pr-stat-val" id="wt-stat-peak">—</span>
+        </span>
+        <span class="pr-status-cell pr-status-cell-grow"></span>
+        <span class="pr-status-cell">
+          <span class="pr-stat-key">DRAW</span>
+          <span class="pr-stat-val muted">CLICK + DRAG TO PAINT THE WAVEFORM · SHIFT-DRAG = LINE · ESC TO CLOSE</span>
+        </span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Wavescan modal — 3D-stacked view of all 512 frames in a wavetable
+       bank. Each visible frame renders as a polyline; the active
+       position highlights one frame in bright phosphor. Click any
+       frame to drill into the wavetable-edit modal pre-loaded with
+       that frame's data. The position scrubber at the top is also
+       wired to node.params.position so dragging here scrubs the live
+       audio. -->
+  <div class="modal-backdrop" id="wavescan-modal" style="display:none;">
+    <div class="modal ws-modal">
+      <div class="modal-head ws-modal-head">
+        <span class="wt-title-mark">WAVESCAN</span>
+        <span class="wt-title-id" id="wavescan-modal-title">[—]</span>
+        <span class="wt-title-spacer"></span>
+        <span class="wt-readout" id="wavescan-readout">FRAME —/512    POS 0.000</span>
+        <button class="btn modal-x" id="btn-wavescan-close">×</button>
+      </div>
+      <div class="wt-toolbar">
+        <div class="wt-tool-group">
+          <span class="wt-tool-label">BANK</span>
+          <select id="ws-bank" class="pr-select">
+            <option value="0">SINE → SAW</option>
+            <option value="1">HARMONIC WALK</option>
+            <option value="2">FORMANT SCAN</option>
+            <option value="3">SINE FOLD</option>
+            <option value="4">SINE → TRIANGLE</option>
+            <option value="5">MORPH PAIR</option>
+          </select>
+        </div>
+        <div class="wt-tool-group">
+          <span class="wt-tool-label">POSITION</span>
+          <input id="ws-position" type="range" min="0" max="1" step="0.001" value="0" class="ws-position" />
+          <span class="ws-pos-readout" id="ws-pos-readout">0.000</span>
+        </div>
+        <div class="wt-tool-group">
+          <span class="wt-tool-label">VIEW</span>
+          <button class="wt-tool-btn" data-view="3d"    title="3D-stacked perspective view of all 512 frames">3D</button>
+          <button class="wt-tool-btn" data-view="grid"  title="Grid view — sample frames laid out as a contact sheet">GRID</button>
+        </div>
+        <span class="wt-tool-spacer"></span>
+        <button class="btn pr-btn" id="btn-wavescan-clear-overrides" title="Clear all custom frames (revert to bank algorithm)">CLEAR OVERRIDES</button>
+        <button class="btn pr-btn pr-btn-primary" id="btn-wavescan-done">DONE</button>
+      </div>
+      <div class="ws-stage" id="ws-stage">
+        <svg id="ws-canvas" class="ws-canvas"></svg>
+        <div class="ws-hint">Click any frame to drill into the per-frame editor. Drag the POSITION slider to scrub through the bank.</div>
+      </div>
+      <div class="pr-status">
+        <span class="pr-status-cell">
+          <span class="pr-stat-key">FRAMES</span>
+          <span class="pr-stat-val">512 × 256</span>
+        </span>
+        <span class="pr-status-cell">
+          <span class="pr-stat-key">CUSTOM</span>
+          <span class="pr-stat-val" id="ws-stat-overrides">0</span>
+        </span>
+        <span class="pr-status-cell">
+          <span class="pr-stat-key">BANK</span>
+          <span class="pr-stat-val" id="ws-stat-bank">SINE → SAW</span>
+        </span>
+        <span class="pr-status-cell pr-status-cell-grow"></span>
+        <span class="pr-status-cell">
+          <span class="pr-stat-key">SHORTCUTS</span>
+          <span class="pr-stat-val muted">← → SCRUB · ⇧ ← → COARSE · ESC CLOSE</span>
+        </span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Sprint SpriteCreator-1 -- Sprite Studio modal. LLM-driven pixel
+       art generator. Layout:
+         Left:   prompt textarea + style presets + generate button
+         Center: preview canvas (zoom-fits the generated bitmap)
+         Right:  asset metadata (name, size, frames, scale) + save button
+       Generated JS runs in main thread inside `new Function("ctx", ...)`.
+       Worker isolation deferred to v2 (the LLM is trusted via the user's
+       own API key; v1 trades isolation for simpler debugging). -->
+  <div class="modal-backdrop" id="spritestudio-modal" style="display:none;">
+    <div class="modal" style="width: 920px; max-width: 95vw; max-height: 90vh; display: flex; flex-direction: column;">
+      <div class="modal-head" style="display:flex; align-items:center; gap:10px;">
+        <span class="modal-title" style="font-family: var(--font-instr); letter-spacing: 0.20em; color: var(--phosphor); text-transform: lowercase;">sprite studio</span>
+        <span id="ss-status" style="font-family: var(--font-mono); font-size: 10px; color: var(--text-3); flex: 1;">ready</span>
+        <button class="btn modal-x" id="ss-close" type="button">×</button>
+      </div>
+      <!-- Generation progress bar: hidden when idle, shows fill % during a /sprite-gen call.
+           Driven by polling /sprite-gen/progress every 400 ms (sd-progress sprint). -->
+      <div id="ss-progress-wrap" style="display:none; height:3px; background:var(--bg-2); border-top:1px solid var(--instr-rule); overflow:hidden;">
+        <div id="ss-progress-bar" style="height:100%; width:0%; background:var(--phosphor); transition:width 0.18s linear;"></div>
+      </div>
+      <div style="display:grid; grid-template-columns: 280px 1fr 220px; gap:0; flex:1; min-height:0; border-top:1px solid var(--instr-rule);">
+        <!-- Left: prompt panel -->
+        <div style="padding:12px; border-right:1px solid var(--instr-rule); display:flex; flex-direction:column; gap:10px; overflow:auto;">
+          <div>
+            <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); letter-spacing:0.06em; margin-bottom:4px;">DESCRIPTION</div>
+            <textarea id="ss-prompt" placeholder="small red fox, side view, idle pose, simple SNES-era pixel art" style="width:100%; height:110px; padding:6px 8px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10.5px; resize:vertical;"></textarea>
+          </div>
+          <div>
+            <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); letter-spacing:0.06em; margin-bottom:4px;">STYLE PRESET</div>
+            <select id="ss-preset" style="width:100%; padding:5px 6px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10.5px;">
+              <option value="snes" selected>SNES 16-bit (limited palette)</option>
+              <option value="nes">NES 8-bit (4-color)</option>
+              <option value="gameboy">Game Boy (4 greens)</option>
+              <option value="modern">Modern pixel art (free palette)</option>
+            </select>
+          </div>
+          <div>
+            <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); letter-spacing:0.06em; margin-bottom:4px;">BACKEND</div>
+            <select id="ss-backend" style="width:100%; padding:5px 6px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10.5px;">
+              <option value="compile-server-sd">Compile-server SD (Z-Image-Turbo)</option>
+              <option value="local-sd-a1111">Local SD (A1111 webui)</option>
+              <option value="llm-canvas">LLM → JS canvas (low quality, free)</option>
+            </select>
+          </div>
+          <div id="ss-model-row">
+            <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); letter-spacing:0.06em; margin-bottom:4px;">SD MODEL</div>
+            <select id="ss-sd-model" style="width:100%; padding:5px 6px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10.5px;">
+              <option value="z-image-turbo" selected>Z-Image-Turbo (Apache 2.0, ~6 GB)</option>
+              <option value="sdxl">SDXL + Pixel Art XL LoRA (~7 GB)</option>
+              <option value="flux2-klein">Flux.2 klein (Apache 2.0, ~12 GB)</option>
+            </select>
+            <div id="ss-model-status" style="font-family:var(--font-mono); font-size:8.5px; color:var(--text-3); margin-top:3px;"></div>
+          </div>
+          <div id="ss-quality-row">
+            <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); letter-spacing:0.06em; margin-bottom:4px;">QUALITY</div>
+            <select id="ss-sd-quality" style="width:100%; padding:5px 6px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10.5px;" title="Native generation resolution. Higher = better quality + much slower. The result downsamples to your sprite size regardless.">
+              <option value="384">Draft (384×384, ~30s on M4)</option>
+              <option value="512" selected>Standard (512×512, ~1 min)</option>
+              <option value="768">High (768×768, ~3 min)</option>
+              <option value="1024">Max (1024×1024, ~5 min — may time out)</option>
+            </select>
+          </div>
+          <div id="ss-sd-config" style="display:none;">
+            <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); letter-spacing:0.06em; margin-bottom:4px;">A1111 ENDPOINT</div>
+            <input type="text" id="ss-sd-endpoint" placeholder="http://localhost:7860" style="width:100%; padding:5px 6px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10.5px;"/>
+            <div style="display:flex; gap:6px; margin-top:6px;">
+              <div style="flex:1;">
+                <div style="font-family:var(--font-mono); font-size:9px; color:var(--text-3); margin-bottom:2px;">STEPS</div>
+                <input type="number" id="ss-sd-steps" min="5" max="100" step="1" value="20" style="width:100%; padding:3px 5px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10px;"/>
+              </div>
+              <div style="flex:2;">
+                <div style="font-family:var(--font-mono); font-size:9px; color:var(--text-3); margin-bottom:2px;">SAMPLER</div>
+                <input type="text" id="ss-sd-sampler" placeholder="DPM++ 2M Karras" style="width:100%; padding:3px 5px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10px;"/>
+              </div>
+            </div>
+          </div>
+          <button class="btn primary" id="ss-generate" style="width:100%; padding:8px;">Generate</button>
+          <div id="ss-help" style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); line-height:1.5;">
+            Uses the LLM provider set in <em>User DSP → ⚙</em>. Default: Claude API. Output runs as JS canvas paint code in this page. No corporate-IP references in the prompt.
+          </div>
+        </div>
+        <!-- Center: preview. CSS checkerboard via layered 45° gradients
+             so the user can see transparency (after _ssChromaKeyWhite).
+             Canvas display size pinned to 320 CSS px so a 32px sprite
+             is visible at 10×; larger sprites scale to fit via max-*. -->
+        <div style="background:#0a0c10; display:flex; align-items:center; justify-content:center; overflow:hidden; min-height:300px; position:relative;">
+          <canvas id="ss-canvas" width="32" height="32" style="image-rendering:pixelated; image-rendering:crisp-edges; width:320px; height:320px; max-width:90%; max-height:90%; background-color:#2a2d35; background-image: linear-gradient(45deg, #3a3d45 25%, transparent 25%), linear-gradient(-45deg, #3a3d45 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #3a3d45 75%), linear-gradient(-45deg, transparent 75%, #3a3d45 75%); background-size:16px 16px; background-position:0 0, 0 8px, 8px -8px, 8px 0px;"></canvas>
+          <div id="ss-empty" style="position:absolute; color:var(--text-3); font-family:var(--font-mono); font-size:10.5px; text-align:center; pointer-events:none;">
+            Empty preview.<br/>Type a description and click Generate.
+          </div>
+        </div>
+        <!-- Right: metadata + save -->
+        <div style="padding:12px; border-left:1px solid var(--instr-rule); display:flex; flex-direction:column; gap:8px; overflow:auto;">
+          <div>
+            <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); letter-spacing:0.06em; margin-bottom:4px;">NAME</div>
+            <input type="text" id="ss-name" placeholder="my-sprite" style="width:100%; padding:5px 6px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10.5px;"/>
+          </div>
+          <div style="display:grid; grid-template-columns: 1fr 1fr; gap:6px;">
+            <div>
+              <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); margin-bottom:3px;">WIDTH</div>
+              <input type="number" id="ss-width" value="128" min="8" max="512" step="8" style="width:100%; padding:4px 6px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10.5px;"/>
+            </div>
+            <div>
+              <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); margin-bottom:3px;">HEIGHT</div>
+              <input type="number" id="ss-height" value="128" min="8" max="512" step="8" style="width:100%; padding:4px 6px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10.5px;"/>
+            </div>
+          </div>
+          <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:6px;">
+            <div>
+              <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); margin-bottom:3px;">COLS</div>
+              <input type="number" id="ss-framesX" value="1" min="1" max="32" step="1" style="width:100%; padding:4px 6px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10.5px;"/>
+            </div>
+            <div>
+              <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); margin-bottom:3px;">ROWS</div>
+              <input type="number" id="ss-framesY" value="1" min="1" max="32" step="1" style="width:100%; padding:4px 6px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10.5px;"/>
+            </div>
+            <div>
+              <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); margin-bottom:3px;">FPS</div>
+              <input type="number" id="ss-fps" value="8" min="0.5" max="60" step="0.5" style="width:100%; padding:4px 6px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10.5px;"/>
+            </div>
+          </div>
+          <div>
+            <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); margin-bottom:3px;" title="pixels per world unit">SCALE (px/unit)</div>
+            <input type="number" id="ss-scale" value="32" min="1" max="2048" step="1" style="width:100%; padding:4px 6px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10.5px;"/>
+          </div>
+          <div style="flex:1;"></div>
+          <button class="btn" id="ss-save" disabled style="width:100%; padding:8px;">Save to Assets</button>
+          <details style="margin-top:6px;">
+            <summary style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); cursor:pointer;">Generated JS (read-only)</summary>
+            <textarea id="ss-code" readonly style="width:100%; height:120px; margin-top:4px; padding:6px; background:var(--bg-1); color:var(--text-2); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:9.5px; resize:vertical;"></textarea>
+          </details>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Sprint tilemap-painter -- visual click-paint editor for Tilemap2D
+       nodes. Opens via the ⚙ gear handle on a Tilemap2D node and
+       loads its tileData / palette / dims into the painter. Each cell
+       is a 16-px swatch on the canvas; click + drag paints with the
+       active brush; Save writes the modified string back to tileData
+       and triggers a mesh rebuild via the existing meshCacheKey path.
+       Hand-counting dots is over. -->
+  <div class="modal-backdrop" id="tilemap-editor-modal" style="display:none;">
+    <div class="modal" style="width: 1100px; max-width: 95vw; max-height: 95vh; display:flex; flex-direction:column;">
+      <div class="modal-head" style="display:flex; align-items:center; gap:10px;">
+        <span class="modal-title" style="font-family:var(--font-instr); letter-spacing:0.20em; color:var(--phosphor); text-transform:lowercase;">tilemap painter</span>
+        <span id="tme-status" style="font-family:var(--font-mono); font-size:10px; color:var(--text-3); flex:1;">no tilemap open</span>
+        <button class="btn modal-x" id="tme-close" type="button">×</button>
+      </div>
+      <div style="display:grid; grid-template-columns: 200px 1fr; gap:0; flex:1; min-height:0; border-top:1px solid var(--instr-rule);">
+        <!-- Brush palette -->
+        <div style="padding:12px; border-right:1px solid var(--instr-rule); display:flex; flex-direction:column; gap:6px; overflow:auto;">
+          <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); letter-spacing:0.06em;">BRUSH</div>
+          <div id="tme-palette" style="display:flex; flex-direction:column; gap:4px;">
+            <!-- Brush buttons rendered dynamically from the tilemap's palette -->
+          </div>
+          <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); letter-spacing:0.06em; margin-top:12px;">DIMENSIONS</div>
+          <div style="display:grid; grid-template-columns: 1fr 1fr; gap:6px;">
+            <div>
+              <div style="font-family:var(--font-mono); font-size:9px; color:var(--text-3); margin-bottom:2px;">COLS</div>
+              <input type="number" id="tme-cols" min="1" max="200" step="1" style="width:100%; padding:3px 5px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10px;"/>
+            </div>
+            <div>
+              <div style="font-family:var(--font-mono); font-size:9px; color:var(--text-3); margin-bottom:2px;">ROWS</div>
+              <input type="number" id="tme-rows" min="1" max="100" step="1" style="width:100%; padding:3px 5px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:10px;"/>
+            </div>
+          </div>
+          <button class="btn" id="tme-resize" style="width:100%; padding:5px;">Resize</button>
+          <div style="flex:1;"></div>
+          <div style="font-family:var(--font-mono); font-size:9px; color:var(--text-3); line-height:1.5;">
+            Left-click to paint. Drag to paint a stroke. Right-click to erase (set to '.'). Resize crops/pads the grid.
+          </div>
+          <button class="btn primary" id="tme-save" style="width:100%; padding:8px;">Save</button>
+          <button class="btn" id="tme-cancel" style="width:100%; padding:6px;">Cancel</button>
+        </div>
+        <!-- Grid canvas (scrolls if larger than viewport) -->
+        <div style="overflow:auto; background:#0a0c10;">
+          <canvas id="tme-grid" style="display:block; image-rendering:pixelated; image-rendering:crisp-edges;"></canvas>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Sprint Level2D Phase 1b -- layer-list modal for Level2D nodes.
+       Opens via the ⚙ gear handle on a Level2D node. The layers JSON
+       on the node is parsed into a working array on the modal; per-
+       layer cards expose type-specific fields, depthZ slider, up/
+       down reorder, and delete. Save serializes back to params.layers.
+       Phase 2 will add tileset asset wiring + visual click-paint;
+       Phase 3 adds scatter placement-by-mouse. For Phase 1b the
+       tileData / positions strings remain editable as textareas. -->
+  <div class="modal-backdrop" id="level2d-editor-modal" style="display:none;">
+    <div class="modal" style="width: 920px; max-width: 95vw; max-height: 92vh; display:flex; flex-direction:column;">
+      <div class="modal-head" style="display:flex; align-items:center; gap:10px;">
+        <span class="modal-title" style="font-family:var(--font-instr); letter-spacing:0.20em; color:var(--phosphor); text-transform:lowercase;">level editor</span>
+        <span id="lvl-status" style="font-family:var(--font-mono); font-size:10px; color:var(--text-3); flex:1;">no level open</span>
+        <button class="btn modal-x" id="lvl-close" type="button">×</button>
+      </div>
+      <!-- Add-layer toolbar -->
+      <div style="padding:8px 12px; border-top:1px solid var(--instr-rule); display:flex; gap:6px; align-items:center;">
+        <span style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); letter-spacing:0.06em;">ADD LAYER:</span>
+        <button class="btn" id="lvl-add-parallax" type="button">+ parallax bg</button>
+        <button class="btn" id="lvl-add-tilemap"  type="button">+ tilemap</button>
+        <button class="btn" id="lvl-add-scatter"  type="button">+ scatter</button>
+        <span style="flex:1;"></span>
+        <span id="lvl-layer-count" style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3);"></span>
+      </div>
+      <!-- Layer cards list -->
+      <div id="lvl-layers" style="flex:1; min-height:0; overflow:auto; padding:12px; border-top:1px solid var(--instr-rule); display:flex; flex-direction:column; gap:8px;">
+        <!-- Cards rendered dynamically -->
+      </div>
+      <!-- Footer -->
+      <div style="padding:10px 12px; border-top:1px solid var(--instr-rule); display:flex; gap:8px; align-items:center;">
+        <span style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); flex:1;">
+          Lower depthZ = closer to camera. Order in the list = paint order (top draws first).
+        </span>
+        <button class="btn" id="lvl-cancel" type="button">Cancel</button>
+        <button class="btn primary" id="lvl-save" type="button">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Phase 8.A.3.2 -- Save Selection as Prefab modal. Opens when the
+       user clicks the "Save Prefab" button in the toolbar with one or
+       more nodes selected. Auto-derives a default prefabMeta (all
+       numeric params exposed + all mesh-out ports listed for output
+       selection); user can uncheck params to hide them, edit labels,
+       and pick which mesh-out to expose as the prefab's output port. -->
+  <div class="modal-backdrop" id="prefab-save-modal" style="display:none;">
+    <div class="modal" style="width: 720px; max-width: 95vw; max-height: 90vh; display:flex; flex-direction:column;">
+      <div class="modal-head" style="display:flex; align-items:center; gap:10px;">
+        <span class="modal-title" style="font-family:var(--font-instr); letter-spacing:0.20em; color:var(--phosphor); text-transform:lowercase;">save selection as prefab</span>
+        <span id="pfs-status" style="font-family:var(--font-mono); font-size:10px; color:var(--text-3); flex:1;"></span>
+        <button class="btn modal-x" id="pfs-close" type="button">×</button>
+      </div>
+      <div style="padding:12px 14px; border-top:1px solid var(--instr-rule); display:flex; flex-direction:column; gap:10px; flex:1; min-height:0; overflow:auto;">
+        <div>
+          <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); letter-spacing:0.06em; margin-bottom:4px;">PREFAB NAME (becomes patchName + filename)</div>
+          <input type="text" id="pfs-name" placeholder="MyPrefab" style="width:100%; padding:5px 6px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:11px;"/>
+        </div>
+        <div>
+          <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); letter-spacing:0.06em; margin-bottom:4px;">EXPOSED PARAMETERS  ·  check to expose, edit label to rename</div>
+          <div id="pfs-params" style="display:flex; flex-direction:column; gap:4px; max-height:220px; overflow:auto; padding:6px 8px; background:var(--bg-1); border:1px solid var(--instr-rule); border-radius:3px;">
+            <!-- Populated dynamically -->
+          </div>
+        </div>
+        <div>
+          <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); letter-spacing:0.06em; margin-bottom:4px;">EXPOSED OUTPUT PORT  ·  one mesh-output for the prefab's mesh out</div>
+          <div id="pfs-ports" style="display:flex; flex-direction:column; gap:4px; max-height:160px; overflow:auto; padding:6px 8px; background:var(--bg-1); border:1px solid var(--instr-rule); border-radius:3px;">
+            <!-- Populated dynamically -->
+          </div>
+        </div>
+      </div>
+      <div style="padding:10px 12px; border-top:1px solid var(--instr-rule); display:flex; gap:8px; align-items:center;">
+        <span style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); flex:1;">
+          .gpatch downloads to disk. IDB saves into the browser asset store -- live PrefabInstance refs auto-refresh on update.
+        </span>
+        <button class="btn" id="pfs-cancel" type="button">Cancel</button>
+        <button class="btn" id="pfs-save-idb" type="button" title="Save into the browser IDB asset store (drop via toolbar's Drop Prefab button)">Save to IDB</button>
+        <button class="btn primary" id="pfs-save" type="button">Save .gpatch</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- §8.A.6 -- Drop Prefab from IDB picker. Toolbar button opens this;
+       lists all prefab assets stored in IDB; clicking one drops a
+       PrefabInstance referencing the asset by ID. -->
+  <div class="modal-backdrop" id="prefab-pick-modal" style="display:none;">
+    <div class="modal" style="width: 540px; max-width: 95vw; max-height: 80vh; display:flex; flex-direction:column;">
+      <div class="modal-head" style="display:flex; align-items:center; gap:10px;">
+        <span class="modal-title" style="font-family:var(--font-instr); letter-spacing:0.20em; color:var(--phosphor); text-transform:lowercase;">drop prefab</span>
+        <span id="pfp-status" style="font-family:var(--font-mono); font-size:10px; color:var(--text-3); flex:1;"></span>
+        <button class="btn modal-x" id="pfp-close" type="button">×</button>
+      </div>
+      <div id="pfp-list" style="padding:8px; border-top:1px solid var(--instr-rule); display:flex; flex-direction:column; gap:4px; flex:1; min-height:0; overflow:auto;">
+        <!-- Populated dynamically with one row per IDB prefab asset -->
+      </div>
+      <div style="padding:10px 12px; border-top:1px solid var(--instr-rule); display:flex; gap:8px; align-items:center;">
+        <span style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); flex:1;">
+          Drop inserts a PrefabInstance referencing the asset by ID -- updates to the asset propagate live.
+        </span>
+        <button class="btn" id="pfp-cancel" type="button">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Sprint asset-folders -- Folder editor modal. Opens when the user
+       clicks an existing folder card OR creates a new folder via the
+       Assets-tab "+ FOLDER" chip. Layout:
+         Header: name (editable) + function dropdown + close
+         Body:   one row per slot (label + drop-target preview + clear)
+         Footer: Auto-Sort button (LLM), Save, Done.
+       Drag sprites from the Assets tab into a slot to assign. -->
+  <div class="modal-backdrop" id="folder-modal" style="display:none;">
+    <div class="modal" style="width: 720px; max-width: 95vw; max-height: 90vh; display:flex; flex-direction:column;">
+      <div class="modal-head" style="display:flex; align-items:center; gap:10px;">
+        <span class="modal-title" style="font-family:var(--font-instr); letter-spacing:0.20em; color:var(--phosphor); text-transform:lowercase;">asset folder</span>
+        <span id="folder-status" style="font-family:var(--font-mono); font-size:10px; color:var(--text-3); flex:1;"></span>
+        <button class="btn modal-x" id="folder-close" type="button">×</button>
+      </div>
+      <div style="padding:12px 14px; border-top:1px solid var(--instr-rule); display:flex; flex-direction:column; gap:10px; flex:1; min-height:0; overflow:auto;">
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+          <div>
+            <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); letter-spacing:0.06em; margin-bottom:4px;">NAME</div>
+            <input type="text" id="folder-name" style="width:100%; padding:5px 6px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:11px;"/>
+          </div>
+          <div>
+            <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); letter-spacing:0.06em; margin-bottom:4px;">FUNCTION</div>
+            <select id="folder-function" style="width:100%; padding:5px 6px; background:var(--bg-1); color:var(--text-1); border:1px solid var(--instr-rule); border-radius:2px; font-family:var(--font-mono); font-size:11px;">
+              <!-- Populated dynamically from _ASSET_FUNCTIONS -->
+            </select>
+          </div>
+        </div>
+        <div id="folder-func-desc" style="font-family:var(--font-mono); font-size:10px; color:var(--text-3); line-height:1.5; font-style:italic;"></div>
+        <div style="display:flex; gap:8px; align-items:center;">
+          <button class="btn primary" id="folder-autosort" title="Use the LLM to assign existing sprites to slots based on their names and the slot descriptions">⚡ Auto-Sort (LLM)</button>
+          <span id="folder-autosort-status" style="font-family:var(--font-mono); font-size:10px; color:var(--text-3);"></span>
+        </div>
+        <div id="folder-slots" style="display:flex; flex-direction:column; gap:6px;">
+          <!-- Slot rows rendered dynamically -->
+        </div>
+        <div style="font-family:var(--font-mono); font-size:9.5px; color:var(--text-3); line-height:1.5; padding:6px 0;">
+          Tip: drag sprites from the Assets tab onto a slot. The Auto-Sort button uses your configured LLM (User DSP → ⚙) to match sprite names against slot descriptions.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Sample waveform editor — opens for SamplePlayer / Stereo /
+       Granular nodes. Shows the loaded asset's waveform (downsampled
+       min/max envelope, cached per-asset), handles for the relevant
+       parameters (start/end for SamplePlayer, position for Granular),
+       and a drop-zone overlay so files can be dragged in to replace
+       the current asset. Mono assets render as a single trace; stereo
+       splits the canvas into upper L / lower R halves. -->
+  <div class="modal-backdrop" id="sample-modal" style="display:none;">
+    <div class="modal sm-modal">
+      <div class="modal-head sm-modal-head">
+        <span class="wt-title-mark">SAMPLE</span>
+        <span class="wt-title-id" id="sample-modal-title">[—]</span>
+        <span class="wt-title-spacer"></span>
+        <span class="wt-readout" id="sample-readout">no file loaded</span>
+        <button class="btn modal-x" id="btn-sample-close">×</button>
+      </div>
+      <div class="wt-toolbar">
+        <div class="wt-tool-group">
+          <span class="wt-tool-label">FILE</span>
+          <button class="wt-tool-btn" id="btn-sample-replace">REPLACE…</button>
+          <button class="wt-tool-btn" id="btn-sample-clear" title="Detach the asset (does not delete from the IDB cache)">CLEAR</button>
+        </div>
+        <div class="wt-tool-group" id="sample-marker-group">
+          <span class="wt-tool-label" id="sample-marker-label">MARKERS</span>
+          <span class="sm-marker-readout" id="sm-marker-readout">—</span>
+        </div>
+        <span class="wt-tool-spacer"></span>
+        <button class="btn pr-btn pr-btn-primary" id="btn-sample-done">DONE</button>
+      </div>
+      <div class="sm-stage" id="sm-stage">
+        <svg id="sm-canvas" class="sm-canvas"></svg>
+        <div class="sm-drop-overlay" id="sm-drop-overlay">
+          <div class="sm-drop-mark">DROP AUDIO FILE TO LOAD</div>
+          <div class="sm-drop-sub">.wav · .mp3 · .ogg · .flac · .m4a — any sample rate, mono or stereo</div>
+        </div>
+      </div>
+      <div class="pr-status">
+        <span class="pr-status-cell">
+          <span class="pr-stat-key">FILE</span>
+          <span class="pr-stat-val" id="sm-stat-file">—</span>
+        </span>
+        <span class="pr-status-cell">
+          <span class="pr-stat-key">DUR</span>
+          <span class="pr-stat-val" id="sm-stat-dur">—</span>
+        </span>
+        <span class="pr-status-cell">
+          <span class="pr-stat-key">SR</span>
+          <span class="pr-stat-val" id="sm-stat-sr">—</span>
+        </span>
+        <span class="pr-status-cell">
+          <span class="pr-stat-key">SAMPLES</span>
+          <span class="pr-stat-val" id="sm-stat-len">—</span>
+        </span>
+        <span class="pr-status-cell pr-status-cell-grow"></span>
+        <span class="pr-status-cell">
+          <span class="pr-stat-key">SHORTCUTS</span>
+          <span class="pr-stat-val muted">DRAG WAVEFORM TO MOVE MARKERS · DROP FILE TO REPLACE · ESC CLOSE</span>
+        </span>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="help-modal" style="display:none;">
+    <div class="modal">
+      <div class="modal-head">
+        <span>Keyboard shortcuts &amp; tips</span>
+        <button class="btn modal-x" id="btn-help-close">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="kbd-grid">
+          <kbd>/</kbd><span>Focus the palette filter</span>
+          <kbd>⌫</kbd><span>Delete the selected node(s)</span>
+          <kbd>Shift</kbd><span>Hold while clicking nodes or marqueeing to add to selection</span>
+          <kbd>Esc</kbd><span>Clear selection / dismiss modal</span>
+          <kbd>Space</kbd><span>Hold + drag to pan the canvas (or middle-click drag)</span>
+          <kbd>Wheel</kbd><span>Zoom toward cursor (Shift = finer step)</span>
+          <kbd>0</kbd><span>Reset view (zoom 100%, pan 0)</span>
+          <kbd>⌘ Z / ⌘ ⇧ Z</kbd><span>Undo / redo</span>
+          <kbd>⌘ A</kbd><span>Select all nodes</span>
+          <kbd>⌘ S</kbd><span>Save .gpatch</span>
+          <kbd>1 / 2 / 3 / 4 / 5</kbd><span>Switch tab (Properties / C++ / JSON / User DSP / Monitor)</span>
+          <kbd>V / D</kbd><span><em>Select</em> / <em>Draw</em> tool (pen, handwriting). Disabled while playing.</span>
+          <kbd>W</kbd><span><em>Auto-wire</em> the current selection left-to-right by spatial X. Disabled while playing.</span>
+          <kbd>Z / X</kbd><span>Octave down / up while playing</span>
+          <kbd>L</kbd><span><em>Live Mode</em> — hide the editor, show only the visual layer. <kbd>L</kbd> or <kbd>Esc</kbd> exits.</span>
+          <kbd>⌘ ↵</kbd><span>Run the AI prompt (when AI panel open)</span>
+        </div>
+        <p class="modal-note" style="margin-top: 16px;">
+          <strong>Wiring</strong> — drag a port onto another port to connect. Click an input port to pick up its existing wire and re-route. Drop on empty space to delete.
+        </p>
+        <p class="modal-note" style="margin: 0;">
+          <strong>Port types</strong> — <span class="legend-dot" style="--c: var(--audio)"></span> audio (solid),
+          <span class="legend-dot legend-dot--dashed" style="--c: var(--param)"></span> param (dashed),
+          <span class="legend-dot" style="--c: var(--gate)"></span> gate (trigger event),
+          <span class="legend-dot" style="--c: var(--clock); border-style: double; border-width: 3px;"></span> clock (sequencer rate),
+          <span class="legend-dot" style="--c: var(--texture); border-style: dotted; border-width: 2px;"></span> texture (GPU image — Phase 6),
+          <span class="legend-dot" style="--c: var(--transform); border-style: groove; border-width: 2.5px;"></span> transform (4×4 mat),
+          <span class="legend-dot" style="--c: var(--mesh); border-width: 3px;"></span> mesh (vertex buffer).
+        </p>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<input type="file" id="file-input" accept=".gpatch,.json" />
+
+<script>/*__INLINE_JS__*/</script>
+
+</body>
+</html>
