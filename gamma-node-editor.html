@@ -952,6 +952,58 @@
     border-radius: 3px;
   }
 
+  /* Phase B sprint 5 — pull-a-model UI. Suggestion chips for common
+   * starter tags + a progress bar driven by the NDJSON events from
+   * Ollama's /api/pull. The bar is determinate when {total, completed}
+   * are present and shows a slow indeterminate shimmer otherwise (the
+   * "pulling manifest" / "verifying" / "writing manifest" phases). */
+  .ollama-pull-suggestions {
+    margin-top: 5px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .ollama-pull-suggest {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--text-wire);
+    background: rgba(131,232,255,0.08);
+    border: 1px solid rgba(131,232,255,0.2);
+    border-radius: 12px;
+    padding: 2px 9px;
+    cursor: pointer;
+    user-select: none;
+    transition: background 0.12s, border-color 0.12s;
+  }
+  .ollama-pull-suggest:hover {
+    background: rgba(131,232,255,0.16);
+    border-color: rgba(131,232,255,0.45);
+  }
+  .ollama-pull-progress {
+    width: 100%;
+    height: 8px;
+    background: rgba(0,0,0,0.4);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    overflow: hidden;
+    position: relative;
+  }
+  .ollama-pull-progress-fill {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, var(--text-wire), var(--accent));
+    transition: width 0.18s ease-out;
+  }
+  .ollama-pull-progress.indeterminate .ollama-pull-progress-fill {
+    width: 30%;
+    background: linear-gradient(90deg, transparent, var(--text-wire), transparent);
+    animation: ollama-pull-shimmer 1.4s ease-in-out infinite;
+  }
+  @keyframes ollama-pull-shimmer {
+    0%   { transform: translateX(-100%); }
+    100% { transform: translateX(333%); }
+  }
+
   .port:hover { transform: translateY(-50%) scale(1.4); }
   /* Live snap target during a wire drag — when the dragged endpoint
    * is within a screen-radius of a type-compatible input port, that
@@ -7344,6 +7396,34 @@
           </div>
           <p class="modal-note" id="ollama-probe-note" style="margin: 10px 0 0; min-height: 18px;"></p>
           <div id="ollama-models-list" class="ollama-models-list" style="margin-top: 8px;"></div>
+
+          <!-- Phase B sprint 5 — pull a model directly from the editor.
+               NDJSON progress events from /api/pull drive the bar +
+               status text below. No terminal required. -->
+          <div id="ollama-pull-section" style="margin-top: 14px; padding-top: 14px; border-top: 1px solid rgba(255,255,255,0.06);">
+            <div class="settings-grid" style="grid-template-columns: 110px 1fr;">
+              <label>Pull model</label>
+              <div>
+                <input id="ollama-pull-name" placeholder="model tag (e.g. llama3.2 or qwen3:8b)" style="width: 100%;" />
+                <div class="ollama-pull-suggestions">
+                  <a class="ollama-pull-suggest" data-pull="llama3.2:1b">llama3.2:1b · ~1.3 GB</a>
+                  <a class="ollama-pull-suggest" data-pull="llama3.2">llama3.2:3b · ~2.0 GB</a>
+                  <a class="ollama-pull-suggest" data-pull="qwen3:8b">qwen3:8b · ~5.2 GB</a>
+                  <a class="ollama-pull-suggest" data-pull="nomic-embed-text">nomic-embed-text · ~270 MB</a>
+                </div>
+              </div>
+            </div>
+            <div class="modal-actions" style="margin-top: 10px; justify-content: flex-start;">
+              <button class="btn" id="btn-ollama-pull">Pull</button>
+              <span id="ollama-pull-rate" style="font-size: 11px; font-family: var(--font-mono); color: var(--text-3); align-self: center; margin-left: 6px;"></span>
+            </div>
+            <div id="ollama-pull-progress-wrap" style="margin-top: 8px; display: none;">
+              <div class="ollama-pull-progress">
+                <div id="ollama-pull-progress-fill" class="ollama-pull-progress-fill"></div>
+              </div>
+            </div>
+            <p class="modal-note" id="ollama-pull-note" style="margin: 6px 0 0; min-height: 18px;"></p>
+          </div>
         </div>
 
         <!-- Compile server section ------------------------------------- -->
@@ -8223,7 +8303,7 @@
  * Pages deploy workflow (.github/workflows/pages.yml). The string
  * after the equals sign is what the workflow's sed targets — don't
  * change the format of this line. */
-const APP_VERSION = "0.3.707";
+const APP_VERSION = "0.3.708";
 
 /* =========================================================================
  * Node kinds — runtime-only kind registry
@@ -54133,6 +54213,143 @@ if (btnOllamaRefresh) btnOllamaRefresh.addEventListener("click", async () => {
   const opts = _ollamaPanelOptsFor(provider);
   await probeOllamaStatus({ baseUrl: opts.baseUrl, key: opts.key, force: true });
   refreshOllamaStatus();
+});
+
+/* Phase B sprint 5 -- model download UX. The Ollama panel exposes a
+ * "Pull model" form: tag input + 4 suggestion chips + Pull button +
+ * progress bar. The Pull button streams NDJSON events from /api/pull
+ * and drives the bar from the {completed, total} pair when the daemon
+ * sends them. The "pulling manifest" / "verifying" / "writing
+ * manifest" phases don't have byte totals -- we render an
+ * indeterminate shimmer for those so the user knows we're still alive.
+ *
+ * Suggestion chips just stuff the input field. The user is free to
+ * type any tag they want, including registry-namespaced ones like
+ * "library/mistral".
+ *
+ * On success the status panel is force-refreshed so the new model
+ * shows up in the model badge popover + the installed-models list. */
+const _ollamaPullSuggestNodes = document.querySelectorAll(".ollama-pull-suggest");
+const _ollamaPullInput = document.getElementById("ollama-pull-name");
+_ollamaPullSuggestNodes.forEach((chip) => {
+  chip.addEventListener("click", () => {
+    const tag = chip.getAttribute("data-pull") || "";
+    if (_ollamaPullInput) {
+      _ollamaPullInput.value = tag;
+      _ollamaPullInput.focus();
+    }
+  });
+});
+
+function _formatBytes(n) {
+  if (!Number.isFinite(n) || n <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return n.toFixed(n >= 100 ? 0 : (n >= 10 ? 1 : 2)) + " " + units[i];
+}
+
+const btnOllamaPull = document.getElementById("btn-ollama-pull");
+if (btnOllamaPull) btnOllamaPull.addEventListener("click", async () => {
+  const input    = document.getElementById("ollama-pull-name");
+  const note     = document.getElementById("ollama-pull-note");
+  const progWrap = document.getElementById("ollama-pull-progress-wrap");
+  const progEl   = progWrap ? progWrap.querySelector(".ollama-pull-progress") : null;
+  const fillEl   = document.getElementById("ollama-pull-progress-fill");
+  const rateEl   = document.getElementById("ollama-pull-rate");
+  const model    = (input && input.value || "").trim();
+  if (!model) {
+    if (note) { note.textContent = "Enter a model tag (e.g. llama3.2)."; note.style.color = "var(--danger)"; }
+    return;
+  }
+
+  const provider = sProvider ? sProvider.value : aiSettings.provider;
+  const opts     = _ollamaPanelOptsFor(provider);
+
+  // Show the progress UI, start in indeterminate mode (we don't know
+  // total bytes until the first layer event arrives).
+  if (progWrap) progWrap.style.display = "block";
+  if (progEl)   progEl.classList.add("indeterminate");
+  if (fillEl)   fillEl.style.width = "30%";
+  if (note)     { note.textContent = "Starting pull of " + model + "…"; note.style.color = "var(--text-3)"; }
+  if (rateEl)   rateEl.textContent = "";
+  btnOllamaPull.disabled = true;
+  _ollamaPullSuggestNodes.forEach(c => c.style.pointerEvents = "none");
+
+  // Throttle UI updates to once per ~90ms to avoid layout thrash --
+  // Ollama emits dozens of progress events per second on a fast link.
+  let lastUiAt = 0;
+  const startedAt = performance.now();
+  let lastCompleted = 0;
+  let lastSampleAt = startedAt;
+
+  const onProgress = (ev) => {
+    if (!ev || typeof ev !== "object") return;
+    const status    = ev.status || "";
+    const total     = Number(ev.total);
+    const completed = Number(ev.completed);
+    const hasBytes  = Number.isFinite(total) && total > 0 && Number.isFinite(completed);
+
+    // Status text always updates (cheap), bar updates throttled.
+    const now = performance.now();
+    if (now - lastUiAt < 90 && status === note?._lastStatus) return;
+    lastUiAt = now;
+    if (note) { note._lastStatus = status; }
+
+    if (hasBytes) {
+      if (progEl) progEl.classList.remove("indeterminate");
+      const pct = Math.max(0, Math.min(100, (completed / total) * 100));
+      if (fillEl) fillEl.style.width = pct.toFixed(1) + "%";
+      // Rolling rate sample over the last ~600ms window.
+      const dtMs = now - lastSampleAt;
+      if (dtMs > 600) {
+        const dBytes = completed - lastCompleted;
+        const rate   = dBytes / (dtMs / 1000);  // bytes / s
+        if (rateEl && rate > 0) rateEl.textContent = _formatBytes(rate) + "/s";
+        lastSampleAt  = now;
+        lastCompleted = completed;
+      }
+      if (note) {
+        note.textContent = status + " — " + _formatBytes(completed) + " / " + _formatBytes(total)
+          + " (" + pct.toFixed(0) + "%)";
+        note.style.color = "var(--text-3)";
+      }
+    } else {
+      // Indeterminate phase (manifest / verify / write manifest / success).
+      if (progEl) progEl.classList.add("indeterminate");
+      if (note) {
+        note.textContent = status;
+        note.style.color = "var(--text-3)";
+      }
+    }
+  };
+
+  try {
+    await pullOllamaModel({ baseUrl: opts.baseUrl, key: opts.key, model, onProgress });
+    // Fill to 100% on success regardless of the last progress event.
+    if (progEl) progEl.classList.remove("indeterminate");
+    if (fillEl) fillEl.style.width = "100%";
+    if (rateEl) rateEl.textContent = "";
+    const elapsedS = ((performance.now() - startedAt) / 1000).toFixed(1);
+    if (note) {
+      note.textContent = "✓ Pulled " + model + " (" + elapsedS + "s). Refreshing model list…";
+      note.style.color = "var(--accent)";
+    }
+    // Force a fresh probe so the badge + installed-models list show the new tag.
+    await probeOllamaStatus({ baseUrl: opts.baseUrl, key: opts.key, force: true });
+    refreshOllamaStatus();
+  } catch (err) {
+    if (progEl) progEl.classList.remove("indeterminate");
+    if (fillEl) fillEl.style.width = "0%";
+    if (rateEl) rateEl.textContent = "";
+    if (note) {
+      note.textContent = "✗ Pull failed: " + ((err && err.message) || String(err));
+      note.style.color = "var(--danger)";
+    }
+  } finally {
+    btnOllamaPull.disabled = false;
+    _ollamaPullSuggestNodes.forEach(c => c.style.pointerEvents = "");
+  }
 });
 
 function openSettings() {

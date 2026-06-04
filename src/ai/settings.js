@@ -1311,6 +1311,143 @@ if (btnOllamaRefresh) btnOllamaRefresh.addEventListener("click", async () => {
   refreshOllamaStatus();
 });
 
+/* Phase B sprint 5 -- model download UX. The Ollama panel exposes a
+ * "Pull model" form: tag input + 4 suggestion chips + Pull button +
+ * progress bar. The Pull button streams NDJSON events from /api/pull
+ * and drives the bar from the {completed, total} pair when the daemon
+ * sends them. The "pulling manifest" / "verifying" / "writing
+ * manifest" phases don't have byte totals -- we render an
+ * indeterminate shimmer for those so the user knows we're still alive.
+ *
+ * Suggestion chips just stuff the input field. The user is free to
+ * type any tag they want, including registry-namespaced ones like
+ * "library/mistral".
+ *
+ * On success the status panel is force-refreshed so the new model
+ * shows up in the model badge popover + the installed-models list. */
+const _ollamaPullSuggestNodes = document.querySelectorAll(".ollama-pull-suggest");
+const _ollamaPullInput = document.getElementById("ollama-pull-name");
+_ollamaPullSuggestNodes.forEach((chip) => {
+  chip.addEventListener("click", () => {
+    const tag = chip.getAttribute("data-pull") || "";
+    if (_ollamaPullInput) {
+      _ollamaPullInput.value = tag;
+      _ollamaPullInput.focus();
+    }
+  });
+});
+
+function _formatBytes(n) {
+  if (!Number.isFinite(n) || n <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return n.toFixed(n >= 100 ? 0 : (n >= 10 ? 1 : 2)) + " " + units[i];
+}
+
+const btnOllamaPull = document.getElementById("btn-ollama-pull");
+if (btnOllamaPull) btnOllamaPull.addEventListener("click", async () => {
+  const input    = document.getElementById("ollama-pull-name");
+  const note     = document.getElementById("ollama-pull-note");
+  const progWrap = document.getElementById("ollama-pull-progress-wrap");
+  const progEl   = progWrap ? progWrap.querySelector(".ollama-pull-progress") : null;
+  const fillEl   = document.getElementById("ollama-pull-progress-fill");
+  const rateEl   = document.getElementById("ollama-pull-rate");
+  const model    = (input && input.value || "").trim();
+  if (!model) {
+    if (note) { note.textContent = "Enter a model tag (e.g. llama3.2)."; note.style.color = "var(--danger)"; }
+    return;
+  }
+
+  const provider = sProvider ? sProvider.value : aiSettings.provider;
+  const opts     = _ollamaPanelOptsFor(provider);
+
+  // Show the progress UI, start in indeterminate mode (we don't know
+  // total bytes until the first layer event arrives).
+  if (progWrap) progWrap.style.display = "block";
+  if (progEl)   progEl.classList.add("indeterminate");
+  if (fillEl)   fillEl.style.width = "30%";
+  if (note)     { note.textContent = "Starting pull of " + model + "…"; note.style.color = "var(--text-3)"; }
+  if (rateEl)   rateEl.textContent = "";
+  btnOllamaPull.disabled = true;
+  _ollamaPullSuggestNodes.forEach(c => c.style.pointerEvents = "none");
+
+  // Throttle UI updates to once per ~90ms to avoid layout thrash --
+  // Ollama emits dozens of progress events per second on a fast link.
+  let lastUiAt = 0;
+  const startedAt = performance.now();
+  let lastCompleted = 0;
+  let lastSampleAt = startedAt;
+
+  const onProgress = (ev) => {
+    if (!ev || typeof ev !== "object") return;
+    const status    = ev.status || "";
+    const total     = Number(ev.total);
+    const completed = Number(ev.completed);
+    const hasBytes  = Number.isFinite(total) && total > 0 && Number.isFinite(completed);
+
+    // Status text always updates (cheap), bar updates throttled.
+    const now = performance.now();
+    if (now - lastUiAt < 90 && status === note?._lastStatus) return;
+    lastUiAt = now;
+    if (note) { note._lastStatus = status; }
+
+    if (hasBytes) {
+      if (progEl) progEl.classList.remove("indeterminate");
+      const pct = Math.max(0, Math.min(100, (completed / total) * 100));
+      if (fillEl) fillEl.style.width = pct.toFixed(1) + "%";
+      // Rolling rate sample over the last ~600ms window.
+      const dtMs = now - lastSampleAt;
+      if (dtMs > 600) {
+        const dBytes = completed - lastCompleted;
+        const rate   = dBytes / (dtMs / 1000);  // bytes / s
+        if (rateEl && rate > 0) rateEl.textContent = _formatBytes(rate) + "/s";
+        lastSampleAt  = now;
+        lastCompleted = completed;
+      }
+      if (note) {
+        note.textContent = status + " — " + _formatBytes(completed) + " / " + _formatBytes(total)
+          + " (" + pct.toFixed(0) + "%)";
+        note.style.color = "var(--text-3)";
+      }
+    } else {
+      // Indeterminate phase (manifest / verify / write manifest / success).
+      if (progEl) progEl.classList.add("indeterminate");
+      if (note) {
+        note.textContent = status;
+        note.style.color = "var(--text-3)";
+      }
+    }
+  };
+
+  try {
+    await pullOllamaModel({ baseUrl: opts.baseUrl, key: opts.key, model, onProgress });
+    // Fill to 100% on success regardless of the last progress event.
+    if (progEl) progEl.classList.remove("indeterminate");
+    if (fillEl) fillEl.style.width = "100%";
+    if (rateEl) rateEl.textContent = "";
+    const elapsedS = ((performance.now() - startedAt) / 1000).toFixed(1);
+    if (note) {
+      note.textContent = "✓ Pulled " + model + " (" + elapsedS + "s). Refreshing model list…";
+      note.style.color = "var(--accent)";
+    }
+    // Force a fresh probe so the badge + installed-models list show the new tag.
+    await probeOllamaStatus({ baseUrl: opts.baseUrl, key: opts.key, force: true });
+    refreshOllamaStatus();
+  } catch (err) {
+    if (progEl) progEl.classList.remove("indeterminate");
+    if (fillEl) fillEl.style.width = "0%";
+    if (rateEl) rateEl.textContent = "";
+    if (note) {
+      note.textContent = "✗ Pull failed: " + ((err && err.message) || String(err));
+      note.style.color = "var(--danger)";
+    }
+  } finally {
+    btnOllamaPull.disabled = false;
+    _ollamaPullSuggestNodes.forEach(c => c.style.pointerEvents = "");
+  }
+});
+
 function openSettings() {
   sProvider.value = aiSettings.provider;
   if (aiSettings.provider === "gemma") {
