@@ -37,6 +37,14 @@ function defaultAiSettings() {
     provider: "gemma",
     model: "onnx-community/gemma-4-E2B-it-ONNX",
     anthropicKey: "",
+    // Phase B sprint 1 — Ollama provider plumbing.
+    //   ollamaUrl: empty → auto-probe 127.0.0.1:11434. Set to a full URL
+    //     (e.g. "http://192.168.1.42:11434") to point at a daemon on
+    //     another machine — same LAN-iPad story as compileServerUrl.
+    //   ollamaKey: API key for the ollama-cloud variant (ollama.com
+    //     hosted Turbo models). Empty when using the local daemon.
+    ollamaUrl: "",
+    ollamaKey: "",
     compileServerUrl: "",
     // Sprite Studio settings (SpriteCreator-1 / sd-1 / sd-2).
     // Default = compile-server-sd because it's the bundled path; users
@@ -354,6 +362,61 @@ const PROVIDERS = {
     }
   },
 
+  /* Phase B sprint 1 -- Local Ollama daemon (ollama.com/download).
+   * Talks directly to 127.0.0.1:11434 (or aiSettings.ollamaUrl if the
+   * user pointed it at a LAN host). NDJSON streaming via ollamaChat in
+   * src/ai/ollama.js. supportsImage is conservative-false; multimodal
+   * models (llava, llama3.2-vision) do accept the `images` field but
+   * non-vision models error noisily, and we have no way to know from
+   * the model name alone -- a Sprint B.2 dynamic-capabilities probe
+   * will flip this per-model later. goodClassifier=false to keep HW.3
+   * handwriting-recognition fallbacks off Ollama for now (small local
+   * models drift on constrained classification). */
+  ollama: {
+    defaultModel: "llama3.2",
+    requiresKey: false,
+    supportsImage: false,
+    supportsAudio: false,
+    goodClassifier: false,
+    async call({ system, user, model, onToken, image, temperature, maxTokens }) {
+      return await ollamaChat({
+        baseUrl: aiSettings.ollamaUrl,
+        model,
+        system,
+        user,
+        image,
+        onToken,
+        temperature,
+        maxTokens
+      });
+    }
+  },
+
+  /* Phase B sprint 1 -- Ollama Cloud (ollama.com hosted Turbo models).
+   * Same endpoints + same NDJSON streaming, but with the cloud base URL
+   * and a Bearer token from the user's ollama.com account. Larger models
+   * make goodClassifier=true defensible. */
+  "ollama-cloud": {
+    defaultModel: "gpt-oss:120b-cloud",
+    requiresKey: true,
+    supportsImage: false,
+    supportsAudio: false,
+    goodClassifier: true,
+    async call({ system, user, model, key, onToken, image, temperature, maxTokens }) {
+      return await ollamaChat({
+        baseUrl: OLLAMA_CLOUD_BASE_URL,
+        key,
+        model,
+        system,
+        user,
+        image,
+        onToken,
+        temperature,
+        maxTokens
+      });
+    }
+  },
+
   /* Gemma 4 via @huggingface/transformers + WebGPU.
    *
    * One model, three jobs:
@@ -619,6 +682,31 @@ const MODEL_OPTIONS = [
     name: "Claude Opus 4.7",
     meta: "Anthropic API · top quality · higher cost",
     tag: "cloud"
+  },
+  /* Phase B sprint 1 -- Ollama placeholders for the badge picker. Sprint
+   * B.2 will replace these with a dynamic list from /api/tags. For now
+   * llama3.2 is a sensible bootstrap (a single `ollama pull llama3.2`
+   * gets the user going); qwen3:8b is a small coding-capable alt. */
+  {
+    provider: "ollama",
+    model: "llama3.2",
+    name: "Llama 3.2 (Ollama)",
+    meta: "Local · ollama daemon · 2 GB",
+    tag: "local"
+  },
+  {
+    provider: "ollama",
+    model: "qwen3:8b",
+    name: "Qwen3 8B (Ollama)",
+    meta: "Local · ollama daemon · 5 GB",
+    tag: "local"
+  },
+  {
+    provider: "ollama-cloud",
+    model: "gpt-oss:120b-cloud",
+    name: "gpt-oss 120B (Cloud)",
+    meta: "ollama.com Turbo · per-call cost",
+    tag: "cloud"
   }
 ];
 
@@ -634,6 +722,12 @@ function shortModelName(provider, model) {
     if (/haiku/i.test(model)) return "Claude Haiku";
     return model;
   }
+  // Phase B sprint 1 -- Ollama. Drop the optional ":tag" suffix and the
+  // -cloud sigil for the short display name.
+  if (provider === "ollama" || provider === "ollama-cloud") {
+    const base = (model || "").split(":")[0].replace(/-cloud$/, "");
+    return base || model || "ollama";
+  }
   return model;
 }
 
@@ -643,13 +737,19 @@ function refreshModelBadge() {
   const btn = document.getElementById("btn-model-badge");
   if (!tag || !name || !btn) return;
   const p = aiSettings.provider;
-  const isLocal = p === "gemma";
-  const hasKey = p === "gemma" || (p === "anthropic" && !!aiSettings.anthropicKey);
+  const isLocal = (p === "gemma" || p === "ollama");
+  const hasKey = (p === "gemma" || p === "ollama")
+              || (p === "anthropic"    && !!aiSettings.anthropicKey)
+              || (p === "ollama-cloud" && !!aiSettings.ollamaKey);
   tag.textContent = isLocal ? "local" : "cloud";
   tag.className = "model-badge-tag " + (isLocal ? "local" : (hasKey ? "cloud" : "unset"));
   name.textContent = shortModelName(p, aiSettings.model);
+  const providerLabel = (p === "gemma")        ? "local Gemma"
+                      : (p === "ollama")       ? "local Ollama"
+                      : (p === "ollama-cloud") ? "Ollama Cloud"
+                      :                          "Anthropic API";
   btn.title = "Active model: " + shortModelName(p, aiSettings.model) +
-    " (" + (isLocal ? "local Gemma" : "Anthropic API") + ")" +
+    " (" + providerLabel + ")" +
     (!hasKey ? " — needs API key" : "") +
     " — click to switch";
 }
@@ -746,7 +846,11 @@ document.getElementById("btn-ai-go").addEventListener("click", async () => {
   const provider = PROVIDERS[aiSettings.provider];
   let key = "";
   if (provider.requiresKey) {
-    key = aiSettings.anthropicKey;  // Only Anthropic needs a key now
+    // Phase B sprint 1 -- per-provider key field. Anthropic uses
+    // anthropicKey; ollama-cloud uses ollamaKey. Local Ollama + Gemma
+    // don't enter this branch (requiresKey=false).
+    if (aiSettings.provider === "ollama-cloud") key = aiSettings.ollamaKey;
+    else                                        key = aiSettings.anthropicKey;
     if (!key) {
       setAiStatus("No API key set — click ⚙ to configure.", "err");
       return;
@@ -766,8 +870,9 @@ document.getElementById("btn-ai-go").addEventListener("click", async () => {
   }
 
   const { system, user } = buildPrompt(mode, userText, getUdspText());
+  const localityLabel = (aiSettings.provider === "gemma" || aiSettings.provider === "ollama") ? "local" : "cloud";
   setAiStatus("Thinking… (" + shortModelName(aiSettings.provider, aiSettings.model) + ", " +
-    (aiSettings.provider === "gemma" ? "local" : "cloud") + ")", "thinking");
+    localityLabel + ")", "thinking");
 
   // Show the result panel immediately and stream tokens into it.
   // Apply button stays hidden until streaming finishes (and isn't shown
@@ -842,24 +947,57 @@ const sCompileUrl   = document.getElementById("settings-compile-url");
 const sServerResult = document.getElementById("settings-server-result");
 
 function applyProviderUi(p) {
-  const isLocal = p === "gemma";
-  // Toggle WebGPU note vs API-key note
-  sNoteApi.style.display   = isLocal ? "none" : "block";
-  sNoteLocal.style.display = isLocal ? "block" : "none";
-  // Toggle model-id input vs model dropdown
-  sModel.style.display      = isLocal ? "none" : "block";
-  sModelLocal.style.display = isLocal ? "block" : "none";
-  // Hide key field for Gemma (no key needed)
-  sKey.style.display      = isLocal ? "none" : "block";
-  sKeyLabel.style.display = isLocal ? "none" : "block";
-  // Show / refresh the local-model status panel
+  // Phase B sprint 1 -- four flavors now: gemma, ollama (local),
+  // ollama-cloud, anthropic.
+  const isGemma       = (p === "gemma");
+  const isOllamaLocal = (p === "ollama");
+  const isOllamaCloud = (p === "ollama-cloud");
+  const isAnthropic   = (p === "anthropic");
+
+  // The WebGPU note belongs to Gemma; the API-key note belongs to any
+  // cloud provider (Anthropic, Ollama Cloud). Local Ollama gets neither
+  // -- it's covered by the per-field placeholder below + the dedicated
+  // ollama install note (added Sprint B.2).
+  sNoteApi.style.display   = (isAnthropic || isOllamaCloud) ? "block" : "none";
+  sNoteLocal.style.display = isGemma ? "block" : "none";
+
+  // Gemma uses a fixed dropdown of two ONNX checkpoints. Everything else
+  // is a free-text model-id input (Ollama tags, Anthropic model names).
+  sModel.style.display      = isGemma ? "none"  : "block";
+  sModelLocal.style.display = isGemma ? "block" : "none";
+
+  // Key field repurposing:
+  //   Gemma          -- hidden (no auth)
+  //   Anthropic      -- API key (password input)
+  //   Ollama Cloud   -- API key (password input)
+  //   Local Ollama   -- visible as URL field (text input) so the user can
+  //                     point at a LAN host. Empty -> auto-probe 127.0.0.1:11434.
+  sKey.style.display      = isGemma ? "none" : "block";
+  sKeyLabel.style.display = isGemma ? "none" : "block";
+  if (isOllamaLocal) {
+    sKeyLabel.textContent = "Ollama URL";
+    sKey.placeholder = "http://127.0.0.1:11434 (leave empty for default)";
+    sKey.type = "text";
+  } else if (isOllamaCloud) {
+    sKeyLabel.textContent = "Ollama Cloud key";
+    sKey.placeholder = "Bearer token from ollama.com";
+    sKey.type = "password";
+  } else if (isAnthropic) {
+    sKeyLabel.textContent = "API key";
+    sKey.placeholder = "sk-ant-…";
+    sKey.type = "password";
+  }
+
+  // Show / refresh the local-model status panel (Gemma's WebGPU + cache state).
+  // Ollama gets its own status panel in Sprint B.2.
   const panel = document.getElementById("gemma-status-panel");
-  if (panel) panel.style.display = isLocal ? "block" : "none";
-  if (isLocal) refreshGemmaStatus();
-  // Warn if WebGPU isn't available
-  if (isLocal && !setupGemmaAvailable()) {
+  if (panel) panel.style.display = isGemma ? "block" : "none";
+  if (isGemma) refreshGemmaStatus();
+
+  // Warn if WebGPU isn't available (Gemma-only concern).
+  if (isGemma && !setupGemmaAvailable()) {
     sNoteLocal.style.color = "var(--danger)";
-    sNoteLocal.textContent = "WebGPU is not available in this browser. Gemma 4 requires Chrome, Edge, or recent Safari with WebGPU enabled. Try chrome://flags/#enable-unsafe-webgpu if needed, or switch to the Anthropic provider.";
+    sNoteLocal.textContent = "WebGPU is not available in this browser. Gemma 4 requires Chrome, Edge, or recent Safari with WebGPU enabled. Try chrome://flags/#enable-unsafe-webgpu if needed, or switch to the Anthropic / Ollama provider.";
   } else {
     sNoteLocal.style.color = "";
     sNoteLocal.textContent = "Local models run entirely in your browser via WebGPU. No data leaves your machine. The first time you Run, the model weights download (~1.5 GB for E4B, ~500 MB for E2B) and are cached in the browser; subsequent runs are offline. Requires a WebGPU-capable browser (Chrome, Edge, recent Safari) and a discrete GPU or unified-memory machine with at least 4 GB free.";
@@ -940,6 +1078,14 @@ function openSettings() {
   if (aiSettings.provider === "gemma") {
     const opts = Array.from(sModelLocal.options).map(o => o.value);
     sModelLocal.value = opts.includes(aiSettings.model) ? aiSettings.model : PROVIDERS.gemma.defaultModel;
+  } else if (aiSettings.provider === "ollama") {
+    // Phase B sprint 1 -- Ollama local. Model is a free-text tag like
+    // "llama3.2" or "qwen3:8b". Key field is repurposed as the URL.
+    sModel.value = aiSettings.model || PROVIDERS.ollama.defaultModel;
+    sKey.value   = aiSettings.ollamaUrl || "";
+  } else if (aiSettings.provider === "ollama-cloud") {
+    sModel.value = aiSettings.model || PROVIDERS["ollama-cloud"].defaultModel;
+    sKey.value   = aiSettings.ollamaKey || "";
   } else {
     sModel.value = aiSettings.model;
     sKey.value   = aiSettings.anthropicKey;
@@ -960,10 +1106,20 @@ sProvider.addEventListener("change", () => {
   if (p === "gemma") {
     const opts = Array.from(sModelLocal.options).map(o => o.value);
     sModelLocal.value = opts.includes(aiSettings.model) ? aiSettings.model : PROVIDERS.gemma.defaultModel;
+  } else if (p === "ollama") {
+    sKey.value = aiSettings.ollamaUrl || "";
+    if (!sModel.value || sModel.value.startsWith("onnx-community/") || sModel.value.startsWith("claude-")) {
+      sModel.value = PROVIDERS.ollama.defaultModel;
+    }
+  } else if (p === "ollama-cloud") {
+    sKey.value = aiSettings.ollamaKey || "";
+    if (!sModel.value || sModel.value.startsWith("onnx-community/") || sModel.value.startsWith("claude-")) {
+      sModel.value = PROVIDERS["ollama-cloud"].defaultModel;
+    }
   } else {
     sKey.value = aiSettings.anthropicKey;
     // Anthropic — pre-fill with default model if user hasn't already typed one
-    if (!sModel.value || sModel.value.startsWith("onnx-community/")) {
+    if (!sModel.value || sModel.value.startsWith("onnx-community/") || /(:|^ll|^qw|^gpt-oss)/i.test(sModel.value)) {
       sModel.value = PROVIDERS.anthropic.defaultModel;
     }
   }
@@ -980,6 +1136,12 @@ document.getElementById("btn-settings-save").addEventListener("click", () => {
       gemmaLoadPromise = null;
     }
     aiSettings.model = newModel;
+  } else if (aiSettings.provider === "ollama") {
+    aiSettings.model     = sModel.value.trim() || PROVIDERS.ollama.defaultModel;
+    aiSettings.ollamaUrl = sKey.value.trim().replace(/\/+$/, "");
+  } else if (aiSettings.provider === "ollama-cloud") {
+    aiSettings.model     = sModel.value.trim() || PROVIDERS["ollama-cloud"].defaultModel;
+    aiSettings.ollamaKey = sKey.value.trim();
   } else {
     aiSettings.model = sModel.value.trim() || PROVIDERS.anthropic.defaultModel;
     aiSettings.anthropicKey = sKey.value.trim();
@@ -1032,8 +1194,17 @@ document.getElementById("btn-settings-test-server").addEventListener("click", as
   }
 });
 document.getElementById("btn-settings-clear").addEventListener("click", () => {
-  if (!confirm("Clear stored Anthropic API key from this browser?")) return;
-  aiSettings.anthropicKey = "";
+  // Phase B sprint 1 -- clears the credential / URL relevant to the
+  // currently-selected provider. Gemma has no credential so the button
+  // is a no-op there.
+  const p = aiSettings.provider;
+  let what = "Anthropic API key";
+  if (p === "ollama")       what = "Ollama URL override";
+  if (p === "ollama-cloud") what = "Ollama Cloud key";
+  if (!confirm("Clear stored " + what + " from this browser?")) return;
+  if (p === "ollama")            aiSettings.ollamaUrl = "";
+  else if (p === "ollama-cloud") aiSettings.ollamaKey = "";
+  else                           aiSettings.anthropicKey = "";
   saveAiSettings();
   sKey.value = "";
   refreshModelBadge();
