@@ -1375,6 +1375,17 @@ function _formatBytes(n) {
   return n.toFixed(n >= 100 ? 0 : (n >= 10 ? 1 : 2)) + " " + units[i];
 }
 
+/* HTML-escape for the small set of chars that can break attribute /
+ * element context when surfacing user-controlled HF repo names into
+ * the pull-note innerHTML. Used by the sprint-9 HF probe error path. */
+function _ollamaPullEscapeHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
 const btnOllamaPull = document.getElementById("btn-ollama-pull");
 if (btnOllamaPull) btnOllamaPull.addEventListener("click", async () => {
   const input    = document.getElementById("ollama-pull-name");
@@ -1393,9 +1404,53 @@ if (btnOllamaPull) btnOllamaPull.addEventListener("click", async () => {
   // through unchanged; HF references get rewritten to `hf.co/...:quant`.
   const quant = _ollamaPullHfQuant ? _ollamaPullHfQuant.value : "";
   const model = normalizeOllamaModelTag(rawInput, quant);
+  const isHf  = /^hf\.co\//i.test(model);
 
   const provider = sProvider ? sProvider.value : aiSettings.provider;
   const opts     = _ollamaPanelOptsFor(provider);
+
+  /* Phase B sprint 9 -- HF pre-pull probe. If the input is an HF
+   * reference, check the public HF API for actual `.gguf` siblings
+   * before bothering Ollama. Avoids the daemon's "manifest not found"
+   * error for non-GGUF repos like microsoft/TRELLIS.2-4B (a 3D-
+   * generation model with no GGUF artifacts at all). */
+  if (isHf) {
+    if (note) { note.textContent = "Checking HuggingFace for GGUF files…"; note.style.color = "var(--text-3)"; }
+    const probe = await probeHuggingFaceRepo(model);
+    if (probe.ok && probe.hasGguf === false) {
+      if (note) {
+        const repoFull = probe.repoFull || "";
+        const searchTerm = (repoFull.split("/")[1] || repoFull) + " GGUF";
+        const searchUrl  = "https://huggingface.co/models?search=" + encodeURIComponent(searchTerm);
+        note.innerHTML = "✗ <strong>" + _ollamaPullEscapeHtml(repoFull) + "</strong> has no <code style=\"color:var(--accent);\">.gguf</code> files. " +
+          "Ollama can only pull GGUF-quantized repos -- this one is likely SafeTensors / diffusion / multimodal. " +
+          "<a href=\"" + searchUrl + "\" target=\"_blank\" rel=\"noopener\" style=\"color:var(--text-wire);\">Search HF for GGUF versions →</a>";
+        note.style.color = "var(--danger)";
+      }
+      return;
+    }
+    if (!probe.ok && probe.status === 404) {
+      if (note) {
+        note.textContent = "✗ " + (probe.repoFull || rawInput) +
+          " not found on HF (or private/gated -- set HF_TOKEN as an env var on the Ollama daemon for private pulls).";
+        note.style.color = "var(--danger)";
+      }
+      return;
+    }
+    // probe.ok && hasGguf=true: hint if the picked quant isn't in the
+    // available file list (Ollama will fall back to a default).
+    if (probe.ok && quant && probe.ggufFiles.length &&
+        !probe.ggufFiles.some(f => f.toUpperCase().includes(quant.toUpperCase()))) {
+      if (note) {
+        const available = probe.ggufFiles.slice(0, 4).map(f => f.replace(/\.gguf$/i, "")).join(", ");
+        note.textContent = "ⓘ " + quant + " not in this repo. Available: " + available +
+          (probe.ggufFiles.length > 4 ? "…" : "") + ". Pulling default anyway…";
+        note.style.color = "var(--warn)";
+      }
+    }
+    // ok=false with non-404 status (CORS / offline / private with failed
+    // auth) -- proceed silently, let Ollama decide.
+  }
 
   // Show the progress UI, start in indeterminate mode (we don't know
   // total bytes until the first layer event arrives).
@@ -1474,7 +1529,18 @@ if (btnOllamaPull) btnOllamaPull.addEventListener("click", async () => {
     if (fillEl) fillEl.style.width = "0%";
     if (rateEl) rateEl.textContent = "";
     if (note) {
-      note.textContent = "✗ Pull failed: " + ((err && err.message) || String(err));
+      const msg = (err && err.message) || String(err);
+      // Phase B sprint 9 -- if the pull failed AND we were targeting
+      // an HF tag, append the GGUF reminder. Catches the case where
+      // the pre-probe couldn't reach HF (CORS / offline) but the
+      // daemon-side pull failed for the same gguf-absent reason.
+      if (isHf && /manifest|not found|no such|404/i.test(msg)) {
+        note.innerHTML = "✗ Pull failed: " + _ollamaPullEscapeHtml(msg) +
+          "<br><span style=\"font-size:11px;color:var(--text-3);\">Tip: Ollama only pulls <code style=\"color:var(--accent);\">.gguf</code> files. " +
+          "Confirm this HF repo has a GGUF release.</span>";
+      } else {
+        note.textContent = "✗ Pull failed: " + msg;
+      }
       note.style.color = "var(--danger)";
     }
   } finally {

@@ -212,6 +212,66 @@ function normalizeOllamaModelTag(input, quant) {
   return s;
 }
 
+/* Phase B sprint 9 -- HuggingFace repo pre-pull probe.
+ *
+ * Ollama can only pull HF models that ship GGUF files. There's no way
+ * to know that until the pull fails (and the daemon's error is
+ * usually a not-very-helpful "manifest not found"). This probe hits
+ * HF's public model-metadata endpoint to check for `.gguf` siblings
+ * before we even bother Ollama:
+ *
+ *   GET https://huggingface.co/api/models/{user}/{repo}
+ *     -> { id, siblings: [{ rfilename: "model.Q4_K_M.gguf" }, ...], ... }
+ *
+ * Returns a result object:
+ *   {
+ *     ok:        boolean,      -- network/parse success
+ *     status:    number,       -- HTTP status (404 = private/gated/missing)
+ *     hasGguf:   boolean,      -- at least one .gguf file in the file list
+ *     ggufFiles: string[],     -- the .gguf filenames (for quant picker hints)
+ *     repoFull:  string,       -- "user/repo"
+ *     error:     string|null   -- human message when ok=false
+ *   }
+ *
+ * A network failure (CORS, offline, gated repo) returns ok=false but
+ * with hasGguf=null so the caller can decide whether to proceed anyway
+ * (a private repo with the right HF_TOKEN on the Ollama daemon side
+ * might still succeed). */
+async function probeHuggingFaceRepo(userOrRepo, maybeRepo) {
+  let user, repo;
+  if (maybeRepo !== undefined) { user = userOrRepo; repo = maybeRepo; }
+  else {
+    const s = String(userOrRepo || "").trim();
+    // Accept "user/repo", "hf.co/user/repo[:quant]", "huggingface.co/user/repo[/tree/...]".
+    const cleaned = s
+      .replace(/^https?:\/\//i, "")
+      .replace(/^(huggingface\.co|hf\.co)\//i, "")
+      .replace(/\/(tree|blob|resolve|commit|raw)\/.*$/i, "")
+      .replace(/:[A-Za-z0-9_]+$/, "");  // drop quant suffix for probe
+    const parts = cleaned.split("/");
+    if (parts.length < 2) return { ok: false, status: 0, hasGguf: null, ggufFiles: [], repoFull: s, error: "Not a user/repo path" };
+    user = parts[0]; repo = parts[1];
+  }
+  const repoFull = user + "/" + repo;
+  const url = "https://huggingface.co/api/models/" + encodeURIComponent(user) + "/" + encodeURIComponent(repo);
+  try {
+    const res = await fetch(url, { method: "GET" });
+    if (!res.ok) {
+      return { ok: false, status: res.status, hasGguf: null, ggufFiles: [], repoFull,
+        error: res.status === 404 ? "Repo not found (could be private/gated)" : ("HF API " + res.status) };
+    }
+    const data = await res.json();
+    const sibs = Array.isArray(data && data.siblings) ? data.siblings : [];
+    const ggufFiles = sibs
+      .map(s => (s && s.rfilename) || "")
+      .filter(name => /\.gguf$/i.test(name));
+    return { ok: true, status: 200, hasGguf: ggufFiles.length > 0, ggufFiles, repoFull, error: null };
+  } catch (e) {
+    return { ok: false, status: 0, hasGguf: null, ggufFiles: [], repoFull,
+      error: (e && e.message) || String(e) };
+  }
+}
+
 async function probeOllama(opts) {
   const res = await _ollamaFetch("/api/version", opts);
   return await res.json();
