@@ -416,10 +416,12 @@ function brSwitchTab(name) {
   const vA = document.getElementById("br-view-assets");
   const vD = document.getElementById("br-view-demos");
   const vP = document.getElementById("br-view-prefabs");
+  const vT = document.getElementById("br-view-tektite");
   if (vN) vN.hidden = name !== "nodes";
   if (vA) vA.hidden = name !== "assets";
   if (vD) vD.hidden = name !== "demos";
   if (vP) vP.hidden = name !== "prefabs";
+  if (vT) vT.hidden = name !== "tektite";
   // Status text updates per-tab
   const status = document.getElementById("br-tab-status");
   if (status) {
@@ -427,10 +429,12 @@ function brSwitchTab(name) {
     if (name === "assets")  status.textContent = `ASSETS · ${(_assets ? _assets.size : 0)}`;
     if (name === "demos")   status.textContent = `DEMOS · ${_demos.length}`;
     if (name === "prefabs") status.textContent = `PREFABS · ${_prefabBrowserCount()}`;
+    if (name === "tektite") status.textContent = `TEKTITE`;
   }
   if (name === "assets")  brRenderAssets();
   if (name === "demos")   brRenderDemos();
   if (name === "prefabs") brRenderPrefabs();
+  if (name === "tektite") tektiteTabAttach();  // idempotent
 }
 
 /* ─── Demos tab ─────────────────────────────────────────────────── */
