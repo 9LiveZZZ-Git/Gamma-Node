@@ -1327,12 +1327,42 @@ if (btnOllamaRefresh) btnOllamaRefresh.addEventListener("click", async () => {
  * shows up in the model badge popover + the installed-models list. */
 const _ollamaPullSuggestNodes = document.querySelectorAll(".ollama-pull-suggest");
 const _ollamaPullInput = document.getElementById("ollama-pull-name");
+const _ollamaPullHfRow     = document.getElementById("ollama-pull-hf-row");
+const _ollamaPullHfPreview = document.getElementById("ollama-pull-hf-preview");
+const _ollamaPullHfQuant   = document.getElementById("ollama-pull-hf-quant");
+
+/* Phase B sprint 7 -- preview the HF normalization live. When the user
+ * types or pastes an HF URL into the pull-name field, normalize it via
+ * normalizeOllamaModelTag() and show the rewritten `hf.co/...` form
+ * (so they can verify before pulling). Also reveal the quant dropdown
+ * so they can pick a quantization tier. */
+function _ollamaUpdateHfPreview() {
+  if (!_ollamaPullInput || !_ollamaPullHfRow) return;
+  const raw = _ollamaPullInput.value || "";
+  const quant = _ollamaPullHfQuant ? _ollamaPullHfQuant.value : "";
+  const normalized = normalizeOllamaModelTag(raw, quant);
+  const isHf = /^hf\.co\//i.test(normalized);
+  if (isHf && normalized !== raw.trim()) {
+    _ollamaPullHfRow.style.display = "block";
+    if (_ollamaPullHfPreview) _ollamaPullHfPreview.textContent = normalized;
+  } else if (isHf) {
+    // User typed `hf.co/...` directly; still show the quant picker.
+    _ollamaPullHfRow.style.display = "block";
+    if (_ollamaPullHfPreview) _ollamaPullHfPreview.textContent = normalized;
+  } else {
+    _ollamaPullHfRow.style.display = "none";
+  }
+}
+if (_ollamaPullInput) _ollamaPullInput.addEventListener("input", _ollamaUpdateHfPreview);
+if (_ollamaPullHfQuant) _ollamaPullHfQuant.addEventListener("change", _ollamaUpdateHfPreview);
+
 _ollamaPullSuggestNodes.forEach((chip) => {
   chip.addEventListener("click", () => {
     const tag = chip.getAttribute("data-pull") || "";
     if (_ollamaPullInput) {
       _ollamaPullInput.value = tag;
       _ollamaPullInput.focus();
+      _ollamaUpdateHfPreview();
     }
   });
 });
@@ -1353,11 +1383,16 @@ if (btnOllamaPull) btnOllamaPull.addEventListener("click", async () => {
   const progEl   = progWrap ? progWrap.querySelector(".ollama-pull-progress") : null;
   const fillEl   = document.getElementById("ollama-pull-progress-fill");
   const rateEl   = document.getElementById("ollama-pull-rate");
-  const model    = (input && input.value || "").trim();
-  if (!model) {
-    if (note) { note.textContent = "Enter a model tag (e.g. llama3.2)."; note.style.color = "var(--danger)"; }
+  const rawInput = (input && input.value || "").trim();
+  if (!rawInput) {
+    if (note) { note.textContent = "Enter a model tag (e.g. llama3.2) or HuggingFace URL."; note.style.color = "var(--danger)"; }
     return;
   }
+  // Phase B sprint 7 -- HF URL / org-slash-repo / plain tag all flow
+  // through normalizeOllamaModelTag. Plain Ollama-registry tags pass
+  // through unchanged; HF references get rewritten to `hf.co/...:quant`.
+  const quant = _ollamaPullHfQuant ? _ollamaPullHfQuant.value : "";
+  const model = normalizeOllamaModelTag(rawInput, quant);
 
   const provider = sProvider ? sProvider.value : aiSettings.provider;
   const opts     = _ollamaPanelOptsFor(provider);

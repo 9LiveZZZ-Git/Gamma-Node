@@ -1,4 +1,237 @@
 const _demos = [
+  /* Phase B sprint 7 -- Ollama Showcase. End-to-end demo of every node
+   * shipped in Phase B (sprints B.4 + B.6) wired into one patch:
+   *
+   *   SystemPrompt + LLMChat + LLMToTTS  -- "Tell joke" pipeline
+   *     button → LLMChat (with SystemPrompt set to comedian system) →
+   *     stream the joke into the chat body → on done, speak via TTS.
+   *
+   *   LLMClassifier                       -- "Classify last" button reads
+   *     LLMChat.text and snaps it to one of {funny, scary, sad, neutral,
+   *     absurd}.
+   *
+   *   JSONFormat                          -- "Random color" button asks
+   *     Ollama in format: "json" for a colour record + extracts the
+   *     `hex` field. Lands on the JSONFormat body as `#XXXXXX`.
+   *
+   *   VoiceToLLM + (second) LLMToTTS      -- "Hold to speak" button uses
+   *     Web Speech API to capture mic input live → on release, fires a
+   *     fresh LLMChat through the VoiceToLLM node → speaks the reply.
+   *
+   *   ConversationMemory                  -- accumulates every joke into
+   *     a rolling 6-turn buffer. HUDText shows the message count.
+   *
+   *   EmbedSimilarity                     -- side viz: cosine similarity
+   *     of two LLMEmbed outputs (joke + classifier label) → HUDText.
+   *
+   * Setup:
+   *   1. Install Ollama (https://ollama.com/download).
+   *   2. Pull a chat model: `ollama pull llama3.2`
+   *   3. Pull an embed model: `ollama pull nomic-embed-text`
+   *   4. Settings → Provider → "Ollama (local)" → Test connection.
+   *   5. Load this demo, hit Run (▶), then click any of the top buttons.
+   *
+   * The runtime-only dispatcher in src/ai/llm-runtime.js drives every
+   * llm-op + llm-sink node; no C++ codegen, no compile-server needed.
+   * UI buttons + HUD are rendered via the standard Scene2D + UIButton
+   * + UIText overlay path. */
+  {
+    id: "phase-b-ollama-showcase",
+    name: "Phase B · Ollama Showcase",
+    sub: "Chat + classify + JSON + voice + memory · all sprint B.4/B.6 nodes",
+    type: "advanced",
+    thumb: `<svg viewBox="0 0 100 44">
+      <rect width="100" height="44" fill="rgba(18,22,32,0.95)"/>
+      <!-- llama silhouette in accent green -->
+      <g fill="rgba(200,232,90,0.92)">
+        <path d="M 16 30 L 16 18 Q 16 12 22 12 Q 28 12 28 18 L 28 30 Z"/>
+        <circle cx="22" cy="16" r="1.2" fill="rgba(18,22,32,0.95)"/>
+        <path d="M 14 13 L 18 8 L 20 13 Z"/>
+        <path d="M 24 13 L 26 8 L 28 13 Z"/>
+      </g>
+      <!-- speech bubbles cascading right -->
+      <g fill="none" stroke="rgba(131,232,255,0.85)" stroke-width="1.2">
+        <rect x="36" y="14" width="22" height="10" rx="3"/>
+        <rect x="62" y="20" width="22" height="10" rx="3"/>
+        <rect x="36" y="28" width="22" height="10" rx="3"/>
+      </g>
+      <!-- token dots -->
+      <g fill="rgba(131,232,255,0.85)">
+        <circle cx="41" cy="19" r="1.2"/><circle cx="46" cy="19" r="1.2"/><circle cx="51" cy="19" r="1.2"/>
+        <circle cx="67" cy="25" r="1.2"/><circle cx="72" cy="25" r="1.2"/><circle cx="77" cy="25" r="1.2"/>
+        <circle cx="41" cy="33" r="1.2"/><circle cx="46" cy="33" r="1.2"/><circle cx="51" cy="33" r="1.2"/>
+      </g>
+      <!-- mic icon, far right -->
+      <g fill="rgba(178,100,200,0.95)">
+        <rect x="88" y="16" width="6" height="12" rx="3"/>
+        <rect x="86" y="30" width="10" height="2" rx="1"/>
+        <rect x="90" y="32" width="2" height="4"/>
+      </g>
+    </svg>`,
+    build: () => {
+      // ── Title (top-center) + setup hint (top-left) ─────────────────
+      makeNode("UIText", 60, 40, {
+        text: "Phase B · Ollama Showcase",
+        x: 0, y: 18, fontSize: 22, color: "#c8e85a",
+        align: "center", corner: "top-left", interactive: 0
+      });
+      makeNode("UIText", 60, 100, {
+        text: "Tap buttons → llm-runtime fires Ollama via Settings → Provider → Ollama (local).",
+        x: 0, y: 46, fontSize: 11, color: "#9bd0ff",
+        align: "center", corner: "top-left", interactive: 0
+      });
+
+      // ── Joke pipeline: button → SystemPrompt + LLMChat → TTS ──────
+      const jokeSys = makeNode("SystemPrompt", 60, 200, {
+        text: "You are a witty stand-up comedian. Reply with ONE short joke about programming or AI, max two sentences."
+      });
+      const jokeBtn = makeNode("UIButton", 60, 320, {
+        label: "Tell joke",
+        x: 20, y: 80, width: 120, height: 34,
+        color: "#3a4a60", hoverColor: "#5f7a98",
+        textColor: "#ffffff", borderColor: "#c8e85a", borderWidth: 1.4,
+        borderRadius: 6, fontSize: 13, opacity: 0.95, corner: "top-left"
+      });
+      const joke = makeNode("LLMChat", 320, 260, {
+        prompt: "Tell me a fresh joke.",
+        system: "", model: "", trigger: 0, text: "", done: 0
+      });
+      const jokeTts = makeNode("LLMToTTS", 620, 260, {
+        text: "", speak: 0, rate: 1.05, pitch: 1.0, voice: "", done: 0
+      });
+      state.edges.push({ from: { node: jokeSys, port: "text"    }, to: { node: joke,    port: "system"  } });
+      state.edges.push({ from: { node: jokeBtn, port: "clicked" }, to: { node: joke,    port: "trigger" } });
+      state.edges.push({ from: { node: joke,    port: "text"    }, to: { node: jokeTts, port: "text"   } });
+      state.edges.push({ from: { node: joke,    port: "done"    }, to: { node: jokeTts, port: "speak"  } });
+
+      // ── Classifier: classifies the joke into a mood label ──────────
+      const classifyBtn = makeNode("UIButton", 60, 460, {
+        label: "Classify joke",
+        x: 152, y: 80, width: 120, height: 34,
+        color: "#3a4a60", hoverColor: "#5f7a98",
+        textColor: "#ffffff", borderColor: "#9bd0ff", borderWidth: 1.4,
+        borderRadius: 6, fontSize: 13, opacity: 0.95, corner: "top-left"
+      });
+      const classifier = makeNode("LLMClassifier", 320, 460, {
+        input: "", labels: "funny,scary,sad,neutral,absurd",
+        model: "", trigger: 0, label: "", done: 0
+      });
+      state.edges.push({ from: { node: joke,        port: "text"    }, to: { node: classifier, port: "input"   } });
+      state.edges.push({ from: { node: classifyBtn, port: "clicked" }, to: { node: classifier, port: "trigger" } });
+
+      // ── JSON-mode demo: pick a colour, surface its hex ─────────────
+      const jsonBtn = makeNode("UIButton", 60, 600, {
+        label: "Random color",
+        x: 284, y: 80, width: 120, height: 34,
+        color: "#3a4a60", hoverColor: "#5f7a98",
+        textColor: "#ffffff", borderColor: "#83e8ff", borderWidth: 1.4,
+        borderRadius: 6, fontSize: 13, opacity: 0.95, corner: "top-left"
+      });
+      const jsonFmt = makeNode("JSONFormat", 320, 600, {
+        prompt: "Pick a random beautiful color and name it.",
+        schema: "{ name: string, hex: string, mood: string }",
+        field:  "hex",
+        model:  "", trigger: 0, value: "", raw: "", done: 0
+      });
+      state.edges.push({ from: { node: jsonBtn, port: "clicked" }, to: { node: jsonFmt, port: "trigger" } });
+
+      // ── Voice chain (own LLMChat + its own TTS) ────────────────────
+      const voiceBtn = makeNode("UIButton", 60, 740, {
+        label: "Hold to speak",
+        x: 416, y: 80, width: 140, height: 34,
+        color: "#3a4a60", hoverColor: "#5f7a98",
+        textColor: "#ffffff", borderColor: "#b264c8", borderWidth: 1.4,
+        borderRadius: 6, fontSize: 13, opacity: 0.95, corner: "top-left"
+      });
+      const voiceSys = makeNode("SystemPrompt", 60, 860, {
+        text: "You are a helpful, concise assistant. One or two sentences max."
+      });
+      const voice = makeNode("VoiceToLLM", 320, 760, {
+        record: 0, system: "", model: "",
+        userText: "", assistantText: "", done: 0
+      });
+      const voiceTts = makeNode("LLMToTTS", 620, 760, {
+        text: "", speak: 0, rate: 1.0, pitch: 1.0, voice: "", done: 0
+      });
+      state.edges.push({ from: { node: voiceBtn, port: "clicked" }, to: { node: voice,    port: "record" } });
+      state.edges.push({ from: { node: voiceSys, port: "text"    }, to: { node: voice,    port: "system" } });
+      state.edges.push({ from: { node: voice,    port: "assistantText" }, to: { node: voiceTts, port: "text"  } });
+      state.edges.push({ from: { node: voice,    port: "done"    }, to: { node: voiceTts, port: "speak" } });
+
+      // ── Conversation memory: auto-appends each joke + voice exchange ──
+      const mem = makeNode("ConversationMemory", 920, 460, {
+        userMsg: "", assistantMsg: "",
+        appendUser: 0, appendAssistant: 0, clear: 0,
+        maxTurns: 6, history: [], messages: "[]", count: 0
+      });
+      // Joke chain auto-feeds the buffer on each completion.
+      state.edges.push({ from: { node: joke,  port: "text" }, to: { node: mem, port: "assistantMsg"   } });
+      state.edges.push({ from: { node: joke,  port: "done" }, to: { node: mem, port: "appendAssistant" } });
+      // Voice's userText fills the user side; on done we append both
+      // sides (a fresh `done` rising edge fires both appends -- the
+      // userMsg + appendUser pair runs first because of param order).
+      state.edges.push({ from: { node: voice, port: "userText"      }, to: { node: mem, port: "userMsg"     } });
+      state.edges.push({ from: { node: voice, port: "done"          }, to: { node: mem, port: "appendUser"  } });
+      state.edges.push({ from: { node: voice, port: "assistantText" }, to: { node: mem, port: "assistantMsg" } });
+
+      const clearBtn = makeNode("UIButton", 60, 980, {
+        label: "Clear memory",
+        x: 568, y: 80, width: 120, height: 34,
+        color: "#5a3a3a", hoverColor: "#8a5050",
+        textColor: "#ffffff", borderColor: "#e24b4a", borderWidth: 1.4,
+        borderRadius: 6, fontSize: 13, opacity: 0.95, corner: "top-left"
+      });
+      state.edges.push({ from: { node: clearBtn, port: "clicked" }, to: { node: mem, port: "clear" } });
+
+      // ── Embed similarity side-viz ──────────────────────────────────
+      // Two LLMEmbed nodes embed the joke + the classifier label; the
+      // EmbedSimilarity node outputs the cosine similarity as a scalar.
+      // Both embeds are gated by the classifier's done pulse so they
+      // run once after a classify, not every frame.
+      const embedJoke = makeNode("LLMEmbed", 920, 260, {
+        text: "", model: "nomic-embed-text", trigger: 0, dim: 0, done: 0
+      });
+      const embedLabel = makeNode("LLMEmbed", 920, 360, {
+        text: "", model: "nomic-embed-text", trigger: 0, dim: 0, done: 0
+      });
+      state.edges.push({ from: { node: joke,        port: "text"    }, to: { node: embedJoke,  port: "text"    } });
+      state.edges.push({ from: { node: classifier,  port: "done"    }, to: { node: embedJoke,  port: "trigger" } });
+      state.edges.push({ from: { node: classifier,  port: "label"   }, to: { node: embedLabel, port: "text"    } });
+      state.edges.push({ from: { node: classifier,  port: "done"    }, to: { node: embedLabel, port: "trigger" } });
+      const sim = makeNode("EmbedSimilarity", 1180, 310, { similarity: 0 });
+      state.edges.push({ from: { node: embedJoke,  port: "vec" }, to: { node: sim, port: "a" } });
+      state.edges.push({ from: { node: embedLabel, port: "vec" }, to: { node: sim, port: "b" } });
+
+      // ── HUD: memory count + similarity scalar (bottom-right) ───────
+      const hudCount = makeNode("HUDText", 1180, 460, {
+        prefix: "memory: ", suffix: " msgs", value: 0, decimals: 0,
+        corner: "bottom-right", fontSize: 14, color: "#83e8ff",
+        opacity: 0.95, margin: 18
+      });
+      state.edges.push({ from: { node: mem, port: "count" }, to: { node: hudCount, port: "value" } });
+
+      const hudSim = makeNode("HUDText", 1180, 560, {
+        prefix: "joke ↔ label sim: ", suffix: "", value: 0, decimals: 3,
+        corner: "bottom-right", fontSize: 14, color: "#b264c8",
+        opacity: 0.95, margin: 42
+      });
+      state.edges.push({ from: { node: sim, port: "similarity" }, to: { node: hudSim, port: "value" } });
+
+      // ── Visual output: just a dark backdrop so the UI overlay has
+      //    something to composite onto. No 3D scene; this demo is
+      //    entirely about the runtime-only LLM nodes. ────────────────
+      const cam2d = makeNode("OrthoCamera2D", 1180, 720, {
+        posX: 0, posY: 0, orthoSize: 5, pixelSnap: 0, pixelsPerUnit: 64
+      });
+      const scene2d = makeNode("Scene2D", 1380, 720, {
+        clearR: 0.04, clearG: 0.05, clearB: 0.09
+      });
+      state.edges.push({ from: { node: cam2d, port: "camera" }, to: { node: scene2d, port: "camera" } });
+      const vo = makeNode("VisualOutput", 1580, 720, { display: 0 });
+      state.edges.push({ from: { node: scene2d, port: "out" }, to: { node: vo, port: "in" } });
+    }
+  },
+
   /* Phase 8.B.15 / §8.F -- GLB Asset Test. Verifies the asset pipeline
    * end-to-end: LoadGLB streams a SpectraStudios city building + two
    * m3-org props from the compile-server asset host and renders them.

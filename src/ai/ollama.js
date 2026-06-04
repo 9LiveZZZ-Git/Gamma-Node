@@ -158,6 +158,60 @@ async function _ollamaFetch(path, opts) {
   return res;
 }
 
+/* Phase B sprint 7 -- HuggingFace URL/tag normalization.
+ *
+ * Ollama 0.3+ accepts model identifiers of the shape
+ *   hf.co/{user}/{repo}[:{quant}]
+ * which it routes through HuggingFace's hub to pull a GGUF-quantized
+ * model. The model has to be a GGUF repo (or a conversion-on-the-fly
+ * candidate); SafeTensors / diffusion / multimodal repos like
+ * `microsoft/TRELLIS.2-4B` will pull and then fail on Ollama's side --
+ * we surface the daemon's error verbatim.
+ *
+ * Accepts (all equivalent):
+ *   https://huggingface.co/microsoft/TRELLIS.2-4B
+ *   https://huggingface.co/microsoft/TRELLIS.2-4B/tree/main
+ *   huggingface.co/microsoft/TRELLIS.2-4B
+ *   hf.co/microsoft/TRELLIS.2-4B
+ *   microsoft/TRELLIS.2-4B  (org/repo bare, when defaultHf=true)
+ *
+ * Returns either the normalized `hf.co/...` form OR the original
+ * input unchanged (when not an HF reference) so the caller can use
+ * it for both registry tags (llama3.2) and HF mirrors. A second
+ * arg `quant` appends `:{quant}` only when not already present in
+ * the input.
+ *
+ * Used by the Pull UI in src/ai/settings.js to let the user paste
+ * a HuggingFace page URL directly into the model-tag input. */
+function normalizeOllamaModelTag(input, quant) {
+  if (typeof input !== "string") return "";
+  let s = input.trim();
+  if (!s) return "";
+  // Strip scheme.
+  s = s.replace(/^https?:\/\//i, "");
+  // Strip trailing /tree/{branch}, /blob/..., /resolve/..., /commit/...
+  s = s.replace(/\/(tree|blob|resolve|commit|raw)\/.*$/i, "");
+  // Strip trailing slashes / query / fragment.
+  s = s.replace(/[?#].*$/, "").replace(/\/+$/, "");
+  // Now recognize HF variants.
+  let isHf = false;
+  if (/^huggingface\.co\//i.test(s)) { s = s.replace(/^huggingface\.co\//i, "hf.co/"); isHf = true; }
+  else if (/^hf\.co\//i.test(s))     { isHf = true; }
+  // If the cleaned string is bare "user/repo" (one slash, no dots in
+  // the leading segment) treat it as an HF reference. This handles
+  // copy-pastes of just the org/repo line from a HF page.
+  if (!isHf && /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(s)) {
+    s = "hf.co/" + s;
+    isHf = true;
+  }
+  // Optional quant suffix. Only append if the user didn't already
+  // type one and the caller asked for one.
+  if (isHf && quant && !/:[A-Za-z0-9_]+$/.test(s)) {
+    s = s + ":" + quant;
+  }
+  return s;
+}
+
 async function probeOllama(opts) {
   const res = await _ollamaFetch("/api/version", opts);
   return await res.json();
