@@ -19848,5 +19848,112 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     outs: [{ n: "tex", t: "texture" }],
     params: {},
     description: "Phase A.1 placeholder — receives an `llm-attn` input (attention weights [B,H,T,T] + token labels) and outputs a `texture` port for downstream Materials. No runtime behavior yet; the real AttentionGraph3D (port of LLMAttention3D.jsx) ships in Phase D sprint llm-10."
+  },
+
+  /* ============================================================
+   * Phase B sprint 4 — Ollama-backed LLM nodes (MVP)
+   *
+   * Five wirable nodes that drive the editor's Ollama integration
+   * from inside the graph instead of from the User DSP AI panel.
+   * Two pure string sources (kind: "llm-op") and three gate-triggered
+   * async fetchers (kind: "llm-sink"). All five route through
+   * src/ai/llm-runtime.js's dispatcher; none of them participate in
+   * C++ codegen (isRuntimeOnlyKind() in src/codegen/index.js).
+   *
+   * Verify path:
+   *   1. Drop SystemPrompt, set its `text` param.
+   *   2. Drop LLMChat, set its `prompt` param to something.
+   *   3. Wire SystemPrompt.text -> LLMChat.system.
+   *   4. Drop a Button, wire Button.clicked -> LLMChat.trigger.
+   *   5. Hit Run on a patch (Play). Click the Button. Tokens stream
+   *      into the LLMChat node body live. When done, the accumulated
+   *      text lands on params.text + the `done` port pulses for one
+   *      tick (chain another node off it to react).
+   * ============================================================ */
+  SystemPrompt: {
+    category: "AI/LLM", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-op",
+    ins: [],
+    outs: [{ n: "text", t: "text" }],
+    params: { text: "You are a helpful assistant." },
+    description: "Static system-prompt source. Type the prompt into the `text` param; downstream LLMChat / LLMGenerate nodes consume it via their `system` input. Pure passthrough (no runtime call) — just a string source on the wire."
+  },
+  LLMModelPicker: {
+    category: "AI/LLM", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-op",
+    ins: [],
+    outs: [{ n: "model", t: "text" }],
+    params: { model: "llama3.2" },
+    description: "Model-name source. Type an Ollama model tag (e.g. `llama3.2`, `qwen3:8b`, `gpt-oss:120b-cloud`) into the `model` param. Wire `model` into LLMChat/LLMGenerate/LLMEmbed to override their default. Doesn't probe Ollama — Settings → Provider → Refresh models shows what's actually installed."
+  },
+  LLMChat: {
+    category: "AI/LLM", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-sink",
+    ins: [
+      { n: "prompt",  t: "text" },
+      { n: "system",  t: "text" },
+      { n: "model",   t: "text" },
+      { n: "trigger", t: "gate" }
+    ],
+    outs: [
+      { n: "text", t: "text" },
+      { n: "done", t: "gate" }
+    ],
+    params: {
+      prompt: "Write a haiku about transformers.",
+      system: "",
+      model:  "",
+      trigger: 0,
+      text:   "",
+      done:   0
+    },
+    uiOnlyParams: ["text", "done"],
+    description: "Streams a chat response from the configured Ollama daemon (Settings → Provider → Local Ollama). On `trigger` rising edge, calls /api/chat with system + prompt + model. Tokens land in the node body live via the Phase A.2 streaming primitive; the accumulated text lands on the `text` output port and the `done` gate pulses once. Inputs prefer wired values; unwired inputs use their local params. Empty model defaults to the active provider model in Settings."
+  },
+  LLMGenerate: {
+    category: "AI/LLM", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-sink",
+    ins: [
+      { n: "prompt",  t: "text" },
+      { n: "system",  t: "text" },
+      { n: "model",   t: "text" },
+      { n: "trigger", t: "gate" }
+    ],
+    outs: [
+      { n: "text", t: "text" },
+      { n: "done", t: "gate" }
+    ],
+    params: {
+      prompt: "Write a single sentence about a llama.",
+      system: "",
+      model:  "",
+      trigger: 0,
+      text:   "",
+      done:   0
+    },
+    uiOnlyParams: ["text", "done"],
+    description: "Single-shot text completion via Ollama /api/generate. Same shape as LLMChat but cheaper for stateless prompts (no chat history overhead). On `trigger` rising edge, fires the request; tokens stream into the node body; accumulated text lands on `text` and `done` pulses once. Use this over LLMChat for prompt-template style work where every request stands alone."
+  },
+  LLMEmbed: {
+    category: "AI/Embed", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-sink",
+    ins: [
+      { n: "text",    t: "text" },
+      { n: "model",   t: "text" },
+      { n: "trigger", t: "gate" }
+    ],
+    outs: [
+      { n: "vec",  t: "vector" },
+      { n: "done", t: "gate" }
+    ],
+    params: {
+      text:    "Hello world.",
+      model:   "nomic-embed-text",
+      trigger: 0,
+      dim:     0,
+      done:    0
+    },
+    uiOnlyParams: ["dim", "done"],
+    description: "Embeds the input string via Ollama /api/embed. On `trigger` rising edge, calls the embed endpoint with the resolved text + model. The resulting Float32Array lands on the `vec` output port (consume with anything expecting a Phase A.1 `vector` -- VectorSink to inspect shape, future Tektite MD viz, etc). `done` pulses once on completion. Default model is `nomic-embed-text` — install with `ollama pull nomic-embed-text`."
   }
 };

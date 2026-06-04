@@ -427,7 +427,13 @@ const SIGNAL_PORT_TYPES = new Set(["audio", "param", "gate", "clock"]);
 // coercion to audio / param / texture).
 const VISUAL_PORT_TYPES = new Set([
   "texture", "transform", "mesh", "camera", "light", "environment",
-  "vector", "llm-attn"
+  "vector", "llm-attn",
+  // Phase B sprint 4 -- plain JS strings on the wire. Used by the LLM
+  // node family (SystemPrompt → LLMChat.system, LLMChat.text →
+  // downstream text consumer, etc.). Strict same-type rule like every
+  // other visual port; numeric audio/param values don't implicitly
+  // coerce to strings and vice versa.
+  "text"
 ]);
 function portsCompatible(srcType, dstType) {
   if (srcType === dstType) return true;

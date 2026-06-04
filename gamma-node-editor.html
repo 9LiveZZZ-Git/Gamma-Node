@@ -65,6 +65,7 @@
     --heightmap:    #c89060;     /* §5.5.h — terrain heightmap reference (TiledTerrain → Water.heightmap) */
     --vector:       #b264c8;     /* Phase A.1 — typed embedding / tensor vector (Float32Array + shape) */
     --llm-attn:     #e87ad6;     /* Phase A.1 — attention-weights specialization carrying [B,H,T,T] + token labels */
+    --text-wire:    #83e8ff;     /* Phase B.4 — plain JS string on the wire (LLM prompts / responses) */
     --selected:     #4a8fdc;
     --danger:       #e24b4a;
     --info:         #83e8ff;
@@ -837,6 +838,7 @@
   .port.heightmap   { border-color: var(--heightmap);   border-style: dashed; border-width: 3px; }
   .port.vector      { border-color: var(--vector);      border-style: ridge;  border-width: 3px; }
   .port["llm-attn"], .port.llm-attn { border-color: var(--llm-attn); border-style: ridge; border-width: 4px; }
+  .port.text        { border-color: var(--text-wire);   border-style: solid;  border-width: 2px; border-radius: 2px; }
   .port.connected.param { background: var(--param); border-style: solid; }
   .port.connected.gate  { background: var(--gate); }
   .port.connected.clock { background: var(--clock); border-style: solid; }
@@ -848,6 +850,7 @@
   .port.connected.environment { background: var(--environment); border-style: solid; }
   .port.connected.vector      { background: var(--vector);   border-style: solid; }
   .port.connected.llm-attn    { background: var(--llm-attn); border-style: solid; }
+  .port.connected.text        { background: var(--text-wire); border-style: solid; }
 
   /* Phase A.2 — token-stream node body output area. Used by
    * createTokenStreamBody (src/ui/node-bodies.js). Mono font, soft
@@ -871,6 +874,35 @@
   }
   .tk-stream-done::after { content: ""; animation: none; }
   @keyframes tk-stream-cursor { 50% { opacity: 0; } }
+
+  /* Phase B sprint 4 — body slot inside LLMChat / LLMGenerate / LLMEmbed
+   * nodes where streaming tokens land. createTokenStreamBody (Phase A.2)
+   * appends its <span class="tk-stream"> here and updates it per rAF as
+   * tokens arrive from ollamaChat / ollamaGenerate. Capped height so a
+   * long response doesn't push every other node off-canvas. */
+  .llm-stream-body {
+    margin: 6px 8px;
+    padding: 8px 10px;
+    max-height: 180px;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: rgba(0,0,0,0.32);
+    font-size: 11px;
+    line-height: 1.45;
+    color: var(--text);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .llm-stream-body:empty::before {
+    content: "(idle — fire trigger to run)";
+    color: var(--text-3);
+    font-style: italic;
+  }
+  .llm-stream-body.error {
+    border-color: var(--danger);
+    color: var(--danger);
+  }
 
   /* Phase B sprint 2 — Ollama installed-models list inside the settings
    * modal's Ollama status panel. Clickable rows; active model gets a
@@ -941,6 +973,7 @@
   .port.wire-snap-target.mesh      { box-shadow: 0 0 0 4px rgba(255,157, 63,0.22), 0 0 12px 4px rgba(255,157, 63,0.55); }
   .port.wire-snap-target.vector    { box-shadow: 0 0 0 4px rgba(178,100,200,0.22), 0 0 12px 4px rgba(178,100,200,0.55); }
   .port.wire-snap-target.llm-attn  { box-shadow: 0 0 0 4px rgba(232,122,214,0.22), 0 0 12px 4px rgba(232,122,214,0.55); }
+  .port.wire-snap-target.text      { box-shadow: 0 0 0 4px rgba(131,232,255,0.22), 0 0 12px 4px rgba(131,232,255,0.55); }
 
   /* Brief red pulse when a wire-drop is refused by portsCompatible(). The
    * destination port flashes for ~400ms so the rejection is visible without
@@ -8190,7 +8223,7 @@
  * Pages deploy workflow (.github/workflows/pages.yml). The string
  * after the equals sign is what the workflow's sed targets — don't
  * change the format of this line. */
-const APP_VERSION = "0.3.705";
+const APP_VERSION = "0.3.706";
 
 /* =========================================================================
  * Node kinds — runtime-only kind registry
@@ -28146,6 +28179,113 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     outs: [{ n: "tex", t: "texture" }],
     params: {},
     description: "Phase A.1 placeholder — receives an `llm-attn` input (attention weights [B,H,T,T] + token labels) and outputs a `texture` port for downstream Materials. No runtime behavior yet; the real AttentionGraph3D (port of LLMAttention3D.jsx) ships in Phase D sprint llm-10."
+  },
+
+  /* ============================================================
+   * Phase B sprint 4 — Ollama-backed LLM nodes (MVP)
+   *
+   * Five wirable nodes that drive the editor's Ollama integration
+   * from inside the graph instead of from the User DSP AI panel.
+   * Two pure string sources (kind: "llm-op") and three gate-triggered
+   * async fetchers (kind: "llm-sink"). All five route through
+   * src/ai/llm-runtime.js's dispatcher; none of them participate in
+   * C++ codegen (isRuntimeOnlyKind() in src/codegen/index.js).
+   *
+   * Verify path:
+   *   1. Drop SystemPrompt, set its `text` param.
+   *   2. Drop LLMChat, set its `prompt` param to something.
+   *   3. Wire SystemPrompt.text -> LLMChat.system.
+   *   4. Drop a Button, wire Button.clicked -> LLMChat.trigger.
+   *   5. Hit Run on a patch (Play). Click the Button. Tokens stream
+   *      into the LLMChat node body live. When done, the accumulated
+   *      text lands on params.text + the `done` port pulses for one
+   *      tick (chain another node off it to react).
+   * ============================================================ */
+  SystemPrompt: {
+    category: "AI/LLM", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-op",
+    ins: [],
+    outs: [{ n: "text", t: "text" }],
+    params: { text: "You are a helpful assistant." },
+    description: "Static system-prompt source. Type the prompt into the `text` param; downstream LLMChat / LLMGenerate nodes consume it via their `system` input. Pure passthrough (no runtime call) — just a string source on the wire."
+  },
+  LLMModelPicker: {
+    category: "AI/LLM", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-op",
+    ins: [],
+    outs: [{ n: "model", t: "text" }],
+    params: { model: "llama3.2" },
+    description: "Model-name source. Type an Ollama model tag (e.g. `llama3.2`, `qwen3:8b`, `gpt-oss:120b-cloud`) into the `model` param. Wire `model` into LLMChat/LLMGenerate/LLMEmbed to override their default. Doesn't probe Ollama — Settings → Provider → Refresh models shows what's actually installed."
+  },
+  LLMChat: {
+    category: "AI/LLM", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-sink",
+    ins: [
+      { n: "prompt",  t: "text" },
+      { n: "system",  t: "text" },
+      { n: "model",   t: "text" },
+      { n: "trigger", t: "gate" }
+    ],
+    outs: [
+      { n: "text", t: "text" },
+      { n: "done", t: "gate" }
+    ],
+    params: {
+      prompt: "Write a haiku about transformers.",
+      system: "",
+      model:  "",
+      trigger: 0,
+      text:   "",
+      done:   0
+    },
+    uiOnlyParams: ["text", "done"],
+    description: "Streams a chat response from the configured Ollama daemon (Settings → Provider → Local Ollama). On `trigger` rising edge, calls /api/chat with system + prompt + model. Tokens land in the node body live via the Phase A.2 streaming primitive; the accumulated text lands on the `text` output port and the `done` gate pulses once. Inputs prefer wired values; unwired inputs use their local params. Empty model defaults to the active provider model in Settings."
+  },
+  LLMGenerate: {
+    category: "AI/LLM", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-sink",
+    ins: [
+      { n: "prompt",  t: "text" },
+      { n: "system",  t: "text" },
+      { n: "model",   t: "text" },
+      { n: "trigger", t: "gate" }
+    ],
+    outs: [
+      { n: "text", t: "text" },
+      { n: "done", t: "gate" }
+    ],
+    params: {
+      prompt: "Write a single sentence about a llama.",
+      system: "",
+      model:  "",
+      trigger: 0,
+      text:   "",
+      done:   0
+    },
+    uiOnlyParams: ["text", "done"],
+    description: "Single-shot text completion via Ollama /api/generate. Same shape as LLMChat but cheaper for stateless prompts (no chat history overhead). On `trigger` rising edge, fires the request; tokens stream into the node body; accumulated text lands on `text` and `done` pulses once. Use this over LLMChat for prompt-template style work where every request stands alone."
+  },
+  LLMEmbed: {
+    category: "AI/Embed", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-sink",
+    ins: [
+      { n: "text",    t: "text" },
+      { n: "model",   t: "text" },
+      { n: "trigger", t: "gate" }
+    ],
+    outs: [
+      { n: "vec",  t: "vector" },
+      { n: "done", t: "gate" }
+    ],
+    params: {
+      text:    "Hello world.",
+      model:   "nomic-embed-text",
+      trigger: 0,
+      dim:     0,
+      done:    0
+    },
+    uiOnlyParams: ["dim", "done"],
+    description: "Embeds the input string via Ollama /api/embed. On `trigger` rising edge, calls the embed endpoint with the resolved text + model. The resulting Float32Array lands on the `vec` output port (consume with anything expecting a Phase A.1 `vector` -- VectorSink to inspect shape, future Tektite MD viz, etc). `done` pulses once on completion. Default model is `nomic-embed-text` — install with `ollama pull nomic-embed-text`."
   }
 };
 
@@ -47150,7 +47290,13 @@ const SIGNAL_PORT_TYPES = new Set(["audio", "param", "gate", "clock"]);
 // coercion to audio / param / texture).
 const VISUAL_PORT_TYPES = new Set([
   "texture", "transform", "mesh", "camera", "light", "environment",
-  "vector", "llm-attn"
+  "vector", "llm-attn",
+  // Phase B sprint 4 -- plain JS strings on the wire. Used by the LLM
+  // node family (SystemPrompt → LLMChat.system, LLMChat.text →
+  // downstream text consumer, etc.). Strict same-type rule like every
+  // other visual port; numeric audio/param values don't implicitly
+  // coerce to strings and vice versa.
+  "text"
 ]);
 function portsCompatible(srcType, dstType) {
   if (srcType === dstType) return true;
@@ -54272,6 +54418,312 @@ async function* mockTokenStream(text, perTokenMs) {
   for (const tok of tokens) {
     if (perTokenMs > 0) await new Promise(r => setTimeout(r, perTokenMs));
     yield tok;
+  }
+}
+/* =========================================================================
+ * LLM runtime dispatcher
+ *
+ * Phase B sprint 4 of docs/LLM-KNOWLEDGE-PHASE.md §4. Drives the five
+ * MVP LLM nodes added in this sprint:
+ *
+ *   llm-op  nodes (zero-runtime, just a string source):
+ *     SystemPrompt     -- outputs `params.text` on its `text` port
+ *     LLMModelPicker   -- outputs `params.model` on its `model` port
+ *
+ *   llm-sink nodes (gate-triggered async fetch):
+ *     LLMChat          -- /api/chat,     streams to node body, writes `text`
+ *     LLMGenerate      -- /api/generate, same shape as Chat
+ *     LLMEmbed         -- /api/embed,    writes the embedding to `vector`
+ *
+ * For llm-op nodes there's nothing to tick -- consumers read their
+ * outputs via _readTextWire() which just returns the source node's
+ * `params[outputPortName]`. They appear in the graph + flow strings
+ * downstream without any per-frame work.
+ *
+ * For llm-sink nodes, _tickLLMRuntime() is invoked once per visual
+ * frame from src/visual/render-loop.js. The tick:
+ *   1. Detects rising edges on each sink's `trigger` gate.
+ *   2. On rise, reads the text inputs from wires (or local params),
+ *      resolves the model name (wire / param / aiSettings.model
+ *      fallback), and launches the async fetch via ollamaChat /
+ *      ollamaGenerate / ollamaEmbed.
+ *   3. While streaming: tokens flow into the node's `.llm-stream-body`
+ *      element via createTokenStreamBody (Phase A.2 primitive).
+ *   4. On completion: writes the accumulated text to params.text (Chat
+ *      / Generate) or the embedding to params._vec (Embed), fires the
+ *      `done` gate by setting params.done = 1 for one tick.
+ *   5. The node DOM may be rebuilt mid-stream (graph re-render); the
+ *      runtime detects a stale `body.el` and re-creates the stream
+ *      body on the new DOM node.
+ *
+ * Cancellation: not implemented in this sprint. A second trigger
+ * while a stream is in flight is ignored. Sprint B.6 will add an
+ * AbortController per node.
+ * ======================================================================== */
+
+/* Per-node runtime state. Keyed by node id. Stored here rather than on
+ * the node object so a node restart (delete + re-add with same id) gets
+ * a clean slate. */
+const _llmRuntimeStates = new Map();
+
+function _llmGetState(nodeId) {
+  let s = _llmRuntimeStates.get(nodeId);
+  if (!s) {
+    s = {
+      lastTrigger: 0,
+      streaming:   false,
+      body:        null,    // { el, append, finalize, clear, isStreaming }
+      bodyNodeEl:  null,    // the .node DOM element that body was attached to
+      generation:  0        // bumped each fetch; lets late onTokens drop if a new run started
+    };
+    _llmRuntimeStates.set(nodeId, s);
+  }
+  return s;
+}
+
+/* Read a `text`-typed input on `node`. If the port is wired, walk the
+ * wire to the source and return `srcNode.params[srcOutputPortName]` as
+ * a string. If not wired, fall back to `node.params[portName]`. Empty
+ * string for missing / non-string values rather than null so consumers
+ * don't have to null-check before passing into a fetch body.
+ *
+ * Mirrors the existing _readWireJsSideValue pattern for numeric wires
+ * (src/core/wire-eval.js) but specialized for text. The LLM runtime
+ * keeps its own walker rather than extending wire-eval so the text-
+ * port semantics stay local to this subsystem. */
+function _readTextWire(node, portName) {
+  if (!node || typeof portName !== "string") return "";
+  if (state && Array.isArray(state.edges)) {
+    for (const e of state.edges) {
+      if (e && e.to && e.to.node === node.id && e.to.port === portName) {
+        const src = state.nodes.find(n => n && n.id === e.from.node);
+        if (src && src.params) {
+          const v = src.params[e.from.port];
+          if (typeof v === "string") return v;
+          // Allow numeric upstream values to coerce to string for
+          // convenience (e.g. wire a Slider into LLMChat.system to test
+          // a parameter sweep). Only on direct mismatch, not when the
+          // upstream is text but empty.
+          if (typeof v === "number" && Number.isFinite(v)) return String(v);
+        }
+      }
+    }
+  }
+  const local = node.params && node.params[portName];
+  return (typeof local === "string") ? local : "";
+}
+
+/* Detect a rising edge on the `trigger` gate input. Returns true exactly
+ * once per 0->1 transition. The trigger value comes from either a
+ * connected gate wire (read via _readWireJsSideValue) or the local
+ * params.trigger (so a Button auto-wired to params.trigger by the
+ * monitor controls works without the user wiring a gate). */
+function _llmDetectTrigger(node, rt) {
+  let v = 0;
+  // `state` here is the global editor state, not the rt parameter.
+  if (typeof _readWireJsSideValue === "function" && state && Array.isArray(state.edges)) {
+    for (const e of state.edges) {
+      if (e && e.to && e.to.node === node.id && e.to.port === "trigger") {
+        const r = _readWireJsSideValue(e);
+        if (typeof r === "number") { v = r; break; }
+      }
+    }
+  }
+  if (!v) {
+    const local = node.params && node.params.trigger;
+    if (typeof local === "number") v = local;
+  }
+  const wasLow  = (rt.lastTrigger || 0) < 0.5;
+  const isHigh  = v >= 0.5;
+  rt.lastTrigger = v;
+  return wasLow && isHigh;
+}
+
+/* Resolve (or re-create) the streaming body element inside a sink node's
+ * DOM. The .node element gets rebuilt on every render() pass, so a body
+ * cached against the previous .node element is stale and dropped. */
+function _llmEnsureBody(node, runtimeState) {
+  const nodeEl = document.querySelector('.node[data-id="' + node.id + '"]');
+  if (!nodeEl) return null;
+  if (runtimeState.body && runtimeState.bodyNodeEl === nodeEl && runtimeState.body.el.isConnected) {
+    return runtimeState.body;
+  }
+  // Replace any existing slot or create a fresh one inside this node.
+  let slot = nodeEl.querySelector(".llm-stream-body");
+  if (!slot) {
+    slot = document.createElement("div");
+    slot.className = "llm-stream-body";
+    nodeEl.appendChild(slot);
+  } else {
+    slot.classList.remove("error");
+    slot.innerHTML = "";
+  }
+  runtimeState.body       = createTokenStreamBody(slot);
+  runtimeState.bodyNodeEl = nodeEl;
+  return runtimeState.body;
+}
+
+function _llmMarkError(node, runtimeState, msg) {
+  const nodeEl = document.querySelector('.node[data-id="' + node.id + '"]');
+  if (!nodeEl) return;
+  let slot = nodeEl.querySelector(".llm-stream-body");
+  if (!slot) {
+    slot = document.createElement("div");
+    slot.className = "llm-stream-body";
+    nodeEl.appendChild(slot);
+  }
+  slot.classList.add("error");
+  slot.textContent = String(msg || "error");
+  runtimeState.body = null;
+  runtimeState.bodyNodeEl = null;
+}
+
+/* The four async kicks. Each takes (node, runtimeState) and runs an
+ * Ollama call until completion, then publishes the output. */
+
+async function _llmKickChat(node, rt) {
+  rt.streaming = true;
+  rt.generation++;
+  const myGen = rt.generation;
+  const body  = _llmEnsureBody(node, rt);
+  if (body) body.clear();
+
+  const system = _readTextWire(node, "system");
+  const user   = _readTextWire(node, "prompt") || _readTextWire(node, "user");
+  let   model  = _readTextWire(node, "model");
+  if (!model && typeof aiSettings === "object") model = aiSettings.model || "llama3.2";
+
+  const onToken = (tok) => {
+    if (myGen !== rt.generation) return;
+    if (rt.body) rt.body.append(tok);
+  };
+
+  try {
+    const acc = await ollamaChat({
+      baseUrl: aiSettings && aiSettings.ollamaUrl,
+      model, system, user, onToken
+    });
+    if (myGen !== rt.generation) return;
+    if (rt.body) rt.body.finalize();
+    node.params = node.params || {};
+    node.params.text = acc || "";
+    node.params.done = 1;
+  } catch (err) {
+    if (myGen === rt.generation) _llmMarkError(node, rt, (err && err.message) || String(err));
+  } finally {
+    if (myGen === rt.generation) rt.streaming = false;
+  }
+}
+
+async function _llmKickGenerate(node, rt) {
+  rt.streaming = true;
+  rt.generation++;
+  const myGen = rt.generation;
+  const body  = _llmEnsureBody(node, rt);
+  if (body) body.clear();
+
+  const prompt = _readTextWire(node, "prompt");
+  const system = _readTextWire(node, "system");
+  let   model  = _readTextWire(node, "model");
+  if (!model && typeof aiSettings === "object") model = aiSettings.model || "llama3.2";
+
+  const onToken = (tok) => {
+    if (myGen !== rt.generation) return;
+    if (rt.body) rt.body.append(tok);
+  };
+
+  try {
+    const acc = await ollamaGenerate({
+      baseUrl: aiSettings && aiSettings.ollamaUrl,
+      model, prompt, system, onToken
+    });
+    if (myGen !== rt.generation) return;
+    if (rt.body) rt.body.finalize();
+    node.params = node.params || {};
+    node.params.text = acc || "";
+    node.params.done = 1;
+  } catch (err) {
+    if (myGen === rt.generation) _llmMarkError(node, rt, (err && err.message) || String(err));
+  } finally {
+    if (myGen === rt.generation) rt.streaming = false;
+  }
+}
+
+async function _llmKickEmbed(node, rt) {
+  rt.streaming = true;
+  rt.generation++;
+  const myGen = rt.generation;
+  const body  = _llmEnsureBody(node, rt);
+  if (body) body.clear();
+
+  const text  = _readTextWire(node, "text") || _readTextWire(node, "input");
+  let   model = _readTextWire(node, "model");
+  if (!model) model = (node.params && node.params.model) || "nomic-embed-text";
+
+  try {
+    const res = await ollamaEmbed({
+      baseUrl: aiSettings && aiSettings.ollamaUrl,
+      model, input: text
+    });
+    if (myGen !== rt.generation) return;
+    const first = (res && Array.isArray(res.embeddings) && res.embeddings[0]) || null;
+    if (first) {
+      // Stash the vector on params._vec; the output port reads from
+      // there. We keep the shape metadata + a meta blob so downstream
+      // consumers (Tektite MD / LLM-from-scratch) can identify the
+      // provenance.
+      node.params = node.params || {};
+      node.params._vec = {
+        data:  new Float32Array(first),
+        shape: [first.length],
+        dtype: "f32",
+        meta:  { source: "ollama-embed", model }
+      };
+      node.params.dim = first.length;
+      node.params.done = 1;
+    }
+    if (rt.body) {
+      rt.body.append("embedded " + text.length + " chars → " +
+        (first ? first.length : 0) + "-dim vector");
+      rt.body.finalize();
+    }
+  } catch (err) {
+    if (myGen === rt.generation) _llmMarkError(node, rt, (err && err.message) || String(err));
+  } finally {
+    if (myGen === rt.generation) rt.streaming = false;
+  }
+}
+
+/* Per-frame tick. Walks every llm-sink node, detects trigger rising
+ * edges, kicks off the appropriate Ollama call. Also clears the
+ * `done` gate after a one-tick pulse so downstream `done` consumers
+ * see the rising edge but not a stuck-high gate.
+ *
+ * Called from src/visual/render-loop.js's _visualRenderTick(). */
+function _tickLLMRuntime(dtSec) {
+  if (!state || !Array.isArray(state.nodes)) return;
+  for (const n of state.nodes) {
+    if (!n || !n.type) continue;
+    const def = (typeof TYPES === "object") ? TYPES[n.type] : null;
+    if (!def) continue;
+    if (def.kind !== "llm-sink") continue;
+    n.params = n.params || {};
+    const rt = _llmGetState(n.id);
+
+    // Detect rising edge -> kick fetch (only if not already streaming).
+    if (_llmDetectTrigger(n, rt) && !rt.streaming) {
+      // One-tick `done` pulses get cleared here so a re-trigger starts
+      // clean. (Stale done from a prior run wouldn't actually break
+      // anything, but it's tidier.)
+      n.params.done = 0;
+      if (n.type === "LLMChat")     _llmKickChat(n, rt);
+      else if (n.type === "LLMGenerate") _llmKickGenerate(n, rt);
+      else if (n.type === "LLMEmbed")    _llmKickEmbed(n, rt);
+    } else if (n.params.done === 1) {
+      // Clear the done pulse one tick after it was set, so a downstream
+      // gate sees the rising edge exactly once.
+      n.params.done = 0;
+    }
   }
 }
 /* =========================================================================
@@ -91758,6 +92210,11 @@ function renderVisualFrame() {
   // Lazy-wires its own keyboard listener on first use; no-op when no
   // game-input nodes are in the patch.
   _tickGameInputs(dtSec);
+  // Phase B sprint 4 -- LLM sink nodes (LLMChat / LLMGenerate / LLMEmbed).
+  // Detects rising edges on their `trigger` gates and kicks the async
+  // Ollama fetch. Streams tokens into the node body. No-op when no
+  // llm-sink nodes are in the patch.
+  _tickLLMRuntime(dtSec);
   // §5.5.g -- HUD overlays. Minimap is the first; future Compass /
   // HealthBar / Inventory will plug in here as separate functions.
   // Each renders only when its driving node exists in the patch.

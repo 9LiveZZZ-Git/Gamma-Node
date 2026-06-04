@@ -126,6 +126,11 @@ function renderVisualFrame() {
   // Lazy-wires its own keyboard listener on first use; no-op when no
   // game-input nodes are in the patch.
   _tickGameInputs(dtSec);
+  // Phase B sprint 4 -- LLM sink nodes (LLMChat / LLMGenerate / LLMEmbed).
+  // Detects rising edges on their `trigger` gates and kicks the async
+  // Ollama fetch. Streams tokens into the node body. No-op when no
+  // llm-sink nodes are in the patch.
+  _tickLLMRuntime(dtSec);
   // §5.5.g -- HUD overlays. Minimap is the first; future Compass /
   // HealthBar / Inventory will plug in here as separate functions.
   // Each renders only when its driving node exists in the patch.
