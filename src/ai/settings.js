@@ -291,31 +291,12 @@ function buildPrompt(mode, userText, currentSource) {
  * a simpler non-streaming code path.
  * --------------------------------------------------------------------- */
 
-async function readSSE(response, onEvent) {
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    // SSE events are separated by \n\n. Each event has one or more lines
-    // prefixed with "data: " (we ignore "event:" and "id:" for simplicity).
-    let nl;
-    while ((nl = buffer.indexOf("\n\n")) >= 0) {
-      const block = buffer.slice(0, nl);
-      buffer = buffer.slice(nl + 2);
-      block.split("\n").forEach(line => {
-        if (line.startsWith("data: ")) {
-          const data = line.slice(6);
-          if (data === "[DONE]") return;
-          try { onEvent(JSON.parse(data)); }
-          catch (e) { /* skip malformed event */ }
-        }
-      });
-    }
-  }
-}
+// Phase A.2 — SSE reader extracted to src/ai/streaming.js so the Ollama
+// provider (NDJSON) and the LLM-from-scratch Generate node can share a
+// uniform reader API. `readSSE` kept here as a thin alias so any
+// external callers (older code paths that touched this file by name)
+// still resolve. New code should call streamSSEEvents directly.
+const readSSE = streamSSEEvents;
 
 const PROVIDERS = {
   anthropic: {

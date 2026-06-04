@@ -848,6 +848,30 @@
   .port.connected.environment { background: var(--environment); border-style: solid; }
   .port.connected.vector      { background: var(--vector);   border-style: solid; }
   .port.connected.llm-attn    { background: var(--llm-attn); border-style: solid; }
+
+  /* Phase A.2 — token-stream node body output area. Used by
+   * createTokenStreamBody (src/ui/node-bodies.js). Mono font, soft
+   * cyan accent, wraps inside the node body. The blinking cursor is
+   * a ::after pseudo-element that auto-hides when the consumer calls
+   * finalize() (which adds the .tk-stream-done class). */
+  .tk-stream {
+    display: inline;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    line-height: 1.35;
+    color: var(--info);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .tk-stream::after {
+    content: "▍";
+    color: var(--accent);
+    margin-left: 1px;
+    animation: tk-stream-cursor 700ms steps(2, end) infinite;
+  }
+  .tk-stream-done::after { content: ""; animation: none; }
+  @keyframes tk-stream-cursor { 50% { opacity: 0; } }
+
   .port:hover { transform: translateY(-50%) scale(1.4); }
   /* Live snap target during a wire drag — when the dragged endpoint
    * is within a screen-radius of a type-compatible input port, that
@@ -8097,7 +8121,7 @@
  * Pages deploy workflow (.github/workflows/pages.yml). The string
  * after the equals sign is what the workflow's sed targets — don't
  * change the format of this line. */
-const APP_VERSION = "0.3.690";
+const APP_VERSION = "0.3.691";
 
 /* =========================================================================
  * Node kinds — runtime-only kind registry
@@ -28072,6 +28096,22 @@ const CATEGORY_ORDER = [
   "Physics", "Game", "UI", "Sprite",
   // Visual FX / compositing
   "Source", "Generator", "Composite",
+  // Phase A.2 — LLM + knowledge-management subcategories.
+  // Slash-separated names are kept as flat category strings today; the
+  // browser falls through to _brCatMeta defaults for unknown bins, then
+  // displays them as discrete rails in the palette. A future polish
+  // sprint may render the `X/Y` pattern as nested groups.
+  //   AI/LLM   = Ollama chat / generate / model select / system prompt.
+  //   AI/Embed = Ollama embedding nodes; Tektite MD embedder consumers.
+  //   AI/Viz   = AI-side visualizations (vision overlays, embedding maps).
+  //   LLM/Build, LLM/Train, LLM/Viz = the from-scratch transformer node
+  //                                   families (data / embeddings /
+  //                                   attention / transformer block /
+  //                                   training / inference / viz).
+  //   Notes    = Tektite MD note-source / corpus / query nodes.
+  "AI/LLM", "AI/Embed", "AI/Viz",
+  "LLM/Build", "LLM/Train", "LLM/Viz",
+  "Notes",
   // Misc + legacy "Visual" catch-all (kept for any stragglers)
   "AI", "Visual", "Sink", "User DSP"
 ];
@@ -34276,6 +34316,14 @@ const _BR_CAT_META = {
   Composite:  { ref: "42", tag: "fx · masks · keying · color" },
   // Misc
   AI:         { ref: "50", tag: "vision · ML · landmarks" },
+  // Phase A.2 -- LLM + knowledge subcategories (docs/LLM-KNOWLEDGE-PHASE.md §3.A.2)
+  "AI/LLM":   { ref: "51", tag: "chat · generate · model" },
+  "AI/Embed": { ref: "52", tag: "vector · similarity" },
+  "AI/Viz":   { ref: "53", tag: "ai overlays · maps" },
+  "LLM/Build":{ ref: "60", tag: "tokenizer · embedding · attention" },
+  "LLM/Train":{ ref: "61", tag: "loss · optimizer · dataset" },
+  "LLM/Viz":  { ref: "62", tag: "attention 3d · loss · grad flow" },
+  Notes:      { ref: "70", tag: "tektite md · corpus · query" },
   "User DSP": { ref: "98", tag: ".gdsp · community" },
   Sink:       { ref: "99", tag: "output" },
 };
@@ -51904,6 +51952,162 @@ renderUdspList();
 renderPalette();
 
 /* =========================================================================
+ * Streaming response readers — SSE + NDJSON
+ *
+ * Phase A.2 of the LLM + knowledge-management roadmap branch
+ * (docs/LLM-KNOWLEDGE-PHASE.md §3.A.2).
+ *
+ * Generalizes the per-provider streaming readers that have been
+ * accumulating in src/ai/settings.js (Anthropic SSE, Gemma chunked,
+ * Whisper progress). Phase B (Ollama) needs NDJSON streaming; Phase D
+ * (LLM-from-scratch) needs a uniform iterator for in-house Generate
+ * nodes. Both end up here.
+ *
+ * Two formats supported:
+ *
+ *   SSE (Server-Sent Events) — Anthropic, OpenAI, Cohere, most cloud LLMs.
+ *     Events separated by blank lines (\n\n). Each event has one or
+ *     more lines prefixed with "data: ". A line with the literal
+ *     "data: [DONE]" terminates the stream. Other line prefixes
+ *     ("event:", "id:", "retry:") are ignored — we don't need them.
+ *
+ *   NDJSON (Newline-Delimited JSON) — Ollama, llama.cpp server, many
+ *     local-native providers. Each line is one self-contained JSON
+ *     object. No terminator sentinel — stream ends when the response
+ *     body ends. Malformed lines are skipped.
+ *
+ * Each format ships in two flavors:
+ *
+ *   streamSSEEvents(response, onEvent)
+ *   streamNDJSONEvents(response, onEvent)
+ *     Callback form. Drop-in replacement for the legacy `readSSE` in
+ *     settings.js. Returns a Promise that resolves when the stream
+ *     ends. onEvent is called synchronously per parsed event.
+ *
+ *   streamTokens(response, { format, field })
+ *     Async generator form. `for await (const tok of streamTokens(...))`.
+ *     `field` is a dotted path into each parsed event whose value is
+ *     yielded as a token string. Events where the path is absent are
+ *     silently skipped (lets the same iterator handle metadata-only
+ *     events like Anthropic's "message_start" interleaved with
+ *     "content_block_delta").
+ *
+ * Both forms use a TextDecoder with `{ stream: true }` so multi-byte
+ * UTF-8 sequences split across chunk boundaries decode correctly.
+ *
+ * No error swallowing for network errors — those propagate through
+ * the underlying response.body reader. Only JSON-parse errors on
+ * individual events are caught (and the bad event skipped), so one
+ * malformed event doesn't kill the rest of the stream.
+ * ======================================================================== */
+
+async function streamSSEEvents(response, onEvent) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let nl;
+    while ((nl = buffer.indexOf("\n\n")) >= 0) {
+      const block = buffer.slice(0, nl);
+      buffer = buffer.slice(nl + 2);
+      const lines = block.split("\n");
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        const data = line.slice(6);
+        if (data === "[DONE]") return;
+        try { onEvent(JSON.parse(data)); }
+        catch (_) { /* skip malformed event */ }
+      }
+    }
+  }
+}
+
+async function streamNDJSONEvents(response, onEvent) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      // Flush any trailing line without a newline (some servers omit
+      // the final \n). Skip if empty / whitespace-only.
+      const tail = buffer.trim();
+      if (tail) {
+        try { onEvent(JSON.parse(tail)); } catch (_) {}
+      }
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    let nl;
+    while ((nl = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, nl).trim();
+      buffer = buffer.slice(nl + 1);
+      if (!line) continue;
+      try { onEvent(JSON.parse(line)); }
+      catch (_) { /* skip malformed line */ }
+    }
+  }
+}
+
+/* Resolve a dotted-path on an object. "delta.text" on
+ * { delta: { text: "hi" } } -> "hi". Missing intermediates yield
+ * undefined. */
+function _streamFieldAt(obj, path) {
+  if (!obj || !path) return undefined;
+  const parts = path.split(".");
+  let cur = obj;
+  for (const p of parts) {
+    if (cur == null) return undefined;
+    cur = cur[p];
+  }
+  return cur;
+}
+
+/* Async generator: yields tokens (string fragments) from a streaming
+ * response. `opts.format` is "sse" or "ndjson"; `opts.field` is a
+ * dotted path into each parsed event whose value (if a string) is
+ * yielded. Events lacking the field are silently passed over. */
+async function* streamTokens(response, opts) {
+  const format = (opts && opts.format) || "sse";
+  const field = (opts && opts.field) || "delta.text";
+
+  // The Events callback funnels into a queue that the generator drains.
+  // This is the simplest bridge between the imperative reader and the
+  // async-iteration consumer. Backpressure is implicit: the reader
+  // awaits the queue's drain via `nextResolved`.
+  const queue = [];
+  let done = false;
+  let waiter = null;
+
+  const wakeup = () => {
+    if (waiter) { const w = waiter; waiter = null; w(); }
+  };
+  const onEvent = (ev) => {
+    const v = _streamFieldAt(ev, field);
+    if (typeof v === "string") {
+      queue.push(v);
+      wakeup();
+    }
+  };
+
+  const fn = format === "ndjson" ? streamNDJSONEvents : streamSSEEvents;
+  const reading = fn(response, onEvent).then(() => { done = true; wakeup(); });
+
+  while (true) {
+    if (queue.length) {
+      yield queue.shift();
+    } else if (done) {
+      await reading;  // surface any reader errors
+      return;
+    } else {
+      await new Promise(r => { waiter = r; });
+    }
+  }
+}
+/* =========================================================================
  * AI assistant for .gdsp authoring
  *
  * Architecture:
@@ -52196,31 +52400,12 @@ function buildPrompt(mode, userText, currentSource) {
  * a simpler non-streaming code path.
  * --------------------------------------------------------------------- */
 
-async function readSSE(response, onEvent) {
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    // SSE events are separated by \n\n. Each event has one or more lines
-    // prefixed with "data: " (we ignore "event:" and "id:" for simplicity).
-    let nl;
-    while ((nl = buffer.indexOf("\n\n")) >= 0) {
-      const block = buffer.slice(0, nl);
-      buffer = buffer.slice(nl + 2);
-      block.split("\n").forEach(line => {
-        if (line.startsWith("data: ")) {
-          const data = line.slice(6);
-          if (data === "[DONE]") return;
-          try { onEvent(JSON.parse(data)); }
-          catch (e) { /* skip malformed event */ }
-        }
-      });
-    }
-  }
-}
+// Phase A.2 — SSE reader extracted to src/ai/streaming.js so the Ollama
+// provider (NDJSON) and the LLM-from-scratch Generate node can share a
+// uniform reader API. `readSSE` kept here as a thin alias so any
+// external callers (older code paths that touched this file by name)
+// still resolve. New code should call streamSSEEvents directly.
+const readSSE = streamSSEEvents;
 
 const PROVIDERS = {
   anthropic: {
@@ -52974,6 +53159,116 @@ aiPromptEl.addEventListener("keydown", e => {
   }
 });
 
+/* =========================================================================
+ * Node body renderers — streaming token output
+ *
+ * Phase A.2 of the LLM + knowledge-management roadmap branch
+ * (docs/LLM-KNOWLEDGE-PHASE.md §3.A.2).
+ *
+ * A generic component that gives a node body a live, token-streamed
+ * text area. Phase B Ollama LLMChat / LLMGenerate consume it; Phase D
+ * Generate / Chat / StreamingGenerate consume it; Tektite MD's
+ * AI-assist-over-selection consumes it.
+ *
+ * Design:
+ *
+ *   createTokenStreamBody(container, opts) returns
+ *     { append(token), clear(), finalize(), el, isStreaming }
+ *
+ *   Each append() coalesces into a single rAF flush per frame. This
+ *   matters because some providers (Ollama at low latency, in-house
+ *   Generate at fast sampling) emit 100+ tokens/sec; flushing the DOM
+ *   per token thrashes layout and drops frames. One rAF tick =
+ *   ≤16.7 ms at 60 Hz, so the user-perceived stream rate caps at the
+ *   monitor refresh rate, which is what we want — anything faster is
+ *   wasted work the user can't see anyway.
+ *
+ *   Backpressure: append() never awaits. Callers can fire tokens as
+ *   fast as the stream delivers them; the rAF coalesce + the queue
+ *   inside ai/streaming.js's streamTokens() iterator handle the rest.
+ *
+ *   finalize() flushes any pending tokens immediately (no rAF wait)
+ *   and tags the element with the .tk-stream-done class so a final
+ *   styling tweak can mark "stream complete" (cursor blink off, etc.).
+ *
+ * The mock helper at the bottom of this file (mockTokenStream) is
+ * the Phase A.2 verification path: it's a pure async-generator that
+ * a console caller can wire to createTokenStreamBody to prove the
+ * pipeline works end-to-end without needing a real LLM backend.
+ * Once Phase B ships, the same node bodies are driven by Ollama
+ * NDJSON streams via ai/streaming.js streamTokens().
+ * ======================================================================== */
+
+function createTokenStreamBody(container, opts) {
+  const className = (opts && opts.className) || "tk-stream";
+  let pending = "";
+  let scheduled = false;
+  let active = true;
+
+  const el = document.createElement("span");
+  el.className = className;
+  container.appendChild(el);
+
+  function flush() {
+    scheduled = false;
+    if (!pending) return;
+    // textContent assignment is cheaper than innerHTML because there
+    // is no HTML parser pass — and we never want streamed text
+    // interpreted as markup anyway (XSS-safe by construction).
+    el.textContent += pending;
+    pending = "";
+  }
+
+  return {
+    el,
+    get isStreaming() { return active; },
+    append(token) {
+      if (!active) return;
+      if (typeof token !== "string") return;
+      pending += token;
+      if (!scheduled) {
+        scheduled = true;
+        requestAnimationFrame(flush);
+      }
+    },
+    clear() {
+      pending = "";
+      el.textContent = "";
+    },
+    finalize() {
+      if (!active) return;
+      active = false;
+      // Flush immediately rather than waiting on the next rAF; the
+      // stream is done so we want the final tokens visible now.
+      flush();
+      el.classList.add(className + "-done");
+    }
+  };
+}
+
+/* Mock token stream for Phase A.2 verification.
+ *
+ * Usage from the browser console:
+ *   const c = document.createElement("div");
+ *   document.body.appendChild(c);
+ *   const body = createTokenStreamBody(c);
+ *   for await (const t of mockTokenStream("Hello world streaming test"))
+ *     body.append(t);
+ *   body.finalize();
+ *
+ * Splits the input on word + whitespace boundaries (the regex captures
+ * groups preserve the whitespace too), so the output reads naturally
+ * rather than collapsing to one chunk-per-word. Default 30 ms/token =
+ * ~33 tokens/sec, similar to a fast local Ollama model on a warm
+ * cache. */
+async function* mockTokenStream(text, perTokenMs) {
+  perTokenMs = (typeof perTokenMs === "number" && perTokenMs >= 0) ? perTokenMs : 30;
+  const tokens = String(text).split(/(\s+)/);
+  for (const tok of tokens) {
+    if (perTokenMs > 0) await new Promise(r => setTimeout(r, perTokenMs));
+    yield tok;
+  }
+}
 /* =========================================================================
  * Canvas tools: Select / Draw  + ink-layer capture
  *

@@ -77,6 +77,14 @@ const _BR_CAT_META = {
   Composite:  { ref: "42", tag: "fx · masks · keying · color" },
   // Misc
   AI:         { ref: "50", tag: "vision · ML · landmarks" },
+  // Phase A.2 -- LLM + knowledge subcategories (docs/LLM-KNOWLEDGE-PHASE.md §3.A.2)
+  "AI/LLM":   { ref: "51", tag: "chat · generate · model" },
+  "AI/Embed": { ref: "52", tag: "vector · similarity" },
+  "AI/Viz":   { ref: "53", tag: "ai overlays · maps" },
+  "LLM/Build":{ ref: "60", tag: "tokenizer · embedding · attention" },
+  "LLM/Train":{ ref: "61", tag: "loss · optimizer · dataset" },
+  "LLM/Viz":  { ref: "62", tag: "attention 3d · loss · grad flow" },
+  Notes:      { ref: "70", tag: "tektite md · corpus · query" },
   "User DSP": { ref: "98", tag: ".gdsp · community" },
   Sink:       { ref: "99", tag: "output" },
 };
