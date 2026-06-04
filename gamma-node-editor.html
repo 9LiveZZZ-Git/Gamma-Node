@@ -8190,7 +8190,7 @@
  * Pages deploy workflow (.github/workflows/pages.yml). The string
  * after the equals sign is what the workflow's sed targets — don't
  * change the format of this line. */
-const APP_VERSION = "0.3.701";
+const APP_VERSION = "0.3.702";
 
 /* =========================================================================
  * Node kinds — runtime-only kind registry
@@ -52314,8 +52314,18 @@ const OLLAMA_CLOUD_DEFAULT_MODEL = "gpt-oss:120b-cloud";
 const OLLAMA_DEFAULT_EMBED_MODEL = "nomic-embed-text";
 
 function _resolveOllamaBase(baseUrl) {
-  const u = String(baseUrl || "").trim().replace(/\/+$/, "");
-  return u || OLLAMA_LOCAL_DEFAULT_URL;
+  let u = String(baseUrl || "").trim().replace(/\/+$/, "");
+  if (!u) return OLLAMA_LOCAL_DEFAULT_URL;
+  // Phase B sprint 3 fix -- if the user pasted just "127.0.0.1:11434" or
+  // "192.168.1.42:11434" without a scheme, fetch() would treat it as a
+  // RELATIVE path and resolve against the editor's origin
+  // (https://...github.io/127.0.0.1:11434/api/version), which returns
+  // the editor host's 404 HTML page instead of the Ollama API. Prepend
+  // http:// so the URL is absolute. (We never default to https:// -- a
+  // local Ollama daemon binds plain http; cloud Ollama callers pass the
+  // explicit https://ollama.com base url separately.)
+  if (!/^https?:\/\//i.test(u)) u = "http://" + u;
+  return u;
 }
 
 function _ollamaHeaders(key) {
@@ -52334,10 +52344,24 @@ async function _ollamaFetch(path, opts) {
   });
   if (!res.ok) {
     let detail = "";
-    try { detail = (await res.text()).slice(0, 200); } catch (_) {}
+    let bodyLooksHtml = false;
+    try {
+      const txt = await res.text();
+      detail = txt.slice(0, 200);
+      bodyLooksHtml = /^\s*<!doctype html|^\s*<html/i.test(txt);
+    } catch (_) {}
     const tag = (opts.baseUrl && /^https?:\/\/ollama\.com/i.test(opts.baseUrl))
       ? "Ollama Cloud"
       : "Ollama";
+    // Phase B sprint 3 fix -- a HTML body on /api/version is a strong
+    // signal that the URL didn't reach Ollama at all (Ollama always
+    // returns JSON). Most common cause: the user pasted a URL without
+    // an http:// scheme so fetch resolved it against the editor's origin
+    // and got back the editor host's 404 page. Surface a hint inline so
+    // they don't have to dig through DevTools to find the cause.
+    if (bodyLooksHtml) {
+      throw new Error(`${tag} ${path} ${res.status}: got HTML response (probably wrong URL — request likely hit the editor's host, not Ollama). Resolved URL: ${url}`);
+    }
     throw new Error(`${tag} ${path} ${res.status}: ${detail || res.statusText}`);
   }
   return res;
