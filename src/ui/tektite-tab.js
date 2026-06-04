@@ -28,16 +28,33 @@
  * ======================================================================== */
 
 const _tektiteTabState = {
-  attached:     false,
-  notes:        [],     // current source's listing
-  activeSource: "vault",
-  filterText:   "",
-  listEl:       null,
-  countEl:      null,
-  filterInput:  null,
-  sourceRailEl: null,
-  saveToVaultBtnEl: null
+  attached:        false,
+  notes:           [],     // current source's listing
+  activeSource:    "vault",
+  filterText:      "",
+  listEl:          null,
+  countEl:         null,
+  filterInput:     null,
+  sourceRailEl:    null,
+  saveToVaultBtnEl: null,
+  fullscreen:      false
 };
+
+/* Phase C sprint tektite-1.5b -- fullscreen toggle. Adds a body
+ * class that the CSS uses to pin #br-view-tektite over the canvas
+ * area. Bigger editor + the note list moves to a left rail. */
+function _tektiteTabSetFullscreen(on) {
+  const s = _tektiteTabState;
+  s.fullscreen = !!on;
+  document.body.classList.toggle("tektite-fullscreen", s.fullscreen);
+  const btn = document.getElementById("btn-tektite-fullscreen");
+  if (btn) {
+    btn.textContent = s.fullscreen ? "⤡ Collapse" : "⤢ Expand";
+    btn.title = s.fullscreen
+      ? "Return Tektite to the sidebar"
+      : "Expand Tektite to fill the editor area";
+  }
+}
 
 async function _tektiteTabRefresh() {
   const s = _tektiteTabState;
@@ -117,13 +134,15 @@ function _tektiteTabRender() {
       : filtered.length + " / " + s.notes.length + " notes";
   }
 
-  // Toggle the "+ New note" button -- only vault is writable.
+  // Toggle the "+ New note" button -- vault always works; remote sources
+  // only when they're writable (FS handle present / GH token present).
   const newBtn = document.getElementById("btn-tektite-new");
   if (newBtn) {
-    newBtn.disabled = (s.activeSource !== "vault");
-    newBtn.title = newBtn.disabled
-      ? "New notes can only be created in the Vault. Switch to Vault, or import a remote note via 'Save to vault'."
-      : "Create a new note in the Vault";
+    const writable = tektiteSourceIsWritable(s.activeSource);
+    newBtn.disabled = !writable;
+    newBtn.title = writable
+      ? ("Create a new note in this source (" + writable + ")")
+      : "This source isn't writable. Switch to a writable source or reconnect.";
   }
 
   if (!filtered.length) {
@@ -138,9 +157,10 @@ function _tektiteTabRender() {
     return;
   }
 
-  const currentId = tektiteEditorCurrentNoteId();
+  const currentId     = tektiteEditorCurrentNoteId();
+  const currentSource = tektiteEditorCurrentSourceId();
   const html = filtered.map(n => {
-    const isActive = (n.id === currentId);
+    const isActive = (n.id === currentId && currentSource === s.activeSource);
     const title    = _tektiteEscapeHtml(n.title || n.id);
     const ts       = n.modifiedAt ? _tektiteFormatRelativeTime(n.modifiedAt) : "";
     const path     = (s.activeSource === "vault") ? "" : `<span class="tektite-note-path">${_tektiteEscapeHtml(n.path || "")}</span>`;
@@ -151,17 +171,27 @@ function _tektiteTabRender() {
   }).join("");
   s.listEl.innerHTML = html;
 
-  // Bind click handlers -- different for vault vs. remote sources.
+  // Source-aware click + contextmenu wiring.
   s.listEl.querySelectorAll(".tektite-note-item").forEach(el => {
     const id = el.getAttribute("data-id");
     el.addEventListener("click", async () => {
-      if (s.activeSource === "vault") {
-        await tektiteEditorLoad(id);
-        _tektiteTabRender();
-      } else {
-        await _tektiteTabLoadRemote(id);
+      await tektiteEditorLoadFromSource(s.activeSource, id);
+      // Show/hide the "Save to vault" button -- only meaningful when
+      // the user wants a local copy of a remote note. With write back
+      // working now, this is a "fork to vault" affordance rather than
+      // a way to enable editing.
+      if (s.saveToVaultBtnEl) {
+        const showFork = (s.activeSource !== "vault");
+        s.saveToVaultBtnEl.style.display = showFork ? "inline-block" : "none";
+        if (showFork) {
+          s.saveToVaultBtnEl._sourceId = s.activeSource;
+          s.saveToVaultBtnEl._fileId   = id;
+        }
       }
+      _tektiteTabRender();
     });
+    // Right-click delete -- only for the vault for now. Local-fs and
+    // GitHub deletion via the API is a sprint tektite-2 follow-up.
     if (s.activeSource === "vault") {
       el.addEventListener("contextmenu", (e) => {
         e.preventDefault();
@@ -170,43 +200,6 @@ function _tektiteTabRender() {
         }
       });
     }
-  });
-}
-
-/* Load a remote note into the editor in read-only mode + reveal the
- * "Save to vault" button. Reading from a freshly-connected GitHub
- * source warms the file cache lazily; subsequent loads are fast. */
-async function _tektiteTabLoadRemote(fileId) {
-  const s = _tektiteTabState;
-  const titleInput = document.getElementById("tektite-title");
-  const textarea   = document.getElementById("tektite-editor");
-  const note = s.notes.find(n => n.id === fileId);
-  if (titleInput) {
-    titleInput.value = note ? (note.title || fileId) : fileId;
-    titleInput.disabled = true;  // read-only
-  }
-  if (textarea) {
-    textarea.value = "Loading…";
-    textarea.disabled = true;
-  }
-  try {
-    const content = await tektiteSourceGetContent(s.activeSource, fileId);
-    if (textarea) textarea.value = content || "";
-  } catch (e) {
-    if (textarea) textarea.value = "⚠ Failed to load: " + (e.message || e);
-  }
-  // Wire the "Save to vault" affordance.
-  if (s.saveToVaultBtnEl) {
-    s.saveToVaultBtnEl.style.display = "inline-block";
-    s.saveToVaultBtnEl.disabled = false;
-    s.saveToVaultBtnEl._sourceId = s.activeSource;
-    s.saveToVaultBtnEl._fileId   = fileId;
-  }
-  // Highlight in list -- we don't use editor's currentId for remote
-  // notes (the editor stays in "not loaded" state) so highlight by
-  // tagging the list manually.
-  s.listEl.querySelectorAll(".tektite-note-item").forEach(el => {
-    el.classList.toggle("active", el.getAttribute("data-id") === fileId);
   });
 }
 
@@ -231,22 +224,20 @@ function _tektiteFormatRelativeTime(ms) {
 
 async function _tektiteTabCreate() {
   const s = _tektiteTabState;
-  if (s.activeSource !== "vault") {
-    window.alert("New notes can only be created in the Vault. Switch to the Vault chip first.");
+  if (!tektiteSourceIsWritable(s.activeSource)) {
+    window.alert("This source isn't writable. Switch to a writable source first.");
     return;
   }
-  const base = "Untitled note";
-  const id = await tektiteNextAvailableSlug(base);
-  await tektitePutNote({
-    id,
-    title: base,
-    content: "# " + base + "\n\n"
-  });
-  await _tektiteTabRefresh();
-  await tektiteEditorLoad(id);
-  _tektiteTabRender();
-  const titleInput = document.getElementById("tektite-title");
-  if (titleInput) { titleInput.focus(); titleInput.select(); }
+  try {
+    const newId = await tektiteSourceCreateNote(s.activeSource, "Untitled note");
+    await _tektiteTabRefresh();
+    await tektiteEditorLoadFromSource(s.activeSource, newId);
+    _tektiteTabRender();
+    const titleInput = document.getElementById("tektite-title");
+    if (titleInput && s.activeSource === "vault") { titleInput.focus(); titleInput.select(); }
+  } catch (e) {
+    window.alert("Create failed: " + (e.message || String(e)));
+  }
 }
 
 async function _tektiteTabDelete(id) {
@@ -347,21 +338,37 @@ function tektiteTabAttach() {
     });
   }
 
-  // Editor wiring (vault writes only).
+  // Editor wiring -- now source-aware (vault + local-fs + github writes).
   const editorRoot = document.getElementById("tektite-editor-pane");
   if (editorRoot) tektiteEditorAttach(editorRoot);
 
-  // When a vault save happens, refresh the listing IF we're on vault.
+  // On save, refresh the listing IF the saved note is from the
+  // currently-active source (so the just-saved note bubbles to the top
+  // with the fresh modifiedAt stamp). Cross-source saves are silent
+  // here; their lists refresh on next tab activation.
   tektiteEditorOnSave((record) => {
-    if (s.activeSource !== "vault") return;
-    const idx = s.notes.findIndex(n => n.id === record.id);
+    if (!record || record.sourceId !== s.activeSource) return;
+    const idx = s.notes.findIndex(n => n.id === record.fileId);
     const listingEntry = {
-      id: record.id, title: record.title, path: record.id,
-      modifiedAt: record.modifiedAt, sourceId: "vault"
+      id:         record.fileId,
+      title:      record.title,
+      path:       record.fileId,
+      modifiedAt: record.modifiedAt,
+      sourceId:   record.sourceId
     };
     if (idx >= 0) s.notes.splice(idx, 1);
     s.notes.unshift(listingEntry);
     _tektiteTabRender();
+  });
+
+  // Fullscreen toggle.
+  const fsBtn = document.getElementById("btn-tektite-fullscreen");
+  if (fsBtn) {
+    fsBtn.addEventListener("click", () => _tektiteTabSetFullscreen(!s.fullscreen));
+  }
+  // Esc collapses fullscreen.
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && s.fullscreen) _tektiteTabSetFullscreen(false);
   });
 
   // Connect-modal wiring.

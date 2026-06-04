@@ -210,9 +210,132 @@ async function tektiteSourceGetContent(sourceId, fileId) {
     return await _tektiteReadLocalFile(src.handle, fileId);
   }
   if (src.type === "github") {
-    return await _tektiteFetchGithubFile(src.repo, fileId, src.token);
+    const cached = (src.fileCache || []).find(f => f.path === fileId);
+    const content = await _tektiteFetchGithubFile(src.repo, fileId, src.token);
+    // Cache sha alongside the listing entry so a later write can pass
+    // the latest known sha (GitHub's PUT requires it on existing files
+    // to avoid blind overwrites).
+    if (cached && !cached.sha) {
+      try {
+        const meta = await _tektiteFetchGithubMeta(src.repo, fileId, src.token);
+        cached.sha = meta && meta.sha;
+      } catch (_) {}
+    }
+    return content;
   }
   throw new Error("Unsupported source type: " + src.type);
+}
+
+/* Sprint tektite-1.5b -- write back to the source. Vault writes hit
+ * tektitePutNote directly; local-fs uses the FS Access API (which
+ * needs explicit readwrite permission, granted lazily on first save);
+ * GitHub PUTs to the Contents API (creates a new file if `fileId`
+ * doesn't exist yet, updates with sha if it does). Returns
+ * { ok, id, message? } -- id is the (possibly new) file path so the
+ * UI can update its currentId after a rename.
+ *
+ * For GitHub: requires a PAT with `contents:write` scope. The PAT
+ * is stored in localStorage; the deferred secrets-manager sprint
+ * (docs/LLM-KNOWLEDGE-PHASE.md §12) will harden this. */
+async function tektiteSourceWriteContent(sourceId, fileId, content, opts) {
+  opts = opts || {};
+  const src = tektiteSourcesGet(sourceId);
+  if (!src) throw new Error("Source not found: " + sourceId);
+
+  if (src.type === "vault") {
+    const existing = await tektiteGetNote(fileId);
+    const rec = await tektitePutNote({
+      id: fileId,
+      title: opts.title || (existing && existing.title) || fileId,
+      content,
+      createdAt: existing && existing.createdAt
+    });
+    return { ok: true, id: rec.id };
+  }
+
+  if (src.type === "local-fs") {
+    if (!src.handle) throw new Error("Source disconnected. Remove and re-add to reconnect.");
+    // Ensure readwrite permission. First save in a session prompts the user.
+    const perm = await _tektiteEnsureFsReadWrite(src.handle);
+    if (perm !== "granted") throw new Error("Write permission denied for this folder.");
+    await _tektiteWriteLocalFile(src.handle, fileId, content);
+    // Bust the file cache so the next list reflects the new modifiedAt.
+    src.fileCache = null;
+    return { ok: true, id: fileId };
+  }
+
+  if (src.type === "github") {
+    if (!src.token) throw new Error("This GitHub source has no PAT. Disconnect and re-add with a token that has contents:write scope.");
+    const result = await _tektiteWriteGithubFile(src.repo, fileId, content, src.token, {
+      message: opts.message || ("Update " + fileId.split("/").pop() + " via Gamma Node editor"),
+      sha: opts.sha  // caller can pass a known sha; otherwise we fetch it
+    });
+    // Refresh the cached entry's sha so the next write doesn't need a pre-GET.
+    const cached = (src.fileCache || []).find(f => f.path === fileId);
+    if (cached && result && result.content && result.content.sha) {
+      cached.sha = result.content.sha;
+    }
+    return { ok: true, id: fileId };
+  }
+
+  throw new Error("Unsupported source type for write: " + src.type);
+}
+
+/* Sprint tektite-1.5b -- create a brand-new file in a writable
+ * source.  For vault, just slugs the title.  For local-fs, writes a
+ * fresh .md file.  For GitHub, PUT-creates a file (no sha required
+ * since it's new).  Returns the new fileId so the UI can navigate. */
+async function tektiteSourceCreateNote(sourceId, title, content) {
+  const src = tektiteSourcesGet(sourceId);
+  if (!src) throw new Error("Source not found: " + sourceId);
+  const base = String(title || "Untitled note").trim() || "Untitled note";
+
+  if (src.type === "vault") {
+    const id = await tektiteNextAvailableSlug(base);
+    await tektitePutNote({ id, title: base, content: content || "# " + base + "\n\n" });
+    return id;
+  }
+  if (src.type === "local-fs") {
+    if (!src.handle) throw new Error("Source disconnected.");
+    const perm = await _tektiteEnsureFsReadWrite(src.handle);
+    if (perm !== "granted") throw new Error("Write permission denied.");
+    const fname = tektiteSlugify(base) + ".md";
+    // Avoid clobbering -- if it exists, append a numeric suffix.
+    let candidate = fname;
+    let n = 2;
+    while (await _tektiteLocalFileExists(src.handle, candidate)) {
+      candidate = fname.replace(/\.md$/, "") + "-" + n + ".md";
+      n++;
+      if (n > 9999) throw new Error("Couldn't allocate a fresh filename.");
+    }
+    await _tektiteWriteLocalFile(src.handle, candidate, content || "# " + base + "\n\n");
+    src.fileCache = null;
+    return candidate;
+  }
+  if (src.type === "github") {
+    if (!src.token) throw new Error("GitHub source needs a write-scoped PAT.");
+    const dir = (src.repoPath || "").replace(/^\/|\/$/g, "");
+    const fname = tektiteSlugify(base) + ".md";
+    const filePath = dir ? (dir + "/" + fname) : fname;
+    await _tektiteWriteGithubFile(src.repo, filePath, content || "# " + base + "\n\n", src.token, {
+      message: "Create " + fname + " via Gamma Node editor"
+      // no sha -- this is a fresh file
+    });
+    src.fileCache = null;
+    return filePath;
+  }
+  throw new Error("Unsupported source type for create: " + src.type);
+}
+
+/* Returns "vault" | "local-fs" | "github" if writable, else null. The
+ * UI uses this to enable/disable the New-note button per source. */
+function tektiteSourceIsWritable(sourceId) {
+  const src = tektiteSourcesGet(sourceId);
+  if (!src) return null;
+  if (src.type === "vault") return "vault";
+  if (src.type === "local-fs" && src.handle) return "local-fs";
+  if (src.type === "github" && src.token) return "github";
+  return null;
 }
 
 async function tektiteSourceImportToVault(sourceId, fileId) {
@@ -301,4 +424,107 @@ async function _tektiteFetchGithubFile(repo, filePath, token) {
   const r = await fetch(url, { headers });
   if (!r.ok) throw new Error("GitHub file fetch: HTTP " + r.status);
   return await r.text();
+}
+
+/* GET the file metadata (incl. sha) -- needed before PUT-update. The
+ * raw content endpoint doesn't return the sha; we need the JSON
+ * variant. Returns the parsed response or throws on 404. */
+async function _tektiteFetchGithubMeta(repo, filePath, token) {
+  const url = "https://api.github.com/repos/" + repo + "/contents/" + filePath;
+  const headers = { "Accept": "application/vnd.github+json" };
+  if (token) headers["Authorization"] = "Bearer " + token;
+  const r = await fetch(url, { headers });
+  if (r.status === 404) return null;  // "file doesn't exist" is a valid state
+  if (!r.ok) throw new Error("GitHub meta: HTTP " + r.status);
+  return await r.json();
+}
+
+/* Sprint tektite-1.5b -- PUT a file via the GitHub Contents API. If a
+ * `sha` is provided this updates the existing file; without `sha`
+ * GitHub will create the file (or 422 if it already exists). For
+ * editor flows we ALWAYS pre-fetch the sha to avoid the 422 surprise
+ * when the user edits an existing remote note that wasn't pre-cached. */
+async function _tektiteWriteGithubFile(repo, filePath, content, token, opts) {
+  opts = opts || {};
+  const url = "https://api.github.com/repos/" + repo + "/contents/" + filePath;
+  const headers = {
+    "Accept":        "application/vnd.github+json",
+    "Content-Type":  "application/json",
+    "Authorization": "Bearer " + token
+  };
+  // Encode the content as base64 (the API requires this).
+  const b64 = _tektiteBase64UnicodeEncode(content);
+
+  let sha = opts.sha;
+  if (sha === undefined) {
+    // Pre-fetch to find the latest sha; if 404 it's a fresh file.
+    const meta = await _tektiteFetchGithubMeta(repo, filePath, token);
+    sha = (meta && meta.sha) || undefined;
+  }
+
+  const body = { message: opts.message || "Update via Gamma Node editor", content: b64 };
+  if (sha) body.sha = sha;
+
+  const r = await fetch(url, { method: "PUT", headers, body: JSON.stringify(body) });
+  if (!r.ok) {
+    let detail = "";
+    try { detail = (await r.text()).slice(0, 200); } catch (_) {}
+    throw new Error("GitHub write: HTTP " + r.status + (detail ? (" -- " + detail) : ""));
+  }
+  return await r.json();
+}
+
+/* Base64-encode a UTF-16 string into a UTF-8 base64 payload. btoa()
+ * fails on non-Latin1 chars; the TextEncoder dance handles emoji,
+ * non-Latin scripts, and the byte-order-marky madness GitHub returns
+ * on round-trip. */
+function _tektiteBase64UnicodeEncode(str) {
+  const bytes = new TextEncoder().encode(String(str));
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
+/* Sprint tektite-1.5b -- local FS write. Resolves a nested path
+ * relative to the connected directory handle, creating intermediate
+ * directories if needed, then writes content via createWritable. */
+async function _tektiteWriteLocalFile(dirHandle, path, content) {
+  const parts = String(path || "").split("/").filter(Boolean);
+  if (!parts.length) throw new Error("Empty file path.");
+  let h = dirHandle;
+  for (let i = 0; i < parts.length - 1; i++) {
+    h = await h.getDirectoryHandle(parts[i], { create: true });
+  }
+  const fh = await h.getFileHandle(parts[parts.length - 1], { create: true });
+  const w = await fh.createWritable();
+  await w.write(content);
+  await w.close();
+}
+
+/* Check whether a top-level file exists in the source. Used by the
+ * create-note flow to allocate a non-clashing filename. */
+async function _tektiteLocalFileExists(dirHandle, filename) {
+  try {
+    await dirHandle.getFileHandle(filename, { create: false });
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+/* Permission gate. queryPermission returns "granted" | "denied" |
+ * "prompt"; we escalate from prompt to a user-facing requestPermission
+ * which shows the browser's read-write confirmation. Returns the
+ * final permission state. */
+async function _tektiteEnsureFsReadWrite(handle) {
+  if (!handle) return "denied";
+  const opts = { mode: "readwrite" };
+  if (typeof handle.queryPermission === "function") {
+    const q = await handle.queryPermission(opts);
+    if (q === "granted") return "granted";
+  }
+  if (typeof handle.requestPermission === "function") {
+    return await handle.requestPermission(opts);
+  }
+  return "denied";
 }
