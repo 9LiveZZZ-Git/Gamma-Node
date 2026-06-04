@@ -202,6 +202,57 @@ const _demos = [
       state.edges.push({ from: { node: embedJoke,  port: "vec" }, to: { node: sim, port: "a" } });
       state.edges.push({ from: { node: embedLabel, port: "vec" }, to: { node: sim, port: "b" } });
 
+      // ── In-scene text panels (sprint 8) ────────────────────────────
+      // The LLM nodes' inline bodies are visible only in editor view;
+      // in Play / VisualOutput, the canvas takes over. UILLMText nodes
+      // bridge the gap: wire any text-typed port into one and the
+      // string renders in the live overlay.
+      const jokePanel = makeNode("UILLMText", 1440, 200, {
+        x: -120, y: 140,
+        width: 460, height: 170,
+        corner: "center",
+        fontSize: 15, color: "#fdf2c8",
+        bgColor: "#16100a", borderColor: "#c8e85a", borderWidth: 1.4,
+        borderRadius: 8, opacity: 0.94, padding: 12, maxLines: 12
+      });
+      state.edges.push({ from: { node: joke, port: "text" }, to: { node: jokePanel, port: "text" } });
+      makeNode("UIText", 1440, 320, {
+        text: "[joke]",
+        x: -300, y: 60, fontSize: 11, color: "#c8e85a",
+        align: "left", corner: "center", interactive: 0
+      });
+
+      const voicePanel = makeNode("UILLMText", 1440, 480, {
+        x: 180, y: 140,
+        width: 380, height: 170,
+        corner: "center",
+        fontSize: 14, color: "#f0e8ff",
+        bgColor: "#180a18", borderColor: "#b264c8", borderWidth: 1.4,
+        borderRadius: 8, opacity: 0.94, padding: 12, maxLines: 12
+      });
+      state.edges.push({ from: { node: voice, port: "assistantText" }, to: { node: voicePanel, port: "text" } });
+      makeNode("UIText", 1440, 600, {
+        text: "[voice → assistant]",
+        x: 30, y: 60, fontSize: 11, color: "#b264c8",
+        align: "left", corner: "center", interactive: 0
+      });
+
+      // JSONFormat → small color-hex panel below the joke panel
+      const jsonPanel = makeNode("UILLMText", 1440, 760, {
+        x: -120, y: -120,
+        width: 220, height: 50,
+        corner: "center",
+        fontSize: 18, color: "#83e8ff",
+        bgColor: "#0a1018", borderColor: "#83e8ff", borderWidth: 1.4,
+        borderRadius: 6, opacity: 0.94, padding: 8, maxLines: 1
+      });
+      state.edges.push({ from: { node: jsonFmt, port: "value" }, to: { node: jsonPanel, port: "text" } });
+      makeNode("UIText", 1440, 820, {
+        text: "[colour hex]",
+        x: -240, y: -150, fontSize: 11, color: "#83e8ff",
+        align: "left", corner: "center", interactive: 0
+      });
+
       // ── HUD: memory count + similarity scalar (bottom-right) ───────
       const hudCount = makeNode("HUDText", 1180, 460, {
         prefix: "memory: ", suffix: " msgs", value: 0, decimals: 0,

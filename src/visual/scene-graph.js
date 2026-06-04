@@ -503,6 +503,25 @@ function _resolveNodeParams(node) {
     // surface as one float to the shader; gate is a trigger
     // (different semantics) so it stays out of substitution.
     if (!port) continue;
+    // Phase B sprint 8 -- also walk `text`-typed wires so UI nodes
+    // (UILLMText, future text consumers) see live LLM output. Text
+    // wires aren't substituted via _readWireJsSideValue (that's for
+    // numerics); we walk the edge directly and read the upstream
+    // node's params[port] as a string. Numeric upstreams coerce to
+    // string for convenience (e.g. wire mem.count → display).
+    if (port.t === "text") {
+      const tw = state.edges.find(e =>
+        e && e.to && e.to.node === node.id && e.to.port === port.n
+      );
+      if (!tw || !tw.from) continue;
+      const tsrc = state.nodes.find(n => n && n.id === tw.from.node);
+      if (tsrc && tsrc.params) {
+        const tv = tsrc.params[tw.from.port];
+        if (typeof tv === "string") out[port.n] = tv;
+        else if (typeof tv === "number" && Number.isFinite(tv)) out[port.n] = String(tv);
+      }
+      continue;
+    }
     if (port.t !== "param" && port.t !== "audio" && port.t !== "clock") continue;
     const wire = state.edges.find(e =>
       e && e.to && e.to.node === node.id && e.to.port === port.n

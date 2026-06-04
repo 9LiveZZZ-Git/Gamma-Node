@@ -3398,6 +3398,60 @@ public:
     description: "Positionable text label. Different from HUDText: HUDText stacks by screen corner + formats data with prefix/suffix/decimals; UIText is positioned freely via (x, y) + corner anchor + alignment. Set interactive=1 to enable pointer events -- clicked + hovered outputs work like UIButton. interactive=0 (default) makes it passive (no event capture, doesn't steal clicks from widgets stacked behind it)."
   },
 
+  /* Phase B sprint 8 -- UILLMText.
+   *
+   * Multi-line text panel for displaying LLM output (or any text-typed
+   * wire) in the live scene overlay. The `text` input port is type
+   * "text" so it accepts LLMChat.text / LLMGenerate.text / VoiceToLLM
+   * .userText / .assistantText / ConversationMemory.messages / etc.
+   *
+   * Unlike UIText (single-line, param-typed) this auto-wraps, renders
+   * a background panel + border, and trims to the last `maxLines` rows
+   * so long streams scroll naturally. Set `autoScroll=0` to pin the
+   * top instead. */
+  UILLMText: {
+    category: "Visual", color: COLOR.visual, header: null,
+    cppType: "",
+    kind: "ui",
+    ins: [
+      { n: "show", t: "param" },
+      { n: "text", t: "text"  }
+    ],
+    outs: [
+      { n: "clicked", t: "param" },
+      { n: "hovered", t: "param" }
+    ],
+    params: {
+      text:         "",
+      x:            0,
+      y:            0,
+      width:        420,
+      height:       180,
+      corner:       "center",
+      fontSize:     14,
+      color:        "#e8f0ff",
+      bgColor:      "#0a1018",
+      borderColor:  "#9bd0ff",
+      borderWidth:  1,
+      borderRadius: 6,
+      opacity:      0.95,
+      padding:      10,
+      lineHeight:   1.35,
+      maxLines:     64,
+      autoScroll:   1,
+      interactive:  0,
+      customRender: "",
+      clicked:      0,
+      hovered:      0
+    },
+    paramOptions: {
+      corner: ["center", "top-left", "top-right", "bottom-left", "bottom-right"]
+    },
+    methods: {},
+    uiOnlyParams: ["text", "color", "bgColor", "borderColor", "corner", "customRender", "clicked", "hovered"],
+    description: "Phase B sprint 8 -- in-scene text panel that accepts a `text`-typed input (LLMChat.text, LLMGenerate.text, VoiceToLLM.assistantText, ConversationMemory.messages, etc.). Wraps to `width`, scrolls to the bottom `maxLines` lines as tokens stream in, renders a bgColor panel with optional border. Use this when the LLM nodes' inline body isn't visible in the live render (Play mode hides the editor; this surfaces the text on the VisualOutput overlay). Set interactive=1 to also expose clicked + hovered."
+  },
+
   UIPanel: {
     category: "Visual", color: COLOR.visual, header: null,
     cppType: "",

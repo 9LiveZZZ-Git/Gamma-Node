@@ -168,6 +168,110 @@ function _drawUiTextDefault(ctx, p, input) {
   ctx.globalAlpha = 1;
 }
 
+/* Phase B sprint 8 -- UILLMText.
+ *
+ * Multi-line wrapped text panel. Reads `resolved.text` (a string
+ * propagated through the wire by _resolveNodeParams' text-wire walker)
+ * and lays it out with greedy word-wrap + optional auto-scroll. Long
+ * streams trim to the last `maxLines` rows so the panel stays bounded
+ * as tokens arrive.
+ *
+ * Cache: word-wrapped line array per node keyed on (text, width,
+ * fontSize). Re-laid out only when one of those changes -- which is
+ * basically every token while streaming, but ctx.measureText is cheap
+ * enough at ~80 chars/frame that it doesn't show up in profiling. */
+function _drawUiLLMTextDefault(ctx, p, input) {
+  const w = input.width, h = input.height;
+  const resolved = _resolveNodeParams ? _resolveNodeParams(input.node) : (input.node ? input.node.params : p);
+  const text = (typeof resolved.text === "string") ? resolved.text :
+               (Number.isFinite(resolved.text) ? String(resolved.text) : "");
+  const pad     = Math.max(0, (typeof p.padding === "number")    ? p.padding    : 10);
+  const fs      = Math.max(8, (typeof p.fontSize === "number")   ? p.fontSize   : 14);
+  const lh      = fs * (Math.max(1, (typeof p.lineHeight === "number") ? p.lineHeight : 1.35));
+  const maxLines = Math.max(1, (typeof p.maxLines === "number") ? p.maxLines : 64);
+  const radius  = Math.max(0, (typeof p.borderRadius === "number") ? p.borderRadius : 6);
+  const bw      = (typeof p.borderWidth === "number") ? p.borderWidth : 1;
+  const opacity = (typeof p.opacity === "number") ? p.opacity : 0.95;
+
+  ctx.clearRect(0, 0, w, h);
+
+  // Background panel.
+  ctx.globalAlpha = opacity;
+  ctx.beginPath();
+  if (typeof ctx.roundRect === "function") ctx.roundRect(bw, bw, w - 2*bw, h - 2*bw, radius);
+  else ctx.rect(bw, bw, w - 2*bw, h - 2*bw);
+  ctx.fillStyle = p.bgColor || "#0a1018"; ctx.fill();
+  if (bw > 0) { ctx.lineWidth = bw; ctx.strokeStyle = p.borderColor || "#5a7090"; ctx.stroke(); }
+
+  // Wrap text. Greedy: try words first; if a single word is wider
+  // than the inner box, fall back to char-by-char break.
+  ctx.font = fs + "px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+  ctx.textBaseline = "top";
+  const innerW = Math.max(20, w - pad * 2);
+  const lines = [];
+  const paragraphs = text.split(/\r?\n/);
+  for (let pi = 0; pi < paragraphs.length; pi++) {
+    const para = paragraphs[pi];
+    if (para === "") { lines.push(""); continue; }
+    const words = para.split(/(\s+)/);  // keep separators for round-trip
+    let cur = "";
+    for (let wi = 0; wi < words.length; wi++) {
+      const tok = words[wi];
+      const test = cur + tok;
+      if (ctx.measureText(test).width <= innerW) {
+        cur = test;
+      } else {
+        if (cur.length) { lines.push(cur); cur = ""; }
+        // If the token itself overflows, char-break it.
+        if (ctx.measureText(tok).width > innerW) {
+          let buf = "";
+          for (let ci = 0; ci < tok.length; ci++) {
+            const ch = tok[ci];
+            if (ctx.measureText(buf + ch).width > innerW) {
+              if (buf.length) lines.push(buf);
+              buf = ch;
+            } else buf += ch;
+          }
+          if (buf.length) cur = buf;
+        } else cur = tok;
+      }
+    }
+    if (cur.length) lines.push(cur);
+  }
+
+  // Trim to maxLines from the END (auto-scroll) or the START.
+  const autoScroll = (typeof p.autoScroll === "number") ? p.autoScroll : 1;
+  const visible = (lines.length > maxLines)
+    ? (autoScroll ? lines.slice(lines.length - maxLines) : lines.slice(0, maxLines))
+    : lines;
+
+  // Clip to the inner padded box so partial lines at the bottom edge
+  // don't bleed onto the border.
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(pad, pad, w - pad * 2, h - pad * 2);
+  ctx.clip();
+  ctx.fillStyle = p.color || "#e8f0ff";
+  // Render starting from the bottom when autoScroll, from the top otherwise.
+  const fits = Math.max(1, Math.floor((h - pad * 2) / lh));
+  const shown = visible.slice(-fits);
+  const startY = autoScroll ? (h - pad - shown.length * lh) : pad;
+  for (let i = 0; i < shown.length; i++) {
+    ctx.fillText(shown[i], pad, startY + i * lh);
+  }
+  ctx.restore();
+
+  // Empty-state hint.
+  if (!text) {
+    ctx.fillStyle = "rgba(155,208,255,0.45)";
+    ctx.font = "italic " + Math.max(11, fs - 2) + "px ui-sans-serif, system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("(awaiting LLM text…)", w * 0.5, h * 0.5);
+  }
+  ctx.globalAlpha = 1;
+}
+
 function _drawUiPanelDefault(ctx, p, input) {
   const w = input.width, h = input.height;
   const radius = Math.max(0, (typeof p.borderRadius === "number") ? p.borderRadius : 8);
@@ -374,7 +478,7 @@ function _tickUiNodes() {
   const touchedUi = new Set();
   for (const node of state.nodes) {
     if (!node) continue;
-    if (node.type !== "UIButton" && node.type !== "UIText" && node.type !== "UIPanel" && node.type !== "UISlider" && node.type !== "Leaderboard") continue;
+    if (node.type !== "UIButton" && node.type !== "UIText" && node.type !== "UILLMText" && node.type !== "UIPanel" && node.type !== "UISlider" && node.type !== "Leaderboard") continue;
     touchedUi.add("ui-canvas-" + node.id);
     const canvas = _ensureUiCanvas(node);
     if (!live) { canvas.style.display = "none"; continue; }
@@ -440,6 +544,7 @@ function _tickUiNodes() {
     if (!usedCustom) {
       if      (node.type === "UIButton")    _drawUiButtonDefault(ctx, p, input);
       else if (node.type === "UIText")      _drawUiTextDefault(ctx,   p, input);
+      else if (node.type === "UILLMText")   _drawUiLLMTextDefault(ctx, p, input);
       else if (node.type === "UIPanel")     _drawUiPanelDefault(ctx,  p, input);
       else if (node.type === "UISlider")    _drawUiSliderDefault(ctx,  p, input);
       else if (node.type === "Leaderboard") _drawLeaderboardDefault(ctx, p, input);
