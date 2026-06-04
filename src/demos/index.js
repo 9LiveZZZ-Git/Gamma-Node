@@ -9569,5 +9569,78 @@ const _demos = [
         state.edges.push({ from: { node: restartBtn, port: "clicked" }, to: { node: b, port: "reset" } });
       }
     }
+  },
+
+  /* Phase A foundations demo — verifies the new typed-vector port
+   * system from docs/LLM-KNOWLEDGE-PHASE.md §3.A.1. Drops the three
+   * placeholder LLM nodes (VectorSource / VectorSink / AttnViz)
+   * alongside a real audio chain (Sine → SoftClip → OutputStereo)
+   * so two things are visible at once:
+   *
+   *   1. The new magenta `vector` wire color and pink `llm-attn`
+   *      port style (ridge border treatment). Wire a VectorSource
+   *      to a VectorSink and the wire connects. Try wiring a
+   *      VectorSource → AttnViz and portsCompatible refuses (the
+   *      destination port flashes red — strict same-type rule).
+   *
+   *   2. The audio chain DOES compile to C++ — open the Code tab
+   *      to see Sine + SoftClip member declarations and an
+   *      operator() that returns the soft-clipped sine. The three
+   *      LLM placeholder nodes contribute NOTHING to the emitted
+   *      .h (their kind: "llm-*" routes them through the runtime-
+   *      only skip in src/codegen/index.js). That's the
+   *      isRuntimeOnlyKind() guard ensuring runtime-only nodes
+   *      travel as patch state without polluting the generated
+   *      audio code. */
+  {
+    id: "phase-a-foundations",
+    name: "Phase A foundations",
+    sub: "vector + llm-attn port types · runtime-only kinds · codegen skip",
+    type: "advanced",
+    thumb: `<svg viewBox="0 0 100 44">
+      <rect width="100" height="44" fill="rgba(18,22,32,0.95)"/>
+      <!-- two vector nodes connected by a magenta vector wire -->
+      <rect x="6"  y="12" width="22" height="10" rx="2" fill="rgba(178,100,200,0.25)" stroke="rgba(178,100,200,0.9)" stroke-width="0.8"/>
+      <rect x="38" y="12" width="22" height="10" rx="2" fill="rgba(178,100,200,0.25)" stroke="rgba(178,100,200,0.9)" stroke-width="0.8"/>
+      <path d="M 28 17 C 32 17, 34 17, 38 17" stroke="rgba(178,100,200,0.95)" stroke-width="1.5" fill="none"/>
+      <!-- llm-attn-port node (unconnected) -->
+      <rect x="70" y="12" width="22" height="10" rx="2" fill="rgba(232,122,214,0.18)" stroke="rgba(232,122,214,0.85)" stroke-width="1.1"/>
+      <!-- audio chain below: sine -> softclip -> stereo -->
+      <circle cx="14" cy="32" r="3.5" fill="rgba(29,158,117,0.85)"/>
+      <rect x="32" y="29" width="16" height="6" rx="1.5" fill="rgba(216,90,48,0.7)"/>
+      <rect x="56" y="28" width="12" height="8" rx="1.5" fill="rgba(58,61,68,0.95)" stroke="rgba(150,150,160,0.6)" stroke-width="0.5"/>
+      <line x1="18" y1="32" x2="32" y2="32" stroke="rgba(29,158,117,0.85)" stroke-width="1.2"/>
+      <line x1="48" y1="32" x2="56" y2="32" stroke="rgba(29,158,117,0.85)" stroke-width="1.2"/>
+    </svg>`,
+    build: () => {
+      // ----- Top row: vector wires (magenta). Two VectorSource → VectorSink
+      //       pairs to show the typed wire color and same-type compatibility.
+      const vsA  = makeNode("VectorSource", 100,  60, { dim: 4 });
+      const vskA = makeNode("VectorSink",   420,  60, {});
+      state.edges.push({ from: { node: vsA, port: "vec" }, to: { node: vskA, port: "vec" } });
+
+      const vsB  = makeNode("VectorSource", 100, 160, { dim: 8 });
+      const vskB = makeNode("VectorSink",   420, 160, {});
+      state.edges.push({ from: { node: vsB, port: "vec" }, to: { node: vskB, port: "vec" } });
+
+      // ----- AttnViz: separate "llm-attn" input type. Intentionally NOT
+      //       wired to the VectorSource above — try to drag a connection
+      //       between them yourself; portsCompatible() refuses (strict
+      //       same-type rule for visual port types). The pink ridge border
+      //       on AttnViz.attn is visually distinct from VectorSource.vec.
+      makeNode("AttnViz", 700, 110, {});
+
+      // ----- Bottom row: real audio chain. Compiles to C++ as usual.
+      //       The VectorSource / VectorSink / AttnViz above contribute
+      //       nothing to the emitted .h — the runtime-only kind guard in
+      //       src/codegen/index.js skips them entirely. Switch to the
+      //       Code tab to see operator() returning a soft-clipped sine.
+      const sine = makeNode("Sine",         100, 320, { freq: 220 });
+      const clip = makeNode("SoftClip",     420, 320, {});
+      const out  = makeNode("OutputStereo", 700, 320, {});
+      state.edges.push({ from: { node: sine, port: "out" }, to: { node: clip, port: "in" } });
+      state.edges.push({ from: { node: clip, port: "out" }, to: { node: out,  port: "l"  } });
+      state.edges.push({ from: { node: clip, port: "out" }, to: { node: out,  port: "r"  } });
+    }
   }
 ];
