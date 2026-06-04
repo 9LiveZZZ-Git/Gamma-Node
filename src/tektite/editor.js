@@ -1,33 +1,31 @@
 /* =========================================================================
- * Tektite MD -- minimal editor
+ * Tektite MD -- editor (CodeMirror 6 + textarea fallback)
  *
- * Phase C sprint tektite-1 (initial) + tektite-1.5b (source-aware).
+ * Phase C sprint tektite-1 (textarea) + tektite-1.5b (source-aware) +
+ * tektite-2 (CodeMirror swap-in + wikilink decoration).
  *
- * Plain <textarea> bound to the currently selected note. Saves on
- * every keystroke via a 400 ms debounce. The save dispatches based
- * on the loaded note's source:
+ * CodeMirror is loaded lazily by src/tektite/markdown.js on the first
+ * tektiteEditorAttach call. If the CDN fetch fails (offline / blocked),
+ * the editor stays on the textarea fallback so basic editing still
+ * works.
+ *
+ * Save dispatches based on the loaded note's source:
  *   - vault    -> tektitePutNote (IDB)
  *   - local-fs -> File System Access API write (lazily requests rw perm)
  *   - github   -> Contents API PUT (uses cached sha; refreshes on conflict)
  *   - gdrive   -> throws (stub; secrets-manager sprint will land it)
  *
- * Title-rename for local-fs / github writes goes to the same path
- * (the file's path on disk / repo doesn't change just because the
- * Markdown's first heading does). The title field is therefore a
- * display hint for vault notes only; for remote sources, it's
- * effectively read-only and shown for context.
- *
  * Public surface:
  *   tektiteEditorAttach(rootEl)
  *   tektiteEditorLoad(noteId)
- *           -- legacy vault-only loader (kept for back-compat)
+ *           -- legacy vault-only loader
  *   tektiteEditorLoadFromSource(sourceId, fileId)
- *           -- the new source-aware loader; both vault + remote
- *   tektiteEditorCurrentNoteId()    -- the loaded fileId (any source)
- *   tektiteEditorCurrentSourceId()  -- the source the loaded note came from
- *   tektiteEditorMarkDirty()
- *   tektiteEditorFlush()
- *   tektiteEditorOnSave(fn)         -- subscribes to save events
+ *           -- source-aware loader
+ *   tektiteEditorCurrentNoteId()    / tektiteEditorCurrentSourceId()
+ *   tektiteEditorMarkDirty() / tektiteEditorFlush()
+ *   tektiteEditorOnSave(fn)
+ *   tektiteEditorNavigateToWikilink(target)
+ *           -- sprint 2 hook called by the wikilink ctrl-click handler
  *
  * Save events carry { sourceId, fileId, title, content, modifiedAt }.
  * ======================================================================== */
@@ -35,7 +33,10 @@
 const _tektiteEditorState = {
   rootEl:         null,
   titleInput:     null,
-  textarea:       null,
+  textarea:       null,       // fallback textarea reference
+  cmContainer:    null,       // CodeMirror host div
+  cm:             null,       // CodeMirror handle (from markdown.js); null if fallback
+  cmLoading:      null,       // in-flight attach promise
   currentId:      null,
   currentSource:  null,
   saveTimer:      null,
@@ -43,6 +44,7 @@ const _tektiteEditorState = {
   saving:         false,
   pendingSave:    false,
   statusEl:       null,
+  navigateFn:     null,       // tab.js sets this so wikilink ctrl-click can open notes
   listeners:      new Set()
 };
 
@@ -64,42 +66,117 @@ function _tektiteSetStatus(text, kind) {
   s.statusEl.className = "tektite-editor-status" + (kind ? (" " + kind) : "");
 }
 
+/* Wikilink ctrl-click navigation. The tab module is responsible for
+ * resolving the target id to a (sourceId, fileId) pair and loading it;
+ * we just forward the click. */
+function tektiteEditorSetWikilinkNavigator(fn) {
+  _tektiteEditorState.navigateFn = (typeof fn === "function") ? fn : null;
+}
+
+function tektiteEditorNavigateToWikilink(target) {
+  const s = _tektiteEditorState;
+  if (s.navigateFn) s.navigateFn(target);
+}
+
+/* Read + write helpers that hide whether we're using CM or textarea. */
+function _tektiteEditorGetText() {
+  const s = _tektiteEditorState;
+  if (s.cm) return s.cm.getDoc();
+  if (s.textarea) return s.textarea.value || "";
+  return "";
+}
+
+function _tektiteEditorSetText(text) {
+  const s = _tektiteEditorState;
+  if (s.cm) { s.cm.setDoc(text || ""); return; }
+  if (s.textarea) s.textarea.value = text || "";
+}
+
+function _tektiteEditorSetReadOnly(ro) {
+  const s = _tektiteEditorState;
+  if (s.cm) {
+    try { s.cm.setReadOnly(!!ro); } catch (e) {
+      console.warn("[tektite] CM setReadOnly failed:", e);
+    }
+    return;
+  }
+  if (s.textarea) s.textarea.disabled = !!ro;
+}
+
+async function _tektiteEditorEnsureCodeMirror() {
+  const s = _tektiteEditorState;
+  if (s.cm || s.cmLoading) return s.cmLoading;
+  if (!s.cmContainer) return null;
+  s.cmLoading = (async () => {
+    const handle = await tektiteMarkdownAttach(s.cmContainer, _tektiteEditorGetText(), {
+      onChange: () => {
+        if (!s.currentId) return;
+        tektiteEditorMarkDirty();
+      },
+      onWikilinkClick: (target) => tektiteEditorNavigateToWikilink(target),
+      readOnly: s.textarea ? !!s.textarea.disabled : false
+    });
+    if (handle) {
+      s.cm = handle;
+      // Hide the textarea fallback; CM owns the surface now.
+      if (s.textarea) s.textarea.style.display = "none";
+    }
+    return handle;
+  })();
+  return s.cmLoading;
+}
+
 function tektiteEditorAttach(rootEl) {
   if (!rootEl) return;
   const s = _tektiteEditorState;
-  s.rootEl     = rootEl;
-  s.titleInput = rootEl.querySelector("#tektite-title");
-  s.textarea   = rootEl.querySelector("#tektite-editor");
-  s.statusEl   = document.getElementById("tektite-editor-status");
-  if (!s.textarea) {
-    console.warn("[tektite] editor textarea missing inside rootEl");
+  if (s.rootEl === rootEl) return;   // idempotent
+  s.rootEl      = rootEl;
+  s.titleInput  = rootEl.querySelector("#tektite-title");
+  s.textarea    = rootEl.querySelector("#tektite-editor");
+  s.cmContainer = rootEl.querySelector("#tektite-cm");
+  s.statusEl    = document.getElementById("tektite-editor-status");
+  if (!s.textarea && !s.cmContainer) {
+    console.warn("[tektite] editor host element missing");
     return;
   }
-  s.textarea.addEventListener("input", () => {
-    if (!s.currentId) return;
-    tektiteEditorMarkDirty();
-  });
+
+  // Fallback wiring: textarea input fires mark-dirty.
+  if (s.textarea) {
+    s.textarea.addEventListener("input", () => {
+      if (!s.currentId) return;
+      // If CM has taken over the surface, the textarea is hidden +
+      // doesn't receive input events. Only the fallback hits this.
+      if (s.cm) return;
+      tektiteEditorMarkDirty();
+    });
+  }
+
   if (s.titleInput) {
     s.titleInput.addEventListener("input", () => {
       if (!s.currentId) return;
-      // Title is only meaningful for vault saves; remote sources
-      // ignore it on flush.
       if (s.currentSource === "vault") tektiteEditorMarkDirty();
     });
     s.titleInput.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") { e.preventDefault(); s.textarea.focus(); }
+      if (e.key === "Enter") {
+        e.preventDefault();
+        if (s.cm) s.cm.focus();
+        else if (s.textarea) s.textarea.focus();
+      }
     });
   }
+
   // Flush on hide/unload so reload-in-flight + tab-switch don't lose
-  // the last few seconds of typing. fire-and-forget (async).
+  // the last few seconds of typing.
   window.addEventListener("beforeunload", () => { tektiteEditorFlush(); });
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") tektiteEditorFlush();
   });
+
+  // Lazy-init CodeMirror on first attach. The promise resolves silently
+  // when CM is ready; if it fails the textarea fallback stays visible.
+  _tektiteEditorEnsureCodeMirror();
 }
 
-/* Back-compat: load a vault note by its IDB id. New code should
- * prefer tektiteEditorLoadFromSource("vault", id). */
 async function tektiteEditorLoad(noteId) {
   if (!noteId) return _tektiteEditorClear();
   return await tektiteEditorLoadFromSource("vault", noteId);
@@ -111,14 +188,14 @@ async function _tektiteEditorClear() {
   s.currentId     = null;
   s.currentSource = null;
   if (s.titleInput) { s.titleInput.value = ""; s.titleInput.disabled = true; }
-  if (s.textarea)   { s.textarea.value   = ""; s.textarea.disabled   = true; }
+  _tektiteEditorSetText("");
+  _tektiteEditorSetReadOnly(true);
   _tektiteSetStatus("");
 }
 
 async function tektiteEditorLoadFromSource(sourceId, fileId) {
   const s = _tektiteEditorState;
   if (!sourceId || !fileId) { await _tektiteEditorClear(); return; }
-  // Flush the previous note (if any) before swapping.
   if (s.currentId && (s.currentId !== fileId || s.currentSource !== sourceId)) {
     await tektiteEditorFlush();
   }
@@ -127,8 +204,6 @@ async function tektiteEditorLoadFromSource(sourceId, fileId) {
     const content = await tektiteSourceGetContent(sourceId, fileId);
     s.currentId     = fileId;
     s.currentSource = sourceId;
-    // Pull title from the listing if available (vault has rich titles;
-    // local-fs uses filename; github uses filename minus .md).
     let title = fileId;
     try {
       const listing = await tektiteSourceListNotes(sourceId);
@@ -137,24 +212,19 @@ async function tektiteEditorLoadFromSource(sourceId, fileId) {
     } catch (_) {}
     if (s.titleInput) {
       s.titleInput.value = title;
-      // Title editing only matters for vault; remote sources have
-      // their filename pinned. Disable rather than ignore so users
-      // see why.
       s.titleInput.disabled = (sourceId !== "vault");
     }
-    if (s.textarea) {
-      s.textarea.value = content || "";
-      const writable = (typeof tektiteSourceIsWritable === "function")
-        ? tektiteSourceIsWritable(sourceId)
-        : (sourceId === "vault" ? "vault" : null);
-      s.textarea.disabled = !writable;
-    }
+    _tektiteEditorSetText(content || "");
+    const writable = (typeof tektiteSourceIsWritable === "function")
+      ? tektiteSourceIsWritable(sourceId)
+      : (sourceId === "vault" ? "vault" : null);
+    _tektiteEditorSetReadOnly(!writable);
     _tektiteSetStatus("");
   } catch (e) {
     s.currentId     = null;
     s.currentSource = null;
     if (s.titleInput) s.titleInput.value = "";
-    if (s.textarea)   s.textarea.value   = "Failed to load: " + (e.message || e);
+    _tektiteEditorSetText("Failed to load: " + (e.message || e));
     _tektiteSetStatus("error", "err");
   }
 }
@@ -173,16 +243,13 @@ function tektiteEditorMarkDirty() {
 async function tektiteEditorFlush() {
   const s = _tektiteEditorState;
   if (s.saveTimer) { clearTimeout(s.saveTimer); s.saveTimer = null; }
-  if (!s.currentId || !s.textarea) return;
-  // If a save is already in flight, queue exactly one follow-up so
-  // we capture the latest content without piling up a queue of
-  // identical writes.
+  if (!s.currentId) return;
   if (s.saving) { s.pendingSave = true; return; }
   s.saving = true;
   const sourceId = s.currentSource || "vault";
   const fileId   = s.currentId;
   const title    = (s.titleInput && s.titleInput.value || fileId).trim();
-  const content  = s.textarea.value || "";
+  const content  = _tektiteEditorGetText();
   _tektiteSetStatus("Saving…", "saving");
   try {
     const result = await tektiteSourceWriteContent(sourceId, fileId, content, { title });
@@ -193,7 +260,6 @@ async function tektiteEditorFlush() {
       modifiedAt: Date.now()
     });
     _tektiteSetStatus("Saved", "ok");
-    // Briefly clear the "Saved" badge so it's not a permanent fixture.
     setTimeout(() => {
       if (_tektiteEditorState.statusEl &&
           _tektiteEditorState.statusEl.textContent === "Saved") {
@@ -207,8 +273,6 @@ async function tektiteEditorFlush() {
     s.saving = false;
     if (s.pendingSave) {
       s.pendingSave = false;
-      // Run the queued save with a tiny delay so a typing burst
-      // doesn't spin three+ writes back to back.
       setTimeout(() => tektiteEditorFlush(), 80);
     }
   }

@@ -37,8 +37,126 @@ const _tektiteTabState = {
   filterInput:     null,
   sourceRailEl:    null,
   saveToVaultBtnEl: null,
-  fullscreen:      false
+  fullscreen:      false,
+  backlinksEl:     null
 };
+
+/* Sprint tektite-2 -- wikilink navigation. Resolves a [[target]] in
+ * priority order: vault notes by id → vault notes by case-insensitive
+ * title → other writable sources by filename. If nothing matches,
+ * offers to create a new vault note under that name. */
+async function _tektiteNavigateWikilink(target) {
+  if (!target) return;
+  const s = _tektiteTabState;
+  const targetLc = target.toLowerCase();
+
+  // 1. Try as a vault id (slug match).
+  const vaultHit = await tektiteGetNote(target);
+  if (vaultHit) {
+    s.activeSource = "vault";
+    await _tektiteTabRefresh();
+    await tektiteEditorLoadFromSource("vault", vaultHit.id);
+    _tektiteTabRender();
+    return;
+  }
+  // 2. Try as a vault title (case-insensitive).
+  const vaultList = await tektiteListNotes();
+  const titleHit = vaultList.find(n => (n.title || n.id).toLowerCase() === targetLc);
+  if (titleHit) {
+    s.activeSource = "vault";
+    await _tektiteTabRefresh();
+    await tektiteEditorLoadFromSource("vault", titleHit.id);
+    _tektiteTabRender();
+    return;
+  }
+  // 3. Walk other sources (local-fs / github) for filename matches.
+  const sources = tektiteSourcesList();
+  for (const src of sources) {
+    if (src.id === "vault") continue;
+    try {
+      const listing = await tektiteSourceListNotes(src.id);
+      const fileHit = listing.find(n =>
+        (n.title || "").toLowerCase() === targetLc ||
+        (n.path  || "").toLowerCase() === targetLc ||
+        (n.path  || "").toLowerCase().endsWith("/" + targetLc + ".md"));
+      if (fileHit) {
+        s.activeSource = src.id;
+        await _tektiteTabRefresh();
+        await tektiteEditorLoadFromSource(src.id, fileHit.id);
+        _tektiteTabRender();
+        return;
+      }
+    } catch (_) {}
+  }
+  // 4. Nothing matched -- offer to create. Only when vault is writable.
+  if (tektiteSourceIsWritable("vault") &&
+      window.confirm("No note named \"" + target + "\" found. Create one in the Vault?")) {
+    try {
+      const newId = await tektiteSourceCreateNote("vault", target);
+      s.activeSource = "vault";
+      await _tektiteTabRefresh();
+      await tektiteEditorLoadFromSource("vault", newId);
+      _tektiteTabRender();
+    } catch (e) {
+      window.alert("Create failed: " + (e.message || e));
+    }
+  }
+}
+
+/* Render the backlinks panel for the currently-loaded note. Vault-only
+ * for sprint 2 -- remote-source backlinks need an async cross-source
+ * walk that lands in sprint tektite-3. */
+async function _tektiteRenderBacklinks() {
+  const s = _tektiteTabState;
+  if (!s.backlinksEl) return;
+  const noteId = tektiteEditorCurrentNoteId();
+  const sourceId = tektiteEditorCurrentSourceId();
+  if (!noteId || sourceId !== "vault") {
+    s.backlinksEl.innerHTML = `
+      <div class="tektite-backlinks-header">Backlinks</div>
+      <div class="tektite-backlinks-empty">${noteId ? "Backlinks are vault-only for now." : "Select a note to see incoming links."}</div>`;
+    return;
+  }
+  await tektiteBacklinksEnsureReady();
+  // Look up incoming for both the slug id AND the displayed title --
+  // users may [[link]] by either.
+  const note = await tektiteGetNote(noteId);
+  const incomingById    = tektiteBacklinksGetIncoming(noteId);
+  const incomingByTitle = (note && note.title && note.title !== noteId)
+    ? tektiteBacklinksGetIncoming(note.title)
+    : [];
+  // Merge dedup by sourceId.
+  const seen = new Set();
+  const incoming = [];
+  for (const e of incomingById.concat(incomingByTitle)) {
+    if (seen.has(e.noteId) || e.noteId === noteId) continue;
+    seen.add(e.noteId);
+    incoming.push(e);
+  }
+
+  const header = `<div class="tektite-backlinks-header">Backlinks <span class="tektite-backlinks-count">${incoming.length}</span></div>`;
+  if (!incoming.length) {
+    s.backlinksEl.innerHTML = header +
+      `<div class="tektite-backlinks-empty">No notes link here yet. Add <code>[[${_tektiteEscapeHtml(note ? note.title : noteId)}]]</code> elsewhere in the vault.</div>`;
+    return;
+  }
+  const html = incoming.map(e => {
+    return `<div class="tektite-backlink-item" data-id="${_tektiteEscapeAttr(e.noteId)}">
+      <div class="tektite-backlink-title">${_tektiteEscapeHtml(e.title)}</div>
+      <div class="tektite-backlink-ts">${e.modifiedAt ? _tektiteFormatRelativeTime(e.modifiedAt) : ""}</div>
+    </div>`;
+  }).join("");
+  s.backlinksEl.innerHTML = header + html;
+  s.backlinksEl.querySelectorAll(".tektite-backlink-item").forEach(el => {
+    const id = el.getAttribute("data-id");
+    el.addEventListener("click", async () => {
+      s.activeSource = "vault";
+      await _tektiteTabRefresh();
+      await tektiteEditorLoadFromSource("vault", id);
+      _tektiteTabRender();
+    });
+  });
+}
 
 /* Phase C sprint tektite-1.5b -- fullscreen toggle. Adds a body
  * class that the CSS uses to pin #br-view-tektite over the canvas
@@ -170,6 +288,10 @@ function _tektiteTabRender() {
     </div>`;
   }).join("");
   s.listEl.innerHTML = html;
+
+  // Sprint tektite-2 -- refresh backlinks after every list render
+  // (loads happen via list clicks + a re-render is triggered).
+  _tektiteRenderBacklinks();
 
   // Source-aware click + contextmenu wiring.
   s.listEl.querySelectorAll(".tektite-note-item").forEach(el => {
@@ -342,23 +464,46 @@ function tektiteTabAttach() {
   const editorRoot = document.getElementById("tektite-editor-pane");
   if (editorRoot) tektiteEditorAttach(editorRoot);
 
-  // On save, refresh the listing IF the saved note is from the
-  // currently-active source (so the just-saved note bubbles to the top
-  // with the fresh modifiedAt stamp). Cross-source saves are silent
-  // here; their lists refresh on next tab activation.
+  // Sprint tektite-2 -- wire the wikilink ctrl-click handler so
+  // CodeMirror clicks resolve through _tektiteNavigateWikilink.
+  if (typeof tektiteEditorSetWikilinkNavigator === "function") {
+    tektiteEditorSetWikilinkNavigator(_tektiteNavigateWikilink);
+  }
+
+  // Sprint tektite-2 -- backlinks panel lives in #tektite-backlinks.
+  s.backlinksEl = document.getElementById("tektite-backlinks");
+
+  // On save: update the listing if same source AND update the
+  // backlinks index (vault only). Re-render backlinks if the saved
+  // note is the one currently open, since the user might have added /
+  // removed a [[link]] that changes its incoming list.
   tektiteEditorOnSave((record) => {
-    if (!record || record.sourceId !== s.activeSource) return;
-    const idx = s.notes.findIndex(n => n.id === record.fileId);
-    const listingEntry = {
-      id:         record.fileId,
-      title:      record.title,
-      path:       record.fileId,
-      modifiedAt: record.modifiedAt,
-      sourceId:   record.sourceId
-    };
-    if (idx >= 0) s.notes.splice(idx, 1);
-    s.notes.unshift(listingEntry);
-    _tektiteTabRender();
+    if (!record) return;
+    // Backlinks: incremental ingest (vault only -- remote saves don't
+    // participate in the vault-only index yet).
+    if (record.sourceId === "vault" && typeof tektiteBacklinksOnNoteSaved === "function") {
+      tektiteBacklinksOnNoteSaved({
+        id:         record.fileId,
+        title:      record.title,
+        content:    record.content,
+        modifiedAt: record.modifiedAt
+      });
+      _tektiteRenderBacklinks();
+    }
+    // List re-order (active source only).
+    if (record.sourceId === s.activeSource) {
+      const idx = s.notes.findIndex(n => n.id === record.fileId);
+      const listingEntry = {
+        id:         record.fileId,
+        title:      record.title,
+        path:       record.fileId,
+        modifiedAt: record.modifiedAt,
+        sourceId:   record.sourceId
+      };
+      if (idx >= 0) s.notes.splice(idx, 1);
+      s.notes.unshift(listingEntry);
+      _tektiteTabRender();
+    }
   });
 
   // Fullscreen toggle.
