@@ -224,3 +224,99 @@ async function ollamaEmbed(opts) {
   });
   return await res.json();
 }
+
+/* Phase B sprint 2 -- cached status probes
+ *
+ * Daemons + model lists move slowly; the badge popover, the model-
+ * picker, and the AI panel's run-time gating all read the same data.
+ * Probing on every consumer access spams /api/version + /api/tags
+ * unnecessarily and feels laggy at popover-open time. So we keep two
+ * keyed caches (one per base-url + key pair) with short TTLs and an
+ * `expectingFreshness` async getter that returns last-good data
+ * immediately while a background refetch updates the cache for the
+ * next read.
+ *
+ * Cache shape:
+ *   _ollamaStatusCache.get(key) = {
+ *     version: string | null,
+ *     models:  array  | null,        // from /api/tags
+ *     error:   string | null,
+ *     fetchedAt: number,             // ms epoch
+ *     inFlight: Promise | null
+ *   }
+ *
+ * Cache key: `${baseUrlResolved}::${key || ""}`. We don't store the
+ * auth key in the cache value, just hash it into the key so two users
+ * on the same machine with different api keys don't see each other's
+ * cloud-status payloads.
+ *
+ * TTL = 30 s. After that, the next consumer triggers a background
+ * refetch but still gets the stale value synchronously for snappy UX.
+ * `forceProbeOllama` bypasses TTL (the "Test connection" + "Refresh"
+ * buttons in settings call this).
+ */
+const OLLAMA_STATUS_TTL_MS = 30 * 1000;
+const _ollamaStatusCache = new Map();
+
+function _ollamaCacheKey(baseUrl, key) {
+  return _resolveOllamaBase(baseUrl) + "::" + (key || "");
+}
+
+function getCachedOllamaStatus(baseUrl, key) {
+  return _ollamaStatusCache.get(_ollamaCacheKey(baseUrl, key)) || null;
+}
+
+async function _doOllamaProbe(baseUrl, key) {
+  const out = { version: null, models: null, error: null, fetchedAt: Date.now(), inFlight: null };
+  try {
+    const v = await probeOllama({ baseUrl, key });
+    out.version = (v && typeof v.version === "string") ? v.version : "?";
+  } catch (e) {
+    out.error = (e && e.message) || String(e);
+    return out;  // models call would fail too if version did
+  }
+  try {
+    out.models = await listOllamaModels({ baseUrl, key });
+  } catch (e) {
+    // Probe succeeded but model list failed. Surface in `error` so the
+    // panel can show a partial-success state.
+    out.error = (e && e.message) || String(e);
+  }
+  return out;
+}
+
+async function probeOllamaStatus(opts) {
+  opts = opts || {};
+  const cacheKey = _ollamaCacheKey(opts.baseUrl, opts.key);
+  const cached = _ollamaStatusCache.get(cacheKey);
+  const now = Date.now();
+  const fresh = cached && !opts.force && (now - cached.fetchedAt) < OLLAMA_STATUS_TTL_MS;
+  if (fresh && !cached.inFlight) return cached;
+
+  // If a probe is already in flight for this cache key, return its
+  // promise rather than starting a parallel one.
+  if (cached && cached.inFlight) return cached.inFlight;
+
+  const p = _doOllamaProbe(opts.baseUrl, opts.key).then(out => {
+    _ollamaStatusCache.set(cacheKey, out);
+    if (typeof opts.onUpdate === "function") {
+      try { opts.onUpdate(out); } catch (_) {}
+    }
+    return out;
+  });
+  // Mark in-flight so concurrent callers reuse the promise. The promise
+  // itself replaces the cached `inFlight` field above.
+  _ollamaStatusCache.set(cacheKey, Object.assign({}, cached || {}, { inFlight: p }));
+  return p;
+}
+
+/* "Background refresh" pattern: return the cached snapshot synchronously
+ * (or null) and kick a probe whose result is delivered via onUpdate.
+ * Useful for the model badge / popover where the UI shouldn't block. */
+function probeOllamaStatusBackground(opts) {
+  opts = opts || {};
+  const cached = getCachedOllamaStatus(opts.baseUrl, opts.key);
+  const stale = !cached || (Date.now() - cached.fetchedAt) >= OLLAMA_STATUS_TTL_MS;
+  if (stale) probeOllamaStatus(opts);
+  return cached;
+}

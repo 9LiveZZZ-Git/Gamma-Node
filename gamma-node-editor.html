@@ -872,6 +872,54 @@
   .tk-stream-done::after { content: ""; animation: none; }
   @keyframes tk-stream-cursor { 50% { opacity: 0; } }
 
+  /* Phase B sprint 2 — Ollama installed-models list inside the settings
+   * modal's Ollama status panel. Clickable rows; active model gets a
+   * left-edge accent. Capped height so the panel doesn't grow without
+   * bound when the user has many models pulled. */
+  .ollama-models-list {
+    max-height: 220px;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: rgba(0,0,0,0.18);
+  }
+  .ollama-models-list:empty { display: none; }
+  .ollama-model {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 10px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text);
+    cursor: pointer;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    border-left: 3px solid transparent;
+    transition: background 0.12s, border-color 0.12s;
+  }
+  .ollama-model:last-child { border-bottom: none; }
+  .ollama-model:hover { background: rgba(255,255,255,0.04); }
+  .ollama-model.active {
+    border-left-color: var(--vector);
+    background: rgba(178,100,200,0.10);
+    color: var(--accent);
+  }
+  .ollama-model-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ollama-model-size { color: var(--text-3); margin-left: 12px; font-size: 11px; flex-shrink: 0; }
+  .ollama-model-empty {
+    padding: 10px 12px;
+    color: var(--text-2);
+    font-size: 11.5px;
+    text-align: center;
+  }
+  .ollama-model-empty code {
+    font-family: var(--font-mono);
+    color: var(--accent);
+    background: rgba(200,232,90,0.08);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+
   .port:hover { transform: translateY(-50%) scale(1.4); }
   /* Live snap target during a wire drag — when the dragged endpoint
    * is within a screen-radius of a type-compatible input port, that
@@ -7246,6 +7294,25 @@
           <p class="modal-note" id="gemma-preload-note" style="margin: 10px 0 0; min-height: 18px;"></p>
         </div>
 
+        <!-- Phase B sprint 2 — Ollama status panel: shown when Provider
+             ∈ { ollama, ollama-cloud }. Probes /api/version + /api/tags
+             on settings open and on Refresh; lists installed models
+             clickably so users can pick one without typing the tag. -->
+        <div id="ollama-status-panel" style="display:none; margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border);">
+          <div class="settings-grid" style="grid-template-columns: 110px 1fr;">
+            <label>Daemon</label>
+            <span id="ollama-version-state" style="font-size: 11.5px; font-family: var(--font-mono);">checking…</span>
+            <label>Models</label>
+            <span id="ollama-models-state" style="font-size: 11.5px; font-family: var(--font-mono);">—</span>
+          </div>
+          <div class="modal-actions" style="margin-top: 12px; justify-content: flex-start;">
+            <button class="btn" id="btn-ollama-test">Test connection</button>
+            <button class="btn" id="btn-ollama-refresh">Refresh models</button>
+          </div>
+          <p class="modal-note" id="ollama-probe-note" style="margin: 10px 0 0; min-height: 18px;"></p>
+          <div id="ollama-models-list" class="ollama-models-list" style="margin-top: 8px;"></div>
+        </div>
+
         <!-- Compile server section ------------------------------------- -->
         <div class="settings-section-header" style="font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin: 22px 0 10px; padding-top: 16px; border-top: 1px solid var(--border);">Compile server</div>
 
@@ -8123,7 +8190,7 @@
  * Pages deploy workflow (.github/workflows/pages.yml). The string
  * after the equals sign is what the workflow's sed targets — don't
  * change the format of this line. */
-const APP_VERSION = "0.3.697";
+const APP_VERSION = "0.3.698";
 
 /* =========================================================================
  * Node kinds — runtime-only kind registry
@@ -52408,6 +52475,102 @@ async function ollamaEmbed(opts) {
   });
   return await res.json();
 }
+
+/* Phase B sprint 2 -- cached status probes
+ *
+ * Daemons + model lists move slowly; the badge popover, the model-
+ * picker, and the AI panel's run-time gating all read the same data.
+ * Probing on every consumer access spams /api/version + /api/tags
+ * unnecessarily and feels laggy at popover-open time. So we keep two
+ * keyed caches (one per base-url + key pair) with short TTLs and an
+ * `expectingFreshness` async getter that returns last-good data
+ * immediately while a background refetch updates the cache for the
+ * next read.
+ *
+ * Cache shape:
+ *   _ollamaStatusCache.get(key) = {
+ *     version: string | null,
+ *     models:  array  | null,        // from /api/tags
+ *     error:   string | null,
+ *     fetchedAt: number,             // ms epoch
+ *     inFlight: Promise | null
+ *   }
+ *
+ * Cache key: `${baseUrlResolved}::${key || ""}`. We don't store the
+ * auth key in the cache value, just hash it into the key so two users
+ * on the same machine with different api keys don't see each other's
+ * cloud-status payloads.
+ *
+ * TTL = 30 s. After that, the next consumer triggers a background
+ * refetch but still gets the stale value synchronously for snappy UX.
+ * `forceProbeOllama` bypasses TTL (the "Test connection" + "Refresh"
+ * buttons in settings call this).
+ */
+const OLLAMA_STATUS_TTL_MS = 30 * 1000;
+const _ollamaStatusCache = new Map();
+
+function _ollamaCacheKey(baseUrl, key) {
+  return _resolveOllamaBase(baseUrl) + "::" + (key || "");
+}
+
+function getCachedOllamaStatus(baseUrl, key) {
+  return _ollamaStatusCache.get(_ollamaCacheKey(baseUrl, key)) || null;
+}
+
+async function _doOllamaProbe(baseUrl, key) {
+  const out = { version: null, models: null, error: null, fetchedAt: Date.now(), inFlight: null };
+  try {
+    const v = await probeOllama({ baseUrl, key });
+    out.version = (v && typeof v.version === "string") ? v.version : "?";
+  } catch (e) {
+    out.error = (e && e.message) || String(e);
+    return out;  // models call would fail too if version did
+  }
+  try {
+    out.models = await listOllamaModels({ baseUrl, key });
+  } catch (e) {
+    // Probe succeeded but model list failed. Surface in `error` so the
+    // panel can show a partial-success state.
+    out.error = (e && e.message) || String(e);
+  }
+  return out;
+}
+
+async function probeOllamaStatus(opts) {
+  opts = opts || {};
+  const cacheKey = _ollamaCacheKey(opts.baseUrl, opts.key);
+  const cached = _ollamaStatusCache.get(cacheKey);
+  const now = Date.now();
+  const fresh = cached && !opts.force && (now - cached.fetchedAt) < OLLAMA_STATUS_TTL_MS;
+  if (fresh && !cached.inFlight) return cached;
+
+  // If a probe is already in flight for this cache key, return its
+  // promise rather than starting a parallel one.
+  if (cached && cached.inFlight) return cached.inFlight;
+
+  const p = _doOllamaProbe(opts.baseUrl, opts.key).then(out => {
+    _ollamaStatusCache.set(cacheKey, out);
+    if (typeof opts.onUpdate === "function") {
+      try { opts.onUpdate(out); } catch (_) {}
+    }
+    return out;
+  });
+  // Mark in-flight so concurrent callers reuse the promise. The promise
+  // itself replaces the cached `inFlight` field above.
+  _ollamaStatusCache.set(cacheKey, Object.assign({}, cached || {}, { inFlight: p }));
+  return p;
+}
+
+/* "Background refresh" pattern: return the cached snapshot synchronously
+ * (or null) and kick a probe whose result is delivered via onUpdate.
+ * Useful for the model badge / popover where the UI shouldn't block. */
+function probeOllamaStatusBackground(opts) {
+  opts = opts || {};
+  const cached = getCachedOllamaStatus(opts.baseUrl, opts.key);
+  const stale = !cached || (Date.now() - cached.fetchedAt) >= OLLAMA_STATUS_TTL_MS;
+  if (stale) probeOllamaStatus(opts);
+  return cached;
+}
 /* =========================================================================
  * AI assistant for .gdsp authoring
  *
@@ -53168,22 +53331,81 @@ function renderModelPopover() {
   const pop = document.getElementById("model-popover");
   if (!pop) return;
   const hasAnthKey = !!aiSettings.anthropicKey;
+  const hasOllamaCloudKey = !!aiSettings.ollamaKey;
+
+  // Phase B sprint 2 -- inject live Ollama models alongside the static
+  // MODEL_OPTIONS so the popover reflects whatever the user actually has
+  // installed. Status is read from the cache (populated by
+  // probeOllamaStatus, called from refreshOllamaStatus / openSettings /
+  // initial idle probe below). Stale cached data is rendered immediately;
+  // a background refresh updates the cache for the next popover open.
+  const localStatus = getCachedOllamaStatus(aiSettings.ollamaUrl, "");
+  const localModels = (localStatus && localStatus.models) || [];
+  const localOk     = !!(localStatus && localStatus.version && !localStatus.error);
+
+  // Build the combined item list. Static MODEL_OPTIONS minus the local-
+  // Ollama placeholders if we have a real list to substitute in; cloud
+  // Ollama placeholder is kept regardless (cloud probe needs a key to
+  // succeed and we don't pre-emptively probe with an empty key).
+  const items = [];
+  MODEL_OPTIONS.forEach(opt => {
+    if (opt.provider === "ollama" && localOk && localModels.length) return;  // replaced by live list below
+    items.push({ kind: "static", opt });
+  });
+  if (localOk && localModels.length) {
+    localModels.forEach(m => {
+      items.push({
+        kind: "ollama",
+        opt: {
+          provider: "ollama",
+          model: m.name,
+          name: m.name,
+          meta: (typeof m.size === "number")
+            ? "Local · ollama daemon · " + (m.size / 1e9).toFixed(2) + " GB"
+            : "Local · ollama daemon",
+          tag: "local"
+        }
+      });
+    });
+  }
+
   let html = `<div class="model-popover-head">Active AI model</div>`;
-  MODEL_OPTIONS.forEach((opt, i) => {
+  items.forEach((it, i) => {
+    const opt = it.opt;
     const isActive = aiSettings.provider === opt.provider && aiSettings.model === opt.model;
-    const needsKey = opt.tag === "cloud" && !hasAnthKey;
+    let needsKey = false;
+    if (opt.provider === "anthropic"   && !hasAnthKey)        needsKey = true;
+    if (opt.provider === "ollama-cloud" && !hasOllamaCloudKey) needsKey = true;
     const cls = "model-popover-item " + opt.tag + (isActive ? " active" : "") + (needsKey ? " disabled" : "");
-    html += `<div class="${cls}" data-idx="${i}" role="menuitem"${needsKey ? ' aria-disabled="true"' : ""}>
+    let keyHint = "";
+    if (needsKey) keyHint = (opt.provider === "ollama-cloud") ? " · Ollama key not set" : " · API key not set";
+    html += `<div class="${cls}" data-i="${i}" role="menuitem"${needsKey ? ' aria-disabled="true"' : ""}>
       <span class="check" aria-hidden="true"></span>
       <span class="info">
         <span class="name">${escapeText(opt.name)}</span>
-        <span class="meta">${escapeText(opt.meta)}${needsKey ? " · API key not set" : ""}</span>
+        <span class="meta">${escapeText(opt.meta)}${keyHint}</span>
       </span>
       <span class="badge-tag">${opt.tag}</span>
     </div>`;
   });
+
+  // Footer: status summary + Settings link. The summary covers both
+  // Anthropic key state AND the local-Ollama probe state, which is what
+  // the user most often wants to glance at when switching models.
+  let footerSummary = "";
+  if (localStatus) {
+    if (localOk) {
+      footerSummary = "Ollama: ✓ v" + localStatus.version + " · " + localModels.length + " models";
+    } else if (localStatus.error) {
+      footerSummary = "Ollama: ✗ unreachable";
+    }
+  }
+  if (hasAnthKey)        footerSummary += (footerSummary ? " · " : "") + "Anthropic key set";
+  if (hasOllamaCloudKey) footerSummary += (footerSummary ? " · " : "") + "Cloud key set";
+  if (!footerSummary)    footerSummary = "Run probe in Settings to discover local models";
+
   html += `<div class="model-popover-foot">
-    <span>${hasAnthKey ? "API key set" : "No Anthropic key configured"}</span>
+    <span>${escapeText(footerSummary)}</span>
     <a id="model-popover-settings">Settings →</a>
   </div>`;
   pop.innerHTML = html;
@@ -53191,7 +53413,7 @@ function renderModelPopover() {
   pop.querySelectorAll(".model-popover-item").forEach(el => {
     el.addEventListener("click", () => {
       if (el.classList.contains("disabled")) return;
-      const opt = MODEL_OPTIONS[+el.dataset.idx];
+      const opt = items[+el.dataset.i].opt;
       aiSettings.provider = opt.provider;
       aiSettings.model = opt.model;
       try { localStorage.setItem(AI_LS_KEY, JSON.stringify(aiSettings)); } catch (_) {}
@@ -53222,6 +53444,18 @@ function openModelPopover() {
   pop.style.display = "block";
   btn.setAttribute("aria-expanded", "true");
   setTimeout(() => document.addEventListener("click", outsideClickClose, { capture: true }), 0);
+
+  // Phase B sprint 2 -- kick a background Ollama probe so the popover
+  // reflects whatever the user has installed RIGHT NOW. The first render
+  // above used the cached snapshot (if any); when this probe lands, we
+  // re-render the popover IFF it's still open.
+  probeOllamaStatus({
+    baseUrl: aiSettings.ollamaUrl,
+    key:     "",
+    onUpdate: () => {
+      if (pop.style.display === "block") renderModelPopover();
+    }
+  });
 }
 function closeModelPopover() {
   const pop = document.getElementById("model-popover");
@@ -53399,10 +53633,16 @@ function applyProviderUi(p) {
   }
 
   // Show / refresh the local-model status panel (Gemma's WebGPU + cache state).
-  // Ollama gets its own status panel in Sprint B.2.
   const panel = document.getElementById("gemma-status-panel");
   if (panel) panel.style.display = isGemma ? "block" : "none";
   if (isGemma) refreshGemmaStatus();
+
+  // Phase B sprint 2 -- Ollama status panel (daemon version + installed
+  // models list). Shown for BOTH local and cloud variants; the probe
+  // targets the appropriate base URL based on provider.
+  const ollamaPanel = document.getElementById("ollama-status-panel");
+  if (ollamaPanel) ollamaPanel.style.display = (isOllamaLocal || isOllamaCloud) ? "block" : "none";
+  if (isOllamaLocal || isOllamaCloud) refreshOllamaStatus();
 
   // Warn if WebGPU isn't available (Gemma-only concern).
   if (isGemma && !setupGemmaAvailable()) {
@@ -53481,6 +53721,154 @@ document.getElementById("btn-gemma-preload").addEventListener("click", async () 
   } finally {
     setGemmaProgressHook(null);
   }
+});
+
+/* Phase B sprint 2 -- Ollama status panel.
+ *
+ * Mirrors the Gemma panel shape: shows daemon-version + installed-model
+ * lines, a "Test connection" button, and a scrollable list of installed
+ * models. Each model row is clickable -- click sets it as the active
+ * model. List repopulates via probeOllamaStatus() from src/ai/ollama.js
+ * with a 30s cache + background-refresh fallback.
+ *
+ * The same panel serves both provider variants: for "ollama" the base
+ * URL comes from aiSettings.ollamaUrl (or the 127.0.0.1:11434 default),
+ * for "ollama-cloud" it's the fixed ollama.com endpoint. The panel
+ * detects which is active and probes accordingly.
+ */
+function _ollamaPanelOptsFor(provider) {
+  // Read the LIVE settings-modal field value, not aiSettings, so the
+  // user can test before saving. The "key" field doubles as URL for
+  // local Ollama -- see applyProviderUi for the dual-role.
+  const raw = (sKey && sKey.value) ? sKey.value.trim() : "";
+  if (provider === "ollama-cloud") {
+    return { baseUrl: OLLAMA_CLOUD_BASE_URL, key: raw || aiSettings.ollamaKey };
+  }
+  // Local Ollama.
+  const url = raw.replace(/\/+$/, "");
+  return { baseUrl: url || aiSettings.ollamaUrl, key: "" };
+}
+
+function refreshOllamaStatus() {
+  const verSpan   = document.getElementById("ollama-version-state");
+  const countSpan = document.getElementById("ollama-models-state");
+  const listEl    = document.getElementById("ollama-models-list");
+  const noteEl    = document.getElementById("ollama-probe-note");
+  if (!verSpan || !countSpan || !listEl) return;
+
+  const provider = sProvider ? sProvider.value : aiSettings.provider;
+  const opts = _ollamaPanelOptsFor(provider);
+  const cached = getCachedOllamaStatus(opts.baseUrl, opts.key);
+
+  // Render whatever cached snapshot we have right now.
+  _ollamaRenderStatus(cached, provider);
+
+  // Kick a background probe; re-render when it lands.
+  probeOllamaStatus({
+    baseUrl: opts.baseUrl,
+    key:     opts.key,
+    onUpdate: (out) => _ollamaRenderStatus(out, provider)
+  });
+  if (noteEl) {
+    noteEl.textContent = cached ? "" : "probing " + _resolveOllamaBase(opts.baseUrl) + "…";
+    noteEl.style.color = "var(--text-3)";
+  }
+}
+
+function _ollamaRenderStatus(snapshot, provider) {
+  const verSpan   = document.getElementById("ollama-version-state");
+  const countSpan = document.getElementById("ollama-models-state");
+  const listEl    = document.getElementById("ollama-models-list");
+  const noteEl    = document.getElementById("ollama-probe-note");
+  if (!verSpan || !countSpan || !listEl) return;
+  if (!snapshot) {
+    verSpan.textContent   = "checking…";
+    verSpan.style.color   = "var(--text-3)";
+    countSpan.textContent = "—";
+    countSpan.style.color = "var(--text-3)";
+    listEl.innerHTML = "";
+    return;
+  }
+  if (snapshot.error && !snapshot.version) {
+    verSpan.textContent   = "✗ unreachable";
+    verSpan.style.color   = "var(--danger)";
+    countSpan.textContent = "—";
+    countSpan.style.color = "var(--text-3)";
+    listEl.innerHTML = "";
+    if (noteEl) {
+      // Most common failure: daemon not running. Surface install hint.
+      const msg = snapshot.error;
+      let hint = msg;
+      if (/Failed to fetch|NetworkError/i.test(msg)) {
+        if (provider === "ollama-cloud") {
+          hint = "blocked — check your Ollama Cloud key or network connection";
+        } else {
+          hint = "daemon not reachable. Install Ollama from ollama.com/download and run `ollama serve`, or set the URL above to point at a daemon on another machine.";
+        }
+      }
+      noteEl.textContent = hint;
+      noteEl.style.color = "var(--danger)";
+    }
+    return;
+  }
+  // Success path.
+  verSpan.textContent = "✓ v" + snapshot.version;
+  verSpan.style.color = "var(--audio)";
+  const models = snapshot.models || [];
+  countSpan.textContent = models.length + (models.length === 1 ? " model" : " models");
+  countSpan.style.color = models.length ? "var(--audio)" : "var(--warn)";
+
+  // Render the scrollable list of installed models. Each row sets that
+  // model as the active one on click. Active model gets a check.
+  const activeModel = (sModel && sModel.value) || aiSettings.model;
+  if (!models.length) {
+    listEl.innerHTML = '<div class="ollama-model-empty">No models pulled yet. Run <code>ollama pull llama3.2</code> in a terminal, then click Refresh.</div>';
+  } else {
+    listEl.innerHTML = models.map(m => {
+      const sizeStr = (typeof m.size === "number") ? (m.size / 1e9).toFixed(2) + " GB" : "";
+      const isActive = (m.name === activeModel);
+      return `<div class="ollama-model${isActive ? " active" : ""}" data-name="${escapeAttr(m.name)}" role="button">
+        <span class="ollama-model-name">${escapeText(m.name)}</span>
+        <span class="ollama-model-size">${sizeStr}</span>
+      </div>`;
+    }).join("");
+    listEl.querySelectorAll(".ollama-model").forEach(el => {
+      el.addEventListener("click", () => {
+        const name = el.dataset.name;
+        if (sModel) sModel.value = name;
+        // Update the active highlight without a full re-render.
+        listEl.querySelectorAll(".ollama-model").forEach(e => e.classList.remove("active"));
+        el.classList.add("active");
+      });
+    });
+  }
+  if (noteEl) {
+    noteEl.textContent = "Last probed " + new Date(snapshot.fetchedAt).toLocaleTimeString();
+    noteEl.style.color = "var(--text-3)";
+  }
+}
+
+/* Buttons inside the Ollama status panel. Both end up calling
+ * refreshOllamaStatus() with a force flag (Test connection) or without
+ * (Refresh) -- the difference is only whether we honor the 30s cache. */
+const btnOllamaTest = document.getElementById("btn-ollama-test");
+if (btnOllamaTest) btnOllamaTest.addEventListener("click", async () => {
+  const noteEl = document.getElementById("ollama-probe-note");
+  const provider = sProvider ? sProvider.value : aiSettings.provider;
+  const opts = _ollamaPanelOptsFor(provider);
+  if (noteEl) {
+    noteEl.textContent = "probing " + _resolveOllamaBase(opts.baseUrl) + "…";
+    noteEl.style.color = "var(--text-3)";
+  }
+  await probeOllamaStatus({ baseUrl: opts.baseUrl, key: opts.key, force: true });
+  refreshOllamaStatus();
+});
+const btnOllamaRefresh = document.getElementById("btn-ollama-refresh");
+if (btnOllamaRefresh) btnOllamaRefresh.addEventListener("click", async () => {
+  const provider = sProvider ? sProvider.value : aiSettings.provider;
+  const opts = _ollamaPanelOptsFor(provider);
+  await probeOllamaStatus({ baseUrl: opts.baseUrl, key: opts.key, force: true });
+  refreshOllamaStatus();
 });
 
 function openSettings() {
@@ -53622,6 +54010,23 @@ document.getElementById("btn-settings-clear").addEventListener("click", () => {
 
 // Initial paint of the badge after AI settings are wired up.
 refreshModelBadge();
+
+// Phase B sprint 2 -- idle probe of the local Ollama daemon so the
+// model badge popover has fresh `installed models` data the first time
+// the user clicks it. requestIdleCallback (with a setTimeout fallback)
+// keeps this off the startup-paint critical path. Failures are silent
+// here -- the cache will record the error and the popover renders
+// "Ollama: ✗ unreachable" in the footer next time it opens.
+const _kickIdleOllamaProbe = () => {
+  probeOllamaStatus({ baseUrl: aiSettings.ollamaUrl, key: "" })
+    .then(() => refreshModelBadge())
+    .catch(() => {});
+};
+if (typeof requestIdleCallback === "function") {
+  requestIdleCallback(_kickIdleOllamaProbe, { timeout: 4000 });
+} else {
+  setTimeout(_kickIdleOllamaProbe, 1500);
+}
 
 // Cmd/Ctrl-Enter in prompt = run
 aiPromptEl.addEventListener("keydown", e => {
