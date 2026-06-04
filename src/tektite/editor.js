@@ -82,11 +82,13 @@ async function _tektiteRefreshPreview() {
   if (s.viewMode === "source") return;
   const text = _tektiteEditorGetText();
   try {
-    const html = await tektiteMarkdownRender(text || "");
-    s.previewEl.innerHTML = html ||
-      '<div class="tektite-preview-empty">(empty note — start typing in the source pane)</div>';
-    // Wire wikilink clicks inside the preview to the same navigator
-    // that CodeMirror's decoration uses.
+    if (!text) {
+      s.previewEl.innerHTML = '<div class="tektite-preview-empty">(empty note — start typing in the source pane)</div>';
+      return;
+    }
+    // Sprint tektite-2c1 -- render INTO the live preview element so
+    // Mermaid + KaTeX can measure attached-DOM layout.
+    await tektiteMarkdownRenderInto(s.previewEl, text);
     s.previewEl.querySelectorAll("a.tektite-link").forEach(a => {
       a.addEventListener("click", (e) => {
         e.preventDefault();

@@ -78,22 +78,35 @@ let _tektiteMarkedCache = null;
 async function _tektiteLoadMarked() {
   if (_tektiteMarkedCache) return _tektiteMarkedCache;
   try {
-    const m = await import("https://esm.sh/marked@latest");
+    // Sprint tektite-2c1 -- pin marked + marked-footnote to compatible
+    // majors so esm.sh hands both packages the SAME marked instance.
+    // Without pins, `latest` resolution can give us marked@13 here but
+    // marked-footnote loads marked@9 internally → fn.use() mutates a
+    // marked instance the renderer never sees, footnotes silently
+    // don't get parsed.
+    const m = await import("https://esm.sh/marked@13");
     const fn = (typeof m.marked === "function") ? m.marked
              : (typeof m.default === "function") ? m.default
              : null;
     if (!fn) throw new Error("marked module did not expose a callable entry");
-    // GFM + line breaks; headerIds disabled to avoid collisions when
-    // the same note renders multiple times in transclusion.
     if (typeof fn.setOptions === "function") {
       fn.setOptions({ gfm: true, breaks: true, headerIds: false, mangle: false });
     }
-    // Sprint tektite-2c -- footnotes via marked-footnote extension.
-    // Optional; if the load fails footnotes degrade to literal text.
+    // Footnotes via marked-footnote. The `?deps=marked@13` query tells
+    // esm.sh to give marked-footnote the SAME marked instance we just
+    // imported, so fn.use() and the extension's marked-mutation hit
+    // the same object.
     try {
-      const fnExt = await import("https://esm.sh/marked-footnote@latest");
-      const ext = (fnExt.default || fnExt.markedFootnote);
-      if (ext && typeof fn.use === "function") fn.use(ext());
+      const fnExt = await import("https://esm.sh/marked-footnote@1?deps=marked@13");
+      const ext = (typeof fnExt.default === "function") ? fnExt.default
+                : (typeof fnExt.markedFootnote === "function") ? fnExt.markedFootnote
+                : null;
+      if (ext && typeof fn.use === "function") {
+        fn.use(ext());
+        console.info("[tektite] marked-footnote registered");
+      } else {
+        console.warn("[tektite] marked-footnote shape unexpected:", Object.keys(fnExt));
+      }
     } catch (e) {
       console.warn("[tektite] marked-footnote unavailable:", e);
     }
@@ -225,31 +238,51 @@ async function _tektiteTransformMermaid(rootEl) {
   if (!nodes.length) return;
   const mermaid = await _tektiteLoadMermaid();
   if (!mermaid) return;
-  for (const code of nodes) {
+
+  // Sprint tektite-2c1 -- replace each <pre><code> with a fresh
+  // <div class="mermaid"> that mermaid.run() will populate. The
+  // run() API is more reliable than render() because it spins up
+  // mermaid's own off-screen measuring SVG, which gets the correct
+  // computed styles from the attached document.
+  const containers = [];
+  nodes.forEach(code => {
     const src = code.textContent || "";
     const id  = "tektite-mmd-" + (_tektiteMermaidIdCtr++);
-    try {
-      const { svg } = await mermaid.render(id, src);
-      const wrap = document.createElement("div");
-      wrap.className = "tektite-mermaid";
-      wrap.innerHTML = svg;
-      // Replace the parent <pre> so the inline ``` framing disappears.
-      code.parentElement.replaceWith(wrap);
-    } catch (e) {
-      const err = document.createElement("div");
-      err.className = "tektite-mermaid-err";
-      err.textContent = "Mermaid error: " + (e.message || String(e));
-      code.parentElement.replaceWith(err);
-    }
+    const div = document.createElement("div");
+    div.className = "mermaid tektite-mermaid";
+    div.id = id;
+    div.textContent = src;
+    code.parentElement.replaceWith(div);
+    containers.push(div);
+  });
+
+  try {
+    // run() takes a NodeList or array of nodes; passes them through
+    // the same render path as the original auto-init flow.
+    await mermaid.run({ nodes: containers });
+  } catch (e) {
+    // run() can throw on the first bad block + skip the rest; mark
+    // any remaining non-rendered containers as errored.
+    containers.forEach(div => {
+      if (!div.querySelector("svg")) {
+        const err = document.createElement("div");
+        err.className = "tektite-mermaid-err";
+        err.textContent = "Mermaid error: " + (e.message || String(e));
+        div.replaceWith(err);
+      }
+    });
   }
 }
 
-/* Public: render markdown text to HTML element. Caller appends the
- * returned element to a container; we own the DOM transform so KaTeX
- * + Mermaid post-processing can mutate live nodes. */
-async function tektiteMarkdownRender(text) {
+/* Public: render markdown text into a target element. Caller passes
+ * the live preview container; we set innerHTML then run the math +
+ * mermaid transforms in place on the attached DOM so Mermaid can
+ * measure text (Mermaid silently fails to render on detached nodes).
+ *
+ * Returns void; the target element is now populated. */
+async function tektiteMarkdownRenderInto(targetEl, text) {
+  if (!targetEl) return;
   const marked = await _tektiteLoadMarked();
-  // Process [[wikilinks]] into anchors before marked sees them.
   const withLinks = String(text || "").replace(
     TEKTITE_WIKILINK_RE,
     (whole, inner) => {
@@ -261,16 +294,29 @@ async function tektiteMarkdownRender(text) {
       return '<a href="#" class="tektite-link" data-tektite-link="' + safeT + '">' + safeD + '</a>';
     }
   );
-  // Math placeholders survive marked's HTML escape.
   const withMath = _tektitePreprocessMath(withLinks);
   const rawHtml = marked(withMath);
-  // Mount into a detached container so the transform passes can
-  // mutate nodes before they're attached to the visible DOM.
+  targetEl.innerHTML = rawHtml;
+  // Transforms run on the LIVE attached DOM so Mermaid + KaTeX can
+  // measure layout. KaTeX is sync inside the loop; Mermaid is async
+  // per-block (it spins up a temporary SVG to compute text widths).
+  await _tektiteTransformMath(targetEl);
+  await _tektiteTransformMermaid(targetEl);
+}
+
+/* Back-compat shim: prior callers expected an HTML string. The detached
+ * pass swallowed Mermaid; we keep this for transclusion use cases where
+ * an HTML string is genuinely what's needed. */
+async function tektiteMarkdownRender(text) {
   const wrap = document.createElement("div");
-  wrap.innerHTML = rawHtml;
-  await _tektiteTransformMath(wrap);
-  await _tektiteTransformMermaid(wrap);
-  return wrap.innerHTML;
+  document.body.appendChild(wrap);
+  wrap.style.cssText = "position:absolute;left:-9999px;top:0;width:600px;visibility:hidden;";
+  try {
+    await tektiteMarkdownRenderInto(wrap, text);
+    return wrap.innerHTML;
+  } finally {
+    wrap.remove();
+  }
 }
 
 /* Inline wikilink decoration. Walks the visible doc on every viewport
@@ -298,6 +344,180 @@ function _tektiteMakeWikilinkPlugin(cm) {
             class: "cm-wikilink",
             attributes: { "data-tektite-link": m[1] }
           }));
+        }
+      }
+      return builder.finish();
+    }
+  }, { decorations: v => v.decorations });
+}
+
+/* Sprint tektite-2d -- Obsidian-style Live Preview decoration.
+ *
+ * Hides inline markdown syntax markers (* _ ** __ ~~ == `) when the
+ * cursor is NOT on the line that contains them. Cursor enters → markers
+ * re-appear so the user can edit. Headings and links get the same
+ * treatment via block-level decorations.
+ *
+ * Patterns covered:
+ *   **bold**             -> renders inner text bold, hides **
+ *   __bold__             -> same, alt syntax
+ *   *italic*  /  _italic_ -> italic
+ *   ~~strike~~           -> strikethrough
+ *   ==highlight==        -> mark-style highlight
+ *   `code`               -> inline-code style
+ *   [text](url)          -> hide ](url) part, link-style text
+ *   # H1 / ## H2 / ...   -> hide marker, scale font on the line
+ *
+ * Two rules:
+ *   1. If the cursor is on the same line as a match, keep the source
+ *      visible (just style the inner text).
+ *   2. Otherwise, replace the markers with a zero-width decoration so
+ *      they "disappear", and style the inner content.
+ *
+ * Builder caveat: CodeMirror's RangeSetBuilder needs ranges sorted by
+ * `from`, AND for `Decoration.replace` ranges they must be non-
+ * overlapping. We track a `claimed` interval list per build and skip
+ * matches that overlap an already-claimed range (so e.g. **__nested__**
+ * matches the outer ** pair and leaves the inner __ alone). */
+function _tektiteMakeLivePreviewPlugin(cm) {
+  const { Decoration, ViewPlugin, RangeSetBuilder } = cm;
+  const HIDE = Decoration.replace({});
+
+  // Inline-mark patterns. Order matters: longer markers first so
+  // `**bold**` wins over the inner `*bold*`.
+  const INLINE = [
+    { re: /\*\*([^\*\n]+?)\*\*/g,  ml: 2, cls: "cm-md-bold"   },
+    { re: /__([^_\n]+?)__/g,        ml: 2, cls: "cm-md-bold"   },
+    { re: /(?<!\*)\*([^\*\n]+?)\*(?!\*)/g, ml: 1, cls: "cm-md-italic" },
+    { re: /(?<!_)_([^_\n]+?)_(?!_)/g,      ml: 1, cls: "cm-md-italic" },
+    { re: /~~([^~\n]+?)~~/g,        ml: 2, cls: "cm-md-strike"    },
+    { re: /==([^=\n]+?)==/g,        ml: 2, cls: "cm-md-highlight" },
+    { re: /`([^`\n]+?)`/g,          ml: 1, cls: "cm-md-code"      }
+  ];
+  // [text](url) -- treat as one match; renderer hides everything from
+  // `]` onward (the trailing `](url)`).
+  const LINK_RE = /\[([^\]\n]+)\]\(([^)\n]+)\)/g;
+  // Headings -- whole-line decoration plus marker-hide.
+  const HEADING_RE = /^(#{1,6})\s+(.+)$/;
+
+  function rangesOverlap(claimed, from, to) {
+    for (let i = 0; i < claimed.length; i++) {
+      const c = claimed[i];
+      if (from < c[1] && to > c[0]) return true;
+    }
+    return false;
+  }
+
+  return ViewPlugin.fromClass(class {
+    constructor(view) { this.decorations = this.build(view); }
+    update(update) {
+      if (update.docChanged || update.viewportChanged || update.selectionSet) {
+        this.decorations = this.build(update.view);
+      }
+    }
+    build(view) {
+      const claimed = [];
+      const items   = [];  // { from, to, deco, isLine }
+      const head    = view.state.selection.main.head;
+      const cursorLineNo = view.state.doc.lineAt(head).number;
+
+      for (const { from, to } of view.visibleRanges) {
+        let lineStart = view.state.doc.lineAt(from).from;
+        while (lineStart <= to) {
+          const line = view.state.doc.lineAt(lineStart);
+          const lineText = line.text;
+          const lineNo = line.number;
+          const cursorOnLine = (cursorLineNo === lineNo);
+
+          // ----- Heading: line-level -----
+          const headM = lineText.match(HEADING_RE);
+          if (headM) {
+            const level = headM[1].length;
+            items.push({
+              from: line.from, to: line.from, deco: Decoration.line({ class: "cm-md-h" + level }), isLine: true
+            });
+            if (!cursorOnLine) {
+              // Hide "## " marker + space.
+              items.push({
+                from: line.from, to: line.from + level + 1, deco: HIDE, isLine: false
+              });
+              claimed.push([line.from, line.from + level + 1]);
+            }
+          }
+
+          // ----- Inline patterns on this line -----
+          for (const pat of INLINE) {
+            pat.re.lastIndex = 0;
+            let m;
+            while ((m = pat.re.exec(lineText))) {
+              const matchFrom = line.from + m.index;
+              const matchTo   = matchFrom + m[0].length;
+              if (rangesOverlap(claimed, matchFrom, matchTo)) continue;
+              const cursorInMatch = head >= matchFrom && head <= matchTo;
+              if (cursorOnLine || cursorInMatch) {
+                // Just style the inner text; keep markers visible.
+                items.push({
+                  from: matchFrom + pat.ml, to: matchTo - pat.ml,
+                  deco: Decoration.mark({ class: pat.cls }), isLine: false
+                });
+              } else {
+                // Hide opening + closing markers; style inner.
+                items.push({ from: matchFrom, to: matchFrom + pat.ml, deco: HIDE, isLine: false });
+                items.push({
+                  from: matchFrom + pat.ml, to: matchTo - pat.ml,
+                  deco: Decoration.mark({ class: pat.cls }), isLine: false
+                });
+                items.push({ from: matchTo - pat.ml, to: matchTo, deco: HIDE, isLine: false });
+              }
+              claimed.push([matchFrom, matchTo]);
+            }
+          }
+
+          // ----- Link [text](url) -----
+          LINK_RE.lastIndex = 0;
+          let lm;
+          while ((lm = LINK_RE.exec(lineText))) {
+            const matchFrom = line.from + lm.index;
+            const matchTo   = matchFrom + lm[0].length;
+            if (rangesOverlap(claimed, matchFrom, matchTo)) continue;
+            const cursorInMatch = head >= matchFrom && head <= matchTo;
+            const textStart = matchFrom + 1;
+            const textEnd   = textStart + lm[1].length;
+            if (cursorOnLine || cursorInMatch) {
+              items.push({
+                from: textStart, to: textEnd,
+                deco: Decoration.mark({ class: "cm-md-link" }), isLine: false
+              });
+            } else {
+              // Hide `[`, style text, hide `](url)`
+              items.push({ from: matchFrom, to: textStart, deco: HIDE, isLine: false });
+              items.push({
+                from: textStart, to: textEnd,
+                deco: Decoration.mark({ class: "cm-md-link" }), isLine: false
+              });
+              items.push({ from: textEnd, to: matchTo, deco: HIDE, isLine: false });
+            }
+            claimed.push([matchFrom, matchTo]);
+          }
+
+          if (line.to >= to) break;
+          lineStart = line.to + 1;
+        }
+      }
+
+      // RangeSetBuilder needs sorted ranges. Line decorations go in
+      // separate side because they're at the line.from boundary.
+      items.sort((a, b) => a.from - b.from || (a.isLine ? -1 : 1));
+      const builder = new RangeSetBuilder();
+      let lastFrom = -1, lastTo = -1, lastIsLine = false;
+      for (const it of items) {
+        // Skip exact duplicates that the sort might surface.
+        if (it.from === lastFrom && it.to === lastTo && it.isLine === lastIsLine) continue;
+        try {
+          builder.add(it.from, it.to, it.deco);
+          lastFrom = it.from; lastTo = it.to; lastIsLine = it.isLine;
+        } catch (_) {
+          // Builder rejects out-of-order; skip silently.
         }
       }
       return builder.finish();
@@ -337,10 +557,16 @@ async function tektiteMarkdownAttach(container, initialDoc, opts) {
   const mdOpts = { base: cm.markdownLanguage };
   if (cm.languages && cm.languages.length) mdOpts.codeLanguages = cm.languages;
 
+  // Sprint tektite-2d -- Live Preview decoration is opt-in via
+  // opts.livePreview (default ON). Disable by passing { livePreview:
+  // false } if you need raw source view at all times.
+  const useLivePreview = (opts.livePreview !== false);
+
   const extensions = [
     cm.basicSetup,
     cm.markdown(mdOpts),
     _tektiteMakeWikilinkPlugin(cm),
+    ...(useLivePreview ? [_tektiteMakeLivePreviewPlugin(cm)] : []),
     cm.EditorView.lineWrapping,
     cm.EditorView.theme({
       "&": {
