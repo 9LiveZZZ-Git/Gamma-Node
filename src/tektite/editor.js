@@ -45,8 +45,67 @@ const _tektiteEditorState = {
   pendingSave:    false,
   statusEl:       null,
   navigateFn:     null,       // tab.js sets this so wikilink ctrl-click can open notes
-  listeners:      new Set()
+  listeners:      new Set(),
+  // Sprint tektite-2b -- MarkText-style view modes.
+  viewMode:       "source",   // "source" | "split" | "preview"
+  previewEl:      null,
+  previewTimer:   null,
+  previewDelayMs: 250
 };
+
+/* Sprint tektite-2b -- view-mode toggle. Three modes mirror MarkText:
+ *   source  -- CodeMirror only (default)
+ *   split   -- CodeMirror + preview side-by-side (50/50)
+ *   preview -- rendered preview only, source hidden
+ * Preview re-renders on doc-change with a 250ms debounce so a typing
+ * burst doesn't thrash the markdown parser. */
+function tektiteEditorSetViewMode(mode) {
+  const s = _tektiteEditorState;
+  if (mode !== "source" && mode !== "split" && mode !== "preview") return;
+  s.viewMode = mode;
+  if (s.rootEl) {
+    s.rootEl.classList.toggle("view-source",  mode === "source");
+    s.rootEl.classList.toggle("view-split",   mode === "split");
+    s.rootEl.classList.toggle("view-preview", mode === "preview");
+  }
+  document.querySelectorAll(".tektite-view-mode-btn").forEach(btn => {
+    btn.classList.toggle("active", btn.getAttribute("data-mode") === mode);
+  });
+  if (mode === "split" || mode === "preview") _tektiteRefreshPreview();
+}
+
+function tektiteEditorGetViewMode() { return _tektiteEditorState.viewMode; }
+
+async function _tektiteRefreshPreview() {
+  const s = _tektiteEditorState;
+  if (!s.previewEl) return;
+  if (s.viewMode === "source") return;
+  const text = _tektiteEditorGetText();
+  try {
+    const html = await tektiteMarkdownRender(text || "");
+    s.previewEl.innerHTML = html ||
+      '<div class="tektite-preview-empty">(empty note — start typing in the source pane)</div>';
+    // Wire wikilink clicks inside the preview to the same navigator
+    // that CodeMirror's decoration uses.
+    s.previewEl.querySelectorAll("a.tektite-link").forEach(a => {
+      a.addEventListener("click", (e) => {
+        e.preventDefault();
+        const target = a.getAttribute("data-tektite-link");
+        if (target) tektiteEditorNavigateToWikilink(target);
+      });
+    });
+  } catch (e) {
+    s.previewEl.innerHTML = '<div class="tektite-preview-empty">Preview render failed: ' +
+      (e && e.message || String(e)) + '</div>';
+  }
+}
+
+function _tektiteEditorMarkPreviewDirty() {
+  const s = _tektiteEditorState;
+  if (s.viewMode === "source") return;
+  if (s.previewTimer) clearTimeout(s.previewTimer);
+  s.previewTimer = setTimeout(_tektiteRefreshPreview, s.previewDelayMs);
+}
 
 function tektiteEditorOnSave(fn) {
   if (typeof fn === "function") _tektiteEditorState.listeners.add(fn);
@@ -112,6 +171,7 @@ async function _tektiteEditorEnsureCodeMirror() {
       onChange: () => {
         if (!s.currentId) return;
         tektiteEditorMarkDirty();
+        _tektiteEditorMarkPreviewDirty();
       },
       onWikilinkClick: (target) => tektiteEditorNavigateToWikilink(target),
       readOnly: s.textarea ? !!s.textarea.disabled : false
@@ -134,7 +194,18 @@ function tektiteEditorAttach(rootEl) {
   s.titleInput  = rootEl.querySelector("#tektite-title");
   s.textarea    = rootEl.querySelector("#tektite-editor");
   s.cmContainer = rootEl.querySelector("#tektite-cm");
+  s.previewEl   = rootEl.querySelector("#tektite-preview");
   s.statusEl    = document.getElementById("tektite-editor-status");
+
+  // Sprint tektite-2b -- view-mode buttons in the editor toolbar.
+  rootEl.querySelectorAll(".tektite-view-mode-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const mode = btn.getAttribute("data-mode");
+      if (mode) tektiteEditorSetViewMode(mode);
+    });
+  });
+  // Default mode -- source. Sets the body class for the layout.
+  tektiteEditorSetViewMode("source");
   if (!s.textarea && !s.cmContainer) {
     console.warn("[tektite] editor host element missing");
     return;
@@ -148,6 +219,7 @@ function tektiteEditorAttach(rootEl) {
       // doesn't receive input events. Only the fallback hits this.
       if (s.cm) return;
       tektiteEditorMarkDirty();
+      _tektiteEditorMarkPreviewDirty();
     });
   }
 
@@ -220,6 +292,8 @@ async function tektiteEditorLoadFromSource(sourceId, fileId) {
       : (sourceId === "vault" ? "vault" : null);
     _tektiteEditorSetReadOnly(!writable);
     _tektiteSetStatus("");
+    // Sprint tektite-2b -- refresh preview if it's currently visible.
+    _tektiteRefreshPreview();
   } catch (e) {
     s.currentId     = null;
     s.currentSource = null;

@@ -40,11 +40,16 @@ async function _tektiteLoadCodeMirror() {
     // Each package ships its own ESM bundle from jsdelivr. We load
     // them in parallel; the EditorView in `codemirror` re-exports
     // basicSetup so callers don't need a separate import for it.
-    const [cm, lang, viewMod, stateMod] = await Promise.all([
+    //
+    // Sprint tektite-2b -- added @codemirror/language-data for
+    // syntax highlighting in fenced code blocks (the markdown
+    // extension reads it for codeLanguages discovery).
+    const [cm, lang, viewMod, stateMod, langData] = await Promise.all([
       import("https://cdn.jsdelivr.net/npm/codemirror@6/+esm"),
       import("https://cdn.jsdelivr.net/npm/@codemirror/lang-markdown@6/+esm"),
       import("https://cdn.jsdelivr.net/npm/@codemirror/view@6/+esm"),
-      import("https://cdn.jsdelivr.net/npm/@codemirror/state@6/+esm")
+      import("https://cdn.jsdelivr.net/npm/@codemirror/state@6/+esm"),
+      import("https://cdn.jsdelivr.net/npm/@codemirror/language-data@6/+esm").catch(() => null)
     ]);
     _tektiteCmModules = {
       EditorView:   cm.EditorView   || viewMod.EditorView,
@@ -55,13 +60,67 @@ async function _tektiteLoadCodeMirror() {
       WidgetType:   viewMod.WidgetType,
       keymap:       viewMod.keymap,
       RangeSetBuilder: stateMod.RangeSetBuilder,
-      markdown:     lang.markdown
+      markdown:     lang.markdown,
+      markdownLanguage: lang.markdownLanguage,
+      languages:    langData ? (langData.languages || []) : []
     };
     return _tektiteCmModules;
   } catch (e) {
     console.warn("[tektite] CodeMirror load failed; falling back to textarea:", e);
     return null;
   }
+}
+
+/* Sprint tektite-2b -- markdown-to-HTML renderer for the preview pane.
+ * Loads `marked` lazily on first use (a single ~50KB ESM bundle).
+ * Falls back to a noop pre-formatter if the CDN fetch fails. */
+let _tektiteMarkedCache = null;
+async function _tektiteLoadMarked() {
+  if (_tektiteMarkedCache) return _tektiteMarkedCache;
+  try {
+    const m = await import("https://cdn.jsdelivr.net/npm/marked@latest/+esm");
+    // marked@4+ exports { marked } with options; older versions exported
+    // a callable default. Handle both shapes.
+    const fn = (typeof m.marked === "function") ? m.marked
+             : (typeof m.default === "function") ? m.default
+             : null;
+    if (!fn) throw new Error("marked module did not expose a callable entry");
+    // Configure: GFM, line breaks, headerIds disabled to avoid id
+    // collisions when the same note renders multiple times.
+    if (typeof fn.setOptions === "function") {
+      fn.setOptions({ gfm: true, breaks: true, headerIds: false, mangle: false });
+    }
+    _tektiteMarkedCache = fn;
+    return fn;
+  } catch (e) {
+    console.warn("[tektite] marked load failed; using plain preview:", e);
+    _tektiteMarkedCache = (text) =>
+      "<pre style=\"white-space:pre-wrap;font-family:ui-monospace,monospace;\">" +
+      String(text || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") +
+      "</pre>";
+    return _tektiteMarkedCache;
+  }
+}
+
+/* Public: render markdown text to HTML.  Used by the preview pane in
+ * editor.js + reusable elsewhere (e.g. transclusion in tektite-4). */
+async function tektiteMarkdownRender(text) {
+  const marked = await _tektiteLoadMarked();
+  // Also process [[wikilinks]] into real anchors with a tektite-link
+  // class so the preview surface gets the same affordance as the
+  // CodeMirror decoration.
+  const withLinks = String(text || "").replace(
+    TEKTITE_WIKILINK_RE,
+    (whole, inner) => {
+      const pipe = inner.match(TEKTITE_PIPE_SPLIT);
+      const target = pipe ? pipe[1].trim() : inner.trim();
+      const display = pipe ? pipe[2].trim() : target;
+      const safeT = target.replace(/"/g, "&quot;");
+      const safeD = display.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+      return '<a href="#" class="tektite-link" data-tektite-link="' + safeT + '">' + safeD + '</a>';
+    }
+  );
+  return marked(withLinks);
 }
 
 /* Inline wikilink decoration. Walks the visible doc on every viewport
@@ -118,13 +177,19 @@ async function tektiteMarkdownAttach(container, initialDoc, opts) {
   const cm = await _tektiteLoadCodeMirror();
   if (!cm) return null;  // caller falls back to textarea
 
-  const compartments = {
-    readOnly: new cm.EditorState.compartment ? null : null  // CM compartments need an import; we re-create the state on r/o flip
-  };
+  // Note: read-only toggling rebuilds the state via view.setState() in
+  // the setReadOnly handle below, so no Compartment is needed.
+
+  // Sprint tektite-2b -- pass GFM + codeLanguages to the markdown
+  // extension so fenced code blocks (```js, ```python, etc.) get
+  // syntax highlighting via @codemirror/language-data's lazy-loaded
+  // grammar registry.
+  const mdOpts = { base: cm.markdownLanguage };
+  if (cm.languages && cm.languages.length) mdOpts.codeLanguages = cm.languages;
 
   const extensions = [
     cm.basicSetup,
-    cm.markdown(),
+    cm.markdown(mdOpts),
     _tektiteMakeWikilinkPlugin(cm),
     cm.EditorView.lineWrapping,
     cm.EditorView.theme({
