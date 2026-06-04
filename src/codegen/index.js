@@ -155,6 +155,14 @@ function prepareSample(cgCtx) {
     // emitted at the bottom of operator() by generateCode.
     if (def.kind === "delay1") return;
 
+    // Phase A.1 — runtime-only LLM / notes nodes (kind: "llm-op",
+    // "llm-sink", "llm-viz", "notes-source") don't participate in the
+    // audio codegen path. Their port types live in VISUAL_PORT_TYPES
+    // ("vector", "llm-attn", "texture"), so they shouldn't appear here
+    // anyway — but skip defensively in case a future codegen change
+    // wires them in. See docs/LLM-KNOWLEDGE-PHASE.md §3.A.1.
+    if (isRuntimeOnlyKind(def.kind)) return;
+
     // Walk dependencies first so deeper binds (and their hoists) appear
     // earlier in the statement list.
     def.ins.forEach(p => {
@@ -449,6 +457,10 @@ function generateCode() {
       delay1Nodes.push(n);
       return;
     }
+    // Phase A.1 — runtime-only LLM / notes nodes don't emit any C++.
+    // They persist in `.gpatch` as runtime state but contribute nothing
+    // to the generated `.h`. See docs/LLM-KNOWLEDGE-PHASE.md §3.A.1.
+    if (isRuntimeOnlyKind(def.kind)) return;
     if (def.cppType) decls.push(`    ${def.cppType} ${n.id};`);
     if (def.extraCtor) {
       // extraCtor entries can be either:

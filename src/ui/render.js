@@ -414,7 +414,21 @@ const SIGNAL_PORT_TYPES = new Set(["audio", "param", "gate", "clock"]);
 // Sprint 7.5.3a -- camera is a new visual-side port type alongside
 // mesh + texture. Same strict-same-type rule applies. Cameras carry
 // view + projection matrices to a Scene sink.
-const VISUAL_PORT_TYPES = new Set(["texture", "transform", "mesh", "camera", "light", "environment"]);
+//
+// Phase A.1 -- two LLM-side port types added:
+//   "vector"   = { data: Float32Array, shape, dtype, gpu?, meta? }
+//                Carries embeddings (Ollama /api/embed output, dim ~768),
+//                model activations ([B,T,D]), gradient buffers, etc.
+//                See docs/LLM-KNOWLEDGE-PHASE.md §9.
+//   "llm-attn" = vector + { tokens: string[], dims: {B,H,T} }
+//                Specialization for attention weights of shape [B,H,T,T]
+//                with token labels for the AttentionGraph3D viz node.
+// Both are strict same-type like every other visual port (no implicit
+// coercion to audio / param / texture).
+const VISUAL_PORT_TYPES = new Set([
+  "texture", "transform", "mesh", "camera", "light", "environment",
+  "vector", "llm-attn"
+]);
 function portsCompatible(srcType, dstType) {
   if (srcType === dstType) return true;
   if (SIGNAL_PORT_TYPES.has(srcType) && SIGNAL_PORT_TYPES.has(dstType)) return true;

@@ -19806,5 +19806,47 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   /* ---- B1: Stateful primitives (simple ones — bigger ones in B4) ---- */
   RingMod: { category: "Effect", color: COLOR.effect, header: null, cppType: "", ins: [{n:"a", t:"audio"}, {n:"b", t:"audio"}], outs: [{n:"out", t:"audio"}], params: {}, template: "({a} * {b})", description: "Ring modulator (just multiplication, but named)" },
   PhaseInvert: { category: "Math", color: COLOR.math, header: null, cppType: "", ins: [{n:"in", t:"audio"}], outs: [{n:"out", t:"audio"}], params: {}, template: "(-{in})", description: "Multiply by -1" },
-  SoftClip: { category: "Effect", color: COLOR.effect, header: "cmath", cppType: "", ins: [{n:"in", t:"audio"}], outs: [{n:"out", t:"audio"}], params: {}, template: "tanhf({in})", description: "Soft clip via tanh" }
+  SoftClip: { category: "Effect", color: COLOR.effect, header: "cmath", cppType: "", ins: [{n:"in", t:"audio"}], outs: [{n:"out", t:"audio"}], params: {}, template: "tanhf({in})", description: "Soft clip via tanh" },
+
+  /* ============================================================
+   * Phase A.1 placeholder nodes — typed-vector port verification
+   *
+   * These three are the smoke test for the new `vector` and
+   * `llm-attn` port types (added to VISUAL_PORT_TYPES this sprint)
+   * and the new runtime-only node kinds ("llm-op", "llm-sink",
+   * "llm-viz"). They have NO runtime behavior yet — the actual
+   * dispatchers ship in Phase B (Ollama → src/ai/ollama.js) and
+   * Phase D (LLM-from-scratch → src/llm/dispatcher.js).
+   *
+   * Verification: drop a VectorSource → VectorSink in a patch, see
+   * the magenta `vector` wire connect. Drop the same pair with
+   * unrelated wire types and see them refuse (portsCompatible →
+   * false). The patch's emitted `.h` is unchanged regardless of
+   * how many of these you wire in — codegen skip via
+   * isRuntimeOnlyKind() in src/codegen/index.js.
+   * ============================================================ */
+  VectorSource: {
+    category: "AI", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-op",
+    ins: [],
+    outs: [{ n: "vec", t: "vector" }],
+    params: { dim: 4 },
+    description: "Phase A.1 placeholder — emits a static Float32Array of length `dim` with values [0..dim-1] on its `vec` output. Used to smoke-test the new typed-vector wire system. No runtime behavior; replaced by real LLMEmbed / TokenEmbedding nodes in Phases B + D."
+  },
+  VectorSink: {
+    category: "AI", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-sink",
+    ins: [{ n: "vec", t: "vector" }],
+    outs: [],
+    params: {},
+    description: "Phase A.1 placeholder — receives a `vector` input and displays its shape + first few values in the node body. No runtime behavior yet (Phase A.2 adds the node-body renderer). Used to smoke-test typed-vector wire compatibility."
+  },
+  AttnViz: {
+    category: "AI", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-viz",
+    ins: [{ n: "attn", t: "llm-attn" }],
+    outs: [{ n: "tex", t: "texture" }],
+    params: {},
+    description: "Phase A.1 placeholder — receives an `llm-attn` input (attention weights [B,H,T,T] + token labels) and outputs a `texture` port for downstream Materials. No runtime behavior yet; the real AttentionGraph3D (port of LLMAttention3D.jsx) ships in Phase D sprint llm-10."
+  }
 };

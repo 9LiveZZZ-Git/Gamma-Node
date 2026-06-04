@@ -63,6 +63,8 @@
     --environment:  #7ad6c4;     /* Sprint 7.5.4 — environment / sky (GradientSky → Scene.environment) */
     --hud:          #ff79c6;     /* §5.5.g — HUD overlay node (Minimap → Scene.hud1) */
     --heightmap:    #c89060;     /* §5.5.h — terrain heightmap reference (TiledTerrain → Water.heightmap) */
+    --vector:       #b264c8;     /* Phase A.1 — typed embedding / tensor vector (Float32Array + shape) */
+    --llm-attn:     #e87ad6;     /* Phase A.1 — attention-weights specialization carrying [B,H,T,T] + token labels */
     --selected:     #4a8fdc;
     --danger:       #e24b4a;
     --info:         #83e8ff;
@@ -833,6 +835,8 @@
      params from a TiledTerrain into a Water node so the water shader
      can compute LOD-matched depth that aligns with the rendered mesh. */
   .port.heightmap   { border-color: var(--heightmap);   border-style: dashed; border-width: 3px; }
+  .port.vector      { border-color: var(--vector);      border-style: ridge;  border-width: 3px; }
+  .port["llm-attn"], .port.llm-attn { border-color: var(--llm-attn); border-style: ridge; border-width: 4px; }
   .port.connected.param { background: var(--param); border-style: solid; }
   .port.connected.gate  { background: var(--gate); }
   .port.connected.clock { background: var(--clock); border-style: solid; }
@@ -842,6 +846,8 @@
   .port.connected.camera    { background: var(--camera);    border-style: solid; }
   .port.connected.light     { background: var(--light);     border-style: solid; }
   .port.connected.environment { background: var(--environment); border-style: solid; }
+  .port.connected.vector      { background: var(--vector);   border-style: solid; }
+  .port.connected.llm-attn    { background: var(--llm-attn); border-style: solid; }
   .port:hover { transform: translateY(-50%) scale(1.4); }
   /* Live snap target during a wire drag — when the dragged endpoint
    * is within a screen-radius of a type-compatible input port, that
@@ -861,6 +867,8 @@
   .port.wire-snap-target.texture   { box-shadow: 0 0 0 4px rgba( 95,190,255,0.22), 0 0 12px 4px rgba( 95,190,255,0.55); }
   .port.wire-snap-target.transform { box-shadow: 0 0 0 4px rgba(185,116,255,0.22), 0 0 12px 4px rgba(185,116,255,0.55); }
   .port.wire-snap-target.mesh      { box-shadow: 0 0 0 4px rgba(255,157, 63,0.22), 0 0 12px 4px rgba(255,157, 63,0.55); }
+  .port.wire-snap-target.vector    { box-shadow: 0 0 0 4px rgba(178,100,200,0.22), 0 0 12px 4px rgba(178,100,200,0.55); }
+  .port.wire-snap-target.llm-attn  { box-shadow: 0 0 0 4px rgba(232,122,214,0.22), 0 0 12px 4px rgba(232,122,214,0.55); }
 
   /* Brief red pulse when a wire-drop is refused by portsCompatible(). The
    * destination port flashes for ~400ms so the rejection is visible without
@@ -8089,8 +8097,73 @@
  * Pages deploy workflow (.github/workflows/pages.yml). The string
  * after the equals sign is what the workflow's sed targets — don't
  * change the format of this line. */
-const APP_VERSION = "0.3.688";
+const APP_VERSION = "0.3.689";
 
+/* =========================================================================
+ * Node kinds — runtime-only kind registry
+ *
+ * Phase A.1 of the LLM + knowledge-management roadmap branch
+ * (docs/LLM-KNOWLEDGE-PHASE.md §3.A.1).
+ *
+ * `def.kind` is an existing field in the node-type registry; today the
+ * codegen path reads it to special-case `"delay1"` feedback nodes
+ * (src/codegen/index.js). RayTracedScene already uses `kind: "scene-rt"`
+ * to dispatch a different visual encoder path.
+ *
+ * Phase A.1 reserves four NEW kind tags for nodes that are JS/WebGPU-
+ * runtime-only and do NOT participate in the C++ Gamma DSP codegen
+ * path (mirroring how `RayTracedScene` is treated — its outputs land
+ * in the visual pipeline, not in the emitted `.h`):
+ *
+ *   "llm-op"        Pure tensor op. Has forward + backward exported
+ *                   in the LLM autograd registry (Phase D / src/llm/).
+ *                   Examples: MultiHeadAttention, LayerNorm, FFN.
+ *
+ *   "llm-sink"      Side-effecting LLM endpoint (training, inference).
+ *                   Examples: TrainStep, Generate, Chat.
+ *
+ *   "llm-viz"       Renders LLM state to a `texture` port (consumable
+ *                   by any downstream Material / Composite slot).
+ *                   Examples: AttentionGraph3D, LossPlot,
+ *                   EmbeddingProjection.
+ *
+ *   "notes-source"  Streams tokenized notes from the Tektite MD vault
+ *                   (Phase C / src/tektite/) as a training corpus.
+ *                   Example: NotesCorpus.
+ *
+ * Nodes with these kinds:
+ *   - Skip C++ codegen entirely (no member declaration, no setter
+ *     emission, no expression contribution). They naturally don't
+ *     appear in audio codegen because their port types
+ *     (`vector`, `llm-attn`, `texture`, ...) live in
+ *     VISUAL_PORT_TYPES, not SIGNAL_PORT_TYPES, so they can't be
+ *     wired into the audio signal tree. The skip is enforced
+ *     defensively in src/codegen/index.js via isRuntimeOnlyKind().
+ *   - Persist their params + wire connections in `.gpatch` save
+ *     (no special treatment — just falls through the regular
+ *     state-serialization path).
+ *   - Are dispatched at runtime through subsystem-specific routers:
+ *       llm-* → src/llm/dispatcher.js (Phase D)
+ *       notes-source → src/tektite/corpus.js (Phase C)
+ *     Until those subsystems ship, runtime-only nodes are inert
+ *     (registered but produce no per-frame output).
+ *
+ * This file declares the set + an isRuntimeOnlyKind() helper that
+ * codegen, wire-eval, and any future runtime dispatcher consult so
+ * the canonical list lives in exactly one place. Adding a new
+ * runtime-only kind tag means editing this file and nothing else.
+ * ======================================================================== */
+
+const RUNTIME_ONLY_KINDS = new Set([
+  "llm-op",
+  "llm-sink",
+  "llm-viz",
+  "notes-source"
+]);
+
+function isRuntimeOnlyKind(k) {
+  return typeof k === "string" && RUNTIME_ONLY_KINDS.has(k);
+}
 /* =========================================================================
  * Node type registry — covers ~55 Gamma DSP classes
  *
@@ -27938,7 +28011,49 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   /* ---- B1: Stateful primitives (simple ones — bigger ones in B4) ---- */
   RingMod: { category: "Effect", color: COLOR.effect, header: null, cppType: "", ins: [{n:"a", t:"audio"}, {n:"b", t:"audio"}], outs: [{n:"out", t:"audio"}], params: {}, template: "({a} * {b})", description: "Ring modulator (just multiplication, but named)" },
   PhaseInvert: { category: "Math", color: COLOR.math, header: null, cppType: "", ins: [{n:"in", t:"audio"}], outs: [{n:"out", t:"audio"}], params: {}, template: "(-{in})", description: "Multiply by -1" },
-  SoftClip: { category: "Effect", color: COLOR.effect, header: "cmath", cppType: "", ins: [{n:"in", t:"audio"}], outs: [{n:"out", t:"audio"}], params: {}, template: "tanhf({in})", description: "Soft clip via tanh" }
+  SoftClip: { category: "Effect", color: COLOR.effect, header: "cmath", cppType: "", ins: [{n:"in", t:"audio"}], outs: [{n:"out", t:"audio"}], params: {}, template: "tanhf({in})", description: "Soft clip via tanh" },
+
+  /* ============================================================
+   * Phase A.1 placeholder nodes — typed-vector port verification
+   *
+   * These three are the smoke test for the new `vector` and
+   * `llm-attn` port types (added to VISUAL_PORT_TYPES this sprint)
+   * and the new runtime-only node kinds ("llm-op", "llm-sink",
+   * "llm-viz"). They have NO runtime behavior yet — the actual
+   * dispatchers ship in Phase B (Ollama → src/ai/ollama.js) and
+   * Phase D (LLM-from-scratch → src/llm/dispatcher.js).
+   *
+   * Verification: drop a VectorSource → VectorSink in a patch, see
+   * the magenta `vector` wire connect. Drop the same pair with
+   * unrelated wire types and see them refuse (portsCompatible →
+   * false). The patch's emitted `.h` is unchanged regardless of
+   * how many of these you wire in — codegen skip via
+   * isRuntimeOnlyKind() in src/codegen/index.js.
+   * ============================================================ */
+  VectorSource: {
+    category: "AI", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-op",
+    ins: [],
+    outs: [{ n: "vec", t: "vector" }],
+    params: { dim: 4 },
+    description: "Phase A.1 placeholder — emits a static Float32Array of length `dim` with values [0..dim-1] on its `vec` output. Used to smoke-test the new typed-vector wire system. No runtime behavior; replaced by real LLMEmbed / TokenEmbedding nodes in Phases B + D."
+  },
+  VectorSink: {
+    category: "AI", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-sink",
+    ins: [{ n: "vec", t: "vector" }],
+    outs: [],
+    params: {},
+    description: "Phase A.1 placeholder — receives a `vector` input and displays its shape + first few values in the node body. No runtime behavior yet (Phase A.2 adds the node-body renderer). Used to smoke-test typed-vector wire compatibility."
+  },
+  AttnViz: {
+    category: "AI", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-viz",
+    ins: [{ n: "attn", t: "llm-attn" }],
+    outs: [{ n: "tex", t: "texture" }],
+    params: {},
+    description: "Phase A.1 placeholder — receives an `llm-attn` input (attention weights [B,H,T,T] + token labels) and outputs a `texture` port for downstream Materials. No runtime behavior yet; the real AttentionGraph3D (port of LLMAttention3D.jsx) ships in Phase D sprint llm-10."
+  }
 };
 
 /* Display order in the palette. "Sample" was missing here even though
@@ -46832,7 +46947,21 @@ const SIGNAL_PORT_TYPES = new Set(["audio", "param", "gate", "clock"]);
 // Sprint 7.5.3a -- camera is a new visual-side port type alongside
 // mesh + texture. Same strict-same-type rule applies. Cameras carry
 // view + projection matrices to a Scene sink.
-const VISUAL_PORT_TYPES = new Set(["texture", "transform", "mesh", "camera", "light", "environment"]);
+//
+// Phase A.1 -- two LLM-side port types added:
+//   "vector"   = { data: Float32Array, shape, dtype, gpu?, meta? }
+//                Carries embeddings (Ollama /api/embed output, dim ~768),
+//                model activations ([B,T,D]), gradient buffers, etc.
+//                See docs/LLM-KNOWLEDGE-PHASE.md §9.
+//   "llm-attn" = vector + { tokens: string[], dims: {B,H,T} }
+//                Specialization for attention weights of shape [B,H,T,T]
+//                with token labels for the AttentionGraph3D viz node.
+// Both are strict same-type like every other visual port (no implicit
+// coercion to audio / param / texture).
+const VISUAL_PORT_TYPES = new Set([
+  "texture", "transform", "mesh", "camera", "light", "environment",
+  "vector", "llm-attn"
+]);
 function portsCompatible(srcType, dstType) {
   if (srcType === dstType) return true;
   if (SIGNAL_PORT_TYPES.has(srcType) && SIGNAL_PORT_TYPES.has(dstType)) return true;
@@ -49232,6 +49361,14 @@ function prepareSample(cgCtx) {
     // emitted at the bottom of operator() by generateCode.
     if (def.kind === "delay1") return;
 
+    // Phase A.1 — runtime-only LLM / notes nodes (kind: "llm-op",
+    // "llm-sink", "llm-viz", "notes-source") don't participate in the
+    // audio codegen path. Their port types live in VISUAL_PORT_TYPES
+    // ("vector", "llm-attn", "texture"), so they shouldn't appear here
+    // anyway — but skip defensively in case a future codegen change
+    // wires them in. See docs/LLM-KNOWLEDGE-PHASE.md §3.A.1.
+    if (isRuntimeOnlyKind(def.kind)) return;
+
     // Walk dependencies first so deeper binds (and their hoists) appear
     // earlier in the statement list.
     def.ins.forEach(p => {
@@ -49526,6 +49663,10 @@ function generateCode() {
       delay1Nodes.push(n);
       return;
     }
+    // Phase A.1 — runtime-only LLM / notes nodes don't emit any C++.
+    // They persist in `.gpatch` as runtime state but contribute nothing
+    // to the generated `.h`. See docs/LLM-KNOWLEDGE-PHASE.md §3.A.1.
+    if (isRuntimeOnlyKind(def.kind)) return;
     if (def.cppType) decls.push(`    ${def.cppType} ${n.id};`);
     if (def.extraCtor) {
       // extraCtor entries can be either:
