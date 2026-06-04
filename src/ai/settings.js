@@ -23,7 +23,20 @@ let aiPending = null;   // last suggestion awaiting Apply/Discard
 function loadAiSettings() {
   try {
     const raw = localStorage.getItem(AI_LS_KEY);
-    if (raw) return Object.assign(defaultAiSettings(), JSON.parse(raw));
+    if (raw) {
+      const merged = Object.assign(defaultAiSettings(), JSON.parse(raw));
+      // v0.3.703 fix -- if a previous build allowed an API key to be
+      // saved into ollamaUrl (e.g. paste-into-wrong-field), scrub it on
+      // load so the auto-prefix-http:// path can never turn it into a
+      // URL again. Logs a warning so the user knows their stored
+      // setting was reset.
+      if (merged.ollamaUrl && !_looksLikeOllamaUrl(merged.ollamaUrl)) {
+        console.warn("[ai-settings] Stored ollamaUrl doesn't look like a URL — clearing it. (Open Settings to re-enter a real URL, or leave blank for default 127.0.0.1:11434.)");
+        merged.ollamaUrl = "";
+        try { localStorage.setItem(AI_LS_KEY, JSON.stringify(merged)); } catch (_) {}
+      }
+      return merged;
+    }
   } catch (e) {}
   return defaultAiSettings();
 }
@@ -1363,7 +1376,17 @@ document.getElementById("btn-settings-save").addEventListener("click", () => {
     aiSettings.model = newModel;
   } else if (aiSettings.provider === "ollama") {
     aiSettings.model     = sModel.value.trim() || PROVIDERS.ollama.defaultModel;
-    aiSettings.ollamaUrl = sKey.value.trim().replace(/\/+$/, "");
+    // v0.3.703 fix -- if the URL field looks like an API key (most
+    // commonly an Anthropic sk-ant-... value pasted into the wrong
+    // input), refuse to save. The previous behaviour stored that in
+    // localStorage which then got auto-prefixed with http:// and
+    // showed up in console URLs, leaking the key.
+    const rawUrl = sKey.value.trim();
+    if (rawUrl && !_looksLikeOllamaUrl(rawUrl)) {
+      setAiStatus("Ollama URL doesn't look like a URL — leave blank for the default 127.0.0.1:11434, or paste a real http:// URL.", "err");
+      return;
+    }
+    aiSettings.ollamaUrl = rawUrl.replace(/\/+$/, "");
   } else if (aiSettings.provider === "ollama-cloud") {
     aiSettings.model     = sModel.value.trim() || PROVIDERS["ollama-cloud"].defaultModel;
     aiSettings.ollamaKey = sKey.value.trim();

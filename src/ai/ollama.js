@@ -62,6 +62,35 @@ const OLLAMA_LOCAL_DEFAULT_MODEL = "llama3.2";
 const OLLAMA_CLOUD_DEFAULT_MODEL = "gpt-oss:120b-cloud";
 const OLLAMA_DEFAULT_EMBED_MODEL = "nomic-embed-text";
 
+/* Return `true` if `s` looks plausibly like an Ollama base URL --
+ * either with an explicit http(s):// scheme, or scheme-less but having
+ * the host:port shape that a developer would actually type. Rejects
+ * obvious garbage so we don't auto-prefix http:// to things like
+ * accidentally-pasted API keys.
+ *
+ * The validation isn't trying to be exhaustive; just defensive enough
+ * to avoid the failure mode reported in v0.3.702: an Anthropic API
+ * key (`sk-ant-api03-...`) had been written into aiSettings.ollamaUrl,
+ * and the http:// auto-prefix turned it into a real http URL that
+ * leaked the key in console errors. Anything not looking like a host
+ * (no dot, no colon, no slash; or starting with the well-known API-key
+ * prefixes) falls back to the default. */
+function _looksLikeOllamaUrl(s) {
+  if (typeof s !== "string") return false;
+  s = s.trim();
+  if (!s) return false;
+  if (/^https?:\/\//i.test(s)) return true;
+  // Heuristic rejects: obvious API-key shapes that aren't URLs.
+  if (/^(sk-|api[-_]key|bearer\s)/i.test(s)) return false;
+  if (/\s/.test(s)) return false;  // spaces in a URL hostname are a tell
+  // Plausible scheme-less host:port: contains a `:` OR a `.`.
+  if (/[:.]/.test(s)) {
+    // Sanity-check by attempting URL parse with the http:// prefix.
+    try { new URL("http://" + s); return true; } catch (_) { return false; }
+  }
+  return false;
+}
+
 function _resolveOllamaBase(baseUrl) {
   let u = String(baseUrl || "").trim().replace(/\/+$/, "");
   if (!u) return OLLAMA_LOCAL_DEFAULT_URL;
@@ -69,10 +98,18 @@ function _resolveOllamaBase(baseUrl) {
   // "192.168.1.42:11434" without a scheme, fetch() would treat it as a
   // RELATIVE path and resolve against the editor's origin
   // (https://...github.io/127.0.0.1:11434/api/version), which returns
-  // the editor host's 404 HTML page instead of the Ollama API. Prepend
-  // http:// so the URL is absolute. (We never default to https:// -- a
-  // local Ollama daemon binds plain http; cloud Ollama callers pass the
-  // explicit https://ollama.com base url separately.)
+  // the editor host's 404 HTML page instead of the Ollama API.
+  //
+  // v0.3.703 fix on top: validate the URL shape BEFORE auto-prefixing
+  // http://. If it doesn't look like a URL (e.g. an Anthropic API key
+  // got accidentally written into ollamaUrl), reject it and fall back
+  // to the default. Without this, the auto-prefix would turn the key
+  // into a real http:// URL, leaking it in console error messages.
+  if (!_looksLikeOllamaUrl(u)) {
+    console.warn("[ollama] aiSettings.ollamaUrl does not look like a URL; falling back to default. Clear the field in Settings if you didn't intend to set it. Value preview:",
+      u.slice(0, 12) + (u.length > 12 ? "…" : ""));
+    return OLLAMA_LOCAL_DEFAULT_URL;
+  }
   if (!/^https?:\/\//i.test(u)) u = "http://" + u;
   return u;
 }
