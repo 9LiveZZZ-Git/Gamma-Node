@@ -123,10 +123,15 @@ function _ollamaHeaders(key) {
 async function _ollamaFetch(path, opts) {
   opts = opts || {};
   const url = _resolveOllamaBase(opts.baseUrl) + path;
+  // Phase B sprint 6 -- signal lets callers wire an AbortController so
+  // a second trigger on a sink node can cancel an in-flight stream.
+  // Pass-through to fetch; downstream stream reader sees the abort as
+  // a normal stream error and our finally{} clears state.
   const res = await fetch(url, {
     method: opts.method || "GET",
     headers: _ollamaHeaders(opts.key),
-    body: opts.body ? JSON.stringify(opts.body) : undefined
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+    signal: opts.signal || undefined
   });
   if (!res.ok) {
     let detail = "";
@@ -203,6 +208,10 @@ async function ollamaChat(opts) {
     messages,
     stream: !!opts.onToken
   };
+  // Phase B sprint 6 -- format: "json" enables Ollama's constrained
+  // JSON output. Pairs well with a schema-style system prompt. Some
+  // models honor this better than others (llama3.1+, qwen2.5+).
+  if (opts.format) body.format = opts.format;
   const inner = {};
   if (typeof opts.temperature === "number") inner.temperature = opts.temperature;
   if (typeof opts.maxTokens === "number" && opts.maxTokens > 0) inner.num_predict = opts.maxTokens;
@@ -212,7 +221,8 @@ async function ollamaChat(opts) {
     baseUrl: opts.baseUrl,
     key: opts.key,
     method: "POST",
-    body
+    body,
+    signal: opts.signal
   });
 
   if (!opts.onToken) {
@@ -242,6 +252,7 @@ async function ollamaGenerate(opts) {
     stream: !!opts.onToken
   };
   if (opts.system) body.system = opts.system;
+  if (opts.format) body.format = opts.format;  // Phase B sprint 6 -- JSON mode.
   const inner = {};
   if (typeof opts.temperature === "number") inner.temperature = opts.temperature;
   if (typeof opts.maxTokens === "number" && opts.maxTokens > 0) inner.num_predict = opts.maxTokens;
@@ -251,7 +262,8 @@ async function ollamaGenerate(opts) {
     baseUrl: opts.baseUrl,
     key: opts.key,
     method: "POST",
-    body
+    body,
+    signal: opts.signal
   });
 
   if (!opts.onToken) {

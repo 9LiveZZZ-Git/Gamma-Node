@@ -8303,7 +8303,7 @@
  * Pages deploy workflow (.github/workflows/pages.yml). The string
  * after the equals sign is what the workflow's sed targets — don't
  * change the format of this line. */
-const APP_VERSION = "0.3.709";
+const APP_VERSION = "0.3.710";
 
 /* =========================================================================
  * Node kinds — runtime-only kind registry
@@ -28366,6 +28366,170 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     },
     uiOnlyParams: ["dim", "done"],
     description: "Embeds the input string via Ollama /api/embed. On `trigger` rising edge, calls the embed endpoint with the resolved text + model. The resulting Float32Array lands on the `vec` output port (consume with anything expecting a Phase A.1 `vector` -- VectorSink to inspect shape, future Tektite MD viz, etc). `done` pulses once on completion. Default model is `nomic-embed-text` — install with `ollama pull nomic-embed-text`."
+  },
+
+  /* ============================================================
+   * Phase B sprint 6 -- stretch nodes.
+   *
+   * Six nodes that compose on top of the MVP five from sprint B.4:
+   *
+   *   ConversationMemory  -- rolling N-turn buffer; serializes to .gpatch
+   *   EmbedSimilarity     -- cosine similarity scalar between two vectors
+   *   LLMClassifier       -- constrained-choice classifier
+   *   VoiceToLLM          -- mic → STT → LLMChat composite (Web Speech API)
+   *   LLMToTTS            -- text → SpeechSynthesis sink
+   *   JSONFormat          -- JSON-mode chat with a single-field extractor
+   *
+   * All dispatched from src/ai/llm-runtime.js. ConversationMemory +
+   * EmbedSimilarity are llm-op (cheap, runs every tick); the four
+   * llm-sinks each have an AbortController so a second trigger
+   * cancels the in-flight stream + starts a new one.
+   * ============================================================ */
+  ConversationMemory: {
+    category: "AI/LLM", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-op",
+    ins: [
+      { n: "userMsg",         t: "text" },
+      { n: "assistantMsg",    t: "text" },
+      { n: "appendUser",      t: "gate" },
+      { n: "appendAssistant", t: "gate" },
+      { n: "clear",           t: "gate" }
+    ],
+    outs: [
+      { n: "messages", t: "text" },
+      { n: "count",    t: "param" }
+    ],
+    params: {
+      userMsg:         "",
+      assistantMsg:    "",
+      appendUser:      0,
+      appendAssistant: 0,
+      clear:           0,
+      maxTurns:        10,
+      history:         [],
+      messages:        "[]",
+      count:           0
+    },
+    uiOnlyParams: ["messages", "count"],
+    description: "Rolling chat-history buffer. On `appendUser` rising edge, pushes {role:'user', content: userMsg} onto an internal history array; same for `appendAssistant`. `clear` wipes the buffer. The `messages` output emits the JSON-serialized array; pipe it into a downstream LLMChat (or read history[] via the `.gpatch`). Trims oldest turns to `maxTurns * 2` entries. The `history` param persists in saved `.gpatch` so a chat session survives reload."
+  },
+
+  EmbedSimilarity: {
+    category: "AI/Embed", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-op",
+    ins: [
+      { n: "a", t: "vector" },
+      { n: "b", t: "vector" }
+    ],
+    outs: [
+      { n: "similarity", t: "param" }
+    ],
+    params: { similarity: 0 },
+    uiOnlyParams: ["similarity"],
+    description: "Cosine similarity between two vector inputs. Reads both Float32Array buffers per tick and outputs a scalar in [-1, 1] (1 = identical direction, 0 = orthogonal). Wire two LLMEmbed nodes in and drive an audio param, shader uniform, or threshold gate downstream. Vectors must have the same length; mismatch outputs 0."
+  },
+
+  LLMClassifier: {
+    category: "AI/LLM", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-sink",
+    ins: [
+      { n: "input",   t: "text" },
+      { n: "labels",  t: "text" },
+      { n: "model",   t: "text" },
+      { n: "trigger", t: "gate" }
+    ],
+    outs: [
+      { n: "label", t: "text" },
+      { n: "done",  t: "gate" }
+    ],
+    params: {
+      input:   "I love this!",
+      labels:  "positive,negative,neutral",
+      model:   "",
+      trigger: 0,
+      label:   "",
+      done:    0
+    },
+    uiOnlyParams: ["label", "done"],
+    description: "Constrained classifier. On `trigger` rising edge, asks the LLM to pick exactly one of `labels` (comma-separated) for `input`. Uses a tight system prompt + low max-tokens to force a single-word reply. Output snapped back to the closest matching label string (case-insensitive). Use for smart-link wiring (classify intent → branch behavior) or telemetry labeling."
+  },
+
+  VoiceToLLM: {
+    category: "AI/LLM", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-sink",
+    ins: [
+      { n: "record",  t: "gate" },
+      { n: "system",  t: "text" },
+      { n: "model",   t: "text" }
+    ],
+    outs: [
+      { n: "userText",      t: "text" },
+      { n: "assistantText", t: "text" },
+      { n: "done",          t: "gate" }
+    ],
+    params: {
+      record:        0,
+      system:        "",
+      model:         "",
+      userText:      "",
+      assistantText: "",
+      done:          0
+    },
+    uiOnlyParams: ["userText", "assistantText", "done"],
+    description: "Voice-in, LLM-out. On `record` rising edge, starts Web Speech API recognition; on falling edge OR `recognition.end`, finalizes the transcript, fires LLMChat with it, streams the response into `assistantText`. `userText` updates live as the user speaks. Requires a Chromium-based browser (SpeechRecognition unsupported in Firefox). Holds the mic only between rising + falling edge of `record`."
+  },
+
+  LLMToTTS: {
+    category: "AI/LLM", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-sink",
+    ins: [
+      { n: "text",  t: "text" },
+      { n: "speak", t: "gate" },
+      { n: "rate",  t: "param" },
+      { n: "pitch", t: "param" }
+    ],
+    outs: [
+      { n: "done", t: "gate" }
+    ],
+    params: {
+      text:  "Hello world.",
+      speak: 0,
+      rate:  1.0,
+      pitch: 1.0,
+      voice: "",
+      done:  0
+    },
+    uiOnlyParams: ["done"],
+    description: "Speaks `text` via browser SpeechSynthesis on `speak` rising edge. `rate` is 0.1-10 (default 1), `pitch` is 0-2 (default 1), `voice` is a substring match against navigator's voice list (e.g. 'Daniel', 'Samantha' — leave blank for system default). `done` pulses once on utterance end. Useful as a sink for LLMChat.text → LLMToTTS.text for round-trip voice conversations."
+  },
+
+  JSONFormat: {
+    category: "AI/LLM", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-sink",
+    ins: [
+      { n: "prompt",  t: "text" },
+      { n: "schema",  t: "text" },
+      { n: "field",   t: "text" },
+      { n: "model",   t: "text" },
+      { n: "trigger", t: "gate" }
+    ],
+    outs: [
+      { n: "value", t: "text" },
+      { n: "raw",   t: "text" },
+      { n: "done",  t: "gate" }
+    ],
+    params: {
+      prompt:  "Pick a random integer 0-100 and a colour name.",
+      schema:  "{ number: int, color: string }",
+      field:   "number",
+      model:   "",
+      trigger: 0,
+      value:   "",
+      raw:     "",
+      done:    0
+    },
+    uiOnlyParams: ["value", "raw", "done"],
+    description: "LLM-as-controller. Calls Ollama with `format: 'json'` mode + a system prompt incorporating `schema`. On success, parses the response and extracts the top-level `field` into `value` (as text). The full JSON lands on `raw` for downstream consumers. Wire `value` into a NumFromText / param to use the LLM as a parameter source — e.g. 'choose a melody mode from {dorian, lydian, mixolydian}'."
   }
 };
 
@@ -52600,10 +52764,15 @@ function _ollamaHeaders(key) {
 async function _ollamaFetch(path, opts) {
   opts = opts || {};
   const url = _resolveOllamaBase(opts.baseUrl) + path;
+  // Phase B sprint 6 -- signal lets callers wire an AbortController so
+  // a second trigger on a sink node can cancel an in-flight stream.
+  // Pass-through to fetch; downstream stream reader sees the abort as
+  // a normal stream error and our finally{} clears state.
   const res = await fetch(url, {
     method: opts.method || "GET",
     headers: _ollamaHeaders(opts.key),
-    body: opts.body ? JSON.stringify(opts.body) : undefined
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+    signal: opts.signal || undefined
   });
   if (!res.ok) {
     let detail = "";
@@ -52680,6 +52849,10 @@ async function ollamaChat(opts) {
     messages,
     stream: !!opts.onToken
   };
+  // Phase B sprint 6 -- format: "json" enables Ollama's constrained
+  // JSON output. Pairs well with a schema-style system prompt. Some
+  // models honor this better than others (llama3.1+, qwen2.5+).
+  if (opts.format) body.format = opts.format;
   const inner = {};
   if (typeof opts.temperature === "number") inner.temperature = opts.temperature;
   if (typeof opts.maxTokens === "number" && opts.maxTokens > 0) inner.num_predict = opts.maxTokens;
@@ -52689,7 +52862,8 @@ async function ollamaChat(opts) {
     baseUrl: opts.baseUrl,
     key: opts.key,
     method: "POST",
-    body
+    body,
+    signal: opts.signal
   });
 
   if (!opts.onToken) {
@@ -52719,6 +52893,7 @@ async function ollamaGenerate(opts) {
     stream: !!opts.onToken
   };
   if (opts.system) body.system = opts.system;
+  if (opts.format) body.format = opts.format;  // Phase B sprint 6 -- JSON mode.
   const inner = {};
   if (typeof opts.temperature === "number") inner.temperature = opts.temperature;
   if (typeof opts.maxTokens === "number" && opts.maxTokens > 0) inner.num_predict = opts.maxTokens;
@@ -52728,7 +52903,8 @@ async function ollamaGenerate(opts) {
     baseUrl: opts.baseUrl,
     key: opts.key,
     method: "POST",
-    body
+    body,
+    signal: opts.signal
   });
 
   if (!opts.onToken) {
@@ -54640,42 +54816,47 @@ async function* mockTokenStream(text, perTokenMs) {
 /* =========================================================================
  * LLM runtime dispatcher
  *
- * Phase B sprint 4 of docs/LLM-KNOWLEDGE-PHASE.md §4. Drives the five
- * MVP LLM nodes added in this sprint:
+ * Phase B sprints 4 + 6 of docs/LLM-KNOWLEDGE-PHASE.md §4. Drives all
+ * LLM-side nodes that don't participate in C++ codegen:
  *
- *   llm-op  nodes (zero-runtime, just a string source):
- *     SystemPrompt     -- outputs `params.text` on its `text` port
- *     LLMModelPicker   -- outputs `params.model` on its `model` port
+ *   llm-op nodes (cheap per-tick or pure passthrough):
+ *     SystemPrompt        -- outputs `params.text` on its `text` port
+ *     LLMModelPicker      -- outputs `params.model` on its `model` port
+ *     ConversationMemory  -- rolling N-turn buffer, gate-driven appends
+ *     EmbedSimilarity     -- cosine similarity of two vector wires
  *
- *   llm-sink nodes (gate-triggered async fetch):
- *     LLMChat          -- /api/chat,     streams to node body, writes `text`
- *     LLMGenerate      -- /api/generate, same shape as Chat
- *     LLMEmbed         -- /api/embed,    writes the embedding to `vector`
+ *   llm-sink nodes (gate-triggered async work + AbortController):
+ *     LLMChat       -- /api/chat, streams to node body, writes `text`
+ *     LLMGenerate   -- /api/generate, same shape as Chat
+ *     LLMEmbed      -- /api/embed, writes embedding to `vec`
+ *     LLMClassifier -- constrained one-of-N label pick
+ *     JSONFormat    -- /api/chat with `format: "json"` + field extract
+ *     VoiceToLLM    -- Web Speech API STT -> LLMChat
+ *     LLMToTTS      -- SpeechSynthesis sink
  *
- * For llm-op nodes there's nothing to tick -- consumers read their
- * outputs via _readTextWire() which just returns the source node's
- * `params[outputPortName]`. They appear in the graph + flow strings
- * downstream without any per-frame work.
+ * For llm-op nodes the dispatcher runs every frame -- ConversationMemory
+ * watches its append/clear gates, EmbedSimilarity recomputes its scalar
+ * from the two vector wires, the two pure-passthroughs are no-ops.
  *
- * For llm-sink nodes, _tickLLMRuntime() is invoked once per visual
- * frame from src/visual/render-loop.js. The tick:
- *   1. Detects rising edges on each sink's `trigger` gate.
- *   2. On rise, reads the text inputs from wires (or local params),
- *      resolves the model name (wire / param / aiSettings.model
- *      fallback), and launches the async fetch via ollamaChat /
- *      ollamaGenerate / ollamaEmbed.
- *   3. While streaming: tokens flow into the node's `.llm-stream-body`
- *      element via createTokenStreamBody (Phase A.2 primitive).
- *   4. On completion: writes the accumulated text to params.text (Chat
- *      / Generate) or the embedding to params._vec (Embed), fires the
- *      `done` gate by setting params.done = 1 for one tick.
+ * For llm-sink nodes, _tickLLMRuntime() detects rising edges on each
+ * sink's `trigger` / `speak` / `record` gate. On rise:
+ *   1. Cancels any in-flight request via rt.aborter.abort()
+ *   2. Creates a new AbortController -> rt.aborter, signal passed
+ *      through to ollamaChat/Generate/Embed.
+ *   3. Launches the async fetch; tokens stream into the node body via
+ *      createTokenStreamBody (Phase A.2 primitive).
+ *   4. On completion: writes the accumulated text/vector/label/value
+ *      to the appropriate output param, pulses `done` for one tick.
  *   5. The node DOM may be rebuilt mid-stream (graph re-render); the
  *      runtime detects a stale `body.el` and re-creates the stream
  *      body on the new DOM node.
  *
- * Cancellation: not implemented in this sprint. A second trigger
- * while a stream is in flight is ignored. Sprint B.6 will add an
- * AbortController per node.
+ * Cancellation semantics (sprint B.6): a second rising edge while a
+ * stream is in flight cancels the old request (rt.aborter.abort()) and
+ * starts a new one. The old fetch's onToken callbacks drop because the
+ * generation guard (myGen !== rt.generation) sees the bump. The same
+ * applies to TTS -- a second `speak` while speaking cancels the
+ * current utterance via speechSynthesis.cancel().
  * ======================================================================== */
 
 /* Per-node runtime state. Keyed by node id. Stored here rather than on
@@ -54687,11 +54868,19 @@ function _llmGetState(nodeId) {
   let s = _llmRuntimeStates.get(nodeId);
   if (!s) {
     s = {
-      lastTrigger: 0,
-      streaming:   false,
-      body:        null,    // { el, append, finalize, clear, isStreaming }
-      bodyNodeEl:  null,    // the .node DOM element that body was attached to
-      generation:  0        // bumped each fetch; lets late onTokens drop if a new run started
+      lastTrigger:    0,
+      lastAppendUser: 0,
+      lastAppendAsst: 0,
+      lastClear:      0,
+      lastSpeak:      0,
+      lastRecord:     0,
+      streaming:      false,
+      aborter:        null,  // AbortController for the in-flight fetch
+      body:           null,  // { el, append, finalize, clear, isStreaming }
+      bodyNodeEl:     null,  // the .node DOM element that body was attached to
+      generation:     0,     // bumped each kick; lets late onTokens drop
+      recognizer:     null,  // SpeechRecognition instance (VoiceToLLM)
+      utterance:      null   // SpeechSynthesisUtterance (LLMToTTS)
     };
     _llmRuntimeStates.set(nodeId, s);
   }
@@ -54730,30 +54919,78 @@ function _readTextWire(node, portName) {
   return (typeof local === "string") ? local : "";
 }
 
-/* Detect a rising edge on the `trigger` gate input. Returns true exactly
- * once per 0->1 transition. The trigger value comes from either a
- * connected gate wire (read via _readWireJsSideValue) or the local
- * params.trigger (so a Button auto-wired to params.trigger by the
- * monitor controls works without the user wiring a gate). */
-function _llmDetectTrigger(node, rt) {
+/* Read a `vector`-typed input on `node`. Vector data is stashed by
+ * source nodes on `params._vec` (LLMEmbed publishes a Float32Array
+ * there; other vector producers follow the same convention). Returns
+ * the raw { data, shape, dtype } object, or null if not wired / no
+ * vector available. */
+function _readVectorWire(node, portName) {
+  if (!node || typeof portName !== "string") return null;
+  if (!state || !Array.isArray(state.edges)) return null;
+  for (const e of state.edges) {
+    if (e && e.to && e.to.node === node.id && e.to.port === portName) {
+      const src = state.nodes.find(n => n && n.id === e.from.node);
+      if (src && src.params && src.params._vec && src.params._vec.data) {
+        return src.params._vec;
+      }
+    }
+  }
+  return null;
+}
+
+/* Detect a rising edge on a named gate input. Generalized from the
+ * old _llmDetectTrigger so the new ConversationMemory + VoiceToLLM +
+ * LLMToTTS nodes can reuse it. `lastKey` is the field on the rt state
+ * object that stores the previous value (e.g. "lastTrigger",
+ * "lastSpeak"). */
+function _llmDetectGate(node, rt, portName, lastKey) {
   let v = 0;
-  // `state` here is the global editor state, not the rt parameter.
   if (typeof _readWireJsSideValue === "function" && state && Array.isArray(state.edges)) {
     for (const e of state.edges) {
-      if (e && e.to && e.to.node === node.id && e.to.port === "trigger") {
+      if (e && e.to && e.to.node === node.id && e.to.port === portName) {
         const r = _readWireJsSideValue(e);
         if (typeof r === "number") { v = r; break; }
       }
     }
   }
   if (!v) {
-    const local = node.params && node.params.trigger;
+    const local = node.params && node.params[portName];
     if (typeof local === "number") v = local;
   }
-  const wasLow  = (rt.lastTrigger || 0) < 0.5;
-  const isHigh  = v >= 0.5;
-  rt.lastTrigger = v;
+  const wasLow = (rt[lastKey] || 0) < 0.5;
+  const isHigh = v >= 0.5;
+  rt[lastKey] = v;
   return wasLow && isHigh;
+}
+
+/* Falling-edge detector. Same plumbing as rising, opposite direction.
+ * Used by VoiceToLLM: a `record` falling edge ends the recognition
+ * session and fires the LLM with the accumulated transcript. */
+function _llmDetectFallingGate(node, rt, portName, lastKey) {
+  let v = 0;
+  if (typeof _readWireJsSideValue === "function" && state && Array.isArray(state.edges)) {
+    for (const e of state.edges) {
+      if (e && e.to && e.to.node === node.id && e.to.port === portName) {
+        const r = _readWireJsSideValue(e);
+        if (typeof r === "number") { v = r; break; }
+      }
+    }
+  }
+  if (!v) {
+    const local = node.params && node.params[portName];
+    if (typeof local === "number") v = local;
+  }
+  const wasHigh = (rt[lastKey] || 0) >= 0.5;
+  const isLow   = v < 0.5;
+  rt[lastKey] = v;
+  return wasHigh && isLow;
+}
+
+/* Back-compat shim -- the sprint B.4 dispatcher called
+ * _llmDetectTrigger(node, rt) for the trigger gate specifically. Keep
+ * the old name for the existing LLMChat/Generate/Embed call sites. */
+function _llmDetectTrigger(node, rt) {
+  return _llmDetectGate(node, rt, "trigger", "lastTrigger");
 }
 
 /* Resolve (or re-create) the streaming body element inside a sink node's
@@ -54795,14 +55032,29 @@ function _llmMarkError(node, runtimeState, msg) {
   runtimeState.bodyNodeEl = null;
 }
 
-/* The four async kicks. Each takes (node, runtimeState) and runs an
- * Ollama call until completion, then publishes the output. */
+/* Cancel any in-flight fetch on this node. Used both before starting a
+ * new request (cancellation semantics) and when the node is removed.
+ * AbortError surfaces through the catch in the kick functions and is
+ * silently swallowed so the user doesn't see a red error flash for
+ * an intentional cancel. */
+function _llmAbortInFlight(rt) {
+  if (rt && rt.aborter) {
+    try { rt.aborter.abort(); } catch (_) {}
+    rt.aborter = null;
+  }
+}
+
+/* The async kicks. Each takes (node, runtimeState) and runs an Ollama
+ * call until completion, then publishes the output. */
 
 async function _llmKickChat(node, rt) {
+  _llmAbortInFlight(rt);
+  rt.aborter   = new AbortController();
   rt.streaming = true;
   rt.generation++;
   const myGen = rt.generation;
-  const body  = _llmEnsureBody(node, rt);
+  const signal = rt.aborter.signal;
+  const body   = _llmEnsureBody(node, rt);
   if (body) body.clear();
 
   const system = _readTextWire(node, "system");
@@ -54818,7 +55070,7 @@ async function _llmKickChat(node, rt) {
   try {
     const acc = await ollamaChat({
       baseUrl: aiSettings && aiSettings.ollamaUrl,
-      model, system, user, onToken
+      model, system, user, onToken, signal
     });
     if (myGen !== rt.generation) return;
     if (rt.body) rt.body.finalize();
@@ -54826,17 +55078,22 @@ async function _llmKickChat(node, rt) {
     node.params.text = acc || "";
     node.params.done = 1;
   } catch (err) {
-    if (myGen === rt.generation) _llmMarkError(node, rt, (err && err.message) || String(err));
+    if (myGen !== rt.generation) return;
+    if (err && err.name === "AbortError") return;  // silent cancel
+    _llmMarkError(node, rt, (err && err.message) || String(err));
   } finally {
-    if (myGen === rt.generation) rt.streaming = false;
+    if (myGen === rt.generation) { rt.streaming = false; rt.aborter = null; }
   }
 }
 
 async function _llmKickGenerate(node, rt) {
+  _llmAbortInFlight(rt);
+  rt.aborter   = new AbortController();
   rt.streaming = true;
   rt.generation++;
   const myGen = rt.generation;
-  const body  = _llmEnsureBody(node, rt);
+  const signal = rt.aborter.signal;
+  const body   = _llmEnsureBody(node, rt);
   if (body) body.clear();
 
   const prompt = _readTextWire(node, "prompt");
@@ -54852,7 +55109,7 @@ async function _llmKickGenerate(node, rt) {
   try {
     const acc = await ollamaGenerate({
       baseUrl: aiSettings && aiSettings.ollamaUrl,
-      model, prompt, system, onToken
+      model, prompt, system, onToken, signal
     });
     if (myGen !== rt.generation) return;
     if (rt.body) rt.body.finalize();
@@ -54860,17 +55117,22 @@ async function _llmKickGenerate(node, rt) {
     node.params.text = acc || "";
     node.params.done = 1;
   } catch (err) {
-    if (myGen === rt.generation) _llmMarkError(node, rt, (err && err.message) || String(err));
+    if (myGen !== rt.generation) return;
+    if (err && err.name === "AbortError") return;
+    _llmMarkError(node, rt, (err && err.message) || String(err));
   } finally {
-    if (myGen === rt.generation) rt.streaming = false;
+    if (myGen === rt.generation) { rt.streaming = false; rt.aborter = null; }
   }
 }
 
 async function _llmKickEmbed(node, rt) {
+  _llmAbortInFlight(rt);
+  rt.aborter   = new AbortController();
   rt.streaming = true;
   rt.generation++;
   const myGen = rt.generation;
-  const body  = _llmEnsureBody(node, rt);
+  const signal = rt.aborter.signal;
+  const body   = _llmEnsureBody(node, rt);
   if (body) body.clear();
 
   const text  = _readTextWire(node, "text") || _readTextWire(node, "input");
@@ -54880,7 +55142,7 @@ async function _llmKickEmbed(node, rt) {
   try {
     const res = await ollamaEmbed({
       baseUrl: aiSettings && aiSettings.ollamaUrl,
-      model, input: text
+      model, input: text, signal
     });
     if (myGen !== rt.generation) return;
     const first = (res && Array.isArray(res.embeddings) && res.embeddings[0]) || null;
@@ -54905,17 +55167,365 @@ async function _llmKickEmbed(node, rt) {
       rt.body.finalize();
     }
   } catch (err) {
-    if (myGen === rt.generation) _llmMarkError(node, rt, (err && err.message) || String(err));
+    if (myGen !== rt.generation) return;
+    if (err && err.name === "AbortError") return;
+    _llmMarkError(node, rt, (err && err.message) || String(err));
   } finally {
-    if (myGen === rt.generation) rt.streaming = false;
+    if (myGen === rt.generation) { rt.streaming = false; rt.aborter = null; }
   }
 }
 
-/* Per-frame tick. Walks every llm-sink node, detects trigger rising
- * edges, kicks off the appropriate Ollama call. Also clears the
- * `done` gate after a one-tick pulse so downstream `done` consumers
- * see the rising edge but not a stuck-high gate.
+/* Sprint B.6 -- constrained classifier. Builds a tight system prompt
+ * that names the label set + forbids any other output. Capped at
+ * num_predict=16 to avoid the model rambling. After the call, snaps
+ * the response to the closest label by case-insensitive substring
+ * match -- "Positive!" -> "positive", "neg" -> "negative". If nothing
+ * matches, the raw model output goes through verbatim so the user can
+ * see what went wrong. */
+async function _llmKickClassifier(node, rt) {
+  _llmAbortInFlight(rt);
+  rt.aborter   = new AbortController();
+  rt.streaming = true;
+  rt.generation++;
+  const myGen = rt.generation;
+  const signal = rt.aborter.signal;
+  const body   = _llmEnsureBody(node, rt);
+  if (body) body.clear();
+
+  const input  = _readTextWire(node, "input");
+  const labels = _readTextWire(node, "labels") || "";
+  const labelList = labels.split(",").map(s => s.trim()).filter(Boolean);
+  let model  = _readTextWire(node, "model");
+  if (!model && typeof aiSettings === "object") model = aiSettings.model || "llama3.2";
+
+  if (!labelList.length) {
+    _llmMarkError(node, rt, "no labels (set the labels input to a comma-separated list)");
+    rt.streaming = false;
+    rt.aborter   = null;
+    return;
+  }
+
+  const system = "You are a classifier. Read the user message and reply with EXACTLY one of these labels and nothing else: " +
+    labelList.join(" | ") + ". Use lowercase. No punctuation. No explanation.";
+  const onToken = (tok) => {
+    if (myGen !== rt.generation) return;
+    if (rt.body) rt.body.append(tok);
+  };
+
+  try {
+    const acc = await ollamaChat({
+      baseUrl: aiSettings && aiSettings.ollamaUrl,
+      model, system, user: input, onToken, signal,
+      maxTokens: 16, temperature: 0.0
+    });
+    if (myGen !== rt.generation) return;
+    if (rt.body) rt.body.finalize();
+    // Snap to closest label (case-insensitive substring; pick the
+    // first label that appears in the response).
+    const lower = (acc || "").toLowerCase();
+    let chosen = "";
+    for (const lab of labelList) {
+      if (lower.includes(lab.toLowerCase())) { chosen = lab; break; }
+    }
+    node.params = node.params || {};
+    node.params.label = chosen || (acc || "").trim();
+    node.params.done  = 1;
+  } catch (err) {
+    if (myGen !== rt.generation) return;
+    if (err && err.name === "AbortError") return;
+    _llmMarkError(node, rt, (err && err.message) || String(err));
+  } finally {
+    if (myGen === rt.generation) { rt.streaming = false; rt.aborter = null; }
+  }
+}
+
+/* Sprint B.6 -- JSON-mode chat. Passes format: "json" to Ollama which
+ * forces the model to emit syntactically-valid JSON. The schema input
+ * goes into the system prompt as a hint (Ollama's JSON mode doesn't
+ * enforce a schema -- it just guarantees valid JSON syntax -- so the
+ * model still needs the schema to know what fields to produce). After
+ * the response: tries to parse it, extracts the named field as text.
+ * Both `value` and `raw` go on outputs so a downstream JSON tool can
+ * grab additional fields without re-running the model. */
+async function _llmKickJSONFormat(node, rt) {
+  _llmAbortInFlight(rt);
+  rt.aborter   = new AbortController();
+  rt.streaming = true;
+  rt.generation++;
+  const myGen = rt.generation;
+  const signal = rt.aborter.signal;
+  const body   = _llmEnsureBody(node, rt);
+  if (body) body.clear();
+
+  const prompt = _readTextWire(node, "prompt");
+  const schema = _readTextWire(node, "schema");
+  const field  = _readTextWire(node, "field");
+  let   model  = _readTextWire(node, "model");
+  if (!model && typeof aiSettings === "object") model = aiSettings.model || "llama3.2";
+
+  const system = "Respond with a single JSON object. " +
+    (schema ? ("Schema: " + schema + ". ") : "") +
+    "No prose, no markdown fences, just JSON.";
+
+  const onToken = (tok) => {
+    if (myGen !== rt.generation) return;
+    if (rt.body) rt.body.append(tok);
+  };
+
+  try {
+    const acc = await ollamaChat({
+      baseUrl: aiSettings && aiSettings.ollamaUrl,
+      model, system, user: prompt, onToken, signal,
+      format: "json", temperature: 0.2
+    });
+    if (myGen !== rt.generation) return;
+    if (rt.body) rt.body.finalize();
+    node.params = node.params || {};
+    node.params.raw = acc || "";
+    let value = "";
+    try {
+      const obj = JSON.parse(acc || "{}");
+      if (field && obj && Object.prototype.hasOwnProperty.call(obj, field)) {
+        const v = obj[field];
+        value = (typeof v === "string") ? v : JSON.stringify(v);
+      } else {
+        value = JSON.stringify(obj);
+      }
+    } catch (_) {
+      // Model produced non-JSON despite format: "json". Surface raw
+      // text so the user can see what it actually said.
+      value = acc || "";
+    }
+    node.params.value = value;
+    node.params.done  = 1;
+  } catch (err) {
+    if (myGen !== rt.generation) return;
+    if (err && err.name === "AbortError") return;
+    _llmMarkError(node, rt, (err && err.message) || String(err));
+  } finally {
+    if (myGen === rt.generation) { rt.streaming = false; rt.aborter = null; }
+  }
+}
+
+/* Sprint B.6 -- LLMToTTS sink. Uses window.speechSynthesis. The
+ * `voice` param does a case-insensitive substring match against
+ * navigator's voice list (e.g. "Daniel", "Samantha"); empty falls
+ * back to the system default. Pulses `done` when the utterance ends.
  *
+ * Cancellation: a second `speak` rising edge cancels the previous
+ * utterance via speechSynthesis.cancel() before starting fresh. */
+function _llmKickTTS(node, rt) {
+  if (typeof window === "undefined" || !window.speechSynthesis) {
+    _llmMarkError(node, rt, "SpeechSynthesis unavailable in this browser");
+    return;
+  }
+  // Cancel any in-flight utterance from this node (or any node, really
+  // -- speechSynthesis is a singleton).
+  try { window.speechSynthesis.cancel(); } catch (_) {}
+  rt.utterance = null;
+
+  const text  = _readTextWire(node, "text");
+  if (!text) {
+    if (node.params) node.params.done = 1;
+    return;
+  }
+  const rate  = _readNumOrParam(node, "rate", 1);
+  const pitch = _readNumOrParam(node, "pitch", 1);
+  const voiceHint = ((node.params && node.params.voice) || "").trim().toLowerCase();
+
+  const utter = new SpeechSynthesisUtterance(text);
+  utter.rate  = Math.max(0.1, Math.min(10, rate));
+  utter.pitch = Math.max(0,   Math.min(2,  pitch));
+  if (voiceHint) {
+    const voices = window.speechSynthesis.getVoices();
+    const match  = voices.find(v => v && v.name && v.name.toLowerCase().includes(voiceHint));
+    if (match) utter.voice = match;
+  }
+  utter.onend = () => {
+    if (node.params) node.params.done = 1;
+    rt.utterance = null;
+  };
+  utter.onerror = () => {
+    if (node.params) node.params.done = 1;
+    rt.utterance = null;
+  };
+
+  const body = _llmEnsureBody(node, rt);
+  if (body) { body.clear(); body.append("🔊 " + text.slice(0, 80)); body.finalize(); }
+
+  rt.utterance = utter;
+  window.speechSynthesis.speak(utter);
+}
+
+/* Sprint B.6 -- VoiceToLLM. Web Speech API recognition on rising
+ * edge of `record`; final transcript fires an LLMChat on falling
+ * edge (or on recognition.onend if the user stops speaking). The
+ * userText output updates live as interim results arrive so the user
+ * sees feedback while talking. */
+function _llmStartVoice(node, rt) {
+  const SR = (typeof window !== "undefined") &&
+    (window.SpeechRecognition || window.webkitSpeechRecognition);
+  if (!SR) {
+    _llmMarkError(node, rt, "SpeechRecognition unavailable (use Chrome or Edge)");
+    return;
+  }
+  if (rt.recognizer) {
+    try { rt.recognizer.abort(); } catch (_) {}
+    rt.recognizer = null;
+  }
+  const rec = new SR();
+  rec.continuous     = true;
+  rec.interimResults = true;
+  rec.lang           = "en-US";
+
+  let finalTxt = "";
+  rec.onresult = (ev) => {
+    let interim = "";
+    for (let i = ev.resultIndex; i < ev.results.length; i++) {
+      const r = ev.results[i];
+      if (r.isFinal) finalTxt += r[0].transcript + " ";
+      else           interim  += r[0].transcript;
+    }
+    node.params = node.params || {};
+    node.params.userText = (finalTxt + interim).trim();
+  };
+  rec.onerror = (ev) => {
+    _llmMarkError(node, rt, "speech: " + ((ev && ev.error) || "unknown"));
+  };
+  rec.onend = () => {
+    rt.recognizer = null;
+    const transcript = (node.params && node.params.userText || finalTxt || "").trim();
+    if (transcript) _llmVoiceFireChat(node, rt, transcript);
+  };
+
+  const body = _llmEnsureBody(node, rt);
+  if (body) { body.clear(); body.append("🎙 listening…"); }
+
+  try { rec.start(); } catch (e) {
+    _llmMarkError(node, rt, "recognizer.start: " + (e && e.message || e));
+    return;
+  }
+  rt.recognizer = rec;
+}
+
+function _llmStopVoice(node, rt) {
+  if (rt.recognizer) {
+    try { rt.recognizer.stop(); } catch (_) {}
+    // onend will fire and dispatch the chat
+  }
+}
+
+async function _llmVoiceFireChat(node, rt, userText) {
+  _llmAbortInFlight(rt);
+  rt.aborter   = new AbortController();
+  rt.streaming = true;
+  rt.generation++;
+  const myGen = rt.generation;
+  const signal = rt.aborter.signal;
+  const body   = _llmEnsureBody(node, rt);
+  if (body) { body.clear(); body.append("→ " + userText + "\n\n"); }
+
+  const system = _readTextWire(node, "system");
+  let model    = _readTextWire(node, "model");
+  if (!model && typeof aiSettings === "object") model = aiSettings.model || "llama3.2";
+
+  const onToken = (tok) => {
+    if (myGen !== rt.generation) return;
+    if (rt.body) rt.body.append(tok);
+  };
+
+  try {
+    const acc = await ollamaChat({
+      baseUrl: aiSettings && aiSettings.ollamaUrl,
+      model, system, user: userText, onToken, signal
+    });
+    if (myGen !== rt.generation) return;
+    if (rt.body) rt.body.finalize();
+    node.params = node.params || {};
+    node.params.assistantText = acc || "";
+    node.params.done = 1;
+  } catch (err) {
+    if (myGen !== rt.generation) return;
+    if (err && err.name === "AbortError") return;
+    _llmMarkError(node, rt, (err && err.message) || String(err));
+  } finally {
+    if (myGen === rt.generation) { rt.streaming = false; rt.aborter = null; }
+  }
+}
+
+/* ---------- llm-op tickers (cheap, run every frame) ----------------- */
+
+/* Reads a numeric input -- wired param wire OR local params value.
+ * Mirrors the trigger pattern but returns a number instead of a bool.
+ * Falls back to `def` on missing / non-numeric input. */
+function _readNumOrParam(node, portName, def) {
+  if (typeof _readWireJsSideValue === "function" && state && Array.isArray(state.edges)) {
+    for (const e of state.edges) {
+      if (e && e.to && e.to.node === node.id && e.to.port === portName) {
+        const r = _readWireJsSideValue(e);
+        if (typeof r === "number" && Number.isFinite(r)) return r;
+      }
+    }
+  }
+  const local = node.params && node.params[portName];
+  return (typeof local === "number" && Number.isFinite(local)) ? local : def;
+}
+
+/* ConversationMemory tick. Watches three gates (appendUser,
+ * appendAssistant, clear). On rising edges, mutates the persisted
+ * history array. Then re-syncs the messages JSON + count outputs so
+ * downstream LLMChat / .gpatch consumers see the new state. */
+function _tickConversationMemory(node, rt) {
+  node.params = node.params || {};
+  if (!Array.isArray(node.params.history)) node.params.history = [];
+  const maxTurns = Math.max(1, Math.floor(_readNumOrParam(node, "maxTurns", 10)));
+  let mutated = false;
+
+  if (_llmDetectGate(node, rt, "appendUser", "lastAppendUser")) {
+    const msg = _readTextWire(node, "userMsg");
+    if (msg) { node.params.history.push({ role: "user", content: msg }); mutated = true; }
+  }
+  if (_llmDetectGate(node, rt, "appendAssistant", "lastAppendAsst")) {
+    const msg = _readTextWire(node, "assistantMsg");
+    if (msg) { node.params.history.push({ role: "assistant", content: msg }); mutated = true; }
+  }
+  if (_llmDetectGate(node, rt, "clear", "lastClear")) {
+    node.params.history = []; mutated = true;
+  }
+  // Trim oldest pairs (each turn = user + assistant = 2 messages).
+  while (node.params.history.length > maxTurns * 2) {
+    node.params.history.shift(); mutated = true;
+  }
+  if (mutated || node.params.messages === undefined) {
+    node.params.messages = JSON.stringify(node.params.history);
+    node.params.count    = node.params.history.length;
+  }
+}
+
+/* EmbedSimilarity tick. Cosine similarity of two vector wires. Returns
+ * 0 on mismatched lengths / missing inputs (rather than throwing) so
+ * an unwired patch just shows 0 and the user can see why. */
+function _tickEmbedSimilarity(node) {
+  node.params = node.params || {};
+  const a = _readVectorWire(node, "a");
+  const b = _readVectorWire(node, "b");
+  if (!a || !b || !a.data || !b.data || a.data.length !== b.data.length || a.data.length === 0) {
+    node.params.similarity = 0;
+    return;
+  }
+  let dot = 0, na = 0, nb = 0;
+  const len = a.data.length;
+  for (let i = 0; i < len; i++) {
+    const x = a.data[i], y = b.data[i];
+    dot += x * y;
+    na  += x * x;
+    nb  += y * y;
+  }
+  const denom = Math.sqrt(na) * Math.sqrt(nb);
+  node.params.similarity = (denom > 1e-12) ? (dot / denom) : 0;
+}
+
+/* Per-frame tick. Walks every LLM-runtime node, dispatches per kind.
  * Called from src/visual/render-loop.js's _visualRenderTick(). */
 function _tickLLMRuntime(dtSec) {
   if (!state || !Array.isArray(state.nodes)) return;
@@ -54923,19 +55533,50 @@ function _tickLLMRuntime(dtSec) {
     if (!n || !n.type) continue;
     const def = (typeof TYPES === "object") ? TYPES[n.type] : null;
     if (!def) continue;
-    if (def.kind !== "llm-sink") continue;
     n.params = n.params || {};
+
+    if (def.kind === "llm-op") {
+      // Sprint B.6 -- ConversationMemory + EmbedSimilarity run per
+      // tick. SystemPrompt + LLMModelPicker are pure passthroughs --
+      // their output ports read params.text / params.model directly so
+      // no per-frame work is needed.
+      const rt = _llmGetState(n.id);
+      if      (n.type === "ConversationMemory") _tickConversationMemory(n, rt);
+      else if (n.type === "EmbedSimilarity")    _tickEmbedSimilarity(n);
+      continue;
+    }
+    if (def.kind !== "llm-sink") continue;
+
     const rt = _llmGetState(n.id);
 
-    // Detect rising edge -> kick fetch (only if not already streaming).
+    // VoiceToLLM has its own start/stop on rising/falling edge of
+    // `record` and dispatches the chat from inside the recognizer's
+    // onend callback rather than here.
+    if (n.type === "VoiceToLLM") {
+      if (_llmDetectGate(n, rt, "record", "lastRecord")) _llmStartVoice(n, rt);
+      if (_llmDetectFallingGate(n, rt, "record", "lastRecord_fall")) _llmStopVoice(n, rt);
+      if (n.params.done === 1) n.params.done = 0;
+      continue;
+    }
+    // LLMToTTS triggers on the `speak` gate, not `trigger`.
+    if (n.type === "LLMToTTS") {
+      if (_llmDetectGate(n, rt, "speak", "lastSpeak")) {
+        n.params.done = 0;
+        _llmKickTTS(n, rt);
+      } else if (n.params.done === 1) {
+        n.params.done = 0;
+      }
+      continue;
+    }
+
+    // Default sink path: trigger -> async fetch.
     if (_llmDetectTrigger(n, rt) && !rt.streaming) {
-      // One-tick `done` pulses get cleared here so a re-trigger starts
-      // clean. (Stale done from a prior run wouldn't actually break
-      // anything, but it's tidier.)
       n.params.done = 0;
-      if (n.type === "LLMChat")     _llmKickChat(n, rt);
-      else if (n.type === "LLMGenerate") _llmKickGenerate(n, rt);
-      else if (n.type === "LLMEmbed")    _llmKickEmbed(n, rt);
+      if      (n.type === "LLMChat")       _llmKickChat(n, rt);
+      else if (n.type === "LLMGenerate")   _llmKickGenerate(n, rt);
+      else if (n.type === "LLMEmbed")      _llmKickEmbed(n, rt);
+      else if (n.type === "LLMClassifier") _llmKickClassifier(n, rt);
+      else if (n.type === "JSONFormat")    _llmKickJSONFormat(n, rt);
     } else if (n.params.done === 1) {
       // Clear the done pulse one tick after it was set, so a downstream
       // gate sees the rising edge exactly once.

@@ -19955,5 +19955,169 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     },
     uiOnlyParams: ["dim", "done"],
     description: "Embeds the input string via Ollama /api/embed. On `trigger` rising edge, calls the embed endpoint with the resolved text + model. The resulting Float32Array lands on the `vec` output port (consume with anything expecting a Phase A.1 `vector` -- VectorSink to inspect shape, future Tektite MD viz, etc). `done` pulses once on completion. Default model is `nomic-embed-text` — install with `ollama pull nomic-embed-text`."
+  },
+
+  /* ============================================================
+   * Phase B sprint 6 -- stretch nodes.
+   *
+   * Six nodes that compose on top of the MVP five from sprint B.4:
+   *
+   *   ConversationMemory  -- rolling N-turn buffer; serializes to .gpatch
+   *   EmbedSimilarity     -- cosine similarity scalar between two vectors
+   *   LLMClassifier       -- constrained-choice classifier
+   *   VoiceToLLM          -- mic → STT → LLMChat composite (Web Speech API)
+   *   LLMToTTS            -- text → SpeechSynthesis sink
+   *   JSONFormat          -- JSON-mode chat with a single-field extractor
+   *
+   * All dispatched from src/ai/llm-runtime.js. ConversationMemory +
+   * EmbedSimilarity are llm-op (cheap, runs every tick); the four
+   * llm-sinks each have an AbortController so a second trigger
+   * cancels the in-flight stream + starts a new one.
+   * ============================================================ */
+  ConversationMemory: {
+    category: "AI/LLM", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-op",
+    ins: [
+      { n: "userMsg",         t: "text" },
+      { n: "assistantMsg",    t: "text" },
+      { n: "appendUser",      t: "gate" },
+      { n: "appendAssistant", t: "gate" },
+      { n: "clear",           t: "gate" }
+    ],
+    outs: [
+      { n: "messages", t: "text" },
+      { n: "count",    t: "param" }
+    ],
+    params: {
+      userMsg:         "",
+      assistantMsg:    "",
+      appendUser:      0,
+      appendAssistant: 0,
+      clear:           0,
+      maxTurns:        10,
+      history:         [],
+      messages:        "[]",
+      count:           0
+    },
+    uiOnlyParams: ["messages", "count"],
+    description: "Rolling chat-history buffer. On `appendUser` rising edge, pushes {role:'user', content: userMsg} onto an internal history array; same for `appendAssistant`. `clear` wipes the buffer. The `messages` output emits the JSON-serialized array; pipe it into a downstream LLMChat (or read history[] via the `.gpatch`). Trims oldest turns to `maxTurns * 2` entries. The `history` param persists in saved `.gpatch` so a chat session survives reload."
+  },
+
+  EmbedSimilarity: {
+    category: "AI/Embed", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-op",
+    ins: [
+      { n: "a", t: "vector" },
+      { n: "b", t: "vector" }
+    ],
+    outs: [
+      { n: "similarity", t: "param" }
+    ],
+    params: { similarity: 0 },
+    uiOnlyParams: ["similarity"],
+    description: "Cosine similarity between two vector inputs. Reads both Float32Array buffers per tick and outputs a scalar in [-1, 1] (1 = identical direction, 0 = orthogonal). Wire two LLMEmbed nodes in and drive an audio param, shader uniform, or threshold gate downstream. Vectors must have the same length; mismatch outputs 0."
+  },
+
+  LLMClassifier: {
+    category: "AI/LLM", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-sink",
+    ins: [
+      { n: "input",   t: "text" },
+      { n: "labels",  t: "text" },
+      { n: "model",   t: "text" },
+      { n: "trigger", t: "gate" }
+    ],
+    outs: [
+      { n: "label", t: "text" },
+      { n: "done",  t: "gate" }
+    ],
+    params: {
+      input:   "I love this!",
+      labels:  "positive,negative,neutral",
+      model:   "",
+      trigger: 0,
+      label:   "",
+      done:    0
+    },
+    uiOnlyParams: ["label", "done"],
+    description: "Constrained classifier. On `trigger` rising edge, asks the LLM to pick exactly one of `labels` (comma-separated) for `input`. Uses a tight system prompt + low max-tokens to force a single-word reply. Output snapped back to the closest matching label string (case-insensitive). Use for smart-link wiring (classify intent → branch behavior) or telemetry labeling."
+  },
+
+  VoiceToLLM: {
+    category: "AI/LLM", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-sink",
+    ins: [
+      { n: "record",  t: "gate" },
+      { n: "system",  t: "text" },
+      { n: "model",   t: "text" }
+    ],
+    outs: [
+      { n: "userText",      t: "text" },
+      { n: "assistantText", t: "text" },
+      { n: "done",          t: "gate" }
+    ],
+    params: {
+      record:        0,
+      system:        "",
+      model:         "",
+      userText:      "",
+      assistantText: "",
+      done:          0
+    },
+    uiOnlyParams: ["userText", "assistantText", "done"],
+    description: "Voice-in, LLM-out. On `record` rising edge, starts Web Speech API recognition; on falling edge OR `recognition.end`, finalizes the transcript, fires LLMChat with it, streams the response into `assistantText`. `userText` updates live as the user speaks. Requires a Chromium-based browser (SpeechRecognition unsupported in Firefox). Holds the mic only between rising + falling edge of `record`."
+  },
+
+  LLMToTTS: {
+    category: "AI/LLM", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-sink",
+    ins: [
+      { n: "text",  t: "text" },
+      { n: "speak", t: "gate" },
+      { n: "rate",  t: "param" },
+      { n: "pitch", t: "param" }
+    ],
+    outs: [
+      { n: "done", t: "gate" }
+    ],
+    params: {
+      text:  "Hello world.",
+      speak: 0,
+      rate:  1.0,
+      pitch: 1.0,
+      voice: "",
+      done:  0
+    },
+    uiOnlyParams: ["done"],
+    description: "Speaks `text` via browser SpeechSynthesis on `speak` rising edge. `rate` is 0.1-10 (default 1), `pitch` is 0-2 (default 1), `voice` is a substring match against navigator's voice list (e.g. 'Daniel', 'Samantha' — leave blank for system default). `done` pulses once on utterance end. Useful as a sink for LLMChat.text → LLMToTTS.text for round-trip voice conversations."
+  },
+
+  JSONFormat: {
+    category: "AI/LLM", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-sink",
+    ins: [
+      { n: "prompt",  t: "text" },
+      { n: "schema",  t: "text" },
+      { n: "field",   t: "text" },
+      { n: "model",   t: "text" },
+      { n: "trigger", t: "gate" }
+    ],
+    outs: [
+      { n: "value", t: "text" },
+      { n: "raw",   t: "text" },
+      { n: "done",  t: "gate" }
+    ],
+    params: {
+      prompt:  "Pick a random integer 0-100 and a colour name.",
+      schema:  "{ number: int, color: string }",
+      field:   "number",
+      model:   "",
+      trigger: 0,
+      value:   "",
+      raw:     "",
+      done:    0
+    },
+    uiOnlyParams: ["value", "raw", "done"],
+    description: "LLM-as-controller. Calls Ollama with `format: 'json'` mode + a system prompt incorporating `schema`. On success, parses the response and extracts the top-level `field` into `value` (as text). The full JSON lands on `raw` for downstream consumers. Wire `value` into a NumFromText / param to use the LLM as a parameter source — e.g. 'choose a melody mode from {dorian, lydian, mixolydian}'."
   }
 };
