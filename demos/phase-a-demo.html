@@ -1,0 +1,838 @@
+<!DOCTYPE html>
+<!--
+  Phase A demo + verification page.
+
+  Self-contained — does NOT depend on gamma-node-editor.html. Opens
+  directly in a browser, exercises every primitive introduced by
+  Phase A.1 + A.2 of docs/LLM-KNOWLEDGE-PHASE.md:
+
+    Phase A.1
+      * RUNTIME_ONLY_KINDS + isRuntimeOnlyKind() (src/core/node-kinds.js)
+      * "vector" + "llm-attn" port types in VISUAL_PORT_TYPES
+      * portsCompatible() with the new types
+      * VectorSource / VectorSink / AttnViz placeholder nodes
+
+    Phase A.2
+      * streamSSEEvents() + streamNDJSONEvents() (src/ai/streaming.js)
+      * streamTokens() async generator
+      * createTokenStreamBody() with rAF coalesce + finalize cursor
+        (src/ui/node-bodies.js)
+      * mockTokenStream() generator
+
+  The Phase A modules are INLINED below verbatim from their src/
+  counterparts so this demo file doesn't fall out of sync when those
+  files move. The HTML harness runs the test suite on load and lets
+  you trigger the live streaming demo with a button.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Gamma Node — Phase A demo</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --surface: #161a22;
+    --border: #2a2f3a;
+    --text: #e6e3dc;
+    --text-2: #95928a;
+    --accent: #c8e85a;
+    --info: #83e8ff;
+    --ok: #1d9e75;
+    --fail: #e24b4a;
+    --warn: #ffb347;
+    --vector: #b264c8;
+    --llm-attn: #e87ad6;
+    --param: #7f77dd;
+    --audio: #1d9e75;
+    --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Consolas, monospace;
+    --font-sans: "Inter", system-ui, -apple-system, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 2em;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-sans);
+    line-height: 1.5;
+  }
+  h1 {
+    margin: 0 0 0.2em;
+    color: var(--accent);
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  h2 {
+    margin: 2em 0 0.5em;
+    font-size: 1.15em;
+    font-weight: 500;
+    color: var(--text);
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 0.3em;
+  }
+  .sub {
+    color: var(--text-2);
+    margin-bottom: 1.5em;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1em 1.2em;
+    margin: 0.7em 0;
+  }
+  .test-row {
+    display: grid;
+    grid-template-columns: 24px 1fr auto;
+    gap: 0.7em;
+    align-items: center;
+    padding: 0.35em 0;
+    border-bottom: 1px solid #1f2330;
+    font-size: 0.92em;
+  }
+  .test-row:last-child { border-bottom: none; }
+  .badge {
+    display: inline-block;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    text-align: center;
+    line-height: 18px;
+    font-size: 11px;
+    font-weight: 600;
+    color: #fff;
+    background: var(--text-2);
+  }
+  .badge.ok { background: var(--ok); }
+  .badge.fail { background: var(--fail); }
+  .name { font-family: var(--font-mono); font-size: 0.85em; color: var(--text); }
+  .desc { color: var(--text-2); }
+  .summary {
+    padding: 0.6em 1em;
+    border-radius: 4px;
+    margin-bottom: 1em;
+    font-weight: 500;
+  }
+  .summary.ok   { background: rgba(29,158,117,0.18);  color: var(--ok);   border: 1px solid rgba(29,158,117,0.4); }
+  .summary.fail { background: rgba(226, 75, 74,0.18); color: var(--fail); border: 1px solid rgba(226, 75, 74,0.4); }
+  button {
+    background: var(--surface);
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    padding: 0.5em 1em;
+    border-radius: 4px;
+    font-family: var(--font-mono);
+    font-size: 0.9em;
+    cursor: pointer;
+    transition: background 0.12s;
+  }
+  button:hover { background: rgba(200,232,90,0.1); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  select, input[type="number"] {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.35em 0.5em;
+    font-family: var(--font-mono);
+    font-size: 0.85em;
+  }
+  .controls { display: flex; gap: 0.8em; align-items: center; flex-wrap: wrap; margin-bottom: 1em; }
+  .controls label { color: var(--text-2); font-size: 0.9em; }
+  .stream-box {
+    min-height: 8em;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1em;
+    margin-top: 0.6em;
+  }
+  .tk-stream {
+    display: inline;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    line-height: 1.45;
+    color: var(--info);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .tk-stream::after {
+    content: "▍";
+    color: var(--accent);
+    margin-left: 1px;
+    animation: tk-stream-cursor 700ms steps(2, end) infinite;
+  }
+  .tk-stream-done::after { content: ""; animation: none; }
+  @keyframes tk-stream-cursor { 50% { opacity: 0; } }
+
+  /* Port-type visualization swatches */
+  .port-swatch-row { display: flex; gap: 1.5em; flex-wrap: wrap; }
+  .port-swatch {
+    display: flex; align-items: center; gap: 0.5em;
+    font-family: var(--font-mono); font-size: 0.85em;
+  }
+  .port-swatch .dot {
+    width: 18px; height: 18px; border-radius: 50%; border: 3px ridge;
+  }
+  .port-swatch .dot.vector { border-color: var(--vector); background: rgba(178,100,200,0.15); }
+  .port-swatch .dot.llm-attn { border-color: var(--llm-attn); border-width: 4px; background: rgba(232,122,214,0.15); }
+  .port-swatch .dot.audio { border-color: var(--audio); border-style: solid; background: rgba(29,158,117,0.15); }
+  .port-swatch .dot.param { border-color: var(--param); border-style: dashed; background: rgba(127,119,221,0.15); }
+
+  code { font-family: var(--font-mono); color: var(--info); background: rgba(131,232,255,0.08); padding: 0.05em 0.35em; border-radius: 3px; font-size: 0.92em; }
+  small { color: var(--text-2); }
+</style>
+</head>
+<body>
+
+<h1>Phase A demo</h1>
+<p class="sub">
+  Self-contained verification for the foundations sprint
+  (<code>docs/LLM-KNOWLEDGE-PHASE.md §3</code>). Tests run on load;
+  the streaming demo is interactive.
+</p>
+
+<div id="summary" class="summary">Running tests…</div>
+
+<h2>Phase A.1 — port types + node kinds</h2>
+<div class="card" id="a1-tests"></div>
+
+<h2>Port type visualization</h2>
+<div class="card">
+  <p class="sub" style="margin:0 0 0.8em">
+    The two new port types added to <code>VISUAL_PORT_TYPES</code>.
+    Same CSS treatment as the existing visual ports (ridge border;
+    same-type-only legality).
+  </p>
+  <div class="port-swatch-row">
+    <div class="port-swatch"><span class="dot vector"></span> vector — Float32Array + shape</div>
+    <div class="port-swatch"><span class="dot llm-attn"></span> llm-attn — attention weights + tokens</div>
+    <div class="port-swatch"><span class="dot audio"></span> audio (signal — for comparison)</div>
+    <div class="port-swatch"><span class="dot param"></span> param (signal — for comparison)</div>
+  </div>
+</div>
+
+<h2>Phase A.2 — streaming readers</h2>
+<div class="card" id="a2-tests"></div>
+
+<h2>Live streaming demo</h2>
+<div class="card">
+  <p class="sub" style="margin:0 0 0.8em">
+    Runs <code>mockTokenStream()</code> through
+    <code>createTokenStreamBody()</code>. The blinking block cursor
+    is the <code>.tk-stream::after</code> pseudo-element; it stops
+    when <code>finalize()</code> applies <code>.tk-stream-done</code>.
+    rAF coalescing inside <code>append()</code> keeps the DOM writes
+    capped at 60 Hz even at 1 ms/token.
+  </p>
+  <div class="controls">
+    <button id="play-btn">▶ Stream message</button>
+    <button id="clear-btn">Clear</button>
+    <label>Speed: <select id="speed">
+      <option value="1">1 ms/token (stress test)</option>
+      <option value="30" selected>30 ms/token (Ollama-ish)</option>
+      <option value="80">80 ms/token (Anthropic-ish)</option>
+      <option value="250">250 ms/token (slow)</option>
+    </select></label>
+    <label>Format: <select id="format">
+      <option value="mock">mockTokenStream (in-process)</option>
+      <option value="sse">SSE via streamTokens (Response polyfill)</option>
+      <option value="ndjson">NDJSON via streamTokens (Response polyfill)</option>
+    </select></label>
+  </div>
+  <div id="stream-box" class="stream-box"></div>
+</div>
+
+<h2>Runtime-only kinds reference</h2>
+<div class="card">
+  <p class="sub" style="margin:0 0 0.6em">
+    Node kinds that <strong>skip C++ codegen</strong> and dispatch via
+    JS subsystem routers instead (mirrors how <code>RayTracedScene</code>
+    already works with <code>kind: "scene-rt"</code>).
+  </p>
+  <ul style="font-family:var(--font-mono);font-size:0.9em;line-height:1.8">
+    <li><code>"llm-op"</code> — pure tensor ops (MultiHeadAttention, LayerNorm, FFN, …). <em>Dispatcher: <code>src/llm/dispatcher.js</code> (Phase D).</em></li>
+    <li><code>"llm-sink"</code> — side-effecting LLM endpoints (TrainStep, Generate, Chat). <em>Phase B (Ollama) + Phase D.</em></li>
+    <li><code>"llm-viz"</code> — render LLM state to a <code>texture</code> port (AttentionGraph3D, LossPlot, …). <em>Phase D.</em></li>
+    <li><code>"notes-source"</code> — streams tokenized notes from the Tektite MD vault. <em>Phase C (<code>src/tektite/corpus.js</code>).</em></li>
+  </ul>
+</div>
+
+<small>
+  Built against Phase A.2 (v0.3.691). If new files
+  (<code>src/ai/streaming.js</code>, <code>src/ui/node-bodies.js</code>,
+  <code>src/core/node-kinds.js</code>) drift from the inlined copies
+  below, run the tests in the actual editor's DevTools console instead
+  — those load the live source.
+</small>
+
+<script>
+/* ============================================================
+ * Inlined Phase A modules (verbatim from src/)
+ * ============================================================ */
+
+/* src/core/node-kinds.js */
+const RUNTIME_ONLY_KINDS = new Set([
+  "llm-op", "llm-sink", "llm-viz", "notes-source"
+]);
+function isRuntimeOnlyKind(k) {
+  return typeof k === "string" && RUNTIME_ONLY_KINDS.has(k);
+}
+
+/* portsCompatible -- replicated from src/ui/render.js for the type-
+ * compatibility tests below. */
+const SIGNAL_PORT_TYPES = new Set(["audio", "param", "gate", "clock"]);
+const VISUAL_PORT_TYPES = new Set([
+  "texture", "transform", "mesh", "camera", "light", "environment",
+  "vector", "llm-attn"
+]);
+function portsCompatible(srcType, dstType) {
+  if (srcType === dstType) return true;
+  if (SIGNAL_PORT_TYPES.has(srcType) && SIGNAL_PORT_TYPES.has(dstType)) return true;
+  return false;
+}
+
+/* src/ai/streaming.js */
+async function streamSSEEvents(response, onEvent) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let nl;
+    while ((nl = buffer.indexOf("\n\n")) >= 0) {
+      const block = buffer.slice(0, nl);
+      buffer = buffer.slice(nl + 2);
+      const lines = block.split("\n");
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        const data = line.slice(6);
+        if (data === "[DONE]") return;
+        try { onEvent(JSON.parse(data)); } catch (_) {}
+      }
+    }
+  }
+}
+async function streamNDJSONEvents(response, onEvent) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      const tail = buffer.trim();
+      if (tail) { try { onEvent(JSON.parse(tail)); } catch (_) {} }
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    let nl;
+    while ((nl = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, nl).trim();
+      buffer = buffer.slice(nl + 1);
+      if (!line) continue;
+      try { onEvent(JSON.parse(line)); } catch (_) {}
+    }
+  }
+}
+function _streamFieldAt(obj, path) {
+  if (!obj || !path) return undefined;
+  const parts = path.split(".");
+  let cur = obj;
+  for (const p of parts) {
+    if (cur == null) return undefined;
+    cur = cur[p];
+  }
+  return cur;
+}
+async function* streamTokens(response, opts) {
+  const format = (opts && opts.format) || "sse";
+  const field = (opts && opts.field) || "delta.text";
+  const queue = [];
+  let done = false;
+  let waiter = null;
+  const wakeup = () => { if (waiter) { const w = waiter; waiter = null; w(); } };
+  const onEvent = (ev) => {
+    const v = _streamFieldAt(ev, field);
+    if (typeof v === "string") { queue.push(v); wakeup(); }
+  };
+  const fn = format === "ndjson" ? streamNDJSONEvents : streamSSEEvents;
+  const reading = fn(response, onEvent).then(() => { done = true; wakeup(); });
+  while (true) {
+    if (queue.length) yield queue.shift();
+    else if (done) { await reading; return; }
+    else await new Promise(r => { waiter = r; });
+  }
+}
+
+/* src/ui/node-bodies.js */
+function createTokenStreamBody(container, opts) {
+  const className = (opts && opts.className) || "tk-stream";
+  let pending = "";
+  let scheduled = false;
+  let active = true;
+  const el = document.createElement("span");
+  el.className = className;
+  container.appendChild(el);
+  function flush() {
+    scheduled = false;
+    if (!pending) return;
+    el.textContent += pending;
+    pending = "";
+  }
+  return {
+    el,
+    get isStreaming() { return active; },
+    append(token) {
+      if (!active || typeof token !== "string") return;
+      pending += token;
+      if (!scheduled) { scheduled = true; requestAnimationFrame(flush); }
+    },
+    clear() { pending = ""; el.textContent = ""; },
+    finalize() {
+      if (!active) return;
+      active = false;
+      flush();
+      el.classList.add(className + "-done");
+    }
+  };
+}
+async function* mockTokenStream(text, perTokenMs) {
+  perTokenMs = (typeof perTokenMs === "number" && perTokenMs >= 0) ? perTokenMs : 30;
+  const tokens = String(text).split(/(\s+)/);
+  for (const tok of tokens) {
+    if (perTokenMs > 0) await new Promise(r => setTimeout(r, perTokenMs));
+    yield tok;
+  }
+}
+
+/* ============================================================
+ * Test harness
+ * ============================================================ */
+
+const tests = [];
+function test(category, name, fn, desc) {
+  tests.push({ category, name, fn, desc });
+}
+
+function eq(a, b) {
+  if (a === b) return true;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    if (a.length !== b.length) return false;
+    return a.every((x, i) => eq(x, b[i]));
+  }
+  return false;
+}
+
+/* Polyfill Response.body.getReader for our mock byte streams. We need
+ * this because the demo runs in any modern browser, but we want to
+ * feed deterministic chunked bytes through streamSSEEvents /
+ * streamNDJSONEvents to verify chunk-boundary correctness. */
+function mockResponse(chunks) {
+  const encoder = new TextEncoder();
+  const encoded = chunks.map(c => encoder.encode(c));
+  let i = 0;
+  return {
+    body: {
+      getReader() {
+        return {
+          async read() {
+            if (i >= encoded.length) return { value: undefined, done: true };
+            return { value: encoded[i++], done: false };
+          }
+        };
+      }
+    }
+  };
+}
+
+/* ----- Phase A.1 tests ----- */
+
+test("a1", "RUNTIME_ONLY_KINDS has all 4 entries", () => {
+  return RUNTIME_ONLY_KINDS.size === 4
+      && RUNTIME_ONLY_KINDS.has("llm-op")
+      && RUNTIME_ONLY_KINDS.has("llm-sink")
+      && RUNTIME_ONLY_KINDS.has("llm-viz")
+      && RUNTIME_ONLY_KINDS.has("notes-source");
+}, "the four runtime-only kinds are declared");
+
+test("a1", "isRuntimeOnlyKind() returns true for the 4 kinds", () => {
+  return isRuntimeOnlyKind("llm-op")
+      && isRuntimeOnlyKind("llm-sink")
+      && isRuntimeOnlyKind("llm-viz")
+      && isRuntimeOnlyKind("notes-source");
+}, "predicate works on each declared kind");
+
+test("a1", "isRuntimeOnlyKind() returns false for known existing kinds", () => {
+  return !isRuntimeOnlyKind("delay1")
+      && !isRuntimeOnlyKind("scene-rt")
+      && !isRuntimeOnlyKind("");
+}, "predicate doesn't accidentally match delay1 / scene-rt");
+
+test("a1", "isRuntimeOnlyKind() returns false for non-string input", () => {
+  return !isRuntimeOnlyKind(undefined)
+      && !isRuntimeOnlyKind(null)
+      && !isRuntimeOnlyKind(42);
+}, "no-string-input guard");
+
+test("a1", "vector + llm-attn live in VISUAL_PORT_TYPES", () => {
+  return VISUAL_PORT_TYPES.has("vector")
+      && VISUAL_PORT_TYPES.has("llm-attn")
+      && !SIGNAL_PORT_TYPES.has("vector")
+      && !SIGNAL_PORT_TYPES.has("llm-attn");
+}, "both new types are visual (strict same-type) not signal");
+
+test("a1", "vector→vector connects", () => {
+  return portsCompatible("vector", "vector") === true;
+});
+
+test("a1", "llm-attn→llm-attn connects", () => {
+  return portsCompatible("llm-attn", "llm-attn") === true;
+});
+
+test("a1", "vector→llm-attn rejected", () => {
+  return portsCompatible("vector", "llm-attn") === false;
+}, "strict same-type rule blocks cross-LLM mismatches");
+
+test("a1", "vector→audio rejected", () => {
+  return portsCompatible("vector", "audio") === false;
+}, "no implicit coercion from vector to signal types");
+
+test("a1", "audio→vector rejected", () => {
+  return portsCompatible("audio", "vector") === false;
+});
+
+test("a1", "vector→texture rejected", () => {
+  return portsCompatible("vector", "texture") === false;
+}, "vector + texture are both visual but distinct");
+
+test("a1", "audio→param still allowed (signal cross-type)", () => {
+  return portsCompatible("audio", "param") === true;
+}, "regression check on the existing signal-type rule");
+
+/* ----- Phase A.2 tests ----- */
+
+test("a2", "streamSSEEvents parses a 3-event stream", async () => {
+  const sse = [
+    "data: {\"i\":1,\"x\":\"a\"}\n\n",
+    "data: {\"i\":2,\"x\":\"b\"}\n\n",
+    "data: {\"i\":3,\"x\":\"c\"}\n\n",
+    "data: [DONE]\n\n"
+  ].join("");
+  const events = [];
+  await streamSSEEvents(mockResponse([sse]), e => events.push(e));
+  return events.length === 3 && events[0].i === 1 && events[2].x === "c";
+});
+
+test("a2", "streamSSEEvents tolerates split chunks at any boundary", async () => {
+  const full = "data: {\"x\":\"hello\"}\n\ndata: {\"x\":\"world\"}\n\n";
+  /* split into 1-char chunks to stress the buffer */
+  const chunks = full.split("");
+  const events = [];
+  await streamSSEEvents(mockResponse(chunks), e => events.push(e));
+  return events.length === 2 && events[0].x === "hello" && events[1].x === "world";
+});
+
+test("a2", "streamSSEEvents skips malformed events without stopping", async () => {
+  const sse = [
+    "data: {\"ok\":1}\n\n",
+    "data: not-json\n\n",
+    "data: {\"ok\":2}\n\n"
+  ].join("");
+  const events = [];
+  await streamSSEEvents(mockResponse([sse]), e => events.push(e));
+  return events.length === 2 && events[0].ok === 1 && events[1].ok === 2;
+});
+
+test("a2", "streamSSEEvents stops at [DONE] without consuming trailing data", async () => {
+  const sse = [
+    "data: {\"i\":1}\n\n",
+    "data: [DONE]\n\n",
+    "data: {\"i\":2}\n\n"  /* must NOT be emitted */
+  ].join("");
+  const events = [];
+  await streamSSEEvents(mockResponse([sse]), e => events.push(e));
+  return events.length === 1 && events[0].i === 1;
+});
+
+test("a2", "streamNDJSONEvents parses 3 JSON lines", async () => {
+  const ndj = "{\"i\":1}\n{\"i\":2}\n{\"i\":3}\n";
+  const events = [];
+  await streamNDJSONEvents(mockResponse([ndj]), e => events.push(e));
+  return events.length === 3 && events[0].i === 1 && events[2].i === 3;
+});
+
+test("a2", "streamNDJSONEvents flushes the final no-newline line", async () => {
+  const ndj = "{\"i\":1}\n{\"i\":2}";  /* no trailing \n */
+  const events = [];
+  await streamNDJSONEvents(mockResponse([ndj]), e => events.push(e));
+  return events.length === 2 && events[1].i === 2;
+});
+
+test("a2", "streamNDJSONEvents tolerates split chunks", async () => {
+  const full = "{\"x\":\"hello\"}\n{\"x\":\"world\"}\n";
+  const chunks = full.split("");
+  const events = [];
+  await streamNDJSONEvents(mockResponse(chunks), e => events.push(e));
+  return events.length === 2 && events[0].x === "hello" && events[1].x === "world";
+});
+
+test("a2", "streamNDJSONEvents skips malformed lines", async () => {
+  const ndj = "{\"ok\":1}\nnot json\n{\"ok\":2}\n";
+  const events = [];
+  await streamNDJSONEvents(mockResponse([ndj]), e => events.push(e));
+  return events.length === 2;
+});
+
+test("a2", "streamTokens yields tokens from SSE delta.text", async () => {
+  const sse = [
+    "data: {\"delta\":{\"text\":\"hello \"}}\n\n",
+    "data: {\"delta\":{\"text\":\"world\"}}\n\n",
+    "data: {\"delta\":{\"text\":\"!\"}}\n\n"
+  ].join("");
+  const collected = [];
+  for await (const t of streamTokens(mockResponse([sse]), { format: "sse", field: "delta.text" })) {
+    collected.push(t);
+  }
+  return collected.join("") === "hello world!";
+});
+
+test("a2", "streamTokens yields tokens from NDJSON message.content", async () => {
+  const ndj = [
+    "{\"message\":{\"content\":\"hello \"}}\n",
+    "{\"message\":{\"content\":\"streaming \"}}\n",
+    "{\"message\":{\"content\":\"world\"}}\n"
+  ].join("");
+  const collected = [];
+  for await (const t of streamTokens(mockResponse([ndj]), { format: "ndjson", field: "message.content" })) {
+    collected.push(t);
+  }
+  return collected.join("") === "hello streaming world";
+});
+
+test("a2", "streamTokens skips events lacking the field", async () => {
+  const sse = [
+    "data: {\"type\":\"message_start\"}\n\n",
+    "data: {\"delta\":{\"text\":\"hi\"}}\n\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+    "data: {\"delta\":{\"text\":\" there\"}}\n\n"
+  ].join("");
+  const collected = [];
+  for await (const t of streamTokens(mockResponse([sse]), { format: "sse", field: "delta.text" })) {
+    collected.push(t);
+  }
+  return collected.join("") === "hi there";
+});
+
+test("a2", "createTokenStreamBody renders text via append + finalize", async () => {
+  const c = document.createElement("div");
+  const body = createTokenStreamBody(c);
+  body.append("Hello ");
+  body.append("world");
+  /* Wait two rAF ticks to be sure the flush ran. */
+  await new Promise(r => requestAnimationFrame(r));
+  await new Promise(r => requestAnimationFrame(r));
+  if (body.el.textContent !== "Hello world") return false;
+  if (body.el.classList.contains("tk-stream-done")) return false;
+  body.finalize();
+  return body.el.textContent === "Hello world"
+      && body.el.classList.contains("tk-stream-done")
+      && !body.isStreaming;
+});
+
+test("a2", "createTokenStreamBody append() after finalize is a no-op", async () => {
+  const c = document.createElement("div");
+  const body = createTokenStreamBody(c);
+  body.append("A");
+  await new Promise(r => requestAnimationFrame(r));
+  body.finalize();
+  body.append("B");
+  await new Promise(r => requestAnimationFrame(r));
+  return body.el.textContent === "A";
+});
+
+test("a2", "createTokenStreamBody clear() wipes content", async () => {
+  const c = document.createElement("div");
+  const body = createTokenStreamBody(c);
+  body.append("garbage");
+  await new Promise(r => requestAnimationFrame(r));
+  body.clear();
+  return body.el.textContent === "";
+});
+
+test("a2", "mockTokenStream yields words+whitespace tokens", async () => {
+  const collected = [];
+  for await (const t of mockTokenStream("hello world", 0)) collected.push(t);
+  return eq(collected, ["hello", " ", "world"]);
+});
+
+test("a2", "mockTokenStream respects perTokenMs (timed)", async () => {
+  const t0 = performance.now();
+  let n = 0;
+  for await (const _ of mockTokenStream("a b c d", 50)) n++;
+  const elapsed = performance.now() - t0;
+  /* 7 tokens (a, " ", b, " ", c, " ", d) * 50ms = 350ms minimum */
+  return n === 7 && elapsed >= 280;
+});
+
+/* ============================================================
+ * Run tests + render results
+ * ============================================================ */
+
+(async function runAll() {
+  const a1Container = document.getElementById("a1-tests");
+  const a2Container = document.getElementById("a2-tests");
+  let passed = 0;
+  let failed = 0;
+
+  for (const t of tests) {
+    const row = document.createElement("div");
+    row.className = "test-row";
+
+    const badge = document.createElement("span");
+    badge.className = "badge";
+    badge.textContent = "…";
+    row.appendChild(badge);
+
+    const label = document.createElement("div");
+    label.innerHTML =
+      "<span class='name'>" + t.name + "</span>" +
+      (t.desc ? "<br><span class='desc'>" + t.desc + "</span>" : "");
+    row.appendChild(label);
+
+    const status = document.createElement("span");
+    status.className = "desc";
+    status.style.fontFamily = "var(--font-mono)";
+    status.style.fontSize = "0.78em";
+    row.appendChild(status);
+
+    (t.category === "a1" ? a1Container : a2Container).appendChild(row);
+
+    try {
+      const t0 = performance.now();
+      const ok = await t.fn();
+      const dt = (performance.now() - t0).toFixed(1);
+      if (ok) {
+        badge.className = "badge ok";
+        badge.textContent = "✓";
+        status.textContent = dt + "ms";
+        passed++;
+      } else {
+        badge.className = "badge fail";
+        badge.textContent = "✗";
+        status.textContent = "returned falsy";
+        status.style.color = "var(--fail)";
+        failed++;
+      }
+    } catch (e) {
+      badge.className = "badge fail";
+      badge.textContent = "✗";
+      status.textContent = String(e.message || e);
+      status.style.color = "var(--fail)";
+      failed++;
+    }
+  }
+
+  const sum = document.getElementById("summary");
+  if (failed === 0) {
+    sum.className = "summary ok";
+    sum.textContent = "✓ All " + passed + " tests passed.";
+  } else {
+    sum.className = "summary fail";
+    sum.textContent = "✗ " + failed + " failed, " + passed + " passed.";
+  }
+})();
+
+/* ============================================================
+ * Live streaming demo
+ * ============================================================ */
+
+const STREAM_MESSAGES = [
+  "Phase A foundations are live: vector and llm-attn port types " +
+  "added, RUNTIME_ONLY_KINDS dispatch registered, SSE plus NDJSON " +
+  "readers extracted into a reusable async iterator, and the " +
+  "createTokenStreamBody primitive ready to host whatever Phase B " +
+  "Ollama or Phase D in-house Generate nodes emit. Next stop: " +
+  "Sprint B.1 — provider plumbing in src/ai/ollama.js.",
+
+  "Lorem ipsum dolor sit amet, consectetur adipiscing elit. " +
+  "Streamed via mockTokenStream at the speed you picked. " +
+  "Switch the format dropdown to SSE or NDJSON to route through " +
+  "streamTokens instead — same visible output, different parser " +
+  "underneath."
+];
+
+let currentBody = null;
+let currentRunId = 0;
+const streamBox = document.getElementById("stream-box");
+
+async function runStream() {
+  currentRunId++;
+  const myRun = currentRunId;
+  if (currentBody) currentBody.finalize();
+  streamBox.innerHTML = "";
+  currentBody = createTokenStreamBody(streamBox);
+
+  const msg = STREAM_MESSAGES[Math.floor(Math.random() * STREAM_MESSAGES.length)];
+  const ms = parseInt(document.getElementById("speed").value, 10);
+  const format = document.getElementById("format").value;
+
+  if (format === "mock") {
+    for await (const t of mockTokenStream(msg, ms)) {
+      if (myRun !== currentRunId) return;
+      currentBody.append(t);
+    }
+  } else {
+    /* Build a synthetic SSE / NDJSON body whose chunks arrive at
+     * `ms` cadence, then drive streamTokens through it. Proves the
+     * SSE / NDJSON parsers also flow into createTokenStreamBody
+     * with identical UX. */
+    const tokens = msg.split(/(\s+)/);
+    const chunks = [];
+    for (const tok of tokens) {
+      if (format === "sse") {
+        chunks.push("data: " + JSON.stringify({ delta: { text: tok } }) + "\n\n");
+      } else {
+        chunks.push(JSON.stringify({ message: { content: tok } }) + "\n");
+      }
+    }
+    const encoder = new TextEncoder();
+    let idx = 0;
+    const response = {
+      body: {
+        getReader() {
+          return {
+            async read() {
+              if (idx >= chunks.length) return { value: undefined, done: true };
+              if (ms > 0) await new Promise(r => setTimeout(r, ms));
+              return { value: encoder.encode(chunks[idx++]), done: false };
+            }
+          };
+        }
+      }
+    };
+    const field = format === "sse" ? "delta.text" : "message.content";
+    for await (const t of streamTokens(response, { format, field })) {
+      if (myRun !== currentRunId) return;
+      currentBody.append(t);
+    }
+  }
+
+  if (myRun === currentRunId) currentBody.finalize();
+}
+
+document.getElementById("play-btn").addEventListener("click", runStream);
+document.getElementById("clear-btn").addEventListener("click", () => {
+  currentRunId++;
+  if (currentBody) currentBody.finalize();
+  streamBox.innerHTML = "";
+  currentBody = null;
+});
+
+/* Auto-start one demo run so the page isn't silent on load. */
+setTimeout(runStream, 800);
+</script>
+
+</body>
+</html>
