@@ -1773,6 +1773,15 @@ async function probeLocalServer() {
     if (!res.ok) throw new Error("HTTP " + res.status);
     const j = await res.json();
     if (!j || j.service !== "gamma-compile-server") throw new Error("not gamma-compile-server");
+    // Phase B sprint 3 -- compile-server advertises its local Ollama
+    // daemon under j.ollama (gamma-compile-server v0.3.44+). Prime the
+    // Ollama status cache so the model badge can surface that state
+    // without waiting on the editor's own 30s direct probe. Useful for
+    // LAN setups where the direct browser probe is mixed-content-blocked
+    // but the /health relay through the compile-server isn't.
+    if (j.ollama && typeof applyOllamaHealthSnapshot === "function") {
+      try { applyOllamaHealthSnapshot(j.ollama); } catch (_) {}
+    }
     return base;
   }));
   const ok = results.find(r => r.status === "fulfilled");

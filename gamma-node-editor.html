@@ -8190,7 +8190,7 @@
  * Pages deploy workflow (.github/workflows/pages.yml). The string
  * after the equals sign is what the workflow's sed targets — don't
  * change the format of this line. */
-const APP_VERSION = "0.3.699";
+const APP_VERSION = "0.3.700";
 
 /* =========================================================================
  * Node kinds — runtime-only kind registry
@@ -52571,6 +52571,50 @@ function probeOllamaStatusBackground(opts) {
   if (stale) probeOllamaStatus(opts);
   return cached;
 }
+
+/* Phase B sprint 3 -- compile-server /health advertisement consumer.
+ *
+ * The gamma-compile-server daemon polls its own local Ollama every 60s
+ * and includes the snapshot in /health under `ollama`. When the editor
+ * parses /health (in src/audio/preview.js's probeLocalServer), it calls
+ * this helper to prime our cache so the model badge can surface Ollama
+ * state from the compile-server's perspective.
+ *
+ * Why useful:
+ *   - LAN setups where the editor loads from https://9livezzz-git.github.io
+ *     and the compile-server is on a non-loopback LAN address. The
+ *     direct browser probe of Ollama there is blocked by mixed-content;
+ *     /health (relayed through the compile-server) succeeds.
+ *   - Cold start: the compile-server's /health response often lands
+ *     faster than our own 30s direct probe schedule.
+ *
+ * The snapshot is stored under its own `baseUrl` key so the user's
+ * configured aiSettings.ollamaUrl cache slot isn't overwritten when
+ * those URLs differ (a remote compile-server's "127.0.0.1:11434" is
+ * NOT the editor user's "127.0.0.1:11434"). Direct probes by the
+ * editor later for any matching baseUrl will overwrite this entry
+ * with whatever the direct probe finds. */
+function applyOllamaHealthSnapshot(s) {
+  if (!s || typeof s !== "object") return null;
+  const baseUrl = (typeof s.baseUrl === "string") ? s.baseUrl : OLLAMA_LOCAL_DEFAULT_URL;
+  const snapshot = {
+    version:   typeof s.version === "string" ? s.version : null,
+    models:    Array.isArray(s.models) ? s.models : null,
+    error:     typeof s.error === "string" ? s.error : (s.present ? null : "compile-server reported no daemon"),
+    fetchedAt: typeof s.fetchedAt === "number" ? s.fetchedAt : Date.now(),
+    inFlight:  null
+  };
+  // Only write if we don't have a fresher direct-probe snapshot for the
+  // same baseUrl -- the direct probe is authoritative; this is only a
+  // hint. Also skip overwriting a successful direct probe with a failed
+  // health-relay snapshot (would degrade UX for no reason).
+  const cacheKey = _ollamaCacheKey(baseUrl, "");
+  const existing = _ollamaStatusCache.get(cacheKey);
+  if (existing && existing.fetchedAt >= snapshot.fetchedAt) return existing;
+  if (existing && existing.version && !snapshot.version) return existing;
+  _ollamaStatusCache.set(cacheKey, snapshot);
+  return snapshot;
+}
 /* =========================================================================
  * AI assistant for .gdsp authoring
  *
@@ -96015,6 +96059,15 @@ async function probeLocalServer() {
     if (!res.ok) throw new Error("HTTP " + res.status);
     const j = await res.json();
     if (!j || j.service !== "gamma-compile-server") throw new Error("not gamma-compile-server");
+    // Phase B sprint 3 -- compile-server advertises its local Ollama
+    // daemon under j.ollama (gamma-compile-server v0.3.44+). Prime the
+    // Ollama status cache so the model badge can surface that state
+    // without waiting on the editor's own 30s direct probe. Useful for
+    // LAN setups where the direct browser probe is mixed-content-blocked
+    // but the /health relay through the compile-server isn't.
+    if (j.ollama && typeof applyOllamaHealthSnapshot === "function") {
+      try { applyOllamaHealthSnapshot(j.ollama); } catch (_) {}
+    }
     return base;
   }));
   const ok = results.find(r => r.status === "fulfilled");
