@@ -326,7 +326,7 @@ const PROVIDERS = {
     supportsImage: true,
     supportsAudio: false,   // Whisper isn't routed through this path
     goodClassifier: true,   // HW.3 -- strong enough for constrained node-name classification
-    async call({ system, user, model, key, onToken, image, audio, temperature, maxTokens }) {
+    async call({ system, user, model, key, onToken, image, audio, temperature, maxTokens, format, signal }) {
       if (audio) throw new Error("Anthropic provider does not handle audio input. Use Gemma for voice.");
 
       // image can be a single base64 string OR an array of base64
@@ -337,10 +337,19 @@ const PROVIDERS = {
             .concat([{ type: "text", text: user }])
         : user;
 
+      // Sprint B.10 -- JSON-mode shim. Anthropic doesn't have a
+      // "format" knob like Ollama; the canonical pattern is to append
+      // a system-prompt instruction + assert in the user message.
+      let effectiveSystem = system || "";
+      if (format === "json") {
+        effectiveSystem = (effectiveSystem ? (effectiveSystem + "\n\n") : "") +
+          "Respond with a single valid JSON object. No prose, no markdown fences, no commentary.";
+      }
+
       const body = {
         model: model || "claude-sonnet-4-5",
         max_tokens: (typeof maxTokens === "number" && maxTokens > 0) ? maxTokens : 2048,
-        system,
+        system: effectiveSystem,
         messages: [{ role: "user", content: userContent }],
         stream: !!onToken
       };
@@ -353,7 +362,8 @@ const PROVIDERS = {
           "anthropic-version": "2023-06-01",
           "anthropic-dangerous-direct-browser-access": "true"
         },
-        body: JSON.stringify(body)
+        body: JSON.stringify(body),
+        signal: signal || undefined  // Sprint B.10 -- AbortController hookup
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
@@ -391,7 +401,7 @@ const PROVIDERS = {
     supportsImage: false,
     supportsAudio: false,
     goodClassifier: false,
-    async call({ system, user, model, onToken, image, temperature, maxTokens }) {
+    async call({ system, user, model, onToken, image, temperature, maxTokens, format, signal }) {
       return await ollamaChat({
         baseUrl: aiSettings.ollamaUrl,
         model,
@@ -400,7 +410,9 @@ const PROVIDERS = {
         image,
         onToken,
         temperature,
-        maxTokens
+        maxTokens,
+        format,
+        signal
       });
     }
   },
@@ -415,7 +427,7 @@ const PROVIDERS = {
     supportsImage: false,
     supportsAudio: false,
     goodClassifier: true,
-    async call({ system, user, model, key, onToken, image, temperature, maxTokens }) {
+    async call({ system, user, model, key, onToken, image, temperature, maxTokens, format, signal }) {
       return await ollamaChat({
         baseUrl: OLLAMA_CLOUD_BASE_URL,
         key,
@@ -425,7 +437,9 @@ const PROVIDERS = {
         image,
         onToken,
         temperature,
-        maxTokens
+        maxTokens,
+        format,
+        signal
       });
     }
   },
@@ -449,8 +463,21 @@ const PROVIDERS = {
     requiresKey: false,
     supportsImage: true,
     supportsAudio: true,
-    async call({ system, user, model, onToken, image, audio, temperature, maxTokens }) {
+    async call({ system, user, model, onToken, image, audio, temperature, maxTokens, format, signal }) {
+      // Note: `signal` is accepted for API parity but ignored. Gemma
+      // runs in-browser via transformers.js without a native abort
+      // hook; the LLM-runtime generation counter handles cancellation
+      // at the consumer side (late tokens drop, see llm-runtime.js).
       const pipe = await ensureGemmaPipeline(model);
+
+      // Sprint B.10 -- JSON-mode shim. Same pattern as Anthropic;
+      // Gemma honors a "respond as JSON only" instruction reasonably
+      // well on the E2B/E4B sizes.
+      let effectiveSystem = system || "";
+      if (format === "json") {
+        effectiveSystem = (effectiveSystem ? (effectiveSystem + "\n\n") : "") +
+          "Respond with a single valid JSON object. No prose, no markdown fences, no commentary.";
+      }
 
       // Build the messages array. Multimodal content (image / audio) goes
       // BEFORE the text per Google's recommendation for best results.
@@ -464,7 +491,7 @@ const PROVIDERS = {
       userContent.push({ type: "text", text: user });
 
       const messages = [
-        { role: "system", content: system },
+        { role: "system", content: effectiveSystem },
         { role: "user",   content: userContent }
       ];
 

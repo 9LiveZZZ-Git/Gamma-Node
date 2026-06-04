@@ -229,10 +229,39 @@ function _llmAbortInFlight(rt) {
   }
 }
 
-/* The async kicks. Each takes (node, runtimeState) and runs an Ollama
- * call until completion, then publishes the output. */
+/* Sprint B.10 -- resolve the currently-configured provider's call()
+ * + key + default-model. Used by every llm-sink so the choice of
+ * Provider (Ollama / Ollama Cloud / Anthropic / Gemma) propagates
+ * uniformly. Returns null + emits a node-body error if the provider
+ * is misconfigured. */
+function _llmResolveProvider(node, rt) {
+  const providerId = (typeof aiSettings === "object" && aiSettings.provider) || "ollama";
+  const provider   = (typeof PROVIDERS === "object") ? PROVIDERS[providerId] : null;
+  if (!provider || typeof provider.call !== "function") {
+    _llmMarkError(node, rt, "Unknown provider: " + providerId + ". Set it in Settings → Provider.");
+    return null;
+  }
+  // Per-provider key resolution mirrors the dispatch in chooseAi() in
+  // src/ai/settings.js -- anthropic uses anthropicKey, ollama-cloud
+  // uses ollamaKey, the others are key-less.
+  let key = "";
+  if (providerId === "anthropic")    key = (aiSettings && aiSettings.anthropicKey) || "";
+  if (providerId === "ollama-cloud") key = (aiSettings && aiSettings.ollamaKey)    || "";
+  if (provider.requiresKey && !key) {
+    _llmMarkError(node, rt,
+      providerId + " requires an API key. Set it in Settings → " +
+      (providerId === "anthropic" ? "Anthropic API key" : "Ollama Cloud API key") + ".");
+    return null;
+  }
+  return { providerId, provider, key };
+}
+
+/* The async kicks. Each takes (node, runtimeState) and runs a
+ * provider call until completion, then publishes the output. */
 
 async function _llmKickChat(node, rt) {
+  const pr = _llmResolveProvider(node, rt);
+  if (!pr) return;
   _llmAbortInFlight(rt);
   rt.aborter   = new AbortController();
   rt.streaming = true;
@@ -245,7 +274,7 @@ async function _llmKickChat(node, rt) {
   const system = _readTextWire(node, "system");
   const user   = _readTextWire(node, "prompt") || _readTextWire(node, "user");
   let   model  = _readTextWire(node, "model");
-  if (!model && typeof aiSettings === "object") model = aiSettings.model || "llama3.2";
+  if (!model) model = (aiSettings && aiSettings.model) || pr.provider.defaultModel || "llama3.2";
 
   const onToken = (tok) => {
     if (myGen !== rt.generation) return;
@@ -253,9 +282,8 @@ async function _llmKickChat(node, rt) {
   };
 
   try {
-    const acc = await ollamaChat({
-      baseUrl: aiSettings && aiSettings.ollamaUrl,
-      model, system, user, onToken, signal
+    const acc = await pr.provider.call({
+      system, user, model, key: pr.key, onToken, signal
     });
     if (myGen !== rt.generation) return;
     if (rt.body) rt.body.finalize();
@@ -272,6 +300,8 @@ async function _llmKickChat(node, rt) {
 }
 
 async function _llmKickGenerate(node, rt) {
+  const pr = _llmResolveProvider(node, rt);
+  if (!pr) return;
   _llmAbortInFlight(rt);
   rt.aborter   = new AbortController();
   rt.streaming = true;
@@ -284,7 +314,7 @@ async function _llmKickGenerate(node, rt) {
   const prompt = _readTextWire(node, "prompt");
   const system = _readTextWire(node, "system");
   let   model  = _readTextWire(node, "model");
-  if (!model && typeof aiSettings === "object") model = aiSettings.model || "llama3.2";
+  if (!model) model = (aiSettings && aiSettings.model) || pr.provider.defaultModel || "llama3.2";
 
   const onToken = (tok) => {
     if (myGen !== rt.generation) return;
@@ -292,10 +322,23 @@ async function _llmKickGenerate(node, rt) {
   };
 
   try {
-    const acc = await ollamaGenerate({
-      baseUrl: aiSettings && aiSettings.ollamaUrl,
-      model, prompt, system, onToken, signal
-    });
+    // Sprint B.10 -- prefer the Ollama-only /api/generate endpoint when
+    // the provider is Ollama-based (cheaper than /chat for stateless
+    // single-prompt completions). For Anthropic + Gemma, fall back to
+    // the unified PROVIDERS.call path; the user-facing behavior is
+    // identical (stateless prompt → response).
+    let acc;
+    if (pr.providerId === "ollama" || pr.providerId === "ollama-cloud") {
+      acc = await ollamaGenerate({
+        baseUrl: pr.providerId === "ollama" ? (aiSettings && aiSettings.ollamaUrl) : OLLAMA_CLOUD_BASE_URL,
+        key:     pr.key,
+        model, prompt, system, onToken, signal
+      });
+    } else {
+      acc = await pr.provider.call({
+        system, user: prompt, model, key: pr.key, onToken, signal
+      });
+    }
     if (myGen !== rt.generation) return;
     if (rt.body) rt.body.finalize();
     node.params = node.params || {};
@@ -311,6 +354,17 @@ async function _llmKickGenerate(node, rt) {
 }
 
 async function _llmKickEmbed(node, rt) {
+  // Sprint B.10 -- LLMEmbed is Ollama-only because Anthropic doesn't
+  // expose embeddings via their public API and Gemma's embedding head
+  // isn't wired through transformers.js yet. Surface a clear error if
+  // the active provider can't do embeddings.
+  const providerId = (typeof aiSettings === "object" && aiSettings.provider) || "ollama";
+  if (providerId !== "ollama" && providerId !== "ollama-cloud") {
+    _llmMarkError(node, rt,
+      "LLMEmbed needs an Ollama provider (Anthropic + Gemma don't expose embeddings). " +
+      "Settings → Provider → Ollama (local) or Ollama Cloud.");
+    return;
+  }
   _llmAbortInFlight(rt);
   rt.aborter   = new AbortController();
   rt.streaming = true;
@@ -325,8 +379,12 @@ async function _llmKickEmbed(node, rt) {
   if (!model) model = (node.params && node.params.model) || "nomic-embed-text";
 
   try {
+    const baseUrl = (providerId === "ollama")
+      ? (aiSettings && aiSettings.ollamaUrl)
+      : OLLAMA_CLOUD_BASE_URL;
+    const key = (providerId === "ollama-cloud") ? (aiSettings && aiSettings.ollamaKey) : undefined;
     const res = await ollamaEmbed({
-      baseUrl: aiSettings && aiSettings.ollamaUrl,
+      baseUrl, key,
       model, input: text, signal
     });
     if (myGen !== rt.generation) return;
@@ -368,6 +426,8 @@ async function _llmKickEmbed(node, rt) {
  * matches, the raw model output goes through verbatim so the user can
  * see what went wrong. */
 async function _llmKickClassifier(node, rt) {
+  const pr = _llmResolveProvider(node, rt);
+  if (!pr) return;
   _llmAbortInFlight(rt);
   rt.aborter   = new AbortController();
   rt.streaming = true;
@@ -381,7 +441,7 @@ async function _llmKickClassifier(node, rt) {
   const labels = _readTextWire(node, "labels") || "";
   const labelList = labels.split(",").map(s => s.trim()).filter(Boolean);
   let model  = _readTextWire(node, "model");
-  if (!model && typeof aiSettings === "object") model = aiSettings.model || "llama3.2";
+  if (!model) model = (aiSettings && aiSettings.model) || pr.provider.defaultModel || "llama3.2";
 
   if (!labelList.length) {
     _llmMarkError(node, rt, "no labels (set the labels input to a comma-separated list)");
@@ -398,9 +458,8 @@ async function _llmKickClassifier(node, rt) {
   };
 
   try {
-    const acc = await ollamaChat({
-      baseUrl: aiSettings && aiSettings.ollamaUrl,
-      model, system, user: input, onToken, signal,
+    const acc = await pr.provider.call({
+      system, user: input, model, key: pr.key, onToken, signal,
       maxTokens: 16, temperature: 0.0
     });
     if (myGen !== rt.generation) return;
@@ -433,6 +492,8 @@ async function _llmKickClassifier(node, rt) {
  * Both `value` and `raw` go on outputs so a downstream JSON tool can
  * grab additional fields without re-running the model. */
 async function _llmKickJSONFormat(node, rt) {
+  const pr = _llmResolveProvider(node, rt);
+  if (!pr) return;
   _llmAbortInFlight(rt);
   rt.aborter   = new AbortController();
   rt.streaming = true;
@@ -446,8 +507,12 @@ async function _llmKickJSONFormat(node, rt) {
   const schema = _readTextWire(node, "schema");
   const field  = _readTextWire(node, "field");
   let   model  = _readTextWire(node, "model");
-  if (!model && typeof aiSettings === "object") model = aiSettings.model || "llama3.2";
+  if (!model) model = (aiSettings && aiSettings.model) || pr.provider.defaultModel || "llama3.2";
 
+  // Schema goes into the system prompt as a hint regardless of provider.
+  // The `format: "json"` flag is honored by Ollama natively and by the
+  // Anthropic / Gemma JSON-mode shims in PROVIDERS (which append a
+  // "respond as JSON only" instruction to the system prompt).
   const system = "Respond with a single JSON object. " +
     (schema ? ("Schema: " + schema + ". ") : "") +
     "No prose, no markdown fences, just JSON.";
@@ -458,9 +523,8 @@ async function _llmKickJSONFormat(node, rt) {
   };
 
   try {
-    const acc = await ollamaChat({
-      baseUrl: aiSettings && aiSettings.ollamaUrl,
-      model, system, user: prompt, onToken, signal,
+    const acc = await pr.provider.call({
+      system, user: prompt, model, key: pr.key, onToken, signal,
       format: "json", temperature: 0.2
     });
     if (myGen !== rt.generation) return;
@@ -601,6 +665,8 @@ function _llmStopVoice(node, rt) {
 }
 
 async function _llmVoiceFireChat(node, rt, userText) {
+  const pr = _llmResolveProvider(node, rt);
+  if (!pr) return;
   _llmAbortInFlight(rt);
   rt.aborter   = new AbortController();
   rt.streaming = true;
@@ -612,7 +678,7 @@ async function _llmVoiceFireChat(node, rt, userText) {
 
   const system = _readTextWire(node, "system");
   let model    = _readTextWire(node, "model");
-  if (!model && typeof aiSettings === "object") model = aiSettings.model || "llama3.2";
+  if (!model) model = (aiSettings && aiSettings.model) || pr.provider.defaultModel || "llama3.2";
 
   const onToken = (tok) => {
     if (myGen !== rt.generation) return;
@@ -620,9 +686,8 @@ async function _llmVoiceFireChat(node, rt, userText) {
   };
 
   try {
-    const acc = await ollamaChat({
-      baseUrl: aiSettings && aiSettings.ollamaUrl,
-      model, system, user: userText, onToken, signal
+    const acc = await pr.provider.call({
+      system, user: userText, model, key: pr.key, onToken, signal
     });
     if (myGen !== rt.generation) return;
     if (rt.body) rt.body.finalize();
