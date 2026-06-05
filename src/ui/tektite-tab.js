@@ -40,13 +40,108 @@ const _tektiteTabState = {
   saveToVaultBtnEl: null,
   fullscreen:      false,
   backlinksEl:     null,
-  // Sprint tektite-5a -- tree view state. openFolders is a Set of
-  // folder paths (e.g. "journal/2026") that are currently expanded.
-  // viewMode is "tree" when any note path contains `/`, else "list"
-  // (auto-detected per source on render).
-  openFolders:     new Set(),
+  // Sprint tektite-5a2 -- closedFolders is the inverse: a Set of
+  // paths the user has explicitly collapsed. Everything else stays
+  // open by default (matches Obsidian's file explorer). Migrated
+  // from openFolders since users expected expanded-by-default.
+  closedFolders:   new Set(),
   treeViewForced:  null    // null = auto-detect; true/false = manual override
 };
+
+/* Sprint tektite-5b -- graph-modal state. The modal is fullscreen +
+ * absolutely-positioned; we keep the renderer handle separately so
+ * the close/reopen cycle can drop + recreate it cleanly. */
+const _tektiteGraphState = {
+  modal:    null,
+  canvas:   null,
+  renderer: null,
+  graph:    null,
+  mode:     "global",
+  depth:    2,
+  minDeg:   0
+};
+
+async function _tektiteOpenGraphModal() {
+  const s = _tektiteGraphState;
+  s.modal  = document.getElementById("tektite-graph-modal");
+  s.canvas = document.getElementById("tektite-graph-canvas");
+  if (!s.modal || !s.canvas) return;
+  s.modal.style.display = "flex";
+
+  // Wire mode buttons (idempotent re-wire is fine; addEventListener
+  // dedups on reference equality after the first attach but we use
+  // anonymous lambdas so they pile up. Track wiredOnce to bail.).
+  if (!s.wiredOnce) {
+    s.wiredOnce = true;
+    document.querySelectorAll(".tektite-graph-mode-btn").forEach(btn => {
+      btn.addEventListener("click", () => {
+        s.mode = btn.getAttribute("data-graph-mode") || "global";
+        document.querySelectorAll(".tektite-graph-mode-btn").forEach(b =>
+          b.classList.toggle("active", b === btn));
+        _tektiteRebuildGraph();
+      });
+    });
+    const depthEl   = document.getElementById("tektite-graph-depth");
+    const depthVal  = document.getElementById("tektite-graph-depth-val");
+    if (depthEl) depthEl.addEventListener("input", () => {
+      s.depth = Number(depthEl.value);
+      if (depthVal) depthVal.textContent = String(s.depth);
+      if (s.mode === "local") _tektiteRebuildGraph();
+    });
+    const minEl    = document.getElementById("tektite-graph-mindeg");
+    const minVal   = document.getElementById("tektite-graph-mindeg-val");
+    if (minEl) minEl.addEventListener("input", () => {
+      s.minDeg = Number(minEl.value);
+      if (minVal) minVal.textContent = String(s.minDeg);
+      _tektiteRebuildGraph();
+    });
+    const recenter = document.getElementById("btn-tektite-graph-recenter");
+    if (recenter) recenter.addEventListener("click", () => {
+      if (s.renderer) s.renderer.recenter();
+    });
+  }
+
+  await _tektiteRebuildGraph();
+}
+
+function _tektiteCloseGraphModal() {
+  const s = _tektiteGraphState;
+  if (s.renderer) { s.renderer.destroy(); s.renderer = null; }
+  if (s.modal) s.modal.style.display = "none";
+}
+
+async function _tektiteRebuildGraph() {
+  const s = _tektiteGraphState;
+  const stats = document.getElementById("tektite-graph-stats");
+  if (stats) stats.textContent = "building…";
+  const centerId = tektiteEditorCurrentNoteId();
+  try {
+    s.graph = await tektiteGraphBuild({
+      mode:      s.mode,
+      centerId,
+      depth:     s.depth,
+      minDegree: s.minDeg
+    });
+  } catch (e) {
+    if (stats) stats.textContent = "build failed: " + (e.message || e);
+    return;
+  }
+  if (s.renderer) s.renderer.destroy();
+  s.renderer = tektiteGraphRenderer(s.canvas, s.graph, {
+    selectedId:  centerId,
+    onNodeClick: async (id) => {
+      _tektiteCloseGraphModal();
+      _tektiteTabState.activeSource = "vault";
+      await _tektiteTabRefresh();
+      await tektiteEditorLoadFromSource("vault", id);
+      _tektiteTabRender();
+    }
+  });
+  s.renderer.start();
+  if (stats) {
+    stats.textContent = s.graph.nodes.length + " notes · " + s.graph.edges.length + " links";
+  }
+}
 
 /* Sprint tektite-2 -- wikilink navigation. Resolves a [[target]] in
  * priority order: vault notes by id → vault notes by case-insensitive
@@ -308,7 +403,7 @@ function _tektiteTabRender() {
   let html;
   if (useTree && typeof tektiteBuildTree === "function") {
     const tree = tektiteBuildTree(filtered);
-    const flat = tektiteFlattenTree(tree, s.openFolders);
+    const flat = tektiteFlattenTree(tree, s.closedFolders);
     html = flat.map(item => {
       const indentPx = item.depth * 14;
       if (item.type === "folder") {
@@ -352,13 +447,13 @@ function _tektiteTabRender() {
   }
   s.listEl.innerHTML = html;
 
-  // Sprint tektite-5a -- folder click toggles open/closed state.
+  // Sprint tektite-5a2 -- folder click toggles closed state (default open).
   s.listEl.querySelectorAll(".tektite-folder-row").forEach(row => {
     row.addEventListener("click", () => {
       const path = row.getAttribute("data-folder");
       if (!path) return;
-      if (s.openFolders.has(path)) s.openFolders.delete(path);
-      else s.openFolders.add(path);
+      if (s.closedFolders.has(path)) s.closedFolders.delete(path);
+      else s.closedFolders.add(path);
       _tektiteTabRender();
     });
   });
@@ -543,6 +638,18 @@ function tektiteTabAttach() {
       _tektiteTabRender();
     } catch (e) {
       window.alert("Today note open/create failed: " + (e.message || e));
+    }
+  });
+
+  // Sprint tektite-5b -- graph view modal.
+  const graphBtn = document.getElementById("btn-tektite-graph");
+  if (graphBtn) graphBtn.addEventListener("click", () => _tektiteOpenGraphModal());
+  const graphCloseBtn = document.getElementById("btn-tektite-graph-close");
+  if (graphCloseBtn) graphCloseBtn.addEventListener("click", () => _tektiteCloseGraphModal());
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && _tektiteGraphState.modal &&
+        _tektiteGraphState.modal.style.display !== "none") {
+      _tektiteCloseGraphModal();
     }
   });
 

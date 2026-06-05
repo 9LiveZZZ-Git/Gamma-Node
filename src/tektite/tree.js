@@ -73,18 +73,24 @@ function tektiteBuildTree(listing) {
 /* Pre-order flatten. Used by the sidebar renderer so it can iterate
  * with a single map() instead of a recursive HTML-building walk.
  * Each emitted entry carries { type, depth, name, path?, note? } so
- * the renderer can both compute indent + bind click handlers. */
-function tektiteFlattenTree(root, openFolders, depth, out) {
+ * the renderer can both compute indent + bind click handlers.
+ *
+ * Sprint tektite-5a2 -- semantics flipped from "open set" to "closed
+ * set" so folders default to EXPANDED (matching Obsidian's file
+ * explorer). Pass a Set of folder paths the user has explicitly
+ * collapsed; everything else stays open. */
+function tektiteFlattenTree(root, closedFolders, depth, out) {
   out = out || [];
   depth = depth || 0;
   if (!root) return out;
   // Skip the synthetic root node; only emit its children.
   if (depth === 0 && root.type === "folder" && root.name === "") {
-    for (const child of root.children) tektiteFlattenTree(child, openFolders, 0, out);
+    for (const child of root.children) tektiteFlattenTree(child, closedFolders, 0, out);
     return out;
   }
   if (root.type === "folder") {
-    const isOpen = !openFolders || openFolders.has(root.path);
+    // Default OPEN. Collapse only if explicitly tracked in closedFolders.
+    const isOpen = !closedFolders || !closedFolders.has(root.path);
     out.push({
       type:  "folder",
       name:  root.name,
@@ -93,7 +99,7 @@ function tektiteFlattenTree(root, openFolders, depth, out) {
       depth, isOpen
     });
     if (isOpen) {
-      for (const child of root.children) tektiteFlattenTree(child, openFolders, depth + 1, out);
+      for (const child of root.children) tektiteFlattenTree(child, closedFolders, depth + 1, out);
     }
   } else {
     out.push({
