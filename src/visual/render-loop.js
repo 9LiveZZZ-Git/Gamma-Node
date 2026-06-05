@@ -131,6 +131,11 @@ function renderVisualFrame() {
   // Ollama fetch. Streams tokens into the node body. No-op when no
   // llm-sink nodes are in the patch.
   _tickLLMRuntime(dtSec);
+  // Phase C sprint tektite-5c -- TektiteGraph nodes (knowledge graph
+  // as a texture). Walks vault, runs force-directed sim, renders to
+  // an offscreen canvas, uploads to a GPUTexture each frame. No-op
+  // when no TektiteGraph nodes are in the patch.
+  if (typeof tickTektiteGraphTextures === "function") tickTektiteGraphTextures(dtSec);
   // §5.5.g -- HUD overlays. Minimap is the first; future Compass /
   // HealthBar / Inventory will plug in here as separate functions.
   // Each renders only when its driving node exists in the patch.

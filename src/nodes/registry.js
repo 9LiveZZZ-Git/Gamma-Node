@@ -19904,6 +19904,54 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     description: "Phase A.1 placeholder — receives an `llm-attn` input (attention weights [B,H,T,T] + token labels) and outputs a `texture` port for downstream Materials. No runtime behavior yet; the real AttentionGraph3D (port of LLMAttention3D.jsx) ships in Phase D sprint llm-10."
   },
 
+  /* Phase C sprint tektite-5c -- TektiteGraph.
+   *
+   * The Tektite-unique upgrade vs Obsidian: the knowledge graph isn't
+   * a sandboxed pane but a first-class TEXTURE SOURCE in the visual
+   * node pipeline. The force-directed layout from the Tektite tab's
+   * 🕸 Graph button (sprint tektite-5b) renders here to an offscreen
+   * canvas and uploads to a GPUTexture each frame, exposed as the
+   * `tex` output. Wire it into Sprite.texture, ShaderFrag.uniform,
+   * or any other texture consumer in the visual pipeline.
+   *
+   * mode = "global" walks the whole vault. mode = "local" centers on
+   *   the editor's currently-loaded note + depth-hop BFS neighborhood.
+   * minDegree filters out isolated notes (degree < threshold) in
+   *   global mode; useful for hiding orphans in noisy vaults.
+   * width / height set the output texture resolution (default 512^2,
+   *   max 2048^2).
+   *
+   * Runtime-only (no C++ codegen). Layout settles within ~250
+   * iterations (~4 seconds at 60 Hz), after which the texture stays
+   * static until a config param changes.
+   * ============================================================ */
+  TektiteGraph: {
+    category: "AI", color: COLOR.ai, header: null,
+    cppType: "", kind: "tektite-graph",
+    ins: [
+      { n: "mode",      t: "text"  },
+      { n: "depth",     t: "param" },
+      { n: "minDegree", t: "param" },
+      { n: "centerId",  t: "text"  }
+    ],
+    outs: [
+      { n: "tex", t: "texture" }
+    ],
+    params: {
+      mode:      "global",
+      depth:     2,
+      minDegree: 0,
+      centerId:  "",
+      width:     512,
+      height:    512,
+      bgR:       0.04, bgG: 0.05, bgB: 0.09,
+      edgeR:     0.61, edgeG: 0.81, edgeB: 1.0, edgeA: 0.30,
+      nodeR:     0.78, nodeG: 0.91, nodeB: 0.35
+    },
+    paramOptions: { mode: ["global", "local"] },
+    description: "Renders the Tektite vault as a force-directed graph onto a live GPUTexture (default 512×512). Wire `tex` into Sprite.texture / ShaderFrag.uniform / Materials. `mode=local` centers on the currently-loaded note + `depth`-hop neighborhood; `mode=global` walks the whole vault with optional `minDegree` filter. Background, edge, and node colors are configurable (RGB params 0-1). The layout matches what the 🕸 Graph button shows; this is the same data as a texture source rather than a UI pane. **Tektite-unique upgrade — Obsidian's graph view is sandboxed in a pane; ours flows directly into the audio/visual node pipeline.**"
+  },
+
   /* ============================================================
    * Phase B sprint 4 — Ollama-backed LLM nodes (MVP)
    *

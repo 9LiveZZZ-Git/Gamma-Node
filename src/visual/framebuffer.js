@@ -190,7 +190,15 @@ function _resolveSpriteTextureEntry(spriteNode) {
   );
   if (!wire || !wire.from) return null;
   const src = state.nodes.find(n => n && n.id === wire.from.node);
-  if (!src || src.type !== "ImageURL") return null;
+  if (!src) return null;
+  // Phase C sprint tektite-5c -- TektiteGraph is a live texture
+  // emitter; its per-frame tick stashes _textureEntry directly on the
+  // node so we can short-circuit the ImageURL URL path entirely.
+  if (typeof _tektiteResolveTextureEntry === "function") {
+    const tk = _tektiteResolveTextureEntry(src);
+    if (tk) return tk;
+  }
+  if (src.type !== "ImageURL") return null;
   const sp = _resolveNodeParams(src);
   const url = (typeof sp.url === "string") ? sp.url : "";
   if (!url) return null;
