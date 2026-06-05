@@ -19978,13 +19978,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     ins: [],
     outs: [{ n: "text", t: "text" }],
     params: {
-      text:   "New text card.\n\nDrag to move. Resize from the corner.",
-      width:  260,
-      height: 80,
-      color:  ""
+      text:       "New text card.\n\nClick to edit. Drag corner to resize.",
+      width:      260,
+      height:     80,
+      color:      "",
+      linkedFile: ""    // Sprint 10d -- optional vault note id; when
+                         // set, edits sync two-way with the vault
     },
     paramOptions: { color: ["", "1", "2", "3", "4", "5", "6"] },
-    description: "Phase C sprint tektite-10b -- spatial card holding plain markdown text.  Outputs `text` so an LLM node / SystemPrompt / classifier can read the body.  Resizes from the corner; the `color` param maps to a JSON Canvas palette slot (1=red 2=orange 3=yellow 4=green 5=cyan 6=purple) so docs round-trip cleanly with Obsidian Canvas + Tektite's 🗂 Canvas modal."
+    description: "Phase C sprint tektite-10b/10d -- editable spatial card holding markdown text.  Click body to edit; outputs `text` so an LLM / SystemPrompt / classifier can read the body. Set `linkedFile` to a vault note id and edits sync TWO-WAY with that note (changes here save to the vault; changes in Tektite refresh the card). `color` maps to JSON Canvas palette slot (1=red 2=orange 3=yellow 4=green 5=cyan 6=purple). Resizes from the corner."
   },
   NoteCard: {
     category: "Tektite", color: COLOR.tektite, header: null,
@@ -20009,13 +20011,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     ins: [],
     outs: [{ n: "url", t: "text" }],
     params: {
-      url:    "https://example.com",
-      width:  320,
-      height: 300,
-      color:  ""
+      url:        "https://example.com",
+      label:      "",         // optional display label
+      width:      320,
+      height:     120,
+      color:      "",
+      linkedFile: ""    // Sprint 10d -- optional vault note id; when
+                         // set, url comes from the note's frontmatter
+                         // `url:` field + edits sync back
     },
     paramOptions: { color: ["", "1", "2", "3", "4", "5", "6"] },
-    description: "Phase C sprint tektite-10b -- spatial card holding a URL. Outputs the URL as a text wire. Full iframe embed will land in sprint tektite-10c alongside the canvas-mode rendering; for now it surfaces the URL for downstream nodes (e.g. LLMChat that processes the URL's metadata)."
+    description: "Phase C sprint tektite-10b/10d -- editable URL card. Click URL to edit; outputs `url` as a text wire so downstream nodes (LLMChat, Sprite via fetch wrappers, etc.) consume it. Set `linkedFile` to a vault note id and the url + label sync TWO-WAY with that note's `url:` and `label:` frontmatter fields."
   },
   BaseCard: {
     category: "Tektite", color: COLOR.tektite, header: null,
