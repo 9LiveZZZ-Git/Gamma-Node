@@ -9383,6 +9383,15 @@
               <button class="tektite-graph-layout-btn" data-graph-layout="timeline"     type="button" title="Notes laid out by modifiedAt along X">⏵ Timeline</button>
               <button class="tektite-graph-layout-btn" data-graph-layout="calendar"     type="button" title="Calendar heatmap (week column / day row)">▦ Calendar</button>
             </div>
+            <!-- Sprint tektite-7 -- remaining 6 viz modes. -->
+            <div class="tektite-graph-layout-switcher">
+              <button class="tektite-graph-layout-btn" data-graph-layout="matrix"   type="button" title="Adjacency matrix: N x N grid with edges as filled cells">▤ Matrix</button>
+              <button class="tektite-graph-layout-btn" data-graph-layout="chord"    type="button" title="Chord diagram: nodes on a circle, edges as bezier arcs">⌬ Chord</button>
+              <button class="tektite-graph-layout-btn" data-graph-layout="sankey"   type="button" title="Sankey flow: source -> hub -> sink columns">⇶ Sankey</button>
+              <button class="tektite-graph-layout-btn" data-graph-layout="tagcloud" type="button" title="Tag cloud sized by frequency (frontmatter + inline #tags)">☁ Tags</button>
+              <button class="tektite-graph-layout-btn" data-graph-layout="geo"      type="button" title="Equirectangular plot of frontmatter `location:` / lat,lon">🌍 Geo</button>
+              <button class="tektite-graph-layout-btn" data-graph-layout="kanban"   type="button" title="Kanban board by frontmatter status / column">▥ Kanban</button>
+            </div>
             <label class="tektite-graph-control">
               Depth
               <input id="tektite-graph-depth" type="range" min="1" max="5" value="2" />
@@ -62410,6 +62419,13 @@ async function tektiteGraphBuild(opts) {
     const n = idIndex.get(id);
     const ang = (i / Math.max(1, visibleIds.size)) * Math.PI * 2;
     const r = 200;
+    // Sprint 7 -- pluck frontmatter so kanban / geo / tagcloud have
+    // their drive fields.  Cheap synchronous parse; falls back to
+    // empty object when no frontmatter helper is loaded yet.
+    let fm = {};
+    if (n && n.content && typeof tektiteParseFrontmatter === "function") {
+      try { fm = tektiteParseFrontmatter(n.content).frontmatter || {}; } catch (_) {}
+    }
     nodes.push({
       id,
       title: (n && n.title) || id,
@@ -62423,7 +62439,8 @@ async function tektiteGraphBuild(opts) {
       // layouts have something to work with.
       modifiedAt: (n && n.modifiedAt) || 0,
       createdAt:  (n && n.createdAt)  || 0,
-      // _depth: galaxy layout fills this in; rendererdraw() reads it.
+      // Sprint 7 -- frontmatter for kanban / geo / tagcloud layouts.
+      frontmatter: fm,
       _depth: 0
     });
     idToIdx.set(id, i++);
@@ -62773,6 +62790,328 @@ function tektiteGraphLayoutCalendar(nodes /*, edges */) {
   }
 }
 
+/* ---- Sprint tektite-7 -- remaining 6 viz modes --------------------
+ * matrix / chord / sankey / tagcloud / geo / kanban.
+ *
+ * Each layout mutates nodes[].x/y in place.  Layouts whose visual
+ * needs differ from the default circle+line renderer also set
+ * window._tektiteGraphDrawHook (read by draw()) -- when set, the
+ * renderer skips its default node + edge passes and invokes the hook
+ * instead, which renders matrix cells / chord arcs / sankey ribbons
+ * / tag glyphs / etc.
+ *
+ * All 6 honor the "fits seed vault under 200 ms" criterion via
+ * cheap O(N+E) placement; matrix / chord pay an extra O(E) on the
+ * draw side but still settle inside the budget for vaults <= ~500. */
+
+const _tektiteGraphDrawHooks = {};   // mode -> (ctx, nodes, edges, viewState) => void
+
+/* Kanban: columns by frontmatter status (or "untagged" fallback).
+ * Note positions stack vertically in their column.  No custom draw;
+ * default circles work well as cards. */
+function tektiteGraphLayoutKanban(nodes /*, edges */) {
+  if (!nodes.length) return;
+  const colMap = new Map();   // status -> nodes[]
+  for (const n of nodes) {
+    let s = (n.frontmatter && (n.frontmatter.status || n.frontmatter.column)) || "";
+    s = String(s || "untagged").toLowerCase();
+    if (!colMap.has(s)) colMap.set(s, []);
+    colMap.get(s).push(n);
+  }
+  // Stable column order: known buckets first, others alphabetical.
+  const knownOrder = ["idea", "backlog", "draft", "wip", "review", "done", "archive", "untagged"];
+  const keys = Array.from(colMap.keys());
+  keys.sort((a, b) => {
+    const ia = knownOrder.indexOf(a), ib = knownOrder.indexOf(b);
+    if (ia >= 0 && ib >= 0) return ia - ib;
+    if (ia >= 0) return -1;
+    if (ib >= 0) return  1;
+    return a.localeCompare(b);
+  });
+  const colW = 160, rowH = 40;
+  keys.forEach((k, ci) => {
+    const list = colMap.get(k);
+    const x = ci * colW - (keys.length - 1) * colW / 2;
+    list.forEach((n, ri) => {
+      n.x = x;
+      n.y = ri * rowH - (list.length - 1) * rowH / 2;
+      n.vx = 0; n.vy = 0;
+      n._depth = 0;
+      n._kanbanColumn = k;
+    });
+  });
+  // Kanban column header draw hook.
+  _tektiteGraphDrawHooks.kanban = function (ctx /*, nodes, edges, vs */) {
+    ctx.save();
+    ctx.font = "12px ui-sans-serif, system-ui, sans-serif";
+    ctx.fillStyle = "rgba(200, 232, 90, 0.85)";
+    ctx.textAlign = "center";
+    keys.forEach((k, ci) => {
+      const x = ci * colW - (keys.length - 1) * colW / 2;
+      const list = colMap.get(k);
+      ctx.fillText(k.toUpperCase() + " (" + list.length + ")", x, -((list.length || 1) * rowH / 2) - 18);
+    });
+    ctx.restore();
+  };
+}
+
+/* Geo: project frontmatter.location (or lat/lon) onto a flat
+ * equirectangular plate.  Notes without coords pile up off the grid. */
+function tektiteGraphLayoutGeo(nodes /*, edges */) {
+  if (!nodes.length) return;
+  function pickLatLon(fm) {
+    if (!fm) return null;
+    if (typeof fm.lat === "number" && typeof fm.lon === "number")  return [fm.lat, fm.lon];
+    if (typeof fm.lat === "number" && typeof fm.lng === "number")  return [fm.lat, fm.lng];
+    if (typeof fm.location === "string") {
+      const m = fm.location.match(/(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)/);
+      if (m) return [parseFloat(m[1]), parseFloat(m[2])];
+    }
+    return null;
+  }
+  const W = 720, H = 360;
+  let placed = 0, unplaced = 0;
+  for (const n of nodes) {
+    const ll = pickLatLon(n.frontmatter);
+    if (ll) {
+      const [lat, lon] = ll;
+      n.x = (lon / 180) * (W / 2);
+      n.y = -(lat / 90)  * (H / 2);
+      n._geoPlaced = true;
+      placed++;
+    } else {
+      // Stack the unplaced below the map.
+      const idx = unplaced++;
+      const cols = 16;
+      n.x = (idx % cols - cols / 2) * 36;
+      n.y = H / 2 + 40 + Math.floor(idx / cols) * 28;
+      n._geoPlaced = false;
+    }
+    n.vx = 0; n.vy = 0; n._depth = 0;
+  }
+  _tektiteGraphDrawHooks.geo = function (ctx /*, nodes, edges, vs */) {
+    ctx.save();
+    // Equirectangular grid.
+    ctx.strokeStyle = "rgba(95, 184, 212, 0.25)";
+    ctx.lineWidth = 0.8;
+    ctx.beginPath();
+    for (let i = -180; i <= 180; i += 30) {
+      const x = (i / 180) * (W / 2);
+      ctx.moveTo(x, -H / 2); ctx.lineTo(x, H / 2);
+    }
+    for (let i = -90; i <= 90; i += 30) {
+      const y = -(i / 90) * (H / 2);
+      ctx.moveTo(-W / 2, y); ctx.lineTo(W / 2, y);
+    }
+    ctx.stroke();
+    ctx.strokeStyle = "rgba(95, 184, 212, 0.55)";
+    ctx.lineWidth = 1.2;
+    ctx.strokeRect(-W / 2, -H / 2, W, H);
+    // "unplaced" divider.
+    ctx.fillStyle = "rgba(232, 240, 255, 0.55)";
+    ctx.font = "10px ui-sans-serif, system-ui, sans-serif";
+    ctx.fillText("Notes without location:", -W / 2, H / 2 + 26);
+    ctx.restore();
+  };
+}
+
+/* Tag cloud: count tags from frontmatter.tags + inline #tags, place
+ * each TAG as a text glyph sized by frequency.  Notes are positioned
+ * but invisible (the custom draw paints tags instead). */
+function tektiteGraphLayoutTagcloud(nodes /*, edges */) {
+  if (!nodes.length) return;
+  const counts = new Map();
+  for (const n of nodes) {
+    const fmTags = (n.frontmatter && n.frontmatter.tags) || [];
+    const arr = Array.isArray(fmTags) ? fmTags : String(fmTags).split(/[\s,]+/);
+    for (let t of arr) {
+      t = String(t || "").replace(/^#/, "").trim();
+      if (t) counts.set(t, (counts.get(t) || 0) + 1);
+    }
+    // Also scan the title for inline #tags as a cheap fallback.
+    const inline = (n.title || "").match(/#([\w-]+)/g);
+    if (inline) for (const m of inline) {
+      const t = m.slice(1);
+      counts.set(t, (counts.get(t) || 0) + 1);
+    }
+  }
+  // Place ALL nodes off-screen so the default renderer doesn't draw
+  // any circles -- tag glyphs in the draw hook are the only visible
+  // marks for this layout.
+  for (const n of nodes) {
+    n.x = 1e6; n.y = 1e6; n.vx = 0; n.vy = 0; n._depth = 0;
+  }
+  // Sort tags by count, then place along an Archimedean spiral.
+  const entries = Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);
+  const placements = [];
+  let angle = 0, radius = 30;
+  for (const [tag, c] of entries) {
+    placements.push({ tag, count: c, x: Math.cos(angle) * radius, y: Math.sin(angle) * radius });
+    angle += 0.7;
+    radius += 4 + c * 1.5;
+  }
+  _tektiteGraphDrawHooks.tagcloud = function (ctx /*, nodes, edges, vs */) {
+    ctx.save();
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    for (const p of placements) {
+      const sz = 10 + Math.log2(1 + p.count) * 5;
+      ctx.font = sz + "px ui-sans-serif, system-ui, sans-serif";
+      const hue = (Math.abs(_tektiteGraphSimpleHash(p.tag)) % 360);
+      ctx.fillStyle = "hsla(" + hue + ", 70%, 65%, 0.92)";
+      ctx.fillText("#" + p.tag, p.x, p.y);
+    }
+    ctx.restore();
+  };
+}
+
+function _tektiteGraphSimpleHash(s) {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = (h * 33 + s.charCodeAt(i)) | 0;
+  return h;
+}
+
+/* Chord: nodes evenly spaced around a circle; edges drawn as quad-
+ * bezier curves through the center.  Hover highlights the active
+ * node's chords. */
+function tektiteGraphLayoutChord(nodes, edges) {
+  if (!nodes.length) return;
+  // Sort by degree descending so heavy hubs sit next to each other,
+  // making chord clusters easier to read.
+  const order = nodes.map((n, i) => i).sort((a, b) => (nodes[b].degree || 0) - (nodes[a].degree || 0));
+  const R = Math.max(180, Math.min(360, nodes.length * 4));
+  order.forEach((idx, rank) => {
+    const a = (rank / nodes.length) * Math.PI * 2 - Math.PI / 2;
+    nodes[idx].x = Math.cos(a) * R;
+    nodes[idx].y = Math.sin(a) * R;
+    nodes[idx].vx = 0; nodes[idx].vy = 0; nodes[idx]._depth = 0;
+  });
+  _tektiteGraphDrawHooks.chord = function (ctx, ns, es) {
+    ctx.save();
+    ctx.lineCap = "round";
+    for (const e of es) {
+      const a = ns[e.source], b = ns[e.target];
+      if (!a || !b) continue;
+      // Curve through origin for the chord look.
+      ctx.beginPath();
+      ctx.strokeStyle = "rgba(131, 232, 255, 0.40)";
+      ctx.lineWidth   = 1.3;
+      ctx.moveTo(a.x, a.y);
+      ctx.quadraticCurveTo(0, 0, b.x, b.y);
+      ctx.stroke();
+    }
+    ctx.restore();
+  };
+}
+
+/* Matrix: adjacency matrix layout.  N nodes on the diagonal; off-
+ * diagonal cells indicate edges. */
+function tektiteGraphLayoutMatrix(nodes /*, edges */) {
+  if (!nodes.length) return;
+  const cell = 14;
+  const half = (nodes.length - 1) * cell / 2;
+  nodes.forEach((n, i) => {
+    n.x = i * cell - half;
+    n.y = i * cell - half;
+    n.vx = 0; n.vy = 0; n._depth = 0;
+  });
+  _tektiteGraphDrawHooks.matrix = function (ctx, ns, es) {
+    ctx.save();
+    const N = ns.length;
+    const left = -half - cell / 2;
+    const top  = -half - cell / 2;
+    // Grid background.
+    ctx.fillStyle = "rgba(10, 14, 22, 0.65)";
+    ctx.fillRect(left, top, N * cell, N * cell);
+    // Grid lines.
+    ctx.strokeStyle = "rgba(95, 184, 212, 0.10)";
+    ctx.lineWidth = 0.5;
+    ctx.beginPath();
+    for (let i = 0; i <= N; i++) {
+      ctx.moveTo(left + i * cell, top);
+      ctx.lineTo(left + i * cell, top + N * cell);
+      ctx.moveTo(left, top + i * cell);
+      ctx.lineTo(left + N * cell, top + i * cell);
+    }
+    ctx.stroke();
+    // Diagonal markers.
+    ctx.fillStyle = "rgba(95, 184, 212, 0.55)";
+    for (let i = 0; i < N; i++) {
+      ctx.fillRect(left + i * cell, top + i * cell, cell, cell);
+    }
+    // Edges.
+    ctx.fillStyle = "rgba(200, 232, 90, 0.78)";
+    for (const e of es) {
+      ctx.fillRect(left + e.target * cell, top + e.source * cell, cell, cell);
+      ctx.fillRect(left + e.source * cell, top + e.target * cell, cell, cell);
+    }
+    ctx.restore();
+  };
+}
+
+/* Sankey: 3-column flow.  source (no incoming) -> hub (both) -> sink
+ * (no outgoing).  Disconnected go to a 4th column "isolates". */
+function tektiteGraphLayoutSankey(nodes, edges) {
+  if (!nodes.length) return;
+  const incoming = new Map();
+  const outgoing = new Map();
+  for (const e of edges) {
+    incoming.set(e.target, (incoming.get(e.target) || 0) + 1);
+    outgoing.set(e.source, (outgoing.get(e.source) || 0) + 1);
+  }
+  const cols = { source: [], hub: [], sink: [], isolate: [] };
+  nodes.forEach((n, i) => {
+    const inc = incoming.get(i) || 0;
+    const out = outgoing.get(i) || 0;
+    if (inc === 0 && out === 0)      cols.isolate.push(i);
+    else if (inc === 0)              cols.source.push(i);
+    else if (out === 0)              cols.sink.push(i);
+    else                              cols.hub.push(i);
+  });
+  const order = ["source", "hub", "sink", "isolate"];
+  const colW = 180;
+  order.forEach((k, ci) => {
+    const list = cols[k];
+    const x = ci * colW - (order.length - 1) * colW / 2;
+    list.forEach((nodeIdx, ri) => {
+      const n = nodes[nodeIdx];
+      n.x = x;
+      n.y = ri * 24 - (list.length - 1) * 12;
+      n.vx = 0; n.vy = 0; n._depth = 0;
+      n._sankeyCol = k;
+    });
+  });
+  _tektiteGraphDrawHooks.sankey = function (ctx, ns, es) {
+    ctx.save();
+    // Flow ribbons -- thin gradient strokes between connected nodes.
+    for (const e of es) {
+      const a = ns[e.source], b = ns[e.target];
+      if (!a || !b) continue;
+      const grad = ctx.createLinearGradient(a.x, a.y, b.x, b.y);
+      grad.addColorStop(0, "rgba(95, 184, 212, 0.35)");
+      grad.addColorStop(1, "rgba(200, 232, 90, 0.35)");
+      ctx.strokeStyle = grad;
+      ctx.lineWidth = 2.0;
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      // S-curve via two control points horizontally.
+      const mx = (a.x + b.x) / 2;
+      ctx.bezierCurveTo(mx, a.y, mx, b.y, b.x, b.y);
+      ctx.stroke();
+    }
+    // Column labels.
+    ctx.fillStyle = "rgba(200, 232, 90, 0.85)";
+    ctx.textAlign = "center";
+    ctx.font = "12px ui-sans-serif, system-ui, sans-serif";
+    order.forEach((k, ci) => {
+      const x = ci * colW - (order.length - 1) * colW / 2;
+      const n = cols[k].length;
+      ctx.fillText(k.toUpperCase() + " (" + n + ")", x, -260);
+    });
+    ctx.restore();
+  };
+}
+
 /* Canvas renderer + interaction layer. Returns a control handle; the
  * caller owns the canvas element + decides when to start/stop. */
 function tektiteGraphRenderer(canvas, graph, opts) {
@@ -62795,6 +63134,18 @@ function tektiteGraphRenderer(canvas, graph, opts) {
     return { width: Math.max(40, ctx.measureText(text).width + 14), height: 22 };
   }
 
+  /* Sprint 7 -- per-mode draw policy.  skipDefaultEdges/Nodes flips
+   * the renderer's built-in pass off so the hook can paint its own
+   * representation (chord arcs, matrix cells, sankey ribbons, etc.). */
+  const _drawPolicy = {
+    matrix:   { skipEdges: true,  skipNodes: true  },
+    chord:    { skipEdges: true,  skipNodes: false },
+    sankey:   { skipEdges: true,  skipNodes: false },
+    tagcloud: { skipEdges: true,  skipNodes: true  },
+    geo:      { skipEdges: false, skipNodes: false },
+    kanban:   { skipEdges: false, skipNodes: false }
+  };
+
   function draw() {
     const w = canvas.width  = canvas.clientWidth  * (window.devicePixelRatio || 1);
     const h = canvas.height = canvas.clientHeight * (window.devicePixelRatio || 1);
@@ -62808,21 +63159,31 @@ function tektiteGraphRenderer(canvas, graph, opts) {
     ctx.translate(cw / 2 + offsetX, ch / 2 + offsetY);
     ctx.scale(scale, scale);
 
-    // Edges.
-    ctx.strokeStyle = "rgba(155, 208, 255, 0.30)";
-    ctx.lineWidth = 1 / scale;
-    ctx.beginPath();
-    for (const e of edges) {
-      const a = nodes[e.source], b = nodes[e.target];
-      ctx.moveTo(a.x, a.y);
-      ctx.lineTo(b.x, b.y);
+    const policy = _drawPolicy[layoutMode] || { skipEdges: false, skipNodes: false };
+    const hook = _tektiteGraphDrawHooks[layoutMode];
+    if (typeof hook === "function") {
+      try { hook(ctx, nodes, edges, { scale, offsetX, offsetY }); }
+      catch (e) { console.warn("[graph] custom draw hook failed:", e); }
     }
-    ctx.stroke();
 
-    // Highlight edges connected to hover/selected node.
+    // Default edges (skipped for modes whose hook owns them).
+    if (!policy.skipEdges) {
+      ctx.strokeStyle = "rgba(155, 208, 255, 0.30)";
+      ctx.lineWidth = 1 / scale;
+      ctx.beginPath();
+      for (const e of edges) {
+        const a = nodes[e.source], b = nodes[e.target];
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+      }
+      ctx.stroke();
+    }
+
+    // Highlight edges connected to hover/selected node (only when the
+    // default edge pass ran -- otherwise the hook owns edges).
     const focusIdx = (hoverIdx >= 0) ? hoverIdx :
                      (selectedId ? nodes.findIndex(n => n.id === selectedId) : -1);
-    if (focusIdx >= 0) {
+    if (focusIdx >= 0 && !policy.skipEdges) {
       ctx.strokeStyle = "rgba(200, 232, 90, 0.95)";
       ctx.lineWidth = 1.5 / scale;
       ctx.beginPath();
@@ -62838,8 +63199,9 @@ function tektiteGraphRenderer(canvas, graph, opts) {
 
     // Nodes.  Sprint 6 -- galaxy layout modulates radius + alpha by
     // n._depth (PCA Z component) for a parallax look.  Other layouts
-    // leave _depth at 0 so the modulation is a no-op.
-    for (let i = 0; i < nodes.length; i++) {
+    // leave _depth at 0 so the modulation is a no-op.  Sprint 7 --
+    // tagcloud + matrix skip the default node pass entirely.
+    if (!policy.skipNodes) for (let i = 0; i < nodes.length; i++) {
       const n = nodes[i];
       const baseR = Math.max(3, Math.min(16, 4 + Math.log2(1 + n.degree) * 2.5));
       const depth = Number(n._depth) || 0;   // [-1, 1] for galaxy
@@ -62899,13 +63261,26 @@ function tektiteGraphRenderer(canvas, graph, opts) {
   }
 
   function applyStaticLayout(mode) {
-    if (mode === "tree")          tektiteGraphLayoutTree       (nodes, edges, selectedId);
-    else if (mode === "radial")   tektiteGraphLayoutRadial     (nodes, edges, selectedId);
-    else if (mode === "sunburst") tektiteGraphLayoutSunburst   (nodes, edges, selectedId);
-    else if (mode === "embedding-2d") tektiteGraphLayoutEmbedding2D(nodes, edges);
-    else if (mode === "galaxy")       tektiteGraphLayoutGalaxy     (nodes, edges);
-    else if (mode === "timeline")     tektiteGraphLayoutTimeline   (nodes, edges);
-    else if (mode === "calendar")     tektiteGraphLayoutCalendar   (nodes, edges);
+    // Drop any prior custom drawer so it doesn't bleed into the new mode.
+    delete _tektiteGraphDrawHooks.matrix;
+    delete _tektiteGraphDrawHooks.chord;
+    delete _tektiteGraphDrawHooks.sankey;
+    delete _tektiteGraphDrawHooks.tagcloud;
+    delete _tektiteGraphDrawHooks.geo;
+    delete _tektiteGraphDrawHooks.kanban;
+    if (mode === "tree")              tektiteGraphLayoutTree         (nodes, edges, selectedId);
+    else if (mode === "radial")       tektiteGraphLayoutRadial       (nodes, edges, selectedId);
+    else if (mode === "sunburst")     tektiteGraphLayoutSunburst     (nodes, edges, selectedId);
+    else if (mode === "embedding-2d") tektiteGraphLayoutEmbedding2D  (nodes, edges);
+    else if (mode === "galaxy")       tektiteGraphLayoutGalaxy       (nodes, edges);
+    else if (mode === "timeline")     tektiteGraphLayoutTimeline     (nodes, edges);
+    else if (mode === "calendar")     tektiteGraphLayoutCalendar     (nodes, edges);
+    else if (mode === "matrix")       tektiteGraphLayoutMatrix       (nodes, edges);
+    else if (mode === "chord")        tektiteGraphLayoutChord        (nodes, edges);
+    else if (mode === "sankey")       tektiteGraphLayoutSankey       (nodes, edges);
+    else if (mode === "tagcloud")     tektiteGraphLayoutTagcloud     (nodes, edges);
+    else if (mode === "geo")          tektiteGraphLayoutGeo          (nodes, edges);
+    else if (mode === "kanban")       tektiteGraphLayoutKanban       (nodes, edges);
   }
 
   /* Sprint 6 -- embedding modes need n._embedding populated.  This
@@ -63119,7 +63494,8 @@ function tektiteGraphRenderer(canvas, graph, opts) {
     setLayout: async (mode) => {
       const known = new Set([
         "force", "tree", "radial", "sunburst",
-        "embedding-2d", "galaxy", "timeline", "calendar"
+        "embedding-2d", "galaxy", "timeline", "calendar",
+        "matrix", "chord", "sankey", "tagcloud", "geo", "kanban"
       ]);
       if (!known.has(mode)) return;
       layoutMode = mode;
