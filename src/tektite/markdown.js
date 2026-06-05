@@ -37,18 +37,22 @@ let _tektiteCmModules = null;  // resolved import bundle (or null on failure)
 async function _tektiteLoadCodeMirror() {
   if (_tektiteCmModules) return _tektiteCmModules;
   try {
-    // Sprint tektite-5a1 -- pin versions so esm.sh resolves the same
-    // build every time. The "Cannot read properties of undefined
-    // (reading 'extension')" crash users hit on 2026-06-05 was caused
-    // by codemirror@6 (the unpinned `@latest`) sometimes not
-    // re-exporting basicSetup, leaving an undefined slot in the
-    // extensions array.
+    // Sprint tektite-5c2a -- explicit dep-pinning via esm.sh's ?deps=
+    // query. Without it, each @codemirror/* package pulls its own
+    // copy of @codemirror/state (peer-dep-resolved at request time),
+    // and the instanceof checks across packages fail
+    // ("Unrecognized extension value... multiple instances of
+    // @codemirror/state are loaded"). With ?deps= esm.sh routes every
+    // dependent through the SAME pinned state + view instance.
+    const STATE_PIN = "@codemirror/state@6.4.1";
+    const VIEW_PIN  = "@codemirror/view@6.34.1";
+    const SHARED    = "?deps=" + STATE_PIN + "," + VIEW_PIN;
     const [cm, lang, viewMod, stateMod, langData] = await Promise.all([
-      import("https://esm.sh/codemirror@6.0.2"),
-      import("https://esm.sh/@codemirror/lang-markdown@6.3.1"),
-      import("https://esm.sh/@codemirror/view@6.34.1"),
-      import("https://esm.sh/@codemirror/state@6.4.1"),
-      import("https://esm.sh/@codemirror/language-data@6.5.1").catch(() => null)
+      import("https://esm.sh/codemirror@6.0.2" + SHARED),
+      import("https://esm.sh/@codemirror/lang-markdown@6.3.1" + SHARED),
+      import("https://esm.sh/" + VIEW_PIN + "?deps=" + STATE_PIN),
+      import("https://esm.sh/" + STATE_PIN),
+      import("https://esm.sh/@codemirror/language-data@6.5.1" + SHARED).catch(() => null)
     ]);
     _tektiteCmModules = {
       EditorView:   cm.EditorView   || viewMod.EditorView,
