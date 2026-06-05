@@ -49,14 +49,24 @@ toolBtns.forEach(b => {
  * reasonable footprint for the bulk of the registry. Sloppy bbox is
  * fine -- the fit clamps zoom to [0.2, 4] so an undersized estimate
  * just leans toward over-margin rather than clipping. */
-function _gnFitCanvasToView() {
+function _gnFitCanvasToView(opts) {
   if (typeof state === "undefined" || !state || !Array.isArray(state.nodes)) return;
   const c = document.getElementById("canvas");
   if (!c) return;
   const rect = c.getBoundingClientRect();
-  const subset = (typeof selectedSet !== "undefined" && selectedSet && selectedSet.size > 0)
-    ? state.nodes.filter(n => selectedSet.has(n.id))
-    : state.nodes;
+  // Sprint 10f -- optional opts.onlyKind filter so Tektite Canvas
+  // Mode can fit just to Tektite cards instead of the whole graph.
+  // Matches a kind prefix (e.g. "tektite-card" matches tektite-card-text,
+  // tektite-card-graph, etc.).
+  const onlyKindPrefix = opts && typeof opts.onlyKind === "string" ? opts.onlyKind : null;
+  const subset = onlyKindPrefix
+    ? state.nodes.filter(n => {
+        const def = (typeof TYPES === "object" && n) ? TYPES[n.type] : null;
+        return def && typeof def.kind === "string" && def.kind.indexOf(onlyKindPrefix) === 0;
+      })
+    : ((typeof selectedSet !== "undefined" && selectedSet && selectedSet.size > 0)
+        ? state.nodes.filter(n => selectedSet.has(n.id))
+        : state.nodes);
   if (!subset.length) {
     view.panX = 0; view.panY = 0; view.zoom = 1;
     if (typeof render === "function") render();
