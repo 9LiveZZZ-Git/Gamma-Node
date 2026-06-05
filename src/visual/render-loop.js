@@ -136,6 +136,12 @@ function renderVisualFrame() {
   // an offscreen canvas, uploads to a GPUTexture each frame. No-op
   // when no TektiteGraph nodes are in the patch.
   if (typeof tickTektiteGraphTextures === "function") tickTektiteGraphTextures(dtSec);
+  // Phase C sprint tektite-10b+ -- Tektite card kinds (TextCard /
+  // NoteCard / LinkCard / BaseCard) get their content rendered into
+  // an inline body element on the main canvas, similar to the LLM
+  // streaming bodies. Cheap per-frame walk; no-op when no card nodes
+  // are in the patch.
+  if (typeof _tickTektiteCards === "function") _tickTektiteCards(dtSec);
   // §5.5.g -- HUD overlays. Minimap is the first; future Compass /
   // HealthBar / Inventory will plug in here as separate functions.
   // Each renders only when its driving node exists in the patch.
