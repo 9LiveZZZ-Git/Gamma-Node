@@ -367,8 +367,12 @@ function render() {
   filenameEl.textContent = state.filename;
   deleteBtn.disabled = selectedSet.size === 0;
   // Phase 8.A.3.2 -- enable Save Prefab only with a selection.
+  // (btn-save-prefab moved to Prefabs tab in sprint 10d-fix; both
+  // toolbar + tab buttons get disabled in sync if either exists.)
   const _btnPfs = document.getElementById("btn-save-prefab");
   if (_btnPfs) _btnPfs.disabled = selectedSet.size === 0;
+  const _brPfs = document.getElementById("br-prefab-save-sel");
+  if (_brPfs) _brPfs.disabled = selectedSet.size === 0;
   renderProps();
   renderCode();
   renderJson();

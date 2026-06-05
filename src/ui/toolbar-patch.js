@@ -487,7 +487,15 @@ function _dropPrefabFromAsset(assetId) {
   if (typeof renderProps === "function") renderProps();
 }
 
-document.getElementById("btn-save-prefab").addEventListener("click", _openPrefabSaveModal);
+// btn-save-prefab + btn-drop-prefab were moved to the Prefabs browser
+// tab (sprint 10d-fix house-keeping); their handlers stay reachable
+// via br-prefab-save-sel (palette.js) + card-click drop in the tab.
+{
+  const _saveBtn = document.getElementById("btn-save-prefab");
+  if (_saveBtn) _saveBtn.addEventListener("click", _openPrefabSaveModal);
+  const _dropBtn = document.getElementById("btn-drop-prefab");
+  if (_dropBtn) _dropBtn.addEventListener("click", _openPrefabPickModal);
+}
 document.getElementById("pfs-close").addEventListener("click", _closePrefabSaveModal);
 document.getElementById("pfs-cancel").addEventListener("click", _closePrefabSaveModal);
 document.getElementById("pfs-save").addEventListener("click", _commitPrefabSave);
@@ -495,7 +503,6 @@ document.getElementById("pfs-save-idb").addEventListener("click", _commitPrefabS
 document.getElementById("prefab-save-modal").addEventListener("click", (e) => {
   if (e.target.id === "prefab-save-modal") _closePrefabSaveModal();
 });
-document.getElementById("btn-drop-prefab").addEventListener("click", _openPrefabPickModal);
 document.getElementById("pfp-close").addEventListener("click", _closePrefabPickModal);
 document.getElementById("pfp-cancel").addEventListener("click", _closePrefabPickModal);
 document.getElementById("prefab-pick-modal").addEventListener("click", (e) => {

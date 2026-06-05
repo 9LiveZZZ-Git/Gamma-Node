@@ -139,6 +139,24 @@ function _tektiteCardEnsureBody(node, st) {
 function _tektiteCardWireBody(node, body) {
   const renderEl = body.querySelector(".tektite-card-render");
   const editEl   = body.querySelector(".tektite-card-edit");
+
+  // Sprint 10d-fix: stop pointerdown on the body from reaching the
+  // canvas. Canvas pointerdown selects + drag-arms the node, then
+  // calls render() which destroys the body DOM mid-gesture, so the
+  // subsequent click event never fires (its pointerdown target is
+  // gone). Catching it on the body lets click reach our listener.
+  // Exceptions: the linkbar (its buttons handle their own events)
+  // and anchor links inside rendered markdown.
+  body.addEventListener("pointerdown", (e) => {
+    if (e.target && e.target.closest(".tektite-card-linkbar")) return;
+    if (e.target && e.target.closest("a")) return;
+    if (e.target && e.target.closest(".tektite-card-grip")) return;
+    e.stopPropagation();
+    // Manually select the node so other selection-aware UI still
+    // updates (props pane, etc.). selectOne does NOT re-render.
+    if (typeof selectOne === "function") selectOne(node.id);
+  });
+
   // Edit mode is keyed on the body element; we look up the state map
   // by node id at call time to avoid stale closure references after
   // re-renders.
@@ -153,8 +171,11 @@ function _tektiteCardWireBody(node, body) {
     body.classList.add("editing");
     renderEl.style.display = "none";
     editEl.style.display = "block";
-    // Auto-focus + select-none so cursor lands at end.
-    setTimeout(() => { editEl.focus(); }, 0);
+    // Auto-focus + caret-to-end so the user can immediately type.
+    setTimeout(() => {
+      editEl.focus();
+      try { editEl.setSelectionRange(editEl.value.length, editEl.value.length); } catch (_) {}
+    }, 0);
     if (e) e.stopPropagation();
   }
   renderEl.addEventListener("dblclick", enterEdit);
@@ -182,7 +203,11 @@ function _tektiteCardWireBody(node, body) {
     // Force re-render of the rendered view.
     st.lastHash = "";
   });
+  // Stop ALL keydown from bubbling to window/document while the user
+  // is typing -- the global handlers all guard on isTextInput, but
+  // belt-and-suspenders so any future global hotkey can't fire.
   editEl.addEventListener("keydown", (e) => {
+    e.stopPropagation();
     if (e.key === "Escape") {
       // Revert: refill from source, drop edit mode.
       const st = _tektiteCardGetState(node);
@@ -297,16 +322,25 @@ function _tektiteCardWireGrip(node, grip, body) {
 }
 
 /* Vault link bar -- shown at the top of every editable card. Renders
- * the current link state + a prompt-driven picker (10d minimum; a
- * proper dropdown picker can replace prompt() in a future sprint). */
+ * the current link state + a dropdown picker for vault notes.
+ *
+ * Sprint 10d-fix: idempotent rebuild. Was rewriting innerHTML every
+ * frame which destroyed the button handlers (so clicks did nothing).
+ * Hash check guards the rebuild + re-wire. */
 function _renderLinkBar(node, st) {
   if (!st.linkBar) return;
   const linkedFile = _tektiteCardLinkedFile(node);
   const editable = _tektiteCardEditable(node);
   if (!editable) {
-    st.linkBar.style.display = "none";
+    if (st.linkBarHash !== "hide") {
+      st.linkBarHash = "hide";
+      st.linkBar.style.display = "none";
+    }
     return;
   }
+  const linkBarHash = "show:" + (linkedFile || "");
+  if (st.linkBarHash === linkBarHash) return;
+  st.linkBarHash = linkBarHash;
   st.linkBar.style.display = "";
   if (linkedFile) {
     st.linkBar.innerHTML =
@@ -320,66 +354,171 @@ function _renderLinkBar(node, st) {
         '🔗 Link to vault…' +
       '</button>';
   }
-  // Wire button handlers (idempotent reset via cloneNode trick).
+  // Wire button handlers fresh after rebuild.
   st.linkBar.querySelectorAll("button[data-act]").forEach(btn => {
     btn.addEventListener("pointerdown", (e) => e.stopPropagation());
-    btn.addEventListener("click", async (e) => {
+    btn.addEventListener("click", (e) => {
       e.stopPropagation();
       const act = btn.getAttribute("data-act");
       if (act === "link" || act === "rename") {
-        const cur = _tektiteCardLinkedFile(node);
-        const target = window.prompt("Vault note id or title to link this card to:", cur);
-        if (target == null) return;
-        const trimmed = target.trim();
-        if (!trimmed) return;
-        // Resolve target so we can store the canonical id.
-        let note = await tektiteGetNote(trimmed);
-        if (!note) {
-          const all = await tektiteListNotes();
-          note = all.find(n => (n.title || "").toLowerCase() === trimmed.toLowerCase());
-        }
-        if (!note) {
-          if (window.confirm("No note matched. Create a new vault note \"" + trimmed + "\"?")) {
-            const id = await tektiteNextAvailableSlug(trimmed);
+        _openVaultPicker(btn, _tektiteCardLinkedFile(node), async (pick) => {
+          if (pick.id) {
+            _tektiteCardSetLinkedFile(node, pick.id);
+          } else if (pick.create) {
+            const id = await tektiteNextAvailableSlug(pick.create);
             const content = (node.type === "LinkCard")
-              ? '---\nurl: "' + (node.params.url || "") + '"\n---\n# ' + trimmed + '\n'
-              : '# ' + trimmed + '\n\n' + (node.params.text || "");
-            await tektitePutNote({ id, title: trimmed, content });
+              ? '---\nurl: "' + (node.params.url || "") + '"\n---\n# ' + pick.create + '\n'
+              : '# ' + pick.create + '\n\n' + (node.params.text || "");
+            await tektitePutNote({ id, title: pick.create, content });
             _tektiteCardSetLinkedFile(node, id);
-            st.lastResolveKey = "";  // force re-resolve
-            st.lastHash = "";
+          } else {
+            return;
           }
-        } else {
-          _tektiteCardSetLinkedFile(node, note.id);
-          st.lastResolveKey = "";
-          st.lastHash = "";
-        }
+          st.lastResolveKey = "";   // force re-resolve
+          st.lastHash       = "";
+          st.linkBarHash    = "";   // force link-bar rebuild with new state
+        });
       } else if (act === "unlink") {
         if (!window.confirm("Unlink this card from " + _tektiteCardLinkedFile(node) +
             "? The card keeps its current content; future edits stop syncing.")) return;
         _tektiteCardSetLinkedFile(node, "");
-        st.lastHash = "";
+        st.lastHash    = "";
+        st.linkBarHash = "";
       }
     });
   });
 }
 
+/* Vault dropdown picker (sprint 10d-fix). Singleton popover anchored
+ * to a trigger button. Lists vault notes with type-ahead filter and
+ * a "Create note" affordance if the typed text doesn't match. */
+let _tektitePickerEl = null;
+let _tektitePickerCleanup = null;
+
+function _ensureVaultPicker() {
+  if (_tektitePickerEl) return _tektitePickerEl;
+  const el = document.createElement("div");
+  el.className = "tektite-vault-picker";
+  el.style.display = "none";
+  el.innerHTML =
+    '<input type="text" class="tvp-search" placeholder="Filter or create new…" spellcheck="false" autocomplete="off">' +
+    '<div class="tvp-list"></div>';
+  document.body.appendChild(el);
+  _tektitePickerEl = el;
+  return el;
+}
+
+async function _openVaultPicker(anchorBtn, initial, onPick) {
+  // Close any open picker first.
+  if (typeof _tektitePickerCleanup === "function") _tektitePickerCleanup();
+  const el = _ensureVaultPicker();
+  const searchEl = el.querySelector(".tvp-search");
+  const listEl   = el.querySelector(".tvp-list");
+
+  let notes = [];
+  try { notes = await tektiteListNotes(); } catch (_) { notes = []; }
+
+  // Anchor below the trigger button, clamped to the viewport.
+  const rect = anchorBtn.getBoundingClientRect();
+  el.style.display = "block";
+  const pickerW = 280;
+  let left = rect.left;
+  if (left + pickerW > window.innerWidth - 8) left = window.innerWidth - pickerW - 8;
+  el.style.left = Math.max(8, left) + "px";
+  el.style.top  = Math.min(rect.bottom + 4, window.innerHeight - 240) + "px";
+
+  searchEl.value = initial || "";
+
+  function renderList() {
+    const q = (searchEl.value || "").toLowerCase().trim();
+    const matches = notes.filter(n => {
+      if (!q) return true;
+      return (n.id    || "").toLowerCase().includes(q) ||
+             (n.title || "").toLowerCase().includes(q);
+    });
+    let html = matches.slice(0, 80).map(n =>
+      '<div class="tvp-row" data-id="' + _tektiteCardEsc(n.id) + '">' +
+        '<div class="tvp-title">' + _tektiteCardEsc(n.title || n.id) + '</div>' +
+        '<div class="tvp-id">' + _tektiteCardEsc(n.id) + '</div>' +
+      '</div>'
+    ).join("");
+    const exactMatch = !!matches.find(n =>
+      (n.id || "").toLowerCase() === q || (n.title || "").toLowerCase() === q
+    );
+    if (q && !exactMatch) {
+      html += '<div class="tvp-row tvp-create" data-create="' + _tektiteCardEsc(searchEl.value.trim()) + '">' +
+        '<div class="tvp-title">+ Create note &quot;' + _tektiteCardEsc(searchEl.value.trim()) + '&quot;</div>' +
+        '</div>';
+    }
+    if (!matches.length && !q) {
+      html = '<div class="tvp-empty">(vault is empty — type a name and Enter to create)</div>';
+    }
+    listEl.innerHTML = html;
+  }
+
+  renderList();
+  setTimeout(() => { searchEl.focus(); searchEl.select(); }, 0);
+
+  function close() {
+    el.style.display = "none";
+    document.removeEventListener("pointerdown", outsideHandler, true);
+    searchEl.removeEventListener("input",   renderList);
+    searchEl.removeEventListener("keydown", keyHandler);
+    listEl  .removeEventListener("click",   clickHandler);
+    _tektitePickerCleanup = null;
+  }
+  _tektitePickerCleanup = close;
+
+  function outsideHandler(e) {
+    if (!el.contains(e.target)) close();
+  }
+  function keyHandler(e) {
+    e.stopPropagation();
+    if (e.key === "Escape") { close(); return; }
+    if (e.key === "Enter") {
+      const first = listEl.querySelector(".tvp-row");
+      if (first) first.click();
+    }
+  }
+  function clickHandler(e) {
+    const row = e.target.closest(".tvp-row");
+    if (!row) return;
+    if (row.dataset.create) {
+      const v = row.getAttribute("data-create") || "";
+      close();
+      onPick({ create: v });
+    } else if (row.dataset.id) {
+      close();
+      onPick({ id: row.dataset.id });
+    }
+  }
+
+  searchEl.addEventListener("input",   renderList);
+  searchEl.addEventListener("keydown", keyHandler);
+  listEl  .addEventListener("click",   clickHandler);
+  // Defer outside-click capture so the click that opened us doesn't
+  // also close us.
+  setTimeout(() => document.addEventListener("pointerdown", outsideHandler, true), 0);
+}
+
 /* ----- Per-kind render passes -------------------------------------- */
 
 async function _renderTextCardBody(node, st) {
+  // Sprint 10d-fix: bail completely while editing. The textarea is
+  // user-owned; touching its .value resets the caret to 0 and makes
+  // typing feel broken.
+  if (st.editing) return;
   const linkedFile = _tektiteCardLinkedFile(node);
   // For a linked card, ensure params.text mirrors the vault note's
   // content + re-poll modifiedAt to catch external edits.
-  if (linkedFile && !st.editing) {
+  if (linkedFile) {
     await _tektiteCardPollLinked(node, st);
   }
   const text = String((node.params && node.params.text) || "");
-  const hash = "T:" + (linkedFile || "") + ":" + text + ":" + (st.editing ? "E" : "R");
+  const hash = "T:" + (linkedFile || "") + ":" + text + ":R";
   if (hash === st.lastHash) return;
   st.lastHash = hash;
-  if (st.editing) {
-    if (st.editEl) st.editEl.value = text;
-  } else if (st.renderEl) {
+  if (st.renderEl) {
     if (!text) {
       st.renderEl.innerHTML = '<div class="tektite-card-empty">(empty — click to edit)</div>';
     } else if (typeof tektiteMarkdownRenderInto === "function") {
@@ -392,18 +531,17 @@ async function _renderTextCardBody(node, st) {
 }
 
 async function _renderLinkCardBody(node, st) {
+  if (st.editing) return;   // user owns the textarea
   const linkedFile = _tektiteCardLinkedFile(node);
-  if (linkedFile && !st.editing) {
+  if (linkedFile) {
     await _tektiteCardPollLinkedLink(node, st);
   }
   const url   = String((node.params && node.params.url)   || "");
   const label = String((node.params && node.params.label) || "");
-  const hash = "L:" + (linkedFile || "") + ":" + url + ":" + label + ":" + (st.editing ? "E" : "R");
+  const hash = "L:" + (linkedFile || "") + ":" + url + ":" + label + ":R";
   if (hash === st.lastHash) return;
   st.lastHash = hash;
-  if (st.editing) {
-    if (st.editEl) st.editEl.value = url;
-  } else if (st.renderEl) {
+  if (st.renderEl) {
     if (!url) {
       st.renderEl.innerHTML = '<div class="tektite-card-empty">(no url — click to edit)</div>';
     } else {
@@ -468,16 +606,15 @@ async function _renderNoteCardBody(node, st) {
     }
     return;
   }
+  if (st.editing) return;   // user owns the textarea
   // Polling for external changes.
-  if (!st.editing) await _tektiteCardPollLinked(node, st);
+  await _tektiteCardPollLinked(node, st);
   const body  = (node.params && node.params.text)  || "";
   const title = (node.params && node.params.title) || fileKey;
-  const hash = "N:" + fileKey + ":" + body.length + ":" + title + ":" + (st.editing ? "E" : "R");
+  const hash = "N:" + fileKey + ":" + body.length + ":" + title + ":R";
   if (hash === st.lastHash) return;
   st.lastHash = hash;
-  if (st.editing) {
-    if (st.editEl) st.editEl.value = body;
-  } else if (st.renderEl) {
+  if (st.renderEl) {
     st.renderEl.innerHTML =
       '<div class="tektite-card-note-title">📄 ' + _tektiteCardEsc(title) + '</div>' +
       '<div class="tektite-card-note-body"></div>';
