@@ -89,10 +89,73 @@ function _tektiteCardEditable(node) {
   return t === "TextCard" || t === "NoteCard" || t === "LinkCard";
 }
 
+/* Sprint 10g -- ensure a minimize button + display title live in the
+ * node head.  The head is rebuilt on every render() call, so this
+ * runs each tick (idempotent: only mutates the head if the button is
+ * missing).  Clicking the button toggles node._minimized + the CSS
+ * class; subsequent ticks honor the flag.  Also overwrites the head's
+ * .name span with the linked-vault title when a card is linked. */
+function _tektiteCardEnsureHeadChrome(node, nodeEl, st) {
+  const head = nodeEl.querySelector(".node-head");
+  if (!head) return;
+  // Resolve display title -- vault note title if linked, fallback to
+  // node type.  Asynchronously fetched + cached on st.linkedTitle.
+  const linkedFile = _tektiteCardLinkedFile(node);
+  if (linkedFile && st.lastTitleFile !== linkedFile && !st.resolvingTitle) {
+    st.resolvingTitle = true;
+    (async () => {
+      try {
+        const note = await tektiteGetNote(linkedFile);
+        st.linkedTitle  = note ? (note.title || note.id) : "";
+        st.lastTitleFile = linkedFile;
+      } catch (_) {
+        st.linkedTitle  = "";
+        st.lastTitleFile = linkedFile;
+      } finally {
+        st.resolvingTitle = false;
+      }
+    })();
+  } else if (!linkedFile && st.lastTitleFile) {
+    st.linkedTitle  = "";
+    st.lastTitleFile = "";
+  }
+  const displayName = st.linkedTitle || node.type;
+  const nameEl = head.querySelector(".name");
+  if (nameEl && nameEl.textContent !== displayName) nameEl.textContent = displayName;
+
+  // Minimize/expand button -- inserted once per head; clicking toggles
+  // node._minimized.  pointerdown stopPropagation so the node doesn't
+  // start a drag when the user reaches for the button.
+  let minBtn = head.querySelector(".tektite-card-minimize");
+  if (!minBtn) {
+    minBtn = document.createElement("button");
+    minBtn.type = "button";
+    minBtn.className = "tektite-card-minimize";
+    minBtn.title = "Minimize card";
+    minBtn.textContent = node._minimized ? "▢" : "—";
+    minBtn.addEventListener("pointerdown", (e) => e.stopPropagation());
+    minBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      node._minimized = !node._minimized;
+      const ne = document.querySelector('.node[data-id="' + node.id + '"]');
+      if (ne) ne.classList.toggle("minimized", !!node._minimized);
+      minBtn.textContent = node._minimized ? "▢" : "—";
+      minBtn.title = node._minimized ? "Restore card" : "Minimize card";
+    });
+    head.appendChild(minBtn);
+  } else {
+    minBtn.textContent = node._minimized ? "▢" : "—";
+  }
+  // Sync the class state on the node element each frame (render()
+  // rebuilds .node without our class).
+  nodeEl.classList.toggle("minimized", !!node._minimized);
+}
+
 function _tektiteCardEnsureBody(node, st) {
   const nodeEl = document.querySelector('.node[data-id="' + node.id + '"]');
   if (!nodeEl) return null;
   nodeEl.classList.add("tektite-card-node");
+  _tektiteCardEnsureHeadChrome(node, nodeEl, st);
 
   // Sprint 10e-fix: detect a stale body. The main canvas's render()
   // tears down + rebuilds the node DOM on any drag / undo / select,
@@ -111,14 +174,19 @@ function _tektiteCardEnsureBody(node, st) {
     nodeEl.appendChild(body);
     _tektiteCardWireBody(node, body);
   }
-  // Sizing from params.
+  // Sizing from params.  Sprint 10g -- use explicit width/height
+  // instead of min-width/min-height so the resize grip can SHRINK
+  // the card, not just grow it.  Content overflows via the render
+  // layer's internal scroll (flex: 1 1 auto).
   if (node.params) {
     if (Number.isFinite(node.params.width)) {
-      body.style.minWidth = node.params.width + "px";
+      body.style.width    = node.params.width + "px";
+      body.style.minWidth = "";
       body.style.maxWidth = "none";
     }
     if (Number.isFinite(node.params.height)) {
-      body.style.minHeight = node.params.height + "px";
+      body.style.height    = node.params.height + "px";
+      body.style.minHeight = "";
       body.style.maxHeight = "none";
     }
   }
@@ -338,8 +406,12 @@ function _tektiteCardWireGrip(node, grip, body) {
     node.params = node.params || {};
     node.params.width  = Math.max(120, Math.round(startW + dx));
     node.params.height = Math.max(60,  Math.round(startH + dy));
-    body.style.minWidth  = node.params.width  + "px";
-    body.style.minHeight = node.params.height + "px";
+    // Sprint 10g -- explicit width/height so the body can shrink as
+    // well as grow.  Min-width on the body was clamping us up only.
+    body.style.width    = node.params.width  + "px";
+    body.style.height   = node.params.height + "px";
+    body.style.minWidth  = "";
+    body.style.minHeight = "";
   });
   grip.addEventListener("pointerup", (e) => {
     dragging = false;
