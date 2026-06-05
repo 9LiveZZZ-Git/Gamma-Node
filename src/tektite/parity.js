@@ -356,3 +356,42 @@ function _tektiteWireJsonCanvasIO() {
     _tektiteWireJsonCanvasIO();
   }
 })();
+
+/* Sprint 10p -- Tektite toolbar dropdown menus (Views, .canvas I/O).
+ * Idempotent: triggers get marked _tkMenuWired on first attach so a
+ * later tab re-render doesn't pile up handlers.  Outside-click closes
+ * any open menu. */
+function _tektiteWireMenus() {
+  document.querySelectorAll(".tektite-toolbar .tk-menu").forEach(menu => {
+    const trigger = menu.querySelector(".tk-menu-trigger");
+    if (!trigger || trigger._tkMenuWired) return;
+    trigger._tkMenuWired = true;
+    trigger.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const wasOpen = menu.classList.contains("open");
+      // Close any other open menus first.
+      document.querySelectorAll(".tektite-toolbar .tk-menu.open").forEach(m =>
+        m.classList.remove("open"));
+      if (!wasOpen) menu.classList.add("open");
+    });
+    // Clicking an action inside the pop should close the menu.
+    menu.querySelectorAll(".tk-menu-pop .btn").forEach(btn => {
+      btn.addEventListener("click", () => menu.classList.remove("open"));
+    });
+  });
+}
+
+document.addEventListener("pointerdown", (e) => {
+  // Outside click -> close every open menu.
+  document.querySelectorAll(".tektite-toolbar .tk-menu.open").forEach(m => {
+    if (!m.contains(e.target)) m.classList.remove("open");
+  });
+}, true);
+
+(function _autoWireMenus() {
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", _tektiteWireMenus);
+  } else {
+    _tektiteWireMenus();
+  }
+})();
