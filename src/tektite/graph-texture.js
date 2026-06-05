@@ -91,10 +91,38 @@ async function _tektiteBuildGraphForNode(node, st) {
   }
 }
 
+/* Detect if this TektiteGraph node is wired (directly or via Sprite)
+ * into a VisualOutput. When yes, the framework's tektite-graph
+ * branch in shader-frag-pass.js needs the canvas sized to
+ * Visual.fbWidth x Visual.fbHeight so copyExternalImageToTexture
+ * lands in the framebuffer layer.  When no, the user's width/height
+ * params win (the texture is consumed via Sprite sampling, which is
+ * size-agnostic). */
+function _tektiteHasVoDownstream(node) {
+  if (typeof state === "undefined" || !state || !Array.isArray(state.edges)) return false;
+  // Cheap one-hop check: edges from this node to a VisualOutput.
+  for (const e of state.edges) {
+    if (!e || !e.from || !e.to) continue;
+    if (e.from.node !== node.id) continue;
+    const dst = state.nodes.find(n => n && n.id === e.to.node);
+    if (dst && dst.type === "VisualOutput") return true;
+  }
+  return false;
+}
+
 function _tektiteEnsureTexture(node, st) {
   const p = node.params || {};
-  const w = Math.max(64, Math.min(2048, (p.width  | 0) || 512));
-  const h = Math.max(64, Math.min(2048, (p.height | 0) || 512));
+  let w, h;
+  if (_tektiteHasVoDownstream(node) &&
+      typeof Visual !== "undefined" && Visual.fbWidth && Visual.fbHeight) {
+    // Sprint tektite-5c1 -- wire to VisualOutput: match framebuffer
+    // dims so the layer-copy in shader-frag-pass.js works.
+    w = Visual.fbWidth;
+    h = Visual.fbHeight;
+  } else {
+    w = Math.max(64, Math.min(2048, (p.width  | 0) || 512));
+    h = Math.max(64, Math.min(2048, (p.height | 0) || 512));
+  }
   if (st.canvas && st.texW === w && st.texH === h && st.texture) return;
   // Reallocate.
   if (st.texture) { try { st.texture.destroy(); } catch (_) {} }

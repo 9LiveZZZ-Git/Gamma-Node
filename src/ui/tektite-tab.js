@@ -130,16 +130,178 @@ async function _tektiteRebuildGraph() {
   s.renderer = tektiteGraphRenderer(s.canvas, s.graph, {
     selectedId:  centerId,
     onNodeClick: async (id) => {
-      _tektiteCloseGraphModal();
+      // Sprint tektite-5c1 -- open in floating popout INSTEAD of
+      // closing the modal + switching the main editor. The user
+      // explicitly preferred this UX so multiple nodes can be inspected
+      // without leaving the graph.
+      _tektitePopoutOpen(id);
+      if (s.renderer) s.renderer.setSelectedId(id);
+    }
+  });
+  s.renderer.start();
+  if (stats) {
+    stats.textContent = s.graph.nodes.length + " notes · " + s.graph.edges.length + " links";
+  }
+}
+
+/* ------------------------------------------------------------------
+ * Sprint tektite-5c1 -- floating popout editor inside the graph
+ * modal. Single popout (reused across node clicks); drag the title
+ * bar to move; — collapses to title-bar-only; ⤴ opens in the main
+ * editor and closes the graph; × hides without saving (saves still
+ * happen on input via debounce).
+ * ------------------------------------------------------------------ */
+const _tektitePopoutState = {
+  attached:   false,
+  noteId:     null,
+  saveTimer:  null,
+  drag:       false,
+  dragOffsetX: 0,
+  dragOffsetY: 0
+};
+
+function _tektitePopoutEnsureAttached() {
+  const s = _tektitePopoutState;
+  if (s.attached) return;
+  const popout = document.getElementById("tektite-graph-popout");
+  const bar    = document.getElementById("tektite-graph-popout-bar");
+  const titleInput   = document.getElementById("tektite-graph-popout-titleinput");
+  const editor       = document.getElementById("tektite-graph-popout-editor");
+  const collapseBtn  = document.getElementById("tektite-graph-popout-collapse");
+  const closeBtn     = document.getElementById("tektite-graph-popout-close");
+  const openBtn      = document.getElementById("tektite-graph-popout-open");
+  if (!popout || !bar || !titleInput || !editor) return;
+
+  // Drag the title bar to reposition the popout. Buttons inside the
+  // bar bail the drag start so clicks on collapse/close/open work.
+  bar.addEventListener("pointerdown", (e) => {
+    if (e.target && e.target.classList.contains("tektite-graph-popout-btn")) return;
+    s.drag = true;
+    const rect = popout.getBoundingClientRect();
+    s.dragOffsetX = e.clientX - rect.left;
+    s.dragOffsetY = e.clientY - rect.top;
+    bar.setPointerCapture(e.pointerId);
+  });
+  bar.addEventListener("pointermove", (e) => {
+    if (!s.drag) return;
+    const host = document.querySelector("#tektite-graph-modal .tektite-graph-host");
+    const hostRect = host ? host.getBoundingClientRect() : { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
+    let nx = e.clientX - hostRect.left - s.dragOffsetX;
+    let ny = e.clientY - hostRect.top  - s.dragOffsetY;
+    // Clamp to host bounds so the title bar always stays grabbable.
+    nx = Math.max(0, Math.min(hostRect.width  - popout.offsetWidth,  nx));
+    ny = Math.max(0, Math.min(hostRect.height - 36, ny));
+    popout.style.left = nx + "px";
+    popout.style.top  = ny + "px";
+  });
+  bar.addEventListener("pointerup", (e) => {
+    s.drag = false;
+    try { bar.releasePointerCapture(e.pointerId); } catch (_) {}
+  });
+
+  // Debounced save (same 400 ms cadence as the main editor).
+  function markDirty() {
+    if (!s.noteId) return;
+    if (s.saveTimer) clearTimeout(s.saveTimer);
+    _tektitePopoutSetStatus("Editing…", "saving");
+    s.saveTimer = setTimeout(_tektitePopoutFlush, 400);
+  }
+  editor.addEventListener("input",      markDirty);
+  titleInput.addEventListener("input",  markDirty);
+
+  collapseBtn.addEventListener("click", () => {
+    popout.classList.toggle("collapsed");
+    collapseBtn.textContent = popout.classList.contains("collapsed") ? "□" : "—";
+  });
+  closeBtn.addEventListener("click", () => {
+    _tektitePopoutFlush();
+    popout.style.display = "none";
+  });
+  openBtn.addEventListener("click", async () => {
+    await _tektitePopoutFlush();
+    const id = s.noteId;
+    popout.style.display = "none";
+    _tektiteCloseGraphModal();
+    if (id) {
       _tektiteTabState.activeSource = "vault";
       await _tektiteTabRefresh();
       await tektiteEditorLoadFromSource("vault", id);
       _tektiteTabRender();
     }
   });
-  s.renderer.start();
-  if (stats) {
-    stats.textContent = s.graph.nodes.length + " notes · " + s.graph.edges.length + " links";
+
+  s.attached = true;
+}
+
+function _tektitePopoutSetStatus(text, kind) {
+  const el = document.getElementById("tektite-graph-popout-status");
+  if (!el) return;
+  el.textContent = text || "";
+  el.className = "tektite-graph-popout-status" + (kind ? (" " + kind) : "");
+}
+
+async function _tektitePopoutOpen(noteId) {
+  _tektitePopoutEnsureAttached();
+  const popout      = document.getElementById("tektite-graph-popout");
+  const titleEl     = document.getElementById("tektite-graph-popout-title");
+  const titleInput  = document.getElementById("tektite-graph-popout-titleinput");
+  const editor      = document.getElementById("tektite-graph-popout-editor");
+  if (!popout || !titleEl || !titleInput || !editor) return;
+  // Flush whatever was being edited for the previous node before swapping.
+  await _tektitePopoutFlush();
+  const s = _tektitePopoutState;
+  s.noteId = noteId;
+  popout.style.display = "flex";
+  popout.classList.remove("collapsed");
+  const collapseBtn = document.getElementById("tektite-graph-popout-collapse");
+  if (collapseBtn) collapseBtn.textContent = "—";
+  try {
+    const note = await tektiteGetNote(noteId);
+    titleEl.textContent  = (note && note.title) || noteId;
+    titleInput.value     = (note && note.title) || noteId;
+    editor.value         = (note && note.content) || "";
+    _tektitePopoutSetStatus("");
+  } catch (e) {
+    editor.value = "Failed to load: " + (e.message || e);
+    _tektitePopoutSetStatus("error", "err");
+  }
+}
+
+async function _tektitePopoutFlush() {
+  const s = _tektitePopoutState;
+  if (s.saveTimer) { clearTimeout(s.saveTimer); s.saveTimer = null; }
+  if (!s.noteId) return;
+  const titleInput = document.getElementById("tektite-graph-popout-titleinput");
+  const editor     = document.getElementById("tektite-graph-popout-editor");
+  if (!titleInput || !editor) return;
+  const title   = (titleInput.value || s.noteId).trim();
+  const content = editor.value || "";
+  _tektitePopoutSetStatus("Saving…", "saving");
+  try {
+    const existing = await tektiteGetNote(s.noteId);
+    await tektitePutNote({
+      id:        s.noteId,
+      title:     title || s.noteId,
+      content,
+      createdAt: existing && existing.createdAt
+    });
+    const titleEl = document.getElementById("tektite-graph-popout-title");
+    if (titleEl) titleEl.textContent = title || s.noteId;
+    _tektitePopoutSetStatus("Saved", "ok");
+    setTimeout(() => {
+      const el = document.getElementById("tektite-graph-popout-status");
+      if (el && el.textContent === "Saved") _tektitePopoutSetStatus("");
+    }, 1500);
+    // Also refresh the backlinks + tags indices for this note.
+    if (typeof tektiteBacklinksOnNoteSaved === "function") {
+      tektiteBacklinksOnNoteSaved({ id: s.noteId, title, content, modifiedAt: Date.now() });
+    }
+    if (typeof tektiteTagsOnNoteSaved === "function") {
+      tektiteTagsOnNoteSaved({ id: s.noteId, title, content, modifiedAt: Date.now() });
+    }
+  } catch (e) {
+    _tektitePopoutSetStatus("✗ " + (e.message || e), "err");
+    console.warn("[tektite] popout save failed:", e);
   }
 }
 

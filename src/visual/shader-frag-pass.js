@@ -41,6 +41,46 @@ function _encodeShaderFragPassForPlan(enc, entry, dtSec) {
     return _encodeRtScenePass(enc, entry);
   }
 
+  // Phase C sprint tektite-5c1 -- tektite-graph branch: copy the
+  // node's per-frame 2D canvas (drawn by tickTektiteGraphTextures in
+  // src/tektite/graph-texture.js) directly into the assigned
+  // framebuffer / scratch layer. Same model as ai-vision-canvas --
+  // bypass the shader pipeline and queue a copyExternalImageToTexture.
+  // The canvas dimensions are sized to match Visual.fbWidth/fbHeight
+  // by the tick so the copy lands cleanly.
+  if (def.kind === "tektite-graph") {
+    if (typeof _tektiteGraphTexState === "undefined") return false;
+    const st = _tektiteGraphTexState.get(node.id);
+    if (!st || !st.canvas) return false;
+    const targetTex = entry.isScratch
+      ? (entry.writeKey === "a" ? Visual.scratchTextureA : Visual.scratchTextureB)
+      : Visual.framebuffer;
+    if (!targetTex) return false;
+    try {
+      Visual.device.queue.copyExternalImageToTexture(
+        { source: st.canvas, flipY: false },
+        { texture: targetTex, origin: { x: 0, y: 0, z: entry.layerIdx } },
+        [st.texW, st.texH, 1]
+      );
+    } catch (e) {
+      // Fallback for browsers where the OffscreenCanvas direct upload
+      // chokes -- transfer to an ImageBitmap then copy.
+      try {
+        const bm = st.canvas.transferToImageBitmap
+          ? st.canvas.transferToImageBitmap()
+          : null;
+        if (bm) {
+          Visual.device.queue.copyExternalImageToTexture(
+            { source: bm },
+            { texture: targetTex, origin: { x: 0, y: 0, z: entry.layerIdx } },
+            [st.texW, st.texH, 1]
+          );
+        }
+      } catch (e2) { return false; }
+    }
+    return true;
+  }
+
   // v0.3.3 — ai-vision-canvas branch: bypass the shader pipeline
   // entirely. The MediaPipe detection loop drew video + landmark
   // overlay into entry.drawCanvas; queue a direct
