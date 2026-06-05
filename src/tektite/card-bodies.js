@@ -759,6 +759,101 @@ function _tektiteCardApplyAccent(node, st) {
   else   st.body.style.borderLeft = "";
 }
 
+/* Sprint tektite-10e -- GraphCard.  Force-directed view of the
+ * vault graph in a card-shaped canvas; click a graph node to open a
+ * popout; the ⛶ button expands to the full 🕸 Graph modal.  Reuses
+ * tektiteGraphBuild + tektiteGraphRenderer from src/tektite/graph.js
+ * so the layout matches what the modal shows. */
+async function _renderGraphCardBody(node, st) {
+  if (!st.renderEl) return;
+  // Build the canvas + expand button on first mount.
+  if (!st.graphCanvas) {
+    st.renderEl.innerHTML =
+      '<div class="tektite-card-graph-bar">' +
+        '<span class="tektite-card-graph-mode" data-act="mode-toggle" title="Toggle global / local mode">' +
+          String(node.params.mode || "global") +
+        '</span>' +
+        '<span class="tektite-card-graph-stats">…</span>' +
+        '<button class="tektite-card-graph-expand" data-act="expand" type="button" title="Open in full 🕸 Graph modal">⛶</button>' +
+      '</div>' +
+      '<canvas class="tektite-card-graph-canvas"></canvas>';
+    st.graphCanvas    = st.renderEl.querySelector(".tektite-card-graph-canvas");
+    st.graphModeEl    = st.renderEl.querySelector(".tektite-card-graph-mode");
+    st.graphStatsEl   = st.renderEl.querySelector(".tektite-card-graph-stats");
+    st.graphExpandBtn = st.renderEl.querySelector(".tektite-card-graph-expand");
+    // Expand: open the full-screen modal anchored on this card's centerId.
+    st.graphExpandBtn.addEventListener("pointerdown", (e) => e.stopPropagation());
+    st.graphExpandBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (typeof _tektiteOpenGraphModal === "function") {
+        // Hand off the card's config to the modal state before opening.
+        if (typeof _tektiteGraphState !== "undefined" && _tektiteGraphState) {
+          _tektiteGraphState.mode   = String(node.params.mode    || "global");
+          _tektiteGraphState.depth  = Number(node.params.depth)  || 2;
+          _tektiteGraphState.minDeg = Number(node.params.minDegree) || 0;
+        }
+        _tektiteOpenGraphModal();
+      }
+    });
+    // Mode chip toggles global <-> local on click.
+    st.graphModeEl.addEventListener("pointerdown", (e) => e.stopPropagation());
+    st.graphModeEl.addEventListener("click", (e) => {
+      e.stopPropagation();
+      node.params = node.params || {};
+      node.params.mode = (node.params.mode === "global") ? "local" : "global";
+      st.graphModeEl.textContent = node.params.mode;
+      st.graphConfigHash = "";  // force rebuild on next tick
+    });
+  }
+  // Detect param changes and rebuild the graph + renderer when needed.
+  const mode      = String((node.params && node.params.mode)      || "global");
+  const depth     = Number((node.params && node.params.depth))     || 2;
+  const minDegree = Number((node.params && node.params.minDegree)) || 0;
+  const centerId  = String((node.params && node.params.centerId)  || "");
+  const cfgHash = "G:" + mode + ":" + depth + ":" + minDegree + ":" + centerId;
+  if (cfgHash !== st.graphConfigHash && !st.graphBuilding) {
+    st.graphBuilding = true;
+    try {
+      // Local mode picks the centerId param, falling back to the
+      // currently-loaded note in the Tektite tab (mirrors the modal).
+      const resolvedCenter = centerId ||
+        ((typeof tektiteEditorCurrentNoteId === "function") ? tektiteEditorCurrentNoteId() : null);
+      const graph = await tektiteGraphBuild({
+        mode, depth, minDegree, centerId: resolvedCenter
+      });
+      // Drop the old renderer before installing a new one so its rAF
+      // loop stops + canvas state resets.
+      if (st.graphRenderer && typeof st.graphRenderer.destroy === "function") {
+        st.graphRenderer.destroy();
+      }
+      st.graphRenderer = tektiteGraphRenderer(st.graphCanvas, graph, {
+        selectedId: resolvedCenter,
+        onNodeClick: (id) => {
+          // Click -> open popout (matches modal behavior).
+          if (typeof _tektitePopoutOpen === "function") _tektitePopoutOpen(id);
+          // Expose the click to the wire graph + stash for codegen-less
+          // downstream reads. params.selectedId is what _readWireJsSideValue
+          // returns for the GraphCard's out port.
+          node.params = node.params || {};
+          node.params.selectedId = id;
+          if (st.graphRenderer) st.graphRenderer.setSelectedId(id);
+        }
+      });
+      st.graphRenderer.start();
+      node.params.count = graph.nodes.length;
+      if (st.graphStatsEl) {
+        st.graphStatsEl.textContent = graph.nodes.length + " · " + graph.edges.length;
+      }
+      st.graphConfigHash = cfgHash;
+    } catch (e) {
+      if (st.graphStatsEl) st.graphStatsEl.textContent = "build failed";
+      console.warn("[graph-card] build failed:", e);
+    } finally {
+      st.graphBuilding = false;
+    }
+  }
+}
+
 /* Per-frame tick. */
 function _tickTektiteCards(dtSec) {
   if (typeof state === "undefined" || !state || !Array.isArray(state.nodes)) return;
@@ -769,17 +864,21 @@ function _tickTektiteCards(dtSec) {
     if (!def) continue;
     const k = def.kind;
     if (k !== "tektite-card-text"  && k !== "tektite-card-note" &&
-        k !== "tektite-card-link"  && k !== "tektite-card-base") continue;
+        k !== "tektite-card-link"  && k !== "tektite-card-base" &&
+        k !== "tektite-card-graph") continue;
     const st = _tektiteCardGetState(n);
     if (!_tektiteCardEnsureBody(n, st)) continue;
     _tektiteCardApplyAccent(n, st);
-    _renderLinkBar(n, st);
-    if      (k === "tektite-card-text") _renderTextCardBody(n, st);
-    else if (k === "tektite-card-link") _renderLinkCardBody(n, st);
-    else if (k === "tektite-card-note") _renderNoteCardBody(n, st);
-    else if (k === "tektite-card-base") _renderBaseCardBody(n, st);
+    // GraphCard has no link bar (it's its own kind of source).
+    if (k !== "tektite-card-graph") _renderLinkBar(n, st);
+    if      (k === "tektite-card-text")  _renderTextCardBody(n, st);
+    else if (k === "tektite-card-link")  _renderLinkCardBody(n, st);
+    else if (k === "tektite-card-note")  _renderNoteCardBody(n, st);
+    else if (k === "tektite-card-base")  _renderBaseCardBody(n, st);
+    else if (k === "tektite-card-graph") _renderGraphCardBody(n, st);
   }
 }
+
 
 function _tektiteCardEsc(s) {
   return String(s || "")

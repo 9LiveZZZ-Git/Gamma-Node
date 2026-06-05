@@ -20045,6 +20045,41 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     description: "Phase C sprint tektite-10b -- spatial card embedding a Base (typed-frontmatter tabular view, sprint tektite-8). Set `baseId` to a base-note id; the card runs the base's filter + sort and outputs the result rows as a JSON-serialized `text` wire + a `count` scalar. Useful for piping a filtered note set into an LLM batch operation. The card-side rendering lands in sprint tektite-10c."
   },
 
+  /* Phase C sprint tektite-10e -- GraphCard. Force-directed view of
+   * the vault graph (notes = nodes, [[wikilinks]] = edges) embedded
+   * as a card on the main canvas. Mirrors the 🕸 Graph modal's
+   * renderer in a card-sized canvas; click a graph node to open it
+   * in a popout. ⛶ button on the card opens the full-screen modal
+   * for workspace-scale exploration. Outputs the currently selected
+   * note id so downstream cards / LLM nodes can react.
+   *
+   * The TektiteGraph node (AI category, kind tektite-graph) renders
+   * to a GPUTexture for the visual pipeline; GraphCard renders to
+   * the DOM for direct interaction. Same underlying graph + layout. */
+  GraphCard: {
+    category: "Tektite", color: COLOR.tektite, header: null,
+    cppType: "", kind: "tektite-card-graph",
+    ins: [],
+    outs: [
+      { n: "selectedId", t: "text"  },
+      { n: "count",      t: "param" }
+    ],
+    params: {
+      mode:      "global",
+      depth:     2,
+      minDegree: 0,
+      centerId:  "",
+      width:     360,
+      height:    260,
+      color:     ""
+    },
+    paramOptions: {
+      mode:  ["global", "local"],
+      color: ["", "1", "2", "3", "4", "5", "6"]
+    },
+    description: "Phase C sprint tektite-10e -- live force-directed view of the vault graph as a card. Click a graph node to open it in a popout. Click the ⛶ button to expand to the full 🕸 Graph modal. `mode=local` centers on `centerId` (or the currently selected note if blank) within `depth` hops; `mode=global` walks the entire vault with optional `minDegree` filter. Outputs `selectedId` (the clicked note's id) so downstream cards / LLM nodes can react to selection."
+  },
+
   /* ============================================================
    * Phase B sprint 4 — Ollama-backed LLM nodes (MVP)
    *
