@@ -809,3 +809,74 @@ function _tektiteWireAttachmentDropzone() {
     if (tries > 25) clearInterval(t);
   }, 200);
 })();
+
+/* Sprint 10x -- DevTools menu wiring (Vault stats / Unload). */
+function _tektiteWireDevToolsMenu() {
+  const statsBtn  = document.getElementById("btn-tektite-vault-stats");
+  if (statsBtn && !statsBtn._wired) {
+    statsBtn._wired = true;
+    statsBtn.addEventListener("click", async () => {
+      try {
+        const text = await tektiteVaultStatsText();
+        window.alert(text);
+        console.log(text);
+      } catch (e) {
+        window.alert("Stats failed: " + (e && e.message || e));
+      }
+    });
+  }
+  const unloadAttBtn = document.getElementById("btn-tektite-vault-unload-attachments");
+  if (unloadAttBtn && !unloadAttBtn._wired) {
+    unloadAttBtn._wired = true;
+    unloadAttBtn.addEventListener("click", async () => {
+      const stats = await tektiteVaultStats();
+      const ok = window.confirm(
+        "Delete ALL attachments?\n\n" +
+        stats.attachmentCount + " attachment" + (stats.attachmentCount === 1 ? "" : "s") +
+        " · " + _tektiteFmtBytes(stats.attachmentsBytes) + "\n\n" +
+        "Notes are preserved.  This cannot be undone.");
+      if (!ok) return;
+      try {
+        await tektiteDevtoolUnload({ confirmed: true, scope: "attachments" });
+        window.alert("Attachments cleared.");
+        if (typeof _tektiteTabRefresh === "function") await _tektiteTabRefresh();
+      } catch (e) { window.alert("Unload failed: " + (e && e.message || e)); }
+    });
+  }
+  const unloadAllBtn = document.getElementById("btn-tektite-vault-unload-all");
+  if (unloadAllBtn && !unloadAllBtn._wired) {
+    unloadAllBtn._wired = true;
+    unloadAllBtn.addEventListener("click", async () => {
+      const stats = await tektiteVaultStats();
+      const ok = window.confirm(
+        "⚠ DELETE THE ENTIRE VAULT?\n\n" +
+        stats.noteCount + " note" + (stats.noteCount === 1 ? "" : "s") +
+        " · " + stats.attachmentCount + " attachment" + (stats.attachmentCount === 1 ? "" : "s") +
+        " · " + _tektiteFmtBytes(stats.notesBytes + stats.attachmentsBytes) + "\n\n" +
+        "This is irreversible.  Export anything you want to keep first.");
+      if (!ok) return;
+      // Second confirmation -- destructive op.
+      const really = window.prompt("Type DELETE to confirm.");
+      if (really !== "DELETE") { window.alert("Cancelled."); return; }
+      try {
+        await tektiteDevtoolUnload({ confirmed: true, scope: "all" });
+        window.alert("Vault cleared.");
+        if (typeof _tektiteTabRefresh === "function") await _tektiteTabRefresh();
+      } catch (e) { window.alert("Unload failed: " + (e && e.message || e)); }
+    });
+  }
+}
+
+(function _autoWireDevTools() {
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", _tektiteWireDevToolsMenu);
+  } else {
+    _tektiteWireDevToolsMenu();
+  }
+  let tries = 0;
+  const t = setInterval(() => {
+    _tektiteWireDevToolsMenu();
+    tries++;
+    if (tries > 25) clearInterval(t);
+  }, 200);
+})();

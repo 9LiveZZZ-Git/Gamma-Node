@@ -88,7 +88,7 @@ async function tektiteListNotes() {
   const store = tx.objectStore(TEKTITE_NOTES_STORE);
   // Iterate the modifiedAt index in reverse so most-recent shows first.
   const idx = store.index("modifiedAt");
-  return new Promise((resolve, reject) => {
+  const raw = await new Promise((resolve, reject) => {
     const results = [];
     const cursorReq = idx.openCursor(null, "prev");
     cursorReq.onsuccess = () => {
@@ -99,6 +99,49 @@ async function tektiteListNotes() {
     };
     cursorReq.onerror = () => reject(cursorReq.error);
   });
+  // Sprint 10x -- inflate compressed content so callers that read
+  // `.content` (graph build / wikilink scan / embeddings) get a
+  // string regardless of how it landed on disk.
+  for (const r of raw) await _tektiteInflateNote(r);
+  return raw;
+}
+
+/* Sprint 10x -- on-disk compression for note content via the native
+ * CompressionStream API.  Notes longer than the threshold get gzipped
+ * to a Uint8Array before put(); reads transparently inflate.  No new
+ * deps -- CompressionStream / DecompressionStream are baseline in
+ * every Chromium / Safari / Firefox version Gamma supports.
+ *
+ * Existing uncompressed notes (string `content`) still load fine --
+ * decompress dispatches on the type. */
+const TEKTITE_COMPRESS_THRESHOLD = 4096;  // bytes; below this, gzip cost > win
+
+async function _tektiteCompressString(s) {
+  if (typeof CompressionStream === "undefined") return null;
+  const enc  = new TextEncoder().encode(s);
+  const cs   = new CompressionStream("gzip");
+  const out  = new Response(new Blob([enc]).stream().pipeThrough(cs));
+  const buf  = await out.arrayBuffer();
+  return new Uint8Array(buf);
+}
+
+async function _tektiteDecompressU8(u8) {
+  if (typeof DecompressionStream === "undefined") {
+    // Stored as raw bytes, no decompress available -- best effort UTF-8.
+    return new TextDecoder().decode(u8);
+  }
+  const ds  = new DecompressionStream("gzip");
+  const out = new Response(new Blob([u8]).stream().pipeThrough(ds));
+  return await out.text();
+}
+
+async function _tektiteInflateNote(rec) {
+  if (!rec) return rec;
+  if (rec._compressed && rec.content && rec.content.byteLength !== undefined) {
+    rec.content    = await _tektiteDecompressU8(rec.content);
+    rec._compressed = false;
+  }
+  return rec;
 }
 
 async function tektiteGetNote(id) {
@@ -107,16 +150,28 @@ async function tektiteGetNote(id) {
   const tx = db.transaction(TEKTITE_NOTES_STORE, "readonly");
   const store = tx.objectStore(TEKTITE_NOTES_STORE);
   const res = await _tektitePromisifyRequest(store.get(String(id)));
-  return res || null;
+  if (!res) return null;
+  return await _tektiteInflateNote(res);
 }
 
 async function tektitePutNote(note) {
   if (!note || !note.id) throw new Error("note.id required");
   const now = Date.now();
+  const contentStr = String(note.content || "");
+  let storedContent = contentStr;
+  let compressed = false;
+  if (contentStr.length > TEKTITE_COMPRESS_THRESHOLD) {
+    const u8 = await _tektiteCompressString(contentStr);
+    if (u8 && u8.byteLength < contentStr.length) {
+      storedContent = u8;
+      compressed = true;
+    }
+  }
   const record = {
     id:         String(note.id),
     title:      String(note.title || note.id),
-    content:    String(note.content || ""),
+    content:    storedContent,
+    _compressed: compressed,
     createdAt:  Number.isFinite(note.createdAt)  ? note.createdAt  : now,
     modifiedAt: now
   };
@@ -124,7 +179,9 @@ async function tektitePutNote(note) {
   const tx = db.transaction(TEKTITE_NOTES_STORE, "readwrite");
   const store = tx.objectStore(TEKTITE_NOTES_STORE);
   await _tektitePromisifyRequest(store.put(record));
-  return record;
+  // Hand back a record with the original string so callers don't have
+  // to inflate themselves.
+  return { ...record, content: contentStr, _compressed: false };
 }
 
 async function tektiteDeleteNote(id) {
@@ -330,9 +387,27 @@ async function tektiteDeleteAttachment(id) {
 }
 
 /* Import a File / Blob (e.g. from a drag-drop or file picker) into
- * the vault as an attachment.  Returns the resolved id. */
+ * the vault as an attachment.  Returns the resolved id.  Sprint 10x:
+ * confirms before storing files past TEKTITE_BIG_FILE_WARN so a single
+ * stray drop doesn't blow past the browser's IDB quota and leave the
+ * vault in a stuck state. */
+const TEKTITE_BIG_FILE_WARN = 50 * 1024 * 1024;   // 50 MB
+const TEKTITE_BIG_FILE_HARD = 250 * 1024 * 1024;  // 250 MB
+
 async function tektiteImportFile(file) {
   if (!file || !file.name) throw new Error("tektiteImportFile: File required");
+  const sz = file.size || 0;
+  if (sz > TEKTITE_BIG_FILE_HARD) {
+    throw new Error("Refusing to import " + (sz / (1024*1024)).toFixed(1) +
+      " MB > " + (TEKTITE_BIG_FILE_HARD / (1024*1024)) + " MB hard cap. " +
+      "Use a server-backed source or split the file.");
+  }
+  if (sz > TEKTITE_BIG_FILE_WARN) {
+    const ok = window.confirm("This file is " + (sz / (1024*1024)).toFixed(1) +
+      " MB. Storing very large blobs in IndexedDB can hit browser quota " +
+      "limits and put the vault in a stuck state.  Continue?");
+    if (!ok) throw new Error("import cancelled by user");
+  }
   const rawId = file.name.replace(/\\/g, "/").split("/").pop();
   // Allow multiple imports of the same name by appending -n.
   let id = rawId;
@@ -349,4 +424,115 @@ async function tektiteImportFile(file) {
   }
   await tektitePutAttachment({ id, blob: file, mime: file.type });
   return id;
+}
+
+/* =========================================================================
+ * Sprint 10x -- Tektite devtools.
+ *
+ * Console-callable + UI-button-callable commands for emergency vault
+ * management.  Use these when the vault hits a quota error, a blob
+ * is corrupted, or you just want a fresh start.
+ *
+ * From the console:
+ *   await tektiteDevtoolUnload({ confirmed: true })
+ *      -> clears EVERY note + attachment
+ *   await tektiteDevtoolUnload({ confirmed: true, scope: "attachments" })
+ *      -> attachments only
+ *   await tektiteDevtoolUnload({ confirmed: true, scope: "notes" })
+ *      -> notes only
+ *   await tektiteVaultStats()
+ *      -> { noteCount, attachmentCount, notesBytes, attachmentsBytes,
+ *           quota, quotaUsed }  bytes are post-compression on disk
+ * ======================================================================== */
+async function tektiteDevtoolUnload(opts) {
+  opts = opts || {};
+  if (!opts.confirmed) {
+    return "Pass { confirmed: true, scope: 'all' | 'notes' | 'attachments' } to actually drop data.";
+  }
+  const scope = opts.scope || "all";
+  const db = await tektiteVaultOpen();
+  const stores = [];
+  if (scope === "all" || scope === "notes")       stores.push(TEKTITE_NOTES_STORE);
+  if (scope === "all" || scope === "attachments") stores.push(TEKTITE_ATTACHMENTS_STORE);
+  for (const sName of stores) {
+    const tx = db.transaction(sName, "readwrite");
+    tx.objectStore(sName).clear();
+    await new Promise((resolve, reject) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror    = () => reject(tx.error);
+    });
+  }
+  console.log("[tektite-devtool] vault cleared:", scope);
+  return scope + " cleared";
+}
+
+async function tektiteVaultStats() {
+  const db = await tektiteVaultOpen();
+  function countAndSize(storeName) {
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(storeName, "readonly");
+      const store = tx.objectStore(storeName);
+      let count = 0, bytes = 0;
+      const cur = store.openCursor();
+      cur.onsuccess = () => {
+        const c = cur.result;
+        if (!c) { resolve({ count, bytes }); return; }
+        count++;
+        const v = c.value;
+        if (storeName === TEKTITE_NOTES_STORE) {
+          // After compression `content` is either a Uint8Array or string.
+          if (v && v.content) {
+            bytes += (v.content.byteLength !== undefined)
+                   ? v.content.byteLength
+                   : v.content.length;
+          }
+        } else {
+          if (v && v.size) bytes += v.size;
+          else if (v && v.blob && v.blob.size) bytes += v.blob.size;
+        }
+        c.continue();
+      };
+      cur.onerror = () => reject(cur.error);
+    });
+  }
+  const notes       = await countAndSize(TEKTITE_NOTES_STORE);
+  const attachments = await countAndSize(TEKTITE_ATTACHMENTS_STORE);
+  let quota = null, quotaUsed = null;
+  try {
+    if (navigator.storage && navigator.storage.estimate) {
+      const est = await navigator.storage.estimate();
+      quota     = est.quota;
+      quotaUsed = est.usage;
+    }
+  } catch (_) {}
+  return {
+    noteCount:         notes.count,
+    notesBytes:        notes.bytes,
+    attachmentCount:   attachments.count,
+    attachmentsBytes:  attachments.bytes,
+    quota,             quotaUsed
+  };
+}
+
+/* Pretty-print version of the stats for the console + the UI button. */
+function _tektiteFmtBytes(n) {
+  if (!Number.isFinite(n)) return "?";
+  if (n < 1024)         return n + " B";
+  if (n < 1024*1024)    return (n / 1024).toFixed(1) + " KB";
+  if (n < 1024*1024*1024) return (n / (1024*1024)).toFixed(1) + " MB";
+  return (n / (1024*1024*1024)).toFixed(2) + " GB";
+}
+async function tektiteVaultStatsText() {
+  const s = await tektiteVaultStats();
+  const lines = [
+    "Tektite vault stats:",
+    "  notes:       " + s.noteCount + " entries · " + _tektiteFmtBytes(s.notesBytes),
+    "  attachments: " + s.attachmentCount + " entries · " + _tektiteFmtBytes(s.attachmentsBytes)
+  ];
+  if (s.quota != null && s.quotaUsed != null) {
+    lines.push("  browser quota: " + _tektiteFmtBytes(s.quotaUsed) +
+               " used of " + _tektiteFmtBytes(s.quota) +
+               " (" + ((s.quotaUsed / s.quota) * 100).toFixed(1) + "%)");
+  }
+  return lines.join("\n");
 }
