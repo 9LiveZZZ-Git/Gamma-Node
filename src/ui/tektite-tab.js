@@ -58,7 +58,9 @@ const _tektiteGraphState = {
   graph:    null,
   mode:     "global",
   depth:    2,
-  minDeg:   0
+  minDeg:   0,
+  /* Sprint tektite-5 -- active layout: force / tree / radial / sunburst. */
+  layout:   "force"
 };
 
 async function _tektiteOpenGraphModal() {
@@ -98,6 +100,18 @@ async function _tektiteOpenGraphModal() {
     const recenter = document.getElementById("btn-tektite-graph-recenter");
     if (recenter) recenter.addEventListener("click", () => {
       if (s.renderer) s.renderer.recenter();
+    });
+    // Sprint tektite-5 -- layout switcher (force / tree / radial / sunburst).
+    document.querySelectorAll(".tektite-graph-layout-btn").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const mode = btn.getAttribute("data-graph-layout") || "force";
+        s.layout = mode;
+        document.querySelectorAll(".tektite-graph-layout-btn").forEach(b =>
+          b.classList.toggle("active", b === btn));
+        if (s.renderer && typeof s.renderer.setLayout === "function") {
+          s.renderer.setLayout(mode);
+        }
+      });
     });
     // Sprint 10e-fix: close button wired here so the modal can be
     // opened from places OTHER than tektiteTabAttach (e.g. the
@@ -143,6 +157,7 @@ async function _tektiteRebuildGraph() {
   if (s.renderer) s.renderer.destroy();
   s.renderer = tektiteGraphRenderer(s.canvas, s.graph, {
     selectedId:  centerId,
+    layout:      s.layout || "force",
     onNodeClick: async (id) => {
       // Sprint tektite-5c1 -- open in floating popout INSTEAD of
       // closing the modal + switching the main editor. The user

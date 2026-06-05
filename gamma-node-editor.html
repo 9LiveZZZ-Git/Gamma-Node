@@ -1684,6 +1684,28 @@
   .tektite-graph-mode-btn:last-child { border-right: none; }
   .tektite-graph-mode-btn:hover { background: rgba(255, 255, 255, 0.06); color: var(--text); }
   .tektite-graph-mode-btn.active { background: rgba(200, 232, 90, 0.10); color: var(--accent); }
+  /* Sprint tektite-5 -- layout switcher.  Same look as the mode
+   * switcher; four buttons (force / tree / radial / sunburst). */
+  .tektite-graph-layout-switcher {
+    display: inline-flex;
+    border: 1px solid var(--instr-rule, var(--border));
+    border-radius: 4px;
+    overflow: hidden;
+    flex-shrink: 0;
+  }
+  .tektite-graph-layout-btn {
+    background: transparent;
+    color: var(--text-3);
+    border: none;
+    border-right: 1px solid var(--instr-rule, var(--border));
+    padding: 4px 10px;
+    font-size: 11px;
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s;
+  }
+  .tektite-graph-layout-btn:last-child { border-right: none; }
+  .tektite-graph-layout-btn:hover { background: rgba(255, 255, 255, 0.06); color: var(--text); }
+  .tektite-graph-layout-btn.active { background: rgba(95, 184, 212, 0.16); color: var(--accent); }
   .tektite-graph-control {
     display: inline-flex;
     align-items: center;
@@ -9303,6 +9325,13 @@
             <div class="tektite-graph-mode-switcher">
               <button class="tektite-graph-mode-btn active" data-graph-mode="global" type="button" title="All vault notes">Global</button>
               <button class="tektite-graph-mode-btn" data-graph-mode="local" type="button" title="N hops from the current note">Local</button>
+            </div>
+            <!-- Sprint tektite-5 -- layout switcher: 4 algorithms. -->
+            <div class="tektite-graph-layout-switcher">
+              <button class="tektite-graph-layout-btn active" data-graph-layout="force"    type="button" title="Force-directed (physics simulation)">⚛ Force</button>
+              <button class="tektite-graph-layout-btn"        data-graph-layout="tree"     type="button" title="Top-down hierarchical tree (BFS from selected)">⊥ Tree</button>
+              <button class="tektite-graph-layout-btn"        data-graph-layout="radial"   type="button" title="Concentric rings of BFS levels">◎ Radial</button>
+              <button class="tektite-graph-layout-btn"        data-graph-layout="sunburst" type="button" title="Sunburst (radial w/ subtree-size sweeps)">☀ Sunburst</button>
             </div>
             <label class="tektite-graph-control">
               Depth
@@ -62217,6 +62246,166 @@ function tektiteGraphSimulateStep(nodes, edges, opts) {
   return ke;
 }
 
+/* ----------------------------------------------------------------
+ * Sprint tektite-5 -- alternate layout algorithms.  The force layout
+ * is the default + runs as a simulation; the others are one-shot
+ * deterministic placements computed from BFS levels off a root node.
+ *
+ * All four mutate nodes[].x/y in place.  Callers should re-fit the
+ * viewport after running these (the renderer's fit() helper handles
+ * this when setLayout is called).
+ * ---------------------------------------------------------------- */
+function _tektiteGraphPickRoot(nodes, rootId) {
+  if (rootId) {
+    const i = nodes.findIndex(n => n.id === rootId);
+    if (i >= 0) return i;
+  }
+  // Highest-degree node as fallback root.
+  let best = 0, bestDeg = -1;
+  for (let i = 0; i < nodes.length; i++) {
+    if ((nodes[i].degree || 0) > bestDeg) { bestDeg = nodes[i].degree || 0; best = i; }
+  }
+  return best;
+}
+
+/* BFS over the (undirected) graph; returns { levels: Map<idx, depth>,
+ * children: Map<parentIdx, childIdx[]>, order: idx[] in BFS order }. */
+function _tektiteGraphBfs(nodes, edges, rootIdx) {
+  const adj = new Map();
+  for (let i = 0; i < nodes.length; i++) adj.set(i, new Set());
+  for (const e of edges) {
+    adj.get(e.source).add(e.target);
+    adj.get(e.target).add(e.source);   // undirected for layout
+  }
+  const levels   = new Map();
+  const children = new Map();
+  const order    = [];
+  const visited  = new Set([rootIdx]);
+  const queue    = [rootIdx];
+  levels.set(rootIdx, 0);
+  while (queue.length) {
+    const cur = queue.shift();
+    order.push(cur);
+    children.set(cur, []);
+    const neigh = adj.get(cur);
+    for (const next of neigh) {
+      if (visited.has(next)) continue;
+      visited.add(next);
+      levels.set(next, levels.get(cur) + 1);
+      children.get(cur).push(next);
+      queue.push(next);
+    }
+  }
+  // Disconnected nodes -- attach to root at a fake "depth 1" so they
+  // still get placed.
+  for (let i = 0; i < nodes.length; i++) {
+    if (!levels.has(i)) {
+      levels.set(i, 1);
+      children.get(rootIdx).push(i);
+      order.push(i);
+    }
+  }
+  return { levels, children, order, rootIdx };
+}
+
+/* Tree layout: top-down with siblings spread horizontally. */
+function tektiteGraphLayoutTree(nodes, edges, rootId) {
+  if (!nodes.length) return;
+  const rootIdx = _tektiteGraphPickRoot(nodes, rootId);
+  const bfs = _tektiteGraphBfs(nodes, edges, rootIdx);
+  const byLevel = new Map();
+  for (const [idx, lvl] of bfs.levels) {
+    if (!byLevel.has(lvl)) byLevel.set(lvl, []);
+    byLevel.get(lvl).push(idx);
+  }
+  const levelH = 90;
+  const nodeW  = 70;
+  for (const [lvl, list] of byLevel) {
+    const totalW = (list.length - 1) * nodeW;
+    list.forEach((idx, i) => {
+      nodes[idx].x  = -totalW / 2 + i * nodeW;
+      nodes[idx].y  = lvl * levelH - 150;
+      nodes[idx].vx = 0;
+      nodes[idx].vy = 0;
+    });
+  }
+}
+
+/* Radial layout: root at center, BFS rings of children at increasing
+ * radius, angle distributed evenly within the ring. */
+function tektiteGraphLayoutRadial(nodes, edges, rootId) {
+  if (!nodes.length) return;
+  const rootIdx = _tektiteGraphPickRoot(nodes, rootId);
+  const bfs = _tektiteGraphBfs(nodes, edges, rootIdx);
+  const byLevel = new Map();
+  for (const [idx, lvl] of bfs.levels) {
+    if (!byLevel.has(lvl)) byLevel.set(lvl, []);
+    byLevel.get(lvl).push(idx);
+  }
+  const ringR = 110;
+  for (const [lvl, list] of byLevel) {
+    if (lvl === 0) {
+      list.forEach(idx => {
+        nodes[idx].x = 0; nodes[idx].y = 0;
+        nodes[idx].vx = 0; nodes[idx].vy = 0;
+      });
+      continue;
+    }
+    const r = lvl * ringR;
+    const da = (Math.PI * 2) / list.length;
+    list.forEach((idx, i) => {
+      const a = i * da - Math.PI / 2;
+      nodes[idx].x  = Math.cos(a) * r;
+      nodes[idx].y  = Math.sin(a) * r;
+      nodes[idx].vx = 0;
+      nodes[idx].vy = 0;
+    });
+  }
+}
+
+/* Sunburst layout: radial with each subtree allocated an angular
+ * sweep proportional to its descendant count.  Root at center; deeper
+ * descendants on outer rings. */
+function tektiteGraphLayoutSunburst(nodes, edges, rootId) {
+  if (!nodes.length) return;
+  const rootIdx = _tektiteGraphPickRoot(nodes, rootId);
+  const bfs = _tektiteGraphBfs(nodes, edges, rootIdx);
+  // Subtree sizes via post-order walk.
+  const subtreeSize = new Map();
+  function size(idx) {
+    if (subtreeSize.has(idx)) return subtreeSize.get(idx);
+    const ch = bfs.children.get(idx) || [];
+    let s = 1;
+    for (const c of ch) s += size(c);
+    subtreeSize.set(idx, s);
+    return s;
+  }
+  size(rootIdx);
+  const ringR = 120;
+  // Place root at origin.
+  nodes[rootIdx].x = 0; nodes[rootIdx].y = 0;
+  nodes[rootIdx].vx = 0; nodes[rootIdx].vy = 0;
+  function place(idx, level, a0, a1) {
+    const ch = bfs.children.get(idx) || [];
+    if (!ch.length) return;
+    const total = size(idx) - 1;        // exclude self
+    let aCur = a0;
+    for (const c of ch) {
+      const s = size(c);
+      const span = ((a1 - a0) * s) / Math.max(1, total);
+      const aMid = aCur + span / 2;
+      const r = level * ringR;
+      nodes[c].x  = Math.cos(aMid) * r;
+      nodes[c].y  = Math.sin(aMid) * r;
+      nodes[c].vx = 0;
+      nodes[c].vy = 0;
+      place(c, level + 1, aCur, aCur + span);
+      aCur += span;
+    }
+  }
+  place(rootIdx, 1, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2);
+}
+
 /* Canvas renderer + interaction layer. Returns a control handle; the
  * caller owns the canvas element + decides when to start/stop. */
 function tektiteGraphRenderer(canvas, graph, opts) {
@@ -62328,9 +62517,29 @@ function tektiteGraphRenderer(canvas, graph, opts) {
   // user tried to click.
   let iterations = 0;
   const MAX_ITERATIONS = 500;
+  /* Sprint 5 -- active layout mode.  "force" runs the physics sim;
+   * tree / radial / sunburst are one-shot deterministic placements
+   * recomputed on setLayout(). */
+  let layoutMode = (opts.layout === "tree" || opts.layout === "radial" || opts.layout === "sunburst")
+    ? opts.layout : "force";
+  if (layoutMode !== "force") {
+    applyStaticLayout(layoutMode);
+  }
+
+  function applyStaticLayout(mode) {
+    if (mode === "tree")     tektiteGraphLayoutTree    (nodes, edges, selectedId);
+    else if (mode === "radial")   tektiteGraphLayoutRadial  (nodes, edges, selectedId);
+    else if (mode === "sunburst") tektiteGraphLayoutSunburst(nodes, edges, selectedId);
+  }
 
   function step() {
     if (!running) return;
+    // Sprint 5 -- non-force layouts are static; just draw and stop.
+    if (layoutMode !== "force") {
+      draw();
+      running = false;
+      return;
+    }
     iterations++;
     const ke = tektiteGraphSimulateStep(nodes, edges, opts.forces || {});
     draw();
@@ -62514,6 +62723,31 @@ function tektiteGraphRenderer(canvas, graph, opts) {
     stop:  () => { running = false; if (rafId) cancelAnimationFrame(rafId); },
     recenter: () => { offsetX = 0; offsetY = 0; scale = 1; wake(); },
     fit,
+    /* Sprint 5 -- switch layout mode in-place.  Preserves selectedId
+     * and the current zoom/offset (camera intent).  Re-fits the view
+     * after the new positions land. */
+    setLayout: (mode) => {
+      if (mode !== "force" && mode !== "tree" && mode !== "radial" && mode !== "sunburst") return;
+      layoutMode = mode;
+      if (mode === "force") {
+        // Re-seed with random jitter so the sim has something to work with.
+        for (const n of nodes) {
+          if (!isFinite(n.x) || !isFinite(n.y)) {
+            n.x = (Math.random() - 0.5) * 200;
+            n.y = (Math.random() - 0.5) * 200;
+          }
+          n.vx = 0; n.vy = 0;
+        }
+      } else {
+        applyStaticLayout(mode);
+      }
+      // Don't reset zoom -- preserve camera intent per the sprint 5 spec.
+      iterations = 0;
+      wake();
+      // Refit after the new positions render (next rAF).
+      requestAnimationFrame(() => fit());
+    },
+    getLayout: () => layoutMode,
     setSelectedId: (id) => { selectedId = id; wake(); },
     setGraph: (g) => { nodes = g.nodes; edges = g.edges; wake(); },
     getNodes: () => nodes,
@@ -64899,7 +65133,9 @@ const _tektiteGraphState = {
   graph:    null,
   mode:     "global",
   depth:    2,
-  minDeg:   0
+  minDeg:   0,
+  /* Sprint tektite-5 -- active layout: force / tree / radial / sunburst. */
+  layout:   "force"
 };
 
 async function _tektiteOpenGraphModal() {
@@ -64939,6 +65175,18 @@ async function _tektiteOpenGraphModal() {
     const recenter = document.getElementById("btn-tektite-graph-recenter");
     if (recenter) recenter.addEventListener("click", () => {
       if (s.renderer) s.renderer.recenter();
+    });
+    // Sprint tektite-5 -- layout switcher (force / tree / radial / sunburst).
+    document.querySelectorAll(".tektite-graph-layout-btn").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const mode = btn.getAttribute("data-graph-layout") || "force";
+        s.layout = mode;
+        document.querySelectorAll(".tektite-graph-layout-btn").forEach(b =>
+          b.classList.toggle("active", b === btn));
+        if (s.renderer && typeof s.renderer.setLayout === "function") {
+          s.renderer.setLayout(mode);
+        }
+      });
     });
     // Sprint 10e-fix: close button wired here so the modal can be
     // opened from places OTHER than tektiteTabAttach (e.g. the
@@ -64984,6 +65232,7 @@ async function _tektiteRebuildGraph() {
   if (s.renderer) s.renderer.destroy();
   s.renderer = tektiteGraphRenderer(s.canvas, s.graph, {
     selectedId:  centerId,
+    layout:      s.layout || "force",
     onNodeClick: async (id) => {
       // Sprint tektite-5c1 -- open in floating popout INSTEAD of
       // closing the modal + switching the main editor. The user
