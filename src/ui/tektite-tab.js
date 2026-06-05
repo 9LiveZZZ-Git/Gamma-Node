@@ -2028,7 +2028,26 @@ async function _tektiteTabCreate() {
 }
 
 async function _tektiteTabDelete(id) {
-  await tektiteDeleteNote(id);
+  // Sprint 10u -- dispatch to the right store.  Attachments live in
+  // a separate IDB store; deleting only from the notes store left
+  // the attachment row stuck in the listing.
+  let handled = false;
+  if (typeof _tektiteIsAttachmentId === "function" && _tektiteIsAttachmentId(id)) {
+    try {
+      if (typeof tektiteDeleteAttachment === "function") {
+        await tektiteDeleteAttachment(id);
+        handled = true;
+      }
+    } catch (_) {}
+  }
+  if (!handled) {
+    try { await tektiteDeleteNote(id); } catch (_) {}
+    // Also try the attachment path as a last resort if the note delete
+    // succeeded but an attachment with the same id exists.
+    if (typeof tektiteDeleteAttachment === "function") {
+      try { await tektiteDeleteAttachment(id); } catch (_) {}
+    }
+  }
   if (tektiteEditorCurrentNoteId() === id) {
     await tektiteEditorLoad(null);
   }
@@ -2124,7 +2143,12 @@ async function _tektiteFolderDelete(folderPath) {
   if (!window.confirm("Delete " + notes.length + " note" + (notes.length === 1 ? "" : "s") +
       " under \"" + folderPath + "\"? This cannot be undone.")) return;
   for (const n of notes) {
-    await tektiteDeleteNote(n.id);
+    // Sprint 10u -- folder delete handles attachments too.
+    if (typeof _tektiteIsAttachmentId === "function" && _tektiteIsAttachmentId(n.id)) {
+      try { await tektiteDeleteAttachment(n.id); } catch (_) {}
+    } else {
+      try { await tektiteDeleteNote(n.id); } catch (_) {}
+    }
     if (typeof tektiteBacklinksOnNoteDeleted === "function") tektiteBacklinksOnNoteDeleted(n.id);
     if (typeof tektiteTagsOnNoteDeleted === "function") tektiteTagsOnNoteDeleted(n.id);
   }

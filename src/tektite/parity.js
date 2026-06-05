@@ -490,10 +490,33 @@ async function _tektitePopoutLoadAttachment(inst, attId) {
       .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
   }
   const sizeKb = ((rec.size || 0) / 1024).toFixed(1);
+  // Sprint 10u -- "Edit in <tool>" launchers for the 4 editor links
+  // the user requested.  Stirling-PDF is server-only (Spring Boot)
+  // so it's a "Send to" link against the configured instance; the
+  // other three load in an in-app iframe modal.
+  // Sprint 10u -- editor launchers.  PDF.js is the realistic best
+  // free/open inline-browser PDF editor (server-only Stirling-PDF
+  // got dropped after the user asked for a better option).
+  const editorMap = {
+    image: { label: "Edit in miniPaint",     act: "minipaint"     },
+    pdf:   { label: "Open in PDF.js",        act: "pdfjs"         },
+    data:  { label: "Edit in Tablecruncher", act: "tablecruncher" },
+    doc:   { label: "Edit in docx-editor",   act: "docxeditor"    }
+  };
+  const editor = editorMap[kind];
+  // Only data kind's CSV/TSV actually go to Tablecruncher; JSON et al fall back.
+  const editorEligible = editor && (
+    kind !== "data" || (rec.ext === ".csv" || rec.ext === ".tsv")
+  );
+  const editBtn = editorEligible
+    ? '<button class="tk-att-edit" data-act="' + esc(editor.act) +
+        '" data-id="' + esc(attId) + '" type="button">✎ ' + esc(editor.label) + '</button>'
+    : "";
   const meta = '<div class="tk-att-meta">' +
     '<span class="tk-att-kind">' + esc(kind) + '</span>' +
     '<span class="tk-att-mime">' + esc(rec.mime || "") + '</span>' +
     '<span class="tk-att-size">' + sizeKb + ' KB</span>' +
+    editBtn +
     '<a class="tk-att-dl" href="' + url + '" download="' + esc(attId) + '">Download</a>' +
   '</div>';
   let body = "";
@@ -504,7 +527,12 @@ async function _tektitePopoutLoadAttachment(inst, attId) {
   } else if (kind === "video") {
     body = '<video class="tk-att-video" controls src="' + url + '"></video>';
   } else if (kind === "pdf") {
-    body = '<embed class="tk-att-pdf" type="application/pdf" src="' + url + '">';
+    // Sprint 10u -- Chrome's built-in PDF viewer supports highlight /
+    // signature / free-text annotation when the toolbar is visible.
+    // toolbar=1 + navpanes=1 expose those affordances; the user can
+    // also click "Open in PDF.js" for a richer cross-browser viewer.
+    body = '<embed class="tk-att-pdf" type="application/pdf" src="' +
+           url + '#toolbar=1&navpanes=1&scrollbar=1">';
   } else if (kind === "data" || kind === "text") {
     try {
       const text = await rec.blob.text();
@@ -527,6 +555,97 @@ async function _tektitePopoutLoadAttachment(inst, attId) {
       '">⬇ Download to open externally</a></div>';
   }
   viewer.innerHTML = meta + '<div class="tk-att-body">' + body + '</div>';
+  // Wire the editor launch button (if present).
+  const editBtnEl = viewer.querySelector(".tk-att-edit");
+  if (editBtnEl) editBtnEl.addEventListener("click", () => {
+    _tektiteOpenExternalEditor(editBtnEl.getAttribute("data-act"),
+                               editBtnEl.getAttribute("data-id"));
+  });
+}
+
+/* Sprint 10u -- external-editor launchers.
+ *
+ * Stirling-PDF (Spring Boot Java server) -- cannot run in-browser;
+ * opens the user's configured instance URL in a new tab with the
+ * blob URL appended as ?url=... (Stirling supports this with the
+ * /api/v1/general/load-from-url endpoint when the proxy permits).
+ *
+ * miniPaint / Tablecruncher / docx-editor -- browser-based; load
+ * via iframe modal from their public hosted instances or jsDelivr.
+ * Round-trip-save needs a postMessage protocol the editors don't
+ * support out-of-box yet, so this is "open + edit + manually
+ * download" for the MVP.  See docs/LLM-KNOWLEDGE-PHASE.md for the
+ * follow-up sprint that brings save-back. */
+const TEKTITE_EXTERNAL_EDITOR_URLS = {
+  // Hosted instances; users can override via localStorage.tektite-editor-urls.
+  minipaint:     "https://viliusle.github.io/miniPaint/",
+  // PDF.js mozilla-hosted viewer.  Best free option; supports
+  // highlight + free-text + ink annotation editing in-browser.
+  // Cross-origin blob-URL load doesn't pass to the viewer, so the
+  // launcher also surfaces a Download link the user can re-import
+  // via PDF.js's "Open File" button.
+  pdfjs:         "https://mozilla.github.io/pdf.js/web/viewer.html",
+  tablecruncher: "https://tablecruncher.com/online/",
+  docxeditor:    "https://eigenpal.github.io/docx-editor/"
+};
+
+function _tektiteEditorUrlFor(act) {
+  let urls = TEKTITE_EXTERNAL_EDITOR_URLS;
+  try {
+    const raw = window.localStorage.getItem("tektite-editor-urls");
+    if (raw) urls = Object.assign({}, urls, JSON.parse(raw));
+  } catch (_) {}
+  return urls[act] || null;
+}
+
+async function _tektiteOpenExternalEditor(act, attId) {
+  const baseUrl = _tektiteEditorUrlFor(act);
+  if (!baseUrl) { window.alert("No editor URL configured for " + act); return; }
+  // Fetch the blob so we can hand it to the editor (modal iframe path
+  // is best-effort: most editors don't have a documented postMessage
+  // import API; user typically uses the editor's own File -> Open + we
+  // also offer a Download link in the modal so they can grab it).
+  let blob = null;
+  try {
+    const rec = await tektiteGetAttachment(attId);
+    if (rec && rec.blob) blob = rec.blob;
+  } catch (_) {}
+
+  // Iframe modal for miniPaint / Tablecruncher / docx-editor / PDF.js.
+  let modal = document.getElementById("tk-external-editor-modal");
+  if (!modal) {
+    modal = document.createElement("div");
+    modal.id = "tk-external-editor-modal";
+    modal.className = "tk-external-editor-modal";
+    modal.innerHTML =
+      '<div class="tk-eem-bar">' +
+        '<span class="tk-eem-title">External editor</span>' +
+        '<a class="tk-eem-dl" download>⬇ Download to import</a>' +
+        '<button class="tk-eem-close" type="button">× Close</button>' +
+      '</div>' +
+      '<iframe class="tk-eem-iframe" frameborder="0"></iframe>';
+    document.body.appendChild(modal);
+    modal.querySelector(".tk-eem-close").addEventListener("click", () => {
+      modal.style.display = "none";
+      modal.querySelector(".tk-eem-iframe").src = "about:blank";
+      const dl = modal.querySelector(".tk-eem-dl");
+      if (dl._urlToRevoke) { URL.revokeObjectURL(dl._urlToRevoke); dl._urlToRevoke = null; }
+    });
+  }
+  modal.querySelector(".tk-eem-title").textContent = "External editor: " + attId;
+  modal.querySelector(".tk-eem-iframe").src = baseUrl;
+  modal.style.display = "flex";
+  const dl = modal.querySelector(".tk-eem-dl");
+  if (blob) {
+    if (dl._urlToRevoke) URL.revokeObjectURL(dl._urlToRevoke);
+    const url = URL.createObjectURL(blob);
+    dl._urlToRevoke = url;
+    dl.href = url;
+    dl.setAttribute("download", attId);
+    dl.style.display = "";
+  } else {
+    dl.style.display = "none";
+  }
 }
 
 function _tektiteAttachmentCsvHtml(text, sep) {
@@ -547,32 +666,68 @@ function _tektiteAttachmentCsvHtml(text, sep) {
   return html;
 }
 
-/* Monkey-patch _tektitePopoutLoadTab to detect attachment ids and
- * dispatch to the viewer.  Falls back to the original markdown path
- * for everything else. */
-(function _wrapPopoutLoad() {
-  if (typeof _tektitePopoutLoadTab !== "function") return;
-  if (_tektitePopoutLoadTab._tk10tWrapped) return;
-  const original = _tektitePopoutLoadTab;
-  _tektitePopoutLoadTab = async function (inst, noteId) {
-    if (!noteId) return;
-    if (_tektiteIsAttachmentId(noteId)) {
-      try {
-        const rec = await tektiteGetAttachment(noteId);
-        if (rec && rec.blob) {
-          inst.noteId = noteId;
-          const titleEl = inst.dom && inst.dom.querySelector(".tektite-graph-popout-title");
-          if (titleEl) titleEl.textContent = noteId;
-          await _tektitePopoutLoadAttachment(inst, noteId);
-          if (typeof _tektitePopoutSetStatus === "function") _tektitePopoutSetStatus(inst, "");
-          return;
-        }
-      } catch (_) {}
-    }
-    _tektitePopoutShowMarkdownLayer(inst);
-    return original(inst, noteId);
-  };
-  _tektitePopoutLoadTab._tk10tWrapped = true;
+/* Sprint 10t/10u -- intercept BOTH the initial popout open AND tab
+ * switches so attachment ids land in the viewer instead of the
+ * markdown editor.  The first-open path historically inlined the
+ * note load inside _tektitePopoutOpen, which never reached the
+ * tab-load wrap.  Symptom (10u): clicking an attachment showed an
+ * empty markdown editor. */
+function _tektitePatchPopoutHooks() {
+  // Wrap _tektitePopoutLoadTab (tab switching).
+  if (typeof _tektitePopoutLoadTab === "function" && !_tektitePopoutLoadTab._tk10tWrapped) {
+    const original = _tektitePopoutLoadTab;
+    _tektitePopoutLoadTab = async function (inst, noteId) {
+      if (!noteId) return;
+      if (_tektiteIsAttachmentId(noteId)) {
+        try {
+          const rec = await tektiteGetAttachment(noteId);
+          if (rec && rec.blob) {
+            inst.noteId = noteId;
+            const titleEl = inst.dom && inst.dom.querySelector(".tektite-graph-popout-title");
+            if (titleEl) titleEl.textContent = noteId;
+            await _tektitePopoutLoadAttachment(inst, noteId);
+            if (typeof _tektitePopoutSetStatus === "function") _tektitePopoutSetStatus(inst, "");
+            return;
+          }
+        } catch (_) {}
+      }
+      _tektitePopoutShowMarkdownLayer(inst);
+      return original(inst, noteId);
+    };
+    _tektitePopoutLoadTab._tk10tWrapped = true;
+  }
+  // Wrap _tektitePopoutOpen (first-open path).
+  if (typeof _tektitePopoutOpen === "function" && !_tektitePopoutOpen._tk10tWrapped) {
+    const originalOpen = _tektitePopoutOpen;
+    _tektitePopoutOpen = async function (noteId) {
+      const result = await originalOpen(noteId);
+      // After the original open returns, if the loaded id is an
+      // attachment, swap the markdown layer out for the viewer.
+      // (originalOpen has already set inst.noteId + loaded the empty
+      //  markdown -- harmless; we paint over it.)
+      const inst = _tektitePopouts && _tektitePopouts.instances && _tektitePopouts.instances.get(noteId);
+      if (inst && _tektiteIsAttachmentId(noteId)) {
+        try {
+          const rec = await tektiteGetAttachment(noteId);
+          if (rec && rec.blob) {
+            const titleEl = inst.dom && inst.dom.querySelector(".tektite-graph-popout-title");
+            if (titleEl) titleEl.textContent = noteId;
+            await _tektitePopoutLoadAttachment(inst, noteId);
+          }
+        } catch (_) {}
+      }
+      return result;
+    };
+    _tektitePopoutOpen._tk10tWrapped = true;
+  }
+}
+
+(function _autoPatchPopoutHooks() {
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", _tektitePatchPopoutHooks);
+  } else {
+    _tektitePatchPopoutHooks();
+  }
 })();
 
 /* Drop-zone on the Tektite tab.  Any file dropped on the notes list

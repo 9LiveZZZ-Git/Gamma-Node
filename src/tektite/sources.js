@@ -230,7 +230,10 @@ async function tektiteSourceListNotes(sourceId) {
     if (!src.handle) throw new Error("Source disconnected. Remove and re-add to reconnect.");
     if (!src.fileCache) src.fileCache = await _tektiteWalkLocalDir(src.handle);
     return src.fileCache.map(f => ({
-      id: f.path, title: f.name, path: f.path, modifiedAt: f.modifiedAt, sourceId: src.id
+      id: f.path, title: f.name, path: f.path, modifiedAt: f.modifiedAt,
+      sourceId: src.id,
+      // Sprint 10u -- attachments now flow through; viewer dispatches on kind.
+      kind: f.kind || "note", ext: f.ext, size: f.size
     }));
   }
   if (src.type === "github") {
@@ -421,13 +424,25 @@ async function _tektiteWalkLocalDir(dirHandle, prefix, depth) {
   const SKIP_DIRS = new Set([".obsidian", ".git", "node_modules", ".idea", ".vscode"]);
   const out = [];
   for await (const [name, handle] of dirHandle.entries()) {
-    if (handle.kind === "file" && /\.md$/i.test(name)) {
+    if (handle.kind === "file") {
+      // Sprint 10u -- accept ANY recognized extension, not just .md.
+      // Notes (markdown) stay first-class; attachments come along so
+      // local-fs sources mirror full vaults instead of markdown-only.
+      const lower = name.toLowerCase();
+      const isMd  = /\.(md|markdown)$/i.test(name);
+      const cls   = (typeof tektiteClassifyAttachment === "function")
+                  ? tektiteClassifyAttachment(name) : { kind: "other", ext: "" };
+      const isRecognized = isMd || cls.kind !== "other";
+      if (!isRecognized) continue;
       try {
         const file = await handle.getFile();
         out.push({
-          path: prefix + name,
-          name: name.replace(/\.md$/i, ""),
-          modifiedAt: file.lastModified || 0
+          path:       prefix + name,
+          name:       isMd ? name.replace(/\.(md|markdown)$/i, "") : name,
+          modifiedAt: file.lastModified || 0,
+          kind:       isMd ? "note" : cls.kind,
+          ext:        cls.ext,
+          size:       file.size || 0
         });
       } catch (_) {}
     } else if (handle.kind === "directory" &&
