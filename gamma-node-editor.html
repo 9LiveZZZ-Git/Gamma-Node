@@ -1814,6 +1814,27 @@
     outline: none;
     resize: none;
   }
+  /* Sprint tektite-5c2 -- SVG overlay for the popout->node connector. */
+  .tektite-graph-connector {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    z-index: 2;
+  }
+
+  /* Sprint tektite-5c2 -- main editor minimize. Collapses the editor
+   * body, keeping the toolbar visible so the user can still switch
+   * view-mode / fork-to-vault / restore. The notes list above expands
+   * to fill the freed space since the split is flex:1. */
+  .tektite-editor-pane.editor-minimized .tektite-edit-surface,
+  .tektite-editor-pane.editor-minimized .tektite-backlinks {
+    display: none !important;
+  }
+  .tektite-editor-pane.editor-minimized {
+    flex: 0 0 auto !important;
+  }
 
   /* Sprint tektite-5a -- folder tree rows.
    * Folder rows are compact (no separate meta line) and carry a
@@ -7843,6 +7864,12 @@
                   <button class="tektite-view-mode-btn" data-mode="preview" type="button" title="Preview only">👁</button>
                 </div>
                 <span id="tektite-editor-status" class="tektite-editor-status"></span>
+                <!-- Sprint tektite-5c2 -- minimize toggle. Collapses
+                     the editor body, leaves the toolbar visible; click
+                     again to restore.  Also exposed in the main
+                     toolbar via "Hide editor". -->
+                <button class="btn" id="btn-tektite-editor-min" type="button"
+                  title="Hide/show the editor pane">— Hide</button>
                 <button class="btn" id="btn-tektite-save-to-vault" type="button"
                   title="Copy this remote note into the local vault (fork)">
                   ↓ Fork to vault
@@ -7953,6 +7980,18 @@
       <div class="modal-backdrop" id="tektite-graph-modal" style="display:none; padding:0;">
         <div class="tektite-graph-host">
           <canvas id="tektite-graph-canvas" class="tektite-graph-canvas"></canvas>
+          <!-- Sprint tektite-5c2 -- connecting line between the source
+               node + popout. SVG overlay above the canvas, behind the
+               popout. line endpoints update on graph pan/zoom and on
+               popout drag. -->
+          <svg id="tektite-graph-connector" class="tektite-graph-connector"
+            xmlns="http://www.w3.org/2000/svg" style="display:none;">
+            <line id="tektite-graph-connector-line"
+              x1="0" y1="0" x2="0" y2="0"
+              stroke="#c8e85a" stroke-width="1.5" stroke-dasharray="4 3" opacity="0.85" />
+            <circle id="tektite-graph-connector-dot" cx="0" cy="0" r="4"
+              fill="#c8e85a" opacity="0.95" />
+          </svg>
           <!-- Sprint tektite-5c1 -- floating editor popout overlaid
                on the canvas. Hidden until the user clicks a node;
                draggable by the title bar; collapsible to title-bar-
@@ -60494,6 +60533,10 @@ function tektiteGraphRenderer(canvas, graph, opts) {
       const r = Math.max(3, Math.min(16, 4 + Math.log2(1 + n.degree) * 2.5));
       ctx.fillText(n.title, n.x + r + 4, n.y + 3);
     }
+    // Sprint tektite-5c2 -- notify external viewport listener (the
+    // popout connector) so it can update its line endpoints in
+    // lockstep with the canvas draw.
+    if (viewportListener) viewportListener();
   }
 
   // Sprint tektite-5b1 -- iteration counter + hover-pauses-sim fixes.
@@ -60637,6 +60680,25 @@ function tektiteGraphRenderer(canvas, graph, opts) {
   // Initial render.
   draw();
 
+  /* Sprint tektite-5c2 -- expose viewport transform + node screen
+   * position so the floating popout can draw a connector from the
+   * source node to itself.  viewportListener is invoked AFTER every
+   * draw (covers sim ticks, pans, zooms, hovers) so external code
+   * can refresh DOM overlays in lockstep with the canvas. */
+  let viewportListener = null;
+  function nodeScreenPos(id) {
+    const idx = nodes.findIndex(n => n.id === id);
+    if (idx < 0) return null;
+    const n = nodes[idx];
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: rect.left + rect.width  / 2 + offsetX + n.x * scale,
+      y: rect.top  + rect.height / 2 + offsetY + n.y * scale,
+      nodeRadius: Math.max(3, Math.min(16, 4 + Math.log2(1 + n.degree) * 2.5)) * scale,
+      idx
+    };
+  }
+
   return {
     start: wake,
     stop:  () => { running = false; if (rafId) cancelAnimationFrame(rafId); },
@@ -60644,9 +60706,13 @@ function tektiteGraphRenderer(canvas, graph, opts) {
     setSelectedId: (id) => { selectedId = id; wake(); },
     setGraph: (g) => { nodes = g.nodes; edges = g.edges; wake(); },
     getNodes: () => nodes,
+    nodeScreenPos,
+    onViewportChange: (fn) => { viewportListener = (typeof fn === "function") ? fn : null; },
+    fireViewportChange: () => { if (viewportListener) viewportListener(); },
     destroy: () => {
       running = false;
       if (rafId) cancelAnimationFrame(rafId);
+      viewportListener = null;
     }
   };
 }
@@ -61479,6 +61545,12 @@ async function _tektiteRebuildGraph() {
     }
   });
   s.renderer.start();
+  // Sprint tektite-5c2 -- wire the connector overlay. Renderer fires
+  // viewportListener after every draw (sim ticks, pans, zooms,
+  // hovers); we recompute the line endpoints in lockstep.
+  if (typeof s.renderer.onViewportChange === "function") {
+    s.renderer.onViewportChange(_tektiteUpdateConnector);
+  }
   if (stats) {
     stats.textContent = s.graph.nodes.length + " notes · " + s.graph.edges.length + " links";
   }
@@ -61533,6 +61605,8 @@ function _tektitePopoutEnsureAttached() {
     ny = Math.max(0, Math.min(hostRect.height - 36, ny));
     popout.style.left = nx + "px";
     popout.style.top  = ny + "px";
+    // Sprint tektite-5c2 -- update connector in lockstep with drag.
+    _tektiteUpdateConnector();
   });
   bar.addEventListener("pointerup", (e) => {
     s.drag = false;
@@ -61556,6 +61630,9 @@ function _tektitePopoutEnsureAttached() {
   closeBtn.addEventListener("click", () => {
     _tektitePopoutFlush();
     popout.style.display = "none";
+    // Sprint tektite-5c2 -- hide connector when popout closes.
+    const svg = document.getElementById("tektite-graph-connector");
+    if (svg) svg.style.display = "none";
   });
   openBtn.addEventListener("click", async () => {
     await _tektitePopoutFlush();
@@ -61578,6 +61655,58 @@ function _tektitePopoutSetStatus(text, kind) {
   if (!el) return;
   el.textContent = text || "";
   el.className = "tektite-graph-popout-status" + (kind ? (" " + kind) : "");
+}
+
+/* Sprint tektite-5c2 -- connector line between the source graph node
+ * and the popout editor.  Updates on every renderer draw (subscribed
+ * via onViewportChange) AND on popout drags (manually invoked by the
+ * drag-pointermove handler). */
+function _tektiteUpdateConnector() {
+  const s = _tektiteGraphState;
+  const ps = _tektitePopoutState;
+  const svg     = document.getElementById("tektite-graph-connector");
+  const line    = document.getElementById("tektite-graph-connector-line");
+  const dot     = document.getElementById("tektite-graph-connector-dot");
+  const popout  = document.getElementById("tektite-graph-popout");
+  if (!svg || !line || !dot || !popout) return;
+  if (!ps.noteId || popout.style.display === "none" || !s.renderer ||
+      typeof s.renderer.nodeScreenPos !== "function") {
+    svg.style.display = "none";
+    return;
+  }
+  const np = s.renderer.nodeScreenPos(ps.noteId);
+  if (!np) { svg.style.display = "none"; return; }
+
+  const host = svg.parentElement; // .tektite-graph-host
+  const hostRect = host.getBoundingClientRect();
+  // Map to SVG-local coords.
+  const nx = np.x - hostRect.left;
+  const ny = np.y - hostRect.top;
+
+  // Pick the popout edge anchor closest to the source node.
+  const pRect = popout.getBoundingClientRect();
+  const pLeft   = pRect.left - hostRect.left;
+  const pTop    = pRect.top  - hostRect.top;
+  const pRight  = pLeft + pRect.width;
+  const pBottom = pTop  + pRect.height;
+  const pCx = (pLeft + pRight)  / 2;
+  const pCy = (pTop  + pBottom) / 2;
+  // Clamp anchor to nearest popout edge midpoint.
+  let ax, ay;
+  if (nx < pLeft)        { ax = pLeft;   ay = Math.max(pTop, Math.min(pBottom, ny)); }
+  else if (nx > pRight)  { ax = pRight;  ay = Math.max(pTop, Math.min(pBottom, ny)); }
+  else if (ny < pTop)    { ax = Math.max(pLeft, Math.min(pRight, nx)); ay = pTop;    }
+  else if (ny > pBottom) { ax = Math.max(pLeft, Math.min(pRight, nx)); ay = pBottom; }
+  else                   { ax = pCx; ay = pCy; }  // node is INSIDE popout -- line collapses
+
+  svg.style.display = "block";
+  line.setAttribute("x1", nx);
+  line.setAttribute("y1", ny);
+  line.setAttribute("x2", ax);
+  line.setAttribute("y2", ay);
+  dot.setAttribute("cx", nx);
+  dot.setAttribute("cy", ny);
+  dot.setAttribute("r", Math.max(4, np.nodeRadius * 0.6));
 }
 
 async function _tektitePopoutOpen(noteId) {
@@ -61605,6 +61734,8 @@ async function _tektitePopoutOpen(noteId) {
     editor.value = "Failed to load: " + (e.message || e);
     _tektitePopoutSetStatus("error", "err");
   }
+  // Sprint tektite-5c2 -- show the connector to the source node.
+  _tektiteUpdateConnector();
 }
 
 async function _tektitePopoutFlush() {
@@ -62146,6 +62277,19 @@ function tektiteTabAttach() {
   // Sprint tektite-5b -- graph view modal.
   const graphBtn = document.getElementById("btn-tektite-graph");
   if (graphBtn) graphBtn.addEventListener("click", () => _tektiteOpenGraphModal());
+
+  // Sprint tektite-5c2 -- main editor minimize. Toggles the
+  // `editor-minimized` class on the editor pane; CSS handles the
+  // collapse + restore. Button text flips between "— Hide" and
+  // "▢ Show" so the user can tell what clicking will do next.
+  const editorMinBtn = document.getElementById("btn-tektite-editor-min");
+  if (editorMinBtn) editorMinBtn.addEventListener("click", () => {
+    const pane = document.getElementById("tektite-editor-pane");
+    if (!pane) return;
+    pane.classList.toggle("editor-minimized");
+    editorMinBtn.textContent = pane.classList.contains("editor-minimized")
+      ? "▢ Show" : "— Hide";
+  });
   const graphCloseBtn = document.getElementById("btn-tektite-graph-close");
   if (graphCloseBtn) graphCloseBtn.addEventListener("click", () => _tektiteCloseGraphModal());
   document.addEventListener("keydown", (e) => {
@@ -98578,39 +98722,48 @@ function _encodeShaderFragPassForPlan(enc, entry, dtSec) {
   // Phase C sprint tektite-5c1 -- tektite-graph branch: copy the
   // node's per-frame 2D canvas (drawn by tickTektiteGraphTextures in
   // src/tektite/graph-texture.js) directly into the assigned
-  // framebuffer / scratch layer. Same model as ai-vision-canvas --
-  // bypass the shader pipeline and queue a copyExternalImageToTexture.
-  // The canvas dimensions are sized to match Visual.fbWidth/fbHeight
-  // by the tick so the copy lands cleanly.
+  // framebuffer / scratch layer. Same model as ai-vision-canvas
+  // below -- bypass the shader pipeline and queue a
+  // copyExternalImageToTexture. Dimensions clamped to fb size to
+  // tolerate temporary mismatches (e.g. first frame before the tick
+  // has resized the canvas to match Visual.fbWidth/Height).
   if (def.kind === "tektite-graph") {
     if (typeof _tektiteGraphTexState === "undefined") return false;
     const st = _tektiteGraphTexState.get(node.id);
     if (!st || !st.canvas) return false;
-    const targetTex = entry.isScratch
-      ? (entry.writeKey === "a" ? Visual.scratchTextureA : Visual.scratchTextureB)
+    const destTexture = isScratch
+      ? (writeKey === "a" ? Visual.scratchTextureA : Visual.scratchTextureB)
       : Visual.framebuffer;
-    if (!targetTex) return false;
+    if (!destTexture) return false;
+    const cw = Math.min(st.canvas.width  || 0, Visual.fbWidth);
+    const ch = Math.min(st.canvas.height || 0, Visual.fbHeight);
+    if (cw === 0 || ch === 0) return false;
     try {
       Visual.device.queue.copyExternalImageToTexture(
         { source: st.canvas, flipY: false },
-        { texture: targetTex, origin: { x: 0, y: 0, z: entry.layerIdx } },
-        [st.texW, st.texH, 1]
+        { texture: destTexture, origin: { x: 0, y: 0, z: layerIdx } },
+        [cw, ch, 1]
       );
     } catch (e) {
       // Fallback for browsers where the OffscreenCanvas direct upload
       // chokes -- transfer to an ImageBitmap then copy.
       try {
-        const bm = st.canvas.transferToImageBitmap
+        const bm = (typeof st.canvas.transferToImageBitmap === "function")
           ? st.canvas.transferToImageBitmap()
           : null;
-        if (bm) {
-          Visual.device.queue.copyExternalImageToTexture(
-            { source: bm },
-            { texture: targetTex, origin: { x: 0, y: 0, z: entry.layerIdx } },
-            [st.texW, st.texH, 1]
-          );
+        if (!bm) {
+          console.warn("[tektite-graph-pass] canvas copy failed:", e);
+          return false;
         }
-      } catch (e2) { return false; }
+        Visual.device.queue.copyExternalImageToTexture(
+          { source: bm },
+          { texture: destTexture, origin: { x: 0, y: 0, z: layerIdx } },
+          [cw, ch, 1]
+        );
+      } catch (e2) {
+        console.warn("[tektite-graph-pass] bitmap fallback failed:", e2);
+        return false;
+      }
     }
     return true;
   }

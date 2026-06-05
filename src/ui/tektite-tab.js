@@ -139,6 +139,12 @@ async function _tektiteRebuildGraph() {
     }
   });
   s.renderer.start();
+  // Sprint tektite-5c2 -- wire the connector overlay. Renderer fires
+  // viewportListener after every draw (sim ticks, pans, zooms,
+  // hovers); we recompute the line endpoints in lockstep.
+  if (typeof s.renderer.onViewportChange === "function") {
+    s.renderer.onViewportChange(_tektiteUpdateConnector);
+  }
   if (stats) {
     stats.textContent = s.graph.nodes.length + " notes · " + s.graph.edges.length + " links";
   }
@@ -193,6 +199,8 @@ function _tektitePopoutEnsureAttached() {
     ny = Math.max(0, Math.min(hostRect.height - 36, ny));
     popout.style.left = nx + "px";
     popout.style.top  = ny + "px";
+    // Sprint tektite-5c2 -- update connector in lockstep with drag.
+    _tektiteUpdateConnector();
   });
   bar.addEventListener("pointerup", (e) => {
     s.drag = false;
@@ -216,6 +224,9 @@ function _tektitePopoutEnsureAttached() {
   closeBtn.addEventListener("click", () => {
     _tektitePopoutFlush();
     popout.style.display = "none";
+    // Sprint tektite-5c2 -- hide connector when popout closes.
+    const svg = document.getElementById("tektite-graph-connector");
+    if (svg) svg.style.display = "none";
   });
   openBtn.addEventListener("click", async () => {
     await _tektitePopoutFlush();
@@ -238,6 +249,58 @@ function _tektitePopoutSetStatus(text, kind) {
   if (!el) return;
   el.textContent = text || "";
   el.className = "tektite-graph-popout-status" + (kind ? (" " + kind) : "");
+}
+
+/* Sprint tektite-5c2 -- connector line between the source graph node
+ * and the popout editor.  Updates on every renderer draw (subscribed
+ * via onViewportChange) AND on popout drags (manually invoked by the
+ * drag-pointermove handler). */
+function _tektiteUpdateConnector() {
+  const s = _tektiteGraphState;
+  const ps = _tektitePopoutState;
+  const svg     = document.getElementById("tektite-graph-connector");
+  const line    = document.getElementById("tektite-graph-connector-line");
+  const dot     = document.getElementById("tektite-graph-connector-dot");
+  const popout  = document.getElementById("tektite-graph-popout");
+  if (!svg || !line || !dot || !popout) return;
+  if (!ps.noteId || popout.style.display === "none" || !s.renderer ||
+      typeof s.renderer.nodeScreenPos !== "function") {
+    svg.style.display = "none";
+    return;
+  }
+  const np = s.renderer.nodeScreenPos(ps.noteId);
+  if (!np) { svg.style.display = "none"; return; }
+
+  const host = svg.parentElement; // .tektite-graph-host
+  const hostRect = host.getBoundingClientRect();
+  // Map to SVG-local coords.
+  const nx = np.x - hostRect.left;
+  const ny = np.y - hostRect.top;
+
+  // Pick the popout edge anchor closest to the source node.
+  const pRect = popout.getBoundingClientRect();
+  const pLeft   = pRect.left - hostRect.left;
+  const pTop    = pRect.top  - hostRect.top;
+  const pRight  = pLeft + pRect.width;
+  const pBottom = pTop  + pRect.height;
+  const pCx = (pLeft + pRight)  / 2;
+  const pCy = (pTop  + pBottom) / 2;
+  // Clamp anchor to nearest popout edge midpoint.
+  let ax, ay;
+  if (nx < pLeft)        { ax = pLeft;   ay = Math.max(pTop, Math.min(pBottom, ny)); }
+  else if (nx > pRight)  { ax = pRight;  ay = Math.max(pTop, Math.min(pBottom, ny)); }
+  else if (ny < pTop)    { ax = Math.max(pLeft, Math.min(pRight, nx)); ay = pTop;    }
+  else if (ny > pBottom) { ax = Math.max(pLeft, Math.min(pRight, nx)); ay = pBottom; }
+  else                   { ax = pCx; ay = pCy; }  // node is INSIDE popout -- line collapses
+
+  svg.style.display = "block";
+  line.setAttribute("x1", nx);
+  line.setAttribute("y1", ny);
+  line.setAttribute("x2", ax);
+  line.setAttribute("y2", ay);
+  dot.setAttribute("cx", nx);
+  dot.setAttribute("cy", ny);
+  dot.setAttribute("r", Math.max(4, np.nodeRadius * 0.6));
 }
 
 async function _tektitePopoutOpen(noteId) {
@@ -265,6 +328,8 @@ async function _tektitePopoutOpen(noteId) {
     editor.value = "Failed to load: " + (e.message || e);
     _tektitePopoutSetStatus("error", "err");
   }
+  // Sprint tektite-5c2 -- show the connector to the source node.
+  _tektiteUpdateConnector();
 }
 
 async function _tektitePopoutFlush() {
@@ -806,6 +871,19 @@ function tektiteTabAttach() {
   // Sprint tektite-5b -- graph view modal.
   const graphBtn = document.getElementById("btn-tektite-graph");
   if (graphBtn) graphBtn.addEventListener("click", () => _tektiteOpenGraphModal());
+
+  // Sprint tektite-5c2 -- main editor minimize. Toggles the
+  // `editor-minimized` class on the editor pane; CSS handles the
+  // collapse + restore. Button text flips between "— Hide" and
+  // "▢ Show" so the user can tell what clicking will do next.
+  const editorMinBtn = document.getElementById("btn-tektite-editor-min");
+  if (editorMinBtn) editorMinBtn.addEventListener("click", () => {
+    const pane = document.getElementById("tektite-editor-pane");
+    if (!pane) return;
+    pane.classList.toggle("editor-minimized");
+    editorMinBtn.textContent = pane.classList.contains("editor-minimized")
+      ? "▢ Show" : "— Hide";
+  });
   const graphCloseBtn = document.getElementById("btn-tektite-graph-close");
   if (graphCloseBtn) graphCloseBtn.addEventListener("click", () => _tektiteCloseGraphModal());
   document.addEventListener("keydown", (e) => {

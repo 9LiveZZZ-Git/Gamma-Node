@@ -44,39 +44,48 @@ function _encodeShaderFragPassForPlan(enc, entry, dtSec) {
   // Phase C sprint tektite-5c1 -- tektite-graph branch: copy the
   // node's per-frame 2D canvas (drawn by tickTektiteGraphTextures in
   // src/tektite/graph-texture.js) directly into the assigned
-  // framebuffer / scratch layer. Same model as ai-vision-canvas --
-  // bypass the shader pipeline and queue a copyExternalImageToTexture.
-  // The canvas dimensions are sized to match Visual.fbWidth/fbHeight
-  // by the tick so the copy lands cleanly.
+  // framebuffer / scratch layer. Same model as ai-vision-canvas
+  // below -- bypass the shader pipeline and queue a
+  // copyExternalImageToTexture. Dimensions clamped to fb size to
+  // tolerate temporary mismatches (e.g. first frame before the tick
+  // has resized the canvas to match Visual.fbWidth/Height).
   if (def.kind === "tektite-graph") {
     if (typeof _tektiteGraphTexState === "undefined") return false;
     const st = _tektiteGraphTexState.get(node.id);
     if (!st || !st.canvas) return false;
-    const targetTex = entry.isScratch
-      ? (entry.writeKey === "a" ? Visual.scratchTextureA : Visual.scratchTextureB)
+    const destTexture = isScratch
+      ? (writeKey === "a" ? Visual.scratchTextureA : Visual.scratchTextureB)
       : Visual.framebuffer;
-    if (!targetTex) return false;
+    if (!destTexture) return false;
+    const cw = Math.min(st.canvas.width  || 0, Visual.fbWidth);
+    const ch = Math.min(st.canvas.height || 0, Visual.fbHeight);
+    if (cw === 0 || ch === 0) return false;
     try {
       Visual.device.queue.copyExternalImageToTexture(
         { source: st.canvas, flipY: false },
-        { texture: targetTex, origin: { x: 0, y: 0, z: entry.layerIdx } },
-        [st.texW, st.texH, 1]
+        { texture: destTexture, origin: { x: 0, y: 0, z: layerIdx } },
+        [cw, ch, 1]
       );
     } catch (e) {
       // Fallback for browsers where the OffscreenCanvas direct upload
       // chokes -- transfer to an ImageBitmap then copy.
       try {
-        const bm = st.canvas.transferToImageBitmap
+        const bm = (typeof st.canvas.transferToImageBitmap === "function")
           ? st.canvas.transferToImageBitmap()
           : null;
-        if (bm) {
-          Visual.device.queue.copyExternalImageToTexture(
-            { source: bm },
-            { texture: targetTex, origin: { x: 0, y: 0, z: entry.layerIdx } },
-            [st.texW, st.texH, 1]
-          );
+        if (!bm) {
+          console.warn("[tektite-graph-pass] canvas copy failed:", e);
+          return false;
         }
-      } catch (e2) { return false; }
+        Visual.device.queue.copyExternalImageToTexture(
+          { source: bm },
+          { texture: destTexture, origin: { x: 0, y: 0, z: layerIdx } },
+          [cw, ch, 1]
+        );
+      } catch (e2) {
+        console.warn("[tektite-graph-pass] bitmap fallback failed:", e2);
+        return false;
+      }
     }
     return true;
   }
