@@ -93,23 +93,47 @@ async function tektiteEmbedText(text) {
   return v;
 }
 
-/* Single-note get with cache. */
+/* Single-note get with cache.  Sprint 10z -- falls back to attachment
+ * metadata when noteId names an attachment instead of a note (no
+ * markdown content available for binary files, so we embed
+ * "filename kind ext" as a coarse semantic signature). */
 async function tektiteEmbeddingsGet(noteId) {
   if (!noteId) return new Float32Array(TEKTITE_EMB_DIM);
   const note = await tektiteGetNote(noteId);
-  if (!note) return new Float32Array(TEKTITE_EMB_DIM);
-  const cached = await _tektiteEmbCacheGet(noteId);
-  if (cached && cached.modifiedAt >= (note.modifiedAt || 0) && cached.vector) {
-    // Stored as plain array in some browsers; coerce to Float32Array.
-    return cached.vector instanceof Float32Array ? cached.vector : new Float32Array(cached.vector);
+  if (note) {
+    const cached = await _tektiteEmbCacheGet(noteId);
+    if (cached && cached.modifiedAt >= (note.modifiedAt || 0) && cached.vector) {
+      return cached.vector instanceof Float32Array ? cached.vector : new Float32Array(cached.vector);
+    }
+    const vec = await tektiteEmbedText((note.title || "") + " " + (note.content || ""));
+    await _tektiteEmbCachePut({
+      id:         noteId,
+      vector:     vec,
+      modifiedAt: note.modifiedAt || Date.now()
+    });
+    return vec;
   }
-  const vec = await tektiteEmbedText((note.title || "") + " " + (note.content || ""));
-  await _tektiteEmbCachePut({
-    id:         noteId,
-    vector:     vec,
-    modifiedAt: note.modifiedAt || Date.now()
-  });
-  return vec;
+  // No note -> maybe an attachment.
+  if (typeof tektiteGetAttachment === "function") {
+    try {
+      const att = await tektiteGetAttachment(noteId);
+      if (att) {
+        const cached = await _tektiteEmbCacheGet(noteId);
+        if (cached && cached.modifiedAt >= (att.modifiedAt || 0) && cached.vector) {
+          return cached.vector instanceof Float32Array ? cached.vector : new Float32Array(cached.vector);
+        }
+        const text = [att.id || "", att.kind || "", att.ext || "", att.mime || ""].join(" ");
+        const vec  = await tektiteEmbedText(text);
+        await _tektiteEmbCachePut({
+          id:         noteId,
+          vector:     vec,
+          modifiedAt: att.modifiedAt || Date.now()
+        });
+        return vec;
+      }
+    } catch (_) {}
+  }
+  return new Float32Array(TEKTITE_EMB_DIM);
 }
 
 /* Bulk path: ensures every id in `ids` has an up-to-date embedding.

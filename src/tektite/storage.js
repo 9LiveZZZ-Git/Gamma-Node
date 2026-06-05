@@ -388,6 +388,15 @@ async function tektiteListAttachments() {
 }
 
 async function tektiteDeleteAttachment(id) {
+  // Sprint 10z -- if the record is server-backed, also DELETE on the
+  // server so we don't strand orphaned files there.  Best-effort:
+  // server failure shouldn't block the local IDB cleanup.
+  let rec = null;
+  try { rec = await tektiteGetAttachment(id); } catch (_) {}
+  if (rec && rec.backing === "server") {
+    try { await tektiteVaultServerDelete(id); }
+    catch (e) { console.warn("[tektite-vault] server delete failed for", id, e.message); }
+  }
   const db = await tektiteVaultOpen();
   const tx = db.transaction(TEKTITE_ATTACHMENTS_STORE, "readwrite");
   tx.objectStore(TEKTITE_ATTACHMENTS_STORE).delete(id);
@@ -426,19 +435,19 @@ function _tektiteVaultServerUrl() {
   return "";
 }
 
-/* POST a Blob to the compile server's vault endpoint.  Endpoint shape
- * documented in docs/ROADMAP.md §13.6 -- POST <server>/vault/upload
- * with multipart/form-data: { id, file } -> returns { url, size }. */
+/* PUT a Blob to the compile server's vault endpoint.  Server side
+ * documented in gamma-compile-server/src/vault-route.js.  PUT raw-
+ * body is simpler than multipart (no extra Node deps) and matches the
+ * existing /assets/import pattern. */
 async function tektiteVaultServerUpload(id, blob) {
   const base = _tektiteVaultServerUrl();
   if (!base) throw new Error("No compile server URL configured in AI settings.");
-  const fd = new FormData();
-  fd.append("id", String(id));
-  fd.append("file", blob, String(id));
-  const r = await fetch(base + "/vault/upload", {
-    method: "POST",
-    body:   fd,
-    mode:   "cors"
+  const path = String(id).replace(/^\/+/, "");
+  const r = await fetch(base + "/vault/file/" + encodeURI(path), {
+    method:  "PUT",
+    body:    blob,
+    headers: { "Content-Type": blob.type || "application/octet-stream" },
+    mode:    "cors"
   });
   if (!r.ok) throw new Error("Server upload failed: HTTP " + r.status);
   const j = await r.json();
@@ -452,6 +461,30 @@ async function tektiteVaultServerFetch(url) {
   const r = await fetch(url, { mode: "cors" });
   if (!r.ok) throw new Error("Server fetch failed: HTTP " + r.status);
   return await r.blob();
+}
+
+/* List server-side vault files (metadata only).  Used by the
+ * DevTools menu to compare local IDB usage vs server usage. */
+async function tektiteVaultServerList(prefix) {
+  const base = _tektiteVaultServerUrl();
+  if (!base) return [];
+  const r = await fetch(base + "/vault/list" + (prefix ? "?prefix=" + encodeURIComponent(prefix) : ""), {
+    mode: "cors"
+  });
+  if (!r.ok) throw new Error("Server list failed: HTTP " + r.status);
+  const j = await r.json();
+  return (j && j.files) || [];
+}
+
+async function tektiteVaultServerDelete(id) {
+  const base = _tektiteVaultServerUrl();
+  if (!base) throw new Error("No compile server URL configured.");
+  const path = String(id).replace(/^\/+/, "");
+  const r = await fetch(base + "/vault/file/" + encodeURI(path), {
+    method: "DELETE",
+    mode:   "cors"
+  });
+  if (!r.ok && r.status !== 404) throw new Error("Server delete failed: HTTP " + r.status);
 }
 
 async function tektiteImportFile(file) {

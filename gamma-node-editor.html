@@ -60380,6 +60380,15 @@ async function tektiteListAttachments() {
 }
 
 async function tektiteDeleteAttachment(id) {
+  // Sprint 10z -- if the record is server-backed, also DELETE on the
+  // server so we don't strand orphaned files there.  Best-effort:
+  // server failure shouldn't block the local IDB cleanup.
+  let rec = null;
+  try { rec = await tektiteGetAttachment(id); } catch (_) {}
+  if (rec && rec.backing === "server") {
+    try { await tektiteVaultServerDelete(id); }
+    catch (e) { console.warn("[tektite-vault] server delete failed for", id, e.message); }
+  }
   const db = await tektiteVaultOpen();
   const tx = db.transaction(TEKTITE_ATTACHMENTS_STORE, "readwrite");
   tx.objectStore(TEKTITE_ATTACHMENTS_STORE).delete(id);
@@ -60418,19 +60427,19 @@ function _tektiteVaultServerUrl() {
   return "";
 }
 
-/* POST a Blob to the compile server's vault endpoint.  Endpoint shape
- * documented in docs/ROADMAP.md §13.6 -- POST <server>/vault/upload
- * with multipart/form-data: { id, file } -> returns { url, size }. */
+/* PUT a Blob to the compile server's vault endpoint.  Server side
+ * documented in gamma-compile-server/src/vault-route.js.  PUT raw-
+ * body is simpler than multipart (no extra Node deps) and matches the
+ * existing /assets/import pattern. */
 async function tektiteVaultServerUpload(id, blob) {
   const base = _tektiteVaultServerUrl();
   if (!base) throw new Error("No compile server URL configured in AI settings.");
-  const fd = new FormData();
-  fd.append("id", String(id));
-  fd.append("file", blob, String(id));
-  const r = await fetch(base + "/vault/upload", {
-    method: "POST",
-    body:   fd,
-    mode:   "cors"
+  const path = String(id).replace(/^\/+/, "");
+  const r = await fetch(base + "/vault/file/" + encodeURI(path), {
+    method:  "PUT",
+    body:    blob,
+    headers: { "Content-Type": blob.type || "application/octet-stream" },
+    mode:    "cors"
   });
   if (!r.ok) throw new Error("Server upload failed: HTTP " + r.status);
   const j = await r.json();
@@ -60444,6 +60453,30 @@ async function tektiteVaultServerFetch(url) {
   const r = await fetch(url, { mode: "cors" });
   if (!r.ok) throw new Error("Server fetch failed: HTTP " + r.status);
   return await r.blob();
+}
+
+/* List server-side vault files (metadata only).  Used by the
+ * DevTools menu to compare local IDB usage vs server usage. */
+async function tektiteVaultServerList(prefix) {
+  const base = _tektiteVaultServerUrl();
+  if (!base) return [];
+  const r = await fetch(base + "/vault/list" + (prefix ? "?prefix=" + encodeURIComponent(prefix) : ""), {
+    mode: "cors"
+  });
+  if (!r.ok) throw new Error("Server list failed: HTTP " + r.status);
+  const j = await r.json();
+  return (j && j.files) || [];
+}
+
+async function tektiteVaultServerDelete(id) {
+  const base = _tektiteVaultServerUrl();
+  if (!base) throw new Error("No compile server URL configured.");
+  const path = String(id).replace(/^\/+/, "");
+  const r = await fetch(base + "/vault/file/" + encodeURI(path), {
+    method: "DELETE",
+    mode:   "cors"
+  });
+  if (!r.ok && r.status !== 404) throw new Error("Server delete failed: HTTP " + r.status);
 }
 
 async function tektiteImportFile(file) {
@@ -62085,23 +62118,47 @@ async function tektiteEmbedText(text) {
   return v;
 }
 
-/* Single-note get with cache. */
+/* Single-note get with cache.  Sprint 10z -- falls back to attachment
+ * metadata when noteId names an attachment instead of a note (no
+ * markdown content available for binary files, so we embed
+ * "filename kind ext" as a coarse semantic signature). */
 async function tektiteEmbeddingsGet(noteId) {
   if (!noteId) return new Float32Array(TEKTITE_EMB_DIM);
   const note = await tektiteGetNote(noteId);
-  if (!note) return new Float32Array(TEKTITE_EMB_DIM);
-  const cached = await _tektiteEmbCacheGet(noteId);
-  if (cached && cached.modifiedAt >= (note.modifiedAt || 0) && cached.vector) {
-    // Stored as plain array in some browsers; coerce to Float32Array.
-    return cached.vector instanceof Float32Array ? cached.vector : new Float32Array(cached.vector);
+  if (note) {
+    const cached = await _tektiteEmbCacheGet(noteId);
+    if (cached && cached.modifiedAt >= (note.modifiedAt || 0) && cached.vector) {
+      return cached.vector instanceof Float32Array ? cached.vector : new Float32Array(cached.vector);
+    }
+    const vec = await tektiteEmbedText((note.title || "") + " " + (note.content || ""));
+    await _tektiteEmbCachePut({
+      id:         noteId,
+      vector:     vec,
+      modifiedAt: note.modifiedAt || Date.now()
+    });
+    return vec;
   }
-  const vec = await tektiteEmbedText((note.title || "") + " " + (note.content || ""));
-  await _tektiteEmbCachePut({
-    id:         noteId,
-    vector:     vec,
-    modifiedAt: note.modifiedAt || Date.now()
-  });
-  return vec;
+  // No note -> maybe an attachment.
+  if (typeof tektiteGetAttachment === "function") {
+    try {
+      const att = await tektiteGetAttachment(noteId);
+      if (att) {
+        const cached = await _tektiteEmbCacheGet(noteId);
+        if (cached && cached.modifiedAt >= (att.modifiedAt || 0) && cached.vector) {
+          return cached.vector instanceof Float32Array ? cached.vector : new Float32Array(cached.vector);
+        }
+        const text = [att.id || "", att.kind || "", att.ext || "", att.mime || ""].join(" ");
+        const vec  = await tektiteEmbedText(text);
+        await _tektiteEmbCachePut({
+          id:         noteId,
+          vector:     vec,
+          modifiedAt: att.modifiedAt || Date.now()
+        });
+        return vec;
+      }
+    } catch (_) {}
+  }
+  return new Float32Array(TEKTITE_EMB_DIM);
 }
 
 /* Bulk path: ensures every id in `ids` has an up-to-date embedding.
@@ -63480,7 +63537,47 @@ async function tektiteGraphBuild(opts) {
   const minDegree = Number.isFinite(opts.minDegree) ? Math.max(0, opts.minDegree | 0) : 0;
   const centerId  = opts.centerId || null;
 
-  const all = await tektiteListNotes();
+  const allNotes = await tektiteListNotes();
+  /* Sprint 10z -- merge ATTACHMENTS into the graph build so the
+   * tag-aware / kanban / timeline / calendar / geo layouts see
+   * every file the vault holds, not just markdown notes.
+   * Attachments synthesize a couple of tag-like fields so they
+   * cluster meaningfully in tagcloud + kanban. */
+  let attachments = [];
+  try {
+    if (typeof tektiteListAttachments === "function") {
+      attachments = await tektiteListAttachments();
+    }
+  } catch (_) {}
+  const all = allNotes.slice();
+  for (const a of attachments) {
+    // Decorate as a note-like record so the wikilink + frontmatter
+    // passes below treat them uniformly.  Synthesized tags: the
+    // file KIND + the EXT (without the dot).
+    const synthTags = [];
+    if (a.kind) synthTags.push(a.kind);
+    if (a.ext)  synthTags.push(String(a.ext).replace(/^\./, ""));
+    all.push({
+      id:         a.id,
+      title:      a.id,
+      content:    "",        // binaries have no wikilink-bearing text
+      modifiedAt: a.modifiedAt || 0,
+      createdAt:  a.createdAt  || 0,
+      // Frontmatter shim so the kanban/tagcloud/geo passes find data.
+      _attachmentKind: a.kind || "other",
+      _attachmentExt:  a.ext  || "",
+      _attachmentSize: a.size || 0,
+      _attachmentMime: a.mime || "",
+      _isAttachment:   true,
+      _synthFrontmatter: {
+        tags:   synthTags,
+        kind:   a.kind || "other",
+        status: a.kind || "other",
+        size:   a.size || 0,
+        mime:   a.mime || ""
+      }
+    });
+  }
   const idIndex = new Map();      // id -> note record
   const titleIndex = new Map();   // lowercased title -> id
   for (const n of all) {
@@ -63579,9 +63676,15 @@ async function tektiteGraphBuild(opts) {
     // Sprint 7 -- pluck frontmatter so kanban / geo / tagcloud have
     // their drive fields.  Cheap synchronous parse; falls back to
     // empty object when no frontmatter helper is loaded yet.
+    // Sprint 10z -- attachments shim a synthetic frontmatter built
+    // from their kind/ext/size so they cluster meaningfully in the
+    // tag-aware layouts even though they have no real text content.
     let fm = {};
     if (n && n.content && typeof tektiteParseFrontmatter === "function") {
       try { fm = tektiteParseFrontmatter(n.content).frontmatter || {}; } catch (_) {}
+    }
+    if (n && n._isAttachment && n._synthFrontmatter) {
+      fm = { ...n._synthFrontmatter, ...fm };  // real fm wins if both
     }
     nodes.push({
       id,
@@ -63598,6 +63701,11 @@ async function tektiteGraphBuild(opts) {
       createdAt:  (n && n.createdAt)  || 0,
       // Sprint 7 -- frontmatter for kanban / geo / tagcloud layouts.
       frontmatter: fm,
+      // Sprint 10z -- attachment markers so the renderer can color
+      // binary files differently from notes.
+      _isAttachment:    !!(n && n._isAttachment),
+      _attachmentKind:  (n && n._attachmentKind) || null,
+      _attachmentExt:   (n && n._attachmentExt)  || null,
       _depth: 0
     });
     idToIdx.set(id, i++);
@@ -64366,11 +64474,24 @@ function tektiteGraphRenderer(canvas, graph, opts) {
       const alpha = 0.45 + Math.max(0, (1 + depth) * 0.30);   // 0.45-1.05 clamped
       const isSel   = (selectedId === n.id);
       const isHover = (hoverIdx === i);
+      // Sprint 10z -- attachments get a distinct hue per kind so
+      // the kanban / tagcloud / etc. layouts visually communicate
+      // what kind of file each dot represents.
+      const kindHue = {
+        image: 30, audio: 280, video: 200, pdf: 0,  doc: 220,
+        data:  140, code:  60, html:    90, text: 180, archive: 320,
+        patch: 100, dsp:   40
+      };
+      let baseColor = "rgba(131, 232, 255, " + Math.min(1, alpha) + ")";
+      if (n._isAttachment) {
+        const h = kindHue[n._attachmentKind] != null ? kindHue[n._attachmentKind] : 200;
+        baseColor = "hsla(" + h + ", 65%, 60%, " + Math.min(1, alpha) + ")";
+      }
       ctx.beginPath();
       ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
       ctx.fillStyle = isSel   ? "#c8e85a"
                     : isHover ? "#9bd0ff"
-                    : "rgba(131, 232, 255, " + Math.min(1, alpha) + ")";
+                    : baseColor;
       ctx.fill();
       if (isSel || isHover) {
         ctx.strokeStyle = isSel ? "#c8e85a" : "#9bd0ff";
