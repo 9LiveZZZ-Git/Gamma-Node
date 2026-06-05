@@ -75,14 +75,26 @@ async function _tektiteOpenGraphModal() {
   // anonymous lambdas so they pile up. Track wiredOnce to bail.).
   if (!s.wiredOnce) {
     s.wiredOnce = true;
-    document.querySelectorAll(".tektite-graph-mode-btn").forEach(btn => {
-      btn.addEventListener("click", () => {
-        s.mode = btn.getAttribute("data-graph-mode") || "global";
-        document.querySelectorAll(".tektite-graph-mode-btn").forEach(b =>
-          b.classList.toggle("active", b === btn));
+    // Sprint 10s -- mode selector is now a native <select>.  Falls
+    // back to the old class-based buttons if the select isn't there
+    // (e.g. legacy embedded HTML).
+    const modeSel = document.getElementById("tektite-graph-mode-select");
+    if (modeSel) {
+      modeSel.value = s.mode || "global";
+      modeSel.addEventListener("change", () => {
+        s.mode = modeSel.value || "global";
         _tektiteRebuildGraph();
       });
-    });
+    } else {
+      document.querySelectorAll(".tektite-graph-mode-btn").forEach(btn => {
+        btn.addEventListener("click", () => {
+          s.mode = btn.getAttribute("data-graph-mode") || "global";
+          document.querySelectorAll(".tektite-graph-mode-btn").forEach(b =>
+            b.classList.toggle("active", b === btn));
+          _tektiteRebuildGraph();
+        });
+      });
+    }
     const depthEl   = document.getElementById("tektite-graph-depth");
     const depthVal  = document.getElementById("tektite-graph-depth-val");
     if (depthEl) depthEl.addEventListener("input", () => {
@@ -101,18 +113,31 @@ async function _tektiteOpenGraphModal() {
     if (recenter) recenter.addEventListener("click", () => {
       if (s.renderer) s.renderer.recenter();
     });
-    // Sprint tektite-5 -- layout switcher (force / tree / radial / sunburst).
-    document.querySelectorAll(".tektite-graph-layout-btn").forEach(btn => {
-      btn.addEventListener("click", () => {
-        const mode = btn.getAttribute("data-graph-layout") || "force";
+    // Sprint 10s -- layout selector consolidated into one <select>
+    // with 3 optgroups (Structural / Semantic+Time / Specialized).
+    const layoutSel = document.getElementById("tektite-graph-layout-select");
+    if (layoutSel) {
+      layoutSel.value = s.layout || "force";
+      layoutSel.addEventListener("change", () => {
+        const mode = layoutSel.value || "force";
         s.layout = mode;
-        document.querySelectorAll(".tektite-graph-layout-btn").forEach(b =>
-          b.classList.toggle("active", b === btn));
         if (s.renderer && typeof s.renderer.setLayout === "function") {
           s.renderer.setLayout(mode);
         }
       });
-    });
+    } else {
+      document.querySelectorAll(".tektite-graph-layout-btn").forEach(btn => {
+        btn.addEventListener("click", () => {
+          const mode = btn.getAttribute("data-graph-layout") || "force";
+          s.layout = mode;
+          document.querySelectorAll(".tektite-graph-layout-btn").forEach(b =>
+            b.classList.toggle("active", b === btn));
+          if (s.renderer && typeof s.renderer.setLayout === "function") {
+            s.renderer.setLayout(mode);
+          }
+        });
+      });
+    }
     // Sprint 10e-fix: close button wired here so the modal can be
     // opened from places OTHER than tektiteTabAttach (e.g. the
     // GraphCard's ⛶ expand button). Previously this wiring lived

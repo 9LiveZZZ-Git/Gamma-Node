@@ -221,6 +221,8 @@ function _tektiteCardEnsureBody(node, st) {
     st.graphResizeObs  = null;
     st.graphCanvas     = null;
     st.graphModeEl     = null;
+    st.graphModeSel    = null;
+    st.graphLayoutSel  = null;
     st.graphStatsEl    = null;
     st.graphExpandBtn  = null;
     st.graphConfigHash = "";
@@ -885,41 +887,77 @@ async function _renderGraphCardBody(node, st) {
     // Sprint 10e-fix: mark the render layer so CSS can flex-fill the
     // canvas (no fixed 220 px height anymore).
     st.renderEl.classList.add("tektite-card-graph-render");
+    // Sprint 10s -- two native <select>s instead of a single chip,
+    // matching the modal's mode + layout dropdowns.
     st.renderEl.innerHTML =
       '<div class="tektite-card-graph-bar">' +
-        '<span class="tektite-card-graph-mode" data-act="mode-toggle" title="Toggle global / local mode">' +
-          String(node.params.mode || "global") +
-        '</span>' +
+        '<select class="tektite-card-graph-mode-sel" title="Scope">' +
+          '<option value="global">Global</option>' +
+          '<option value="local">Local</option>' +
+        '</select>' +
+        '<select class="tektite-card-graph-layout-sel" title="Layout">' +
+          '<optgroup label="Structural">' +
+            '<option value="force">⚛ Force</option>' +
+            '<option value="tree">⊥ Tree</option>' +
+            '<option value="radial">◎ Radial</option>' +
+            '<option value="sunburst">☀ Sunburst</option>' +
+          '</optgroup>' +
+          '<optgroup label="Semantic + Time">' +
+            '<option value="embedding-2d">✨ Embed 2D</option>' +
+            '<option value="galaxy">🌌 Galaxy</option>' +
+            '<option value="timeline">⏵ Timeline</option>' +
+            '<option value="calendar">▦ Calendar</option>' +
+          '</optgroup>' +
+          '<optgroup label="Specialized">' +
+            '<option value="matrix">▤ Matrix</option>' +
+            '<option value="chord">⌬ Chord</option>' +
+            '<option value="sankey">⇶ Sankey</option>' +
+            '<option value="tagcloud">☁ Tags</option>' +
+            '<option value="geo">🌍 Geo</option>' +
+            '<option value="kanban">▥ Kanban</option>' +
+          '</optgroup>' +
+        '</select>' +
         '<span class="tektite-card-graph-stats">…</span>' +
         '<button class="tektite-card-graph-expand" data-act="expand" type="button" title="Open in full 🕸 Graph modal">⛶</button>' +
       '</div>' +
       '<canvas class="tektite-card-graph-canvas"></canvas>';
     st.graphCanvas    = st.renderEl.querySelector(".tektite-card-graph-canvas");
-    st.graphModeEl    = st.renderEl.querySelector(".tektite-card-graph-mode");
+    st.graphModeSel   = st.renderEl.querySelector(".tektite-card-graph-mode-sel");
+    st.graphLayoutSel = st.renderEl.querySelector(".tektite-card-graph-layout-sel");
     st.graphStatsEl   = st.renderEl.querySelector(".tektite-card-graph-stats");
     st.graphExpandBtn = st.renderEl.querySelector(".tektite-card-graph-expand");
-    // Expand: open the full-screen modal anchored on this card's centerId.
+    st.graphModeSel.value   = String(node.params.mode   || "global");
+    st.graphLayoutSel.value = String(node.params.layout || "force");
+    // Expand: open the full-screen modal anchored on this card's config.
     st.graphExpandBtn.addEventListener("pointerdown", (e) => e.stopPropagation());
     st.graphExpandBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       if (typeof _tektiteOpenGraphModal === "function") {
-        // Hand off the card's config to the modal state before opening.
         if (typeof _tektiteGraphState !== "undefined" && _tektiteGraphState) {
           _tektiteGraphState.mode   = String(node.params.mode    || "global");
+          _tektiteGraphState.layout = String(node.params.layout  || "force");
           _tektiteGraphState.depth  = Number(node.params.depth)  || 2;
           _tektiteGraphState.minDeg = Number(node.params.minDegree) || 0;
         }
         _tektiteOpenGraphModal();
       }
     });
-    // Mode chip toggles global <-> local on click.
-    st.graphModeEl.addEventListener("pointerdown", (e) => e.stopPropagation());
-    st.graphModeEl.addEventListener("click", (e) => {
-      e.stopPropagation();
+    // Mode + layout selectors -> update params + force a rebuild.
+    st.graphModeSel.addEventListener("pointerdown", (e) => e.stopPropagation());
+    st.graphLayoutSel.addEventListener("pointerdown", (e) => e.stopPropagation());
+    st.graphModeSel.addEventListener("change", () => {
       node.params = node.params || {};
-      node.params.mode = (node.params.mode === "global") ? "local" : "global";
-      st.graphModeEl.textContent = node.params.mode;
-      st.graphConfigHash = "";  // force rebuild on next tick
+      node.params.mode = st.graphModeSel.value || "global";
+      st.graphConfigHash = "";
+    });
+    st.graphLayoutSel.addEventListener("change", () => {
+      node.params = node.params || {};
+      node.params.layout = st.graphLayoutSel.value || "force";
+      // Apply layout WITHOUT a full rebuild -- cheap when the layout
+      // changes while scope stays the same.
+      if (st.graphRenderer && typeof st.graphRenderer.setLayout === "function") {
+        st.graphRenderer.setLayout(node.params.layout);
+      }
     });
     // Sprint 10e-fix: ResizeObserver re-fits the graph as the user
     // drags the card's resize grip. Cheap (one rAF per size change).
@@ -934,9 +972,19 @@ async function _renderGraphCardBody(node, st) {
   }
   // Detect param changes and rebuild the graph + renderer when needed.
   const mode      = String((node.params && node.params.mode)      || "global");
+  const layout    = String((node.params && node.params.layout)    || "force");
   const depth     = Number((node.params && node.params.depth))     || 2;
   const minDegree = Number((node.params && node.params.minDegree)) || 0;
   const centerId  = String((node.params && node.params.centerId)  || "");
+  // Sprint 10s -- keep the dropdowns synced when the props pane edits
+  // params directly (avoids stale display vs actual layout).
+  if (st.graphModeSel   && st.graphModeSel.value   !== mode)   st.graphModeSel.value   = mode;
+  if (st.graphLayoutSel && st.graphLayoutSel.value !== layout) {
+    st.graphLayoutSel.value = layout;
+    if (st.graphRenderer && typeof st.graphRenderer.setLayout === "function") {
+      st.graphRenderer.setLayout(layout);
+    }
+  }
   const cfgHash = "G:" + mode + ":" + depth + ":" + minDegree + ":" + centerId;
   if (cfgHash !== st.graphConfigHash && !st.graphBuilding) {
     st.graphBuilding = true;
@@ -955,6 +1003,7 @@ async function _renderGraphCardBody(node, st) {
       }
       st.graphRenderer = tektiteGraphRenderer(st.graphCanvas, graph, {
         selectedId: resolvedCenter,
+        layout: String((node.params && node.params.layout) || "force"),
         onNodeClick: (id) => {
           // Click -> open popout (matches modal behavior).
           if (typeof _tektitePopoutOpen === "function") _tektitePopoutOpen(id);

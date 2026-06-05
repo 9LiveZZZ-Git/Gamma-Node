@@ -20066,6 +20066,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     ],
     params: {
       mode:      "global",
+      // Sprint 10s -- layout matches the modal's 14 layouts.
+      layout:    "force",
       depth:     2,
       minDegree: 0,
       centerId:  "",
@@ -20074,10 +20076,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       color:     ""
     },
     paramOptions: {
-      mode:  ["global", "local"],
-      color: ["", "1", "2", "3", "4", "5", "6"]
+      mode:   ["global", "local"],
+      layout: [
+        "force", "tree", "radial", "sunburst",
+        "embedding-2d", "galaxy", "timeline", "calendar",
+        "matrix", "chord", "sankey", "tagcloud", "geo", "kanban"
+      ],
+      color:  ["", "1", "2", "3", "4", "5", "6"]
     },
-    description: "Phase C sprint tektite-10e -- live force-directed view of the vault graph as a card. Click a graph node to open it in a popout. Click the ⛶ button to expand to the full 🕸 Graph modal. `mode=local` centers on `centerId` (or the currently selected note if blank) within `depth` hops; `mode=global` walks the entire vault with optional `minDegree` filter. Outputs `selectedId` (the clicked note's id) so downstream cards / LLM nodes can react to selection."
+    description: "Phase C sprint tektite-10e + 10s -- live view of the vault graph as a card. Both scope (global/local) and layout (all 14: force / tree / radial / sunburst / embedding-2d / galaxy / timeline / calendar / matrix / chord / sankey / tagcloud / geo / kanban) are dropdowns on the card; ⛶ expands to the full 🕸 Graph modal with the same config. Click a graph node to open it in a popout. Outputs `selectedId` (the clicked note's id) so downstream cards / LLM nodes can react to selection."
   },
 
   /* Phase C sprint tektite-10m -- CanvasCard.  Wraps a legacy Tektite

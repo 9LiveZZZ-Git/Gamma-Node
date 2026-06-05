@@ -204,9 +204,27 @@ async function tektiteSourceListNotes(sourceId) {
   if (!src) return [];
   if (src.type === "vault") {
     const notes = await tektiteListNotes();
-    return notes.map(n => ({
-      id: n.id, title: n.title || n.id, path: n.id, modifiedAt: n.modifiedAt, sourceId: "vault"
+    let merged = notes.map(n => ({
+      id: n.id, title: n.title || n.id, path: n.id,
+      modifiedAt: n.modifiedAt, sourceId: "vault", kind: "note"
     }));
+    // Sprint 10t -- merge attachments into the vault listing so binary
+    // files show up next to markdown notes.  The viewer dispatches by
+    // kind on click.
+    if (typeof tektiteListAttachments === "function") {
+      try {
+        const atts = await tektiteListAttachments();
+        for (const a of atts) {
+          merged.push({
+            id: a.id, title: a.id, path: a.id,
+            modifiedAt: a.modifiedAt, sourceId: "vault",
+            kind: a.kind || "attachment", ext: a.ext, size: a.size, mime: a.mime
+          });
+        }
+        merged.sort((x, y) => (y.modifiedAt || 0) - (x.modifiedAt || 0));
+      } catch (_) {}
+    }
+    return merged;
   }
   if (src.type === "local-fs") {
     if (!src.handle) throw new Error("Source disconnected. Remove and re-add to reconnect.");

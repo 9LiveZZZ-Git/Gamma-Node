@@ -395,3 +395,224 @@ document.addEventListener("pointerdown", (e) => {
     _tektiteWireMenus();
   }
 })();
+
+/* =========================================================================
+ * Sprint 10t -- attachment viewers in the popout + Tektite tab drop-zone.
+ *
+ * Lifecycle inside a popout: the attachment viewer mounts lazily as a
+ * sibling of the CM editor; when a tab loads an attachment id, the
+ * markdown editor + preview hide and the viewer takes over.  Tab
+ * switching back to a markdown note re-shows the editor.
+ * ======================================================================== */
+
+function _tektiteAttachmentExtensions() {
+  // Flat union of every recognized extension for drop-classify fast paths.
+  const out = new Set();
+  if (typeof TEKTITE_FILE_KINDS !== "object") return out;
+  for (const kind of Object.keys(TEKTITE_FILE_KINDS)) {
+    for (const ext of TEKTITE_FILE_KINDS[kind]) out.add(ext);
+  }
+  return out;
+}
+
+function _tektiteIsAttachmentId(id) {
+  const lower = String(id || "").toLowerCase();
+  for (const ext of _tektiteAttachmentExtensions()) {
+    if (lower.endsWith(ext)) return true;
+  }
+  return false;
+}
+
+function _tektitePopoutEnsureViewerEl(inst) {
+  if (!inst || !inst.dom) return null;
+  const surface = inst.dom.querySelector(".tektite-popout-edit-surface");
+  if (!surface) return null;
+  let viewer = surface.querySelector(".tektite-popout-attachment-viewer");
+  if (!viewer) {
+    viewer = document.createElement("div");
+    viewer.className = "tektite-popout-attachment-viewer";
+    viewer.style.display = "none";
+    surface.appendChild(viewer);
+  }
+  return viewer;
+}
+
+function _tektitePopoutShowMarkdownLayer(inst) {
+  if (!inst || !inst.dom) return;
+  const cm = inst.dom.querySelector(".tektite-popout-cm-host");
+  const ta = inst.dom.querySelector(".tektite-graph-popout-editor");
+  const pv = inst.dom.querySelector(".tektite-popout-preview");
+  const viewer = inst.dom.querySelector(".tektite-popout-attachment-viewer");
+  if (cm) cm.style.display     = "";
+  if (ta && inst.cm) ta.style.display = "none";
+  else if (ta) ta.style.display       = "";
+  if (pv) pv.style.display     = "";
+  if (viewer) {
+    viewer.style.display = "none";
+    if (inst._attachmentBlobUrl) {
+      URL.revokeObjectURL(inst._attachmentBlobUrl);
+      inst._attachmentBlobUrl = null;
+    }
+    viewer.innerHTML = "";
+  }
+}
+
+function _tektitePopoutShowAttachmentLayer(inst) {
+  if (!inst || !inst.dom) return;
+  const cm = inst.dom.querySelector(".tektite-popout-cm-host");
+  const ta = inst.dom.querySelector(".tektite-graph-popout-editor");
+  const pv = inst.dom.querySelector(".tektite-popout-preview");
+  if (cm) cm.style.display = "none";
+  if (ta) ta.style.display = "none";
+  if (pv) pv.style.display = "none";
+}
+
+async function _tektitePopoutLoadAttachment(inst, attId) {
+  const viewer = _tektitePopoutEnsureViewerEl(inst);
+  if (!viewer) return;
+  _tektitePopoutShowAttachmentLayer(inst);
+  viewer.style.display = "block";
+  viewer.innerHTML = '<div class="tk-att-loading">Loading <code>' +
+    String(attId || "").replace(/&/g, "&amp;").replace(/</g, "&lt;") + '</code>…</div>';
+  let rec = null;
+  try { rec = await tektiteGetAttachment(attId); } catch (_) {}
+  if (!rec || !rec.blob) {
+    viewer.innerHTML = '<div class="tk-att-empty">⚠ Attachment not found.</div>';
+    return;
+  }
+  if (inst._attachmentBlobUrl) URL.revokeObjectURL(inst._attachmentBlobUrl);
+  const url = URL.createObjectURL(rec.blob);
+  inst._attachmentBlobUrl = url;
+  const kind = rec.kind || (typeof tektiteClassifyAttachment === "function"
+    ? tektiteClassifyAttachment(attId).kind : "other");
+  function esc(s) {
+    return String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+  const sizeKb = ((rec.size || 0) / 1024).toFixed(1);
+  const meta = '<div class="tk-att-meta">' +
+    '<span class="tk-att-kind">' + esc(kind) + '</span>' +
+    '<span class="tk-att-mime">' + esc(rec.mime || "") + '</span>' +
+    '<span class="tk-att-size">' + sizeKb + ' KB</span>' +
+    '<a class="tk-att-dl" href="' + url + '" download="' + esc(attId) + '">Download</a>' +
+  '</div>';
+  let body = "";
+  if (kind === "image") {
+    body = '<img class="tk-att-image" src="' + url + '" alt="' + esc(attId) + '">';
+  } else if (kind === "audio") {
+    body = '<audio class="tk-att-audio" controls src="' + url + '"></audio>';
+  } else if (kind === "video") {
+    body = '<video class="tk-att-video" controls src="' + url + '"></video>';
+  } else if (kind === "pdf") {
+    body = '<embed class="tk-att-pdf" type="application/pdf" src="' + url + '">';
+  } else if (kind === "data" || kind === "text") {
+    try {
+      const text = await rec.blob.text();
+      const ext = (rec.ext || "").toLowerCase();
+      if (ext === ".json" || ext === ".jsonl" || ext === ".gpatch") {
+        let pretty = text;
+        try { pretty = JSON.stringify(JSON.parse(text), null, 2); } catch (_) {}
+        body = '<pre class="tk-att-pre">' + esc(pretty.slice(0, 200000)) + '</pre>';
+      } else if (ext === ".csv" || ext === ".tsv") {
+        body = _tektiteAttachmentCsvHtml(text, ext === ".tsv" ? "\t" : ",");
+      } else {
+        body = '<pre class="tk-att-pre">' + esc(text.slice(0, 200000)) + '</pre>';
+      }
+    } catch (e) {
+      body = '<div class="tk-att-empty">⚠ Failed to read text: ' + esc(e.message || e) + '</div>';
+    }
+  } else {
+    body = '<div class="tk-att-empty">No inline viewer for <code>' + esc(rec.ext || "?") +
+      '</code>.<br><br><a class="tk-att-dl-big" href="' + url + '" download="' + esc(attId) +
+      '">⬇ Download to open externally</a></div>';
+  }
+  viewer.innerHTML = meta + '<div class="tk-att-body">' + body + '</div>';
+}
+
+function _tektiteAttachmentCsvHtml(text, sep) {
+  const rows = String(text || "").split(/\r?\n/).filter(r => r.length).slice(0, 500);
+  if (!rows.length) return '<div class="tk-att-empty">(empty)</div>';
+  function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+  const header = rows[0].split(sep);
+  let html = '<table class="tk-att-csv"><thead><tr>';
+  for (const h of header) html += "<th>" + esc(h) + "</th>";
+  html += "</tr></thead><tbody>";
+  for (let i = 1; i < rows.length; i++) {
+    const cells = rows[i].split(sep);
+    html += "<tr>";
+    for (let j = 0; j < header.length; j++) html += "<td>" + esc(cells[j] || "") + "</td>";
+    html += "</tr>";
+  }
+  html += "</tbody></table>";
+  return html;
+}
+
+/* Monkey-patch _tektitePopoutLoadTab to detect attachment ids and
+ * dispatch to the viewer.  Falls back to the original markdown path
+ * for everything else. */
+(function _wrapPopoutLoad() {
+  if (typeof _tektitePopoutLoadTab !== "function") return;
+  if (_tektitePopoutLoadTab._tk10tWrapped) return;
+  const original = _tektitePopoutLoadTab;
+  _tektitePopoutLoadTab = async function (inst, noteId) {
+    if (!noteId) return;
+    if (_tektiteIsAttachmentId(noteId)) {
+      try {
+        const rec = await tektiteGetAttachment(noteId);
+        if (rec && rec.blob) {
+          inst.noteId = noteId;
+          const titleEl = inst.dom && inst.dom.querySelector(".tektite-graph-popout-title");
+          if (titleEl) titleEl.textContent = noteId;
+          await _tektitePopoutLoadAttachment(inst, noteId);
+          if (typeof _tektitePopoutSetStatus === "function") _tektitePopoutSetStatus(inst, "");
+          return;
+        }
+      } catch (_) {}
+    }
+    _tektitePopoutShowMarkdownLayer(inst);
+    return original(inst, noteId);
+  };
+  _tektitePopoutLoadTab._tk10tWrapped = true;
+})();
+
+/* Drop-zone on the Tektite tab.  Any file dropped on the notes list
+ * is imported into the vault attachments store + the list refreshes. */
+function _tektiteWireAttachmentDropzone() {
+  const list = document.getElementById("tektite-notes-list");
+  if (!list || list._tk10tDz) return;
+  list._tk10tDz = true;
+  list.addEventListener("dragover", (e) => {
+    if (e.dataTransfer && Array.from(e.dataTransfer.types).includes("Files")) {
+      e.preventDefault();
+      list.classList.add("tk-dropzone-active");
+    }
+  });
+  list.addEventListener("dragleave", () => list.classList.remove("tk-dropzone-active"));
+  list.addEventListener("drop", async (e) => {
+    e.preventDefault();
+    list.classList.remove("tk-dropzone-active");
+    const files = e.dataTransfer && e.dataTransfer.files;
+    if (!files || !files.length) return;
+    for (const f of files) {
+      try { await tektiteImportFile(f); }
+      catch (err) { console.warn("[tektite-attach] import failed for", f.name, err); }
+    }
+    if (typeof _tektiteTabRefresh === "function") await _tektiteTabRefresh();
+  });
+}
+
+(function _autoWireDropzone() {
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", _tektiteWireAttachmentDropzone);
+  } else {
+    _tektiteWireAttachmentDropzone();
+  }
+  // Tektite tab may not have rendered yet on boot; re-check periodically
+  // for the first 5 s so the dropzone wires once the list mounts.
+  let tries = 0;
+  const t = setInterval(() => {
+    _tektiteWireAttachmentDropzone();
+    tries++;
+    if (tries > 25) clearInterval(t);
+  }, 200);
+})();
