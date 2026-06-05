@@ -60,17 +60,80 @@ function _tektiteCardGetState(node) {
 function _tektiteCardEnsureBody(node, st) {
   const nodeEl = document.querySelector('.node[data-id="' + node.id + '"]');
   if (!nodeEl) return null;
-  if (st.body && st.bodyNodeEl === nodeEl && st.body.isConnected) return st.body;
-  // The node may have been re-rendered (graph re-render); recreate.
+  // Sprint tektite-10c -- mark the node so CSS can override .node's
+  // fixed 140 px width and let the card grow with params.width.
+  nodeEl.classList.add("tektite-card-node");
   let slot = nodeEl.querySelector(".tektite-card-body");
+  const fresh = !slot;
   if (!slot) {
     slot = document.createElement("div");
     slot.className = "tektite-card-body";
     nodeEl.appendChild(slot);
   }
+  // Sprint tektite-10c -- card sizing from width/height params +
+  // bottom-right grip. The CSS `max-height: 280px` constraint we
+  // shipped in 10b is dropped here in favor of params.height so a
+  // dragged-bigger card honors the user's choice.
+  if (node.params) {
+    if (Number.isFinite(node.params.width)) {
+      slot.style.minWidth = node.params.width + "px";
+      slot.style.maxWidth = "none";
+    }
+    if (Number.isFinite(node.params.height)) {
+      slot.style.minHeight = node.params.height + "px";
+      slot.style.maxHeight = "none";
+    }
+  }
+  // Resize grip. Idempotent attach via dataset flag so we don't
+  // accumulate listeners on each frame.
+  let grip = nodeEl.querySelector(".tektite-card-grip");
+  if (!grip) {
+    grip = document.createElement("div");
+    grip.className = "tektite-card-grip";
+    nodeEl.appendChild(grip);
+  }
+  if (!grip.dataset.wired) {
+    grip.dataset.wired = "1";
+    _tektiteCardWireGrip(node, grip, slot);
+  }
   st.body = slot;
   st.bodyNodeEl = nodeEl;
+  if (fresh) st.lastHash = "";  // freshly-mounted body needs an initial render
   return slot;
+}
+
+/* Sprint tektite-10c -- corner-grip resize. Updates params.width
+ * and params.height in world-space pixels (divided by view.zoom so
+ * a 100 px screen drag at zoom=2 records as 50 world px). Listener
+ * stops bubbling so the canvas's pan handler doesn't pick the
+ * pointerdown up as a board pan. */
+function _tektiteCardWireGrip(node, grip, slot) {
+  let dragging = false;
+  let startX = 0, startY = 0, startW = 0, startH = 0;
+  grip.addEventListener("pointerdown", (e) => {
+    e.stopPropagation();
+    e.preventDefault();
+    dragging = true;
+    startX = e.clientX; startY = e.clientY;
+    startW = Number.isFinite(node.params.width)  ? node.params.width  : slot.offsetWidth;
+    startH = Number.isFinite(node.params.height) ? node.params.height : slot.offsetHeight;
+    try { grip.setPointerCapture(e.pointerId); } catch (_) {}
+  });
+  grip.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    const zoom = (typeof view === "object" && view && Number.isFinite(view.zoom)) ? view.zoom : 1;
+    const dx = (e.clientX - startX) / Math.max(0.01, zoom);
+    const dy = (e.clientY - startY) / Math.max(0.01, zoom);
+    node.params = node.params || {};
+    node.params.width  = Math.max(120, Math.round(startW + dx));
+    node.params.height = Math.max(60,  Math.round(startH + dy));
+    slot.style.minWidth  = node.params.width  + "px";
+    slot.style.minHeight = node.params.height + "px";
+  });
+  grip.addEventListener("pointerup", (e) => {
+    dragging = false;
+    try { grip.releasePointerCapture(e.pointerId); } catch (_) {}
+  });
 }
 
 /* Per-card color treatment via the JSON Canvas palette slot. Same
