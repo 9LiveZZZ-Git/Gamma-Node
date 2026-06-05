@@ -99,6 +99,17 @@ async function _tektiteOpenGraphModal() {
     if (recenter) recenter.addEventListener("click", () => {
       if (s.renderer) s.renderer.recenter();
     });
+    // Sprint 10e-fix: close button wired here so the modal can be
+    // opened from places OTHER than tektiteTabAttach (e.g. the
+    // GraphCard's ⛶ expand button). Previously this wiring lived
+    // only in tektiteTabAttach, so the modal opened by a card would
+    // get stuck open if the user hadn't visited the Tektite tab yet.
+    const closeBtn = document.getElementById("btn-tektite-graph-close");
+    if (closeBtn) closeBtn.addEventListener("click", () => _tektiteCloseGraphModal());
+    // Backdrop-click to close (matches the modal-backdrop pattern).
+    if (s.modal) s.modal.addEventListener("click", (e) => {
+      if (e.target === s.modal) _tektiteCloseGraphModal();
+    });
   }
 
   await _tektiteRebuildGraph();

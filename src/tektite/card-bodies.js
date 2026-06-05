@@ -94,8 +94,13 @@ function _tektiteCardEnsureBody(node, st) {
   if (!nodeEl) return null;
   nodeEl.classList.add("tektite-card-node");
 
+  // Sprint 10e-fix: detect a stale body. The main canvas's render()
+  // tears down + rebuilds the node DOM on any drag / undo / select,
+  // so the body we mounted last frame may be detached. Check
+  // isConnected to catch that case and force a fresh mount + reset.
   let body = nodeEl.querySelector(".tektite-card-body");
-  const fresh = !body;
+  const stale = body && !body.isConnected;   // shouldn't happen since querySelector descends, but belt-and-suspenders
+  const fresh = !body || stale || (st.bodyNodeEl && st.bodyNodeEl !== nodeEl);
   if (!body) {
     body = document.createElement("div");
     body.className = "tektite-card-body";
@@ -130,7 +135,28 @@ function _tektiteCardEnsureBody(node, st) {
   st.renderEl   = body.querySelector(".tektite-card-render");
   st.editEl     = body.querySelector(".tektite-card-edit");
   st.linkBar    = body.querySelector(".tektite-card-linkbar");
-  if (fresh) st.lastHash = "";
+  if (fresh) {
+    // Reset every cached state that points at the old DOM so the
+    // render passes rebuild from scratch in this body.
+    st.lastHash       = "";
+    st.linkBarHash    = "";
+    st.lastResolveKey = "";
+    // Graph card -- old canvas + renderer are dead, drop them so the
+    // _renderGraphCardBody fresh-mount branch runs.
+    if (st.graphRenderer && typeof st.graphRenderer.destroy === "function") {
+      try { st.graphRenderer.destroy(); } catch (_) {}
+    }
+    if (st.graphResizeObs && typeof st.graphResizeObs.disconnect === "function") {
+      try { st.graphResizeObs.disconnect(); } catch (_) {}
+    }
+    st.graphRenderer   = null;
+    st.graphResizeObs  = null;
+    st.graphCanvas     = null;
+    st.graphModeEl     = null;
+    st.graphStatsEl    = null;
+    st.graphExpandBtn  = null;
+    st.graphConfigHash = "";
+  }
   return body;
 }
 
@@ -768,6 +794,9 @@ async function _renderGraphCardBody(node, st) {
   if (!st.renderEl) return;
   // Build the canvas + expand button on first mount.
   if (!st.graphCanvas) {
+    // Sprint 10e-fix: mark the render layer so CSS can flex-fill the
+    // canvas (no fixed 220 px height anymore).
+    st.renderEl.classList.add("tektite-card-graph-render");
     st.renderEl.innerHTML =
       '<div class="tektite-card-graph-bar">' +
         '<span class="tektite-card-graph-mode" data-act="mode-toggle" title="Toggle global / local mode">' +
@@ -804,6 +833,16 @@ async function _renderGraphCardBody(node, st) {
       st.graphModeEl.textContent = node.params.mode;
       st.graphConfigHash = "";  // force rebuild on next tick
     });
+    // Sprint 10e-fix: ResizeObserver re-fits the graph as the user
+    // drags the card's resize grip. Cheap (one rAF per size change).
+    if (typeof ResizeObserver !== "undefined") {
+      st.graphResizeObs = new ResizeObserver(() => {
+        if (st.graphRenderer && typeof st.graphRenderer.fit === "function") {
+          st.graphRenderer.fit();
+        }
+      });
+      st.graphResizeObs.observe(st.graphCanvas);
+    }
   }
   // Detect param changes and rebuild the graph + renderer when needed.
   const mode      = String((node.params && node.params.mode)      || "global");
@@ -845,6 +884,11 @@ async function _renderGraphCardBody(node, st) {
         st.graphStatsEl.textContent = graph.nodes.length + " · " + graph.edges.length;
       }
       st.graphConfigHash = cfgHash;
+      // Sprint 10e-fix: schedule a fit() after the layout has had a
+      // moment to spread out (sim does ~60 steps in 1 s). Each call
+      // re-centers + re-scales to fit the current canvas size.
+      setTimeout(() => { if (st.graphRenderer) st.graphRenderer.fit(); },  600);
+      setTimeout(() => { if (st.graphRenderer) st.graphRenderer.fit(); }, 1800);
     } catch (e) {
       if (st.graphStatsEl) st.graphStatsEl.textContent = "build failed";
       console.warn("[graph-card] build failed:", e);

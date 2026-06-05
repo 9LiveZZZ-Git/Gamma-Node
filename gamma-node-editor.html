@@ -1820,6 +1820,9 @@
     padding: 6px 8px;
     outline: none;
     resize: none;
+    /* Sprint 10e-fix -- body is flex column; textarea fills the
+     * remaining space when shown (replaces hidden render layer). */
+    flex: 1 1 auto;
   }
   .node .tektite-card-body.editing {
     background: rgba(0, 0, 0, 0.35);
@@ -1844,9 +1847,20 @@
     line-height: 1.45;
     /* Sprint tektite-10c -- max-height removed; cards now size to
      * params.width/height set by the corner grip. */
-    overflow: auto;
+    overflow: hidden;
     color: var(--text);
     box-sizing: border-box;
+    /* Sprint 10e-fix -- flex column so the render layer fills the
+     * remaining height after the linkbar.  GraphCard's canvas then
+     * stretches to the body's size; text/note/link cards work the
+     * same (render fills + scrolls internally). */
+    display: flex;
+    flex-direction: column;
+  }
+  .node .tektite-card-body .tektite-card-render {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
   }
   /* Card resize grip in the node's bottom-right.  Pointer events
    * stopPropagation in JS so the canvas's pan handler doesn't fight
@@ -1920,9 +1934,17 @@
   .node .tektite-card-body .tektite-card-graph-expand:hover {
     background: rgba(95, 184, 212, 0.20);
   }
+  /* Sprint 10e-fix -- graph render layer overrides the default flex
+   * render's overflow:auto since the canvas has no scroll behavior. */
+  .node .tektite-card-body .tektite-card-render.tektite-card-graph-render {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
   .node .tektite-card-body .tektite-card-graph-canvas {
     width: 100%;
-    height: 220px;
+    flex: 1 1 auto;
+    min-height: 80px;
     display: block;
     background: rgba(4, 6, 11, 0.85);
     border: 1px solid rgba(95, 184, 212, 0.20);
@@ -62178,10 +62200,39 @@ function tektiteGraphRenderer(canvas, graph, opts) {
     };
   }
 
+  /* Sprint tektite-10e-fix -- compute the node bounding box and adjust
+   * scale + offset so the entire graph fits the canvas with a small
+   * margin. Idempotent; safe to call repeatedly (e.g. on resize). */
+  function fit() {
+    if (!nodes || !nodes.length) return;
+    let minX =  Infinity, minY =  Infinity;
+    let maxX = -Infinity, maxY = -Infinity;
+    for (const n of nodes) {
+      if (n.x < minX) minX = n.x;
+      if (n.y < minY) minY = n.y;
+      if (n.x > maxX) maxX = n.x;
+      if (n.y > maxY) maxY = n.y;
+    }
+    const bboxW = Math.max(1, maxX - minX);
+    const bboxH = Math.max(1, maxY - minY);
+    const cw = canvas.clientWidth  || canvas.width  || 320;
+    const ch = canvas.clientHeight || canvas.height || 240;
+    if (cw < 10 || ch < 10) return;
+    const margin = 0.85;
+    const s = Math.min(cw / bboxW, ch / bboxH) * margin;
+    scale = Math.max(0.1, Math.min(8, s));
+    const bcx = (minX + maxX) / 2;
+    const bcy = (minY + maxY) / 2;
+    offsetX = -bcx * scale;
+    offsetY = -bcy * scale;
+    wake();
+  }
+
   return {
     start: wake,
     stop:  () => { running = false; if (rafId) cancelAnimationFrame(rafId); },
     recenter: () => { offsetX = 0; offsetY = 0; scale = 1; wake(); },
+    fit,
     setSelectedId: (id) => { selectedId = id; wake(); },
     setGraph: (g) => { nodes = g.nodes; edges = g.edges; wake(); },
     getNodes: () => nodes,
@@ -63072,8 +63123,13 @@ function _tektiteCardEnsureBody(node, st) {
   if (!nodeEl) return null;
   nodeEl.classList.add("tektite-card-node");
 
+  // Sprint 10e-fix: detect a stale body. The main canvas's render()
+  // tears down + rebuilds the node DOM on any drag / undo / select,
+  // so the body we mounted last frame may be detached. Check
+  // isConnected to catch that case and force a fresh mount + reset.
   let body = nodeEl.querySelector(".tektite-card-body");
-  const fresh = !body;
+  const stale = body && !body.isConnected;   // shouldn't happen since querySelector descends, but belt-and-suspenders
+  const fresh = !body || stale || (st.bodyNodeEl && st.bodyNodeEl !== nodeEl);
   if (!body) {
     body = document.createElement("div");
     body.className = "tektite-card-body";
@@ -63108,7 +63164,28 @@ function _tektiteCardEnsureBody(node, st) {
   st.renderEl   = body.querySelector(".tektite-card-render");
   st.editEl     = body.querySelector(".tektite-card-edit");
   st.linkBar    = body.querySelector(".tektite-card-linkbar");
-  if (fresh) st.lastHash = "";
+  if (fresh) {
+    // Reset every cached state that points at the old DOM so the
+    // render passes rebuild from scratch in this body.
+    st.lastHash       = "";
+    st.linkBarHash    = "";
+    st.lastResolveKey = "";
+    // Graph card -- old canvas + renderer are dead, drop them so the
+    // _renderGraphCardBody fresh-mount branch runs.
+    if (st.graphRenderer && typeof st.graphRenderer.destroy === "function") {
+      try { st.graphRenderer.destroy(); } catch (_) {}
+    }
+    if (st.graphResizeObs && typeof st.graphResizeObs.disconnect === "function") {
+      try { st.graphResizeObs.disconnect(); } catch (_) {}
+    }
+    st.graphRenderer   = null;
+    st.graphResizeObs  = null;
+    st.graphCanvas     = null;
+    st.graphModeEl     = null;
+    st.graphStatsEl    = null;
+    st.graphExpandBtn  = null;
+    st.graphConfigHash = "";
+  }
   return body;
 }
 
@@ -63746,6 +63823,9 @@ async function _renderGraphCardBody(node, st) {
   if (!st.renderEl) return;
   // Build the canvas + expand button on first mount.
   if (!st.graphCanvas) {
+    // Sprint 10e-fix: mark the render layer so CSS can flex-fill the
+    // canvas (no fixed 220 px height anymore).
+    st.renderEl.classList.add("tektite-card-graph-render");
     st.renderEl.innerHTML =
       '<div class="tektite-card-graph-bar">' +
         '<span class="tektite-card-graph-mode" data-act="mode-toggle" title="Toggle global / local mode">' +
@@ -63782,6 +63862,16 @@ async function _renderGraphCardBody(node, st) {
       st.graphModeEl.textContent = node.params.mode;
       st.graphConfigHash = "";  // force rebuild on next tick
     });
+    // Sprint 10e-fix: ResizeObserver re-fits the graph as the user
+    // drags the card's resize grip. Cheap (one rAF per size change).
+    if (typeof ResizeObserver !== "undefined") {
+      st.graphResizeObs = new ResizeObserver(() => {
+        if (st.graphRenderer && typeof st.graphRenderer.fit === "function") {
+          st.graphRenderer.fit();
+        }
+      });
+      st.graphResizeObs.observe(st.graphCanvas);
+    }
   }
   // Detect param changes and rebuild the graph + renderer when needed.
   const mode      = String((node.params && node.params.mode)      || "global");
@@ -63823,6 +63913,11 @@ async function _renderGraphCardBody(node, st) {
         st.graphStatsEl.textContent = graph.nodes.length + " · " + graph.edges.length;
       }
       st.graphConfigHash = cfgHash;
+      // Sprint 10e-fix: schedule a fit() after the layout has had a
+      // moment to spread out (sim does ~60 steps in 1 s). Each call
+      // re-centers + re-scales to fit the current canvas size.
+      setTimeout(() => { if (st.graphRenderer) st.graphRenderer.fit(); },  600);
+      setTimeout(() => { if (st.graphRenderer) st.graphRenderer.fit(); }, 1800);
     } catch (e) {
       if (st.graphStatsEl) st.graphStatsEl.textContent = "build failed";
       console.warn("[graph-card] build failed:", e);
@@ -64337,6 +64432,17 @@ async function _tektiteOpenGraphModal() {
     const recenter = document.getElementById("btn-tektite-graph-recenter");
     if (recenter) recenter.addEventListener("click", () => {
       if (s.renderer) s.renderer.recenter();
+    });
+    // Sprint 10e-fix: close button wired here so the modal can be
+    // opened from places OTHER than tektiteTabAttach (e.g. the
+    // GraphCard's ⛶ expand button). Previously this wiring lived
+    // only in tektiteTabAttach, so the modal opened by a card would
+    // get stuck open if the user hadn't visited the Tektite tab yet.
+    const closeBtn = document.getElementById("btn-tektite-graph-close");
+    if (closeBtn) closeBtn.addEventListener("click", () => _tektiteCloseGraphModal());
+    // Backdrop-click to close (matches the modal-backdrop pattern).
+    if (s.modal) s.modal.addEventListener("click", (e) => {
+      if (e.target === s.modal) _tektiteCloseGraphModal();
     });
   }
 
