@@ -224,6 +224,14 @@ function _tektiteCardEnsureBody(node, st) {
     st.graphStatsEl    = null;
     st.graphExpandBtn  = null;
     st.graphConfigHash = "";
+    // Sprint 10m -- CanvasCard refs too.
+    st.canvasCardEl  = null;
+    st.canvasTitleEl = null;
+    st.canvasStatsEl = null;
+    st.canvasOpenBtn = null;
+    st.canvasThumbEl = null;
+    st.canvasEmptyEl = null;
+    st.canvasLastId  = "";
   }
   return body;
 }
@@ -978,6 +986,143 @@ async function _renderGraphCardBody(node, st) {
   }
 }
 
+/* Sprint tektite-10m -- CanvasCard.  Wraps a Tektite Canvas doc
+ * (legacy JSON-Canvas, see src/tektite/canvas.js) inside a card on
+ * the MAIN editor canvas.  Body shows a thumbnail preview of the
+ * doc's cards + an "⛶ Open" button that hands off to the legacy
+ * Canvas modal for actual editing. */
+async function _renderCanvasCardBody(node, st) {
+  if (!st.renderEl) return;
+  // Build the structure once per fresh body.
+  if (!st.canvasCardEl) {
+    st.renderEl.classList.add("tektite-card-canvas-render");
+    st.renderEl.innerHTML =
+      '<div class="tektite-card-canvas-bar">' +
+        '<span class="tektite-card-canvas-title">🗂 (unset)</span>' +
+        '<span class="tektite-card-canvas-stats"></span>' +
+        '<button class="tektite-card-canvas-open" type="button" title="Open in Canvas modal">⛶ Open</button>' +
+      '</div>' +
+      '<svg class="tektite-card-canvas-thumb" preserveAspectRatio="xMidYMid meet"></svg>' +
+      '<div class="tektite-card-canvas-empty" style="display:none;">(no canvas linked — set <code>canvasId</code> or click 🔗 to pick one)</div>';
+    st.canvasCardEl    = st.renderEl;
+    st.canvasTitleEl   = st.renderEl.querySelector(".tektite-card-canvas-title");
+    st.canvasStatsEl   = st.renderEl.querySelector(".tektite-card-canvas-stats");
+    st.canvasOpenBtn   = st.renderEl.querySelector(".tektite-card-canvas-open");
+    st.canvasThumbEl   = st.renderEl.querySelector(".tektite-card-canvas-thumb");
+    st.canvasEmptyEl   = st.renderEl.querySelector(".tektite-card-canvas-empty");
+    st.canvasOpenBtn.addEventListener("pointerdown", (e) => e.stopPropagation());
+    st.canvasOpenBtn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const cid = String((node.params && node.params.canvasId) || "");
+      if (!cid) return;
+      // Hand off to the legacy Canvas modal: pre-set the active doc
+      // id so _tektiteCanvasOpenLegacy lands on it.
+      if (typeof _tektiteCanvasState !== "undefined" && _tektiteCanvasState) {
+        _tektiteCanvasState.currentId = cid;
+      }
+      if (typeof _tektiteCanvasOpenLegacy === "function") {
+        await _tektiteCanvasOpenLegacy();
+      }
+      if (typeof _tektiteCanvasOpenById === "function") {
+        await _tektiteCanvasOpenById(cid);
+      }
+    });
+  }
+  const canvasId = String((node.params && node.params.canvasId) || "");
+  if (!canvasId) {
+    if (st.canvasLastId !== "") {
+      st.canvasLastId = "";
+      st.canvasTitleEl.textContent = "🗂 (unset)";
+      st.canvasStatsEl.textContent = "";
+      st.canvasThumbEl.style.display = "none";
+      st.canvasEmptyEl.style.display = "block";
+      st.canvasOpenBtn.disabled = true;
+    }
+    return;
+  }
+  // (Re)load when canvasId changes.
+  if (canvasId !== st.canvasLastId && !st.canvasLoading) {
+    st.canvasLoading = true;
+    try {
+      const loaded = await tektiteCanvasLoad(canvasId);
+      const doc    = loaded.doc;
+      const title  = (loaded.frontmatter && loaded.frontmatter["canvas-title"])
+                   || (loaded.note && loaded.note.title) || canvasId;
+      st.canvasTitleEl.textContent = "🗂 " + title;
+      st.canvasStatsEl.textContent =
+        (doc.nodes.length) + " card" + (doc.nodes.length === 1 ? "" : "s") +
+        " · " + (doc.edges.length) + " edge" + (doc.edges.length === 1 ? "" : "s");
+      st.canvasThumbEl.style.display = "block";
+      st.canvasEmptyEl.style.display = "none";
+      st.canvasOpenBtn.disabled = false;
+      _tektiteCanvasCardRenderThumb(st.canvasThumbEl, doc);
+      // Expose card/edge counts as wire-readable params for downstream
+      // consumers (matches GraphCard's param-port pattern).
+      node.params = node.params || {};
+      node.params.cardCount = doc.nodes.length;
+      node.params.edgeCount = doc.edges.length;
+      st.canvasLastId = canvasId;
+    } catch (e) {
+      st.canvasTitleEl.textContent = "🗂 ⚠";
+      st.canvasStatsEl.textContent = (e && e.message) || String(e);
+      st.canvasThumbEl.style.display = "none";
+      st.canvasEmptyEl.style.display = "block";
+      st.canvasEmptyEl.textContent = "⚠ Load failed: " + ((e && e.message) || String(e));
+      st.canvasLastId = canvasId;
+    } finally {
+      st.canvasLoading = false;
+    }
+  }
+}
+
+/* Draw an SVG thumbnail of the canvas doc: card rectangles in their
+ * original positions + thin edge lines, fit to the SVG viewBox. */
+function _tektiteCanvasCardRenderThumb(svg, doc) {
+  const nodes = (doc && Array.isArray(doc.nodes)) ? doc.nodes : [];
+  if (!nodes.length) { svg.innerHTML = ""; svg.removeAttribute("viewBox"); return; }
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const n of nodes) {
+    const x = Number(n.x || 0), y = Number(n.y || 0);
+    const w = Number(n.width)  || 200;
+    const h = Number(n.height) || 80;
+    if (x < minX) minX = x;
+    if (y < minY) minY = y;
+    if (x + w > maxX) maxX = x + w;
+    if (y + h > maxY) maxY = y + h;
+  }
+  const pad = 20;
+  const vbX = minX - pad, vbY = minY - pad;
+  const vbW = (maxX - minX) + pad * 2;
+  const vbH = (maxY - minY) + pad * 2;
+  svg.setAttribute("viewBox", vbX + " " + vbY + " " + vbW + " " + vbH);
+  let html = "";
+  const edges = (doc && Array.isArray(doc.edges)) ? doc.edges : [];
+  const byId = new Map(nodes.map(n => [n.id, n]));
+  for (const e of edges) {
+    const a = byId.get(e.fromNode);
+    const b = byId.get(e.toNode);
+    if (!a || !b) continue;
+    const ax = (Number(a.x) || 0) + (Number(a.width)  || 200) / 2;
+    const ay = (Number(a.y) || 0) + (Number(a.height) || 80)  / 2;
+    const bx = (Number(b.x) || 0) + (Number(b.width)  || 200) / 2;
+    const by = (Number(b.y) || 0) + (Number(b.height) || 80)  / 2;
+    html += '<line x1="' + ax + '" y1="' + ay + '" x2="' + bx + '" y2="' + by +
+      '" stroke="rgba(95,184,212,0.45)" stroke-width="2" />';
+  }
+  for (const n of nodes) {
+    const x = Number(n.x) || 0, y = Number(n.y) || 0;
+    const w = Number(n.width)  || 200;
+    const h = Number(n.height) || 80;
+    let fill = "rgba(95,184,212,0.18)";
+    if (n.type === "text") fill = "rgba(200,232,90,0.18)";
+    else if (n.type === "file") fill = "rgba(95,184,212,0.25)";
+    else if (n.type === "link") fill = "rgba(255,184,90,0.20)";
+    html += '<rect x="' + x + '" y="' + y + '" width="' + w + '" height="' + h +
+      '" rx="6" ry="6" fill="' + fill + '" stroke="rgba(95,184,212,0.55)" stroke-width="2" />';
+  }
+  svg.innerHTML = html;
+}
+
 /* Per-frame tick. */
 function _tickTektiteCards(dtSec) {
   if (typeof state === "undefined" || !state || !Array.isArray(state.nodes)) return;
@@ -987,19 +1132,20 @@ function _tickTektiteCards(dtSec) {
     const def = (typeof TYPES === "object") ? TYPES[n.type] : null;
     if (!def) continue;
     const k = def.kind;
-    if (k !== "tektite-card-text"  && k !== "tektite-card-note" &&
-        k !== "tektite-card-link"  && k !== "tektite-card-base" &&
-        k !== "tektite-card-graph") continue;
+    if (k !== "tektite-card-text"  && k !== "tektite-card-note"   &&
+        k !== "tektite-card-link"  && k !== "tektite-card-base"   &&
+        k !== "tektite-card-graph" && k !== "tektite-card-canvas") continue;
     const st = _tektiteCardGetState(n);
     if (!_tektiteCardEnsureBody(n, st)) continue;
     _tektiteCardApplyAccent(n, st);
-    // GraphCard has no link bar (it's its own kind of source).
-    if (k !== "tektite-card-graph") _renderLinkBar(n, st);
-    if      (k === "tektite-card-text")  _renderTextCardBody(n, st);
-    else if (k === "tektite-card-link")  _renderLinkCardBody(n, st);
-    else if (k === "tektite-card-note")  _renderNoteCardBody(n, st);
-    else if (k === "tektite-card-base")  _renderBaseCardBody(n, st);
-    else if (k === "tektite-card-graph") _renderGraphCardBody(n, st);
+    // GraphCard + CanvasCard have no link bar (their own sources).
+    if (k !== "tektite-card-graph" && k !== "tektite-card-canvas") _renderLinkBar(n, st);
+    if      (k === "tektite-card-text")   _renderTextCardBody(n, st);
+    else if (k === "tektite-card-link")   _renderLinkCardBody(n, st);
+    else if (k === "tektite-card-note")   _renderNoteCardBody(n, st);
+    else if (k === "tektite-card-base")   _renderBaseCardBody(n, st);
+    else if (k === "tektite-card-graph")  _renderGraphCardBody(n, st);
+    else if (k === "tektite-card-canvas") _renderCanvasCardBody(n, st);
   }
 }
 

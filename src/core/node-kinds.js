@@ -66,7 +66,11 @@ const RUNTIME_ONLY_KINDS = new Set([
   "tektite-card-base",
   // Sprint 10c reserve: tektite-card-group, tektite-card-image,
   // tektite-card-graph.
-  "tektite-card-graph"
+  "tektite-card-graph",
+  // Sprint 10m -- CanvasCard wraps a legacy Tektite Canvas doc inside
+  // a card on the main canvas.  Click to open the canvas in the
+  // (legacy) Canvas modal for editing.
+  "tektite-card-canvas"
 ]);
 
 function isRuntimeOnlyKind(k) {

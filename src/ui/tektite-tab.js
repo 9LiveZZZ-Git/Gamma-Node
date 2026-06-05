@@ -217,6 +217,13 @@ function _tektitePopoutCreateDom(noteId, index) {
       '<button class="tektite-graph-popout-btn" data-popout-act="collapse" type="button" title="Collapse">—</button>' +
       '<button class="tektite-graph-popout-btn" data-popout-act="close"    type="button" title="Close">×</button>' +
     '</div>' +
+    /* Sprint 10n -- tab strip.  Tabs render from inst.tabs; click a
+       tab to switch the popout's active note.  + opens the quick
+       switcher to add a tab.  × on a tab closes that tab. */
+    '<div class="tektite-popout-tabs">' +
+      '<div class="tektite-popout-tabs-list"></div>' +
+      '<button class="tektite-popout-tab-add" data-popout-act="addtab" type="button" title="Open another note as a new tab (Cmd/Ctrl-P-style)">+</button>' +
+    '</div>' +
     '<input type="text" class="tektite-graph-popout-titleinput" placeholder="title" />' +
     '<div class="tektite-popout-edit-surface">' +
       '<div class="tektite-popout-cm-host"></div>' +
@@ -251,6 +258,24 @@ function _tektitePopoutWire(inst) {
   if (outlineBtn) outlineBtn.addEventListener("click", (e) => {
     e.stopPropagation();
     if (typeof _tektitePopoutToggleOutline === "function") _tektitePopoutToggleOutline(inst);
+  });
+
+  // Sprint 10n -- tab + button opens the quick switcher to add a new
+  // tab to this popout (without spawning a new popout).
+  const addTabBtn = dom.querySelector('[data-popout-act="addtab"]');
+  if (addTabBtn) addTabBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (typeof _openVaultPicker !== "function") return;
+    _openVaultPicker(addTabBtn, "", async (pick) => {
+      try {
+        let targetId = pick && pick.id;
+        if (!targetId && pick && pick.create) {
+          targetId = await tektiteNextAvailableSlug(pick.create);
+          await tektitePutNote({ id: targetId, title: pick.create, content: "# " + pick.create + "\n\n" });
+        }
+        if (targetId) await _tektitePopoutAddTab(inst, targetId);
+      } catch (err) { console.warn("[popout] add tab failed:", err); }
+    });
   });
 
   // Bring to front on any pointer down inside the popout.
@@ -381,7 +406,12 @@ function _tektitePopoutMarkPreviewDirty(inst) {
 function _tektitePopoutCloseInstance(inst) {
   if (!inst || !inst.dom) return;
   inst.dom.remove();
-  _tektitePopouts.instances.delete(inst.noteId);
+  // Sprint 10n -- deregister every noteId held by this popout's tabs.
+  if (Array.isArray(inst.tabs)) {
+    for (const id of inst.tabs) _tektitePopouts.instances.delete(id);
+  } else {
+    _tektitePopouts.instances.delete(inst.noteId);
+  }
   _tektiteUpdateConnectors();
 }
 
@@ -1337,6 +1367,14 @@ async function _tektitePopoutOpen(noteId) {
     existing.dom.classList.remove("collapsed");
     const collapseBtn = existing.dom.querySelector('[data-popout-act="collapse"]');
     if (collapseBtn) collapseBtn.textContent = "—";
+    // Sprint 10n -- if the target noteId is on a different tab of
+    // this popout, switch to that tab before highlighting.
+    if (Array.isArray(existing.tabs)) {
+      const idx = existing.tabs.indexOf(noteId);
+      if (idx >= 0 && idx !== existing.activeTab) {
+        await _tektitePopoutSwitchTab(existing, idx);
+      }
+    }
     // Briefly highlight to indicate the focus jump.
     existing.dom.classList.add("flash");
     setTimeout(() => existing.dom.classList.remove("flash"), 400);
@@ -1358,11 +1396,16 @@ async function _tektitePopoutOpen(noteId) {
     dragOffsetX: 0,
     dragOffsetY: 0,
     viewMode: "source",
-    cm: null
+    cm: null,
+    // Sprint 10n -- tabs.  Active tab's noteId mirrors inst.noteId so
+    // the rest of the popout code keeps reading inst.noteId unchanged.
+    tabs:      [noteId],
+    activeTab: 0
   };
   _tektitePopouts.instances.set(noteId, inst);
   _tektitePopoutWire(inst);
   _tektitePopoutBringToFront(inst);
+  _tektitePopoutRenderTabs(inst);
 
   // Load note content. CM picks up the initial doc via tektiteMarkdownAttach
   // inside _tektitePopoutWire; we ALSO set the textarea so the fallback path
@@ -1387,6 +1430,120 @@ async function _tektitePopoutOpen(noteId) {
     _tektitePopoutSetStatus(inst, "error", "err");
   }
   _tektiteUpdateConnectors();
+}
+
+/* Sprint 10n -- tab strip helpers ------------------------------------
+ *
+ * Each popout holds inst.tabs (array of vault note ids) and
+ * inst.activeTab (index).  Switching tab flushes the current doc,
+ * loads the target doc, and reassigns inst.noteId so the rest of the
+ * popout code (save, preview, title) keeps reading inst.noteId. */
+function _tektitePopoutRenderTabs(inst) {
+  if (!inst || !inst.dom) return;
+  const listEl = inst.dom.querySelector(".tektite-popout-tabs-list");
+  if (!listEl) return;
+  const tabs = Array.isArray(inst.tabs) ? inst.tabs : [];
+  if (tabs.length <= 1) {
+    listEl.innerHTML = "";
+    listEl.parentElement.classList.remove("has-tabs");
+    return;
+  }
+  listEl.parentElement.classList.add("has-tabs");
+  function esc(s) { return String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
+  listEl.innerHTML = tabs.map((id, i) =>
+    '<div class="tektite-popout-tab' + (i === inst.activeTab ? " active" : "") +
+      '" data-tab-index="' + i + '" title="' + esc(id) + '">' +
+      '<span class="tpt-label">' + esc(id) + '</span>' +
+      '<button class="tpt-close" data-tab-close="' + i + '" type="button" title="Close tab">×</button>' +
+    '</div>'
+  ).join("");
+  listEl.querySelectorAll(".tektite-popout-tab").forEach(el => {
+    el.addEventListener("click", (e) => {
+      if (e.target && e.target.closest(".tpt-close")) return;
+      const idx = Number(el.getAttribute("data-tab-index"));
+      _tektitePopoutSwitchTab(inst, idx);
+    });
+  });
+  listEl.querySelectorAll(".tpt-close").forEach(el => {
+    el.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const idx = Number(el.getAttribute("data-tab-close"));
+      _tektitePopoutCloseTab(inst, idx);
+    });
+  });
+}
+
+async function _tektitePopoutAddTab(inst, noteId) {
+  if (!inst || !noteId) return;
+  if (!Array.isArray(inst.tabs)) inst.tabs = [inst.noteId];
+  const existingIdx = inst.tabs.indexOf(noteId);
+  if (existingIdx >= 0) {
+    _tektitePopoutSwitchTab(inst, existingIdx);
+    return;
+  }
+  // Pre-flush the current tab's edits before pushing the new tab.
+  try { await _tektitePopoutFlush(inst); } catch (_) {}
+  inst.tabs.push(noteId);
+  inst.activeTab = inst.tabs.length - 1;
+  // Also register the new noteId in the instances map so a future
+  // _tektitePopoutOpen(noteId) finds this popout.
+  _tektitePopouts.instances.set(noteId, inst);
+  await _tektitePopoutLoadTab(inst, noteId);
+  _tektitePopoutRenderTabs(inst);
+}
+
+async function _tektitePopoutSwitchTab(inst, index) {
+  if (!inst || !Array.isArray(inst.tabs)) return;
+  if (index < 0 || index >= inst.tabs.length) return;
+  if (index === inst.activeTab) return;
+  // Flush before swapping doc.
+  try { await _tektitePopoutFlush(inst); } catch (_) {}
+  inst.activeTab = index;
+  await _tektitePopoutLoadTab(inst, inst.tabs[index]);
+  _tektitePopoutRenderTabs(inst);
+}
+
+async function _tektitePopoutCloseTab(inst, index) {
+  if (!inst || !Array.isArray(inst.tabs)) return;
+  if (index < 0 || index >= inst.tabs.length) return;
+  const closedId = inst.tabs[index];
+  // Flush before removing.
+  try { await _tektitePopoutFlush(inst); } catch (_) {}
+  inst.tabs.splice(index, 1);
+  // Deregister the closed noteId from the instances map (unless another
+  // tab in this popout still holds it -- duplicate guard).
+  if (!inst.tabs.includes(closedId)) _tektitePopouts.instances.delete(closedId);
+  if (inst.tabs.length === 0) {
+    _tektitePopoutCloseInstance(inst);
+    return;
+  }
+  if (inst.activeTab >= inst.tabs.length) inst.activeTab = inst.tabs.length - 1;
+  await _tektitePopoutLoadTab(inst, inst.tabs[inst.activeTab]);
+  _tektitePopoutRenderTabs(inst);
+}
+
+/* Load a noteId into the popout's CM editor + title + textarea
+ * fallback.  Called from add/switch/close tab paths. */
+async function _tektitePopoutLoadTab(inst, noteId) {
+  if (!inst || !inst.dom || !noteId) return;
+  inst.noteId = noteId;
+  const dom        = inst.dom;
+  const titleEl    = dom.querySelector(".tektite-graph-popout-title");
+  const titleInput = dom.querySelector(".tektite-graph-popout-titleinput");
+  const editor     = dom.querySelector(".tektite-graph-popout-editor");
+  try {
+    const note = await tektiteGetNote(noteId);
+    const title = (note && note.title) || noteId;
+    const content = (note && note.content) || "";
+    if (titleEl)    titleEl.textContent = title;
+    if (titleInput) titleInput.value    = title;
+    if (editor)     editor.value        = content;
+    if (inst.cm && typeof inst.cm.setDoc === "function") inst.cm.setDoc(content);
+    _tektitePopoutSetStatus(inst, "");
+  } catch (e) {
+    if (editor) editor.value = "Failed to load: " + (e.message || e);
+    _tektitePopoutSetStatus(inst, "error", "err");
+  }
 }
 
 async function _tektitePopoutFlush(inst) {

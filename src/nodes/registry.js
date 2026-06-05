@@ -20080,6 +20080,31 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     description: "Phase C sprint tektite-10e -- live force-directed view of the vault graph as a card. Click a graph node to open it in a popout. Click the ⛶ button to expand to the full 🕸 Graph modal. `mode=local` centers on `centerId` (or the currently selected note if blank) within `depth` hops; `mode=global` walks the entire vault with optional `minDegree` filter. Outputs `selectedId` (the clicked note's id) so downstream cards / LLM nodes can react to selection."
   },
 
+  /* Phase C sprint tektite-10m -- CanvasCard.  Wraps a legacy Tektite
+   * Canvas doc (JSON-Canvas backed, see src/tektite/canvas.js) inside
+   * a card on the main canvas.  The body shows a read-only preview of
+   * the canvas's cards + an `⛶ Open` button that hands off to the
+   * legacy Canvas modal for editing.  Use this when you want to nest
+   * a docs-canvas inside a normal patch -- e.g. an architecture
+   * diagram embedded next to the audio graph that drives it. */
+  CanvasCard: {
+    category: "Tektite", color: COLOR.tektite, header: null,
+    cppType: "", kind: "tektite-card-canvas",
+    ins: [],
+    outs: [
+      { n: "cardCount", t: "param" },
+      { n: "edgeCount", t: "param" }
+    ],
+    params: {
+      canvasId: "",
+      width:    320,
+      height:   200,
+      color:    ""
+    },
+    paramOptions: { color: ["", "1", "2", "3", "4", "5", "6"] },
+    description: "Phase C sprint tektite-10m -- embed a Tektite Canvas doc (JSON-Canvas backed) as a card on the main editor canvas. Set `canvasId` to the vault id of a `tektite-canvas: true` note, or click 🔗 in the card body to pick / create one. The body shows a thumbnail of the canvas's cards + edges; click ⛶ Open to edit in the full Canvas modal."
+  },
+
   /* ============================================================
    * Phase B sprint 4 — Ollama-backed LLM nodes (MVP)
    *
