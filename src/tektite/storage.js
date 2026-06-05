@@ -349,12 +349,23 @@ async function tektitePutAttachment(record) {
 
 async function tektiteGetAttachment(id) {
   const db = await tektiteVaultOpen();
-  return await new Promise((resolve, reject) => {
+  const rec = await new Promise((resolve, reject) => {
     const tx = db.transaction(TEKTITE_ATTACHMENTS_STORE, "readonly");
     const req = tx.objectStore(TEKTITE_ATTACHMENTS_STORE).get(id);
     req.onsuccess = () => resolve(req.result || null);
     req.onerror   = () => reject(req.error);
   });
+  if (!rec) return null;
+  // Sprint 10y -- server-backed records carry no blob; fetch on demand.
+  if (!rec.blob && rec.serverUrl) {
+    try {
+      rec.blob = await tektiteVaultServerFetch(rec.serverUrl);
+    } catch (e) {
+      console.warn("[tektite-vault] server fetch failed for", id, e);
+      // Return the record without the blob; callers handle the empty-blob case.
+    }
+  }
+  return rec;
 }
 
 async function tektiteListAttachments() {
@@ -390,19 +401,79 @@ async function tektiteDeleteAttachment(id) {
  * the vault as an attachment.  Returns the resolved id.  Sprint 10x:
  * confirms before storing files past TEKTITE_BIG_FILE_WARN so a single
  * stray drop doesn't blow past the browser's IDB quota and leave the
- * vault in a stuck state. */
-const TEKTITE_BIG_FILE_WARN = 50 * 1024 * 1024;   // 50 MB
-const TEKTITE_BIG_FILE_HARD = 250 * 1024 * 1024;  // 250 MB
+ * vault in a stuck state.
+ *
+ * Sprint 10y -- large files can opt into compile-server-backed
+ * storage instead of going into IDB.  When server is configured and
+ * reachable, the import dialog offers "upload to server" as the
+ * default for >TEKTITE_SERVER_HINT files.  Records carry serverUrl
+ * + serverSize; tektiteGetAttachment dereferences serverUrl into a
+ * Blob on demand. */
+const TEKTITE_BIG_FILE_WARN  =  50 * 1024 * 1024;   // 50 MB
+const TEKTITE_BIG_FILE_HARD  = 250 * 1024 * 1024;   // 250 MB
+const TEKTITE_SERVER_HINT    =  25 * 1024 * 1024;   // 25 MB -- offer server
+const TEKTITE_VAULT_REMOTE_FOLDER = "vault/";       // path prefix on the server
+
+/* Read the compile-server URL the user configured for AI settings;
+ * reused as the vault-backing server here.  Empty string -> "no
+ * server configured" -> import falls back to IDB-only behavior. */
+function _tektiteVaultServerUrl() {
+  try {
+    if (typeof aiSettings === "object" && aiSettings && aiSettings.compileServerUrl) {
+      return String(aiSettings.compileServerUrl).replace(/\/+$/, "");
+    }
+  } catch (_) {}
+  return "";
+}
+
+/* POST a Blob to the compile server's vault endpoint.  Endpoint shape
+ * documented in docs/ROADMAP.md §13.6 -- POST <server>/vault/upload
+ * with multipart/form-data: { id, file } -> returns { url, size }. */
+async function tektiteVaultServerUpload(id, blob) {
+  const base = _tektiteVaultServerUrl();
+  if (!base) throw new Error("No compile server URL configured in AI settings.");
+  const fd = new FormData();
+  fd.append("id", String(id));
+  fd.append("file", blob, String(id));
+  const r = await fetch(base + "/vault/upload", {
+    method: "POST",
+    body:   fd,
+    mode:   "cors"
+  });
+  if (!r.ok) throw new Error("Server upload failed: HTTP " + r.status);
+  const j = await r.json();
+  if (!j || !j.url) throw new Error("Server upload returned no url");
+  return { url: j.url, size: j.size || blob.size || 0 };
+}
+
+/* Fetch a previously-uploaded blob from the server. */
+async function tektiteVaultServerFetch(url) {
+  if (!url) throw new Error("no server url");
+  const r = await fetch(url, { mode: "cors" });
+  if (!r.ok) throw new Error("Server fetch failed: HTTP " + r.status);
+  return await r.blob();
+}
 
 async function tektiteImportFile(file) {
   if (!file || !file.name) throw new Error("tektiteImportFile: File required");
   const sz = file.size || 0;
-  if (sz > TEKTITE_BIG_FILE_HARD) {
+  const haveServer = !!_tektiteVaultServerUrl();
+  if (sz > TEKTITE_BIG_FILE_HARD && !haveServer) {
     throw new Error("Refusing to import " + (sz / (1024*1024)).toFixed(1) +
-      " MB > " + (TEKTITE_BIG_FILE_HARD / (1024*1024)) + " MB hard cap. " +
-      "Use a server-backed source or split the file.");
+      " MB > " + (TEKTITE_BIG_FILE_HARD / (1024*1024)) +
+      " MB hard cap.  Configure a compile-server URL in AI settings to host " +
+      "large files instead, or split the file.");
   }
-  if (sz > TEKTITE_BIG_FILE_WARN) {
+  let storeOnServer = false;
+  if (sz > TEKTITE_SERVER_HINT && haveServer) {
+    const sizeMb = (sz / (1024*1024)).toFixed(1);
+    storeOnServer = window.confirm(
+      "This file is " + sizeMb + " MB.\n\n" +
+      "Upload to the compile server (" + _tektiteVaultServerUrl() + ") instead of " +
+      "storing locally in IndexedDB?\n\n" +
+      "OK = upload to server (recommended for big files)\n" +
+      "Cancel = keep in browser IDB");
+  } else if (sz > TEKTITE_BIG_FILE_WARN && !haveServer) {
     const ok = window.confirm("This file is " + (sz / (1024*1024)).toFixed(1) +
       " MB. Storing very large blobs in IndexedDB can hit browser quota " +
       "limits and put the vault in a stuck state.  Continue?");
@@ -421,6 +492,38 @@ async function tektiteImportFile(file) {
       if (n > 9999) throw new Error("too many duplicates");
     }
     id = base + "-" + n + ext;
+  }
+  if (storeOnServer) {
+    let up;
+    try { up = await tektiteVaultServerUpload(TEKTITE_VAULT_REMOTE_FOLDER + id, file); }
+    catch (e) {
+      const fallback = window.confirm(
+        "Server upload failed: " + e.message + "\n\nStore locally in IDB instead?");
+      if (!fallback) throw e;
+      storeOnServer = false;
+    }
+    if (storeOnServer) {
+      const cls = tektiteClassifyAttachment(id);
+      // Server-backed record: NO blob payload; viewer derefs serverUrl.
+      const rec = {
+        id,
+        kind:       cls.kind,
+        ext:        cls.ext,
+        mime:       file.type || tektiteAttachmentMime(cls.ext),
+        size:       up.size,
+        serverUrl:  up.url,
+        createdAt:  Date.now(),
+        modifiedAt: Date.now(),
+        backing:    "server"
+      };
+      const db = await tektiteVaultOpen();
+      const tx = db.transaction(TEKTITE_ATTACHMENTS_STORE, "readwrite");
+      tx.objectStore(TEKTITE_ATTACHMENTS_STORE).put(rec);
+      await new Promise((resolve, reject) => {
+        tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error);
+      });
+      return id;
+    }
   }
   await tektitePutAttachment({ id, blob: file, mime: file.type });
   return id;

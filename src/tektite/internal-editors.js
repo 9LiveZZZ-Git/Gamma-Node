@@ -40,16 +40,15 @@ function _tektiteEnsureInternalEditorModal() {
       '<a class="tk-iem-dl" download>⬇ Download</a>' +
       '<button class="tk-iem-close" type="button" title="Close (Esc)">× Close</button>' +
     '</div>' +
-    /* Sprint 10w -- floating circular close button on the upper-right
-     * of the modal so the close affordance is always obvious even if
-     * an editor's own UI fills the bar area. */
-    '<button class="tk-iem-close-float" type="button" title="Close editor (Esc)">×</button>' +
+    /* Sprint 10y -- removed the giant floating × that bled into the
+     * editor's own UI; the bar × + Esc are sufficient and the user
+     * wanted that affordance on the inline VIEWER bar instead (where
+     * there was no close at all before 10y). */
     '<div class="tk-iem-mount"></div>';
   document.body.appendChild(m);
   _tektiteIntEditorModalEl = m;
   // Close handlers.
-  m.querySelector(".tk-iem-close")      .addEventListener("click", () => _tektiteCloseInternalEditor());
-  m.querySelector(".tk-iem-close-float").addEventListener("click", () => _tektiteCloseInternalEditor());
+  m.querySelector(".tk-iem-close").addEventListener("click", () => _tektiteCloseInternalEditor());
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && m.style.display !== "none" && m.style.display !== "") {
       _tektiteCloseInternalEditor();

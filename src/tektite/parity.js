@@ -517,12 +517,20 @@ async function _tektitePopoutLoadAttachment(inst, attId) {
     ? '<button class="tk-att-edit" data-act="' + esc(editor.act) +
         '" data-id="' + esc(attId) + '" type="button">✎ ' + esc(editor.label) + '</button>'
     : "";
+  // Sprint 10y -- close × on the viewer bar.  The popout's title bar
+  // close was hidden when the popout collapsed to the meta-bar size,
+  // leaving users stuck on an attachment they couldn't dismiss.  This
+  // dispatches to the popout's own close handler so the whole popout
+  // window goes away.
+  const closeBtn = '<button class="tk-att-close" data-id="' + esc(attId) +
+    '" type="button" title="Close (×)">× Close</button>';
   const meta = '<div class="tk-att-meta">' +
     '<span class="tk-att-kind">' + esc(kind) + '</span>' +
     '<span class="tk-att-mime">' + esc(rec.mime || "") + '</span>' +
     '<span class="tk-att-size">' + sizeKb + ' KB</span>' +
     editBtn +
     '<a class="tk-att-dl" href="' + url + '" download="' + esc(attId) + '">Download</a>' +
+    closeBtn +
   '</div>';
   let body = "";
   if (kind === "image") {
@@ -598,6 +606,26 @@ async function _tektitePopoutLoadAttachment(inst, attId) {
     } else if (typeof _tektiteOpenExternalEditor === "function") {
       _tektiteOpenExternalEditor(act, id);
     }
+  });
+  // Sprint 10y -- close × on the viewer bar; dispatches to the popout
+  // close handler (or hides the viewer pane if not in a popout).
+  const closeBtnEl = viewer.querySelector(".tk-att-close");
+  if (closeBtnEl) closeBtnEl.addEventListener("click", () => {
+    // Find the owning popout instance and close it.
+    if (typeof _tektitePopouts !== "undefined" && _tektitePopouts.instances) {
+      for (const [, inst] of _tektitePopouts.instances) {
+        if (inst && inst.dom && inst.dom.contains(viewer)) {
+          if (typeof _tektitePopoutCloseInstance === "function") {
+            _tektitePopoutCloseInstance(inst);
+            return;
+          }
+        }
+      }
+    }
+    // Not in a popout (could be a future inline pane in the Tektite
+    // tab itself): just hide the viewer + revoke its blob URL.
+    viewer.style.display = "none";
+    viewer.innerHTML = "";
   });
 }
 
