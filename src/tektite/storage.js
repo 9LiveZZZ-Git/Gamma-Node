@@ -213,6 +213,16 @@ const TEKTITE_FILE_KINDS = {
   pdf:     [".pdf"],
   doc:     [".doc", ".docx", ".rtf", ".odt"],
   data:    [".csv", ".tsv", ".json", ".jsonl", ".parquet", ".yaml", ".yml", ".xml"],
+  // Sprint 10w -- HTML kind opens in a sandboxed iframe + "Open in
+  // new tab" button.  Editable via the Monaco code editor.
+  html:    [".html", ".htm"],
+  // Sprint 10w -- code files get Monaco for editing.  Adding any
+  // language here implicitly enables Monaco for that extension.
+  code:    [".py", ".c", ".cpp", ".cxx", ".cc", ".h", ".hpp", ".rs", ".jsx", ".tsx",
+            ".ts", ".js", ".mjs", ".cjs", ".raku", ".rakumod", ".rakudoc",
+            ".go", ".java", ".kt", ".swift", ".rb", ".php", ".lua", ".sh", ".bash", ".zsh",
+            ".pl", ".pm", ".sql", ".r", ".jl", ".scala", ".clj", ".cljs", ".ex", ".exs",
+            ".css", ".scss", ".less", ".vue", ".svelte", ".astro", ".wat", ".wgsl", ".glsl"],
   text:    [".txt", ".log", ".md", ".markdown"],
   archive: [".zip", ".tar", ".gz", ".7z", ".tgz"],
   patch:   [".gpatch"],

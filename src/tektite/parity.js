@@ -494,18 +494,22 @@ async function _tektitePopoutLoadAttachment(inst, attId) {
   // the user requested.  Stirling-PDF is server-only (Spring Boot)
   // so it's a "Send to" link against the configured instance; the
   // other three load in an in-app iframe modal.
-  // Sprint 10v -- launchers point at the INLINE editors in
-  // src/tektite/internal-editors.js (PDF.js vendored via esm.sh,
-  // image / CSV pure-canvas + JS, doc via mammoth.js).  No external
-  // tab hops; everything edits in place + saves back to the vault.
+  // Sprint 10v / 10w -- launchers point at INLINE editors in
+  // src/tektite/internal-editors.js (PDF.js + annotation persist,
+  // canvas image, CSV table, docx via mammoth + docx, Monaco for
+  // code + html).  No external tab hops; everything edits in
+  // place + saves back to the vault.
   const editorMap = {
     image: { label: "Edit image",   act: "minipaint"     },
-    pdf:   { label: "Open in PDF",  act: "pdfjs"         },
+    pdf:   { label: "Edit PDF",     act: "pdfjs"         },
     data:  { label: "Edit table",   act: "tablecruncher" },
-    doc:   { label: "Edit doc",     act: "docxeditor"    }
+    doc:   { label: "Edit doc",     act: "docxeditor"    },
+    html:  { label: "Edit HTML",    act: "monaco"        },
+    code:  { label: "Edit code",    act: "monaco"        }
   };
   const editor = editorMap[kind];
-  // Only data kind's CSV/TSV actually go to Tablecruncher; JSON et al fall back.
+  // Only data kind's CSV/TSV actually go to the table editor; JSON
+  // et al fall back to the JSON pretty-print viewer.
   const editorEligible = editor && (
     kind !== "data" || (rec.ext === ".csv" || rec.ext === ".tsv")
   );
@@ -534,6 +538,31 @@ async function _tektitePopoutLoadAttachment(inst, attId) {
     // also click "Open in PDF.js" for a richer cross-browser viewer.
     body = '<embed class="tk-att-pdf" type="application/pdf" src="' +
            url + '#toolbar=1&navpanes=1&scrollbar=1">';
+  } else if (kind === "html") {
+    // Sprint 10w -- sandboxed iframe + "Open in new tab" button so
+    // scripts in the page can't escape into the editor + the user
+    // can still preview rendered output.
+    try {
+      const text = await rec.blob.text();
+      body = '<iframe class="tk-att-html" sandbox="allow-same-origin" srcdoc="' +
+        esc(text).replace(/\n/g, "&#10;") + '"></iframe>' +
+        '<div class="tk-att-html-actions">' +
+          '<a class="tk-att-html-open" href="' + url + '" target="_blank" rel="noopener">↗ Open in new tab</a>' +
+        '</div>';
+    } catch (e) {
+      body = '<div class="tk-att-empty">⚠ Failed to read HTML: ' + esc(e.message || e) + '</div>';
+    }
+  } else if (kind === "code") {
+    // Sprint 10w -- code files (.py/.rs/.js/.html etc.) get a
+    // syntax-aware editor.  Inline viewer just shows the source as
+    // a <pre>; the editor button (✎ Edit code in Monaco) opens the
+    // full Monaco-backed editor.
+    try {
+      const text = await rec.blob.text();
+      body = '<pre class="tk-att-pre">' + esc(text.slice(0, 200000)) + '</pre>';
+    } catch (e) {
+      body = '<div class="tk-att-empty">⚠ Failed to read: ' + esc(e.message || e) + '</div>';
+    }
   } else if (kind === "data" || kind === "text") {
     try {
       const text = await rec.blob.text();
