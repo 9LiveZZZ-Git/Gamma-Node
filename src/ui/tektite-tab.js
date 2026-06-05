@@ -252,6 +252,556 @@ function _tektitePopoutSetStatus(text, kind) {
 }
 
 /* =========================================================================
+ * Sprint tektite-9 -- Canvas UI
+ *
+ * Modal layout: left sidebar (canvases list) + main pane (toolbar +
+ * infinite board). The board is a CSS-transformed container holding
+ * absolutely-positioned cards + an SVG edges layer.
+ *
+ * Pan/zoom state is held on _tektiteCanvasState; the transform string
+ * `translate(panX, panY) scale(zoom)` applied to #tektite-canvas-cards
+ * AND the SVG's viewBox mapping keeps cards + edges co-registered.
+ *
+ * Cards are DOM elements with contenteditable bodies (text cards) or
+ * markdown-rendered previews (file cards). Drag the card body to move
+ * (records position on pointerup); resize via the bottom-right grip.
+ *
+ * Save: 600 ms debounced after any structural change (move, resize,
+ * text edit, add, delete, edge change).
+ * ======================================================================== */
+
+const _tektiteCanvasState = {
+  attached:    false,
+  modal:       null,
+  boardEl:     null,
+  cardsEl:     null,
+  edgesEl:     null,
+  emptyEl:     null,
+  listEl:      null,
+  currentId:   null,
+  doc:         null,
+  selectedId:  null,
+  panX:        0,
+  panY:        0,
+  zoom:        1,
+  saveTimer:   null,
+  pointerMode: null,  // null | "pan" | "drag-card" | "resize-card"
+  dragId:      null,
+  dragStartX:  0,
+  dragStartY:  0,
+  dragOrigX:   0,
+  dragOrigY:   0,
+  dragOrigW:   0,
+  dragOrigH:   0
+};
+
+async function _tektiteCanvasOpen() {
+  const s = _tektiteCanvasState;
+  s.modal = document.getElementById("tektite-canvas-modal");
+  if (!s.modal) return;
+  s.modal.style.display = "flex";
+  _tektiteCanvasAttach();
+  await _tektiteCanvasRefreshList();
+}
+
+function _tektiteCanvasClose() {
+  const s = _tektiteCanvasState;
+  _tektiteCanvasFlush();
+  if (s.modal) s.modal.style.display = "none";
+}
+
+function _tektiteCanvasAttach() {
+  const s = _tektiteCanvasState;
+  if (s.attached) return;
+  s.attached = true;
+  s.boardEl = document.getElementById("tektite-canvas-board");
+  s.cardsEl = document.getElementById("tektite-canvas-cards");
+  s.edgesEl = document.getElementById("tektite-canvas-edges");
+  s.emptyEl = document.getElementById("tektite-canvas-empty");
+  s.listEl  = document.getElementById("tektite-canvas-list");
+
+  document.getElementById("btn-tektite-canvas-new").addEventListener("click", () => _tektiteCanvasCreate());
+  document.getElementById("btn-tektite-canvas-close").addEventListener("click", () => _tektiteCanvasClose());
+  document.getElementById("btn-tektite-canvas-add-text").addEventListener("click", () => _tektiteCanvasAddTextCard());
+  document.getElementById("btn-tektite-canvas-add-file").addEventListener("click", () => _tektiteCanvasAddFileCard());
+  document.getElementById("btn-tektite-canvas-fit").addEventListener("click", () => _tektiteCanvasFitToView());
+
+  // Title input: rename canvas (debounced save).
+  const titleInput = document.getElementById("tektite-canvas-title-input");
+  if (titleInput) {
+    titleInput.addEventListener("input", () => {
+      if (!s.doc) return;
+      s.doc._title = titleInput.value || "";
+      _tektiteCanvasMarkDirty();
+    });
+  }
+
+  // Pan + zoom + click-on-empty deselect.
+  _tektiteCanvasWireBoardPointer();
+
+  // Esc closes.
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && s.modal && s.modal.style.display !== "none") {
+      _tektiteCanvasClose();
+    }
+  });
+}
+
+function _tektiteCanvasWireBoardPointer() {
+  const s = _tektiteCanvasState;
+  s.boardEl.addEventListener("pointerdown", (e) => {
+    // Cards have their own handlers; only react to clicks on the
+    // board background.
+    if (e.target !== s.boardEl) return;
+    s.pointerMode = "pan";
+    s.dragStartX = e.clientX;
+    s.dragStartY = e.clientY;
+    s.dragOrigX  = s.panX;
+    s.dragOrigY  = s.panY;
+    s.boardEl.setPointerCapture(e.pointerId);
+    _tektiteCanvasSelectCard(null);
+  });
+  s.boardEl.addEventListener("pointermove", (e) => {
+    if (s.pointerMode === "pan") {
+      s.panX = s.dragOrigX + (e.clientX - s.dragStartX);
+      s.panY = s.dragOrigY + (e.clientY - s.dragStartY);
+      _tektiteCanvasApplyTransform();
+    }
+  });
+  s.boardEl.addEventListener("pointerup", (e) => {
+    if (s.pointerMode === "pan") {
+      try { s.boardEl.releasePointerCapture(e.pointerId); } catch (_) {}
+      s.pointerMode = null;
+    }
+  });
+  s.boardEl.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const rect = s.boardEl.getBoundingClientRect();
+    const cx = e.clientX - rect.left;
+    const cy = e.clientY - rect.top;
+    const factor = Math.exp(-e.deltaY * 0.0015);
+    const newZoom = Math.max(0.2, Math.min(4, s.zoom * factor));
+    // Zoom toward cursor: keep the world-space point under the
+    // cursor fixed in screen space.
+    const wx = (cx - rect.width  / 2 - s.panX) / s.zoom;
+    const wy = (cy - rect.height / 2 - s.panY) / s.zoom;
+    s.zoom = newZoom;
+    s.panX = cx - rect.width  / 2 - wx * s.zoom;
+    s.panY = cy - rect.height / 2 - wy * s.zoom;
+    _tektiteCanvasApplyTransform();
+  }, { passive: false });
+}
+
+function _tektiteCanvasApplyTransform() {
+  const s = _tektiteCanvasState;
+  if (!s.cardsEl) return;
+  s.cardsEl.style.transform =
+    "translate(" + s.panX + "px, " + s.panY + "px) scale(" + s.zoom + ")";
+  _tektiteCanvasRenderEdges();
+}
+
+async function _tektiteCanvasRefreshList() {
+  const s = _tektiteCanvasState;
+  if (!s.listEl) return;
+  let canvases;
+  try { canvases = await tektiteCanvasListAll(); }
+  catch (e) { console.warn("[tektite] canvas list failed:", e); canvases = []; }
+  if (!canvases.length) {
+    s.listEl.innerHTML = `<div class="tektite-canvas-list-empty">No canvases yet.  Click <strong>＋</strong> to create one.</div>`;
+    return;
+  }
+  s.listEl.innerHTML = canvases.map(c => {
+    const active = (c.id === s.currentId) ? " active" : "";
+    return `<div class="tektite-canvas-list-item${active}" data-id="${_tektiteEscapeAttr(c.id)}">
+      ${_tektiteEscapeHtml(c.title || c.id)}
+    </div>`;
+  }).join("");
+  s.listEl.querySelectorAll(".tektite-canvas-list-item").forEach(el => {
+    el.addEventListener("click", () => _tektiteCanvasOpenById(el.getAttribute("data-id")));
+  });
+}
+
+async function _tektiteCanvasCreate() {
+  try {
+    const title = window.prompt("Name for the new canvas:", "Untitled canvas");
+    if (!title) return;
+    const id = await tektiteCanvasCreate(title);
+    await _tektiteCanvasRefreshList();
+    await _tektiteCanvasOpenById(id);
+  } catch (e) {
+    window.alert("Canvas creation failed: " + (e.message || e));
+  }
+}
+
+async function _tektiteCanvasOpenById(id) {
+  const s = _tektiteCanvasState;
+  await _tektiteCanvasFlush();
+  s.currentId = id;
+  s.selectedId = null;
+  try {
+    const loaded = await tektiteCanvasLoad(id);
+    s.doc = loaded.doc;
+    s.doc._title = loaded.frontmatter["canvas-title"] || loaded.note.title || id;
+  } catch (e) {
+    s.doc = null;
+    if (s.emptyEl) {
+      s.emptyEl.style.display = "flex";
+      s.emptyEl.textContent = "Failed to load: " + (e.message || e);
+    }
+    return;
+  }
+  // Title input.
+  const titleInput = document.getElementById("tektite-canvas-title-input");
+  if (titleInput) titleInput.value = s.doc._title || id;
+  await _tektiteCanvasRefreshList();
+  _tektiteCanvasRenderAll();
+  _tektiteCanvasFitToView();
+}
+
+function _tektiteCanvasRenderAll() {
+  const s = _tektiteCanvasState;
+  if (!s.cardsEl || !s.doc) return;
+  s.cardsEl.innerHTML = "";
+  if (s.emptyEl) s.emptyEl.style.display = s.doc.nodes.length ? "none" : "flex";
+  for (const node of s.doc.nodes) _tektiteCanvasRenderNode(node);
+  _tektiteCanvasRenderEdges();
+  _tektiteCanvasApplyTransform();
+}
+
+function _tektiteCanvasRenderNode(node) {
+  const s = _tektiteCanvasState;
+  if (!s.cardsEl) return;
+  const el = document.createElement("div");
+  el.className = "tektite-canvas-card";
+  el.dataset.nodeId = node.id;
+  el.style.left   = node.x      + "px";
+  el.style.top    = node.y      + "px";
+  el.style.width  = (node.width  | 0) + "px";
+  el.style.height = (node.height | 0) + "px";
+  const accent = tektiteCanvasColor(node.color);
+  if (accent) el.style.borderColor = accent;
+
+  // Title bar (type label + delete).
+  const bar = document.createElement("div");
+  bar.className = "tektite-canvas-card-bar";
+  const titleSpan = document.createElement("span");
+  titleSpan.className = "tektite-canvas-card-bar-title";
+  if (node.type === "file")      titleSpan.textContent = "📄 " + (node.file || "");
+  else if (node.type === "link") titleSpan.textContent = "🔗 " + (node.url  || "");
+  else                            titleSpan.textContent = "📝 text";
+  bar.appendChild(titleSpan);
+  const delBtn = document.createElement("button");
+  delBtn.className = "tektite-canvas-card-bar-btn";
+  delBtn.textContent = "×";
+  delBtn.title = "Delete card";
+  delBtn.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    _tektiteCanvasDeleteNode(node.id);
+  });
+  bar.appendChild(delBtn);
+  el.appendChild(bar);
+
+  // Body. Text cards have a contenteditable; file cards render
+  // markdown preview lazily; link cards render an iframe (deferred
+  // until tektite-9b -- for now show a plain anchor).
+  const body = document.createElement("div");
+  body.className = "tektite-canvas-card-body";
+  if (node.type === "text") {
+    body.contentEditable = "true";
+    body.spellcheck = false;
+    body.textContent = node.text || "";
+    body.addEventListener("input", () => {
+      node.text = body.innerText || "";
+      _tektiteCanvasMarkDirty();
+    });
+    // Prevent the body's edit clicks from initiating a card drag.
+    body.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+  } else if (node.type === "file") {
+    body.style.cursor = "pointer";
+    body.title = "Click to open in the main editor";
+    body.textContent = "(loading…)";
+    (async () => {
+      try {
+        const target = await tektiteGetNote(node.file) ||
+          (await tektiteListNotes()).find(n => (n.title || "").toLowerCase() === String(node.file).toLowerCase());
+        if (!target) { body.textContent = "⚠ Note not found: " + node.file; return; }
+        body.innerHTML = "";
+        if (typeof tektiteMarkdownRenderInto === "function") {
+          await tektiteMarkdownRenderInto(body, target.content || "");
+        } else {
+          body.textContent = target.content || "";
+        }
+      } catch (e) {
+        body.textContent = "⚠ " + (e.message || e);
+      }
+    })();
+    body.addEventListener("click", async (ev) => {
+      if (ev.target.closest("a")) return;
+      _tektiteCanvasClose();
+      _tektiteTabState.activeSource = "vault";
+      await _tektiteTabRefresh();
+      await tektiteEditorLoadFromSource("vault", node.file);
+      _tektiteTabRender();
+    });
+    body.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+  } else if (node.type === "link") {
+    body.innerHTML = '<a href="' + _tektiteEscapeAttr(node.url || "") + '" target="_blank" rel="noopener">' +
+      _tektiteEscapeHtml(node.url || "(no url)") + '</a>';
+    body.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+  }
+  el.appendChild(body);
+
+  // Resize grip.
+  const grip = document.createElement("div");
+  grip.className = "tektite-canvas-card-resize";
+  grip.addEventListener("pointerdown", (ev) => {
+    ev.stopPropagation();
+    _tektiteCanvasStartResize(node.id, ev);
+  });
+  el.appendChild(grip);
+
+  // Drag handle = card itself (bar + outer).
+  el.addEventListener("pointerdown", (ev) => _tektiteCanvasStartDrag(node.id, ev));
+  el.addEventListener("click", () => _tektiteCanvasSelectCard(node.id));
+
+  s.cardsEl.appendChild(el);
+}
+
+function _tektiteCanvasStartDrag(nodeId, e) {
+  const s = _tektiteCanvasState;
+  const node = s.doc.nodes.find(n => n.id === nodeId);
+  if (!node) return;
+  s.pointerMode = "drag-card";
+  s.dragId = nodeId;
+  s.dragStartX = e.clientX;
+  s.dragStartY = e.clientY;
+  s.dragOrigX  = node.x;
+  s.dragOrigY  = node.y;
+  const el = e.currentTarget;
+  el.setPointerCapture(e.pointerId);
+  const onMove = (ev) => {
+    if (s.pointerMode !== "drag-card") return;
+    const dx = (ev.clientX - s.dragStartX) / s.zoom;
+    const dy = (ev.clientY - s.dragStartY) / s.zoom;
+    node.x = s.dragOrigX + dx;
+    node.y = s.dragOrigY + dy;
+    el.style.left = node.x + "px";
+    el.style.top  = node.y + "px";
+    _tektiteCanvasRenderEdges();
+  };
+  const onUp = (ev) => {
+    el.removeEventListener("pointermove", onMove);
+    el.removeEventListener("pointerup", onUp);
+    try { el.releasePointerCapture(ev.pointerId); } catch (_) {}
+    s.pointerMode = null;
+    s.dragId = null;
+    _tektiteCanvasMarkDirty();
+  };
+  el.addEventListener("pointermove", onMove);
+  el.addEventListener("pointerup",   onUp);
+  _tektiteCanvasSelectCard(nodeId);
+}
+
+function _tektiteCanvasStartResize(nodeId, e) {
+  const s = _tektiteCanvasState;
+  const node = s.doc.nodes.find(n => n.id === nodeId);
+  if (!node) return;
+  s.pointerMode = "resize-card";
+  s.dragId = nodeId;
+  s.dragStartX = e.clientX;
+  s.dragStartY = e.clientY;
+  s.dragOrigW = node.width  | 0;
+  s.dragOrigH = node.height | 0;
+  const grip = e.currentTarget;
+  const el = grip.parentElement;
+  grip.setPointerCapture(e.pointerId);
+  const onMove = (ev) => {
+    if (s.pointerMode !== "resize-card") return;
+    const dx = (ev.clientX - s.dragStartX) / s.zoom;
+    const dy = (ev.clientY - s.dragStartY) / s.zoom;
+    node.width  = Math.max(120, s.dragOrigW + dx);
+    node.height = Math.max(60,  s.dragOrigH + dy);
+    el.style.width  = node.width  + "px";
+    el.style.height = node.height + "px";
+    _tektiteCanvasRenderEdges();
+  };
+  const onUp = (ev) => {
+    grip.removeEventListener("pointermove", onMove);
+    grip.removeEventListener("pointerup", onUp);
+    try { grip.releasePointerCapture(ev.pointerId); } catch (_) {}
+    s.pointerMode = null;
+    s.dragId = null;
+    _tektiteCanvasMarkDirty();
+  };
+  grip.addEventListener("pointermove", onMove);
+  grip.addEventListener("pointerup",   onUp);
+}
+
+function _tektiteCanvasSelectCard(nodeId) {
+  const s = _tektiteCanvasState;
+  s.selectedId = nodeId;
+  if (!s.cardsEl) return;
+  s.cardsEl.querySelectorAll(".tektite-canvas-card").forEach(c =>
+    c.classList.toggle("selected", c.dataset.nodeId === nodeId));
+}
+
+function _tektiteCanvasDeleteNode(nodeId) {
+  const s = _tektiteCanvasState;
+  if (!s.doc) return;
+  s.doc.nodes = s.doc.nodes.filter(n => n.id !== nodeId);
+  s.doc.edges = s.doc.edges.filter(e =>
+    e.fromNode !== nodeId && e.toNode !== nodeId);
+  if (s.selectedId === nodeId) s.selectedId = null;
+  _tektiteCanvasRenderAll();
+  _tektiteCanvasMarkDirty();
+}
+
+function _tektiteCanvasRenderEdges() {
+  const s = _tektiteCanvasState;
+  if (!s.edgesEl || !s.doc) return;
+  // Map a node's anchor point in screen coords.
+  const rect = s.boardEl.getBoundingClientRect();
+  const cx0 = rect.width  / 2 + s.panX;
+  const cy0 = rect.height / 2 + s.panY;
+  function anchor(node, side) {
+    const w = node.width  | 0;
+    const h = node.height | 0;
+    let lx = node.x, ly = node.y;
+    if (side === "left")   { lx = node.x;     ly = node.y + h / 2; }
+    if (side === "right")  { lx = node.x + w; ly = node.y + h / 2; }
+    if (side === "top")    { lx = node.x + w / 2; ly = node.y; }
+    if (side === "bottom") { lx = node.x + w / 2; ly = node.y + h; }
+    return { x: cx0 + lx * s.zoom, y: cy0 + ly * s.zoom };
+  }
+  // Re-render the SVG. Simple lines for v1 (no labels).
+  let svgInner = "";
+  for (const e of s.doc.edges) {
+    const a = s.doc.nodes.find(n => n.id === e.fromNode);
+    const b = s.doc.nodes.find(n => n.id === e.toNode);
+    if (!a || !b) continue;
+    const pa = anchor(a, e.fromSide || "right");
+    const pb = anchor(b, e.toSide   || "left");
+    const stroke = tektiteCanvasColor(e.color) || "rgba(155, 208, 255, 0.55)";
+    svgInner += `<line x1="${pa.x}" y1="${pa.y}" x2="${pb.x}" y2="${pb.y}" stroke="${stroke}" stroke-width="1.5" marker-end="url(#tektite-canvas-arrow)"/>`;
+  }
+  s.edgesEl.innerHTML = `<defs>
+      <marker id="tektite-canvas-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 Z" fill="rgba(155, 208, 255, 0.65)" />
+      </marker>
+    </defs>` + svgInner;
+}
+
+function _tektiteCanvasAddTextCard() {
+  const s = _tektiteCanvasState;
+  if (!s.doc) return;
+  const sz = tektiteCanvasDefaultSize("text");
+  const node = {
+    id: tektiteCanvasUid(),
+    type: "text",
+    text: "New card",
+    x: -sz.width / 2 - s.panX / s.zoom,
+    y: -sz.height / 2 - s.panY / s.zoom,
+    width: sz.width,
+    height: sz.height
+  };
+  s.doc.nodes.push(node);
+  _tektiteCanvasRenderNode(node);
+  if (s.emptyEl) s.emptyEl.style.display = "none";
+  _tektiteCanvasSelectCard(node.id);
+  _tektiteCanvasMarkDirty();
+}
+
+async function _tektiteCanvasAddFileCard() {
+  const s = _tektiteCanvasState;
+  if (!s.doc) return;
+  const target = window.prompt("Vault note id or title to embed:");
+  if (!target) return;
+  let note = await tektiteGetNote(target);
+  if (!note) {
+    const all = await tektiteListNotes();
+    note = all.find(n => (n.title || "").toLowerCase() === target.toLowerCase());
+  }
+  if (!note) { window.alert("Note not found: " + target); return; }
+  const sz = tektiteCanvasDefaultSize("file");
+  const node = {
+    id: tektiteCanvasUid(),
+    type: "file",
+    file: note.id,
+    x: -sz.width / 2 - s.panX / s.zoom,
+    y: -sz.height / 2 - s.panY / s.zoom,
+    width: sz.width,
+    height: sz.height
+  };
+  s.doc.nodes.push(node);
+  _tektiteCanvasRenderNode(node);
+  if (s.emptyEl) s.emptyEl.style.display = "none";
+  _tektiteCanvasSelectCard(node.id);
+  _tektiteCanvasMarkDirty();
+}
+
+function _tektiteCanvasFitToView() {
+  const s = _tektiteCanvasState;
+  if (!s.doc || !s.doc.nodes.length || !s.boardEl) {
+    s.panX = 0; s.panY = 0; s.zoom = 1;
+    _tektiteCanvasApplyTransform();
+    return;
+  }
+  // World-space bounding box of every node.
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const n of s.doc.nodes) {
+    minX = Math.min(minX, n.x);
+    maxX = Math.max(maxX, n.x + (n.width  | 0));
+    minY = Math.min(minY, n.y);
+    maxY = Math.max(maxY, n.y + (n.height | 0));
+  }
+  const w = maxX - minX, h = maxY - minY;
+  const rect = s.boardEl.getBoundingClientRect();
+  const margin = 80;
+  const sx = (rect.width  - margin * 2) / Math.max(1, w);
+  const sy = (rect.height - margin * 2) / Math.max(1, h);
+  s.zoom = Math.max(0.2, Math.min(2, Math.min(sx, sy)));
+  // Pan so the bbox center lands at viewport center.
+  const cx = (minX + maxX) / 2;
+  const cy = (minY + maxY) / 2;
+  s.panX = -cx * s.zoom;
+  s.panY = -cy * s.zoom;
+  _tektiteCanvasApplyTransform();
+}
+
+function _tektiteCanvasMarkDirty() {
+  const s = _tektiteCanvasState;
+  if (!s.currentId) return;
+  if (s.saveTimer) clearTimeout(s.saveTimer);
+  _tektiteCanvasSetStatus("Editing…", "saving");
+  s.saveTimer = setTimeout(_tektiteCanvasFlush, 600);
+}
+
+function _tektiteCanvasSetStatus(text, kind) {
+  const el = document.getElementById("tektite-canvas-status");
+  if (!el) return;
+  el.textContent = text || "";
+  el.className = "tektite-canvas-status" + (kind ? (" " + kind) : "");
+}
+
+async function _tektiteCanvasFlush() {
+  const s = _tektiteCanvasState;
+  if (s.saveTimer) { clearTimeout(s.saveTimer); s.saveTimer = null; }
+  if (!s.currentId || !s.doc) return;
+  _tektiteCanvasSetStatus("Saving…", "saving");
+  try {
+    await tektiteCanvasSave(s.currentId, s.doc);
+    _tektiteCanvasSetStatus("Saved", "ok");
+    setTimeout(() => {
+      if ((document.getElementById("tektite-canvas-status") || {}).textContent === "Saved") {
+        _tektiteCanvasSetStatus("");
+      }
+    }, 1500);
+  } catch (e) {
+    _tektiteCanvasSetStatus("✗ " + (e.message || e), "err");
+  }
+}
+
+/* =========================================================================
  * Sprint tektite-8 -- Bases UI
  *
  * Modal with a left sidebar (list of bases) + main pane (editor
@@ -1187,6 +1737,10 @@ function tektiteTabAttach() {
   // Sprint tektite-8 -- Bases modal.
   const basesBtn = document.getElementById("btn-tektite-bases");
   if (basesBtn) basesBtn.addEventListener("click", () => _tektiteBasesOpen());
+
+  // Sprint tektite-9 -- Canvas modal.
+  const canvasBtn = document.getElementById("btn-tektite-canvas");
+  if (canvasBtn) canvasBtn.addEventListener("click", () => _tektiteCanvasOpen());
 
   // Sprint tektite-5c2 -- main editor minimize. Toggles the
   // `editor-minimized` class on the editor pane; CSS handles the
