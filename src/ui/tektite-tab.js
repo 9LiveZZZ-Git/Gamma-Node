@@ -447,73 +447,7 @@ const _tektiteCanvasState = {
   dragOrigPanY: 0
 };
 
-/* Sprint 10l-A -- Tektite Canvas Preset.  Replaces the legacy JSON-
- * Canvas modal that this function used to open.  Now toggles the
- * body class + filters palette to Tektite + fits the main canvas to
- * existing Tektite cards.  No floating pill; exit lives in the
- * preset bar inside the header (replaces the toolbar in-place).
- *
- * Legacy modal still callable via _tektiteCanvasOpenLegacy(). */
-function _tektiteCanvasOpen() {
-  if (document.body.classList.contains("tektite-canvas-preset")) {
-    _tektiteCanvasClose();
-    return;
-  }
-  document.body.classList.add("tektite-canvas-preset");
-  if (typeof brState !== "undefined" && brState) {
-    if (brState._savedCatFilter === undefined) brState._savedCatFilter = brState.catFilter;
-    if (brState._savedTab       === undefined) brState._savedTab       = brState.tab;
-    brState.catFilter = "Tektite";
-  }
-  if (typeof brSwitchTab   === "function") brSwitchTab("nodes");
-  if (typeof brRenderNodes === "function") brRenderNodes();
-  if (typeof _gnFitCanvasToView === "function") {
-    setTimeout(() => _gnFitCanvasToView({ onlyKind: "tektite-card" }), 0);
-  }
-  _tektiteCanvasPresetWire();
-}
-
-function _tektiteCanvasClose() {
-  document.body.classList.remove("tektite-canvas-preset");
-  if (typeof brState !== "undefined" && brState) {
-    if (brState._savedCatFilter !== undefined) {
-      brState.catFilter = brState._savedCatFilter;
-      delete brState._savedCatFilter;
-    } else {
-      brState.catFilter = null;
-    }
-    if (brState._savedTab !== undefined) {
-      const saved = brState._savedTab;
-      delete brState._savedTab;
-      if (typeof brSwitchTab === "function") brSwitchTab(saved);
-    }
-  }
-  if (typeof brRenderNodes === "function") brRenderNodes();
-}
-
-/* Wire the preset bar buttons + Esc handler.  Idempotent (wiredOnce). */
-let _tektiteCanvasPresetWired = false;
-function _tektiteCanvasPresetWire() {
-  if (_tektiteCanvasPresetWired) return;
-  _tektiteCanvasPresetWired = true;
-  const exitBtn = document.getElementById("btn-tektite-preset-exit");
-  if (exitBtn) exitBtn.addEventListener("click", () => _tektiteCanvasClose());
-  const fitBtn = document.getElementById("btn-tektite-preset-fit");
-  if (fitBtn)  fitBtn.addEventListener("click", () => {
-    if (typeof _gnFitCanvasToView === "function") _gnFitCanvasToView({ onlyKind: "tektite-card" });
-  });
-  document.addEventListener("keydown", (e) => {
-    if (e.key !== "Escape") return;
-    if (!document.body.classList.contains("tektite-canvas-preset")) return;
-    const ae = document.activeElement;
-    if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable)) return;
-    _tektiteCanvasClose();
-  });
-}
-
-/* Legacy JSON-Canvas modal -- still callable for users that have
- * pre-10l-A canvas docs saved to the vault. */
-async function _tektiteCanvasOpenLegacy() {
+async function _tektiteCanvasOpen() {
   const s = _tektiteCanvasState;
   s.modal = document.getElementById("tektite-canvas-modal");
   if (!s.modal) return;
@@ -522,7 +456,7 @@ async function _tektiteCanvasOpenLegacy() {
   await _tektiteCanvasRefreshList();
 }
 
-function _tektiteCanvasCloseLegacy() {
+function _tektiteCanvasClose() {
   const s = _tektiteCanvasState;
   _tektiteCanvasFlush();
   if (s.modal) s.modal.style.display = "none";
@@ -539,7 +473,7 @@ function _tektiteCanvasAttach() {
   s.listEl  = document.getElementById("tektite-canvas-list");
 
   document.getElementById("btn-tektite-canvas-new").addEventListener("click", () => _tektiteCanvasCreate());
-  document.getElementById("btn-tektite-canvas-close").addEventListener("click", () => _tektiteCanvasCloseLegacy());
+  document.getElementById("btn-tektite-canvas-close").addEventListener("click", () => _tektiteCanvasClose());
   document.getElementById("btn-tektite-canvas-add-text").addEventListener("click", () => _tektiteCanvasAddTextCard());
   document.getElementById("btn-tektite-canvas-add-file").addEventListener("click", () => _tektiteCanvasAddFileCard());
   document.getElementById("btn-tektite-canvas-fit").addEventListener("click", () => _tektiteCanvasFitToView());
@@ -560,7 +494,7 @@ function _tektiteCanvasAttach() {
   // Esc closes.
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && s.modal && s.modal.style.display !== "none") {
-      _tektiteCanvasCloseLegacy();
+      _tektiteCanvasClose();
     }
   });
 }
@@ -765,7 +699,7 @@ function _tektiteCanvasRenderNode(node) {
     })();
     body.addEventListener("click", async (ev) => {
       if (ev.target.closest("a")) return;
-      _tektiteCanvasCloseLegacy();
+      _tektiteCanvasClose();
       _tektiteTabState.activeSource = "vault";
       await _tektiteTabRefresh();
       await tektiteEditorLoadFromSource("vault", node.file);
