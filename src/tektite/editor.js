@@ -228,7 +228,24 @@ function tektiteEditorAttach(rootEl) {
   if (s.titleInput) {
     s.titleInput.addEventListener("input", () => {
       if (!s.currentId) return;
-      if (s.currentSource === "vault") tektiteEditorMarkDirty();
+      if (s.currentSource === "vault") {
+        tektiteEditorMarkDirty();
+        // Sprint tektite-3a -- emit a "title-only" event immediately so
+        // the note list reflects the typed title without waiting for the
+        // 400ms save debounce.
+        for (const fn of s.listeners) {
+          try {
+            fn({
+              sourceId:   "vault",
+              fileId:     s.currentId,
+              title:      s.titleInput.value || s.currentId,
+              content:    _tektiteEditorGetText(),
+              modifiedAt: Date.now(),
+              titleOnly:  true
+            });
+          } catch (_) {}
+        }
+      }
     });
     s.titleInput.addEventListener("keydown", (e) => {
       if (e.key === "Enter") {

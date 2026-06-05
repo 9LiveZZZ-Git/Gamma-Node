@@ -283,7 +283,20 @@ async function _tektiteTransformMermaid(rootEl) {
 async function tektiteMarkdownRenderInto(targetEl, text) {
   if (!targetEl) return;
   const marked = await _tektiteLoadMarked();
-  const withLinks = String(text || "").replace(
+  // Sprint tektite-4 -- transclusion expansion runs BEFORE the
+  // wikilink / math / marked passes. Each ![[…]] resolves to the
+  // referenced note's body (or section), wrapped in a
+  // <div class="tektite-embed"> so the preview can style it
+  // distinctly. Cycles are broken via a visited-set guard.
+  let working = String(text || "");
+  if (typeof tektiteExpandTransclusions === "function") {
+    try {
+      working = await tektiteExpandTransclusions(working);
+    } catch (e) {
+      console.warn("[tektite] transclusion expand failed:", e);
+    }
+  }
+  const withLinks = working.replace(
     TEKTITE_WIKILINK_RE,
     (whole, inner) => {
       const pipe = inner.match(TEKTITE_PIPE_SPLIT);

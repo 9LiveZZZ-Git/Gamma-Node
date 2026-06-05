@@ -1620,6 +1620,34 @@
     padding: 0 6px;
     line-height: 14px;
   }
+
+  /* Sprint tektite-4 -- transclusion embeds. Embedded note bodies
+   * render inside a left-bordered card so users can tell at a glance
+   * which content is transcluded vs inline. */
+  .tektite-preview .tektite-embed {
+    margin: 0.8em 0;
+    padding: 0.5em 14px 0.5em 16px;
+    border-left: 3px solid var(--text-wire);
+    background: rgba(131, 232, 255, 0.04);
+    border-radius: 0 4px 4px 0;
+  }
+  .tektite-preview .tektite-embed > *:first-child { margin-top: 0; }
+  .tektite-preview .tektite-embed > *:last-child  { margin-bottom: 0; }
+  .tektite-preview .tektite-embed-missing {
+    margin: 0.6em 0;
+    padding: 8px 14px;
+    color: var(--warn);
+    background: rgba(255, 179, 71, 0.06);
+    border: 1px dashed rgba(255, 179, 71, 0.40);
+    border-radius: 4px;
+    font-size: 11.5px;
+  }
+  .tektite-preview .tektite-embed-cycle {
+    color: var(--text-3);
+    font-style: italic;
+    font-size: 11px;
+  }
+
   .tektite-empty {
     padding: 24px 14px;
     text-align: center;
@@ -7540,6 +7568,8 @@
           <div class="tektite-source-rail" id="tektite-source-rail"></div>
           <div class="tektite-toolbar">
             <button class="btn" id="btn-tektite-new" type="button">＋ New note</button>
+            <button class="btn" id="btn-tektite-today" type="button"
+              title="Open or create today's daily note (daily-YYYY-MM-DD)">📅 Today</button>
             <input id="tektite-filter" type="search"
               placeholder="filter or search · try tag:audio prop:status=draft"
               title="Plain text filters by title. tag:NAME, prop:KEY=VALUE, path:SUBSTR, and &quot;quoted phrase&quot; engage the structured query DSL (vault only). Negate with tag:!NAME. Numeric ops: prop:count>5."
@@ -58038,7 +58068,20 @@ async function _tektiteTransformMermaid(rootEl) {
 async function tektiteMarkdownRenderInto(targetEl, text) {
   if (!targetEl) return;
   const marked = await _tektiteLoadMarked();
-  const withLinks = String(text || "").replace(
+  // Sprint tektite-4 -- transclusion expansion runs BEFORE the
+  // wikilink / math / marked passes. Each ![[…]] resolves to the
+  // referenced note's body (or section), wrapped in a
+  // <div class="tektite-embed"> so the preview can style it
+  // distinctly. Cycles are broken via a visited-set guard.
+  let working = String(text || "");
+  if (typeof tektiteExpandTransclusions === "function") {
+    try {
+      working = await tektiteExpandTransclusions(working);
+    } catch (e) {
+      console.warn("[tektite] transclusion expand failed:", e);
+    }
+  }
+  const withLinks = working.replace(
     TEKTITE_WIKILINK_RE,
     (whole, inner) => {
       const pipe = inner.match(TEKTITE_PIPE_SPLIT);
@@ -59220,6 +59263,342 @@ function _tektiteCountOccurrences(haystack, needle) {
   return n;
 }
 /* =========================================================================
+ * Tektite MD -- templates + daily notes
+ *
+ * Phase C sprint tektite-4. Mustache-ish placeholder engine used by:
+ *   - Daily notes (today, yesterday, tomorrow)
+ *   - User-defined note templates (sprint tektite-4b will add a picker)
+ *   - The +New note flow (auto-injects sensible scaffolding)
+ *
+ * Placeholders honored by tektiteRenderTemplate(template, vars):
+ *
+ *   {{date}}            ISO date, today by default (vars.date overrides)
+ *   {{date:format}}     formatted date; supports
+ *                         YYYY MM DD HH mm ss
+ *                         YYYY-MM-DD       (default `date`)
+ *                         dddd ddd dd      day-of-week
+ *                         MMMM MMM         month name
+ *   {{time}}            HH:mm
+ *   {{title}}           the new note's title (vars.title or "Untitled")
+ *   {{slug}}            slugified title
+ *   {{selection}}       text the user had selected when opening template
+ *   {{cursor}}          marker that the editor will jump to after insert
+ *   {{node:type}}       used by /insert-node-doc; replaced with the
+ *                       registry doc-block of that node type (defers
+ *                       to sprint tektite-4b; passes through here)
+ *
+ * Public surface:
+ *   tektiteRenderTemplate(tpl, vars)
+ *       -> string. Pure function; no IDB/UI side effects.
+ *   tektiteDailyNoteTodayId()
+ *       -> the slug of today's daily note (e.g. "daily-2026-06-04")
+ *   tektiteDailyNoteOpenOrCreate({ offset = 0 })
+ *       -> Promise<string> resolving to the note id; creates from the
+ *       daily template if it doesn't exist yet. `offset` is days
+ *       relative to today (-1 = yesterday, +1 = tomorrow).
+ *   tektiteDailyNoteTemplate(date)
+ *       -> string. Default daily-note template body. Easy to override
+ *       in a later sprint via a settings entry.
+ * ======================================================================== */
+
+function _tektiteDateFormat(d, fmt) {
+  const pad = (n, w) => String(n).padStart(w || 2, "0");
+  const monthsLong = ["January","February","March","April","May","June",
+                      "July","August","September","October","November","December"];
+  const monthsShort = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  const daysLong  = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+  const daysShort = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+  const map = {
+    YYYY: pad(d.getFullYear(), 4),
+    YY:   pad(d.getFullYear() % 100, 2),
+    MMMM: monthsLong[d.getMonth()],
+    MMM:  monthsShort[d.getMonth()],
+    MM:   pad(d.getMonth() + 1, 2),
+    DD:   pad(d.getDate(), 2),
+    HH:   pad(d.getHours(), 2),
+    mm:   pad(d.getMinutes(), 2),
+    ss:   pad(d.getSeconds(), 2),
+    dddd: daysLong[d.getDay()],
+    ddd:  daysShort[d.getDay()],
+    dd:   pad(d.getDay(), 2)
+  };
+  // Longer tokens first so YYYY isn't half-consumed by YY.
+  const order = ["YYYY","YY","MMMM","MMM","MM","DD","HH","mm","ss","dddd","ddd","dd"];
+  let out = fmt;
+  for (const tok of order) {
+    out = out.split(tok).join(map[tok]);
+  }
+  return out;
+}
+
+function tektiteRenderTemplate(tpl, vars) {
+  vars = vars || {};
+  const baseDate = (vars.date instanceof Date) ? vars.date : new Date();
+  const subs = {
+    title:     vars.title     || "Untitled",
+    slug:      vars.slug      || ((typeof tektiteSlugify === "function") ? tektiteSlugify(vars.title || "untitled") : "untitled"),
+    selection: vars.selection || "",
+    cursor:    "",  // marker is left empty; the editor strips + jumps
+    date:      _tektiteDateFormat(baseDate, "YYYY-MM-DD"),
+    time:      _tektiteDateFormat(baseDate, "HH:mm")
+  };
+  return String(tpl || "").replace(/\{\{\s*([^}]+?)\s*\}\}/g, (whole, expr) => {
+    const colon = expr.indexOf(":");
+    if (colon < 0) {
+      // Simple `{{key}}` lookup; pass through if unknown.
+      return Object.prototype.hasOwnProperty.call(subs, expr) ? String(subs[expr]) : whole;
+    }
+    const head = expr.slice(0, colon).trim();
+    const arg  = expr.slice(colon + 1).trim();
+    if (head === "date") return _tektiteDateFormat(baseDate, arg || "YYYY-MM-DD");
+    if (head === "time") return _tektiteDateFormat(baseDate, arg || "HH:mm");
+    if (head === "node") {
+      // sprint tektite-4b will resolve from the registry; pass through
+      // for now so the user sees the literal placeholder.
+      return whole;
+    }
+    return whole;
+  });
+}
+
+function tektiteDailyNoteTodayId(offsetDays) {
+  const d = new Date();
+  d.setDate(d.getDate() + (Number.isFinite(offsetDays) ? offsetDays : 0));
+  return "daily-" + _tektiteDateFormat(d, "YYYY-MM-DD");
+}
+
+function tektiteDailyNoteTemplate(date) {
+  const d = (date instanceof Date) ? date : new Date();
+  return tektiteRenderTemplate([
+    "---",
+    "tags: [daily]",
+    "date: {{date}}",
+    "---",
+    "# {{date:dddd, MMMM DD YYYY}}",
+    "",
+    "## Notes",
+    "",
+    "",
+    "## Tasks",
+    "",
+    "- [ ] ",
+    "",
+    "## Log",
+    "",
+    "{{time}} — "
+  ].join("\n"), { date: d });
+}
+
+async function tektiteDailyNoteOpenOrCreate(opts) {
+  opts = opts || {};
+  const offset = Number.isFinite(opts.offset) ? opts.offset : 0;
+  const d = new Date();
+  d.setDate(d.getDate() + offset);
+  const id = "daily-" + _tektiteDateFormat(d, "YYYY-MM-DD");
+  const existing = await tektiteGetNote(id);
+  if (existing) return id;
+  // Title: human-readable date.
+  const title = _tektiteDateFormat(d, "dddd, MMMM DD YYYY");
+  await tektitePutNote({
+    id,
+    title,
+    content: tektiteDailyNoteTemplate(d)
+  });
+  return id;
+}
+/* =========================================================================
+ * Tektite MD -- transclusion (`![[…]]` embeds)
+ *
+ * Phase C sprint tektite-4. Pre-processes `![[target]]`, `![[target#H1]]`,
+ * and `![[target#^block-id]]` patterns BEFORE the markdown is handed to
+ * marked + the wikilink rewriter. The embedded content is inlined as
+ * Markdown (so headings, code blocks, math etc. all render through the
+ * normal pipeline) inside a `<div class="tektite-embed">` wrapper so
+ * the preview can style it distinctly + offer a "jump to source" link.
+ *
+ * Resolution priority mirrors the wikilink navigator:
+ *   1. Vault note by id (slug match)
+ *   2. Vault note by case-insensitive title match
+ *   3. Bare miss -> renders an "unresolved" placeholder so the user
+ *      can spot broken embeds at a glance.
+ *
+ * Section selectors:
+ *   ![[note]]              entire body
+ *   ![[note#Heading]]      section starting at `## Heading` (any level),
+ *                          ending at the next heading of same-or-higher level
+ *   ![[note#^block-id]]    block reference (paragraph carrying `^block-id`)
+ *
+ * Recursion guard: an embedded note that itself transcludes another
+ * note is expanded too, BUT a transitive cycle (A -> B -> A) is
+ * detected via a visited-set and broken with a `(recursion)` placeholder.
+ *
+ * Public surface:
+ *   tektiteExpandTransclusions(text, opts)
+ *     -> Promise<string>. opts:
+ *          { maxDepth: 4, visited: Set<string> }
+ *        Returns the input with every `![[…]]` replaced. Async because
+ *        each lookup hits IDB (cheap, but not sync).
+ *
+ * Vault-only. Cross-source transclusion (embedding a remote GitHub
+ * note inside a vault note) is a tektite-5 follow-up.
+ * ======================================================================== */
+
+const _TEKTITE_TRANSCLUSION_RE = /!\[\[([^\[\]\n]+?)\]\]/g;
+
+/* Split a target into { name, anchor }:
+ *   "note"             -> { name: "note", anchor: null }
+ *   "note#Heading"     -> { name: "note", anchor: { type: "heading", value: "Heading" } }
+ *   "note#^block-id"   -> { name: "note", anchor: { type: "block",   value: "block-id" } } */
+function _tektiteSplitEmbedTarget(target) {
+  const s = String(target).trim();
+  const hash = s.indexOf("#");
+  if (hash < 0) return { name: s, anchor: null };
+  const name = s.slice(0, hash);
+  const rest = s.slice(hash + 1);
+  if (rest.startsWith("^")) return { name, anchor: { type: "block", value: rest.slice(1) } };
+  return { name, anchor: { type: "heading", value: rest } };
+}
+
+/* Find a note by id-or-title. Returns the note record or null. */
+async function _tektiteResolveEmbedNote(name) {
+  if (!name) return null;
+  const byId = await tektiteGetNote(name);
+  if (byId) return byId;
+  // Title fallback (case-insensitive).
+  const all = await tektiteListNotes();
+  const lc = name.toLowerCase();
+  return all.find(n => (n.title || "").toLowerCase() === lc) || null;
+}
+
+/* Extract a heading section: starts at the line matching the requested
+ * heading, ends at the next heading of same or higher level. Heading
+ * text comparison is case-insensitive + ignores trailing whitespace. */
+function _tektiteExtractHeading(body, headingText) {
+  const lines = String(body || "").split("\n");
+  const target = headingText.toLowerCase().trim();
+  let startIdx = -1;
+  let startLevel = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(/^(#{1,6})\s+(.+?)\s*$/);
+    if (m && m[2].toLowerCase().trim() === target) {
+      startIdx = i;
+      startLevel = m[1].length;
+      break;
+    }
+  }
+  if (startIdx < 0) return null;
+  let endIdx = lines.length;
+  for (let i = startIdx + 1; i < lines.length; i++) {
+    const m = lines[i].match(/^(#{1,6})\s+/);
+    if (m && m[1].length <= startLevel) {
+      endIdx = i;
+      break;
+    }
+  }
+  return lines.slice(startIdx, endIdx).join("\n").replace(/\s+$/, "");
+}
+
+/* Block reference: find a paragraph carrying `^block-id` at the end of
+ * a line. Returns just that paragraph (back-walked + forward-walked
+ * across blank lines). */
+function _tektiteExtractBlock(body, blockId) {
+  const lines = String(body || "").split("\n");
+  const re = new RegExp("\\^" + blockId.replace(/[\\.*+?^${}()|[\]]/g, "\\$&") + "\\b");
+  let hitIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (re.test(lines[i])) { hitIdx = i; break; }
+  }
+  if (hitIdx < 0) return null;
+  let start = hitIdx, end = hitIdx;
+  while (start > 0 && lines[start - 1].trim() !== "") start--;
+  while (end < lines.length - 1 && lines[end + 1].trim() !== "") end++;
+  // Strip the `^block-id` marker from the returned text.
+  return lines.slice(start, end + 1).join("\n").replace(re, "").trim();
+}
+
+async function tektiteExpandTransclusions(text, opts) {
+  opts = opts || {};
+  const maxDepth = Number.isFinite(opts.maxDepth) ? opts.maxDepth : 4;
+  const visited  = opts.visited instanceof Set ? opts.visited : new Set();
+  const source   = String(text || "");
+
+  // Collect every match (sync regex scan), resolve each (async), then
+  // splice replacements back in.  Avoids weird interleaving with
+  // String.replace + async resolvers.
+  const matches = [];
+  _TEKTITE_TRANSCLUSION_RE.lastIndex = 0;
+  let m;
+  while ((m = _TEKTITE_TRANSCLUSION_RE.exec(source))) {
+    matches.push({ from: m.index, to: m.index + m[0].length, target: m[1] });
+  }
+  if (!matches.length) return source;
+
+  const replacements = await Promise.all(matches.map(async (mt) => {
+    const { name, anchor } = _tektiteSplitEmbedTarget(mt.target);
+    const note = await _tektiteResolveEmbedNote(name);
+    if (!note) {
+      return _tektiteEmbedWrap(mt.target, _tektiteEmbedMissingHtml(mt.target));
+    }
+    const key = (note.id || name) + (anchor ? ("#" + anchor.type + ":" + anchor.value) : "");
+    if (visited.has(key)) {
+      return _tektiteEmbedWrap(mt.target,
+        '<div class="tektite-embed-cycle">(recursion: ' + _tektiteEscapeForEmbed(mt.target) + ')</div>');
+    }
+    let body = note.content || "";
+    // Strip the embedded note's frontmatter so it doesn't reappear as
+    // a literal `---` block in the host preview.
+    if (typeof tektiteParseFrontmatter === "function") {
+      const parsed = tektiteParseFrontmatter(body);
+      body = parsed.body;
+    }
+    let section = body;
+    if (anchor && anchor.type === "heading") {
+      section = _tektiteExtractHeading(body, anchor.value) || ("(heading not found: " + anchor.value + ")");
+    } else if (anchor && anchor.type === "block") {
+      section = _tektiteExtractBlock(body, anchor.value) || ("(block not found: ^" + anchor.value + ")");
+    }
+    // Recurse, deeper visited set, decremented depth.
+    if (maxDepth > 0) {
+      const inner = new Set(visited);
+      inner.add(key);
+      section = await tektiteExpandTransclusions(section, { maxDepth: maxDepth - 1, visited: inner });
+    }
+    return _tektiteEmbedWrap(mt.target, section);
+  }));
+
+  // Splice from the end so earlier indices stay valid.
+  let out = source;
+  for (let i = matches.length - 1; i >= 0; i--) {
+    const mt = matches[i];
+    out = out.slice(0, mt.from) + replacements[i] + out.slice(mt.to);
+  }
+  return out;
+}
+
+function _tektiteEmbedWrap(target, innerMarkdown) {
+  // The marker `<div class="tektite-embed">` survives marked rendering
+  // because marked treats raw HTML block-level elements as opaque
+  // pass-throughs. The inner content is markdown, indented by a blank
+  // line above/below so marked treats the wrapped section as a fresh
+  // block context.
+  return "\n<div class=\"tektite-embed\" data-tektite-embed-target=\"" + _tektiteEscapeForEmbed(target) + "\">\n\n" +
+    innerMarkdown +
+    "\n\n</div>\n";
+}
+
+function _tektiteEmbedMissingHtml(target) {
+  return '<div class="tektite-embed-missing">⚠ Embed target not found: <code>' +
+    _tektiteEscapeForEmbed(target) + '</code></div>';
+}
+
+function _tektiteEscapeForEmbed(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+/* =========================================================================
  * Tektite MD -- editor (CodeMirror 6 + textarea fallback)
  *
  * Phase C sprint tektite-1 (textarea) + tektite-1.5b (source-aware) +
@@ -59449,7 +59828,24 @@ function tektiteEditorAttach(rootEl) {
   if (s.titleInput) {
     s.titleInput.addEventListener("input", () => {
       if (!s.currentId) return;
-      if (s.currentSource === "vault") tektiteEditorMarkDirty();
+      if (s.currentSource === "vault") {
+        tektiteEditorMarkDirty();
+        // Sprint tektite-3a -- emit a "title-only" event immediately so
+        // the note list reflects the typed title without waiting for the
+        // 400ms save debounce.
+        for (const fn of s.listeners) {
+          try {
+            fn({
+              sourceId:   "vault",
+              fileId:     s.currentId,
+              title:      s.titleInput.value || s.currentId,
+              content:    _tektiteEditorGetText(),
+              modifiedAt: Date.now(),
+              titleOnly:  true
+            });
+          } catch (_) {}
+        }
+      }
     });
     s.titleInput.addEventListener("keydown", (e) => {
       if (e.key === "Enter") {
@@ -60053,6 +60449,20 @@ function tektiteTabAttach() {
   const newBtn = document.getElementById("btn-tektite-new");
   if (newBtn) newBtn.addEventListener("click", () => { _tektiteTabCreate(); });
 
+  // Sprint tektite-4 -- daily-note shortcut.
+  const todayBtn = document.getElementById("btn-tektite-today");
+  if (todayBtn) todayBtn.addEventListener("click", async () => {
+    try {
+      const id = await tektiteDailyNoteOpenOrCreate({});
+      s.activeSource = "vault";
+      await _tektiteTabRefresh();
+      await tektiteEditorLoadFromSource("vault", id);
+      _tektiteTabRender();
+    } catch (e) {
+      window.alert("Today note open/create failed: " + (e.message || e));
+    }
+  });
+
   if (s.filterInput) {
     // Sprint tektite-3 -- distinguish DSL queries (contain `:`,
     // quotes, or `tag:`/`prop:`/`path:` prefixes) from plain
@@ -60106,9 +60516,12 @@ function tektiteTabAttach() {
   // removed a [[link]] that changes its incoming list.
   tektiteEditorOnSave((record) => {
     if (!record) return;
-    // Backlinks + tags: incremental ingest (vault only -- remote saves
-    // don't participate in the vault-only indices yet).
-    if (record.sourceId === "vault") {
+    // Sprint tektite-3a -- record.titleOnly comes from the title-input
+    // immediate-feedback path. Skip the heavyweight backlinks + tags
+    // re-ingest for those (the body content hasn't actually been
+    // written yet), but DO update the list entry so the rename
+    // reflects instantly. The next real save will refresh indices.
+    if (!record.titleOnly && record.sourceId === "vault") {
       const ingestArg = {
         id:         record.fileId,
         title:      record.title,

@@ -477,6 +477,20 @@ function tektiteTabAttach() {
   const newBtn = document.getElementById("btn-tektite-new");
   if (newBtn) newBtn.addEventListener("click", () => { _tektiteTabCreate(); });
 
+  // Sprint tektite-4 -- daily-note shortcut.
+  const todayBtn = document.getElementById("btn-tektite-today");
+  if (todayBtn) todayBtn.addEventListener("click", async () => {
+    try {
+      const id = await tektiteDailyNoteOpenOrCreate({});
+      s.activeSource = "vault";
+      await _tektiteTabRefresh();
+      await tektiteEditorLoadFromSource("vault", id);
+      _tektiteTabRender();
+    } catch (e) {
+      window.alert("Today note open/create failed: " + (e.message || e));
+    }
+  });
+
   if (s.filterInput) {
     // Sprint tektite-3 -- distinguish DSL queries (contain `:`,
     // quotes, or `tag:`/`prop:`/`path:` prefixes) from plain
@@ -530,9 +544,12 @@ function tektiteTabAttach() {
   // removed a [[link]] that changes its incoming list.
   tektiteEditorOnSave((record) => {
     if (!record) return;
-    // Backlinks + tags: incremental ingest (vault only -- remote saves
-    // don't participate in the vault-only indices yet).
-    if (record.sourceId === "vault") {
+    // Sprint tektite-3a -- record.titleOnly comes from the title-input
+    // immediate-feedback path. Skip the heavyweight backlinks + tags
+    // re-ingest for those (the body content hasn't actually been
+    // written yet), but DO update the list entry so the rename
+    // reflects instantly. The next real save will refresh indices.
+    if (!record.titleOnly && record.sourceId === "vault") {
       const ingestArg = {
         id:         record.fileId,
         title:      record.title,
