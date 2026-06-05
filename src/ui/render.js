@@ -709,6 +709,17 @@ function renderWires(temp) {
       const da = t === "param" ? ' stroke-dasharray="4,4"' : "";
       html += `<path d="${path}" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round"${da} />`;
     }
+    // Sprint 10k -- edge labels. JSON Canvas imports preserve labels
+    // on e._label; render them at the chord midpoint with a small
+    // background rect for legibility against any wire color.
+    if (e._label) {
+      const mx = (a.x + b.x) / 2;
+      const my = (a.y + b.y) / 2;
+      const txt = String(e._label).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      const w = Math.max(28, txt.length * 6 + 12);
+      html += `<rect x="${mx - w / 2}" y="${my - 9}" width="${w}" height="16" rx="3" ry="3" fill="rgba(8,12,18,0.85)" stroke="rgba(95,184,212,0.45)" stroke-width="1" />`;
+      html += `<text x="${mx}" y="${my + 3}" text-anchor="middle" font-family="var(--font-instr)" font-size="10" fill="var(--accent)" pointer-events="none">${txt}</text>`;
+    }
   });
   if (temp) {
     html += `<path d="${wirePath(temp.x1, temp.y1, temp.x2, temp.y2)}" fill="none" stroke="#888" stroke-width="1.5" stroke-linecap="round" stroke-dasharray="3,4" opacity="0.7" />`;

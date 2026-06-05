@@ -516,14 +516,22 @@ async function _openVaultPicker(anchorBtn, initial, onPick) {
   let notes = [];
   try { notes = await tektiteListNotes(); } catch (_) { notes = []; }
 
-  // Anchor below the trigger button, clamped to the viewport.
-  const rect = anchorBtn.getBoundingClientRect();
+  // Anchor below the trigger button, clamped to the viewport.  When
+  // anchorBtn is null or the literal string "center", the picker
+  // floats near the top-center of the viewport instead (used by the
+  // quick switcher in sprint 10h).
   el.style.display = "block";
   const pickerW = 280;
-  let left = rect.left;
-  if (left + pickerW > window.innerWidth - 8) left = window.innerWidth - pickerW - 8;
-  el.style.left = Math.max(8, left) + "px";
-  el.style.top  = Math.min(rect.bottom + 4, window.innerHeight - 240) + "px";
+  if (anchorBtn && typeof anchorBtn.getBoundingClientRect === "function") {
+    const rect = anchorBtn.getBoundingClientRect();
+    let left = rect.left;
+    if (left + pickerW > window.innerWidth - 8) left = window.innerWidth - pickerW - 8;
+    el.style.left = Math.max(8, left) + "px";
+    el.style.top  = Math.min(rect.bottom + 4, window.innerHeight - 240) + "px";
+  } else {
+    el.style.left = Math.max(8, (window.innerWidth - pickerW) / 2) + "px";
+    el.style.top  = "80px";
+  }
 
   searchEl.value = initial || "";
 

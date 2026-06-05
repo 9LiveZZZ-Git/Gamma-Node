@@ -213,6 +213,7 @@ function _tektitePopoutCreateDom(noteId, index) {
         '<button class="tektite-popout-view-btn"        data-view="preview" type="button" title="Preview">👁</button>' +
       '</div>' +
       '<span class="tektite-graph-popout-status"></span>' +
+      '<button class="tektite-graph-popout-btn" data-popout-act="outline"  type="button" title="Outline / outgoing links / tags">☰</button>' +
       '<button class="tektite-graph-popout-btn" data-popout-act="collapse" type="button" title="Collapse">—</button>' +
       '<button class="tektite-graph-popout-btn" data-popout-act="close"    type="button" title="Close">×</button>' +
     '</div>' +
@@ -246,6 +247,11 @@ function _tektitePopoutWire(inst) {
   const preview     = dom.querySelector(".tektite-popout-preview");
   const collapseBtn = dom.querySelector('[data-popout-act="collapse"]');
   const closeBtn    = dom.querySelector('[data-popout-act="close"]');
+  const outlineBtn  = dom.querySelector('[data-popout-act="outline"]');
+  if (outlineBtn) outlineBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (typeof _tektitePopoutToggleOutline === "function") _tektitePopoutToggleOutline(inst);
+  });
 
   // Bring to front on any pointer down inside the popout.
   dom.addEventListener("pointerdown", () => _tektitePopoutBringToFront(inst), true);

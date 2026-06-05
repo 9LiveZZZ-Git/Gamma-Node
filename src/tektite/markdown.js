@@ -682,6 +682,20 @@ async function tektiteMarkdownAttach(container, initialDoc, opts) {
       view.setState(cm.EditorState.create({ doc: view.state.doc, extensions: filtered }));
     },
     focus() { view.focus(); },
+    /* Sprint 10i -- scroll a 0-based line into view + park caret there.
+     * Used by the outline pane's heading-click action. */
+    scrollToLine(line) {
+      try {
+        const doc = view.state.doc;
+        const safe = Math.max(1, Math.min(doc.lines, (line | 0) + 1));
+        const pos = doc.line(safe).from;
+        view.dispatch({
+          selection: { anchor: pos },
+          effects:   cm.EditorView.scrollIntoView(pos, { y: "center" })
+        });
+        view.focus();
+      } catch (_) {}
+    },
     destroy() { view.destroy(); }
   };
 }
