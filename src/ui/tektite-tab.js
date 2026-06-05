@@ -166,31 +166,50 @@ const _tektitePopouts = {
 };
 
 function _tektitePopoutContainer() {
-  return document.getElementById("tektite-graph-popouts");
+  // Sprint refactor (2026-06-05) -- popouts now live body-level so
+  // they can hover over either the graph modal OR the Tektite tab.
+  return document.getElementById("tektite-popouts-host") ||
+         document.getElementById("tektite-graph-popouts");
 }
 
 /* Build a fresh popout DOM tree for a note. Returns the root element
- * with all child references stashed on it via dataset/properties. */
+ * with all child references stashed on it via dataset/properties.
+ *
+ * Sprint refactor (2026-06-05) -- the popout now hosts the full
+ * editor experience the deleted in-tab editor used to provide:
+ *   - Title input
+ *   - Status badge
+ *   - Source / Split / Preview view-mode switcher
+ *   - CodeMirror host + textarea fallback + preview pane
+ *   - Open-in-main / collapse / close buttons */
 function _tektitePopoutCreateDom(noteId, index) {
   const wrap = document.createElement("div");
-  wrap.className = "tektite-graph-popout";
+  wrap.className = "tektite-graph-popout tektite-popout-full view-source";
   wrap.dataset.popoutFor = noteId;
   // Cascade initial positions so popouts don't fully overlap.
   const offset = 24 * (index % 6);
   wrap.style.left = (80 + offset) + "px";
   wrap.style.top  = (80 + offset) + "px";
+  wrap.style.width  = "560px";
+  wrap.style.height = "440px";
 
   wrap.innerHTML =
     '<div class="tektite-graph-popout-bar">' +
       '<span class="tektite-graph-popout-title">Note</span>' +
+      '<div class="tektite-popout-view-switch">' +
+        '<button class="tektite-popout-view-btn active" data-view="source"  type="button" title="Source only">&lt;/&gt;</button>' +
+        '<button class="tektite-popout-view-btn"        data-view="split"   type="button" title="Split">◐</button>' +
+        '<button class="tektite-popout-view-btn"        data-view="preview" type="button" title="Preview">👁</button>' +
+      '</div>' +
       '<span class="tektite-graph-popout-status"></span>' +
-      '<button class="tektite-graph-popout-btn" data-popout-act="open"     type="button" title="Open in main editor">⤴</button>' +
       '<button class="tektite-graph-popout-btn" data-popout-act="collapse" type="button" title="Collapse">—</button>' +
       '<button class="tektite-graph-popout-btn" data-popout-act="close"    type="button" title="Close">×</button>' +
     '</div>' +
-    '<div class="tektite-graph-popout-body">' +
-      '<input type="text" class="tektite-graph-popout-titleinput" placeholder="title" />' +
+    '<input type="text" class="tektite-graph-popout-titleinput" placeholder="title" />' +
+    '<div class="tektite-popout-edit-surface">' +
+      '<div class="tektite-popout-cm-host"></div>' +
       '<textarea class="tektite-graph-popout-editor" placeholder="markdown content" spellcheck="false"></textarea>' +
+      '<div class="tektite-popout-preview"></div>' +
     '</div>';
   return wrap;
 }
@@ -212,16 +231,20 @@ function _tektitePopoutWire(inst) {
   const bar         = dom.querySelector(".tektite-graph-popout-bar");
   const titleInput  = dom.querySelector(".tektite-graph-popout-titleinput");
   const editor      = dom.querySelector(".tektite-graph-popout-editor");
+  const cmHost      = dom.querySelector(".tektite-popout-cm-host");
+  const preview     = dom.querySelector(".tektite-popout-preview");
   const collapseBtn = dom.querySelector('[data-popout-act="collapse"]');
   const closeBtn    = dom.querySelector('[data-popout-act="close"]');
-  const openBtn     = dom.querySelector('[data-popout-act="open"]');
 
   // Bring to front on any pointer down inside the popout.
   dom.addEventListener("pointerdown", () => _tektitePopoutBringToFront(inst), true);
 
-  // Drag the title bar to reposition.
+  // Drag the title bar to reposition. Coords are now viewport-fixed
+  // since the popouts host is body-level position:fixed.
   bar.addEventListener("pointerdown", (e) => {
-    if (e.target && e.target.classList.contains("tektite-graph-popout-btn")) return;
+    if (e.target && (e.target.classList.contains("tektite-graph-popout-btn") ||
+                     e.target.classList.contains("tektite-popout-view-btn") ||
+                     e.target.closest(".tektite-popout-view-switch"))) return;
     inst.drag = true;
     const rect = dom.getBoundingClientRect();
     inst.dragOffsetX = e.clientX - rect.left;
@@ -230,12 +253,11 @@ function _tektitePopoutWire(inst) {
   });
   bar.addEventListener("pointermove", (e) => {
     if (!inst.drag) return;
-    const host = document.querySelector("#tektite-graph-modal .tektite-graph-host");
-    const hostRect = host ? host.getBoundingClientRect() : { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
-    let nx = e.clientX - hostRect.left - inst.dragOffsetX;
-    let ny = e.clientY - hostRect.top  - inst.dragOffsetY;
-    nx = Math.max(0, Math.min(hostRect.width  - dom.offsetWidth,  nx));
-    ny = Math.max(0, Math.min(hostRect.height - 36, ny));
+    let nx = e.clientX - inst.dragOffsetX;
+    let ny = e.clientY - inst.dragOffsetY;
+    // Clamp to viewport so the title bar stays grabbable.
+    nx = Math.max(-100, Math.min(window.innerWidth  - 80, nx));
+    ny = Math.max(0,    Math.min(window.innerHeight - 30, ny));
     dom.style.left = nx + "px";
     dom.style.top  = ny + "px";
     _tektiteUpdateConnectors();
@@ -249,9 +271,18 @@ function _tektitePopoutWire(inst) {
     if (inst.saveTimer) clearTimeout(inst.saveTimer);
     _tektitePopoutSetStatus(inst, "Editing…", "saving");
     inst.saveTimer = setTimeout(() => _tektitePopoutFlush(inst), 400);
+    _tektitePopoutMarkPreviewDirty(inst);
   }
   editor.addEventListener("input", markDirty);
   titleInput.addEventListener("input", markDirty);
+
+  // View-mode switcher (Source / Split / Preview).
+  dom.querySelectorAll(".tektite-popout-view-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const mode = btn.getAttribute("data-view");
+      _tektitePopoutSetViewMode(inst, mode);
+    });
+  });
 
   collapseBtn.addEventListener("click", () => {
     dom.classList.toggle("collapsed");
@@ -261,18 +292,73 @@ function _tektitePopoutWire(inst) {
     await _tektitePopoutFlush(inst);
     _tektitePopoutCloseInstance(inst);
   });
-  openBtn.addEventListener("click", async () => {
-    await _tektitePopoutFlush(inst);
-    const id = inst.noteId;
-    _tektitePopoutCloseInstance(inst);
-    _tektiteCloseGraphModal();
-    if (id) {
-      _tektiteTabState.activeSource = "vault";
-      await _tektiteTabRefresh();
-      await tektiteEditorLoadFromSource("vault", id);
-      _tektiteTabRender();
+
+  // Lazy-mount CodeMirror in the same way the deleted main editor did.
+  // Falls back to the textarea if the CM CDN load fails.
+  if (cmHost && typeof tektiteMarkdownAttach === "function") {
+    tektiteMarkdownAttach(cmHost, editor.value || "", {
+      onChange: (newDoc) => {
+        editor.value = newDoc;
+        markDirty();
+      },
+      onWikilinkClick: (target) => {
+        _tektiteNavigateWikilink(target);
+      },
+      readOnly: false
+    }).then(handle => {
+      if (handle) {
+        inst.cm = handle;
+        editor.style.display = "none";  // CM took over
+      }
+    }).catch(err => {
+      console.warn("[tektite-popout] CodeMirror attach failed:", err);
+    });
+  }
+}
+
+function _tektitePopoutSetViewMode(inst, mode) {
+  if (!mode) mode = "source";
+  inst.viewMode = mode;
+  const dom = inst.dom;
+  dom.classList.remove("view-source", "view-split", "view-preview");
+  dom.classList.add("view-" + mode);
+  dom.querySelectorAll(".tektite-popout-view-btn").forEach(b =>
+    b.classList.toggle("active", b.getAttribute("data-view") === mode));
+  if (mode === "split" || mode === "preview") _tektitePopoutRefreshPreview(inst);
+}
+
+async function _tektitePopoutRefreshPreview(inst) {
+  if (!inst || !inst.dom) return;
+  const preview = inst.dom.querySelector(".tektite-popout-preview");
+  if (!preview) return;
+  if (inst.viewMode === "source") return;
+  const text = inst.cm ? inst.cm.getDoc() :
+    (inst.dom.querySelector(".tektite-graph-popout-editor") || {}).value || "";
+  try {
+    if (!text) {
+      preview.innerHTML = '<div class="tektite-preview-empty">(empty note — start typing)</div>';
+      return;
     }
-  });
+    if (typeof tektiteMarkdownRenderInto === "function") {
+      await tektiteMarkdownRenderInto(preview, text);
+      preview.querySelectorAll("a.tektite-link").forEach(a => {
+        a.addEventListener("click", (e) => {
+          e.preventDefault();
+          const target = a.getAttribute("data-tektite-link");
+          if (target) _tektiteNavigateWikilink(target);
+        });
+      });
+    }
+  } catch (e) {
+    preview.innerHTML = '<div class="tektite-preview-empty">Preview render failed: ' +
+      _tektiteEscapeHtml(e.message || String(e)) + '</div>';
+  }
+}
+
+function _tektitePopoutMarkPreviewDirty(inst) {
+  if (!inst || inst.viewMode === "source") return;
+  if (inst.previewTimer) clearTimeout(inst.previewTimer);
+  inst.previewTimer = setTimeout(() => _tektitePopoutRefreshPreview(inst), 250);
 }
 
 function _tektitePopoutCloseInstance(inst) {
@@ -1243,23 +1329,34 @@ async function _tektitePopoutOpen(noteId) {
     noteId,
     dom,
     saveTimer: null,
+    previewTimer: null,
     drag: false,
     dragOffsetX: 0,
-    dragOffsetY: 0
+    dragOffsetY: 0,
+    viewMode: "source",
+    cm: null
   };
   _tektitePopouts.instances.set(noteId, inst);
   _tektitePopoutWire(inst);
   _tektitePopoutBringToFront(inst);
 
-  // Load note content.
+  // Load note content. CM picks up the initial doc via tektiteMarkdownAttach
+  // inside _tektitePopoutWire; we ALSO set the textarea so the fallback path
+  // works + the CM init can read the current value.
   const titleEl    = dom.querySelector(".tektite-graph-popout-title");
   const titleInput = dom.querySelector(".tektite-graph-popout-titleinput");
   const editor     = dom.querySelector(".tektite-graph-popout-editor");
   try {
     const note = await tektiteGetNote(noteId);
-    if (titleEl)    titleEl.textContent  = (note && note.title) || noteId;
-    if (titleInput) titleInput.value     = (note && note.title) || noteId;
-    if (editor)     editor.value         = (note && note.content) || "";
+    const title = (note && note.title) || noteId;
+    const content = (note && note.content) || "";
+    if (titleEl)    titleEl.textContent  = title;
+    if (titleInput) titleInput.value     = title;
+    if (editor)     editor.value         = content;
+    // If CM finished attaching before the load resolved, push the doc
+    // through its API.  Otherwise the attach reads from editor.value
+    // which is the same content.
+    if (inst.cm && typeof inst.cm.setDoc === "function") inst.cm.setDoc(content);
     _tektitePopoutSetStatus(inst, "");
   } catch (e) {
     if (editor) editor.value = "Failed to load: " + (e.message || e);
@@ -1275,7 +1372,10 @@ async function _tektitePopoutFlush(inst) {
   const editor     = inst.dom.querySelector(".tektite-graph-popout-editor");
   if (!titleInput || !editor) return;
   const title   = (titleInput.value || inst.noteId).trim();
-  const content = editor.value || "";
+  // Prefer CM doc if attached; falls back to textarea value.
+  const content = inst.cm && typeof inst.cm.getDoc === "function"
+    ? inst.cm.getDoc()
+    : (editor.value || "");
   _tektitePopoutSetStatus(inst, "Saving…", "saving");
   try {
     const existing = await tektiteGetNote(inst.noteId);
@@ -1632,15 +1732,20 @@ function _tektiteTabRender() {
   // (loads happen via list clicks + a re-render is triggered).
   _tektiteRenderBacklinks();
 
-  // Source-aware click + contextmenu wiring.
+  // Source-aware click + contextmenu wiring. Sprint refactor
+  // (2026-06-05): notes open in floating popouts instead of the
+  // deleted in-tab editor.
   s.listEl.querySelectorAll(".tektite-note-item").forEach(el => {
     const id = el.getAttribute("data-id");
     el.addEventListener("click", async () => {
-      await tektiteEditorLoadFromSource(s.activeSource, id);
-      // Show/hide the "Save to vault" button -- only meaningful when
-      // the user wants a local copy of a remote note. With write back
-      // working now, this is a "fork to vault" affordance rather than
-      // a way to enable editing.
+      if (s.activeSource === "vault") {
+        // Vault notes: open in a popout (full editor experience).
+        await _tektitePopoutOpen(id);
+      } else {
+        // Remote sources still flow through the editor module's
+        // remote-load path so fork-to-vault keeps working.
+        await tektiteEditorLoadFromSource(s.activeSource, id);
+      }
       if (s.saveToVaultBtnEl) {
         const showFork = (s.activeSource !== "vault");
         s.saveToVaultBtnEl.style.display = showFork ? "inline-block" : "none";
