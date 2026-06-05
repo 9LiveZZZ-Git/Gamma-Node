@@ -251,6 +251,318 @@ function _tektitePopoutSetStatus(text, kind) {
   el.className = "tektite-graph-popout-status" + (kind ? (" " + kind) : "");
 }
 
+/* =========================================================================
+ * Sprint tektite-8 -- Bases UI
+ *
+ * Modal with a left sidebar (list of bases) + main pane (editor
+ * controls + rendered view). The config edits are debounced so a
+ * filter-typing burst doesn't thrash IDB; the view re-runs on every
+ * config change.
+ * ======================================================================== */
+
+const _tektiteBasesState = {
+  attached:  false,
+  modal:     null,
+  listEl:    null,
+  bodyEl:    null,
+  currentId: null,
+  config:    null,
+  rows:      [],
+  saveTimer: null,
+  rerunTimer: null,
+  propsCache: null
+};
+
+async function _tektiteBasesOpen() {
+  const s = _tektiteBasesState;
+  s.modal = document.getElementById("tektite-bases-modal");
+  if (!s.modal) return;
+  s.modal.style.display = "flex";
+  _tektiteBasesAttach();
+  await _tektiteBasesRefreshList();
+}
+
+function _tektiteBasesClose() {
+  const s = _tektiteBasesState;
+  _tektiteBasesFlush();
+  if (s.modal) s.modal.style.display = "none";
+}
+
+function _tektiteBasesAttach() {
+  const s = _tektiteBasesState;
+  if (s.attached) return;
+  s.attached = true;
+  s.listEl = document.getElementById("tektite-bases-list");
+  s.bodyEl = document.getElementById("tektite-bases-body");
+  const newBtn  = document.getElementById("btn-tektite-bases-new");
+  const closeBtn = document.getElementById("btn-tektite-bases-close");
+  if (newBtn) newBtn.addEventListener("click", () => _tektiteBasesCreate());
+  if (closeBtn) closeBtn.addEventListener("click", () => _tektiteBasesClose());
+
+  // Editor controls: every input/change triggers a debounced config
+  // save + view re-run.
+  const titleInput = document.getElementById("tektite-base-title-input");
+  const filterInput = document.getElementById("tektite-base-filter-input");
+  const sortKey    = document.getElementById("tektite-base-sort-key");
+  const sortDir    = document.getElementById("tektite-base-sort-dir");
+  const colsInput  = document.getElementById("tektite-base-cols-input");
+  [titleInput, filterInput, colsInput].forEach(el => {
+    if (el) el.addEventListener("input", _tektiteBasesMarkDirty);
+  });
+  [sortKey, sortDir].forEach(el => {
+    if (el) el.addEventListener("change", _tektiteBasesMarkDirty);
+  });
+
+  // View switcher.
+  document.querySelectorAll(".tektite-base-view-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll(".tektite-base-view-btn").forEach(b =>
+        b.classList.toggle("active", b === btn));
+      _tektiteBasesMarkDirty();
+    });
+  });
+
+  // Esc closes.
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && _tektiteBasesState.modal &&
+        _tektiteBasesState.modal.style.display !== "none") {
+      _tektiteBasesClose();
+    }
+  });
+}
+
+async function _tektiteBasesRefreshList() {
+  const s = _tektiteBasesState;
+  if (!s.listEl) return;
+  let bases;
+  try { bases = await tektiteBaseListAll(); }
+  catch (e) { console.warn("[tektite] base list failed:", e); bases = []; }
+  if (!bases.length) {
+    s.listEl.innerHTML = `<div class="tektite-bases-list-empty">No bases yet.  Click <strong>＋</strong> to create one.</div>`;
+    return;
+  }
+  s.listEl.innerHTML = bases.map(b => {
+    const active = (b.id === s.currentId) ? " active" : "";
+    return `<div class="tektite-bases-list-item${active}" data-id="${_tektiteEscapeAttr(b.id)}">
+      ${_tektiteEscapeHtml(b.title || b.id)}
+    </div>`;
+  }).join("");
+  s.listEl.querySelectorAll(".tektite-bases-list-item").forEach(el => {
+    el.addEventListener("click", () => _tektiteBasesOpenById(el.getAttribute("data-id")));
+  });
+}
+
+async function _tektiteBasesCreate() {
+  try {
+    const title = window.prompt("Name for the new base:", "Untitled base");
+    if (!title) return;
+    const id = await tektiteBaseCreate(title);
+    await _tektiteBasesRefreshList();
+    await _tektiteBasesOpenById(id);
+  } catch (e) {
+    window.alert("Base creation failed: " + (e.message || String(e)));
+  }
+}
+
+async function _tektiteBasesOpenById(id) {
+  const s = _tektiteBasesState;
+  await _tektiteBasesFlush();
+  s.currentId = id;
+  try {
+    const loaded = await tektiteBaseLoad(id);
+    s.config = loaded.config;
+  } catch (e) {
+    s.config = null;
+    if (s.bodyEl) s.bodyEl.innerHTML = `<div class="tektite-bases-empty">Failed to load: ${_tektiteEscapeHtml(e.message || e)}</div>`;
+    return;
+  }
+  await _tektiteBasesRefreshList();
+  await _tektiteBasesPopulateControls();
+  await _tektiteBasesRunAndRender();
+}
+
+async function _tektiteBasesPopulateControls() {
+  const s = _tektiteBasesState;
+  if (!s.config) return;
+  const c = s.config;
+  const titleInput = document.getElementById("tektite-base-title-input");
+  const filterInput = document.getElementById("tektite-base-filter-input");
+  const sortKey    = document.getElementById("tektite-base-sort-key");
+  const sortDir    = document.getElementById("tektite-base-sort-dir");
+  const colsInput  = document.getElementById("tektite-base-cols-input");
+  if (titleInput) titleInput.value = c["base-title"] || "";
+  if (filterInput) filterInput.value = c["base-filter"] || "";
+  if (colsInput) colsInput.value = (c["base-columns"] || []).join(", ");
+  // Populate sort-key dropdown from discovered properties.
+  if (sortKey) {
+    if (!s.propsCache) s.propsCache = await tektiteBaseDiscoverProperties();
+    sortKey.innerHTML = s.propsCache.map(p =>
+      `<option value="${_tektiteEscapeAttr(p)}">${_tektiteEscapeHtml(p)}</option>`
+    ).join("");
+    const [k, dir] = String(c["base-sort"] || "modifiedAt desc").split(/\s+/);
+    sortKey.value = k || "modifiedAt";
+    if (sortDir) sortDir.value = (dir === "asc") ? "asc" : "desc";
+  }
+  // View buttons.
+  const view = c["base-view"] || "table";
+  document.querySelectorAll(".tektite-base-view-btn").forEach(btn => {
+    btn.classList.toggle("active", btn.getAttribute("data-view") === view);
+  });
+}
+
+function _tektiteBasesGatherControls() {
+  return {
+    "base-title":   (document.getElementById("tektite-base-title-input") || {}).value || "",
+    "base-filter":  (document.getElementById("tektite-base-filter-input") || {}).value || "",
+    "base-sort":    ((document.getElementById("tektite-base-sort-key") || {}).value || "modifiedAt") +
+                    " " + ((document.getElementById("tektite-base-sort-dir") || {}).value || "desc"),
+    "base-columns": ((document.getElementById("tektite-base-cols-input") || {}).value || "title")
+                      .split(",").map(s => s.trim()).filter(Boolean),
+    "base-view":    (document.querySelector(".tektite-base-view-btn.active") || {}).getAttribute
+                      ? document.querySelector(".tektite-base-view-btn.active").getAttribute("data-view")
+                      : "table",
+    "base-groupBy": ""
+  };
+}
+
+function _tektiteBasesMarkDirty() {
+  const s = _tektiteBasesState;
+  if (s.saveTimer) clearTimeout(s.saveTimer);
+  if (s.rerunTimer) clearTimeout(s.rerunTimer);
+  _tektiteBasesSetStatus("Editing…", "saving");
+  s.rerunTimer = setTimeout(_tektiteBasesRunAndRender, 200);
+  s.saveTimer  = setTimeout(_tektiteBasesFlush, 500);
+}
+
+function _tektiteBasesSetStatus(text, kind) {
+  const el = document.getElementById("tektite-base-status");
+  if (!el) return;
+  el.textContent = text || "";
+  el.className = "tektite-base-status" + (kind ? (" " + kind) : "");
+}
+
+async function _tektiteBasesFlush() {
+  const s = _tektiteBasesState;
+  if (s.saveTimer) { clearTimeout(s.saveTimer); s.saveTimer = null; }
+  if (!s.currentId) return;
+  const config = _tektiteBasesGatherControls();
+  s.config = config;
+  _tektiteBasesSetStatus("Saving…", "saving");
+  try {
+    await tektiteBaseSave(s.currentId, config);
+    _tektiteBasesSetStatus("Saved", "ok");
+    setTimeout(() => {
+      if ((document.getElementById("tektite-base-status") || {}).textContent === "Saved") {
+        _tektiteBasesSetStatus("");
+      }
+    }, 1500);
+  } catch (e) {
+    _tektiteBasesSetStatus("✗ " + (e.message || e), "err");
+  }
+}
+
+async function _tektiteBasesRunAndRender() {
+  const s = _tektiteBasesState;
+  if (!s.bodyEl) return;
+  if (!s.currentId) {
+    s.bodyEl.innerHTML = `<div class="tektite-bases-empty">Select or create a base.</div>`;
+    return;
+  }
+  const config = _tektiteBasesGatherControls();
+  let rows;
+  try { rows = await tektiteBaseExecute(config); }
+  catch (e) {
+    s.bodyEl.innerHTML = `<div class="tektite-bases-empty">✗ ${_tektiteEscapeHtml(e.message || e)}</div>`;
+    return;
+  }
+  s.rows = rows;
+  const countEl = document.getElementById("tektite-base-rowcount");
+  if (countEl) countEl.textContent = rows.length + " row" + (rows.length === 1 ? "" : "s");
+  const view = config["base-view"];
+  const columns = config["base-columns"];
+  if (view === "table") _tektiteBasesRenderTable(rows, columns);
+  else if (view === "list") _tektiteBasesRenderList(rows);
+  else if (view === "cards") _tektiteBasesRenderCards(rows);
+}
+
+function _tektiteBasesRenderTable(rows, columns) {
+  const s = _tektiteBasesState;
+  if (!rows.length) {
+    s.bodyEl.innerHTML = `<div class="tektite-bases-empty">No rows match this base's filter.</div>`;
+    return;
+  }
+  const head = "<tr>" + columns.map(c => "<th>" + _tektiteEscapeHtml(c) + "</th>").join("") + "</tr>";
+  const body = rows.map(row => {
+    const cells = columns.map(col => {
+      const v = tektiteBaseRowValue(row, col);
+      let cellHtml = _tektiteBaseFormatValue(v);
+      const cls = (col === "title") ? "col-title" : "";
+      return `<td class="${cls}">${cellHtml}</td>`;
+    }).join("");
+    return `<tr data-id="${_tektiteEscapeAttr(row.id)}">${cells}</tr>`;
+  }).join("");
+  s.bodyEl.innerHTML = `<table class="tektite-base-table"><thead>${head}</thead><tbody>${body}</tbody></table>`;
+  s.bodyEl.querySelectorAll("tbody tr").forEach(tr => {
+    tr.addEventListener("click", () => _tektiteBasesOpenRow(tr.getAttribute("data-id")));
+  });
+}
+
+function _tektiteBasesRenderList(rows) {
+  const s = _tektiteBasesState;
+  if (!rows.length) {
+    s.bodyEl.innerHTML = `<div class="tektite-bases-empty">No rows match this base's filter.</div>`;
+    return;
+  }
+  const items = rows.map(row => {
+    const dt = row.modifiedAt ? _tektiteFormatRelativeTime(row.modifiedAt) : "";
+    return `<li data-id="${_tektiteEscapeAttr(row.id)}">
+      <span class="tektite-base-list-title">${_tektiteEscapeHtml(row.title)}</span>
+      ${dt ? `<span class="tektite-base-list-meta">${dt}</span>` : ""}
+    </li>`;
+  }).join("");
+  s.bodyEl.innerHTML = `<ul class="tektite-base-list">${items}</ul>`;
+  s.bodyEl.querySelectorAll("li").forEach(li => {
+    li.addEventListener("click", () => _tektiteBasesOpenRow(li.getAttribute("data-id")));
+  });
+}
+
+function _tektiteBasesRenderCards(rows) {
+  const s = _tektiteBasesState;
+  if (!rows.length) {
+    s.bodyEl.innerHTML = `<div class="tektite-bases-empty">No rows match this base's filter.</div>`;
+    return;
+  }
+  const cards = rows.map(row => {
+    const dt = row.modifiedAt ? _tektiteFormatRelativeTime(row.modifiedAt) : "";
+    const preview = String(row.body || "").replace(/\s+/g, " ").slice(0, 200);
+    return `<div class="tektite-base-card" data-id="${_tektiteEscapeAttr(row.id)}">
+      <div class="tektite-base-card-title">${_tektiteEscapeHtml(row.title)}</div>
+      ${dt ? `<div class="tektite-base-card-meta">${dt}</div>` : ""}
+      <div class="tektite-base-card-preview">${_tektiteEscapeHtml(preview)}</div>
+    </div>`;
+  }).join("");
+  s.bodyEl.innerHTML = `<div class="tektite-base-cards">${cards}</div>`;
+  s.bodyEl.querySelectorAll(".tektite-base-card").forEach(c => {
+    c.addEventListener("click", () => _tektiteBasesOpenRow(c.getAttribute("data-id")));
+  });
+}
+
+function _tektiteBaseFormatValue(v) {
+  if (v === undefined || v === null || v === "") return "";
+  if (v instanceof Date) return _tektiteEscapeHtml(_tektiteFormatRelativeTime(v.getTime()));
+  if (Array.isArray(v)) return _tektiteEscapeHtml(v.join(", "));
+  return _tektiteEscapeHtml(String(v));
+}
+
+async function _tektiteBasesOpenRow(id) {
+  if (!id) return;
+  _tektiteBasesClose();
+  _tektiteTabState.activeSource = "vault";
+  await _tektiteTabRefresh();
+  await tektiteEditorLoadFromSource("vault", id);
+  _tektiteTabRender();
+}
+
 /* Sprint tektite-5c2 -- connector line between the source graph node
  * and the popout editor.  Updates on every renderer draw (subscribed
  * via onViewportChange) AND on popout drags (manually invoked by the
@@ -871,6 +1183,10 @@ function tektiteTabAttach() {
   // Sprint tektite-5b -- graph view modal.
   const graphBtn = document.getElementById("btn-tektite-graph");
   if (graphBtn) graphBtn.addEventListener("click", () => _tektiteOpenGraphModal());
+
+  // Sprint tektite-8 -- Bases modal.
+  const basesBtn = document.getElementById("btn-tektite-bases");
+  if (basesBtn) basesBtn.addEventListener("click", () => _tektiteBasesOpen());
 
   // Sprint tektite-5c2 -- main editor minimize. Toggles the
   // `editor-minimized` class on the editor pane; CSS handles the

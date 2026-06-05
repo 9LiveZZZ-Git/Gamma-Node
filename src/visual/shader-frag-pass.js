@@ -41,55 +41,6 @@ function _encodeShaderFragPassForPlan(enc, entry, dtSec) {
     return _encodeRtScenePass(enc, entry);
   }
 
-  // Phase C sprint tektite-5c1 -- tektite-graph branch: copy the
-  // node's per-frame 2D canvas (drawn by tickTektiteGraphTextures in
-  // src/tektite/graph-texture.js) directly into the assigned
-  // framebuffer / scratch layer. Same model as ai-vision-canvas
-  // below -- bypass the shader pipeline and queue a
-  // copyExternalImageToTexture. Dimensions clamped to fb size to
-  // tolerate temporary mismatches (e.g. first frame before the tick
-  // has resized the canvas to match Visual.fbWidth/Height).
-  if (def.kind === "tektite-graph") {
-    if (typeof _tektiteGraphTexState === "undefined") return false;
-    const st = _tektiteGraphTexState.get(node.id);
-    if (!st || !st.canvas) return false;
-    const destTexture = isScratch
-      ? (writeKey === "a" ? Visual.scratchTextureA : Visual.scratchTextureB)
-      : Visual.framebuffer;
-    if (!destTexture) return false;
-    const cw = Math.min(st.canvas.width  || 0, Visual.fbWidth);
-    const ch = Math.min(st.canvas.height || 0, Visual.fbHeight);
-    if (cw === 0 || ch === 0) return false;
-    try {
-      Visual.device.queue.copyExternalImageToTexture(
-        { source: st.canvas, flipY: false },
-        { texture: destTexture, origin: { x: 0, y: 0, z: layerIdx } },
-        [cw, ch, 1]
-      );
-    } catch (e) {
-      // Fallback for browsers where the OffscreenCanvas direct upload
-      // chokes -- transfer to an ImageBitmap then copy.
-      try {
-        const bm = (typeof st.canvas.transferToImageBitmap === "function")
-          ? st.canvas.transferToImageBitmap()
-          : null;
-        if (!bm) {
-          console.warn("[tektite-graph-pass] canvas copy failed:", e);
-          return false;
-        }
-        Visual.device.queue.copyExternalImageToTexture(
-          { source: bm },
-          { texture: destTexture, origin: { x: 0, y: 0, z: layerIdx } },
-          [cw, ch, 1]
-        );
-      } catch (e2) {
-        console.warn("[tektite-graph-pass] bitmap fallback failed:", e2);
-        return false;
-      }
-    }
-    return true;
-  }
-
   // v0.3.3 — ai-vision-canvas branch: bypass the shader pipeline
   // entirely. The MediaPipe detection loop drew video + landmark
   // overlay into entry.drawCanvas; queue a direct

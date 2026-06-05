@@ -84,13 +84,7 @@ function _buildRenderPlan(visualOutputs) {
       // output is a blit of the streamed RT texture onto the
       // assigned framebuffer/scratch layer.
       const isSceneRt    = def.kind === "scene-rt";
-      // Phase C sprint tektite-5c1 -- TektiteGraph emits a 2D canvas
-      // that gets copyExternalImageToTexture'd into the assigned
-      // framebuffer / scratch layer, the same model as
-      // ai-vision-canvas. Plan walker treats it as a layer producer;
-      // dispatch in shader-frag-pass.js's "tektite-graph" branch.
-      const isTektiteGraph = def.kind === "tektite-graph";
-      if (!isShaderFrag && !isAiCanvas && !isScene && !isSceneRt && !isTektiteGraph) return;
+      if (!isShaderFrag && !isAiCanvas && !isScene && !isSceneRt) return;
 
       const planKey = node.id + "@" + vo.id;
       if (plan.has(planKey)) return;

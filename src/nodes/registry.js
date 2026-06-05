@@ -19949,7 +19949,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
       nodeR:     0.78, nodeG: 0.91, nodeB: 0.35
     },
     paramOptions: { mode: ["global", "local"] },
-    description: "Renders the Tektite vault as a force-directed graph onto a live GPUTexture (default 512×512). Wire `tex` into Sprite.texture / ShaderFrag.uniform / Materials. `mode=local` centers on the currently-loaded note + `depth`-hop neighborhood; `mode=global` walks the whole vault with optional `minDegree` filter. Background, edge, and node colors are configurable (RGB params 0-1). The layout matches what the 🕸 Graph button shows; this is the same data as a texture source rather than a UI pane. **Tektite-unique upgrade — Obsidian's graph view is sandboxed in a pane; ours flows directly into the audio/visual node pipeline.**"
+    description: "Renders the Tektite vault as a force-directed graph onto a live GPUTexture (default 512×512). Wire `tex` into **Sprite.texture** (then Sprite → Scene2D → VisualOutput) to render the live knowledge graph. Direct-to-VisualOutput wiring is not currently supported; future sprint will add it. `mode=local` centers on the currently-loaded note + `depth`-hop neighborhood; `mode=global` walks the whole vault with optional `minDegree` filter. Background, edge, and node colors are configurable (RGB params 0-1). The layout matches what the 🕸 Graph button shows. **Tektite-unique upgrade — Obsidian's graph view is sandboxed in a pane; ours flows into the audio/visual node pipeline.**"
   },
 
   /* ============================================================
