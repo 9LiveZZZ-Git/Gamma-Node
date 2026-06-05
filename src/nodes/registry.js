@@ -19953,6 +19953,93 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
   },
 
   /* ============================================================
+   * Phase C sprint tektite-10b -- spatial card kinds.
+   *
+   * Path A unification: TextCard / NoteCard / LinkCard / BaseCard
+   * become first-class node types on the main canvas. The Tektite
+   * Canvas modal becomes (sprint 10c) a palette-filtered preset of
+   * the main canvas; the Tektite Graph modal (sprint 10d) becomes a
+   * GraphCard render. For now these card kinds are no-codegen,
+   * runtime-only (kind: "tektite-card-*"). They flow data through
+   * standard text/param ports so they can wire into LLM / Sprite /
+   * etc. when needed.
+   *
+   * Width / height params let the user resize per-card; defaults
+   * match the Tektite Canvas modal's sizes so a docs-canvas
+   * imported as cards looks identical.
+   *
+   * The JSON-Canvas color slots (1-6) are honored via the `color`
+   * param so cards round-trip cleanly between the spatial-canvas
+   * mode and the main canvas.
+   * ============================================================ */
+  TextCard: {
+    category: "Tektite", color: COLOR.tektite, header: null,
+    cppType: "", kind: "tektite-card-text",
+    ins: [],
+    outs: [{ n: "text", t: "text" }],
+    params: {
+      text:   "New text card.\n\nDrag to move. Resize from the corner.",
+      width:  260,
+      height: 80,
+      color:  ""
+    },
+    paramOptions: { color: ["", "1", "2", "3", "4", "5", "6"] },
+    description: "Phase C sprint tektite-10b -- spatial card holding plain markdown text.  Outputs `text` so an LLM node / SystemPrompt / classifier can read the body.  Resizes from the corner; the `color` param maps to a JSON Canvas palette slot (1=red 2=orange 3=yellow 4=green 5=cyan 6=purple) so docs round-trip cleanly with Obsidian Canvas + Tektite's 🗂 Canvas modal."
+  },
+  NoteCard: {
+    category: "Tektite", color: COLOR.tektite, header: null,
+    cppType: "", kind: "tektite-card-note",
+    ins: [],
+    outs: [
+      { n: "text",  t: "text" },
+      { n: "title", t: "text" }
+    ],
+    params: {
+      file:   "",
+      width:  320,
+      height: 400,
+      color:  ""
+    },
+    paramOptions: { color: ["", "1", "2", "3", "4", "5", "6"] },
+    description: "Phase C sprint tektite-10b -- spatial card embedding a vault note. Set `file` to a note id or title; the card outputs `text` (the note's content) and `title`. Wire `text` into LLMChat.system / LLMClassifier.input / etc.  In 10c-10d the Tektite Canvas + Graph modals will both render their note embeds as NoteCard instances."
+  },
+  LinkCard: {
+    category: "Tektite", color: COLOR.tektite, header: null,
+    cppType: "", kind: "tektite-card-link",
+    ins: [],
+    outs: [{ n: "url", t: "text" }],
+    params: {
+      url:    "https://example.com",
+      width:  320,
+      height: 300,
+      color:  ""
+    },
+    paramOptions: { color: ["", "1", "2", "3", "4", "5", "6"] },
+    description: "Phase C sprint tektite-10b -- spatial card holding a URL. Outputs the URL as a text wire. Full iframe embed will land in sprint tektite-10c alongside the canvas-mode rendering; for now it surfaces the URL for downstream nodes (e.g. LLMChat that processes the URL's metadata)."
+  },
+  BaseCard: {
+    category: "Tektite", color: COLOR.tektite, header: null,
+    cppType: "", kind: "tektite-card-base",
+    ins: [],
+    outs: [
+      { n: "rows",  t: "text" },   // JSON-serialized result set
+      { n: "count", t: "param" }
+    ],
+    params: {
+      baseId: "",    // vault id of a `tektite-base: true` note
+      view:   "table",
+      width:  480,
+      height: 320,
+      color:  ""
+    },
+    paramOptions: {
+      view:  ["table", "list", "cards"],
+      color: ["", "1", "2", "3", "4", "5", "6"]
+    },
+    description: "Phase C sprint tektite-10b -- spatial card embedding a Base (typed-frontmatter tabular view, sprint tektite-8). Set `baseId` to a base-note id; the card runs the base's filter + sort and outputs the result rows as a JSON-serialized `text` wire + a `count` scalar. Useful for piping a filtered note set into an LLM batch operation. The card-side rendering lands in sprint tektite-10c."
+  },
+
+  /* ============================================================
    * Phase B sprint 4 — Ollama-backed LLM nodes (MVP)
    *
    * Five wirable nodes that drive the editor's Ollama integration

@@ -30,10 +30,16 @@ const COLOR = {
   sink:       "#3a3d44",
   visual:     "#1f3a4a",    /* Phase 6 — visual nodes (sinks today,
                                shader-frag/vert/compute starting 6.4.x) */
-  ai:         "#b264c8"     /* Phase 7.1 — AI/vision nodes
+  ai:         "#b264c8",    /* Phase 7.1 — AI/vision nodes
                                (MediaPipe HandLandmarker etc).
                                Distinct magenta so the gesture-/face-/
                                pose-tracking sources stand apart from
                                the audio-side Analysis family. */
+  tektite:    "#5fb8d4"     /* Phase C sprint tektite-10b -- spatial
+                               card kinds (TextCard / NoteCard /
+                               LinkCard / BaseCard / GraphCard).
+                               Cyan tracks the Tektite palette in
+                               the rest of the UI (popouts, wikilinks,
+                               graph edges). */
 };
 

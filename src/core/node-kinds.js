@@ -57,7 +57,16 @@ const RUNTIME_ONLY_KINDS = new Set([
   "llm-op",
   "llm-sink",
   "llm-viz",
-  "notes-source"
+  "notes-source",
+  // Phase C sprint tektite-10b -- spatial card kinds. Pure runtime
+  // (data flows JS-side via text/param wires); no C++ codegen.
+  "tektite-card-text",
+  "tektite-card-note",
+  "tektite-card-link",
+  "tektite-card-base",
+  // Sprint 10c reserve: tektite-card-group, tektite-card-image,
+  // tektite-card-graph.
+  "tektite-card-graph"
 ]);
 
 function isRuntimeOnlyKind(k) {

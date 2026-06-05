@@ -2092,6 +2092,31 @@ function tektiteTabAttach() {
   const canvasBtn = document.getElementById("btn-tektite-canvas");
   if (canvasBtn) canvasBtn.addEventListener("click", () => _tektiteCanvasOpen());
 
+  // Quick-wins follow-up (2026-06-05) -- collapse/expand all folders.
+  // Button label reflects the action that the next click will take.
+  const collapseAllBtn = document.getElementById("btn-tektite-collapse-all");
+  if (collapseAllBtn) collapseAllBtn.addEventListener("click", () => {
+    if (s.closedFolders.size > 0) {
+      s.closedFolders.clear();
+      collapseAllBtn.textContent = "▸ All";
+      collapseAllBtn.title = "Collapse all folders";
+    } else {
+      // Walk every note id; for each "a/b/c" record the prefixes
+      // "a", "a/b". The root level (length-1 segments) means a
+      // file at the vault root, not a folder; skip.
+      for (const n of s.notes) {
+        const id = String(n.id || n.noteId || "");
+        const parts = id.split("/");
+        for (let i = 1; i < parts.length; i++) {
+          s.closedFolders.add(parts.slice(0, i).join("/"));
+        }
+      }
+      collapseAllBtn.textContent = "▾ All";
+      collapseAllBtn.title = "Expand all folders";
+    }
+    _tektiteTabRender();
+  });
+
   // Sprint tektite-5c2 -- main editor minimize. Toggles the
   // `editor-minimized` class on the editor pane; CSS handles the
   // collapse + restore. Button text flips between "— Hide" and
