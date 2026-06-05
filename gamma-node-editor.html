@@ -1621,6 +1621,59 @@
     line-height: 14px;
   }
 
+  /* Sprint tektite-5a -- folder tree rows.
+   * Folder rows are compact (no separate meta line) and carry a
+   * disclosure arrow + name + per-folder file count badge. Tree
+   * leaves reuse .tektite-note-item with .tektite-note-leaf added
+   * for the compact single-line layout (no timestamp / snippet). */
+  .tektite-folder-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 12px 4px 8px;
+    cursor: pointer;
+    color: var(--text-2);
+    font-size: 11.5px;
+    transition: background 0.08s;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.02);
+    user-select: none;
+  }
+  .tektite-folder-row:hover {
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--text);
+  }
+  .tektite-folder-arrow {
+    font-size: 9px;
+    color: var(--text-3);
+    width: 10px;
+    flex-shrink: 0;
+  }
+  .tektite-folder-row:hover .tektite-folder-arrow { color: var(--accent); }
+  .tektite-folder-name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 500;
+  }
+  .tektite-folder-count {
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    color: var(--text-3);
+    background: rgba(255, 255, 255, 0.04);
+    border-radius: 8px;
+    padding: 0 6px;
+    line-height: 14px;
+  }
+  .tektite-note-leaf {
+    padding-top: 3px;
+    padding-bottom: 3px;
+  }
+  .tektite-note-leaf .tektite-note-title {
+    font-size: 11.5px;
+    font-weight: 400;
+  }
+
   /* Sprint tektite-4 -- transclusion embeds. Embedded note bodies
    * render inside a left-bordered card so users can tell at a glance
    * which content is transcluded vs inline. */
@@ -7651,10 +7704,20 @@
             </div>
 
             <div id="tektite-connect-form-local">
-              <div class="modal-note">Picks a folder on your disk via the File System Access API. Tektite walks it for <code>.md</code> files (recursive one level). Chromium-only.</div>
+              <div class="modal-note">Picks a folder on your disk via the File System Access API. Tektite walks it for <code>.md</code> files (recursive up to 8 levels, skipping <code>.obsidian</code> / <code>.git</code> / <code>node_modules</code>). Chromium-only.</div>
               <div class="modal-field" style="margin-top:10px;">
                 <div class="modal-field-label">Display label (optional)</div>
                 <input type="text" id="tektite-connect-local-name" placeholder="e.g. Obsidian vault — Notes" />
+              </div>
+              <!-- Sprint tektite-5a -- bulk-import option. When
+                   checked, every .md under the picked folder is copied
+                   into the IDB vault preserving the nested path as a
+                   slug. Useful for importing an existing Obsidian vault. -->
+              <div class="modal-field" style="margin-top:10px;">
+                <label style="display:flex; align-items:center; gap:8px; font-size:11px; color:var(--text-2);">
+                  <input type="checkbox" id="tektite-connect-local-import" />
+                  Also import the folder into my vault (recursive copy, preserves subfolders).
+                </label>
               </div>
             </div>
             <div id="tektite-connect-form-github" style="display:none;">
@@ -57242,6 +57305,18 @@ function tektiteSlugify(title) {
     .replace(/^-|-$/g, "") || "untitled";
 }
 
+/* Sprint tektite-5a -- folder-aware slug. Same rules as tektiteSlugify
+ * but preserves `/` between path segments + sanitizes each segment
+ * independently. Used by the local-fs / github importers + by future
+ * "+ New note in this folder" actions. Returns a path like
+ * `journal/2026/june-5`. */
+function tektiteSlugifyPath(path) {
+  return String(path || "")
+    .split("/")
+    .map(seg => tektiteSlugify(seg))
+    .join("/") || "untitled";
+}
+
 async function tektiteNextAvailableSlug(baseTitle) {
   const base = tektiteSlugify(baseTitle);
   let candidate = base;
@@ -57376,6 +57451,32 @@ async function tektiteSourcesAddLocal(opts) {
   };
   _tektiteSourcesLoad().push(src);
   _tektiteSourcesPersist();
+  // Sprint tektite-5a -- opts.importToVault recursively pulls every
+  // `.md` under the picked folder into the vault, preserving the
+  // directory structure as nested slug paths. Returns { src, imported }
+  // so the UI can announce "Imported N notes".
+  if (opts.importToVault) {
+    const files = await _tektiteWalkLocalDir(handle);
+    let imported = 0;
+    for (const f of files) {
+      try {
+        const content = await _tektiteReadLocalFile(handle, f.path);
+        const slugPath = (typeof tektiteSlugifyPath === "function")
+          ? tektiteSlugifyPath(f.path.replace(/\.md$/i, ""))
+          : f.path.replace(/\.md$/i, "");
+        let dstId = slugPath, n = 2;
+        while (await tektiteGetNote(dstId)) {
+          dstId = slugPath + "-" + n; n++;
+          if (n > 9999) break;
+        }
+        await tektitePutNote({ id: dstId, title: f.name, content });
+        imported++;
+      } catch (e) {
+        console.warn("[tektite] import skipped", f.path, ":", e);
+      }
+    }
+    return { src, imported };
+  }
   return src;
 }
 
@@ -57599,7 +57700,20 @@ async function tektiteSourceImportToVault(sourceId, fileId) {
   const sourceListing = await tektiteSourceListNotes(sourceId);
   const entry = sourceListing.find(e => e.id === fileId);
   const baseTitle = entry ? entry.title : "imported";
-  const id = await tektiteNextAvailableSlug(baseTitle);
+  // Sprint tektite-5a -- preserve the source's folder structure in
+  // the vault slug so a forked `journal/2026/06-05.md` lands at
+  // `journal/2026/06-05` rather than collapsing into a flat
+  // `06-05` slug.
+  const pathSlug = (typeof tektiteSlugifyPath === "function")
+    ? tektiteSlugifyPath(String(fileId).replace(/\.md$/i, ""))
+    : await tektiteNextAvailableSlug(baseTitle);
+  let id = pathSlug;
+  let n = 2;
+  while (await tektiteGetNote(id)) {
+    id = pathSlug + "-" + n;
+    n++;
+    if (n > 9999) throw new Error("could not allocate a fresh slug");
+  }
   await tektitePutNote({ id, title: baseTitle, content });
   return id;
 }
@@ -57612,6 +57726,11 @@ async function tektiteSourceImportToVault(sourceId, fileId) {
 async function _tektiteWalkLocalDir(dirHandle, prefix, depth) {
   prefix = prefix || "";
   depth  = depth  || 0;
+  // Sprint tektite-5a -- depth raised from 2 to 8 so real vaults like
+  // Obsidian's typical journal/2026/06/05.md don't get truncated.
+  // Skip dotfiles + .obsidian / .git / node_modules to avoid
+  // ingesting tooling overhead.
+  const SKIP_DIRS = new Set([".obsidian", ".git", "node_modules", ".idea", ".vscode"]);
   const out = [];
   for await (const [name, handle] of dirHandle.entries()) {
     if (handle.kind === "file" && /\.md$/i.test(name)) {
@@ -57623,7 +57742,10 @@ async function _tektiteWalkLocalDir(dirHandle, prefix, depth) {
           modifiedAt: file.lastModified || 0
         });
       } catch (_) {}
-    } else if (handle.kind === "directory" && depth < 2 && !name.startsWith(".")) {
+    } else if (handle.kind === "directory" &&
+               depth < 8 &&
+               !name.startsWith(".") &&
+               !SKIP_DIRS.has(name)) {
       const sub = await _tektiteWalkLocalDir(handle, prefix + name + "/", depth + 1);
       out.push.apply(out, sub);
     }
@@ -57651,25 +57773,43 @@ async function _tektiteReadLocalFile(dirHandle, path) {
  * secrets manager. Replace with the secrets-manager bridge once
  * sprint secrets-1 lands.
  * ------------------------------------------------------------------ */
-async function _tektiteFetchGithubListing(repo, repoPath, token) {
-  const slug = repoPath.startsWith("/") ? repoPath : ("/" + repoPath);
-  const url = "https://api.github.com/repos/" + repo + "/contents" + (repoPath ? slug : "");
+async function _tektiteFetchGithubListing(repo, repoPath, token, depth) {
+  // Sprint tektite-5a -- recursive walk. The Contents API returns
+  // entries with type: "file" or "dir"; we recurse into dirs up to
+  // depth 5 (deep enough for typical wiki structures, shallow enough
+  // to avoid hitting the API rate limit). Each .md found along the
+  // way is added to the listing with its full path so the tree
+  // builder can reconstruct the folder structure.
+  depth = Number.isFinite(depth) ? depth : 0;
+  const slug = repoPath ? (repoPath.startsWith("/") ? repoPath : ("/" + repoPath)) : "";
+  const url = "https://api.github.com/repos/" + repo + "/contents" + slug;
   const headers = { "Accept": "application/vnd.github+json" };
   if (token) headers["Authorization"] = "Bearer " + token;
   const r = await fetch(url, { headers });
   if (!r.ok) throw new Error("GitHub Contents API: HTTP " + r.status);
   const list = await r.json();
   if (!Array.isArray(list)) throw new Error("Path is not a directory or repo has no contents at that path.");
-  // Keep only .md files; strip subdirs (sprint tektite-2 walks them).
-  return list
-    .filter(x => x.type === "file" && /\.md$/i.test(x.name))
-    .map(x => ({
-      path: x.path,
-      name: x.name,
-      downloadUrl: x.download_url,
-      sha: x.sha,
-      size: x.size
-    }));
+
+  const out = [];
+  for (const entry of list) {
+    if (entry.type === "file" && /\.md$/i.test(entry.name)) {
+      out.push({
+        path: entry.path,
+        name: entry.name,
+        downloadUrl: entry.download_url,
+        sha: entry.sha,
+        size: entry.size
+      });
+    } else if (entry.type === "dir" && depth < 5 && !entry.name.startsWith(".")) {
+      try {
+        const sub = await _tektiteFetchGithubListing(repo, entry.path, token, depth + 1);
+        out.push.apply(out, sub);
+      } catch (e) {
+        console.warn("[tektite] github subdir walk failed for", entry.path, ":", e);
+      }
+    }
+  }
+  return out;
 }
 
 async function _tektiteFetchGithubFile(repo, filePath, token) {
@@ -59599,6 +59739,123 @@ function _tektiteEscapeForEmbed(s) {
     .replace(/"/g, "&quot;");
 }
 /* =========================================================================
+ * Tektite MD -- folder tree builder + flat-to-nested converter
+ *
+ * Phase C sprint tektite-5a. Takes a flat list of note entries (any
+ * source -- vault IDB, local FS, GitHub) where each entry has an `id`
+ * (or `path`) that may contain `/` separators, and builds a nested
+ * folder tree the sidebar can render hierarchically.
+ *
+ * Tree node shape:
+ *   { type:"folder", name, path, children:[], count }
+ *   { type:"file",   name, note }   // note = original listing entry
+ *
+ * The renderer walks the tree depth-first, indenting each level by
+ * 14 px. Folders track their open/closed state in
+ * _tektiteTabState.openFolders (Set<string>) so reload + filter
+ * cycles preserve the user's expand/collapse decisions.
+ *
+ * Public surface:
+ *   tektiteBuildTree(listing)
+ *     -> root folder node
+ *   tektiteFlattenTree(root)
+ *     -> [{ type, depth, ...node }]    pre-order for renderer iteration
+ *   tektiteCountTreeFiles(node)
+ *     -> int                            total file leaves under a folder
+ * ======================================================================== */
+
+function tektiteBuildTree(listing) {
+  const root = { type: "folder", name: "", path: "", children: [], count: 0 };
+  if (!Array.isArray(listing)) return root;
+  for (const n of listing) {
+    const path = String(n.id || n.path || "").replace(/^\/+/, "");
+    if (!path) continue;
+    const parts = path.split("/");
+    let cur = root;
+    for (let i = 0; i < parts.length - 1; i++) {
+      const folderName = parts[i];
+      let child = cur.children.find(c => c.type === "folder" && c.name === folderName);
+      if (!child) {
+        child = {
+          type: "folder",
+          name: folderName,
+          path: parts.slice(0, i + 1).join("/"),
+          children: [],
+          count: 0
+        };
+        cur.children.push(child);
+      }
+      cur = child;
+    }
+    cur.children.push({
+      type: "file",
+      name: n.title || parts[parts.length - 1].replace(/\.md$/i, ""),
+      note: n
+    });
+  }
+  // Recursive sort -- folders first, then files; both alphabetical.
+  // Also computes each folder's transitive file count for the badge.
+  function sortAndCount(node) {
+    if (node.type !== "folder") return 0;
+    node.children.sort((a, b) => {
+      if (a.type !== b.type) return a.type === "folder" ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+    let count = 0;
+    for (const c of node.children) count += sortAndCount(c) || 1;
+    node.count = count;
+    return count;
+  }
+  sortAndCount(root);
+  return root;
+}
+
+/* Pre-order flatten. Used by the sidebar renderer so it can iterate
+ * with a single map() instead of a recursive HTML-building walk.
+ * Each emitted entry carries { type, depth, name, path?, note? } so
+ * the renderer can both compute indent + bind click handlers. */
+function tektiteFlattenTree(root, openFolders, depth, out) {
+  out = out || [];
+  depth = depth || 0;
+  if (!root) return out;
+  // Skip the synthetic root node; only emit its children.
+  if (depth === 0 && root.type === "folder" && root.name === "") {
+    for (const child of root.children) tektiteFlattenTree(child, openFolders, 0, out);
+    return out;
+  }
+  if (root.type === "folder") {
+    const isOpen = !openFolders || openFolders.has(root.path);
+    out.push({
+      type:  "folder",
+      name:  root.name,
+      path:  root.path,
+      count: root.count,
+      depth, isOpen
+    });
+    if (isOpen) {
+      for (const child of root.children) tektiteFlattenTree(child, openFolders, depth + 1, out);
+    }
+  } else {
+    out.push({
+      type: "file",
+      name: root.name,
+      note: root.note,
+      depth
+    });
+  }
+  return out;
+}
+
+function tektiteCountTreeFiles(node) {
+  if (!node) return 0;
+  if (node.type === "file") return 1;
+  let n = 0;
+  if (Array.isArray(node.children)) {
+    for (const c of node.children) n += tektiteCountTreeFiles(c);
+  }
+  return n;
+}
+/* =========================================================================
  * Tektite MD -- editor (CodeMirror 6 + textarea fallback)
  *
  * Phase C sprint tektite-1 (textarea) + tektite-1.5b (source-aware) +
@@ -60011,7 +60268,13 @@ const _tektiteTabState = {
   sourceRailEl:    null,
   saveToVaultBtnEl: null,
   fullscreen:      false,
-  backlinksEl:     null
+  backlinksEl:     null,
+  // Sprint tektite-5a -- tree view state. openFolders is a Set of
+  // folder paths (e.g. "journal/2026") that are currently expanded.
+  // viewMode is "tree" when any note path contains `/`, else "list"
+  // (auto-detected per source on render).
+  openFolders:     new Set(),
+  treeViewForced:  null    // null = auto-detect; true/false = manual override
 };
 
 /* Sprint tektite-2 -- wikilink navigation. Resolves a [[target]] in
@@ -60261,29 +60524,73 @@ function _tektiteTabRender() {
 
   const currentId     = tektiteEditorCurrentNoteId();
   const currentSource = tektiteEditorCurrentSourceId();
-  const html = filtered.map(n => {
-    // In search mode, n is a search-result object with extra fields
-    // (score, snippet, matchedTags, noteId). Normalize id lookup.
-    const id      = n.noteId || n.id;
-    const isActive = (id === currentId && currentSource === s.activeSource);
-    const title    = _tektiteEscapeHtml(n.title || id);
-    const ts       = n.modifiedAt ? _tektiteFormatRelativeTime(n.modifiedAt) : "";
-    const path     = (s.activeSource === "vault") ? "" : `<span class="tektite-note-path">${_tektiteEscapeHtml(n.path || "")}</span>`;
-    const snippet  = isSearchMode && n.snippet
-      ? `<div class="tektite-note-snippet">${_tektiteEscapeHtml(n.snippet)}</div>` : "";
-    const tagPills = isSearchMode && Array.isArray(n.matchedTags) && n.matchedTags.length
-      ? '<div class="tektite-note-tags">' +
-          n.matchedTags.slice(0, 4).map(t =>
-            '<span class="tektite-tag-pill">#' + _tektiteEscapeHtml(t) + '</span>').join("") +
-        '</div>'
-      : "";
-    return `<div class="tektite-note-item${isActive ? " active" : ""}" data-id="${_tektiteEscapeAttr(id)}">
-      <div class="tektite-note-title">${title}</div>
-      <div class="tektite-note-meta">${ts ? `<span class="tektite-note-ts">${ts}</span>` : ""}${path}</div>
-      ${snippet}${tagPills}
-    </div>`;
-  }).join("");
+
+  // Sprint tektite-5a -- if any note id contains `/`, render as a
+  // folder tree instead of a flat list. Search-mode results stay flat
+  // (the snippets + scoring matter more than the hierarchy). The user
+  // can force list mode via the toolbar toggle (treeViewForced).
+  const hasFolders = !isSearchMode &&
+    filtered.some(n => String(n.id || n.path || "").includes("/"));
+  const useTree = (s.treeViewForced === true) ||
+                  (s.treeViewForced !== false && hasFolders);
+
+  let html;
+  if (useTree && typeof tektiteBuildTree === "function") {
+    const tree = tektiteBuildTree(filtered);
+    const flat = tektiteFlattenTree(tree, s.openFolders);
+    html = flat.map(item => {
+      const indentPx = item.depth * 14;
+      if (item.type === "folder") {
+        return `<div class="tektite-folder-row" data-folder="${_tektiteEscapeAttr(item.path)}"
+                     style="padding-left: ${8 + indentPx}px;">
+          <span class="tektite-folder-arrow">${item.isOpen ? "▼" : "▶"}</span>
+          <span class="tektite-folder-name">${_tektiteEscapeHtml(item.name)}</span>
+          <span class="tektite-folder-count">${item.count}</span>
+        </div>`;
+      }
+      const n = item.note;
+      const id = n.noteId || n.id;
+      const isActive = (id === currentId && currentSource === s.activeSource);
+      return `<div class="tektite-note-item tektite-note-leaf${isActive ? " active" : ""}"
+                   data-id="${_tektiteEscapeAttr(id)}"
+                   style="padding-left: ${8 + indentPx}px;">
+        <div class="tektite-note-title">${_tektiteEscapeHtml(item.name)}</div>
+      </div>`;
+    }).join("");
+  } else {
+    html = filtered.map(n => {
+      const id      = n.noteId || n.id;
+      const isActive = (id === currentId && currentSource === s.activeSource);
+      const title    = _tektiteEscapeHtml(n.title || id);
+      const ts       = n.modifiedAt ? _tektiteFormatRelativeTime(n.modifiedAt) : "";
+      const path     = (s.activeSource === "vault") ? "" : `<span class="tektite-note-path">${_tektiteEscapeHtml(n.path || "")}</span>`;
+      const snippet  = isSearchMode && n.snippet
+        ? `<div class="tektite-note-snippet">${_tektiteEscapeHtml(n.snippet)}</div>` : "";
+      const tagPills = isSearchMode && Array.isArray(n.matchedTags) && n.matchedTags.length
+        ? '<div class="tektite-note-tags">' +
+            n.matchedTags.slice(0, 4).map(t =>
+              '<span class="tektite-tag-pill">#' + _tektiteEscapeHtml(t) + '</span>').join("") +
+          '</div>'
+        : "";
+      return `<div class="tektite-note-item${isActive ? " active" : ""}" data-id="${_tektiteEscapeAttr(id)}">
+        <div class="tektite-note-title">${title}</div>
+        <div class="tektite-note-meta">${ts ? `<span class="tektite-note-ts">${ts}</span>` : ""}${path}</div>
+        ${snippet}${tagPills}
+      </div>`;
+    }).join("");
+  }
   s.listEl.innerHTML = html;
+
+  // Sprint tektite-5a -- folder click toggles open/closed state.
+  s.listEl.querySelectorAll(".tektite-folder-row").forEach(row => {
+    row.addEventListener("click", () => {
+      const path = row.getAttribute("data-folder");
+      if (!path) return;
+      if (s.openFolders.has(path)) s.openFolders.delete(path);
+      else s.openFolders.add(path);
+      _tektiteTabRender();
+    });
+  });
 
   // Sprint tektite-2 -- refresh backlinks after every list render
   // (loads happen via list clicks + a re-render is triggered).
@@ -60395,8 +60702,13 @@ async function _tektiteConnectGo() {
   try {
     if (provider === "local") {
       const label = (document.getElementById("tektite-connect-local-name") || {}).value || "";
-      const src = await tektiteSourcesAddLocal({ label });
-      _tektiteTabState.activeSource = src.id;
+      const importToVault = !!(document.getElementById("tektite-connect-local-import") || {}).checked;
+      const result = await tektiteSourcesAddLocal({ label, importToVault });
+      const src = (result && result.src) || result;
+      _tektiteTabState.activeSource = importToVault ? "vault" : src.id;
+      if (importToVault && result && Number.isFinite(result.imported)) {
+        window.alert("Imported " + result.imported + " notes into the vault.");
+      }
     } else if (provider === "github") {
       const repo  = (document.getElementById("tektite-connect-gh-repo")  || {}).value || "";
       const path  = (document.getElementById("tektite-connect-gh-path")  || {}).value || "";

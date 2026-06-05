@@ -39,7 +39,13 @@ const _tektiteTabState = {
   sourceRailEl:    null,
   saveToVaultBtnEl: null,
   fullscreen:      false,
-  backlinksEl:     null
+  backlinksEl:     null,
+  // Sprint tektite-5a -- tree view state. openFolders is a Set of
+  // folder paths (e.g. "journal/2026") that are currently expanded.
+  // viewMode is "tree" when any note path contains `/`, else "list"
+  // (auto-detected per source on render).
+  openFolders:     new Set(),
+  treeViewForced:  null    // null = auto-detect; true/false = manual override
 };
 
 /* Sprint tektite-2 -- wikilink navigation. Resolves a [[target]] in
@@ -289,29 +295,73 @@ function _tektiteTabRender() {
 
   const currentId     = tektiteEditorCurrentNoteId();
   const currentSource = tektiteEditorCurrentSourceId();
-  const html = filtered.map(n => {
-    // In search mode, n is a search-result object with extra fields
-    // (score, snippet, matchedTags, noteId). Normalize id lookup.
-    const id      = n.noteId || n.id;
-    const isActive = (id === currentId && currentSource === s.activeSource);
-    const title    = _tektiteEscapeHtml(n.title || id);
-    const ts       = n.modifiedAt ? _tektiteFormatRelativeTime(n.modifiedAt) : "";
-    const path     = (s.activeSource === "vault") ? "" : `<span class="tektite-note-path">${_tektiteEscapeHtml(n.path || "")}</span>`;
-    const snippet  = isSearchMode && n.snippet
-      ? `<div class="tektite-note-snippet">${_tektiteEscapeHtml(n.snippet)}</div>` : "";
-    const tagPills = isSearchMode && Array.isArray(n.matchedTags) && n.matchedTags.length
-      ? '<div class="tektite-note-tags">' +
-          n.matchedTags.slice(0, 4).map(t =>
-            '<span class="tektite-tag-pill">#' + _tektiteEscapeHtml(t) + '</span>').join("") +
-        '</div>'
-      : "";
-    return `<div class="tektite-note-item${isActive ? " active" : ""}" data-id="${_tektiteEscapeAttr(id)}">
-      <div class="tektite-note-title">${title}</div>
-      <div class="tektite-note-meta">${ts ? `<span class="tektite-note-ts">${ts}</span>` : ""}${path}</div>
-      ${snippet}${tagPills}
-    </div>`;
-  }).join("");
+
+  // Sprint tektite-5a -- if any note id contains `/`, render as a
+  // folder tree instead of a flat list. Search-mode results stay flat
+  // (the snippets + scoring matter more than the hierarchy). The user
+  // can force list mode via the toolbar toggle (treeViewForced).
+  const hasFolders = !isSearchMode &&
+    filtered.some(n => String(n.id || n.path || "").includes("/"));
+  const useTree = (s.treeViewForced === true) ||
+                  (s.treeViewForced !== false && hasFolders);
+
+  let html;
+  if (useTree && typeof tektiteBuildTree === "function") {
+    const tree = tektiteBuildTree(filtered);
+    const flat = tektiteFlattenTree(tree, s.openFolders);
+    html = flat.map(item => {
+      const indentPx = item.depth * 14;
+      if (item.type === "folder") {
+        return `<div class="tektite-folder-row" data-folder="${_tektiteEscapeAttr(item.path)}"
+                     style="padding-left: ${8 + indentPx}px;">
+          <span class="tektite-folder-arrow">${item.isOpen ? "▼" : "▶"}</span>
+          <span class="tektite-folder-name">${_tektiteEscapeHtml(item.name)}</span>
+          <span class="tektite-folder-count">${item.count}</span>
+        </div>`;
+      }
+      const n = item.note;
+      const id = n.noteId || n.id;
+      const isActive = (id === currentId && currentSource === s.activeSource);
+      return `<div class="tektite-note-item tektite-note-leaf${isActive ? " active" : ""}"
+                   data-id="${_tektiteEscapeAttr(id)}"
+                   style="padding-left: ${8 + indentPx}px;">
+        <div class="tektite-note-title">${_tektiteEscapeHtml(item.name)}</div>
+      </div>`;
+    }).join("");
+  } else {
+    html = filtered.map(n => {
+      const id      = n.noteId || n.id;
+      const isActive = (id === currentId && currentSource === s.activeSource);
+      const title    = _tektiteEscapeHtml(n.title || id);
+      const ts       = n.modifiedAt ? _tektiteFormatRelativeTime(n.modifiedAt) : "";
+      const path     = (s.activeSource === "vault") ? "" : `<span class="tektite-note-path">${_tektiteEscapeHtml(n.path || "")}</span>`;
+      const snippet  = isSearchMode && n.snippet
+        ? `<div class="tektite-note-snippet">${_tektiteEscapeHtml(n.snippet)}</div>` : "";
+      const tagPills = isSearchMode && Array.isArray(n.matchedTags) && n.matchedTags.length
+        ? '<div class="tektite-note-tags">' +
+            n.matchedTags.slice(0, 4).map(t =>
+              '<span class="tektite-tag-pill">#' + _tektiteEscapeHtml(t) + '</span>').join("") +
+          '</div>'
+        : "";
+      return `<div class="tektite-note-item${isActive ? " active" : ""}" data-id="${_tektiteEscapeAttr(id)}">
+        <div class="tektite-note-title">${title}</div>
+        <div class="tektite-note-meta">${ts ? `<span class="tektite-note-ts">${ts}</span>` : ""}${path}</div>
+        ${snippet}${tagPills}
+      </div>`;
+    }).join("");
+  }
   s.listEl.innerHTML = html;
+
+  // Sprint tektite-5a -- folder click toggles open/closed state.
+  s.listEl.querySelectorAll(".tektite-folder-row").forEach(row => {
+    row.addEventListener("click", () => {
+      const path = row.getAttribute("data-folder");
+      if (!path) return;
+      if (s.openFolders.has(path)) s.openFolders.delete(path);
+      else s.openFolders.add(path);
+      _tektiteTabRender();
+    });
+  });
 
   // Sprint tektite-2 -- refresh backlinks after every list render
   // (loads happen via list clicks + a re-render is triggered).
@@ -423,8 +473,13 @@ async function _tektiteConnectGo() {
   try {
     if (provider === "local") {
       const label = (document.getElementById("tektite-connect-local-name") || {}).value || "";
-      const src = await tektiteSourcesAddLocal({ label });
-      _tektiteTabState.activeSource = src.id;
+      const importToVault = !!(document.getElementById("tektite-connect-local-import") || {}).checked;
+      const result = await tektiteSourcesAddLocal({ label, importToVault });
+      const src = (result && result.src) || result;
+      _tektiteTabState.activeSource = importToVault ? "vault" : src.id;
+      if (importToVault && result && Number.isFinite(result.imported)) {
+        window.alert("Imported " + result.imported + " notes into the vault.");
+      }
     } else if (provider === "github") {
       const repo  = (document.getElementById("tektite-connect-gh-repo")  || {}).value || "";
       const path  = (document.getElementById("tektite-connect-gh-path")  || {}).value || "";

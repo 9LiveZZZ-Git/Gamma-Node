@@ -150,6 +150,18 @@ function tektiteSlugify(title) {
     .replace(/^-|-$/g, "") || "untitled";
 }
 
+/* Sprint tektite-5a -- folder-aware slug. Same rules as tektiteSlugify
+ * but preserves `/` between path segments + sanitizes each segment
+ * independently. Used by the local-fs / github importers + by future
+ * "+ New note in this folder" actions. Returns a path like
+ * `journal/2026/june-5`. */
+function tektiteSlugifyPath(path) {
+  return String(path || "")
+    .split("/")
+    .map(seg => tektiteSlugify(seg))
+    .join("/") || "untitled";
+}
+
 async function tektiteNextAvailableSlug(baseTitle) {
   const base = tektiteSlugify(baseTitle);
   let candidate = base;

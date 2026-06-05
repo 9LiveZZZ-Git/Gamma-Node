@@ -121,6 +121,32 @@ async function tektiteSourcesAddLocal(opts) {
   };
   _tektiteSourcesLoad().push(src);
   _tektiteSourcesPersist();
+  // Sprint tektite-5a -- opts.importToVault recursively pulls every
+  // `.md` under the picked folder into the vault, preserving the
+  // directory structure as nested slug paths. Returns { src, imported }
+  // so the UI can announce "Imported N notes".
+  if (opts.importToVault) {
+    const files = await _tektiteWalkLocalDir(handle);
+    let imported = 0;
+    for (const f of files) {
+      try {
+        const content = await _tektiteReadLocalFile(handle, f.path);
+        const slugPath = (typeof tektiteSlugifyPath === "function")
+          ? tektiteSlugifyPath(f.path.replace(/\.md$/i, ""))
+          : f.path.replace(/\.md$/i, "");
+        let dstId = slugPath, n = 2;
+        while (await tektiteGetNote(dstId)) {
+          dstId = slugPath + "-" + n; n++;
+          if (n > 9999) break;
+        }
+        await tektitePutNote({ id: dstId, title: f.name, content });
+        imported++;
+      } catch (e) {
+        console.warn("[tektite] import skipped", f.path, ":", e);
+      }
+    }
+    return { src, imported };
+  }
   return src;
 }
 
@@ -344,7 +370,20 @@ async function tektiteSourceImportToVault(sourceId, fileId) {
   const sourceListing = await tektiteSourceListNotes(sourceId);
   const entry = sourceListing.find(e => e.id === fileId);
   const baseTitle = entry ? entry.title : "imported";
-  const id = await tektiteNextAvailableSlug(baseTitle);
+  // Sprint tektite-5a -- preserve the source's folder structure in
+  // the vault slug so a forked `journal/2026/06-05.md` lands at
+  // `journal/2026/06-05` rather than collapsing into a flat
+  // `06-05` slug.
+  const pathSlug = (typeof tektiteSlugifyPath === "function")
+    ? tektiteSlugifyPath(String(fileId).replace(/\.md$/i, ""))
+    : await tektiteNextAvailableSlug(baseTitle);
+  let id = pathSlug;
+  let n = 2;
+  while (await tektiteGetNote(id)) {
+    id = pathSlug + "-" + n;
+    n++;
+    if (n > 9999) throw new Error("could not allocate a fresh slug");
+  }
   await tektitePutNote({ id, title: baseTitle, content });
   return id;
 }
@@ -357,6 +396,11 @@ async function tektiteSourceImportToVault(sourceId, fileId) {
 async function _tektiteWalkLocalDir(dirHandle, prefix, depth) {
   prefix = prefix || "";
   depth  = depth  || 0;
+  // Sprint tektite-5a -- depth raised from 2 to 8 so real vaults like
+  // Obsidian's typical journal/2026/06/05.md don't get truncated.
+  // Skip dotfiles + .obsidian / .git / node_modules to avoid
+  // ingesting tooling overhead.
+  const SKIP_DIRS = new Set([".obsidian", ".git", "node_modules", ".idea", ".vscode"]);
   const out = [];
   for await (const [name, handle] of dirHandle.entries()) {
     if (handle.kind === "file" && /\.md$/i.test(name)) {
@@ -368,7 +412,10 @@ async function _tektiteWalkLocalDir(dirHandle, prefix, depth) {
           modifiedAt: file.lastModified || 0
         });
       } catch (_) {}
-    } else if (handle.kind === "directory" && depth < 2 && !name.startsWith(".")) {
+    } else if (handle.kind === "directory" &&
+               depth < 8 &&
+               !name.startsWith(".") &&
+               !SKIP_DIRS.has(name)) {
       const sub = await _tektiteWalkLocalDir(handle, prefix + name + "/", depth + 1);
       out.push.apply(out, sub);
     }
@@ -396,25 +443,43 @@ async function _tektiteReadLocalFile(dirHandle, path) {
  * secrets manager. Replace with the secrets-manager bridge once
  * sprint secrets-1 lands.
  * ------------------------------------------------------------------ */
-async function _tektiteFetchGithubListing(repo, repoPath, token) {
-  const slug = repoPath.startsWith("/") ? repoPath : ("/" + repoPath);
-  const url = "https://api.github.com/repos/" + repo + "/contents" + (repoPath ? slug : "");
+async function _tektiteFetchGithubListing(repo, repoPath, token, depth) {
+  // Sprint tektite-5a -- recursive walk. The Contents API returns
+  // entries with type: "file" or "dir"; we recurse into dirs up to
+  // depth 5 (deep enough for typical wiki structures, shallow enough
+  // to avoid hitting the API rate limit). Each .md found along the
+  // way is added to the listing with its full path so the tree
+  // builder can reconstruct the folder structure.
+  depth = Number.isFinite(depth) ? depth : 0;
+  const slug = repoPath ? (repoPath.startsWith("/") ? repoPath : ("/" + repoPath)) : "";
+  const url = "https://api.github.com/repos/" + repo + "/contents" + slug;
   const headers = { "Accept": "application/vnd.github+json" };
   if (token) headers["Authorization"] = "Bearer " + token;
   const r = await fetch(url, { headers });
   if (!r.ok) throw new Error("GitHub Contents API: HTTP " + r.status);
   const list = await r.json();
   if (!Array.isArray(list)) throw new Error("Path is not a directory or repo has no contents at that path.");
-  // Keep only .md files; strip subdirs (sprint tektite-2 walks them).
-  return list
-    .filter(x => x.type === "file" && /\.md$/i.test(x.name))
-    .map(x => ({
-      path: x.path,
-      name: x.name,
-      downloadUrl: x.download_url,
-      sha: x.sha,
-      size: x.size
-    }));
+
+  const out = [];
+  for (const entry of list) {
+    if (entry.type === "file" && /\.md$/i.test(entry.name)) {
+      out.push({
+        path: entry.path,
+        name: entry.name,
+        downloadUrl: entry.download_url,
+        sha: entry.sha,
+        size: entry.size
+      });
+    } else if (entry.type === "dir" && depth < 5 && !entry.name.startsWith(".")) {
+      try {
+        const sub = await _tektiteFetchGithubListing(repo, entry.path, token, depth + 1);
+        out.push.apply(out, sub);
+      } catch (e) {
+        console.warn("[tektite] github subdir walk failed for", entry.path, ":", e);
+      }
+    }
+  }
+  return out;
 }
 
 async function _tektiteFetchGithubFile(repo, filePath, token) {
