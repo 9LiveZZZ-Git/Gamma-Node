@@ -2417,6 +2417,59 @@
   }
   .tk-att-empty .tk-att-dl-big:hover { background: rgba(95, 184, 212, 0.18); }
 
+  /* Sprint 10aa -- floating progress pill during vault imports.
+   * Anchored bottom-right, single global element. */
+  .tk-import-progress {
+    position: fixed;
+    bottom: 18px;
+    right: 18px;
+    z-index: 9500;
+    background: rgba(8, 12, 18, 0.96);
+    border: 1px solid rgba(95, 184, 212, 0.55);
+    border-radius: 6px;
+    padding: 10px 14px;
+    min-width: 320px;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.55);
+    display: none;
+    flex-direction: column;
+    gap: 6px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text);
+  }
+  .tk-import-progress .tk-imp-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .tk-import-progress .tk-imp-label {
+    color: var(--accent);
+    text-transform: uppercase;
+    letter-spacing: 0.10em;
+    font-size: 10px;
+  }
+  .tk-import-progress .tk-imp-count { color: var(--text-3); }
+  .tk-import-progress .tk-imp-bar {
+    width: 100%;
+    height: 6px;
+    background: rgba(95, 184, 212, 0.18);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .tk-import-progress .tk-imp-bar-fill {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, var(--accent), var(--accent-2, #c8e85a));
+    transition: width 0.15s ease-out;
+  }
+  .tk-import-progress .tk-imp-phase {
+    color: var(--text-3);
+    font-size: 10px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
   /* Drop-zone highlight when dragging files onto the notes list. */
   #tektite-notes-list.tk-dropzone-active {
     outline: 2px dashed var(--accent);
@@ -60415,36 +60468,79 @@ const TEKTITE_BIG_FILE_HARD  = 250 * 1024 * 1024;   // 250 MB
 const TEKTITE_SERVER_HINT    =  25 * 1024 * 1024;   // 25 MB -- offer server
 const TEKTITE_VAULT_REMOTE_FOLDER = "vault/";       // path prefix on the server
 
-/* Read the compile-server URL the user configured for AI settings;
- * reused as the vault-backing server here.  Empty string -> "no
- * server configured" -> import falls back to IDB-only behavior. */
+/* Compile-server URL.  Empty `aiSettings.compileServerUrl` means
+ * "use the default local daemon" -- same convention as the AI panel's
+ * test-server button + the audio preview probe.  Returns the URL we
+ * SHOULD try; tektiteVaultServerProbe checks whether it's reachable
+ * before the import flow commits to uploading. */
+const TEKTITE_VAULT_DEFAULT_URL = "http://127.0.0.1:8765";
+
 function _tektiteVaultServerUrl() {
   try {
     if (typeof aiSettings === "object" && aiSettings && aiSettings.compileServerUrl) {
       return String(aiSettings.compileServerUrl).replace(/\/+$/, "");
     }
   } catch (_) {}
-  return "";
+  return TEKTITE_VAULT_DEFAULT_URL;
+}
+
+/* One-shot probe with a short timeout.  Cached for 30 s so the import
+ * flow doesn't re-probe on every dropped file. */
+let _tektiteVaultProbeCache = { url: "", ok: false, at: 0 };
+async function tektiteVaultServerProbe() {
+  const url = _tektiteVaultServerUrl();
+  const now = Date.now();
+  if (_tektiteVaultProbeCache.url === url && (now - _tektiteVaultProbeCache.at) < 30000) {
+    return _tektiteVaultProbeCache.ok;
+  }
+  let ok = false;
+  try {
+    const r = await fetch(url + "/health", { signal: AbortSignal.timeout(1500), mode: "cors" });
+    ok = r.ok;
+  } catch (_) { ok = false; }
+  _tektiteVaultProbeCache = { url, ok, at: now };
+  return ok;
 }
 
 /* PUT a Blob to the compile server's vault endpoint.  Server side
  * documented in gamma-compile-server/src/vault-route.js.  PUT raw-
  * body is simpler than multipart (no extra Node deps) and matches the
- * existing /assets/import pattern. */
-async function tektiteVaultServerUpload(id, blob) {
+ * existing /assets/import pattern.
+ *
+ * Uses XHR (not fetch) so the upload progress event surfaces -- fetch
+ * doesn't expose upload progress yet on most browsers.  onProgress(p)
+ * is called with a [0..1] fraction during the upload. */
+function tektiteVaultServerUpload(id, blob, onProgress) {
   const base = _tektiteVaultServerUrl();
-  if (!base) throw new Error("No compile server URL configured in AI settings.");
+  if (!base) return Promise.reject(new Error("No compile server URL configured."));
   const path = String(id).replace(/^\/+/, "");
-  const r = await fetch(base + "/vault/file/" + encodeURI(path), {
-    method:  "PUT",
-    body:    blob,
-    headers: { "Content-Type": blob.type || "application/octet-stream" },
-    mode:    "cors"
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("PUT", base + "/vault/file/" + encodeURI(path));
+    xhr.setRequestHeader("Content-Type", blob.type || "application/octet-stream");
+    xhr.responseType = "json";
+    xhr.upload.onprogress = (e) => {
+      if (typeof onProgress === "function" && e.lengthComputable) {
+        try { onProgress(e.loaded / e.total); } catch (_) {}
+      }
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        const j = xhr.response;
+        if (!j || !j.url) {
+          reject(new Error("Server upload returned no url"));
+          return;
+        }
+        resolve({ url: j.url, size: j.size || blob.size || 0 });
+      } else {
+        reject(new Error("Server upload failed: HTTP " + xhr.status));
+      }
+    };
+    xhr.onerror   = () => reject(new Error("Server upload network error"));
+    xhr.onabort   = () => reject(new Error("Server upload aborted"));
+    xhr.ontimeout = () => reject(new Error("Server upload timed out"));
+    xhr.send(blob);
   });
-  if (!r.ok) throw new Error("Server upload failed: HTTP " + r.status);
-  const j = await r.json();
-  if (!j || !j.url) throw new Error("Server upload returned no url");
-  return { url: j.url, size: j.size || blob.size || 0 };
 }
 
 /* Fetch a previously-uploaded blob from the server. */
@@ -60479,15 +60575,26 @@ async function tektiteVaultServerDelete(id) {
   if (!r.ok && r.status !== 404) throw new Error("Server delete failed: HTTP " + r.status);
 }
 
-async function tektiteImportFile(file) {
+async function tektiteImportFile(file, opts) {
   if (!file || !file.name) throw new Error("tektiteImportFile: File required");
+  opts = opts || {};
+  const onProgress = (typeof opts.onProgress === "function") ? opts.onProgress : null;
+  const reportPhase = (phase, frac) => {
+    if (!onProgress) return;
+    try { onProgress({ phase, fraction: frac, file: file.name, size: file.size || 0 }); } catch (_) {}
+  };
   const sz = file.size || 0;
-  const haveServer = !!_tektiteVaultServerUrl();
+  // Sprint 10aa -- probe instead of relying on "URL configured".
+  // Default URL is 127.0.0.1:8765 -- works when the local daemon is
+  // running.  When the probe fails (no daemon, or a LAN URL that's
+  // unreachable), fall back to IDB-only behavior.
+  reportPhase("probe", 0);
+  const haveServer = await tektiteVaultServerProbe();
   if (sz > TEKTITE_BIG_FILE_HARD && !haveServer) {
     throw new Error("Refusing to import " + (sz / (1024*1024)).toFixed(1) +
       " MB > " + (TEKTITE_BIG_FILE_HARD / (1024*1024)) +
-      " MB hard cap.  Configure a compile-server URL in AI settings to host " +
-      "large files instead, or split the file.");
+      " MB hard cap.  Start the local gamma-compile-server (or set a " +
+      "reachable URL in AI settings) to host large files instead.");
   }
   let storeOnServer = false;
   if (sz > TEKTITE_SERVER_HINT && haveServer) {
@@ -60501,7 +60608,9 @@ async function tektiteImportFile(file) {
   } else if (sz > TEKTITE_BIG_FILE_WARN && !haveServer) {
     const ok = window.confirm("This file is " + (sz / (1024*1024)).toFixed(1) +
       " MB. Storing very large blobs in IndexedDB can hit browser quota " +
-      "limits and put the vault in a stuck state.  Continue?");
+      "limits and put the vault in a stuck state.\n\n" +
+      "Tip: start gamma-compile-server locally and large files will be offered to it.\n\n" +
+      "Continue with IDB?");
     if (!ok) throw new Error("import cancelled by user");
   }
   const rawId = file.name.replace(/\\/g, "/").split("/").pop();
@@ -60520,8 +60629,12 @@ async function tektiteImportFile(file) {
   }
   if (storeOnServer) {
     let up;
-    try { up = await tektiteVaultServerUpload(TEKTITE_VAULT_REMOTE_FOLDER + id, file); }
-    catch (e) {
+    try {
+      reportPhase("upload", 0);
+      up = await tektiteVaultServerUpload(TEKTITE_VAULT_REMOTE_FOLDER + id, file,
+        (frac) => reportPhase("upload", frac));
+      reportPhase("upload", 1);
+    } catch (e) {
       const fallback = window.confirm(
         "Server upload failed: " + e.message + "\n\nStore locally in IDB instead?");
       if (!fallback) throw e;
@@ -60541,16 +60654,20 @@ async function tektiteImportFile(file) {
         modifiedAt: Date.now(),
         backing:    "server"
       };
+      reportPhase("idb-write", 0);
       const db = await tektiteVaultOpen();
       const tx = db.transaction(TEKTITE_ATTACHMENTS_STORE, "readwrite");
       tx.objectStore(TEKTITE_ATTACHMENTS_STORE).put(rec);
       await new Promise((resolve, reject) => {
         tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error);
       });
+      reportPhase("done", 1);
       return id;
     }
   }
+  reportPhase("idb-write", 0);
   await tektitePutAttachment({ id, blob: file, mime: file.type });
+  reportPhase("done", 1);
   return id;
 }
 
@@ -70465,8 +70582,58 @@ function _tektitePatchPopoutHooks() {
   }
 })();
 
+/* Sprint 10aa -- progress pill shown at the bottom of the screen
+ * during attachment imports.  Single global element; updates per
+ * file + per phase (probe / upload / idb-write). */
+function _tektiteEnsureImportProgress() {
+  let el = document.getElementById("tk-import-progress");
+  if (el) return el;
+  el = document.createElement("div");
+  el.id = "tk-import-progress";
+  el.className = "tk-import-progress";
+  el.innerHTML =
+    '<div class="tk-imp-row">' +
+      '<span class="tk-imp-label">Importing…</span>' +
+      '<span class="tk-imp-count"></span>' +
+    '</div>' +
+    '<div class="tk-imp-bar"><div class="tk-imp-bar-fill"></div></div>' +
+    '<div class="tk-imp-phase"></div>';
+  el.style.display = "none";
+  document.body.appendChild(el);
+  return el;
+}
+
+function _tektiteImportProgressShow(idx, total) {
+  const el = _tektiteEnsureImportProgress();
+  el.style.display = "flex";
+  el.querySelector(".tk-imp-count").textContent = idx + " / " + total;
+}
+function _tektiteImportProgressUpdate(info, idx, total) {
+  const el = _tektiteEnsureImportProgress();
+  el.style.display = "flex";
+  const phase = info && info.phase;
+  const f     = (info && Number.isFinite(info.fraction)) ? Math.max(0, Math.min(1, info.fraction)) : 0;
+  // Overall fraction = (idx-1 completed) + current fraction, divided by total.
+  const overall = total > 0 ? ((idx - 1 + f) / total) : 0;
+  el.querySelector(".tk-imp-bar-fill").style.width = (overall * 100).toFixed(1) + "%";
+  el.querySelector(".tk-imp-count").textContent   = idx + " / " + total;
+  const phaseLabel = {
+    probe:     "probing server…",
+    upload:    "uploading to server " + (f * 100).toFixed(0) + "%",
+    "idb-write": "writing to local vault…",
+    done:      "✓ saved"
+  }[phase] || (phase || "");
+  el.querySelector(".tk-imp-phase").textContent =
+    (info && info.file ? info.file : "") + " · " + phaseLabel;
+}
+function _tektiteImportProgressHide() {
+  const el = document.getElementById("tk-import-progress");
+  if (el) el.style.display = "none";
+}
+
 /* Drop-zone on the Tektite tab.  Any file dropped on the notes list
- * is imported into the vault attachments store + the list refreshes. */
+ * is imported into the vault attachments store + the list refreshes.
+ * Sprint 10aa -- now wires a progress pill at the bottom. */
 function _tektiteWireAttachmentDropzone() {
   const list = document.getElementById("tektite-notes-list");
   if (!list || list._tk10tDz) return;
@@ -70483,10 +70650,22 @@ function _tektiteWireAttachmentDropzone() {
     list.classList.remove("tk-dropzone-active");
     const files = e.dataTransfer && e.dataTransfer.files;
     if (!files || !files.length) return;
-    for (const f of files) {
-      try { await tektiteImportFile(f); }
-      catch (err) { console.warn("[tektite-attach] import failed for", f.name, err); }
+    const total = files.length;
+    _tektiteImportProgressShow(1, total);
+    let failed = 0;
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
+      try {
+        await tektiteImportFile(f, {
+          onProgress: (info) => _tektiteImportProgressUpdate(info, i + 1, total)
+        });
+      } catch (err) {
+        failed++;
+        console.warn("[tektite-attach] import failed for", f.name, err);
+      }
     }
+    _tektiteImportProgressUpdate({ phase: "done", fraction: 1, file: "" }, total, total);
+    setTimeout(_tektiteImportProgressHide, failed ? 4000 : 1200);
     if (typeof _tektiteTabRefresh === "function") await _tektiteTabRefresh();
   });
 }

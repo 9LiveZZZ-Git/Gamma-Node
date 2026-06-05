@@ -423,36 +423,79 @@ const TEKTITE_BIG_FILE_HARD  = 250 * 1024 * 1024;   // 250 MB
 const TEKTITE_SERVER_HINT    =  25 * 1024 * 1024;   // 25 MB -- offer server
 const TEKTITE_VAULT_REMOTE_FOLDER = "vault/";       // path prefix on the server
 
-/* Read the compile-server URL the user configured for AI settings;
- * reused as the vault-backing server here.  Empty string -> "no
- * server configured" -> import falls back to IDB-only behavior. */
+/* Compile-server URL.  Empty `aiSettings.compileServerUrl` means
+ * "use the default local daemon" -- same convention as the AI panel's
+ * test-server button + the audio preview probe.  Returns the URL we
+ * SHOULD try; tektiteVaultServerProbe checks whether it's reachable
+ * before the import flow commits to uploading. */
+const TEKTITE_VAULT_DEFAULT_URL = "http://127.0.0.1:8765";
+
 function _tektiteVaultServerUrl() {
   try {
     if (typeof aiSettings === "object" && aiSettings && aiSettings.compileServerUrl) {
       return String(aiSettings.compileServerUrl).replace(/\/+$/, "");
     }
   } catch (_) {}
-  return "";
+  return TEKTITE_VAULT_DEFAULT_URL;
+}
+
+/* One-shot probe with a short timeout.  Cached for 30 s so the import
+ * flow doesn't re-probe on every dropped file. */
+let _tektiteVaultProbeCache = { url: "", ok: false, at: 0 };
+async function tektiteVaultServerProbe() {
+  const url = _tektiteVaultServerUrl();
+  const now = Date.now();
+  if (_tektiteVaultProbeCache.url === url && (now - _tektiteVaultProbeCache.at) < 30000) {
+    return _tektiteVaultProbeCache.ok;
+  }
+  let ok = false;
+  try {
+    const r = await fetch(url + "/health", { signal: AbortSignal.timeout(1500), mode: "cors" });
+    ok = r.ok;
+  } catch (_) { ok = false; }
+  _tektiteVaultProbeCache = { url, ok, at: now };
+  return ok;
 }
 
 /* PUT a Blob to the compile server's vault endpoint.  Server side
  * documented in gamma-compile-server/src/vault-route.js.  PUT raw-
  * body is simpler than multipart (no extra Node deps) and matches the
- * existing /assets/import pattern. */
-async function tektiteVaultServerUpload(id, blob) {
+ * existing /assets/import pattern.
+ *
+ * Uses XHR (not fetch) so the upload progress event surfaces -- fetch
+ * doesn't expose upload progress yet on most browsers.  onProgress(p)
+ * is called with a [0..1] fraction during the upload. */
+function tektiteVaultServerUpload(id, blob, onProgress) {
   const base = _tektiteVaultServerUrl();
-  if (!base) throw new Error("No compile server URL configured in AI settings.");
+  if (!base) return Promise.reject(new Error("No compile server URL configured."));
   const path = String(id).replace(/^\/+/, "");
-  const r = await fetch(base + "/vault/file/" + encodeURI(path), {
-    method:  "PUT",
-    body:    blob,
-    headers: { "Content-Type": blob.type || "application/octet-stream" },
-    mode:    "cors"
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("PUT", base + "/vault/file/" + encodeURI(path));
+    xhr.setRequestHeader("Content-Type", blob.type || "application/octet-stream");
+    xhr.responseType = "json";
+    xhr.upload.onprogress = (e) => {
+      if (typeof onProgress === "function" && e.lengthComputable) {
+        try { onProgress(e.loaded / e.total); } catch (_) {}
+      }
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        const j = xhr.response;
+        if (!j || !j.url) {
+          reject(new Error("Server upload returned no url"));
+          return;
+        }
+        resolve({ url: j.url, size: j.size || blob.size || 0 });
+      } else {
+        reject(new Error("Server upload failed: HTTP " + xhr.status));
+      }
+    };
+    xhr.onerror   = () => reject(new Error("Server upload network error"));
+    xhr.onabort   = () => reject(new Error("Server upload aborted"));
+    xhr.ontimeout = () => reject(new Error("Server upload timed out"));
+    xhr.send(blob);
   });
-  if (!r.ok) throw new Error("Server upload failed: HTTP " + r.status);
-  const j = await r.json();
-  if (!j || !j.url) throw new Error("Server upload returned no url");
-  return { url: j.url, size: j.size || blob.size || 0 };
 }
 
 /* Fetch a previously-uploaded blob from the server. */
@@ -487,15 +530,26 @@ async function tektiteVaultServerDelete(id) {
   if (!r.ok && r.status !== 404) throw new Error("Server delete failed: HTTP " + r.status);
 }
 
-async function tektiteImportFile(file) {
+async function tektiteImportFile(file, opts) {
   if (!file || !file.name) throw new Error("tektiteImportFile: File required");
+  opts = opts || {};
+  const onProgress = (typeof opts.onProgress === "function") ? opts.onProgress : null;
+  const reportPhase = (phase, frac) => {
+    if (!onProgress) return;
+    try { onProgress({ phase, fraction: frac, file: file.name, size: file.size || 0 }); } catch (_) {}
+  };
   const sz = file.size || 0;
-  const haveServer = !!_tektiteVaultServerUrl();
+  // Sprint 10aa -- probe instead of relying on "URL configured".
+  // Default URL is 127.0.0.1:8765 -- works when the local daemon is
+  // running.  When the probe fails (no daemon, or a LAN URL that's
+  // unreachable), fall back to IDB-only behavior.
+  reportPhase("probe", 0);
+  const haveServer = await tektiteVaultServerProbe();
   if (sz > TEKTITE_BIG_FILE_HARD && !haveServer) {
     throw new Error("Refusing to import " + (sz / (1024*1024)).toFixed(1) +
       " MB > " + (TEKTITE_BIG_FILE_HARD / (1024*1024)) +
-      " MB hard cap.  Configure a compile-server URL in AI settings to host " +
-      "large files instead, or split the file.");
+      " MB hard cap.  Start the local gamma-compile-server (or set a " +
+      "reachable URL in AI settings) to host large files instead.");
   }
   let storeOnServer = false;
   if (sz > TEKTITE_SERVER_HINT && haveServer) {
@@ -509,7 +563,9 @@ async function tektiteImportFile(file) {
   } else if (sz > TEKTITE_BIG_FILE_WARN && !haveServer) {
     const ok = window.confirm("This file is " + (sz / (1024*1024)).toFixed(1) +
       " MB. Storing very large blobs in IndexedDB can hit browser quota " +
-      "limits and put the vault in a stuck state.  Continue?");
+      "limits and put the vault in a stuck state.\n\n" +
+      "Tip: start gamma-compile-server locally and large files will be offered to it.\n\n" +
+      "Continue with IDB?");
     if (!ok) throw new Error("import cancelled by user");
   }
   const rawId = file.name.replace(/\\/g, "/").split("/").pop();
@@ -528,8 +584,12 @@ async function tektiteImportFile(file) {
   }
   if (storeOnServer) {
     let up;
-    try { up = await tektiteVaultServerUpload(TEKTITE_VAULT_REMOTE_FOLDER + id, file); }
-    catch (e) {
+    try {
+      reportPhase("upload", 0);
+      up = await tektiteVaultServerUpload(TEKTITE_VAULT_REMOTE_FOLDER + id, file,
+        (frac) => reportPhase("upload", frac));
+      reportPhase("upload", 1);
+    } catch (e) {
       const fallback = window.confirm(
         "Server upload failed: " + e.message + "\n\nStore locally in IDB instead?");
       if (!fallback) throw e;
@@ -549,16 +609,20 @@ async function tektiteImportFile(file) {
         modifiedAt: Date.now(),
         backing:    "server"
       };
+      reportPhase("idb-write", 0);
       const db = await tektiteVaultOpen();
       const tx = db.transaction(TEKTITE_ATTACHMENTS_STORE, "readwrite");
       tx.objectStore(TEKTITE_ATTACHMENTS_STORE).put(rec);
       await new Promise((resolve, reject) => {
         tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error);
       });
+      reportPhase("done", 1);
       return id;
     }
   }
+  reportPhase("idb-write", 0);
   await tektitePutAttachment({ id, blob: file, mime: file.type });
+  reportPhase("done", 1);
   return id;
 }
 

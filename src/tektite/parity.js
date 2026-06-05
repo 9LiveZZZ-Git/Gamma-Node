@@ -796,8 +796,58 @@ function _tektitePatchPopoutHooks() {
   }
 })();
 
+/* Sprint 10aa -- progress pill shown at the bottom of the screen
+ * during attachment imports.  Single global element; updates per
+ * file + per phase (probe / upload / idb-write). */
+function _tektiteEnsureImportProgress() {
+  let el = document.getElementById("tk-import-progress");
+  if (el) return el;
+  el = document.createElement("div");
+  el.id = "tk-import-progress";
+  el.className = "tk-import-progress";
+  el.innerHTML =
+    '<div class="tk-imp-row">' +
+      '<span class="tk-imp-label">Importing…</span>' +
+      '<span class="tk-imp-count"></span>' +
+    '</div>' +
+    '<div class="tk-imp-bar"><div class="tk-imp-bar-fill"></div></div>' +
+    '<div class="tk-imp-phase"></div>';
+  el.style.display = "none";
+  document.body.appendChild(el);
+  return el;
+}
+
+function _tektiteImportProgressShow(idx, total) {
+  const el = _tektiteEnsureImportProgress();
+  el.style.display = "flex";
+  el.querySelector(".tk-imp-count").textContent = idx + " / " + total;
+}
+function _tektiteImportProgressUpdate(info, idx, total) {
+  const el = _tektiteEnsureImportProgress();
+  el.style.display = "flex";
+  const phase = info && info.phase;
+  const f     = (info && Number.isFinite(info.fraction)) ? Math.max(0, Math.min(1, info.fraction)) : 0;
+  // Overall fraction = (idx-1 completed) + current fraction, divided by total.
+  const overall = total > 0 ? ((idx - 1 + f) / total) : 0;
+  el.querySelector(".tk-imp-bar-fill").style.width = (overall * 100).toFixed(1) + "%";
+  el.querySelector(".tk-imp-count").textContent   = idx + " / " + total;
+  const phaseLabel = {
+    probe:     "probing server…",
+    upload:    "uploading to server " + (f * 100).toFixed(0) + "%",
+    "idb-write": "writing to local vault…",
+    done:      "✓ saved"
+  }[phase] || (phase || "");
+  el.querySelector(".tk-imp-phase").textContent =
+    (info && info.file ? info.file : "") + " · " + phaseLabel;
+}
+function _tektiteImportProgressHide() {
+  const el = document.getElementById("tk-import-progress");
+  if (el) el.style.display = "none";
+}
+
 /* Drop-zone on the Tektite tab.  Any file dropped on the notes list
- * is imported into the vault attachments store + the list refreshes. */
+ * is imported into the vault attachments store + the list refreshes.
+ * Sprint 10aa -- now wires a progress pill at the bottom. */
 function _tektiteWireAttachmentDropzone() {
   const list = document.getElementById("tektite-notes-list");
   if (!list || list._tk10tDz) return;
@@ -814,10 +864,22 @@ function _tektiteWireAttachmentDropzone() {
     list.classList.remove("tk-dropzone-active");
     const files = e.dataTransfer && e.dataTransfer.files;
     if (!files || !files.length) return;
-    for (const f of files) {
-      try { await tektiteImportFile(f); }
-      catch (err) { console.warn("[tektite-attach] import failed for", f.name, err); }
+    const total = files.length;
+    _tektiteImportProgressShow(1, total);
+    let failed = 0;
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
+      try {
+        await tektiteImportFile(f, {
+          onProgress: (info) => _tektiteImportProgressUpdate(info, i + 1, total)
+        });
+      } catch (err) {
+        failed++;
+        console.warn("[tektite-attach] import failed for", f.name, err);
+      }
     }
+    _tektiteImportProgressUpdate({ phase: "done", fraction: 1, file: "" }, total, total);
+    setTimeout(_tektiteImportProgressHide, failed ? 4000 : 1200);
     if (typeof _tektiteTabRefresh === "function") await _tektiteTabRefresh();
   });
 }
