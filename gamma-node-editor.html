@@ -60321,24 +60321,54 @@ function tektiteGraphRenderer(canvas, graph, opts) {
     }
   }
 
+  // Sprint tektite-5b1 -- iteration counter + hover-pauses-sim fixes.
+  // Without these the layout never settles (KE asymptotes above the
+  // 0.05 threshold for large-ish graphs) and HOVERING used to wake
+  // the sim, making nodes jitter under the cursor right when the
+  // user tried to click.
+  let iterations = 0;
+  const MAX_ITERATIONS = 500;
+
   function step() {
     if (!running) return;
+    iterations++;
     const ke = tektiteGraphSimulateStep(nodes, edges, opts.forces || {});
     draw();
-    // Keep simulating while there's measurable kinetic energy or the
-    // user is interacting. Below threshold we still draw on demand
-    // (hover, click) but stop burning CPU.
-    if (ke > 0.05 || hoverIdx >= 0 || dragIdx >= 0 || panning) {
-      rafId = requestAnimationFrame(step);
-    } else {
+    // Stop when we hit the iteration cap (force-settles the layout) OR
+    // KE falls below threshold AND nothing's being actively dragged
+    // or panned. NOTE: hoverIdx no longer keeps the sim alive --
+    // hover events trigger redrawOnly() instead.
+    const settled = (iterations >= MAX_ITERATIONS) ||
+                    (ke < 0.05 && dragIdx < 0 && !panning);
+    if (settled) {
       running = false;
+    } else {
+      rafId = requestAnimationFrame(step);
     }
   }
 
   function wake() {
     if (running) return;
+    // Allow re-waking when the user genuinely needs new motion (drag,
+    // pan, graph rebuild). Reset iteration counter so a drag isn't
+    // capped out before the layout responds.
+    iterations = 0;
     running = true;
     rafId = requestAnimationFrame(step);
+  }
+
+  /* Lightweight: schedule a single draw frame WITHOUT a physics tick.
+   * Used by hover so highlights update under the cursor without the
+   * nodes shifting away.  Bails if the sim is already running (its
+   * loop already calls draw each frame). */
+  let redrawScheduled = false;
+  function redrawOnly() {
+    if (running || redrawScheduled) return;
+    redrawScheduled = true;
+    requestAnimationFrame(() => {
+      redrawScheduled = false;
+      draw();
+    });
   }
 
   function screenToGraph(sx, sy) {
@@ -60383,31 +60413,37 @@ function tektiteGraphRenderer(canvas, graph, opts) {
       const p = screenToGraph(e.clientX, e.clientY);
       nodes[dragIdx].x = p.x; nodes[dragIdx].y = p.y;
       nodes[dragIdx].vx = 0; nodes[dragIdx].vy = 0;
+      wake();        // user-driven motion -- run the sim
     } else if (panning) {
       offsetX += (e.clientX - panLastX);
       offsetY += (e.clientY - panLastY);
       panLastX = e.clientX; panLastY = e.clientY;
+      redrawOnly(); // pan doesn't change graph state, just transform
     } else {
+      // Sprint tektite-5b1 -- hover is a redraw-only event. Waking
+      // the sim here made nodes jitter under the cursor, which
+      // dodged the user's click.
       const idx = nodeAtScreen(e.clientX, e.clientY);
-      if (idx !== hoverIdx) { hoverIdx = idx; wake(); }
+      if (idx !== hoverIdx) { hoverIdx = idx; redrawOnly(); }
       canvas.style.cursor = (idx >= 0) ? "pointer" : "grab";
     }
-    wake();
   });
   canvas.addEventListener("pointerup", (e) => {
     canvas.releasePointerCapture(e.pointerId);
-    // Tap-without-drag on a node -> click.
+    // Tap-without-drag on a node -> click. Tolerance bumped from 4 px
+    // to 8 px so a tiny finger jitter doesn't downgrade a click into
+    // a drag-end (sprint tektite-5b1).
     if (dragIdx >= 0) {
       const n = nodes[dragIdx];
       const moved = Math.hypot(e.clientX - n._dragStartX, e.clientY - n._dragStartY);
       n.pinned = false;
-      if (moved < 4 && typeof opts.onNodeClick === "function") {
+      if (moved < 8 && typeof opts.onNodeClick === "function") {
         opts.onNodeClick(n.id);
       }
     }
     dragIdx = -1; panning = false;
     canvas.style.cursor = "grab";
-    wake();
+    redrawOnly();
   });
   canvas.addEventListener("wheel", (e) => {
     e.preventDefault();
@@ -60420,7 +60456,7 @@ function tektiteGraphRenderer(canvas, graph, opts) {
     offsetX = cx - (cx - offsetX) * factor;
     offsetY = cy - (cy - offsetY) * factor;
     scale = Math.max(0.1, Math.min(8, scale * factor));
-    wake();
+    redrawOnly();  // sprint tektite-5b1 -- zoom is a view-only change
   }, { passive: false });
 
   // Initial render.
