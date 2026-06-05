@@ -494,14 +494,15 @@ async function _tektitePopoutLoadAttachment(inst, attId) {
   // the user requested.  Stirling-PDF is server-only (Spring Boot)
   // so it's a "Send to" link against the configured instance; the
   // other three load in an in-app iframe modal.
-  // Sprint 10u -- editor launchers.  PDF.js is the realistic best
-  // free/open inline-browser PDF editor (server-only Stirling-PDF
-  // got dropped after the user asked for a better option).
+  // Sprint 10v -- launchers point at the INLINE editors in
+  // src/tektite/internal-editors.js (PDF.js vendored via esm.sh,
+  // image / CSV pure-canvas + JS, doc via mammoth.js).  No external
+  // tab hops; everything edits in place + saves back to the vault.
   const editorMap = {
-    image: { label: "Edit in miniPaint",     act: "minipaint"     },
-    pdf:   { label: "Open in PDF.js",        act: "pdfjs"         },
-    data:  { label: "Edit in Tablecruncher", act: "tablecruncher" },
-    doc:   { label: "Edit in docx-editor",   act: "docxeditor"    }
+    image: { label: "Edit image",   act: "minipaint"     },
+    pdf:   { label: "Open in PDF",  act: "pdfjs"         },
+    data:  { label: "Edit table",   act: "tablecruncher" },
+    doc:   { label: "Edit doc",     act: "docxeditor"    }
   };
   const editor = editorMap[kind];
   // Only data kind's CSV/TSV actually go to Tablecruncher; JSON et al fall back.
@@ -555,11 +556,19 @@ async function _tektitePopoutLoadAttachment(inst, attId) {
       '">⬇ Download to open externally</a></div>';
   }
   viewer.innerHTML = meta + '<div class="tk-att-body">' + body + '</div>';
-  // Wire the editor launch button (if present).
+  // Wire the editor launch button (if present).  Sprint 10v -- prefer
+  // the internal editor (vendored PDF.js / inline image / CSV / docx
+  // viewer); fall back to the external iframe launcher only if the
+  // internal one isn't loaded.
   const editBtnEl = viewer.querySelector(".tk-att-edit");
   if (editBtnEl) editBtnEl.addEventListener("click", () => {
-    _tektiteOpenExternalEditor(editBtnEl.getAttribute("data-act"),
-                               editBtnEl.getAttribute("data-id"));
+    const act = editBtnEl.getAttribute("data-act");
+    const id  = editBtnEl.getAttribute("data-id");
+    if (typeof _tektiteOpenInternalEditor === "function") {
+      _tektiteOpenInternalEditor(act, id);
+    } else if (typeof _tektiteOpenExternalEditor === "function") {
+      _tektiteOpenExternalEditor(act, id);
+    }
   });
 }
 
