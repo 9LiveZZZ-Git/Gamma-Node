@@ -37,19 +37,18 @@ let _tektiteCmModules = null;  // resolved import bundle (or null on failure)
 async function _tektiteLoadCodeMirror() {
   if (_tektiteCmModules) return _tektiteCmModules;
   try {
-    // Sprint tektite-2c fix -- switched from jsdelivr `+esm` URLs to
-    // esm.sh. jsdelivr loads each @codemirror/* package as a separate
-    // copy with its OWN @codemirror/state, which breaks instanceof
-    // checks ("Unrecognized extension value... multiple instances of
-    // @codemirror/state are loaded"). esm.sh has built-in dedup --
-    // it serves one shared copy of @codemirror/state to every
-    // dependent package.
+    // Sprint tektite-5a1 -- pin versions so esm.sh resolves the same
+    // build every time. The "Cannot read properties of undefined
+    // (reading 'extension')" crash users hit on 2026-06-05 was caused
+    // by codemirror@6 (the unpinned `@latest`) sometimes not
+    // re-exporting basicSetup, leaving an undefined slot in the
+    // extensions array.
     const [cm, lang, viewMod, stateMod, langData] = await Promise.all([
-      import("https://esm.sh/codemirror@6"),
-      import("https://esm.sh/@codemirror/lang-markdown@6"),
-      import("https://esm.sh/@codemirror/view@6"),
-      import("https://esm.sh/@codemirror/state@6"),
-      import("https://esm.sh/@codemirror/language-data@6").catch(() => null)
+      import("https://esm.sh/codemirror@6.0.2"),
+      import("https://esm.sh/@codemirror/lang-markdown@6.3.1"),
+      import("https://esm.sh/@codemirror/view@6.34.1"),
+      import("https://esm.sh/@codemirror/state@6.4.1"),
+      import("https://esm.sh/@codemirror/language-data@6.5.1").catch(() => null)
     ]);
     _tektiteCmModules = {
       EditorView:   cm.EditorView   || viewMod.EditorView,
@@ -64,6 +63,16 @@ async function _tektiteLoadCodeMirror() {
       markdownLanguage: lang.markdownLanguage,
       languages:    langData ? (langData.languages || []) : []
     };
+    // Sanity-check: every named export we depend on must be defined.
+    // If any are missing log them + return null so we fall back to
+    // the textarea instead of crashing inside state.create().
+    const required = ["EditorView","basicSetup","EditorState","Decoration","ViewPlugin","RangeSetBuilder","markdown"];
+    const missing = required.filter(k => !_tektiteCmModules[k]);
+    if (missing.length) {
+      console.warn("[tektite] CodeMirror modules missing:", missing.join(", "));
+      _tektiteCmModules = null;
+      return null;
+    }
     return _tektiteCmModules;
   } catch (e) {
     console.warn("[tektite] CodeMirror load failed; falling back to textarea:", e);
@@ -618,19 +627,31 @@ async function tektiteMarkdownAttach(container, initialDoc, opts) {
   // Read-only is plumbed via EditorView.editable.of(false) -- when the
   // caller wants to toggle later, we destroy + re-create the state.
   let isReadOnly = !!opts.readOnly;
-  if (isReadOnly) extensions.push(cm.EditorView.editable.of(false));
+  if (isReadOnly && cm.EditorView.editable) {
+    extensions.push(cm.EditorView.editable.of(false));
+  }
 
   // Notify on doc changes (debounced upstream by editor.js).
-  if (typeof opts.onChange === "function") {
+  if (typeof opts.onChange === "function" && cm.EditorView.updateListener) {
     extensions.push(cm.EditorView.updateListener.of((u) => {
       if (u.docChanged) opts.onChange(u.state.doc.toString());
     }));
   }
 
+  // Sprint tektite-5a1 -- filter out any undefined extensions so a
+  // missing accessor (lineWrapping, theme, etc.) on a stale CDN build
+  // doesn't crash state.create() with the "Cannot read properties of
+  // undefined (reading 'extension')" error.
+  const safeExtensions = extensions.filter(e => e !== undefined && e !== null);
+  if (safeExtensions.length !== extensions.length) {
+    console.warn("[tektite] dropped", extensions.length - safeExtensions.length,
+      "undefined CodeMirror extension(s)");
+  }
+
   // Clear container + create the view.
   container.innerHTML = "";
   const view = new cm.EditorView({
-    state: cm.EditorState.create({ doc: String(initialDoc || ""), extensions }),
+    state: cm.EditorState.create({ doc: String(initialDoc || ""), extensions: safeExtensions }),
     parent: container
   });
 
@@ -650,10 +671,10 @@ async function tektiteMarkdownAttach(container, initialDoc, opts) {
       // For sprint 2's UX this is fine -- read-only flips happen on
       // source switch, not while typing.
       isReadOnly = !!ro;
-      const newExt = extensions.slice();
-      // Strip any prior editable.of, then add the current one.
-      const filtered = newExt.filter(e => e !== undefined);
-      filtered.push(cm.EditorView.editable.of(!isReadOnly));
+      const filtered = extensions.filter(e => e !== undefined && e !== null);
+      if (cm.EditorView.editable) {
+        filtered.push(cm.EditorView.editable.of(!isReadOnly));
+      }
       view.setState(cm.EditorState.create({ doc: view.state.doc, extensions: filtered }));
     },
     focus() { view.focus(); },
