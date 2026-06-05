@@ -32,6 +32,7 @@ const _tektiteTabState = {
   notes:           [],     // current source's listing
   activeSource:    "vault",
   filterText:      "",
+  searchResults:   null,    // sprint tektite-3 -- structured query results
   listEl:          null,
   countEl:         null,
   filterInput:     null,
@@ -241,9 +242,20 @@ function _tektiteTabRender() {
   const s = _tektiteTabState;
   if (!s.listEl) return;
   const filter = (s.filterText || "").toLowerCase().trim();
-  const filtered = filter
-    ? s.notes.filter(n => (n.title || n.id).toLowerCase().includes(filter))
-    : s.notes;
+  // Sprint tektite-3 -- if we have structured search results (the user
+  // typed a DSL query containing `:` operators), render those instead
+  // of the plain substring-filtered list. Search is vault-only for
+  // now; remote sources still fall back to substring.
+  let filtered;
+  let isSearchMode = false;
+  if (s.searchResults && s.activeSource === "vault") {
+    isSearchMode = true;
+    filtered = s.searchResults;
+  } else {
+    filtered = filter
+      ? s.notes.filter(n => (n.title || n.id).toLowerCase().includes(filter))
+      : s.notes;
+  }
 
   // Count badge.
   if (s.countEl) {
@@ -278,13 +290,25 @@ function _tektiteTabRender() {
   const currentId     = tektiteEditorCurrentNoteId();
   const currentSource = tektiteEditorCurrentSourceId();
   const html = filtered.map(n => {
-    const isActive = (n.id === currentId && currentSource === s.activeSource);
-    const title    = _tektiteEscapeHtml(n.title || n.id);
+    // In search mode, n is a search-result object with extra fields
+    // (score, snippet, matchedTags, noteId). Normalize id lookup.
+    const id      = n.noteId || n.id;
+    const isActive = (id === currentId && currentSource === s.activeSource);
+    const title    = _tektiteEscapeHtml(n.title || id);
     const ts       = n.modifiedAt ? _tektiteFormatRelativeTime(n.modifiedAt) : "";
     const path     = (s.activeSource === "vault") ? "" : `<span class="tektite-note-path">${_tektiteEscapeHtml(n.path || "")}</span>`;
-    return `<div class="tektite-note-item${isActive ? " active" : ""}" data-id="${_tektiteEscapeAttr(n.id)}">
+    const snippet  = isSearchMode && n.snippet
+      ? `<div class="tektite-note-snippet">${_tektiteEscapeHtml(n.snippet)}</div>` : "";
+    const tagPills = isSearchMode && Array.isArray(n.matchedTags) && n.matchedTags.length
+      ? '<div class="tektite-note-tags">' +
+          n.matchedTags.slice(0, 4).map(t =>
+            '<span class="tektite-tag-pill">#' + _tektiteEscapeHtml(t) + '</span>').join("") +
+        '</div>'
+      : "";
+    return `<div class="tektite-note-item${isActive ? " active" : ""}" data-id="${_tektiteEscapeAttr(id)}">
       <div class="tektite-note-title">${title}</div>
       <div class="tektite-note-meta">${ts ? `<span class="tektite-note-ts">${ts}</span>` : ""}${path}</div>
+      ${snippet}${tagPills}
     </div>`;
   }).join("");
   s.listEl.innerHTML = html;
@@ -454,9 +478,36 @@ function tektiteTabAttach() {
   if (newBtn) newBtn.addEventListener("click", () => { _tektiteTabCreate(); });
 
   if (s.filterInput) {
-    s.filterInput.addEventListener("input", () => {
+    // Sprint tektite-3 -- distinguish DSL queries (contain `:`,
+    // quotes, or `tag:`/`prop:`/`path:` prefixes) from plain
+    // substring filters. DSL runs through tektiteRunQuery; plain
+    // filters do the old startsWith/includes path. Quick re-render
+    // with a short 120ms debounce so a typing burst on a 1k-note
+    // vault doesn't thrash.
+    let searchTimer = null;
+    s.filterInput.addEventListener("input", async () => {
       s.filterText = s.filterInput.value || "";
-      _tektiteTabRender();
+      if (searchTimer) clearTimeout(searchTimer);
+      const isDsl = /(?:^|\s)(?:tag:|prop:|path:|".+?")/.test(s.filterText) &&
+                    s.activeSource === "vault";
+      if (!isDsl) {
+        s.searchResults = null;
+        _tektiteTabRender();
+        return;
+      }
+      searchTimer = setTimeout(async () => {
+        // Make sure the tags index is warm so tag-clause matching is fast.
+        if (typeof tektiteTagsEnsureReady === "function") {
+          await tektiteTagsEnsureReady();
+        }
+        try {
+          s.searchResults = await tektiteRunQuery(s.filterText);
+        } catch (e) {
+          console.warn("[tektite] search failed:", e);
+          s.searchResults = [];
+        }
+        _tektiteTabRender();
+      }, 120);
     });
   }
 
@@ -479,15 +530,21 @@ function tektiteTabAttach() {
   // removed a [[link]] that changes its incoming list.
   tektiteEditorOnSave((record) => {
     if (!record) return;
-    // Backlinks: incremental ingest (vault only -- remote saves don't
-    // participate in the vault-only index yet).
-    if (record.sourceId === "vault" && typeof tektiteBacklinksOnNoteSaved === "function") {
-      tektiteBacklinksOnNoteSaved({
+    // Backlinks + tags: incremental ingest (vault only -- remote saves
+    // don't participate in the vault-only indices yet).
+    if (record.sourceId === "vault") {
+      const ingestArg = {
         id:         record.fileId,
         title:      record.title,
         content:    record.content,
         modifiedAt: record.modifiedAt
-      });
+      };
+      if (typeof tektiteBacklinksOnNoteSaved === "function") {
+        tektiteBacklinksOnNoteSaved(ingestArg);
+      }
+      if (typeof tektiteTagsOnNoteSaved === "function") {
+        tektiteTagsOnNoteSaved(ingestArg);
+      }
       _tektiteRenderBacklinks();
     }
     // List re-order (active source only).

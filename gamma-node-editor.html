@@ -1603,6 +1603,23 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  /* Sprint tektite-3 -- matched-tag pills shown next to search hits. */
+  .tektite-note-tags {
+    margin-top: 4px;
+    display: flex;
+    gap: 4px;
+    flex-wrap: wrap;
+  }
+  .tektite-tag-pill {
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    color: var(--accent);
+    background: rgba(200, 232, 90, 0.10);
+    border: 1px solid rgba(200, 232, 90, 0.30);
+    border-radius: 9px;
+    padding: 0 6px;
+    line-height: 14px;
+  }
   .tektite-empty {
     padding: 24px 14px;
     text-align: center;
@@ -7523,7 +7540,9 @@
           <div class="tektite-source-rail" id="tektite-source-rail"></div>
           <div class="tektite-toolbar">
             <button class="btn" id="btn-tektite-new" type="button">＋ New note</button>
-            <input id="tektite-filter" type="search" placeholder="filter notes…"
+            <input id="tektite-filter" type="search"
+              placeholder="filter or search · try tag:audio prop:status=draft"
+              title="Plain text filters by title. tag:NAME, prop:KEY=VALUE, path:SUBSTR, and &quot;quoted phrase&quot; engage the structured query DSL (vault only). Negate with tag:!NAME. Numeric ops: prop:count>5."
               autocomplete="off" spellcheck="false" />
             <span id="tektite-notes-count" class="tektite-count">0 notes</span>
             <button class="btn tektite-fullscreen-btn" id="btn-tektite-fullscreen" type="button"
@@ -58557,6 +58576,650 @@ async function tektiteBacklinksEnsureReady() {
   if (!_tektiteBacklinks.ready) await tektiteBacklinksRebuild();
 }
 /* =========================================================================
+ * Tektite MD -- YAML frontmatter parser
+ *
+ * Phase C sprint tektite-3. Recognizes the leading
+ *
+ *   ---
+ *   key: value
+ *   tags: [a, b]
+ *   ---
+ *
+ * block at the top of a note. Extracts a typed property map + returns
+ * the body markdown separately.  Used by tags.js + search.js as the
+ * source of truth for queryable note properties.
+ *
+ * The parser is a minimal subset of YAML 1.2 -- enough to cover the
+ * spec §5.1 property-types list (string / number / date / list /
+ * link) without pulling in js-yaml as a CDN dep:
+ *
+ *   string:   key: hello             -> "hello"
+ *             key: "hello: world"    -> "hello: world"
+ *             key: 'hello'           -> "hello"
+ *   number:   key: 42                -> 42
+ *             key: 3.14              -> 3.14
+ *   boolean:  key: true              -> true
+ *             key: false             -> false
+ *   null:     key: null              -> null
+ *             key: ~                 -> null
+ *   date:     key: 2026-06-04        -> Date object
+ *             key: 2026-06-04T12:00  -> Date object
+ *   inline list:  key: [a, b, "c"]   -> ["a", "b", "c"]
+ *   block list:   key:
+ *                   - a
+ *                   - b              -> ["a", "b"]
+ *   link:     key: "[[Other Note]]"  -> stays as string; consumers walk
+ *                                       wikilinks via the existing extractor.
+ *
+ * Nested maps + multi-line scalars (`|`, `>`) are NOT supported in
+ * sprint 3.  If a note needs richer YAML the user can edit it
+ * manually and the typed-property index falls back to string.
+ *
+ * Public surface:
+ *   tektiteParseFrontmatter(content)
+ *       -> { frontmatter: {...}, body: "...", bodyStart: <int> }
+ *       bodyStart is the character offset where the body begins
+ *       (after the closing `---\n`); used by the search snippet
+ *       generator so offsets line up with the original document.
+ *   tektiteSerializeFrontmatter(fm)
+ *       -> string. Round-trip writer; used by future template / tag-
+ *       rename refactors. Booleans, numbers, dates, lists serialize
+ *       to canonical YAML; strings get quoted when they contain
+ *       reserved chars.
+ * ======================================================================== */
+
+function tektiteParseFrontmatter(content) {
+  const text = String(content || "");
+  // Must start exactly with `---` followed by EOL.
+  if (!/^---[ \t]*\r?\n/.test(text)) {
+    return { frontmatter: {}, body: text, bodyStart: 0 };
+  }
+  // Find the closing fence -- `---` at the start of a line, not
+  // immediately after the opener.
+  const closeRe = /\n---[ \t]*\r?\n/;
+  const closeMatch = text.slice(4).match(closeRe);
+  if (!closeMatch) {
+    return { frontmatter: {}, body: text, bodyStart: 0 };
+  }
+  const fmEnd  = 4 + closeMatch.index;             // last char of the YAML block
+  const bodyStart = fmEnd + closeMatch[0].length;  // first char of body
+  const fmText = text.slice(4, fmEnd);
+  const body   = text.slice(bodyStart);
+  return {
+    frontmatter: _tektiteYamlParse(fmText),
+    body,
+    bodyStart
+  };
+}
+
+function _tektiteYamlParse(text) {
+  const out = {};
+  const lines = text.split(/\r?\n/);
+  let pendingKey = null;
+  let pendingList = null;
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
+    if (!raw.trim()) { pendingKey = null; pendingList = null; continue; }
+    // `- item` continuation for the block-list form.
+    const listM = raw.match(/^\s*-\s+(.+?)\s*$/);
+    if (listM && pendingList) {
+      pendingList.push(_tektiteYamlValue(listM[1]));
+      continue;
+    }
+    const m = raw.match(/^([A-Za-z_][A-Za-z0-9_-]*):\s*(.*)$/);
+    if (!m) { pendingKey = null; pendingList = null; continue; }
+    const key  = m[1];
+    const rest = m[2];
+    if (rest === "" || rest === undefined) {
+      // Could be a block list or an empty value. Peek at next line:
+      // if it's `- foo`, it's a list.
+      const nextNonEmpty = lines.slice(i + 1).find(l => l.trim() !== "");
+      if (nextNonEmpty && /^\s*-\s+/.test(nextNonEmpty)) {
+        pendingKey = key;
+        pendingList = [];
+        out[key] = pendingList;
+      } else {
+        out[key] = null;
+        pendingKey = null;
+        pendingList = null;
+      }
+      continue;
+    }
+    if (/^\[.*\]$/.test(rest)) {
+      const inner = rest.slice(1, -1).trim();
+      out[key] = inner === "" ? [] :
+        _tektiteSplitTopLevel(inner).map(s => _tektiteYamlValue(s.trim()));
+    } else {
+      out[key] = _tektiteYamlValue(rest);
+    }
+    pendingKey = null;
+    pendingList = null;
+  }
+  return out;
+}
+
+/* Split a top-level CSV honoring quoted strings: `a, "b, c", d` -> [a, "b, c", d]. */
+function _tektiteSplitTopLevel(s) {
+  const out = [];
+  let cur = "";
+  let q = null;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (q) {
+      cur += ch;
+      if (ch === q && s[i - 1] !== "\\") q = null;
+    } else if (ch === '"' || ch === "'") {
+      cur += ch; q = ch;
+    } else if (ch === ",") {
+      out.push(cur);
+      cur = "";
+    } else {
+      cur += ch;
+    }
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+function _tektiteYamlValue(raw) {
+  const s = String(raw).trim();
+  if (!s) return "";
+  // Quoted string.
+  if ((s[0] === '"' && s[s.length - 1] === '"') ||
+      (s[0] === "'" && s[s.length - 1] === "'")) {
+    return s.slice(1, -1);
+  }
+  // Booleans / null.
+  if (s === "true"  || s === "True"  || s === "TRUE")  return true;
+  if (s === "false" || s === "False" || s === "FALSE") return false;
+  if (s === "null"  || s === "Null"  || s === "~")     return null;
+  // Number.
+  if (/^-?\d+$/.test(s))            return parseInt(s, 10);
+  if (/^-?\d+\.\d+$/.test(s))       return parseFloat(s);
+  // ISO date (YYYY-MM-DD with optional time).
+  if (/^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?)?)?$/.test(s)) {
+    const d = new Date(s);
+    if (!Number.isNaN(d.getTime())) return d;
+  }
+  return s;
+}
+
+function tektiteSerializeFrontmatter(fm) {
+  if (!fm || typeof fm !== "object") return "";
+  const keys = Object.keys(fm);
+  if (!keys.length) return "";
+  const lines = ["---"];
+  for (const k of keys) {
+    lines.push(k + ": " + _tektiteYamlWriteValue(fm[k]));
+  }
+  lines.push("---", "");
+  return lines.join("\n");
+}
+
+function _tektiteYamlWriteValue(v) {
+  if (v === null || v === undefined) return "null";
+  if (typeof v === "boolean") return v ? "true" : "false";
+  if (typeof v === "number")  return String(v);
+  if (v instanceof Date)      return v.toISOString();
+  if (Array.isArray(v)) {
+    return "[" + v.map(x => _tektiteYamlWriteValue(x)).join(", ") + "]";
+  }
+  // String. Quote if it contains a reserved-ish char.
+  const s = String(v);
+  if (/[:#&*!|>'"%@`,\[\]{}]/.test(s) || /^\s|\s$/.test(s)) {
+    return '"' + s.replace(/"/g, '\\"') + '"';
+  }
+  return s;
+}
+/* =========================================================================
+ * Tektite MD -- tag index
+ *
+ * Phase C sprint tektite-3. Extracts `#tags` from note content + the
+ * frontmatter `tags:` array, builds an inverted index, and exposes
+ * lookups used by search.js's query DSL + a future Tag-cloud
+ * visualization mode.
+ *
+ * Tag syntax matches Obsidian's convention:
+ *   #audio          -- simple
+ *   #audio/fm       -- nested (slash-separated levels)
+ *   #project-2026   -- hyphens allowed
+ *   #docs_v2        -- underscores allowed
+ * Tags MUST start with a letter (not digit) so anchor URLs like
+ *   https://example.com#anchor / https://example.com/#section
+ * don't accidentally register as tags.  Inside `code` and code
+ * blocks, # is treated as literal text.
+ *
+ * The index lives in memory (rebuilt on demand by tektiteTagsRebuild
+ * or incrementally via tektiteTagsOnNoteSaved). Mirrors the
+ * backlinks-index lifecycle so the two stay in lockstep when the
+ * vault is bulk-imported or cleared.
+ *
+ * Public surface:
+ *   tektiteExtractTags(content, frontmatter?)
+ *     -> Set<string>   (lowercased tag ids, never carrying the `#`)
+ *   tektiteTagsRebuild()        -- walk vault + populate
+ *   tektiteTagsEnsureReady()    -- lazy-build on first read
+ *   tektiteTagsListAll()        -- [{ tag, count }] sorted by count desc
+ *   tektiteTagsGetNotesByTag(tag) -> [{ noteId, title, modifiedAt }]
+ *   tektiteTagsOnNoteSaved(record)  / tektiteTagsOnNoteDeleted(id)
+ * ======================================================================== */
+
+const _tektiteTagsState = {
+  ready:   false,
+  // tag -> Set<noteId>
+  inverse: new Map(),
+  // noteId -> Set<tag> (used so re-ingest can diff + drop stale tags)
+  forward: new Map(),
+  // noteId -> title cache (mirrors backlinks.js for cheap UI rendering)
+  titles:  new Map(),
+  modAt:   new Map()
+};
+
+/* Regex notes:
+ *   (^|[^\w/])          left boundary -- start-of-string or non-word /
+ *                       non-slash so we don't catch URL #anchors
+ *   #([A-Za-z][\w/-]*)  the tag itself -- must begin with a letter,
+ *                       allow word chars, slash, hyphen
+ *
+ * The negative left boundary specifically excludes `/` to skip
+ * `https://example.com/#section` and `\w` to skip cases like `foo#bar`. */
+const _TEKTITE_TAG_RE = /(^|[^\w/])#([A-Za-z][\w/-]*)/g;
+
+/* Strip code fences + inline code so we don't extract tags from
+ * literal source like ```bash\necho #comment\n```. The replacement
+ * keeps newlines + length-ish parity so line numbers stay roughly
+ * stable (not critical for tag extraction, but helpful for the
+ * future "show tag context" snippet generator). */
+function _tektiteStripCodeForTags(text) {
+  return String(text || "")
+    .replace(/```[\s\S]*?```/g, m => " ".repeat(m.length))
+    .replace(/`[^`\n]*`/g,      m => " ".repeat(m.length));
+}
+
+function tektiteExtractTags(content, frontmatter) {
+  const tags = new Set();
+  // Frontmatter tags array -- can be strings or YAML-list entries.
+  // Accept also a single comma-separated string for legacy notes.
+  if (frontmatter) {
+    let fmTags = frontmatter.tags;
+    if (typeof fmTags === "string") fmTags = fmTags.split(",").map(s => s.trim());
+    if (Array.isArray(fmTags)) {
+      for (const t of fmTags) {
+        const cleaned = String(t || "").replace(/^#/, "").trim();
+        if (cleaned) tags.add(cleaned.toLowerCase());
+      }
+    }
+  }
+  // Body tags.
+  const clean = _tektiteStripCodeForTags(content);
+  _TEKTITE_TAG_RE.lastIndex = 0;
+  let m;
+  while ((m = _TEKTITE_TAG_RE.exec(clean))) {
+    tags.add(m[2].toLowerCase());
+  }
+  return tags;
+}
+
+function _tektiteTagsDropNote(noteId) {
+  const prior = _tektiteTagsState.forward.get(noteId);
+  if (prior) {
+    for (const tag of prior) {
+      const set = _tektiteTagsState.inverse.get(tag);
+      if (set) {
+        set.delete(noteId);
+        if (set.size === 0) _tektiteTagsState.inverse.delete(tag);
+      }
+    }
+    _tektiteTagsState.forward.delete(noteId);
+  }
+  _tektiteTagsState.titles.delete(noteId);
+  _tektiteTagsState.modAt.delete(noteId);
+}
+
+function _tektiteTagsIngestNote(noteId, title, content, modifiedAt) {
+  _tektiteTagsDropNote(noteId);
+  const fm = (typeof tektiteParseFrontmatter === "function")
+    ? tektiteParseFrontmatter(content).frontmatter
+    : {};
+  const tags = tektiteExtractTags(content, fm);
+  _tektiteTagsState.forward.set(noteId, tags);
+  for (const t of tags) {
+    if (!_tektiteTagsState.inverse.has(t)) {
+      _tektiteTagsState.inverse.set(t, new Set());
+    }
+    _tektiteTagsState.inverse.get(t).add(noteId);
+  }
+  _tektiteTagsState.titles.set(noteId, title || noteId);
+  _tektiteTagsState.modAt.set(noteId,  modifiedAt || 0);
+}
+
+async function tektiteTagsRebuild() {
+  _tektiteTagsState.inverse.clear();
+  _tektiteTagsState.forward.clear();
+  _tektiteTagsState.titles.clear();
+  _tektiteTagsState.modAt.clear();
+  const notes = await tektiteListNotes();
+  for (const n of notes) {
+    _tektiteTagsIngestNote(n.id, n.title || n.id, n.content || "", n.modifiedAt || 0);
+  }
+  _tektiteTagsState.ready = true;
+  return notes.length;
+}
+
+async function tektiteTagsEnsureReady() {
+  if (!_tektiteTagsState.ready) await tektiteTagsRebuild();
+}
+
+/* Returns [{ tag, count }] sorted by descending count, ties broken
+ * alphabetically. Used by both the search results header + the
+ * future tag-cloud viz mode. */
+function tektiteTagsListAll() {
+  const out = [];
+  for (const [tag, set] of _tektiteTagsState.inverse) {
+    out.push({ tag, count: set.size });
+  }
+  out.sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag));
+  return out;
+}
+
+function tektiteTagsGetNotesByTag(tag) {
+  if (!tag) return [];
+  const set = _tektiteTagsState.inverse.get(String(tag).toLowerCase());
+  if (!set) return [];
+  const out = [];
+  for (const id of set) {
+    out.push({
+      noteId: id,
+      title: _tektiteTagsState.titles.get(id) || id,
+      modifiedAt: _tektiteTagsState.modAt.get(id) || 0
+    });
+  }
+  out.sort((a, b) => b.modifiedAt - a.modifiedAt);
+  return out;
+}
+
+function tektiteTagsOnNoteSaved(record) {
+  if (!record || !record.id) return;
+  if (!_tektiteTagsState.ready) return;
+  _tektiteTagsIngestNote(
+    record.id,
+    record.title || record.id,
+    record.content || "",
+    record.modifiedAt || Date.now()
+  );
+}
+
+function tektiteTagsOnNoteDeleted(id) {
+  if (!_tektiteTagsState.ready) return;
+  _tektiteTagsDropNote(id);
+}
+/* =========================================================================
+ * Tektite MD -- search + query DSL
+ *
+ * Phase C sprint tektite-3. Backs the filter input on the Tektite tab.
+ * Supports both plain substring filtering AND a structured query DSL:
+ *
+ *   tag:audio              -- has tag (case-insensitive, nested allowed)
+ *   tag:!draft             -- does NOT have tag
+ *   prop:status=draft      -- frontmatter property equals (string)
+ *   prop:count>5           -- numeric comparison (=, !=, >, <, >=, <=)
+ *   prop:status            -- property is set (any non-null value)
+ *   path:notes/            -- note path contains substring
+ *   "exact phrase"         -- quoted: exact substring in title+body
+ *   bareword               -- substring in title+body (case-insensitive)
+ *
+ * Multiple terms are AND-joined. To OR, run two queries (saved-query
+ * compositions ship in tektite-4).  Examples:
+ *
+ *   tag:audio tag:!draft "FM synthesis"
+ *   prop:status=published prop:wordcount>500
+ *   path:journal/ 2026
+ *
+ * Results carry a relevance score:
+ *   tag match:    +10  (cheap + specific)
+ *   prop match:   +8   (cheap + specific)
+ *   path match:   +5
+ *   title text:   +3 per hit
+ *   body  text:   +1 per hit
+ *
+ * Ties broken by modifiedAt descending. Empty queries return [].
+ *
+ * Vault-only for now. Remote-source search needs an async cross-
+ * source crawl that lands in tektite-4 alongside saved queries.
+ *
+ * Public surface:
+ *   tektiteParseQuery(queryStr)
+ *     -> { tags:[{name,negate}], props:[{key,op,value}],
+ *          paths:[string], textTerms:[{text,quoted}], isStructured }
+ *   tektiteRunQuery(queryStr, opts)
+ *     -> Promise< [{ noteId, title, modifiedAt, score, snippet }] >
+ *        opts.maxResults  default 100
+ *        opts.snippetSize default 80
+ * ======================================================================== */
+
+const _TEKTITE_QUERY_TOKEN_RE = /(?:"([^"]+)"|(\S+))/g;
+const _TEKTITE_PROP_OP_RE     = /^([A-Za-z_][A-Za-z0-9_-]*)(>=|<=|!=|=|>|<)(.+)$/;
+
+function tektiteParseQuery(queryStr) {
+  const out = {
+    tags:      [],
+    props:     [],
+    paths:     [],
+    textTerms: [],
+    isStructured: false
+  };
+  const s = String(queryStr || "").trim();
+  if (!s) return out;
+
+  _TEKTITE_QUERY_TOKEN_RE.lastIndex = 0;
+  let m;
+  while ((m = _TEKTITE_QUERY_TOKEN_RE.exec(s))) {
+    const quoted = m[1] !== undefined;
+    const tok = quoted ? m[1] : m[2];
+    if (!tok) continue;
+
+    if (!quoted && tok.startsWith("tag:")) {
+      let name = tok.slice(4).toLowerCase();
+      const negate = name.startsWith("!");
+      if (negate) name = name.slice(1);
+      if (name) { out.tags.push({ name, negate }); out.isStructured = true; }
+    } else if (!quoted && tok.startsWith("prop:")) {
+      const rest = tok.slice(5);
+      const pm = rest.match(_TEKTITE_PROP_OP_RE);
+      if (pm) {
+        out.props.push({ key: pm[1], op: pm[2], value: pm[3] });
+      } else if (/^[A-Za-z_][A-Za-z0-9_-]*$/.test(rest)) {
+        // "prop:status" with no operator = "is set"
+        out.props.push({ key: rest, op: "isset", value: null });
+      }
+      out.isStructured = true;
+    } else if (!quoted && tok.startsWith("path:")) {
+      const v = tok.slice(5);
+      if (v) { out.paths.push(v.toLowerCase()); out.isStructured = true; }
+    } else {
+      out.textTerms.push({ text: tok, quoted });
+    }
+  }
+  return out;
+}
+
+function _tektiteMatchProp(value, op, target) {
+  if (op === "isset") {
+    return value !== undefined && value !== null && value !== "";
+  }
+  if (value === undefined || value === null) return op === "!=";
+  // Numeric path first.
+  const vNum = (typeof value === "number") ? value : parseFloat(value);
+  const tNum = parseFloat(target);
+  if (Number.isFinite(vNum) && Number.isFinite(tNum) && String(vNum) === String(value).trim()) {
+    switch (op) {
+      case "=":  return vNum === tNum;
+      case "!=": return vNum !== tNum;
+      case ">":  return vNum >  tNum;
+      case "<":  return vNum <  tNum;
+      case ">=": return vNum >= tNum;
+      case "<=": return vNum <= tNum;
+    }
+  }
+  // Date path. Treat target as ISO if it parses.
+  if (value instanceof Date) {
+    const tDate = new Date(target);
+    if (!Number.isNaN(tDate.getTime())) {
+      const v = value.getTime();
+      const t = tDate.getTime();
+      switch (op) {
+        case "=":  return v === t;
+        case "!=": return v !== t;
+        case ">":  return v >  t;
+        case "<":  return v <  t;
+        case ">=": return v >= t;
+        case "<=": return v <= t;
+      }
+    }
+  }
+  // Boolean.
+  if (typeof value === "boolean") {
+    const tBool = (target === "true" || target === "1");
+    switch (op) {
+      case "=":  return value === tBool;
+      case "!=": return value !== tBool;
+    }
+  }
+  // Array contains (e.g. prop:tags=audio when tags is a list).
+  if (Array.isArray(value)) {
+    const lcVals = value.map(x => String(x).toLowerCase());
+    const lcT = target.toLowerCase();
+    switch (op) {
+      case "=":  return lcVals.includes(lcT);
+      case "!=": return !lcVals.includes(lcT);
+    }
+  }
+  // String fallback (case-insensitive equality / substring).
+  const vStr = String(value).toLowerCase();
+  const tStr = target.toLowerCase();
+  switch (op) {
+    case "=":  return vStr === tStr;
+    case "!=": return vStr !== tStr;
+    case ">":  return vStr >  tStr;
+    case "<":  return vStr <  tStr;
+    case ">=": return vStr >= tStr;
+    case "<=": return vStr <= tStr;
+  }
+  return false;
+}
+
+/* Generate a 60–80 char snippet centered on the first match of `term`
+ * in `text`. Falls back to the first non-empty paragraph when `term`
+ * isn't found (used for tag-only queries with no text component). */
+function _tektiteMakeSnippet(text, term, snippetSize) {
+  const t = String(text || "").replace(/\s+/g, " ");
+  if (!t) return "";
+  const size = snippetSize || 80;
+  if (!term) {
+    return t.slice(0, size) + (t.length > size ? "…" : "");
+  }
+  const lc  = t.toLowerCase();
+  const idx = lc.indexOf(String(term).toLowerCase());
+  if (idx < 0) return t.slice(0, size) + (t.length > size ? "…" : "");
+  const half = Math.floor(size / 2);
+  const from = Math.max(0, idx - half);
+  const to   = Math.min(t.length, idx + term.length + half);
+  return (from > 0 ? "…" : "") + t.slice(from, to) + (to < t.length ? "…" : "");
+}
+
+async function tektiteRunQuery(queryStr, opts) {
+  opts = opts || {};
+  const maxResults  = Number.isFinite(opts.maxResults)  ? opts.maxResults  : 100;
+  const snippetSize = Number.isFinite(opts.snippetSize) ? opts.snippetSize : 80;
+  const q = tektiteParseQuery(queryStr);
+  if (!q.isStructured && !q.textTerms.length) return [];
+
+  const notes = await tektiteListNotes();
+  const results = [];
+
+  for (const note of notes) {
+    const content = note.content || "";
+    const { frontmatter, body } = (typeof tektiteParseFrontmatter === "function")
+      ? tektiteParseFrontmatter(content)
+      : { frontmatter: {}, body: content };
+    const noteTags = (typeof tektiteExtractTags === "function")
+      ? tektiteExtractTags(content, frontmatter)
+      : new Set();
+
+    // Tag predicates.
+    let pass = true;
+    for (const f of q.tags) {
+      const has = _tektiteTagMatches(noteTags, f.name);
+      if (f.negate && has)  { pass = false; break; }
+      if (!f.negate && !has){ pass = false; break; }
+    }
+    if (!pass) continue;
+
+    // Property predicates.
+    for (const f of q.props) {
+      if (!_tektiteMatchProp(frontmatter[f.key], f.op, f.value)) { pass = false; break; }
+    }
+    if (!pass) continue;
+
+    // Path predicates.
+    for (const p of q.paths) {
+      if (!String(note.id).toLowerCase().includes(p)) { pass = false; break; }
+    }
+    if (!pass) continue;
+
+    // Score + text predicates.
+    let score = q.tags.length * 10 + q.props.length * 8 + q.paths.length * 5;
+    const titleLc = String(note.title || note.id).toLowerCase();
+    const bodyLc  = String(body).toLowerCase();
+    let firstTextMatch = null;
+    for (const t of q.textTerms) {
+      const term = String(t.text).toLowerCase();
+      const titleHits = _tektiteCountOccurrences(titleLc, term);
+      const bodyHits  = _tektiteCountOccurrences(bodyLc,  term);
+      if (titleHits + bodyHits === 0) { pass = false; break; }
+      score += titleHits * 3 + bodyHits;
+      if (!firstTextMatch) firstTextMatch = t.text;
+    }
+    if (!pass) continue;
+
+    results.push({
+      noteId:     note.id,
+      title:      note.title || note.id,
+      modifiedAt: note.modifiedAt || 0,
+      score,
+      snippet:    _tektiteMakeSnippet(body, firstTextMatch, snippetSize),
+      matchedTags: Array.from(noteTags).filter(t => q.tags.some(f => !f.negate && _tektiteSingleTagMatches(t, f.name)))
+    });
+  }
+
+  results.sort((a, b) => b.score - a.score || b.modifiedAt - a.modifiedAt);
+  return results.slice(0, maxResults);
+}
+
+/* Tag match: query "audio" matches notes tagged exactly `audio` OR any
+ * `audio/...` nested child. So `tag:audio` finds `#audio/fm`, but
+ * `tag:audio/fm` finds only `#audio/fm`. */
+function _tektiteSingleTagMatches(noteTag, queryTag) {
+  if (noteTag === queryTag) return true;
+  return noteTag.startsWith(queryTag + "/");
+}
+function _tektiteTagMatches(tagSet, queryTag) {
+  for (const t of tagSet) {
+    if (_tektiteSingleTagMatches(t, queryTag)) return true;
+  }
+  return false;
+}
+
+function _tektiteCountOccurrences(haystack, needle) {
+  if (!needle) return 0;
+  let n = 0, idx = 0;
+  while ((idx = haystack.indexOf(needle, idx)) >= 0) {
+    n++;
+    idx += needle.length;
+  }
+  return n;
+}
+/* =========================================================================
  * Tektite MD -- editor (CodeMirror 6 + textarea fallback)
  *
  * Phase C sprint tektite-1 (textarea) + tektite-1.5b (source-aware) +
@@ -58945,6 +59608,7 @@ const _tektiteTabState = {
   notes:           [],     // current source's listing
   activeSource:    "vault",
   filterText:      "",
+  searchResults:   null,    // sprint tektite-3 -- structured query results
   listEl:          null,
   countEl:         null,
   filterInput:     null,
@@ -59154,9 +59818,20 @@ function _tektiteTabRender() {
   const s = _tektiteTabState;
   if (!s.listEl) return;
   const filter = (s.filterText || "").toLowerCase().trim();
-  const filtered = filter
-    ? s.notes.filter(n => (n.title || n.id).toLowerCase().includes(filter))
-    : s.notes;
+  // Sprint tektite-3 -- if we have structured search results (the user
+  // typed a DSL query containing `:` operators), render those instead
+  // of the plain substring-filtered list. Search is vault-only for
+  // now; remote sources still fall back to substring.
+  let filtered;
+  let isSearchMode = false;
+  if (s.searchResults && s.activeSource === "vault") {
+    isSearchMode = true;
+    filtered = s.searchResults;
+  } else {
+    filtered = filter
+      ? s.notes.filter(n => (n.title || n.id).toLowerCase().includes(filter))
+      : s.notes;
+  }
 
   // Count badge.
   if (s.countEl) {
@@ -59191,13 +59866,25 @@ function _tektiteTabRender() {
   const currentId     = tektiteEditorCurrentNoteId();
   const currentSource = tektiteEditorCurrentSourceId();
   const html = filtered.map(n => {
-    const isActive = (n.id === currentId && currentSource === s.activeSource);
-    const title    = _tektiteEscapeHtml(n.title || n.id);
+    // In search mode, n is a search-result object with extra fields
+    // (score, snippet, matchedTags, noteId). Normalize id lookup.
+    const id      = n.noteId || n.id;
+    const isActive = (id === currentId && currentSource === s.activeSource);
+    const title    = _tektiteEscapeHtml(n.title || id);
     const ts       = n.modifiedAt ? _tektiteFormatRelativeTime(n.modifiedAt) : "";
     const path     = (s.activeSource === "vault") ? "" : `<span class="tektite-note-path">${_tektiteEscapeHtml(n.path || "")}</span>`;
-    return `<div class="tektite-note-item${isActive ? " active" : ""}" data-id="${_tektiteEscapeAttr(n.id)}">
+    const snippet  = isSearchMode && n.snippet
+      ? `<div class="tektite-note-snippet">${_tektiteEscapeHtml(n.snippet)}</div>` : "";
+    const tagPills = isSearchMode && Array.isArray(n.matchedTags) && n.matchedTags.length
+      ? '<div class="tektite-note-tags">' +
+          n.matchedTags.slice(0, 4).map(t =>
+            '<span class="tektite-tag-pill">#' + _tektiteEscapeHtml(t) + '</span>').join("") +
+        '</div>'
+      : "";
+    return `<div class="tektite-note-item${isActive ? " active" : ""}" data-id="${_tektiteEscapeAttr(id)}">
       <div class="tektite-note-title">${title}</div>
       <div class="tektite-note-meta">${ts ? `<span class="tektite-note-ts">${ts}</span>` : ""}${path}</div>
+      ${snippet}${tagPills}
     </div>`;
   }).join("");
   s.listEl.innerHTML = html;
@@ -59367,9 +60054,36 @@ function tektiteTabAttach() {
   if (newBtn) newBtn.addEventListener("click", () => { _tektiteTabCreate(); });
 
   if (s.filterInput) {
-    s.filterInput.addEventListener("input", () => {
+    // Sprint tektite-3 -- distinguish DSL queries (contain `:`,
+    // quotes, or `tag:`/`prop:`/`path:` prefixes) from plain
+    // substring filters. DSL runs through tektiteRunQuery; plain
+    // filters do the old startsWith/includes path. Quick re-render
+    // with a short 120ms debounce so a typing burst on a 1k-note
+    // vault doesn't thrash.
+    let searchTimer = null;
+    s.filterInput.addEventListener("input", async () => {
       s.filterText = s.filterInput.value || "";
-      _tektiteTabRender();
+      if (searchTimer) clearTimeout(searchTimer);
+      const isDsl = /(?:^|\s)(?:tag:|prop:|path:|".+?")/.test(s.filterText) &&
+                    s.activeSource === "vault";
+      if (!isDsl) {
+        s.searchResults = null;
+        _tektiteTabRender();
+        return;
+      }
+      searchTimer = setTimeout(async () => {
+        // Make sure the tags index is warm so tag-clause matching is fast.
+        if (typeof tektiteTagsEnsureReady === "function") {
+          await tektiteTagsEnsureReady();
+        }
+        try {
+          s.searchResults = await tektiteRunQuery(s.filterText);
+        } catch (e) {
+          console.warn("[tektite] search failed:", e);
+          s.searchResults = [];
+        }
+        _tektiteTabRender();
+      }, 120);
     });
   }
 
@@ -59392,15 +60106,21 @@ function tektiteTabAttach() {
   // removed a [[link]] that changes its incoming list.
   tektiteEditorOnSave((record) => {
     if (!record) return;
-    // Backlinks: incremental ingest (vault only -- remote saves don't
-    // participate in the vault-only index yet).
-    if (record.sourceId === "vault" && typeof tektiteBacklinksOnNoteSaved === "function") {
-      tektiteBacklinksOnNoteSaved({
+    // Backlinks + tags: incremental ingest (vault only -- remote saves
+    // don't participate in the vault-only indices yet).
+    if (record.sourceId === "vault") {
+      const ingestArg = {
         id:         record.fileId,
         title:      record.title,
         content:    record.content,
         modifiedAt: record.modifiedAt
-      });
+      };
+      if (typeof tektiteBacklinksOnNoteSaved === "function") {
+        tektiteBacklinksOnNoteSaved(ingestArg);
+      }
+      if (typeof tektiteTagsOnNoteSaved === "function") {
+        tektiteTagsOnNoteSaved(ingestArg);
+      }
       _tektiteRenderBacklinks();
     }
     // List re-order (active source only).
