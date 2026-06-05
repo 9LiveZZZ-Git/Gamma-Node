@@ -441,92 +441,7 @@ const _tektiteCanvasState = {
   dragOrigPanY: 0
 };
 
-/* Sprint tektite-10f -- Tektite Canvas Mode.  Path A unification:
- * the "Tektite Canvas" no longer opens a separate JSON-Canvas modal,
- * it instead enters a palette-filtered mode on the MAIN canvas where
- * only Tektite cards are visible + creatable.  This lets the user
- * leverage the full main canvas (infinite pan/zoom, undo, prefab
- * save, codegen-aware wiring, etc.) while focusing on the Tektite
- * card subset.
- *
- * Exit via the floating "× Exit Tektite Mode" pill or Escape.
- *
- * The legacy JSON-Canvas modal stays accessible at _tektiteCanvasOpenLegacy()
- * for any user-saved canvas docs that haven't been migrated yet. */
-function _tektiteCanvasOpen() {
-  // Apply mode class -> CSS hides non-Tektite nodes + filters palette.
-  document.body.classList.add("tektite-canvas-mode");
-  // Filter palette to Tektite category.
-  if (typeof brState !== "undefined" && brState) {
-    brState._savedCatFilter = brState.catFilter;
-    brState._savedTab       = brState.tab;
-    brState.catFilter = "Tektite";
-  }
-  // Switch left tab to nodes (so the palette shows the Tektite filter).
-  if (typeof brSwitchTab === "function") brSwitchTab("nodes");
-  if (typeof brRenderNodes === "function") brRenderNodes();
-  // Fit the main canvas to existing Tektite cards (if any).
-  if (typeof _gnFitCanvasToView === "function") {
-    setTimeout(() => _gnFitCanvasToView({ onlyKind: "tektite-card" }), 0);
-  }
-  // Show the exit pill (created on first entry).
-  _tektiteCanvasModeShowExitPill();
-}
-
-function _tektiteCanvasClose() {
-  document.body.classList.remove("tektite-canvas-mode");
-  if (typeof brState !== "undefined" && brState) {
-    if (brState._savedCatFilter !== undefined) {
-      brState.catFilter = brState._savedCatFilter;
-      delete brState._savedCatFilter;
-    } else {
-      brState.catFilter = null;
-    }
-    if (brState._savedTab !== undefined) {
-      const saved = brState._savedTab;
-      delete brState._savedTab;
-      if (typeof brSwitchTab === "function") brSwitchTab(saved);
-    }
-  }
-  if (typeof brRenderNodes === "function") brRenderNodes();
-  _tektiteCanvasModeHideExitPill();
-}
-
-/* Floating "× Exit Tektite Mode" pill -- created once, toggled on
- * subsequent enters/exits. Esc also closes. */
-let _tektiteCanvasModePillEl = null;
-function _tektiteCanvasModeShowExitPill() {
-  if (!_tektiteCanvasModePillEl) {
-    const pill = document.createElement("button");
-    pill.id = "tektite-canvas-mode-pill";
-    pill.type = "button";
-    pill.innerHTML = '⬡ Tektite Canvas <span class="tcm-x">× Exit</span>';
-    pill.addEventListener("click", (e) => {
-      e.stopPropagation();
-      _tektiteCanvasClose();
-    });
-    document.body.appendChild(pill);
-    _tektiteCanvasModePillEl = pill;
-    // Esc handler -- one-shot capture; re-bound each open so the
-    // listener isn't dangling when we're not in mode.
-    document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape" && document.body.classList.contains("tektite-canvas-mode")) {
-        // Don't grab Esc if a modal / picker / textarea owns it.
-        const ae = document.activeElement;
-        if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable)) return;
-        _tektiteCanvasClose();
-      }
-    });
-  }
-  _tektiteCanvasModePillEl.style.display = "";
-}
-function _tektiteCanvasModeHideExitPill() {
-  if (_tektiteCanvasModePillEl) _tektiteCanvasModePillEl.style.display = "none";
-}
-
-/* Legacy JSON-Canvas modal (pre-sprint-10f).  Still callable but no
- * longer the default for btn-tektite-canvas. */
-async function _tektiteCanvasOpenLegacy() {
+async function _tektiteCanvasOpen() {
   const s = _tektiteCanvasState;
   s.modal = document.getElementById("tektite-canvas-modal");
   if (!s.modal) return;
@@ -535,7 +450,7 @@ async function _tektiteCanvasOpenLegacy() {
   await _tektiteCanvasRefreshList();
 }
 
-function _tektiteCanvasCloseLegacy() {
+function _tektiteCanvasClose() {
   const s = _tektiteCanvasState;
   _tektiteCanvasFlush();
   if (s.modal) s.modal.style.display = "none";
@@ -552,7 +467,7 @@ function _tektiteCanvasAttach() {
   s.listEl  = document.getElementById("tektite-canvas-list");
 
   document.getElementById("btn-tektite-canvas-new").addEventListener("click", () => _tektiteCanvasCreate());
-  document.getElementById("btn-tektite-canvas-close").addEventListener("click", () => _tektiteCanvasCloseLegacy());
+  document.getElementById("btn-tektite-canvas-close").addEventListener("click", () => _tektiteCanvasClose());
   document.getElementById("btn-tektite-canvas-add-text").addEventListener("click", () => _tektiteCanvasAddTextCard());
   document.getElementById("btn-tektite-canvas-add-file").addEventListener("click", () => _tektiteCanvasAddFileCard());
   document.getElementById("btn-tektite-canvas-fit").addEventListener("click", () => _tektiteCanvasFitToView());
@@ -573,7 +488,7 @@ function _tektiteCanvasAttach() {
   // Esc closes.
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && s.modal && s.modal.style.display !== "none") {
-      _tektiteCanvasCloseLegacy();
+      _tektiteCanvasClose();
     }
   });
 }
