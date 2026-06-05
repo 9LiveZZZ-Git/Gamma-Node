@@ -62,28 +62,45 @@ function _gnFitCanvasToView() {
     if (typeof render === "function") render();
     return;
   }
-  let minX =  Infinity, maxX = -Infinity;
-  let minY =  Infinity, maxY = -Infinity;
-  const APPROX_W = 200, APPROX_H = 140;
-  for (const n of subset) {
-    const x = +n.x || 0, y = +n.y || 0;
-    if (x < minX) minX = x;
-    if (y < minY) minY = y;
-    if (x + APPROX_W > maxX) maxX = x + APPROX_W;
-    if (y + APPROX_H > maxY) maxY = y + APPROX_H;
+  // Sprint tektite-10a -- delegate the math to the shared primitive.
+  // Main canvas uses a top-left world origin (view.panX/Y are offset
+  // from {0,0} = canvas top-left), so we construct a board in that
+  // mode just for this operation. We can't replace `view` wholesale
+  // yet -- too many handlers read view.panX/Y/zoom directly --
+  // but we get the consistent fit semantics + the same clamping.
+  const bounds = (typeof spatialBoundsForNodes === "function")
+    ? spatialBoundsForNodes(subset, 200, 140)
+    : null;
+  if (typeof createSpatialBoard === "function" && bounds) {
+    const board = createSpatialBoard({ minZoom: 0.2, maxZoom: 2, originAtCenter: false });
+    board.fitToBounds(bounds, rect.width, rect.height, 60);
+    view.panX = board.getPanX();
+    view.panY = board.getPanY();
+    view.zoom = board.getZoom();
+  } else {
+    // Fallback to inline math if the primitive isn't loaded.
+    let minX =  Infinity, maxX = -Infinity;
+    let minY =  Infinity, maxY = -Infinity;
+    const APPROX_W = 200, APPROX_H = 140;
+    for (const n of subset) {
+      const x = +n.x || 0, y = +n.y || 0;
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (x + APPROX_W > maxX) maxX = x + APPROX_W;
+      if (y + APPROX_H > maxY) maxY = y + APPROX_H;
+    }
+    const w = Math.max(1, maxX - minX);
+    const h = Math.max(1, maxY - minY);
+    const margin = 60;
+    const sx = (rect.width  - margin * 2) / w;
+    const sy = (rect.height - margin * 2) / h;
+    const z = Math.max(0.2, Math.min(2, Math.min(sx, sy)));
+    view.zoom = z;
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
+    view.panX = rect.width  / 2 - cx * z;
+    view.panY = rect.height / 2 - cy * z;
   }
-  const w = Math.max(1, maxX - minX);
-  const h = Math.max(1, maxY - minY);
-  const margin = 60;
-  const sx = (rect.width  - margin * 2) / w;
-  const sy = (rect.height - margin * 2) / h;
-  const z = Math.max(0.2, Math.min(2, Math.min(sx, sy)));
-  view.zoom = z;
-  // Pan so the bbox center lands at the canvas center.
-  const cx = (minX + maxX) / 2;
-  const cy = (minY + maxY) / 2;
-  view.panX = rect.width  / 2 - cx * z;
-  view.panY = rect.height / 2 - cy * z;
   if (typeof render === "function") render();
 }
 

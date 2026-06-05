@@ -10315,6 +10315,181 @@ function isRuntimeOnlyKind(k) {
   return typeof k === "string" && RUNTIME_ONLY_KINDS.has(k);
 }
 /* =========================================================================
+ * Spatial board primitives
+ *
+ * Phase C sprint tektite-10a -- foundation for the upcoming Path A
+ * unification. Extracted from the main canvas (view.panX/panY/zoom)
+ * + Tektite Canvas pan/zoom + Tektite Graph viewport so the eventual
+ * TextCard / NoteCard / LinkCard / BaseCard / GraphCard node kinds
+ * can sit on a single board abstraction.
+ *
+ * The factory returns a board controller with:
+ *   - pan/zoom state with clamping
+ *   - screen <-> world coord transforms
+ *   - cursor-anchored zoom (mouse wheel UX)
+ *   - fit-to-bounds (used by ⊕ Fit + the Canvas modal's same-named button)
+ *   - reset
+ *   - CSS-transform applier for DOM-backed boards (Tektite Canvas);
+ *     numeric-state-only boards (main canvas, which has its own
+ *     SVG + DOM rendering) can read the numbers and apply themselves.
+ *
+ * The intent is callsite-flexibility: hand the controller a viewport
+ * rect (from getBoundingClientRect) at each operation rather than
+ * stash a DOM reference inside.  Lets the same primitive serve both
+ * the main canvas (uses `canvas` element) and the Tektite Canvas
+ * (uses `.tektite-canvas-board`) without binding to either.
+ *
+ * Sprint 10b: TextCard / NoteCard / LinkCard node kinds reuse this.
+ * Sprint 10c: BaseView + GraphView node kinds reuse this.
+ *
+ * Existing code that uses `view.panX / view.panY / view.zoom`
+ * directly (src/core/state-decl.js + handlers throughout) stays as
+ * the read-write source of truth for the main canvas in this sprint;
+ * it can be refactored to construct one of these controllers in 10b
+ * if we want, but that's not blocking.
+ * ======================================================================== */
+
+function createSpatialBoard(opts) {
+  opts = opts || {};
+  const state = {
+    panX:    Number.isFinite(opts.initialPanX) ? opts.initialPanX : 0,
+    panY:    Number.isFinite(opts.initialPanY) ? opts.initialPanY : 0,
+    zoom:    Number.isFinite(opts.initialZoom) ? opts.initialZoom : 1,
+    minZoom: Number.isFinite(opts.minZoom)     ? opts.minZoom     : 0.1,
+    maxZoom: Number.isFinite(opts.maxZoom)     ? opts.maxZoom     : 8,
+    // Whether worldOriginAtCenter is true: world (0,0) maps to the
+    // viewport center when pan=0.  When false, world (0,0) maps to
+    // the viewport top-left.  Main canvas uses top-left; Tektite
+    // Canvas + graph view use center origin.
+    originAtCenter: opts.originAtCenter !== false
+  };
+
+  function _clampZoom(z) {
+    return Math.max(state.minZoom, Math.min(state.maxZoom, z));
+  }
+
+  return {
+    getPanX:  () => state.panX,
+    getPanY:  () => state.panY,
+    getZoom:  () => state.zoom,
+    setPan:   (x, y) => { state.panX = x; state.panY = y; },
+    setZoom:  (z) => { state.zoom = _clampZoom(z); },
+    setMinMax:(min, max) => { state.minZoom = min; state.maxZoom = max; },
+
+    /* Screen -> world. `rect` is a DOMRect-shape ({ left, top, width,
+     * height }) from getBoundingClientRect on the board element. */
+    screenToWorld(sx, sy, rect) {
+      const cx = sx - rect.left;
+      const cy = sy - rect.top;
+      const ox = state.originAtCenter ? rect.width  / 2 : 0;
+      const oy = state.originAtCenter ? rect.height / 2 : 0;
+      return {
+        x: (cx - ox - state.panX) / state.zoom,
+        y: (cy - oy - state.panY) / state.zoom
+      };
+    },
+    /* World -> screen. */
+    worldToScreen(wx, wy, rect) {
+      const ox = state.originAtCenter ? rect.width  / 2 : 0;
+      const oy = state.originAtCenter ? rect.height / 2 : 0;
+      return {
+        x: rect.left + ox + state.panX + wx * state.zoom,
+        y: rect.top  + oy + state.panY + wy * state.zoom
+      };
+    },
+
+    /* Incremental pan -- accumulate dx/dy in screen pixels. */
+    panBy(dx, dy) { state.panX += dx; state.panY += dy; },
+
+    /* Cursor-anchored zoom -- the world point under (sx, sy) stays
+     * pinned across the zoom step. `factor` > 1 zooms in. */
+    zoomAt(sx, sy, rect, factor) {
+      const ox = state.originAtCenter ? rect.width  / 2 : 0;
+      const oy = state.originAtCenter ? rect.height / 2 : 0;
+      const cx = sx - rect.left - ox;
+      const cy = sy - rect.top  - oy;
+      const wx = (cx - state.panX) / state.zoom;
+      const wy = (cy - state.panY) / state.zoom;
+      state.zoom = _clampZoom(state.zoom * factor);
+      state.panX = cx - wx * state.zoom;
+      state.panY = cy - wy * state.zoom;
+    },
+
+    /* Standard mouse-wheel handler.  Translates delta to a zoom
+     * factor + applies cursor-anchored zoom.  Pass it the event +
+     * viewport rect at call time.  Returns nothing -- caller
+     * triggers their own re-render. */
+    wheelZoom(e, rect, sensitivity) {
+      const sens = (typeof sensitivity === "number") ? sensitivity : 0.0015;
+      const factor = Math.exp(-e.deltaY * sens);
+      this.zoomAt(e.clientX, e.clientY, rect, factor);
+    },
+
+    /* Fit a world-space bounding box ({minX, maxX, minY, maxY}) into
+     * the viewport with `margin` pixels of padding.  Centers the bbox.
+     * Returns nothing; caller re-renders. */
+    fitToBounds(bounds, viewportW, viewportH, margin) {
+      if (!bounds || !Number.isFinite(bounds.minX)) { this.reset(); return; }
+      const m = Number.isFinite(margin) ? margin : 60;
+      const w = Math.max(1, bounds.maxX - bounds.minX);
+      const h = Math.max(1, bounds.maxY - bounds.minY);
+      const sx = (viewportW - m * 2) / w;
+      const sy = (viewportH - m * 2) / h;
+      state.zoom = _clampZoom(Math.min(sx, sy));
+      const cx = (bounds.minX + bounds.maxX) / 2;
+      const cy = (bounds.minY + bounds.maxY) / 2;
+      if (state.originAtCenter) {
+        state.panX = -cx * state.zoom;
+        state.panY = -cy * state.zoom;
+      } else {
+        state.panX = viewportW / 2 - cx * state.zoom;
+        state.panY = viewportH / 2 - cy * state.zoom;
+      }
+    },
+
+    /* Pan + zoom to identity. */
+    reset() { state.panX = 0; state.panY = 0; state.zoom = 1; },
+
+    /* CSS-transform applier for DOM-backed boards. */
+    applyCssTransform(el) {
+      if (!el) return;
+      el.style.transform =
+        "translate(" + state.panX + "px, " + state.panY + "px) scale(" + state.zoom + ")";
+    },
+
+    /* Read the current state as a plain object -- useful for
+     * persistence / debugging. */
+    snapshot() { return { panX: state.panX, panY: state.panY, zoom: state.zoom }; },
+    restore(snap) {
+      if (snap && Number.isFinite(snap.panX)) state.panX = snap.panX;
+      if (snap && Number.isFinite(snap.panY)) state.panY = snap.panY;
+      if (snap && Number.isFinite(snap.zoom)) state.zoom = _clampZoom(snap.zoom);
+    }
+  };
+}
+
+/* Helper: compute the world-space bounding box of an array of node
+ * objects with { x, y, width?, height? } fields.  Used by fit-to-view
+ * across the main canvas, Tektite Canvas, and (after sprint 10c) the
+ * unified spatial node kinds. */
+function spatialBoundsForNodes(nodes, defaultW, defaultH) {
+  if (!Array.isArray(nodes) || !nodes.length) return null;
+  const dw = Number.isFinite(defaultW) ? defaultW : 200;
+  const dh = Number.isFinite(defaultH) ? defaultH : 140;
+  let minX =  Infinity, maxX = -Infinity;
+  let minY =  Infinity, maxY = -Infinity;
+  for (const n of nodes) {
+    const x = +n.x || 0, y = +n.y || 0;
+    const w = +n.width  || dw;
+    const h = +n.height || dh;
+    if (x < minX) minX = x;
+    if (y < minY) minY = y;
+    if (x + w > maxX) maxX = x + w;
+    if (y + h > maxY) maxY = y + h;
+  }
+  return Number.isFinite(minX) ? { minX, maxX, minY, maxY } : null;
+}
+/* =========================================================================
  * Node type registry — covers ~55 Gamma DSP classes
  *
  * Per-entry fields:
@@ -63031,18 +63206,23 @@ const _tektiteCanvasState = {
   currentId:   null,
   doc:         null,
   selectedId:  null,
-  panX:        0,
-  panY:        0,
-  zoom:        1,
+  // Sprint tektite-10a -- pan/zoom delegated to a SpatialBoard
+  // controller (src/core/spatial-board.js). Cards live in world
+  // coords; applyCssTransform maps them to screen.
+  board:       (typeof createSpatialBoard === "function")
+                  ? createSpatialBoard({ minZoom: 0.2, maxZoom: 4, originAtCenter: true })
+                  : null,
   saveTimer:   null,
-  pointerMode: null,  // null | "pan" | "drag-card" | "resize-card"
+  pointerMode: null,
   dragId:      null,
   dragStartX:  0,
   dragStartY:  0,
   dragOrigX:   0,
   dragOrigY:   0,
   dragOrigW:   0,
-  dragOrigH:   0
+  dragOrigH:   0,
+  dragOrigPanX: 0,
+  dragOrigPanY: 0
 };
 
 async function _tektiteCanvasOpen() {
@@ -63100,21 +63280,22 @@ function _tektiteCanvasAttach() {
 function _tektiteCanvasWireBoardPointer() {
   const s = _tektiteCanvasState;
   s.boardEl.addEventListener("pointerdown", (e) => {
-    // Cards have their own handlers; only react to clicks on the
-    // board background.
     if (e.target !== s.boardEl) return;
     s.pointerMode = "pan";
     s.dragStartX = e.clientX;
     s.dragStartY = e.clientY;
-    s.dragOrigX  = s.panX;
-    s.dragOrigY  = s.panY;
+    // Sprint tektite-10a -- pan origin tracked via the board.
+    s.dragOrigPanX = s.board ? s.board.getPanX() : s.panX;
+    s.dragOrigPanY = s.board ? s.board.getPanY() : s.panY;
     s.boardEl.setPointerCapture(e.pointerId);
     _tektiteCanvasSelectCard(null);
   });
   s.boardEl.addEventListener("pointermove", (e) => {
     if (s.pointerMode === "pan") {
-      s.panX = s.dragOrigX + (e.clientX - s.dragStartX);
-      s.panY = s.dragOrigY + (e.clientY - s.dragStartY);
+      const nx = s.dragOrigPanX + (e.clientX - s.dragStartX);
+      const ny = s.dragOrigPanY + (e.clientY - s.dragStartY);
+      if (s.board) s.board.setPan(nx, ny);
+      _tektiteCanvasSyncFromBoard();
       _tektiteCanvasApplyTransform();
     }
   });
@@ -63126,27 +63307,36 @@ function _tektiteCanvasWireBoardPointer() {
   });
   s.boardEl.addEventListener("wheel", (e) => {
     e.preventDefault();
+    if (!s.board) return;
     const rect = s.boardEl.getBoundingClientRect();
-    const cx = e.clientX - rect.left;
-    const cy = e.clientY - rect.top;
-    const factor = Math.exp(-e.deltaY * 0.0015);
-    const newZoom = Math.max(0.2, Math.min(4, s.zoom * factor));
-    // Zoom toward cursor: keep the world-space point under the
-    // cursor fixed in screen space.
-    const wx = (cx - rect.width  / 2 - s.panX) / s.zoom;
-    const wy = (cy - rect.height / 2 - s.panY) / s.zoom;
-    s.zoom = newZoom;
-    s.panX = cx - rect.width  / 2 - wx * s.zoom;
-    s.panY = cy - rect.height / 2 - wy * s.zoom;
+    s.board.wheelZoom(e, rect);
+    _tektiteCanvasSyncFromBoard();
     _tektiteCanvasApplyTransform();
   }, { passive: false });
+}
+
+/* Sprint tektite-10a -- mirror the SpatialBoard's state back onto
+ * the legacy s.panX / s.panY / s.zoom fields so the rest of the
+ * Canvas code (edges, card-spawn positions, etc.) keeps working
+ * unchanged. Once card-drag math is migrated in sprint 10b we can
+ * drop the mirror. */
+function _tektiteCanvasSyncFromBoard() {
+  const s = _tektiteCanvasState;
+  if (!s.board) return;
+  s.panX = s.board.getPanX();
+  s.panY = s.board.getPanY();
+  s.zoom = s.board.getZoom();
 }
 
 function _tektiteCanvasApplyTransform() {
   const s = _tektiteCanvasState;
   if (!s.cardsEl) return;
-  s.cardsEl.style.transform =
-    "translate(" + s.panX + "px, " + s.panY + "px) scale(" + s.zoom + ")";
+  if (s.board) {
+    s.board.applyCssTransform(s.cardsEl);
+  } else {
+    s.cardsEl.style.transform =
+      "translate(" + s.panX + "px, " + s.panY + "px) scale(" + s.zoom + ")";
+  }
   _tektiteCanvasRenderEdges();
 }
 
@@ -63491,30 +63681,22 @@ async function _tektiteCanvasAddFileCard() {
 
 function _tektiteCanvasFitToView() {
   const s = _tektiteCanvasState;
-  if (!s.doc || !s.doc.nodes.length || !s.boardEl) {
-    s.panX = 0; s.panY = 0; s.zoom = 1;
-    _tektiteCanvasApplyTransform();
-    return;
-  }
-  // World-space bounding box of every node.
-  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-  for (const n of s.doc.nodes) {
-    minX = Math.min(minX, n.x);
-    maxX = Math.max(maxX, n.x + (n.width  | 0));
-    minY = Math.min(minY, n.y);
-    maxY = Math.max(maxY, n.y + (n.height | 0));
-  }
-  const w = maxX - minX, h = maxY - minY;
+  if (!s.doc || !s.boardEl) return;
+  // Sprint tektite-10a -- delegate to the SpatialBoard primitive.
+  // spatialBoundsForNodes handles the bbox; board.fitToBounds picks
+  // zoom/pan to frame it with a 80 px margin.
   const rect = s.boardEl.getBoundingClientRect();
-  const margin = 80;
-  const sx = (rect.width  - margin * 2) / Math.max(1, w);
-  const sy = (rect.height - margin * 2) / Math.max(1, h);
-  s.zoom = Math.max(0.2, Math.min(2, Math.min(sx, sy)));
-  // Pan so the bbox center lands at viewport center.
-  const cx = (minX + maxX) / 2;
-  const cy = (minY + maxY) / 2;
-  s.panX = -cx * s.zoom;
-  s.panY = -cy * s.zoom;
+  const bounds = (typeof spatialBoundsForNodes === "function")
+    ? spatialBoundsForNodes(s.doc.nodes, 0, 0)
+    : null;
+  if (!s.board) {
+    s.panX = 0; s.panY = 0; s.zoom = 1;
+  } else if (!bounds) {
+    s.board.reset();
+  } else {
+    s.board.fitToBounds(bounds, rect.width, rect.height, 80);
+  }
+  _tektiteCanvasSyncFromBoard();
   _tektiteCanvasApplyTransform();
 }
 
@@ -64908,28 +65090,45 @@ function _gnFitCanvasToView() {
     if (typeof render === "function") render();
     return;
   }
-  let minX =  Infinity, maxX = -Infinity;
-  let minY =  Infinity, maxY = -Infinity;
-  const APPROX_W = 200, APPROX_H = 140;
-  for (const n of subset) {
-    const x = +n.x || 0, y = +n.y || 0;
-    if (x < minX) minX = x;
-    if (y < minY) minY = y;
-    if (x + APPROX_W > maxX) maxX = x + APPROX_W;
-    if (y + APPROX_H > maxY) maxY = y + APPROX_H;
+  // Sprint tektite-10a -- delegate the math to the shared primitive.
+  // Main canvas uses a top-left world origin (view.panX/Y are offset
+  // from {0,0} = canvas top-left), so we construct a board in that
+  // mode just for this operation. We can't replace `view` wholesale
+  // yet -- too many handlers read view.panX/Y/zoom directly --
+  // but we get the consistent fit semantics + the same clamping.
+  const bounds = (typeof spatialBoundsForNodes === "function")
+    ? spatialBoundsForNodes(subset, 200, 140)
+    : null;
+  if (typeof createSpatialBoard === "function" && bounds) {
+    const board = createSpatialBoard({ minZoom: 0.2, maxZoom: 2, originAtCenter: false });
+    board.fitToBounds(bounds, rect.width, rect.height, 60);
+    view.panX = board.getPanX();
+    view.panY = board.getPanY();
+    view.zoom = board.getZoom();
+  } else {
+    // Fallback to inline math if the primitive isn't loaded.
+    let minX =  Infinity, maxX = -Infinity;
+    let minY =  Infinity, maxY = -Infinity;
+    const APPROX_W = 200, APPROX_H = 140;
+    for (const n of subset) {
+      const x = +n.x || 0, y = +n.y || 0;
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (x + APPROX_W > maxX) maxX = x + APPROX_W;
+      if (y + APPROX_H > maxY) maxY = y + APPROX_H;
+    }
+    const w = Math.max(1, maxX - minX);
+    const h = Math.max(1, maxY - minY);
+    const margin = 60;
+    const sx = (rect.width  - margin * 2) / w;
+    const sy = (rect.height - margin * 2) / h;
+    const z = Math.max(0.2, Math.min(2, Math.min(sx, sy)));
+    view.zoom = z;
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
+    view.panX = rect.width  / 2 - cx * z;
+    view.panY = rect.height / 2 - cy * z;
   }
-  const w = Math.max(1, maxX - minX);
-  const h = Math.max(1, maxY - minY);
-  const margin = 60;
-  const sx = (rect.width  - margin * 2) / w;
-  const sy = (rect.height - margin * 2) / h;
-  const z = Math.max(0.2, Math.min(2, Math.min(sx, sy)));
-  view.zoom = z;
-  // Pan so the bbox center lands at the canvas center.
-  const cx = (minX + maxX) / 2;
-  const cy = (minY + maxY) / 2;
-  view.panX = rect.width  / 2 - cx * z;
-  view.panY = rect.height / 2 - cy * z;
   if (typeof render === "function") render();
 }
 

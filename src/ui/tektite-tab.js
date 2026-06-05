@@ -411,18 +411,23 @@ const _tektiteCanvasState = {
   currentId:   null,
   doc:         null,
   selectedId:  null,
-  panX:        0,
-  panY:        0,
-  zoom:        1,
+  // Sprint tektite-10a -- pan/zoom delegated to a SpatialBoard
+  // controller (src/core/spatial-board.js). Cards live in world
+  // coords; applyCssTransform maps them to screen.
+  board:       (typeof createSpatialBoard === "function")
+                  ? createSpatialBoard({ minZoom: 0.2, maxZoom: 4, originAtCenter: true })
+                  : null,
   saveTimer:   null,
-  pointerMode: null,  // null | "pan" | "drag-card" | "resize-card"
+  pointerMode: null,
   dragId:      null,
   dragStartX:  0,
   dragStartY:  0,
   dragOrigX:   0,
   dragOrigY:   0,
   dragOrigW:   0,
-  dragOrigH:   0
+  dragOrigH:   0,
+  dragOrigPanX: 0,
+  dragOrigPanY: 0
 };
 
 async function _tektiteCanvasOpen() {
@@ -480,21 +485,22 @@ function _tektiteCanvasAttach() {
 function _tektiteCanvasWireBoardPointer() {
   const s = _tektiteCanvasState;
   s.boardEl.addEventListener("pointerdown", (e) => {
-    // Cards have their own handlers; only react to clicks on the
-    // board background.
     if (e.target !== s.boardEl) return;
     s.pointerMode = "pan";
     s.dragStartX = e.clientX;
     s.dragStartY = e.clientY;
-    s.dragOrigX  = s.panX;
-    s.dragOrigY  = s.panY;
+    // Sprint tektite-10a -- pan origin tracked via the board.
+    s.dragOrigPanX = s.board ? s.board.getPanX() : s.panX;
+    s.dragOrigPanY = s.board ? s.board.getPanY() : s.panY;
     s.boardEl.setPointerCapture(e.pointerId);
     _tektiteCanvasSelectCard(null);
   });
   s.boardEl.addEventListener("pointermove", (e) => {
     if (s.pointerMode === "pan") {
-      s.panX = s.dragOrigX + (e.clientX - s.dragStartX);
-      s.panY = s.dragOrigY + (e.clientY - s.dragStartY);
+      const nx = s.dragOrigPanX + (e.clientX - s.dragStartX);
+      const ny = s.dragOrigPanY + (e.clientY - s.dragStartY);
+      if (s.board) s.board.setPan(nx, ny);
+      _tektiteCanvasSyncFromBoard();
       _tektiteCanvasApplyTransform();
     }
   });
@@ -506,27 +512,36 @@ function _tektiteCanvasWireBoardPointer() {
   });
   s.boardEl.addEventListener("wheel", (e) => {
     e.preventDefault();
+    if (!s.board) return;
     const rect = s.boardEl.getBoundingClientRect();
-    const cx = e.clientX - rect.left;
-    const cy = e.clientY - rect.top;
-    const factor = Math.exp(-e.deltaY * 0.0015);
-    const newZoom = Math.max(0.2, Math.min(4, s.zoom * factor));
-    // Zoom toward cursor: keep the world-space point under the
-    // cursor fixed in screen space.
-    const wx = (cx - rect.width  / 2 - s.panX) / s.zoom;
-    const wy = (cy - rect.height / 2 - s.panY) / s.zoom;
-    s.zoom = newZoom;
-    s.panX = cx - rect.width  / 2 - wx * s.zoom;
-    s.panY = cy - rect.height / 2 - wy * s.zoom;
+    s.board.wheelZoom(e, rect);
+    _tektiteCanvasSyncFromBoard();
     _tektiteCanvasApplyTransform();
   }, { passive: false });
+}
+
+/* Sprint tektite-10a -- mirror the SpatialBoard's state back onto
+ * the legacy s.panX / s.panY / s.zoom fields so the rest of the
+ * Canvas code (edges, card-spawn positions, etc.) keeps working
+ * unchanged. Once card-drag math is migrated in sprint 10b we can
+ * drop the mirror. */
+function _tektiteCanvasSyncFromBoard() {
+  const s = _tektiteCanvasState;
+  if (!s.board) return;
+  s.panX = s.board.getPanX();
+  s.panY = s.board.getPanY();
+  s.zoom = s.board.getZoom();
 }
 
 function _tektiteCanvasApplyTransform() {
   const s = _tektiteCanvasState;
   if (!s.cardsEl) return;
-  s.cardsEl.style.transform =
-    "translate(" + s.panX + "px, " + s.panY + "px) scale(" + s.zoom + ")";
+  if (s.board) {
+    s.board.applyCssTransform(s.cardsEl);
+  } else {
+    s.cardsEl.style.transform =
+      "translate(" + s.panX + "px, " + s.panY + "px) scale(" + s.zoom + ")";
+  }
   _tektiteCanvasRenderEdges();
 }
 
@@ -871,30 +886,22 @@ async function _tektiteCanvasAddFileCard() {
 
 function _tektiteCanvasFitToView() {
   const s = _tektiteCanvasState;
-  if (!s.doc || !s.doc.nodes.length || !s.boardEl) {
-    s.panX = 0; s.panY = 0; s.zoom = 1;
-    _tektiteCanvasApplyTransform();
-    return;
-  }
-  // World-space bounding box of every node.
-  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-  for (const n of s.doc.nodes) {
-    minX = Math.min(minX, n.x);
-    maxX = Math.max(maxX, n.x + (n.width  | 0));
-    minY = Math.min(minY, n.y);
-    maxY = Math.max(maxY, n.y + (n.height | 0));
-  }
-  const w = maxX - minX, h = maxY - minY;
+  if (!s.doc || !s.boardEl) return;
+  // Sprint tektite-10a -- delegate to the SpatialBoard primitive.
+  // spatialBoundsForNodes handles the bbox; board.fitToBounds picks
+  // zoom/pan to frame it with a 80 px margin.
   const rect = s.boardEl.getBoundingClientRect();
-  const margin = 80;
-  const sx = (rect.width  - margin * 2) / Math.max(1, w);
-  const sy = (rect.height - margin * 2) / Math.max(1, h);
-  s.zoom = Math.max(0.2, Math.min(2, Math.min(sx, sy)));
-  // Pan so the bbox center lands at viewport center.
-  const cx = (minX + maxX) / 2;
-  const cy = (minY + maxY) / 2;
-  s.panX = -cx * s.zoom;
-  s.panY = -cy * s.zoom;
+  const bounds = (typeof spatialBoundsForNodes === "function")
+    ? spatialBoundsForNodes(s.doc.nodes, 0, 0)
+    : null;
+  if (!s.board) {
+    s.panX = 0; s.panY = 0; s.zoom = 1;
+  } else if (!bounds) {
+    s.board.reset();
+  } else {
+    s.board.fitToBounds(bounds, rect.width, rect.height, 80);
+  }
+  _tektiteCanvasSyncFromBoard();
   _tektiteCanvasApplyTransform();
 }
 
