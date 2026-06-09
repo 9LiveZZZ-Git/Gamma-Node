@@ -200,7 +200,10 @@ function renderProps() {
       `<datalist id="${datalistId}">${datalistOpts}</datalist>` +
       `</div>`;
   }
-  const keys = Object.keys(node.params);
+  // Phase C §7.4 -- the node-note attachment lives in node.params under
+  // NODE_NOTE_PARAM_KEYS but is presented in its own "Documentation"
+  // section below, not as raw editable param rows.
+  const keys = Object.keys(node.params).filter(k => !NODE_NOTE_PARAM_KEYS.includes(k));
   const gateIns = def.ins.filter(p => p.t === "gate");
 
   if (!keys.length && !gateIns.length) {
@@ -682,6 +685,36 @@ function renderProps() {
                Chrome / Edge on Windows show a "Share audio" checkbox when sharing a <em>tab</em> or <em>window</em>. Full-screen shares typically can't capture audio. Toggling the request flag mid-share has no effect — re-pick to apply.
              </div>`;
   }
+  // Phase C §7.4 -- Documentation: link a Tektite vault note to this node.
+  // Its markdown is emitted as a /** */ doc comment above the node's
+  // generated member (see codegen) and travels inside the .gpatch.
+  {
+    const _docNote = nodeAttachedNote(node);
+    html += `<div class="prop-section">Documentation</div>`;
+    if (_docNote) {
+      const _preview = _docNote.body.replace(/\s+/g, " ").trim();
+      html += `<div class="prop-grid" style="grid-template-columns:1fr;">
+        <div style="display:flex;align-items:baseline;gap:8px;padding:6px 8px;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;">
+          <span style="font-size:12px;color:var(--text);font-weight:500;">📝 ${escapeText(_docNote.title)}</span>
+          <span style="font-size:10px;color:var(--text-2);font-family:var(--font-mono);margin-left:auto;">${escapeText(_docNote.id)}</span>
+        </div>
+        ${_preview
+          ? `<div class="prop-inline" style="opacity:.7;font-size:10.5px;line-height:1.45;max-height:48px;overflow:hidden;">${escapeText(_preview.slice(0, 160))}${_preview.length > 160 ? "…" : ""}</div>`
+          : `<div class="prop-inline" style="opacity:.55;">(empty note)</div>`}
+        <div style="display:flex;gap:6px;">
+          <button class="btn" id="btn-node-note-open" style="flex:1;" title="Open this note in a Tektite editor popout">Open</button>
+          <button class="btn" id="btn-node-note-refresh" style="flex:1;" title="Re-pull the latest note text from the vault">Refresh</button>
+          <button class="btn" id="btn-node-note-detach" title="Detach the note (the vault note itself is kept)">Detach</button>
+        </div>
+        <div class="prop-inline" style="opacity:.5;font-size:9.5px;">Emitted as a <code>/** */</code> doc comment above this node's generated member; travels in the .gpatch.</div>
+      </div>`;
+    } else {
+      html += `<div class="prop-grid" style="grid-template-columns:1fr;">
+        <button class="btn primary" id="btn-node-note-attach" style="width:100%;">📝 Attach note…</button>
+        <div class="prop-inline" style="opacity:.5;font-size:9.5px;">Link a Tektite vault note as this node's documentation. Becomes a <code>/** */</code> doc comment in generated C++.</div>
+      </div>`;
+    }
+  }
   propsEl.innerHTML = html;
 
   // Phase 8.A.2-ui -- stage input. Blur or Enter commits; trims
@@ -904,6 +937,16 @@ function renderProps() {
   // v0.3.28 — ColorCurves: per-channel 16-point LUT editor.
   const openCcBtn = propsEl.querySelector('#btn-open-colorcurves');
   if (openCcBtn) openCcBtn.addEventListener('click', () => openColorCurvesModal(node.id));
+
+  // Phase C §7.4 -- node-note-attach (Documentation section) wiring.
+  const _nnAttach = propsEl.querySelector('#btn-node-note-attach');
+  if (_nnAttach) _nnAttach.addEventListener('click', () => openAttachNoteModal(node.id));
+  const _nnOpen = propsEl.querySelector('#btn-node-note-open');
+  if (_nnOpen) _nnOpen.addEventListener('click', () => _nodeNoteOpenInTektite(node.id));
+  const _nnRefresh = propsEl.querySelector('#btn-node-note-refresh');
+  if (_nnRefresh) _nnRefresh.addEventListener('click', () => { _nodeNoteRefresh(node.id); });
+  const _nnDetach = propsEl.querySelector('#btn-node-note-detach');
+  if (_nnDetach) _nnDetach.addEventListener('click', () => _nodeNoteDetach(node.id));
 
   // Sample-host action buttons — load opens a file picker, open
   // launches the waveform editor modal, clear detaches the asset
