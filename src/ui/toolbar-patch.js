@@ -118,6 +118,11 @@ function _applyLoadedPatch(loaded, filename) {
     Visual.theaterCam.pos[2] = state.rig.sweetSpot[2];
   }
   render();
+  // Phase C §5.4 -- offer to import any attached-note snapshots this patch
+  // carries that aren't yet in the local Tektite vault (async, opt-in).
+  if (typeof tektiteRehydrateNotesFromPatch === "function") {
+    try { tektiteRehydrateNotesFromPatch(state.nodes); } catch (_) {}
+  }
 }
 
 document.getElementById("file-input").addEventListener("change", ev => {
