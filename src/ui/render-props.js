@@ -202,8 +202,11 @@ function renderProps() {
   }
   // Phase C §7.4 -- the node-note attachment lives in node.params under
   // NODE_NOTE_PARAM_KEYS but is presented in its own "Documentation"
-  // section below, not as raw editable param rows.
-  const keys = Object.keys(node.params).filter(k => !NODE_NOTE_PARAM_KEYS.includes(k));
+  // section below, not as raw editable param rows. def.hiddenParams (e.g.
+  // NotesCorpus.corpus) are runtime-computed values, never shown as rows.
+  const _hiddenParams = Array.isArray(def.hiddenParams) ? def.hiddenParams : [];
+  const keys = Object.keys(node.params).filter(k =>
+    !NODE_NOTE_PARAM_KEYS.includes(k) && !_hiddenParams.includes(k));
   const gateIns = def.ins.filter(p => p.t === "gate");
 
   if (!keys.length && !gateIns.length) {

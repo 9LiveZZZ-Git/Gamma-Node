@@ -785,6 +785,12 @@ function _tickLLMRuntime(dtSec) {
     if (!def) continue;
     n.params = n.params || {};
 
+    // Phase C §7.1 -- NotesCorpus streams the Tektite vault as text.
+    if (def.kind === "notes-source") {
+      if (n.type === "NotesCorpus" && typeof _tickNotesCorpus === "function") _tickNotesCorpus(n);
+      continue;
+    }
+
     if (def.kind === "llm-op") {
       // Sprint B.6 -- ConversationMemory + EmbedSimilarity run per
       // tick. SystemPrompt + LLMModelPicker are pure passthroughs --

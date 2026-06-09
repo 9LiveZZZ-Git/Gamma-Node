@@ -20140,6 +20140,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     params: { text: "You are a helpful assistant." },
     description: "Static system-prompt source. Type the prompt into the `text` param; downstream LLMChat / LLMGenerate nodes consume it via their `system` input. Pure passthrough (no runtime call) — just a string source on the wire."
   },
+  NotesCorpus: {
+    category: "Notes", color: COLOR.ai, header: null,
+    cppType: "", kind: "notes-source",
+    ins: [{ n: "refresh", t: "gate" }],
+    outs: [{ n: "corpus", t: "text" }],
+    params: { include: "", exclude: "", format: "concat", maxChars: 0, corpus: "", corpusNotes: 0, corpusChars: 0 },
+    paramOptions: { format: ["concat", "chunks"] },
+    hiddenParams: ["corpus"],
+    description: "Phase C §7.1 — streams your Tektite vault as a text corpus. Filter with `include` / `exclude` (terms: #tag, folder/, or plain substring; comma- or space-separated; include is OR, exclude always wins). Outputs `corpus` text — wire into LLMEmbed / LLMChat to embed or chat over your own notes, or (Phase D) into DatasetLoader to train a model on them. Pulse `refresh` to re-scan the vault; corpusNotes / corpusChars report the last scan."
+  },
   LLMModelPicker: {
     category: "AI/LLM", color: COLOR.ai, header: null,
     cppType: "", kind: "llm-op",
