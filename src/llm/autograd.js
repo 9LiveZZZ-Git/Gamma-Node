@@ -784,6 +784,13 @@ async function llmagGradCheck() {
   await checkOp("sdpa(causal)",
     () => ({ Q: g([1, 2, 5, 4]), K: g([1, 2, 5, 4]), V: g([1, 2, 5, 4]) }),
     (t, plain) => (plain ? LLMRT : LLMAG).sdpa(t.Q, t.K, t.V, { causal: true }), ["Q", "K", "V"], 24);
+  // llm-4's broadcast row-add (registered from layers.js, loaded after
+  // this file -- guard for partial builds).
+  if (typeof LLMAG.addRows === "function") {
+    await checkOp("addRows",
+      () => ({ X: g([3, 4, 5]), table: g([4, 5]) }),
+      (t, plain) => (plain ? LLMRT : LLMAG).addRows(t.X, t.table), ["X", "table"]);
+  }
 
   const ok = results.every(r => r.ok);
   console.log(ok ? "LLMAG: gradCheck OK for all " + results.length + " ops" : "LLMAG: gradCheck FAILURES present");

@@ -20477,5 +20477,60 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     },
     uiOnlyParams: ["epoch", "step", "batchShape"],
     description: "Slices token-id streams into training batches. Reads the `ids` vector (wire Tokenizer.ids), emits `batch` [batchSize, seqLen] and `targets` (the same windows shifted +1) as vectors. The first batch builds as soon as ids arrive; each `next` pulse advances the read cursor by batchSize×stride (stride 0 = seqLen, i.e. non-overlapping windows). `epoch` increments when the cursor wraps the corpus; `step` counts batches served. TrainStep (llm-7) pulses `next` once per optimization step."
+  },
+
+  /* ============================================================
+   * Phase D sprint llm-4 -- embedding nodes (spec §6.3
+   * "Embeddings"). First GPU-tensor nodes: outputs are LLMTensors
+   * living in runtime state; the wire carries a {shape, gpuVer}
+   * stub (see src/llm/layer-nodes.js header). Trainable weights
+   * flow through the llm-2 autograd tape once TrainStep (llm-7)
+   * starts recording.
+   * ============================================================ */
+  TokenEmbedding: {
+    category: "AI/Model", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-op",
+    ins: [{ n: "ids", t: "vector" }],
+    outs: [
+      { n: "emb",     t: "vector" },
+      { n: "weights", t: "vector" }
+    ],
+    params: {
+      vocabSize: 0,
+      dModel:    64,
+      status:    ""
+    },
+    uiOnlyParams: ["status"],
+    description: "Trainable token-embedding lookup: [B,T] ids → [B,T,dModel] activations on the GPU (llm-1 embedding_gather, recorded on the llm-2 tape). `vocabSize` 0 auto-detects from the upstream tokenizer's wire metadata. The table initializes N(0, 0.02), deterministic per (vocabSize, dModel). `weights` exposes the live table — wire into EmbeddingProjection (llm-9) or a tied OutputProjection (llm-7)."
+  },
+  PositionalEncoding: {
+    category: "AI/Model", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-op",
+    ins: [{ n: "x", t: "vector" }],
+    outs: [
+      { n: "y",       t: "vector" },
+      { n: "weights", t: "vector" }
+    ],
+    params: {
+      mode:   "sinusoidal",
+      maxLen: 128,
+      theta:  10000,
+      status: ""
+    },
+    uiOnlyParams: ["status"],
+    description: "Positional information for the embedding stream. `mode` = 'sinusoidal' (classic Vaswani sin/cos table, no parameters) or 'learned' (trainable [maxLen, dModel] table, N(0,0.02) init, exposed on `weights` like TokenEmbedding's) — both broadcast-add over the batch. 'rope' and 'alibi' are NOT additive (RoPE rotates Q/K, ALiBi biases attention scores), so those modes pass the stream through and tag the wire; MultiHeadAttention (llm-5) applies them where they mathematically belong. `theta` is the RoPE base. `weights` is live only in learned mode."
+  },
+  EmbeddingDropout: {
+    category: "AI/Model", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-op",
+    ins: [{ n: "x", t: "vector" }],
+    outs: [{ n: "y", t: "vector" }],
+    params: {
+      rate:     0.1,
+      training: 0,
+      status:   ""
+    },
+    uiOnlyParams: ["status"],
+    description: "Inverted dropout on the embedding stream: while `training` ≥ 0.5, zeroes each element with probability `rate` and scales survivors by 1/(1-rate); a fresh mask is sampled per batch step and the backward pass flows through the same mask via the tape. With training 0 (or rate 0) it is an exact passthrough. TrainStep (llm-7) drives `training` automatically; until then toggle it by hand to inspect the masking."
   }
 };

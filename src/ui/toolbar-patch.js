@@ -117,6 +117,11 @@ function _applyLoadedPatch(loaded, filename) {
     Visual.theaterCam.pos[1] = state.rig.sweetSpot[1];
     Visual.theaterCam.pos[2] = state.rig.sweetSpot[2];
   }
+  // Phase D llm-4 -- drop all LLM runtime states (and their GPU tensors)
+  // so the loaded patch never inherits stale tensors from same-id nodes.
+  if (typeof _llmResetRuntimeStates === "function") {
+    try { _llmResetRuntimeStates(); } catch (_) {}
+  }
   // Phase C hardening -- legacy patches may carry the embedded NotesCorpus
   // vault megastring (params.corpus moved to runtime-only params._corpus);
   // scrub on load so an immediate re-save doesn't persist it again.

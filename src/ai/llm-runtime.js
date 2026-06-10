@@ -46,8 +46,42 @@
 
 /* Per-node runtime state. Keyed by node id. Stored here rather than on
  * the node object so a node restart (delete + re-add with same id) gets
- * a clean slate. */
+ * a clean slate -- enforced by the prune sweep in _tickLLMRuntime,
+ * which destroys GPU resources for ids no longer in the patch. */
 const _llmRuntimeStates = new Map();
+
+/* Phase D llm-4 -- runtime states can hold GPU tensors (TokenEmbedding
+ * tables, activations, graveyards, masks). Destroy them all when an rt
+ * is dropped; double-destroys are harmless (try-wrapped, and
+ * rt.tensors.weights aliases rt.table by design). */
+function _llmDestroyRtGpu(rt) {
+  const kill = (t) => {
+    if (t && t.buffer && typeof t.destroy === "function") { try { t.destroy(); } catch (_) {} }
+  };
+  if (rt.tensors)    for (const k of Object.keys(rt.tensors))    kill(rt.tensors[k]);
+  if (rt._graveyard) for (const k of Object.keys(rt._graveyard)) kill(rt._graveyard[k]);
+  kill(rt.table); kill(rt.posTable); kill(rt._idsT); kill(rt._mask);
+}
+
+/* Prune states whose node no longer exists (delete / patch load). */
+function _llmPruneRuntimeStates() {
+  if (!_llmRuntimeStates.size || !state || !Array.isArray(state.nodes)) return;
+  let live = null;
+  for (const id of _llmRuntimeStates.keys()) {
+    if (!live) live = new Set(state.nodes.map(n => n && n.id));
+    if (!live.has(id)) {
+      _llmDestroyRtGpu(_llmRuntimeStates.get(id));
+      _llmRuntimeStates.delete(id);
+    }
+  }
+}
+
+/* Full reset -- called by _applyLoadedPatch so a loaded patch never
+ * inherits stale sigs/tensors from same-id nodes of the old patch. */
+function _llmResetRuntimeStates() {
+  for (const rt of _llmRuntimeStates.values()) _llmDestroyRtGpu(rt);
+  _llmRuntimeStates.clear();
+}
 
 function _llmGetState(nodeId) {
   let s = _llmRuntimeStates.get(nodeId);
@@ -790,6 +824,7 @@ function _tickEmbedSimilarity(node) {
  * Called from src/visual/render-loop.js's _visualRenderTick(). */
 function _tickLLMRuntime(dtSec) {
   if (!state || !Array.isArray(state.nodes)) return;
+  _llmPruneRuntimeStates();
   for (const n of state.nodes) {
     if (!n || !n.type) continue;
     const def = (typeof TYPES === "object") ? TYPES[n.type] : null;
@@ -815,6 +850,10 @@ function _tickLLMRuntime(dtSec) {
       else if (n.type === "Tokenizer"     && typeof _tickTokenizerNode  === "function") _tickTokenizerNode(n, rt);
       else if (n.type === "Vocabulary"    && typeof _tickVocabularyNode === "function") _tickVocabularyNode(n);
       else if (n.type === "DatasetLoader" && typeof _tickDatasetLoader  === "function") _tickDatasetLoader(n, rt);
+      // Phase D llm-4 -- embedding nodes (src/llm/layer-nodes.js).
+      else if (n.type === "TokenEmbedding"     && typeof _tickTokenEmbedding     === "function") _tickTokenEmbedding(n, rt);
+      else if (n.type === "PositionalEncoding" && typeof _tickPositionalEncoding === "function") _tickPositionalEncoding(n, rt);
+      else if (n.type === "EmbeddingDropout"   && typeof _tickEmbeddingDropout   === "function") _tickEmbeddingDropout(n, rt);
       continue;
     }
     if (def.kind !== "llm-sink") continue;
