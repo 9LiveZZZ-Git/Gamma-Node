@@ -128,7 +128,12 @@ async function tektiteSourcesAddLocal(opts) {
   if (opts.importToVault) {
     const files = await _tektiteWalkLocalDir(handle);
     let imported = 0;
+    let skippedBinary = 0;
     for (const f of files) {
+      // Since sprint 10u the walker returns attachments (png/wav/pdf/...)
+      // alongside notes; reading those as UTF-8 text would corrupt them.
+      // Only markdown becomes a vault note.
+      if (f.kind && f.kind !== "note") { skippedBinary++; continue; }
       try {
         const content = await _tektiteReadLocalFile(handle, f.path);
         const slugPath = (typeof tektiteSlugifyPath === "function")
@@ -144,6 +149,9 @@ async function tektiteSourcesAddLocal(opts) {
       } catch (e) {
         console.warn("[tektite] import skipped", f.path, ":", e);
       }
+    }
+    if (skippedBinary) {
+      console.warn("[tektite] import: skipped " + skippedBinary + " non-markdown file(s); attachments are not imported to the vault.");
     }
     return { src, imported };
   }
@@ -261,11 +269,12 @@ async function tektiteSourceGetContent(sourceId, fileId) {
     const content = await _tektiteFetchGithubFile(src.repo, fileId, src.token);
     // Cache sha alongside the listing entry so a later write can pass
     // the latest known sha (GitHub's PUT requires it on existing files
-    // to avoid blind overwrites).
-    if (cached && !cached.sha) {
+    // to avoid blind overwrites). Refreshed on every read so that
+    // reloading a note after a write conflict picks up the new sha.
+    if (cached) {
       try {
         const meta = await _tektiteFetchGithubMeta(src.repo, fileId, src.token);
-        cached.sha = meta && meta.sha;
+        if (meta && meta.sha) cached.sha = meta.sha;
       } catch (_) {}
     }
     return content;
@@ -313,12 +322,17 @@ async function tektiteSourceWriteContent(sourceId, fileId, content, opts) {
 
   if (src.type === "github") {
     if (!src.token) throw new Error("This GitHub source has no PAT. Disconnect and re-add with a token that has contents:write scope.");
+    // Pass the last-observed sha (cached at read/write time) so GitHub's
+    // optimistic-concurrency check rejects a stale buffer with a 409
+    // instead of the write-time pre-fetch blindly overwriting a newer
+    // remote version. Fall back to the pre-fetch only when no sha was
+    // ever observed.
+    const cached = (src.fileCache || []).find(f => f.path === fileId);
     const result = await _tektiteWriteGithubFile(src.repo, fileId, content, src.token, {
       message: opts.message || ("Update " + fileId.split("/").pop() + " via Gamma Node editor"),
-      sha: opts.sha  // caller can pass a known sha; otherwise we fetch it
+      sha: opts.sha !== undefined ? opts.sha : ((cached && cached.sha) || undefined)
     });
     // Refresh the cached entry's sha so the next write doesn't need a pre-GET.
-    const cached = (src.fileCache || []).find(f => f.path === fileId);
     if (cached && result && result.content && result.content.sha) {
       cached.sha = result.content.sha;
     }
@@ -365,8 +379,10 @@ async function tektiteSourceCreateNote(sourceId, title, content) {
     const fname = tektiteSlugify(base) + ".md";
     const filePath = dir ? (dir + "/" + fname) : fname;
     await _tektiteWriteGithubFile(src.repo, filePath, content || "# " + base + "\n\n", src.token, {
-      message: "Create " + fname + " via Gamma Node editor"
-      // no sha -- this is a fresh file
+      message: "Create " + fname + " via Gamma Node editor",
+      // sha: null = create-only. Without it the sha pre-fetch would turn
+      // a title collision into a silent overwrite of the existing file.
+      sha: null
     });
     src.fileCache = null;
     return filePath;
@@ -387,9 +403,14 @@ function tektiteSourceIsWritable(sourceId) {
 
 async function tektiteSourceImportToVault(sourceId, fileId) {
   if (sourceId === "vault") return fileId;  // already there
-  const content = await tektiteSourceGetContent(sourceId, fileId);
   const sourceListing = await tektiteSourceListNotes(sourceId);
   const entry = sourceListing.find(e => e.id === fileId);
+  // Reading a binary attachment as UTF-8 text would store irreversible
+  // mojibake as a note -- only markdown entries can be vault notes.
+  if (entry && entry.kind && entry.kind !== "note") {
+    throw new Error("Only markdown notes can be saved to the vault; \"" + fileId + "\" is a " + entry.kind + " file.");
+  }
+  const content = await tektiteSourceGetContent(sourceId, fileId);
   const baseTitle = entry ? entry.title : "imported";
   // Sprint tektite-5a -- preserve the source's folder structure in
   // the vault slug so a forked `journal/2026/06-05.md` lands at
@@ -515,8 +536,15 @@ async function _tektiteFetchGithubListing(repo, repoPath, token, depth) {
   return out;
 }
 
+/* Percent-encode a repo-relative path per segment (keeping the `/`
+ * separators) so filenames containing `#`, `?`, `%`, etc. don't get
+ * truncated or reinterpreted by the URL parser. */
+function _tektiteGithubEncodePath(filePath) {
+  return String(filePath || "").split("/").map(encodeURIComponent).join("/");
+}
+
 async function _tektiteFetchGithubFile(repo, filePath, token) {
-  const url = "https://api.github.com/repos/" + repo + "/contents/" + filePath;
+  const url = "https://api.github.com/repos/" + repo + "/contents/" + _tektiteGithubEncodePath(filePath);
   const headers = { "Accept": "application/vnd.github.raw" };
   if (token) headers["Authorization"] = "Bearer " + token;
   const r = await fetch(url, { headers });
@@ -528,7 +556,7 @@ async function _tektiteFetchGithubFile(repo, filePath, token) {
  * raw content endpoint doesn't return the sha; we need the JSON
  * variant. Returns the parsed response or throws on 404. */
 async function _tektiteFetchGithubMeta(repo, filePath, token) {
-  const url = "https://api.github.com/repos/" + repo + "/contents/" + filePath;
+  const url = "https://api.github.com/repos/" + repo + "/contents/" + _tektiteGithubEncodePath(filePath);
   const headers = { "Accept": "application/vnd.github+json" };
   if (token) headers["Authorization"] = "Bearer " + token;
   const r = await fetch(url, { headers });
@@ -541,10 +569,13 @@ async function _tektiteFetchGithubMeta(repo, filePath, token) {
  * `sha` is provided this updates the existing file; without `sha`
  * GitHub will create the file (or 422 if it already exists). For
  * editor flows we ALWAYS pre-fetch the sha to avoid the 422 surprise
- * when the user edits an existing remote note that wasn't pre-cached. */
+ * when the user edits an existing remote note that wasn't pre-cached.
+ * `opts.sha === null` is a create-only sentinel: the caller asserts the
+ * file is new, so an existing file aborts with an error instead of
+ * being silently replaced. */
 async function _tektiteWriteGithubFile(repo, filePath, content, token, opts) {
   opts = opts || {};
-  const url = "https://api.github.com/repos/" + repo + "/contents/" + filePath;
+  const url = "https://api.github.com/repos/" + repo + "/contents/" + _tektiteGithubEncodePath(filePath);
   const headers = {
     "Accept":        "application/vnd.github+json",
     "Content-Type":  "application/json",
@@ -554,7 +585,15 @@ async function _tektiteWriteGithubFile(repo, filePath, content, token, opts) {
   const b64 = _tektiteBase64UnicodeEncode(content);
 
   let sha = opts.sha;
-  if (sha === undefined) {
+  if (sha === null) {
+    // Create-only: abort if the path is already taken rather than
+    // attaching its sha and gutting the existing file.
+    const meta = await _tektiteFetchGithubMeta(repo, filePath, token);
+    if (meta && meta.sha) {
+      throw new Error("GitHub write: \"" + filePath + "\" already exists in the repo. Pick a different title.");
+    }
+    sha = undefined;
+  } else if (sha === undefined) {
     // Pre-fetch to find the latest sha; if 404 it's a fresh file.
     const meta = await _tektiteFetchGithubMeta(repo, filePath, token);
     sha = (meta && meta.sha) || undefined;
@@ -567,6 +606,11 @@ async function _tektiteWriteGithubFile(repo, filePath, content, token, opts) {
   if (!r.ok) {
     let detail = "";
     try { detail = (await r.text()).slice(0, 200); } catch (_) {}
+    // 409 = sha mismatch: the file changed on the remote since we last
+    // read it. Make the conflict explicit instead of a bare HTTP code.
+    if (r.status === 409) {
+      throw new Error("GitHub write conflict: \"" + filePath + "\" changed on the remote since it was last loaded. Reload the note and re-apply your edit." + (detail ? (" -- " + detail) : ""));
+    }
     throw new Error("GitHub write: HTTP " + r.status + (detail ? (" -- " + detail) : ""));
   }
   return await r.json();

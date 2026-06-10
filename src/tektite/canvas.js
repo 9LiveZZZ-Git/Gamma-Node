@@ -49,7 +49,11 @@
 
 function _tektiteCanvasIsCanvas(note) {
   if (!note || !note.content) return false;
-  return /^---[\s\S]*?\btektite-canvas:\s*(true|True|TRUE)\b/.test(note.content);
+  // Match only within the YAML frontmatter block (between the two --- fences).
+  // A plain note that merely *mentions* tektite-canvas in its body must not match.
+  const m = note.content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!m) return false;
+  return /\btektite-canvas:\s*(true|True|TRUE)\b/.test(m[1]);
 }
 
 async function tektiteCanvasListAll() {
@@ -78,8 +82,13 @@ async function tektiteCanvasLoad(id) {
   try {
     doc = JSON.parse(parsed.body.trim() || "{}");
   } catch (e) {
-    console.warn("[tektite-canvas] parse failed, starting fresh:", e);
+    console.warn("[tektite-canvas] JSON parse failed – opening read-only to protect original body:", e);
+    // Do NOT fall back to an empty doc: autosave would then permanently destroy
+    // the original content. Instead return a corrupt-flagged doc so the caller
+    // can show a warning and tektiteCanvasSave will refuse to overwrite.
     doc = tektiteCanvasNewDoc();
+    doc._corrupt      = true;
+    doc._corruptBody  = parsed.body;  // stash for possible manual recovery
   }
   if (!Array.isArray(doc.nodes)) doc.nodes = [];
   if (!Array.isArray(doc.edges)) doc.edges = [];
@@ -107,6 +116,13 @@ async function tektiteCanvasCreate(title) {
 }
 
 async function tektiteCanvasSave(id, doc) {
+  // Refuse to overwrite a note whose body failed to parse – the corrupt flag
+  // is set by tektiteCanvasLoad when JSON.parse throws, so we have no valid
+  // nodes/edges to persist and must not destroy the original body.
+  if (doc && doc._corrupt) {
+    console.warn("[tektite-canvas] save blocked: doc is flagged corrupt, original body preserved");
+    return;
+  }
   const existing = await tektiteGetNote(id);
   if (!existing) throw new Error("Canvas note not found: " + id);
   const parsed = tektiteParseFrontmatter(existing.content);

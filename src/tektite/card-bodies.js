@@ -198,6 +198,20 @@ function _tektiteCardEnsureBody(node, st) {
     nodeEl.appendChild(grip);
     _tektiteCardWireGrip(node, grip, body);
   }
+  // render() tears the node DOM down without firing blur on a focused
+  // textarea (WHATWG focus-fixup), so a mid-edit re-render would leave
+  // st.editing latched forever and the blur flush never runs. Flush
+  // the OLD textarea's pending edit before st.editEl is repointed at
+  // the new (empty) one, then drop edit mode.
+  if (fresh && st.editing) {
+    if (st.saveTimer) {
+      clearTimeout(st.saveTimer);
+      st.saveTimer = null;
+      if (st.editEl) _tektiteCardCommitEdit(node, st, st.editEl.value || "");
+    }
+    st.editing = false;
+    body.classList.remove("editing");
+  }
   st.body       = body;
   st.bodyNodeEl = nodeEl;
   st.renderEl   = body.querySelector(".tektite-card-render");
@@ -272,6 +286,10 @@ function _tektiteCardWireBody(node, body) {
     st.editing = true;
     // Initialize textarea from the current source.
     editEl.value = _tektiteCardSourceText(node, st);
+    // Pre-edit snapshot for Escape-revert -- the debounced autosave
+    // overwrites params (and the vault note) long before Escape, so
+    // re-reading the "source" at Escape time would revert nothing.
+    st.editOriginal = editEl.value;
     body.classList.add("editing");
     renderEl.style.display = "none";
     editEl.style.display = "block";
@@ -293,13 +311,23 @@ function _tektiteCardWireBody(node, body) {
   editEl.addEventListener("pointerdown", (e) => e.stopPropagation());
   editEl.addEventListener("input", () => {
     const st = _tektiteCardGetState(node);
+    // Capture the value NOW -- a canvas render() can detach this
+    // textarea before the debounce fires, and st.editEl would then
+    // point at a fresh EMPTY one (wiping the linked vault note).
+    const val = editEl.value || "";
     if (st.saveTimer) clearTimeout(st.saveTimer);
-    st.saveTimer = setTimeout(() => _tektiteCardCommitEdit(node, st), 400);
+    st.saveTimer = setTimeout(() => {
+      st.saveTimer = null;
+      _tektiteCardCommitEdit(node, st, val);
+    }, 400);
   });
   editEl.addEventListener("blur", () => {
     const st = _tektiteCardGetState(node);
+    // Drop the pending debounce so it can't re-commit edited text
+    // after an Escape-revert; the flush below saves the final value.
+    if (st.saveTimer) { clearTimeout(st.saveTimer); st.saveTimer = null; }
     // Flush on blur so a quick-edit-and-click-away saves.
-    _tektiteCardCommitEdit(node, st);
+    _tektiteCardCommitEdit(node, st, editEl.value || "");
     st.editing = false;
     body.classList.remove("editing");
     renderEl.style.display = "";
@@ -313,9 +341,13 @@ function _tektiteCardWireBody(node, body) {
   editEl.addEventListener("keydown", (e) => {
     e.stopPropagation();
     if (e.key === "Escape") {
-      // Revert: refill from source, drop edit mode.
+      // Revert: restore the pre-edit snapshot (params already hold
+      // autosaved edits), drop edit mode. The blur flush re-commits
+      // the snapshot to params + the linked vault note.
       const st = _tektiteCardGetState(node);
-      editEl.value = _tektiteCardSourceText(node, st);
+      editEl.value = (typeof st.editOriginal === "string")
+        ? st.editOriginal
+        : _tektiteCardSourceText(node, st);
       editEl.blur();
     }
   });
@@ -332,9 +364,15 @@ function _tektiteCardSourceText(node, st) {
 
 /* Persist whatever's in the textarea back to params + (if linked) the
  * vault note. Lightweight + idempotent. */
-async function _tektiteCardCommitEdit(node, st) {
-  if (!node || !st || !st.editEl) return;
-  const raw = st.editEl.value || "";
+async function _tektiteCardCommitEdit(node, st, rawOverride) {
+  if (!node || !st) return;
+  // Callers capture the textarea value at event time (rawOverride);
+  // reading st.editEl at fire time can hit a detached or freshly
+  // remounted (empty) textarea after a canvas re-render.
+  const raw = (typeof rawOverride === "string")
+    ? rawOverride
+    : ((st.editEl && st.editEl.isConnected) ? (st.editEl.value || "") : null);
+  if (raw === null) return;
   node.params = node.params || {};
   if (node.type === "LinkCard") {
     node.params.url = raw.trim();
@@ -385,13 +423,15 @@ function _tektiteCardMergeLinkIntoFrontmatter(content, url, label) {
   function upsert(line, key, val) {
     const re = new RegExp("^" + key + ":\\s*.*$", "m");
     const next = val === "" ? "" : (key + ": " + JSON.stringify(val));
-    if (re.test(line)) return next ? line.replace(re, next) : line.replace(re, "").replace(/^\n/, "");
+    // Replacer FUNCTION keeps $-patterns in the URL literal ($& etc.
+    // in a replacement STRING expand to the matched text).
+    if (re.test(line)) return next ? line.replace(re, () => next) : line.replace(re, "").replace(/^\n/, "");
     return next ? (line ? line + "\n" + next : next) : line;
   }
   fmText = upsert(fmText, "url",   url);
   fmText = upsert(fmText, "label", label || "");
   if (fmMatch) {
-    return content.replace(fmMatch[0], "---\n" + fmText + "\n---\n");
+    return content.replace(fmMatch[0], () => "---\n" + fmText + "\n---\n");
   }
   return "---\n" + fmText + "\n---\n" + content;
 }
@@ -663,12 +703,21 @@ async function _renderLinkCardBody(node, st) {
     } else {
       let host = url;
       try { host = new URL(url).hostname || url; } catch (_) {}
+      // The url can come from untrusted note frontmatter (imported /
+      // shared vaults); only emit a live anchor for safe schemes --
+      // a javascript: href would run in the editor's origin.
+      const scheme = (/^\s*([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(url) || [])[1] || "";
+      const safeScheme = !scheme || /^(https?|mailto)$/i.test(scheme);
       st.renderEl.innerHTML =
         '<div class="tektite-card-link-host">🔗 ' + _tektiteCardEsc(host) + '</div>' +
-        '<a class="tektite-card-link-url" href="' + _tektiteCardEsc(url) +
-          '" target="_blank" rel="noopener">' +
-            _tektiteCardEsc(label || url) +
-          '</a>';
+        (safeScheme
+          ? '<a class="tektite-card-link-url" href="' + _tektiteCardEsc(url) +
+              '" target="_blank" rel="noopener">' +
+                _tektiteCardEsc(label || url) +
+              '</a>'
+          : '<span class="tektite-card-link-url">' +
+                _tektiteCardEsc(label || url) +
+              '</span>');
     }
   }
 }
@@ -693,6 +742,9 @@ async function _renderNoteCardBody(node, st) {
         const all = await tektiteListNotes();
         const lc = fileKey.toLowerCase();
         note = all.find(n => (n.title || "").toLowerCase() === lc);
+        // Re-key params.file to the real note id -- commit + poll look
+        // up by id, so a title-keyed card would silently drop edits.
+        if (note) node.params.file = note.id;
       }
       if (!note) {
         node.params.text = "";
@@ -717,6 +769,9 @@ async function _renderNoteCardBody(node, st) {
           _tektiteCardEsc((e && e.message) || String(e)) + '</div>';
       }
       st.lastHash = "N:ERR:" + fileKey;
+      // Mark resolved so the next tick doesn't re-enter this branch
+      // (IDB read + innerHTML rewrite) at frame rate.
+      st.lastResolveKey = fileKey;
     } finally {
       st.resolving = false;
     }
@@ -725,6 +780,9 @@ async function _renderNoteCardBody(node, st) {
   if (st.editing) return;   // user owns the textarea
   // Polling for external changes.
   await _tektiteCardPollLinked(node, st);
+  // Keep the load-failed view until fileKey changes or the poll above
+  // pulls a fresh copy (which clears lastHash).
+  if (st.lastHash === "N:ERR:" + fileKey) return;
   const body  = (node.params && node.params.text)  || "";
   const title = (node.params && node.params.title) || fileKey;
   const hash = "N:" + fileKey + ":" + body.length + ":" + title + ":R";
@@ -810,6 +868,7 @@ async function _renderBaseCardBody(node, st) {
       node.params.rows  = JSON.stringify(rows.slice(0, 50).map(r => ({
         id: r.id, title: r.title, modifiedAt: r.modifiedAt, ...r.frontmatter
       })));
+      st.lastSyncedAt   = (loaded.note && loaded.note.modifiedAt) || Date.now();
       st.lastResolveKey = baseId;
       st.lastHash = "";
     } catch (e) {
@@ -818,11 +877,30 @@ async function _renderBaseCardBody(node, st) {
           _tektiteCardEsc((e && e.message) || String(e)) + '</div>';
       }
       st.lastHash = "B:ERR:" + baseId;
+      // Mark resolved (+ stamp lastSyncedAt) so the next tick doesn't
+      // re-enter this branch at frame rate; the poll below retries
+      // only once the base note is edited/created after the failure.
+      st.lastResolveKey = baseId;
+      st.lastSyncedAt   = Date.now();
       st.resolving = false;
       return;
     }
     st.resolving = false;
+  } else if (!st.resolving) {
+    // Header contract: row set updates on base note edits too. Poll
+    // the base note's modifiedAt (one IDB read per tick, mirroring
+    // _tektiteCardPollLinked) and force a re-load + re-execute.
+    try {
+      const bn = await tektiteGetNote(baseId);
+      if (bn && (bn.modifiedAt || 0) > st.lastSyncedAt + 100) {
+        st.lastResolveKey = "";
+        return;
+      }
+    } catch (_) {}
   }
+  // Keep the load-failed view (don't repaint with stale/empty rows)
+  // until baseId changes or the poll above invalidates the resolve.
+  if (st.lastHash === "B:ERR:" + baseId) return;
   const rows = st.cachedRows || [];
   const cols = st.cachedColumns || ["title"];
   const hash = "B:" + baseId + ":" + view + ":" + rows.length + ":" + cols.join(",");
@@ -1064,13 +1142,13 @@ async function _renderCanvasCardBody(node, st) {
       e.stopPropagation();
       const cid = String((node.params && node.params.canvasId) || "");
       if (!cid) return;
-      // Hand off to the legacy Canvas modal: pre-set the active doc
-      // id so _tektiteCanvasOpenLegacy lands on it.
+      // Hand off to the legacy Canvas modal: show + attach it first
+      // (_tektiteCanvasOpen), then load this card's doc into it.
       if (typeof _tektiteCanvasState !== "undefined" && _tektiteCanvasState) {
         _tektiteCanvasState.currentId = cid;
       }
-      if (typeof _tektiteCanvasOpenLegacy === "function") {
-        await _tektiteCanvasOpenLegacy();
+      if (typeof _tektiteCanvasOpen === "function") {
+        await _tektiteCanvasOpen();
       }
       if (typeof _tektiteCanvasOpenById === "function") {
         await _tektiteCanvasOpenById(cid);
@@ -1175,9 +1253,11 @@ function _tektiteCanvasCardRenderThumb(svg, doc) {
 /* Per-frame tick. */
 function _tickTektiteCards(dtSec) {
   if (typeof state === "undefined" || !state || !Array.isArray(state.nodes)) return;
+  const liveIds = _tektiteCardStates.size ? new Set() : null;
   for (let i = 0; i < state.nodes.length; i++) {
     const n = state.nodes[i];
     if (!n || !n.type) continue;
+    if (liveIds) liveIds.add(n.id);
     const def = (typeof TYPES === "object") ? TYPES[n.type] : null;
     if (!def) continue;
     const k = def.kind;
@@ -1195,6 +1275,22 @@ function _tickTektiteCards(dtSec) {
     else if (k === "tektite-card-base")   _renderBaseCardBody(n, st);
     else if (k === "tektite-card-graph")  _renderGraphCardBody(n, st);
     else if (k === "tektite-card-canvas") _renderCanvasCardBody(n, st);
+  }
+  // Sweep states whose node was deleted (or replaced wholesale by a
+  // patch load) -- otherwise the Map pins detached body DOM, graph
+  // renderers + ResizeObservers for the rest of the session.
+  if (liveIds) {
+    for (const [id, st] of _tektiteCardStates) {
+      if (liveIds.has(id)) continue;
+      if (st.saveTimer) clearTimeout(st.saveTimer);
+      if (st.graphRenderer && typeof st.graphRenderer.destroy === "function") {
+        try { st.graphRenderer.destroy(); } catch (_) {}
+      }
+      if (st.graphResizeObs && typeof st.graphResizeObs.disconnect === "function") {
+        try { st.graphResizeObs.disconnect(); } catch (_) {}
+      }
+      _tektiteCardStates.delete(id);
+    }
   }
 }
 

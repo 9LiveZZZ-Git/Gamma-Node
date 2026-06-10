@@ -20145,10 +20145,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     cppType: "", kind: "notes-source",
     ins: [{ n: "refresh", t: "gate" }],
     outs: [{ n: "corpus", t: "text" }],
-    params: { include: "", exclude: "", format: "concat", maxChars: 0, corpus: "", corpusNotes: 0, corpusChars: 0 },
+    // The collected text + scan stats live on runtime-only params
+    // (_corpus / _corpusNotes / _corpusChars, written by _tickNotesCorpus)
+    // so serializers strip them -- the vault never lands in a .gpatch.
+    params: { include: "", exclude: "", format: "concat", maxChars: 0 },
     paramOptions: { format: ["concat", "chunks"] },
-    hiddenParams: ["corpus"],
-    description: "Phase C §7.1 — streams your Tektite vault as a text corpus. Filter with `include` / `exclude` (terms: #tag, folder/, or plain substring; comma- or space-separated; include is OR, exclude always wins). Outputs `corpus` text — wire into LLMEmbed / LLMChat to embed or chat over your own notes, or (Phase D) into DatasetLoader to train a model on them. Pulse `refresh` to re-scan the vault; corpusNotes / corpusChars report the last scan."
+    description: "Phase C §7.1 — streams your Tektite vault as a text corpus. Filter with `include` / `exclude` (terms: #tag, folder/, or plain substring; comma- or space-separated; include is OR, exclude always wins). Outputs `corpus` text — wire into LLMEmbed / LLMChat to embed or chat over your own notes, or (Phase D) into DatasetLoader to train a model on them. Pulse `refresh` to re-scan the vault; the props panel reports the last scan's note/char counts. The collected text stays runtime-only — it is never saved into the .gpatch."
   },
   LLMModelPicker: {
     category: "AI/LLM", color: COLOR.ai, header: null,

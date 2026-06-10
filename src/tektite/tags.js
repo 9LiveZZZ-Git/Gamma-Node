@@ -49,8 +49,9 @@ const _tektiteTagsState = {
  *                       allow word chars, slash, hyphen
  *
  * The negative left boundary specifically excludes `/` to skip
- * `https://example.com/#section` and `\w` to skip cases like `foo#bar`. */
-const _TEKTITE_TAG_RE = /(^|[^\w/])#([A-Za-z][\w/-]*)/g;
+ * `https://example.com/#section`, `\w` to skip cases like `foo#bar`, and
+ * `(` to skip markdown internal anchor links like `[text](#anchor)`. */
+const _TEKTITE_TAG_RE = /(^|[^\w/(])#([A-Za-z][\w/-]*)/g;
 
 /* Strip code fences + inline code so we don't extract tags from
  * literal source like ```bash\necho #comment\n```. The replacement
@@ -105,10 +106,12 @@ function _tektiteTagsDropNote(noteId) {
 
 function _tektiteTagsIngestNote(noteId, title, content, modifiedAt) {
   _tektiteTagsDropNote(noteId);
-  const fm = (typeof tektiteParseFrontmatter === "function")
-    ? tektiteParseFrontmatter(content).frontmatter
-    : {};
-  const tags = tektiteExtractTags(content, fm);
+  const parsed = (typeof tektiteParseFrontmatter === "function")
+    ? tektiteParseFrontmatter(content)
+    : { frontmatter: {}, body: content };
+  const fm   = parsed.frontmatter || {};
+  const body = parsed.body != null ? parsed.body : content;
+  const tags = tektiteExtractTags(body, fm);
   _tektiteTagsState.forward.set(noteId, tags);
   for (const t of tags) {
     if (!_tektiteTagsState.inverse.has(t)) {

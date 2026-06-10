@@ -33,6 +33,8 @@ const _tektiteTabState = {
   activeSource:    "vault",
   filterText:      "",
   searchResults:   null,    // sprint tektite-3 -- structured query results
+  refreshGen:      0,       // bumps per refresh; stale listings are dropped
+  listError:       null,    // last source-listing failure, shown by render
   listEl:          null,
   countEl:         null,
   filterInput:     null,
@@ -156,11 +158,13 @@ async function _tektiteOpenGraphModal() {
 
 function _tektiteCloseGraphModal() {
   const s = _tektiteGraphState;
-  // Sprint multi-popout (2026-06-05) -- close every popout so their
-  // pending saves flush + DOM gets cleaned up before the modal hides.
-  if (typeof _tektitePopoutCloseAll === "function") _tektitePopoutCloseAll();
+  // Popouts live in the body-level host (not the modal DOM), so they
+  // survive the modal closing -- they're the primary vault editing
+  // surface now. _tektiteUpdateConnectors hides the overlay once the
+  // renderer is gone.
   if (s.renderer) { s.renderer.destroy(); s.renderer = null; }
   if (s.modal) s.modal.style.display = "none";
+  _tektiteUpdateConnectors();
 }
 
 async function _tektiteRebuildGraph() {
@@ -213,7 +217,10 @@ async function _tektiteRebuildGraph() {
  * ------------------------------------------------------------------ */
 const _tektitePopouts = {
   instances: new Map(),   // noteId -> instance
-  topZ: 100
+  topZ: 100,
+  // Source id smuggled past the parity.js _tektitePopoutOpen wrapper
+  // (which only forwards noteId). Read synchronously at open entry.
+  pendingSourceId: null
 };
 
 function _tektitePopoutContainer() {
@@ -350,6 +357,11 @@ function _tektitePopoutWire(inst) {
   });
 
   function markDirty() {
+    // No edits count until the initial note content has loaded --
+    // otherwise a keystroke into the empty/loading editor arms a
+    // flush that overwrites the stored note.
+    if (!inst.loadedOk) return;
+    inst.dirty = true;
     if (inst.saveTimer) clearTimeout(inst.saveTimer);
     _tektitePopoutSetStatus(inst, "Editing…", "saving");
     inst.saveTimer = setTimeout(() => _tektitePopoutFlush(inst), 400);
@@ -380,6 +392,8 @@ function _tektitePopoutWire(inst) {
   if (cmHost && typeof tektiteMarkdownAttach === "function") {
     tektiteMarkdownAttach(cmHost, editor.value || "", {
       onChange: (newDoc) => {
+        // Programmatic setDoc loads must not mark the popout dirty.
+        if (inst.settingDoc) return;
         editor.value = newDoc;
         markDirty();
       },
@@ -388,14 +402,34 @@ function _tektitePopoutWire(inst) {
       },
       readOnly: false
     }).then(handle => {
-      if (handle) {
-        inst.cm = handle;
-        editor.style.display = "none";  // CM took over
+      if (!handle) return;
+      // The popout may have been closed while the CDN load was in
+      // flight -- destroy the orphan view instead of leaking it.
+      if (inst.closed) {
+        try { handle.destroy(); } catch (_) {}
+        return;
       }
+      inst.cm = handle;
+      // The note load may have resolved while CM was still
+      // downloading (cold esm.sh cache); the attach captured the
+      // then-empty textarea value, so re-sync from the textarea
+      // which always holds the latest content.
+      _tektitePopoutSetDocQuiet(inst, editor.value);
+      editor.style.display = "none";  // CM took over
     }).catch(err => {
       console.warn("[tektite-popout] CodeMirror attach failed:", err);
     });
   }
+}
+
+/* Push a document into the popout's CM view without tripping the
+ * onChange -> markDirty -> flush chain (CM update listeners fire on
+ * programmatic dispatches too). */
+function _tektitePopoutSetDocQuiet(inst, text) {
+  if (!inst || !inst.cm || typeof inst.cm.setDoc !== "function") return;
+  inst.settingDoc = true;
+  try { inst.cm.setDoc(text || ""); }
+  finally { inst.settingDoc = false; }
 }
 
 function _tektitePopoutSetViewMode(inst, mode) {
@@ -445,6 +479,13 @@ function _tektitePopoutMarkPreviewDirty(inst) {
 
 function _tektitePopoutCloseInstance(inst) {
   if (!inst || !inst.dom) return;
+  inst.closed = true;
+  // Destroy the CM view before removing its host -- EditorView holds
+  // observers + listeners that outlive a bare dom.remove().
+  if (inst.cm && typeof inst.cm.destroy === "function") {
+    try { inst.cm.destroy(); } catch (_) {}
+    inst.cm = null;
+  }
   inst.dom.remove();
   // Sprint 10n -- deregister every noteId held by this popout's tabs.
   if (Array.isArray(inst.tabs)) {
@@ -462,6 +503,11 @@ function _tektitePopoutCloseAll() {
   const instances = Array.from(_tektitePopouts.instances.values());
   for (const inst of instances) {
     _tektitePopoutFlush(inst);   // fire-and-forget
+    inst.closed = true;
+    if (inst.cm && typeof inst.cm.destroy === "function") {
+      try { inst.cm.destroy(); } catch (_) {}
+      inst.cm = null;
+    }
     inst.dom.remove();
   }
   _tektitePopouts.instances.clear();
@@ -741,6 +787,10 @@ function _tektiteCanvasRenderNode(node) {
   if (node.type === "text") {
     body.contentEditable = "true";
     body.spellcheck = false;
+    // pre-wrap keeps literal \n rendering as line breaks so the
+    // innerText read-back below round-trips multi-line JSON Canvas
+    // text instead of collapsing it to spaces on the first edit.
+    body.style.whiteSpace = "pre-wrap";
     body.textContent = node.text || "";
     body.addEventListener("input", () => {
       node.text = body.innerText || "";
@@ -772,13 +822,21 @@ function _tektiteCanvasRenderNode(node) {
       _tektiteCanvasClose();
       _tektiteTabState.activeSource = "vault";
       await _tektiteTabRefresh();
-      await tektiteEditorLoadFromSource("vault", node.file);
-      _tektiteTabRender();
+      // Sprint refactor (2026-06-05): the in-tab editor is gone --
+      // notes open in floating popouts.
+      await _tektitePopoutOpen(node.file);
     });
     body.addEventListener("pointerdown", (ev) => ev.stopPropagation());
   } else if (node.type === "link") {
-    body.innerHTML = '<a href="' + _tektiteEscapeAttr(node.url || "") + '" target="_blank" rel="noopener">' +
-      _tektiteEscapeHtml(node.url || "(no url)") + '</a>';
+    // Canvas docs can arrive from shared vaults; only emit a live anchor
+    // for safe schemes -- a javascript: href would run in the editor's origin.
+    const _lcScheme = (/^\s*([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(node.url || "") || [])[1] || "";
+    if (!_lcScheme || /^(https?|mailto)$/i.test(_lcScheme)) {
+      body.innerHTML = '<a href="' + _tektiteEscapeAttr(node.url || "") + '" target="_blank" rel="noopener">' +
+        _tektiteEscapeHtml(node.url || "(no url)") + '</a>';
+    } else {
+      body.textContent = node.url || "(no url)";
+    }
     body.addEventListener("pointerdown", (ev) => ev.stopPropagation());
   }
   el.appendChild(body);
@@ -913,8 +971,14 @@ function _tektiteCanvasRenderEdges() {
     if (!a || !b) continue;
     const pa = anchor(a, e.fromSide || "right");
     const pb = anchor(b, e.toSide   || "left");
-    const stroke = tektiteCanvasColor(e.color) || "rgba(155, 208, 255, 0.55)";
-    svgInner += `<line x1="${pa.x}" y1="${pa.y}" x2="${pb.x}" y2="${pb.y}" stroke="${stroke}" stroke-width="1.5" marker-end="url(#tektite-canvas-arrow)"/>`;
+    // tektiteCanvasColor passes `#`-prefixed values through verbatim
+    // and this is an innerHTML sink, so only accept strict hex colors
+    // -- a malicious .canvas note's color field must not break out of
+    // the attribute. Escape as a second line of defense.
+    const raw = tektiteCanvasColor(e.color);
+    const stroke = (raw && /^#[0-9a-fA-F]{3,8}$/.test(raw))
+      ? raw : "rgba(155, 208, 255, 0.55)";
+    svgInner += `<line x1="${pa.x}" y1="${pa.y}" x2="${pb.x}" y2="${pb.y}" stroke="${_tektiteEscapeAttr(stroke)}" stroke-width="1.5" marker-end="url(#tektite-canvas-arrow)"/>`;
   }
   s.edgesEl.innerHTML = `<defs>
       <marker id="tektite-canvas-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
@@ -1147,6 +1211,9 @@ async function _tektiteBasesOpenById(id) {
     s.config = loaded.config;
   } catch (e) {
     s.config = null;
+    // Drop currentId too -- otherwise the close-flush would save the
+    // PREVIOUS base's still-on-screen controls into this base's record.
+    s.currentId = null;
     if (s.bodyEl) s.bodyEl.innerHTML = `<div class="tektite-bases-empty">Failed to load: ${_tektiteEscapeHtml(e.message || e)}</div>`;
     return;
   }
@@ -1218,7 +1285,9 @@ function _tektiteBasesSetStatus(text, kind) {
 async function _tektiteBasesFlush() {
   const s = _tektiteBasesState;
   if (s.saveTimer) { clearTimeout(s.saveTimer); s.saveTimer = null; }
-  if (!s.currentId) return;
+  // Match the Canvas twin's guard: a failed load leaves config null --
+  // never gather + save the stale controls in that state.
+  if (!s.currentId || !s.config) return;
   const config = _tektiteBasesGatherControls();
   s.config = config;
   _tektiteBasesSetStatus("Saving…", "saving");
@@ -1333,8 +1402,8 @@ async function _tektiteBasesOpenRow(id) {
   _tektiteBasesClose();
   _tektiteTabState.activeSource = "vault";
   await _tektiteTabRefresh();
-  await tektiteEditorLoadFromSource("vault", id);
-  _tektiteTabRender();
+  // Sprint refactor (2026-06-05): notes open in floating popouts.
+  await _tektitePopoutOpen(id);
 }
 
 /* Sprint tektite-5c2 + multi-popout -- redraw a connector for every
@@ -1397,10 +1466,22 @@ function _tektiteUpdateConnectors() {
   svg.style.display = anyVisible ? "block" : "none";
 }
 
+/* Open a note from a non-vault source (local-fs / github) in a popout.
+ * parity.js wraps _tektitePopoutOpen with a single-arg function, so the
+ * source id travels via _tektitePopouts.pendingSourceId -- the open's
+ * synchronous prologue captures it before the first await. */
+function _tektitePopoutOpenFromSource(sourceId, fileId) {
+  _tektitePopouts.pendingSourceId = sourceId || "vault";
+  const p = _tektitePopoutOpen(fileId);
+  _tektitePopouts.pendingSourceId = null;
+  return p;
+}
+
 /* Open a popout for `noteId`. If one already exists, bring to front +
  * brief flash; otherwise create a new instance. */
 async function _tektitePopoutOpen(noteId) {
   if (!noteId) return;
+  const sourceId = _tektitePopouts.pendingSourceId || "vault";
   const existing = _tektitePopouts.instances.get(noteId);
   if (existing) {
     _tektitePopoutBringToFront(existing);
@@ -1429,6 +1510,7 @@ async function _tektitePopoutOpen(noteId) {
   container.appendChild(dom);
   const inst = {
     noteId,
+    sourceId,               // "vault" or a connected source id
     dom,
     saveTimer: null,
     previewTimer: null,
@@ -1437,6 +1519,10 @@ async function _tektitePopoutOpen(noteId) {
     dragOffsetY: 0,
     viewMode: "source",
     cm: null,
+    loadedOk:   false,      // true once the note content is in the editor
+    dirty:      false,      // true only after a real user edit
+    closed:     false,      // late CM attach on a closed popout is destroyed
+    settingDoc: false,      // suppresses onChange during programmatic setDoc
     // Sprint 10n -- tabs.  Active tab's noteId mirrors inst.noteId so
     // the rest of the popout code keeps reading inst.noteId unchanged.
     tabs:      [noteId],
@@ -1454,18 +1540,35 @@ async function _tektitePopoutOpen(noteId) {
   const titleInput = dom.querySelector(".tektite-graph-popout-titleinput");
   const editor     = dom.querySelector(".tektite-graph-popout-editor");
   try {
-    const note = await tektiteGetNote(noteId);
-    const title = (note && note.title) || noteId;
-    const content = (note && note.content) || "";
+    let title, content;
+    if (sourceId === "vault") {
+      const note = await tektiteGetNote(noteId);
+      title   = (note && note.title) || noteId;
+      content = (note && note.content) || "";
+    } else {
+      // Remote sources (local-fs / github) read through the source
+      // layer; saves route back via tektiteSourceWriteContent in flush.
+      content = await tektiteSourceGetContent(sourceId, noteId);
+      title = noteId;
+      try {
+        const listing = await tektiteSourceListNotes(sourceId);
+        const hit = listing.find(n => n.id === noteId);
+        if (hit) title = hit.title || noteId;
+      } catch (_) {}
+    }
     if (titleEl)    titleEl.textContent  = title;
     if (titleInput) titleInput.value     = title;
     if (editor)     editor.value         = content;
     // If CM finished attaching before the load resolved, push the doc
-    // through its API.  Otherwise the attach reads from editor.value
-    // which is the same content.
-    if (inst.cm && typeof inst.cm.setDoc === "function") inst.cm.setDoc(content);
+    // through its API (quietly -- a programmatic load is not an edit).
+    // If CM is still downloading, the attach .then re-syncs from the
+    // textarea, which now holds the loaded content.
+    _tektitePopoutSetDocQuiet(inst, content);
+    inst.loadedOk = true;
     _tektitePopoutSetStatus(inst, "");
   } catch (e) {
+    // loadedOk stays false: markDirty and flush are both gated on it,
+    // so the error text can never be persisted over the real note.
     if (editor) editor.value = "Failed to load: " + (e.message || e);
     _tektitePopoutSetStatus(inst, "error", "err");
   }
@@ -1566,19 +1669,30 @@ async function _tektitePopoutCloseTab(inst, index) {
  * fallback.  Called from add/switch/close tab paths. */
 async function _tektitePopoutLoadTab(inst, noteId) {
   if (!inst || !inst.dom || !noteId) return;
-  inst.noteId = noteId;
   const dom        = inst.dom;
   const titleEl    = dom.querySelector(".tektite-graph-popout-title");
   const titleInput = dom.querySelector(".tektite-graph-popout-titleinput");
   const editor     = dom.querySelector(".tektite-graph-popout-editor");
+  // Entering a load: gate flush/markDirty until it succeeds.
+  inst.loadedOk = false;
+  inst.dirty    = false;
   try {
     const note = await tektiteGetNote(noteId);
     const title = (note && note.title) || noteId;
     const content = (note && note.content) || "";
+    // Reassign only after a successful load -- on failure the editor
+    // still holds the PREVIOUS tab's doc, and flushing that under the
+    // new id would cross-write note contents.
+    inst.noteId   = noteId;
+    inst.sourceId = "vault";   // tabs always load vault notes
     if (titleEl)    titleEl.textContent = title;
     if (titleInput) titleInput.value    = title;
     if (editor)     editor.value        = content;
-    if (inst.cm && typeof inst.cm.setDoc === "function") inst.cm.setDoc(content);
+    _tektitePopoutSetDocQuiet(inst, content);
+    inst.loadedOk = true;
+    // The quiet setDoc skips the onChange chain, so refresh the
+    // preview explicitly (no-op in source mode).
+    _tektitePopoutMarkPreviewDirty(inst);
     _tektitePopoutSetStatus(inst, "");
   } catch (e) {
     if (editor) editor.value = "Failed to load: " + (e.message || e);
@@ -1589,6 +1703,12 @@ async function _tektitePopoutLoadTab(inst, noteId) {
 async function _tektitePopoutFlush(inst) {
   if (!inst || !inst.dom) return;
   if (inst.saveTimer) { clearTimeout(inst.saveTimer); inst.saveTimer = null; }
+  // Never persist attachment viewers (that would write a ghost empty
+  // NOTE record under the attachment's id), popouts whose content
+  // never finished loading, or popouts without a real user edit.
+  if (inst.isAttachment) return;
+  if (typeof _tektiteIsAttachmentId === "function" && _tektiteIsAttachmentId(inst.noteId)) return;
+  if (!inst.loadedOk || !inst.dirty) return;
   const titleInput = inst.dom.querySelector(".tektite-graph-popout-titleinput");
   const editor     = inst.dom.querySelector(".tektite-graph-popout-editor");
   if (!titleInput || !editor) return;
@@ -1597,15 +1717,23 @@ async function _tektitePopoutFlush(inst) {
   const content = inst.cm && typeof inst.cm.getDoc === "function"
     ? inst.cm.getDoc()
     : (editor.value || "");
+  const sourceId = inst.sourceId || "vault";
   _tektitePopoutSetStatus(inst, "Saving…", "saving");
   try {
-    const existing = await tektiteGetNote(inst.noteId);
-    await tektitePutNote({
-      id:        inst.noteId,
-      title:     title || inst.noteId,
-      content,
-      createdAt: existing && existing.createdAt
-    });
+    if (sourceId === "vault") {
+      const existing = await tektiteGetNote(inst.noteId);
+      await tektitePutNote({
+        id:        inst.noteId,
+        title:     title || inst.noteId,
+        content,
+        createdAt: existing && existing.createdAt
+      });
+    } else {
+      // Non-vault popouts (local-fs / github) write back through the
+      // source layer instead of creating a shadow vault note.
+      await tektiteSourceWriteContent(sourceId, inst.noteId, content, { title });
+    }
+    inst.dirty = false;
     const titleEl = inst.dom.querySelector(".tektite-graph-popout-title");
     if (titleEl) titleEl.textContent = title || inst.noteId;
     _tektitePopoutSetStatus(inst, "Saved", "ok");
@@ -1613,11 +1741,29 @@ async function _tektitePopoutFlush(inst) {
       const el = inst.dom && inst.dom.querySelector(".tektite-graph-popout-status");
       if (el && el.textContent === "Saved") _tektitePopoutSetStatus(inst, "");
     }, 1500);
-    if (typeof tektiteBacklinksOnNoteSaved === "function") {
-      tektiteBacklinksOnNoteSaved({ id: inst.noteId, title, content, modifiedAt: Date.now() });
+    if (sourceId === "vault") {
+      if (typeof tektiteBacklinksOnNoteSaved === "function") {
+        tektiteBacklinksOnNoteSaved({ id: inst.noteId, title, content, modifiedAt: Date.now() });
+      }
+      if (typeof tektiteTagsOnNoteSaved === "function") {
+        tektiteTagsOnNoteSaved({ id: inst.noteId, title, content, modifiedAt: Date.now() });
+      }
     }
-    if (typeof tektiteTagsOnNoteSaved === "function") {
-      tektiteTagsOnNoteSaved({ id: inst.noteId, title, content, modifiedAt: Date.now() });
+    // Mirror the tektiteEditorOnSave listing update so popout renames
+    // + recency changes reflect in the sidebar without a full refresh.
+    const ts = _tektiteTabState;
+    if (ts && Array.isArray(ts.notes) && ts.activeSource === sourceId) {
+      const idx = ts.notes.findIndex(n => n.id === inst.noteId);
+      const listingEntry = {
+        id:         inst.noteId,
+        title:      title || inst.noteId,
+        path:       inst.noteId,
+        modifiedAt: Date.now(),
+        sourceId
+      };
+      if (idx >= 0) ts.notes.splice(idx, 1);
+      ts.notes.unshift(listingEntry);
+      _tektiteTabRender();
     }
   } catch (e) {
     _tektitePopoutSetStatus(inst, "✗ " + (e.message || e), "err");
@@ -1631,6 +1777,11 @@ async function _tektitePopoutFlush(inst) {
  * offers to create a new vault note under that name. */
 async function _tektiteNavigateWikilink(target) {
   if (!target) return;
+  // The CM plugin passes the RAW inner text, so Obsidian's pipe/heading
+  // forms ([[Note|alias]] / [[Note#Heading]]) must be stripped before
+  // any matching -- the preview renderer + backlinks index already do.
+  target = String(target).split("|")[0].split("#")[0].trim();
+  if (!target) return;
   const s = _tektiteTabState;
   const targetLc = target.toLowerCase();
 
@@ -1639,8 +1790,7 @@ async function _tektiteNavigateWikilink(target) {
   if (vaultHit) {
     s.activeSource = "vault";
     await _tektiteTabRefresh();
-    await tektiteEditorLoadFromSource("vault", vaultHit.id);
-    _tektiteTabRender();
+    await _tektitePopoutOpen(vaultHit.id);
     return;
   }
   // 2. Try as a vault title (case-insensitive).
@@ -1649,8 +1799,7 @@ async function _tektiteNavigateWikilink(target) {
   if (titleHit) {
     s.activeSource = "vault";
     await _tektiteTabRefresh();
-    await tektiteEditorLoadFromSource("vault", titleHit.id);
-    _tektiteTabRender();
+    await _tektitePopoutOpen(titleHit.id);
     return;
   }
   // 3. Walk other sources (local-fs / github) for filename matches.
@@ -1666,8 +1815,7 @@ async function _tektiteNavigateWikilink(target) {
       if (fileHit) {
         s.activeSource = src.id;
         await _tektiteTabRefresh();
-        await tektiteEditorLoadFromSource(src.id, fileHit.id);
-        _tektiteTabRender();
+        await _tektitePopoutOpenFromSource(src.id, fileHit.id);
         return;
       }
     } catch (_) {}
@@ -1722,8 +1870,7 @@ async function _tektiteNavigateWikilink(target) {
       const newId = await tektiteSourceCreateNote("vault", target);
       s.activeSource = "vault";
       await _tektiteTabRefresh();
-      await tektiteEditorLoadFromSource("vault", newId);
-      _tektiteTabRender();
+      await _tektitePopoutOpen(newId);
     } catch (e) {
       window.alert("Create failed: " + (e.message || e));
     }
@@ -1779,8 +1926,7 @@ async function _tektiteRenderBacklinks() {
     el.addEventListener("click", async () => {
       s.activeSource = "vault";
       await _tektiteTabRefresh();
-      await tektiteEditorLoadFromSource("vault", id);
-      _tektiteTabRender();
+      await _tektitePopoutOpen(id);
     });
   });
 }
@@ -1803,14 +1949,20 @@ function _tektiteTabSetFullscreen(on) {
 
 async function _tektiteTabRefresh() {
   const s = _tektiteTabState;
+  // Generation guard: a slow listing (e.g. GitHub) resolving after the
+  // user switched back to a fast source must not overwrite its list.
+  const src = s.activeSource;
+  const gen = ++s.refreshGen;
   try {
-    s.notes = await tektiteSourceListNotes(s.activeSource);
+    const notes = await tektiteSourceListNotes(src);
+    if (gen !== s.refreshGen || src !== s.activeSource) return;
+    s.notes = notes;
+    s.listError = null;
   } catch (e) {
+    if (gen !== s.refreshGen || src !== s.activeSource) return;
     s.notes = [];
+    s.listError = e.message || String(e);
     console.warn("[tektite] source list failed:", e);
-    if (s.listEl) {
-      s.listEl.innerHTML = `<div class="tektite-empty">⚠ ${_tektiteEscapeHtml(e.message || String(e))}</div>`;
-    }
   }
   _tektiteTabRenderSources();
   _tektiteTabRender();
@@ -1902,6 +2054,12 @@ function _tektiteTabRender() {
   }
 
   if (!filtered.length) {
+    // A failed source listing renders its actual error instead of the
+    // misleading "no files" empty state.
+    if (s.listError) {
+      s.listEl.innerHTML = `<div class="tektite-empty">⚠ ${_tektiteEscapeHtml(s.listError)}</div>`;
+      return;
+    }
     s.listEl.innerHTML = `
       <div class="tektite-empty">
         ${s.notes.length === 0
@@ -2006,9 +2164,10 @@ function _tektiteTabRender() {
         // Vault notes: open in a popout (full editor experience).
         await _tektitePopoutOpen(id);
       } else {
-        // Remote sources still flow through the editor module's
-        // remote-load path so fork-to-vault keeps working.
-        await tektiteEditorLoadFromSource(s.activeSource, id);
+        // Remote sources open in a source-aware popout; saves route
+        // back through tektiteSourceWriteContent. Fork-to-vault keeps
+        // working via the button's _sourceId/_fileId set below.
+        await _tektitePopoutOpenFromSource(s.activeSource, id);
       }
       if (s.saveToVaultBtnEl) {
         const showFork = (s.activeSource !== "vault");
@@ -2061,9 +2220,11 @@ async function _tektiteTabCreate() {
   try {
     const newId = await tektiteSourceCreateNote(s.activeSource, "Untitled note");
     await _tektiteTabRefresh();
-    await tektiteEditorLoadFromSource(s.activeSource, newId);
-    _tektiteTabRender();
-    const titleInput = document.getElementById("tektite-title");
+    await _tektitePopoutOpenFromSource(s.activeSource, newId);
+    // Focus the popout's title input so the user can rename right away.
+    const inst = _tektitePopouts.instances.get(newId);
+    const titleInput = inst && inst.dom &&
+      inst.dom.querySelector(".tektite-graph-popout-titleinput");
     if (titleInput && s.activeSource === "vault") { titleInput.focus(); titleInput.select(); }
   } catch (e) {
     window.alert("Create failed: " + (e.message || String(e)));
@@ -2091,6 +2252,10 @@ async function _tektiteTabDelete(id) {
       try { await tektiteDeleteAttachment(id); } catch (_) {}
     }
   }
+  // Evict from the in-memory backlinks/tags indices (mirrors the
+  // folder-delete path) so stale entries don't linger all session.
+  if (typeof tektiteBacklinksOnNoteDeleted === "function") tektiteBacklinksOnNoteDeleted(id);
+  if (typeof tektiteTagsOnNoteDeleted === "function") tektiteTagsOnNoteDeleted(id);
   if (tektiteEditorCurrentNoteId() === id) {
     await tektiteEditorLoad(null);
   }
@@ -2173,8 +2338,7 @@ async function _tektiteFolderNewNote(folderPath) {
   while (await tektiteGetNote(id)) { id = prefix + segSlug + "-" + n; n++; if (n > 9999) break; }
   await tektitePutNote({ id, title: baseTitle, content: "# " + baseTitle + "\n\n" });
   await _tektiteTabRefresh();
-  await tektiteEditorLoadFromSource("vault", id);
-  _tektiteTabRender();
+  await _tektitePopoutOpen(id);
 }
 
 async function _tektiteFolderDelete(folderPath) {
@@ -2322,7 +2486,7 @@ async function _tektiteSaveToVault() {
     const newId = await tektiteSourceImportToVault(btn._sourceId, btn._fileId);
     s.activeSource = "vault";
     await _tektiteTabRefresh();
-    await tektiteEditorLoad(newId);
+    await _tektitePopoutOpen(newId);
     if (btn) btn.style.display = "none";
     _tektiteTabRender();
   } catch (e) {
@@ -2354,8 +2518,7 @@ function tektiteTabAttach() {
       const id = await tektiteDailyNoteOpenOrCreate({});
       s.activeSource = "vault";
       await _tektiteTabRefresh();
-      await tektiteEditorLoadFromSource("vault", id);
-      _tektiteTabRender();
+      await _tektitePopoutOpen(id);
     } catch (e) {
       window.alert("Today note open/create failed: " + (e.message || e));
     }
@@ -2437,17 +2600,25 @@ function tektiteTabAttach() {
         _tektiteTabRender();
         return;
       }
+      // Capture the query at schedule time -- clearTimeout can't cancel
+      // a callback already parked on an await, so each await is followed
+      // by a staleness check before touching state.
+      const q = s.filterText;
       searchTimer = setTimeout(async () => {
         // Make sure the tags index is warm so tag-clause matching is fast.
         if (typeof tektiteTagsEnsureReady === "function") {
           await tektiteTagsEnsureReady();
         }
+        if (q !== s.filterText) return;
+        let results;
         try {
-          s.searchResults = await tektiteRunQuery(s.filterText);
+          results = await tektiteRunQuery(q);
         } catch (e) {
           console.warn("[tektite] search failed:", e);
-          s.searchResults = [];
+          results = [];
         }
+        if (q !== s.filterText) return;
+        s.searchResults = results;
         _tektiteTabRender();
       }, 120);
     });

@@ -96,6 +96,11 @@ function _readTextWire(node, portName) {
           // a parameter sweep). Only on direct mismatch, not when the
           // upstream is text but empty.
           if (typeof v === "number" && Number.isFinite(v)) return String(v);
+          // Runtime-only text lives under the _-prefixed twin of the
+          // port name (NotesCorpus publishes the vault on params._corpus
+          // so serializers strip it -- same convention as params._vec).
+          const rv = src.params["_" + e.from.port];
+          if (typeof rv === "string") return rv;
         }
       }
     }

@@ -59,7 +59,7 @@ function tektiteParseFrontmatter(content) {
   }
   // Find the closing fence -- `---` at the start of a line, not
   // immediately after the opener.
-  const closeRe = /\n---[ \t]*\r?\n/;
+  const closeRe = /\n---[ \t]*\r?(\n|$)/;
   const closeMatch = text.slice(4).match(closeRe);
   if (!closeMatch) {
     return { frontmatter: {}, body: text, bodyStart: 0 };
@@ -89,7 +89,7 @@ function _tektiteYamlParse(text) {
       pendingList.push(_tektiteYamlValue(listM[1]));
       continue;
     }
-    const m = raw.match(/^([A-Za-z_][A-Za-z0-9_-]*):\s*(.*)$/);
+    const m = raw.match(/^([A-Za-z_][A-Za-z0-9_-]*):\s*(.*?)\r?$/);
     if (!m) { pendingKey = null; pendingList = null; continue; }
     const key  = m[1];
     const rest = m[2];
@@ -148,8 +148,10 @@ function _tektiteYamlValue(raw) {
   const s = String(raw).trim();
   if (!s) return "";
   // Quoted string.
-  if ((s[0] === '"' && s[s.length - 1] === '"') ||
-      (s[0] === "'" && s[s.length - 1] === "'")) {
+  if (s[0] === '"' && s[s.length - 1] === '"') {
+    return s.slice(1, -1).replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+  }
+  if (s[0] === "'" && s[s.length - 1] === "'") {
     return s.slice(1, -1);
   }
   // Booleans / null.

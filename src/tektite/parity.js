@@ -133,13 +133,17 @@ function _tektiteCommandPaletteOpen() {
   document.addEventListener("keydown", _tektiteCmdPaletteKeydown, true);
 }
 
+let _tektiteCmdKeyOpen = false;
 window.addEventListener("keydown", (e) => {
+  if (e.repeat) return;
   if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
   if (typeof isTextInput === "function" && isTextInput(document.activeElement)) return;
   // Cmd/Ctrl-O -- quick switcher (open note); Cmd/Ctrl-P -- command palette.
   if (!e.shiftKey && (e.key === "o" || e.key === "O")) {
     e.preventDefault();
-    _tektiteQuickSwitcherOpen();
+    if (_tektiteCmdKeyOpen) return;
+    _tektiteCmdKeyOpen = true;
+    Promise.resolve(_tektiteQuickSwitcherOpen()).finally(() => { _tektiteCmdKeyOpen = false; });
   } else if (!e.shiftKey && (e.key === "p" || e.key === "P")) {
     e.preventDefault();
     _tektiteCommandPaletteOpen();
@@ -847,6 +851,19 @@ function _tektiteAttachmentCsvHtml(text, sep) {
  * tab-load wrap.  Symptom (10u): clicking an attachment showed an
  * empty markdown editor. */
 function _tektitePatchPopoutHooks() {
+  // Wrap _tektitePopoutCloseInstance to revoke any live attachment blob URL
+  // before the DOM is removed (fixes #69: blob URLs leaked on popout close).
+  if (typeof _tektitePopoutCloseInstance === "function" && !_tektitePopoutCloseInstance._tk10tWrapped) {
+    const originalClose = _tektitePopoutCloseInstance;
+    _tektitePopoutCloseInstance = function (inst) {
+      if (inst && inst._attachmentBlobUrl) {
+        URL.revokeObjectURL(inst._attachmentBlobUrl);
+        inst._attachmentBlobUrl = null;
+      }
+      return originalClose(inst);
+    };
+    _tektitePopoutCloseInstance._tk10tWrapped = true;
+  }
   // Wrap _tektitePopoutLoadTab (tab switching).
   if (typeof _tektitePopoutLoadTab === "function" && !_tektitePopoutLoadTab._tk10tWrapped) {
     const original = _tektitePopoutLoadTab;
@@ -874,23 +891,25 @@ function _tektitePatchPopoutHooks() {
   if (typeof _tektitePopoutOpen === "function" && !_tektitePopoutOpen._tk10tWrapped) {
     const originalOpen = _tektitePopoutOpen;
     _tektitePopoutOpen = async function (noteId) {
-      const result = await originalOpen(noteId);
-      // After the original open returns, if the loaded id is an
-      // attachment, swap the markdown layer out for the viewer.
-      // (originalOpen has already set inst.noteId + loaded the empty
-      //  markdown -- harmless; we paint over it.)
-      const inst = _tektitePopouts && _tektitePopouts.instances && _tektitePopouts.instances.get(noteId);
-      if (inst && _tektiteIsAttachmentId(noteId)) {
-        try {
-          const rec = await tektiteGetAttachment(noteId);
-          if (rec && rec.blob) {
-            const titleEl = inst.dom && inst.dom.querySelector(".tektite-graph-popout-title");
-            if (titleEl) titleEl.textContent = noteId;
-            await _tektitePopoutLoadAttachment(inst, noteId);
-          }
-        } catch (_) {}
+      // Detect attachment BEFORE originalOpen so _tektitePopoutFlush
+      // (called on close) never writes a phantom note for the attachment id.
+      if (_tektiteIsAttachmentId(noteId)) {
+        const result = await originalOpen(noteId);
+        const inst = _tektitePopouts && _tektitePopouts.instances && _tektitePopouts.instances.get(noteId);
+        if (inst) {
+          inst.isAttachment = true;
+          try {
+            const rec = await tektiteGetAttachment(noteId);
+            if (rec && rec.blob) {
+              const titleEl = inst.dom && inst.dom.querySelector(".tektite-graph-popout-title");
+              if (titleEl) titleEl.textContent = noteId;
+              await _tektitePopoutLoadAttachment(inst, noteId);
+            }
+          } catch (_) {}
+        }
+        return result;
       }
-      return result;
+      return originalOpen(noteId);
     };
     _tektitePopoutOpen._tk10tWrapped = true;
   }

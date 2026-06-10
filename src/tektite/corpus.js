@@ -102,23 +102,35 @@ async function* tektiteCorpusStream(opts) {
 /* Per-frame runtime tick for a NotesCorpus node (kind "notes-source").
  * Recomputes the corpus when the filter signature changes, a `refresh`
  * gate pulses, or no corpus has been computed yet -- then publishes the
- * text on params.corpus so _readTextWire can hand it to LLM nodes. */
+ * text on params._corpus (underscore-prefixed = runtime-only: every
+ * serializer strips _-keys, so the vault text never lands in a .gpatch,
+ * HTML export, or undo snapshot) where _readTextWire hands it to LLM
+ * nodes. */
 function _tickNotesCorpus(node) {
   if (!node) return;
   const p  = node.params || (node.params = {});
+  // Legacy patches (pre-_corpus) persisted the vault text + stats on
+  // un-prefixed params; scrub them so re-saving the patch doesn't
+  // re-embed a (possibly foreign) corpus.
+  delete p.corpus; delete p.corpusNotes; delete p.corpusChars;
   const rt = (typeof _llmGetState === "function") ? _llmGetState(node.id) : (node._corpusRt || (node._corpusRt = {}));
-  const sig = [p.include || "", p.exclude || "", p.format || "concat", p.maxChars || 0].join("");
+  const sig = JSON.stringify([p.include || "", p.exclude || "", p.format || "concat", p.maxChars || 0]);
   const refreshFired = (typeof _llmDetectGate === "function") && _llmDetectGate(node, rt, "refresh", "lastCorpusRefresh");
-  const need = !rt._corpusBusy && (refreshFired || rt._corpusSig !== sig || typeof p.corpus !== "string");
+  // A refresh edge that lands mid-collect would otherwise be consumed
+  // and lost (the gate stays high afterwards, so no new edge fires) --
+  // latch it and honor it on the next non-busy tick.
+  if (refreshFired && rt._corpusBusy) rt._corpusRefreshPending = true;
+  const need = !rt._corpusBusy && (refreshFired || rt._corpusRefreshPending || rt._corpusSig !== sig || typeof p._corpus !== "string");
   if (!need) return;
+  rt._corpusRefreshPending = false;
   rt._corpusBusy = true;
   rt._corpusSig  = sig;
   tektiteCorpusCollect({ include: p.include, exclude: p.exclude, format: p.format, maxChars: p.maxChars })
     .then(res => {
-      node.params.corpus      = res.text;
-      node.params.corpusNotes = res.noteCount;
-      node.params.corpusChars = res.totalChars;
+      node.params._corpus      = res.text;
+      node.params._corpusNotes = res.noteCount;
+      node.params._corpusChars = res.totalChars;
     })
-    .catch(() => { if (typeof node.params.corpus !== "string") node.params.corpus = ""; })
+    .catch(() => { if (typeof node.params._corpus !== "string") node.params._corpus = ""; })
     .finally(() => { rt._corpusBusy = false; });
 }

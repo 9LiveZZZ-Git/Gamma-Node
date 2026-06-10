@@ -39,10 +39,10 @@ const _tektiteEditorState = {
   cmLoading:      null,       // in-flight attach promise
   currentId:      null,
   currentSource:  null,
+  loadGen:        0,          // bumped per load; stale loads bail out
   saveTimer:      null,
   saveDelayMs:    400,
-  saving:         false,
-  pendingSave:    false,
+  saving:         null,       // in-flight save promise (null when idle)
   statusEl:       null,
   navigateFn:     null,       // tab.js sets this so wikilink ctrl-click can open notes
   listeners:      new Set(),
@@ -179,6 +179,13 @@ async function _tektiteEditorEnsureCodeMirror() {
       readOnly: s.textarea ? !!s.textarea.disabled : false
     });
     if (handle) {
+      // The initial doc above was captured before the CDN await; if a
+      // note was loaded into the textarea fallback while CodeMirror was
+      // initializing, re-sync it so the takeover doesn't display (and a
+      // later flush save) the stale empty doc. s.cm is still null here,
+      // so _tektiteEditorGetText() reads the textarea.
+      const live = _tektiteEditorGetText();
+      if (handle.getDoc() !== live) handle.setDoc(live);
       s.cm = handle;
       // Hide the textarea fallback; CM owns the surface now.
       if (s.textarea) s.textarea.style.display = "none";
@@ -290,22 +297,28 @@ async function tektiteEditorLoadFromSource(sourceId, fileId) {
   if (s.currentId && (s.currentId !== fileId || s.currentSource !== sourceId)) {
     await tektiteEditorFlush();
   }
+  // Guard against the awaits below: currentId only moves to the new
+  // note once its content is actually in the editor surface (a flush
+  // firing mid-load would otherwise save the OLD note's text under the
+  // NEW id), and a newer load supersedes this one entirely.
+  const gen = ++s.loadGen;
   _tektiteSetStatus("Loading…");
   try {
     const content = await tektiteSourceGetContent(sourceId, fileId);
-    s.currentId     = fileId;
-    s.currentSource = sourceId;
     let title = fileId;
     try {
       const listing = await tektiteSourceListNotes(sourceId);
       const hit = listing.find(n => n.id === fileId);
       if (hit) title = hit.title || fileId;
     } catch (_) {}
+    if (gen !== s.loadGen) return;   // superseded by a newer load
     if (s.titleInput) {
       s.titleInput.value = title;
       s.titleInput.disabled = (sourceId !== "vault");
     }
     _tektiteEditorSetText(content || "");
+    s.currentId     = fileId;
+    s.currentSource = sourceId;
     const writable = (typeof tektiteSourceIsWritable === "function")
       ? tektiteSourceIsWritable(sourceId)
       : (sourceId === "vault" ? "vault" : null);
@@ -314,6 +327,7 @@ async function tektiteEditorLoadFromSource(sourceId, fileId) {
     // Sprint tektite-2b -- refresh preview if it's currently visible.
     _tektiteRefreshPreview();
   } catch (e) {
+    if (gen !== s.loadGen) return;   // superseded by a newer load
     s.currentId     = null;
     s.currentSource = null;
     if (s.titleInput) s.titleInput.value = "";
@@ -336,37 +350,47 @@ function tektiteEditorMarkDirty() {
 async function tektiteEditorFlush() {
   const s = _tektiteEditorState;
   if (s.saveTimer) { clearTimeout(s.saveTimer); s.saveTimer = null; }
+  // No live edit surface (the in-tab pane was removed from shell.html,
+  // so attach may never have run): _tektiteEditorGetText() would return
+  // "" and the write below would wipe the note. Hard no-op instead.
+  if (!s.cm && !(s.textarea && s.textarea.isConnected)) return;
   if (!s.currentId) return;
-  if (s.saving) { s.pendingSave = true; return; }
-  s.saving = true;
+  if (s.saving) {
+    // An in-flight save captured older content. Wait for it, then flush
+    // again so the latest keystrokes are persisted before callers (e.g.
+    // tektiteEditorLoadFromSource) move on to another note.
+    await s.saving;
+    return tektiteEditorFlush();
+  }
   const sourceId = s.currentSource || "vault";
   const fileId   = s.currentId;
   const title    = (s.titleInput && s.titleInput.value || fileId).trim();
   const content  = _tektiteEditorGetText();
   _tektiteSetStatus("Saving…", "saving");
-  try {
-    const result = await tektiteSourceWriteContent(sourceId, fileId, content, { title });
-    const recordedId = (result && result.id) || fileId;
-    s.currentId = recordedId;
-    _tektiteEditorEmit({
-      sourceId, fileId: recordedId, title, content,
-      modifiedAt: Date.now()
-    });
-    _tektiteSetStatus("Saved", "ok");
-    setTimeout(() => {
-      if (_tektiteEditorState.statusEl &&
-          _tektiteEditorState.statusEl.textContent === "Saved") {
-        _tektiteSetStatus("");
-      }
-    }, 1500);
-  } catch (e) {
-    _tektiteSetStatus("✗ " + (e.message || String(e)), "err");
-    console.warn("[tektite] save failed:", e);
-  } finally {
-    s.saving = false;
-    if (s.pendingSave) {
-      s.pendingSave = false;
-      setTimeout(() => tektiteEditorFlush(), 80);
+  const save = (async () => {
+    try {
+      const result = await tektiteSourceWriteContent(sourceId, fileId, content, { title });
+      const recordedId = (result && result.id) || fileId;
+      // Don't clobber currentId if the user navigated away mid-save.
+      if (s.currentId === fileId) s.currentId = recordedId;
+      _tektiteEditorEmit({
+        sourceId, fileId: recordedId, title, content,
+        modifiedAt: Date.now()
+      });
+      _tektiteSetStatus("Saved", "ok");
+      setTimeout(() => {
+        if (_tektiteEditorState.statusEl &&
+            _tektiteEditorState.statusEl.textContent === "Saved") {
+          _tektiteSetStatus("");
+        }
+      }, 1500);
+    } catch (e) {
+      _tektiteSetStatus("✗ " + (e.message || String(e)), "err");
+      console.warn("[tektite] save failed:", e);
+    } finally {
+      s.saving = null;
     }
-  }
+  })();
+  s.saving = save;
+  await save;
 }

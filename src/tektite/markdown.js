@@ -135,6 +135,60 @@ async function _tektiteLoadMarked() {
   }
 }
 
+/* DOMPurify loader. marked@13 does NOT sanitize (the sanitize option
+ * was removed upstream), so a note body carrying raw HTML like
+ * <img onerror=...> or a [link](javascript:...) would execute in this
+ * origin -- with the whole IndexedDB vault + localStorage keys behind
+ * it. Every preview render is sanitized. If the CDN fetch fails we do
+ * NOT skip sanitizing: tektiteMarkdownRenderInto escapes raw HTML in
+ * the source instead and _tektiteScrubUnsafeDom drops unsafe URLs from
+ * what marked itself emits. */
+let _tektiteDompurifyCache = null;
+async function _tektiteLoadDompurify() {
+  if (_tektiteDompurifyCache !== null) return _tektiteDompurifyCache;
+  try {
+    const m = await import("https://esm.sh/dompurify@3");
+    const dp = m.default || m;
+    if (!dp || typeof dp.sanitize !== "function") {
+      throw new Error("dompurify module did not expose sanitize()");
+    }
+    _tektiteDompurifyCache = dp;
+    return dp;
+  } catch (e) {
+    console.warn("[tektite] DOMPurify load failed; preview escapes raw HTML instead:", e);
+    _tektiteDompurifyCache = false;
+    return false;
+  }
+}
+
+/* Attributes this pipeline injects pre-marked that must survive
+ * sanitization: wikilink click payloads, math placeholders, embed
+ * markers. (`class` and the GFM task-list <input type=checkbox
+ * disabled checked> are already in DOMPurify's default allowlist.) */
+const _TEKTITE_PURIFY_CFG = {
+  ADD_ATTR: ["data-tektite-link", "data-tektite-math", "data-tektite-math-src", "data-tektite-embed-target"]
+};
+
+/* Scrub for the no-DOMPurify path. Raw HTML has been escaped pre-marked
+ * by then, so the live elements are marked's own output plus our
+ * injected placeholders -- but marked still passes javascript: through
+ * link/image URLs. Allow http(s)/mailto/scheme-less URLs, drop the
+ * rest, and strip any on* attribute as belt-and-braces. */
+function _tektiteScrubUnsafeDom(rootEl) {
+  rootEl.querySelectorAll("*").forEach(el => {
+    for (const a of Array.from(el.attributes)) {
+      const name = a.name.toLowerCase();
+      if (/^on/.test(name)) { el.removeAttribute(a.name); continue; }
+      if (name === "href" || name === "src" || name === "xlink:href") {
+        // Control/space chars first: `jav\tascript:` is still live.
+        const flat = a.value.replace(/[\u0000-\u0020]+/g, "").toLowerCase();
+        const hasScheme = /^[a-z][a-z0-9+.-]*:/.test(flat);
+        if (hasScheme && !/^(https?|mailto):/.test(flat)) el.removeAttribute(a.name);
+      }
+    }
+  });
+}
+
 /* Sprint tektite-2c -- KaTeX loader. Renders both inline ($...$) and
  * block ($$...$$) LaTeX math. Loaded lazily on first preview render
  * that contains a $; downloads the JS + CSS together. */
@@ -198,17 +252,24 @@ async function _tektiteLoadMermaid() {
  * placeholders survive into the rendered HTML where they get swapped
  * for KaTeX output in _tektiteTransformMath. */
 function _tektitePreprocessMath(text) {
+  // The expression is URI-encoded into an attribute and the span left
+  // EMPTY, so the placeholder is fully opaque to marked. With the
+  // expression as span *content*, marked's inline pass chewed it:
+  // `\\` row separators collapsed to `\`, `*...*` became <em> (deleting
+  // the asterisks), and blank lines split block math across <p>s.
+  // _tektiteTransformMath decodes the attribute back.
+  //
   // Block math first ($$...$$, multi-line). The DOTALL-ish [\s\S]*?
   // makes the inner match nongreedy so $$a$$ b $$c$$ stays as two
   // blocks.
   let processed = text.replace(/\$\$([\s\S]+?)\$\$/g, (whole, expr) => {
-    return '<span data-tektite-math="block">' + _tektiteMdEscapeAttr(expr) + '</span>';
+    return '<span data-tektite-math="block" data-tektite-math-src="' + encodeURIComponent(expr) + '"></span>';
   });
   // Inline math -- single $ on each side, no leading/trailing whitespace
   // inside (so `cost is $5` doesn't trigger). Allows newlines inside
   // since some folks write inline math across linebreaks.
   processed = processed.replace(/(?<![\\$])\$(?!\s)([^\n$]+?)(?<!\s)\$(?!\$)/g, (whole, expr) => {
-    return '<span data-tektite-math="inline">' + _tektiteMdEscapeAttr(expr) + '</span>';
+    return '<span data-tektite-math="inline" data-tektite-math-src="' + encodeURIComponent(expr) + '"></span>';
   });
   return processed;
 }
@@ -228,7 +289,12 @@ async function _tektiteTransformMath(rootEl) {
   if (!katex) return;
   nodes.forEach(node => {
     const isBlock = node.getAttribute("data-tektite-math") === "block";
-    const expr = node.textContent;
+    let expr;
+    try {
+      expr = decodeURIComponent(node.getAttribute("data-tektite-math-src") || "");
+    } catch (_) {
+      expr = node.textContent;  // malformed encoding -- render what's visible
+    }
     try {
       const html = katex.renderToString(expr, {
         throwOnError: false,
@@ -287,6 +353,22 @@ async function _tektiteTransformMermaid(rootEl) {
   }
 }
 
+/* Mask fenced blocks + inline code spans (same shapes as
+ * _tektiteStripCodeForTags in tags.js) behind inert \x00 tokens so the
+ * transclusion / wikilink / math text passes can't rewrite literal
+ * code. Restored verbatim just before marked, which HTML-escapes code
+ * content itself. */
+function _tektiteMaskCodeSpans(text, store) {
+  const stash = (m) => { store.push(m); return "\u0000TKTCODE" + (store.length - 1) + "\u0000"; };
+  return String(text || "")
+    .replace(/```[\s\S]*?```/g, stash)
+    .replace(/`[^`\n]*`/g, stash);
+}
+function _tektiteUnmaskCodeSpans(text, store) {
+  return text.replace(/\u0000TKTCODE(\d+)\u0000/g, (whole, i) =>
+    store[+i] !== undefined ? store[+i] : whole);
+}
+
 /* Public: render markdown text into a target element. Caller passes
  * the live preview container; we set innerHTML then run the math +
  * mermaid transforms in place on the attached DOM so Mermaid can
@@ -296,18 +378,32 @@ async function _tektiteTransformMermaid(rootEl) {
 async function tektiteMarkdownRenderInto(targetEl, text) {
   if (!targetEl) return;
   const marked = await _tektiteLoadMarked();
+  const purify = await _tektiteLoadDompurify();
   // Sprint tektite-4 -- transclusion expansion runs BEFORE the
   // wikilink / math / marked passes. Each ![[…]] resolves to the
   // referenced note's body (or section), wrapped in a
   // <div class="tektite-embed"> so the preview can style it
   // distinctly. Cycles are broken via a visited-set guard.
   let working = String(text || "");
+  // Code regions are masked from every text pass below (incl.
+  // transclusion). Masked a second time after expansion because
+  // embedded note bodies can carry their own fences.
+  const codeStore = [];
+  working = _tektiteMaskCodeSpans(working, codeStore);
   if (typeof tektiteExpandTransclusions === "function") {
     try {
       working = await tektiteExpandTransclusions(working);
     } catch (e) {
       console.warn("[tektite] transclusion expand failed:", e);
     }
+  }
+  working = _tektiteMaskCodeSpans(working, codeStore);
+  if (!purify) {
+    // Sanitizer unavailable: neutralize raw HTML in the (untrusted)
+    // source before marked. Embed wrappers degrade to literal text;
+    // the placeholders injected below survive untouched, and masked
+    // code is restored after this so marked escapes it normally.
+    working = working.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   }
   const withLinks = working.replace(
     TEKTITE_WIKILINK_RE,
@@ -321,8 +417,9 @@ async function tektiteMarkdownRenderInto(targetEl, text) {
     }
   );
   const withMath = _tektitePreprocessMath(withLinks);
-  const rawHtml = marked(withMath);
-  targetEl.innerHTML = rawHtml;
+  const rawHtml = marked(_tektiteUnmaskCodeSpans(withMath, codeStore));
+  targetEl.innerHTML = purify ? purify.sanitize(rawHtml, _TEKTITE_PURIFY_CFG) : rawHtml;
+  if (!purify) _tektiteScrubUnsafeDom(targetEl);
   // Transforms run on the LIVE attached DOM so Mermaid + KaTeX can
   // measure layout. KaTeX is sync inside the loop; Mermaid is async
   // per-block (it spins up a temporary SVG to compute text widths).
@@ -366,9 +463,16 @@ function _tektiteMakeWikilinkPlugin(cm) {
         while ((m = TEKTITE_WIKILINK_RE.exec(text))) {
           const start = from + m.index;
           const end   = start + m[0].length;
+          // Click payload carries just the navigable target: strip the
+          // |alias half + any #heading suffix, mirroring the preview
+          // renderer's pipe split in tektiteMarkdownRenderInto.
+          const pipe = m[1].match(TEKTITE_PIPE_SPLIT);
+          let target = (pipe ? pipe[1] : m[1]).trim();
+          const hash = target.indexOf("#");
+          if (hash > 0) target = target.slice(0, hash).trim();
           builder.add(start, end, Decoration.mark({
             class: "cm-wikilink",
-            attributes: { "data-tektite-link": m[1] }
+            attributes: { "data-tektite-link": target }
           }));
         }
       }

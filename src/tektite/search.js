@@ -96,7 +96,8 @@ function _tektiteMatchProp(value, op, target) {
   // Numeric path first.
   const vNum = (typeof value === "number") ? value : parseFloat(value);
   const tNum = parseFloat(target);
-  if (Number.isFinite(vNum) && Number.isFinite(tNum) && String(vNum) === String(value).trim()) {
+  if (Number.isFinite(vNum) && Number.isFinite(tNum) &&
+      (typeof value === "number" || /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(String(value).trim()))) {
     switch (op) {
       case "=":  return vNum === tNum;
       case "!=": return vNum !== tNum;

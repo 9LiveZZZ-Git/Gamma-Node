@@ -202,11 +202,12 @@ function renderProps() {
   }
   // Phase C §7.4 -- the node-note attachment lives in node.params under
   // NODE_NOTE_PARAM_KEYS but is presented in its own "Documentation"
-  // section below, not as raw editable param rows. def.hiddenParams (e.g.
-  // NotesCorpus.corpus) are runtime-computed values, never shown as rows.
+  // section below, not as raw editable param rows. def.hiddenParams and
+  // _-prefixed keys (runtime-only values like params._vec / ._corpus,
+  // stripped by every serializer) are never shown as rows either.
   const _hiddenParams = Array.isArray(def.hiddenParams) ? def.hiddenParams : [];
   const keys = Object.keys(node.params).filter(k =>
-    !NODE_NOTE_PARAM_KEYS.includes(k) && !_hiddenParams.includes(k));
+    k.charCodeAt(0) !== 95 && !NODE_NOTE_PARAM_KEYS.includes(k) && !_hiddenParams.includes(k));
   const gateIns = def.ins.filter(p => p.t === "gate");
 
   if (!keys.length && !gateIns.length) {
@@ -303,6 +304,16 @@ function renderProps() {
         `;
       });
       html += `</div>`;
+    }
+    // Phase C §7.1 -- NotesCorpus scan stats. The corpus text + counts
+    // live on _-prefixed runtime params (never serialized into the
+    // .gpatch), so they get a read-only line instead of param rows.
+    if (node.type === "NotesCorpus") {
+      const nNotes = (typeof node.params._corpusNotes === "number") ? node.params._corpusNotes : 0;
+      const nChars = (typeof node.params._corpusChars === "number") ? node.params._corpusChars : 0;
+      const scanned = (typeof node.params._corpus === "string");
+      html += `<div class="prop-section">Corpus</div>`;
+      html += `<div class="prop-inline">${scanned ? `last scan: ${nNotes} note${nNotes === 1 ? "" : "s"} · ${nChars} chars` : "not scanned yet — runs while the patch ticks"}</div>`;
     }
     // Piano-roll: a single button that opens the editor modal.
     // Notes live in node.params.notes; the modal handles all the

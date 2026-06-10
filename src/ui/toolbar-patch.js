@@ -117,6 +117,14 @@ function _applyLoadedPatch(loaded, filename) {
     Visual.theaterCam.pos[1] = state.rig.sweetSpot[1];
     Visual.theaterCam.pos[2] = state.rig.sweetSpot[2];
   }
+  // Phase C hardening -- legacy patches may carry the embedded NotesCorpus
+  // vault megastring (params.corpus moved to runtime-only params._corpus);
+  // scrub on load so an immediate re-save doesn't persist it again.
+  for (const n of state.nodes) {
+    if (n && n.type === "NotesCorpus" && n.params) {
+      delete n.params.corpus; delete n.params.corpusNotes; delete n.params.corpusChars;
+    }
+  }
   render();
   // Phase C §5.4 -- offer to import any attached-note snapshots this patch
   // carries that aren't yet in the local Tektite vault (async, opt-in).

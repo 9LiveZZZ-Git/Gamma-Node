@@ -516,7 +516,12 @@ function _resolveNodeParams(node) {
       if (!tw || !tw.from) continue;
       const tsrc = state.nodes.find(n => n && n.id === tw.from.node);
       if (tsrc && tsrc.params) {
-        const tv = tsrc.params[tw.from.port];
+        let tv = tsrc.params[tw.from.port];
+        // Bulky runtime-only text outputs (e.g. NotesCorpus's vault
+        // corpus) live under a _-prefixed twin so they never serialize
+        // into the .gpatch; fall back to it when the plain key is absent.
+        if (typeof tv !== "string" && typeof tsrc.params["_" + tw.from.port] === "string")
+          tv = tsrc.params["_" + tw.from.port];
         if (typeof tv === "string") out[port.n] = tv;
         else if (typeof tv === "number" && Number.isFinite(tv)) out[port.n] = String(tv);
       }

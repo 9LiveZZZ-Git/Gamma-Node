@@ -57,7 +57,8 @@ function _tektiteGraphTexNodeState(node) {
       texH:          0,
       iterations:    0,
       kineticEnergy: 0,
-      lastUploadAt:  0
+      lastUploadAt:  0,
+      drawSig:       ""
     };
     _tektiteGraphTexState.set(node.id, st);
   }
@@ -67,6 +68,21 @@ function _tektiteGraphTexNodeState(node) {
 function _tektiteConfigSig(node) {
   const p = node.params || {};
   return [p.mode || "global", p.depth | 0, p.centerId || "", p.minDegree | 0].join("|");
+}
+
+// Signature covering all params that affect pixel content but not
+// graph topology (topology is covered by _tektiteConfigSig). When this
+// changes on a settled node we need one fresh draw+upload.
+function _tektiteDrawSig(node) {
+  const p = node.params || {};
+  const w = Math.max(64, Math.min(2048, (p.width  | 0) || 512));
+  const h = Math.max(64, Math.min(2048, (p.height | 0) || 512));
+  const n = (v, d) => (typeof v === "number" ? v : d).toFixed(4);
+  return [w, h,
+    n(p.bgR, 0.04), n(p.bgG, 0.05), n(p.bgB, 0.09),
+    n(p.edgeR, 0.61), n(p.edgeG, 0.81), n(p.edgeB, 1.0), n(p.edgeA, 0.30),
+    n(p.nodeR, 0.78), n(p.nodeG, 0.91), n(p.nodeB, 0.35)
+  ].join("|");
 }
 
 async function _tektiteBuildGraphForNode(node, st) {
@@ -117,6 +133,9 @@ function _tektiteEnsureTexture(node, st) {
     st.view = st.texture.createView();
   }
   st.texW = w; st.texH = h;
+  // Force a fresh draw+upload so the new (blank) texture gets content
+  // even if the sim has already settled.
+  st.lastUploadAt = 0;
 }
 
 function _tektiteDrawGraphFrame(st, node) {
@@ -222,10 +241,22 @@ function _tektiteUploadToTexture(st) {
 function tickTektiteGraphTextures(dtSec) {
   if (typeof state === "undefined" || !state || !Array.isArray(state.nodes)) return;
   if (typeof Visual === "undefined" || !Visual.device) return;
+
+  // Collect live TektiteGraph ids so we can prune stale map entries
+  // (prevents VRAM leaks when nodes are deleted or patches are cycled).
+  const liveIds = new Set();
   for (let i = 0; i < state.nodes.length; i++) {
     const n = state.nodes[i];
     if (!n || n.type !== "TektiteGraph") continue;
+    liveIds.add(n.id);
     _tickTektiteGraphNode(n, dtSec);
+  }
+  // Destroy + remove entries for deleted nodes.
+  for (const [id, st] of _tektiteGraphTexState) {
+    if (!liveIds.has(id)) {
+      if (st.texture) { try { st.texture.destroy(); } catch (_) {} }
+      _tektiteGraphTexState.delete(id);
+    }
   }
 }
 
@@ -247,6 +278,14 @@ function _tickTektiteGraphNode(node, dtSec) {
   _tektiteEnsureTexture(node, st);
   if (!st.texture || !st.ctx) return;
 
+  // If color or dimension params changed since the last upload, force
+  // a redraw even if the sim is settled (lastUploadAt reset triggers
+  // the else-if branch below on the very next tick).
+  const dsig = _tektiteDrawSig(node);
+  if (dsig !== st.drawSig && st.lastUploadAt !== 0) {
+    st.lastUploadAt = 0;
+  }
+
   // Sim cap -- after 500 iters the layout force-settles. Same logic
   // as the modal renderer in graph.js so the texture matches what
   // the user sees in the graph view.
@@ -259,12 +298,13 @@ function _tickTektiteGraphNode(node, dtSec) {
     _tektiteDrawGraphFrame(st, node);
     _tektiteUploadToTexture(st);
     st.lastUploadAt = performance.now();
+    st.drawSig = dsig;
   } else if (st.lastUploadAt === 0) {
-    // First-time settle path -- draw + upload once even if KE was
-    // tiny from the build.
+    // First-time settle path, or forced redraw after a param change.
     _tektiteDrawGraphFrame(st, node);
     _tektiteUploadToTexture(st);
     st.lastUploadAt = performance.now();
+    st.drawSig = dsig;
   }
 
   // Stash the texture entry so the existing visual pipeline's

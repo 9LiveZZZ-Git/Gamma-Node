@@ -32136,10 +32136,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     cppType: "", kind: "notes-source",
     ins: [{ n: "refresh", t: "gate" }],
     outs: [{ n: "corpus", t: "text" }],
-    params: { include: "", exclude: "", format: "concat", maxChars: 0, corpus: "", corpusNotes: 0, corpusChars: 0 },
+    // The collected text + scan stats live on runtime-only params
+    // (_corpus / _corpusNotes / _corpusChars, written by _tickNotesCorpus)
+    // so serializers strip them -- the vault never lands in a .gpatch.
+    params: { include: "", exclude: "", format: "concat", maxChars: 0 },
     paramOptions: { format: ["concat", "chunks"] },
-    hiddenParams: ["corpus"],
-    description: "Phase C §7.1 — streams your Tektite vault as a text corpus. Filter with `include` / `exclude` (terms: #tag, folder/, or plain substring; comma- or space-separated; include is OR, exclude always wins). Outputs `corpus` text — wire into LLMEmbed / LLMChat to embed or chat over your own notes, or (Phase D) into DatasetLoader to train a model on them. Pulse `refresh` to re-scan the vault; corpusNotes / corpusChars report the last scan."
+    description: "Phase C §7.1 — streams your Tektite vault as a text corpus. Filter with `include` / `exclude` (terms: #tag, folder/, or plain substring; comma- or space-separated; include is OR, exclude always wins). Outputs `corpus` text — wire into LLMEmbed / LLMChat to embed or chat over your own notes, or (Phase D) into DatasetLoader to train a model on them. Pulse `refresh` to re-scan the vault; the props panel reports the last scan's note/char counts. The collected text stays runtime-only — it is never saved into the .gpatch."
   },
   LLMModelPicker: {
     category: "AI/LLM", color: COLOR.ai, header: null,
@@ -52991,11 +52993,12 @@ function renderProps() {
   }
   // Phase C §7.4 -- the node-note attachment lives in node.params under
   // NODE_NOTE_PARAM_KEYS but is presented in its own "Documentation"
-  // section below, not as raw editable param rows. def.hiddenParams (e.g.
-  // NotesCorpus.corpus) are runtime-computed values, never shown as rows.
+  // section below, not as raw editable param rows. def.hiddenParams and
+  // _-prefixed keys (runtime-only values like params._vec / ._corpus,
+  // stripped by every serializer) are never shown as rows either.
   const _hiddenParams = Array.isArray(def.hiddenParams) ? def.hiddenParams : [];
   const keys = Object.keys(node.params).filter(k =>
-    !NODE_NOTE_PARAM_KEYS.includes(k) && !_hiddenParams.includes(k));
+    k.charCodeAt(0) !== 95 && !NODE_NOTE_PARAM_KEYS.includes(k) && !_hiddenParams.includes(k));
   const gateIns = def.ins.filter(p => p.t === "gate");
 
   if (!keys.length && !gateIns.length) {
@@ -53092,6 +53095,16 @@ function renderProps() {
         `;
       });
       html += `</div>`;
+    }
+    // Phase C §7.1 -- NotesCorpus scan stats. The corpus text + counts
+    // live on _-prefixed runtime params (never serialized into the
+    // .gpatch), so they get a read-only line instead of param rows.
+    if (node.type === "NotesCorpus") {
+      const nNotes = (typeof node.params._corpusNotes === "number") ? node.params._corpusNotes : 0;
+      const nChars = (typeof node.params._corpusChars === "number") ? node.params._corpusChars : 0;
+      const scanned = (typeof node.params._corpus === "string");
+      html += `<div class="prop-section">Corpus</div>`;
+      html += `<div class="prop-inline">${scanned ? `last scan: ${nNotes} note${nNotes === 1 ? "" : "s"} · ${nChars} chars` : "not scanned yet — runs while the patch ticks"}</div>`;
     }
     // Piano-roll: a single button that opens the editor modal.
     // Notes live in node.params.notes; the modal handles all the
@@ -54425,6 +54438,9 @@ function _nodeNoteDocComment(node, indent) {
     bodyLines = bodyLines.slice(1);
     while (bodyLines.length && bodyLines[0].trim() === "") bodyLines = bodyLines.slice(1);
   }
+  // "".split("\n") produces [""] — treat a single empty/whitespace-only
+  // element as no body so the separator pair isn't emitted for blank notes.
+  if (bodyLines.length === 1 && bodyLines[0].trim() === "") bodyLines = [];
   const lines = [pad + "/**", pad + " * " + title];
   if (bodyLines.length) {
     lines.push(pad + " *");
@@ -55952,6 +55968,14 @@ function _applyLoadedPatch(loaded, filename) {
     Visual.theaterCam.pos[0] = state.rig.sweetSpot[0];
     Visual.theaterCam.pos[1] = state.rig.sweetSpot[1];
     Visual.theaterCam.pos[2] = state.rig.sweetSpot[2];
+  }
+  // Phase C hardening -- legacy patches may carry the embedded NotesCorpus
+  // vault megastring (params.corpus moved to runtime-only params._corpus);
+  // scrub on load so an immediate re-save doesn't persist it again.
+  for (const n of state.nodes) {
+    if (n && n.type === "NotesCorpus" && n.params) {
+      delete n.params.corpus; delete n.params.corpusNotes; delete n.params.corpusChars;
+    }
   }
   render();
   // Phase C §5.4 -- offer to import any attached-note snapshots this patch
@@ -59402,6 +59426,11 @@ function _readTextWire(node, portName) {
           // a parameter sweep). Only on direct mismatch, not when the
           // upstream is text but empty.
           if (typeof v === "number" && Number.isFinite(v)) return String(v);
+          // Runtime-only text lives under the _-prefixed twin of the
+          // port name (NotesCorpus publishes the vault on params._corpus
+          // so serializers strip it -- same convention as params._vec).
+          const rv = src.params["_" + e.from.port];
+          if (typeof rv === "string") return rv;
         }
       }
     }
@@ -60216,8 +60245,25 @@ function tektiteVaultOpen() {
         att.createIndex("modifiedAt", "modifiedAt", { unique: false });
       }
     };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror   = () => reject(req.error || new Error("IDB open failed"));
+    req.onsuccess = () => {
+      const db = req.result;
+      // Release the connection when a newer-version open request arrives,
+      // so that tab doesn't block indefinitely on `blocked`.
+      db.onversionchange = () => db.close();
+      resolve(db);
+    };
+    req.onerror   = () => {
+      _tektiteVaultDbP = null;   // transient failure -- allow retry next call
+      reject(req.error || new Error("IDB open failed"));
+    };
+    // Another tab's open request is blocked by this connection; ask the
+    // user to close older editor tabs instead of hanging silently.
+    req.onblocked = () => {
+      _tektiteVaultDbP = null;
+      reject(new Error(
+        "Tektite vault upgrade blocked — please close any other editor tabs and reload."
+      ));
+    };
   });
   return _tektiteVaultDbP;
 }
@@ -60542,7 +60588,7 @@ async function tektiteDeleteAttachment(id) {
   let rec = null;
   try { rec = await tektiteGetAttachment(id); } catch (_) {}
   if (rec && rec.backing === "server") {
-    try { await tektiteVaultServerDelete(id); }
+    try { await tektiteVaultServerDelete(TEKTITE_VAULT_REMOTE_FOLDER + id); }
     catch (e) { console.warn("[tektite-vault] server delete failed for", id, e.message); }
   }
   const db = await tektiteVaultOpen();
@@ -60619,7 +60665,7 @@ function tektiteVaultServerUpload(id, blob, onProgress) {
   const path = String(id).replace(/^\/+/, "");
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open("PUT", base + "/vault/file/" + encodeURI(path));
+    xhr.open("PUT", base + "/vault/file/" + path.split("/").map(encodeURIComponent).join("/"));
     xhr.setRequestHeader("Content-Type", blob.type || "application/octet-stream");
     xhr.responseType = "json";
     xhr.upload.onprogress = (e) => {
@@ -60671,7 +60717,7 @@ async function tektiteVaultServerDelete(id) {
   const base = _tektiteVaultServerUrl();
   if (!base) throw new Error("No compile server URL configured.");
   const path = String(id).replace(/^\/+/, "");
-  const r = await fetch(base + "/vault/file/" + encodeURI(path), {
+  const r = await fetch(base + "/vault/file/" + path.split("/").map(encodeURIComponent).join("/"), {
     method: "DELETE",
     mode:   "cors"
   });
@@ -60988,24 +61034,36 @@ async function* tektiteCorpusStream(opts) {
 /* Per-frame runtime tick for a NotesCorpus node (kind "notes-source").
  * Recomputes the corpus when the filter signature changes, a `refresh`
  * gate pulses, or no corpus has been computed yet -- then publishes the
- * text on params.corpus so _readTextWire can hand it to LLM nodes. */
+ * text on params._corpus (underscore-prefixed = runtime-only: every
+ * serializer strips _-keys, so the vault text never lands in a .gpatch,
+ * HTML export, or undo snapshot) where _readTextWire hands it to LLM
+ * nodes. */
 function _tickNotesCorpus(node) {
   if (!node) return;
   const p  = node.params || (node.params = {});
+  // Legacy patches (pre-_corpus) persisted the vault text + stats on
+  // un-prefixed params; scrub them so re-saving the patch doesn't
+  // re-embed a (possibly foreign) corpus.
+  delete p.corpus; delete p.corpusNotes; delete p.corpusChars;
   const rt = (typeof _llmGetState === "function") ? _llmGetState(node.id) : (node._corpusRt || (node._corpusRt = {}));
-  const sig = [p.include || "", p.exclude || "", p.format || "concat", p.maxChars || 0].join("");
+  const sig = JSON.stringify([p.include || "", p.exclude || "", p.format || "concat", p.maxChars || 0]);
   const refreshFired = (typeof _llmDetectGate === "function") && _llmDetectGate(node, rt, "refresh", "lastCorpusRefresh");
-  const need = !rt._corpusBusy && (refreshFired || rt._corpusSig !== sig || typeof p.corpus !== "string");
+  // A refresh edge that lands mid-collect would otherwise be consumed
+  // and lost (the gate stays high afterwards, so no new edge fires) --
+  // latch it and honor it on the next non-busy tick.
+  if (refreshFired && rt._corpusBusy) rt._corpusRefreshPending = true;
+  const need = !rt._corpusBusy && (refreshFired || rt._corpusRefreshPending || rt._corpusSig !== sig || typeof p._corpus !== "string");
   if (!need) return;
+  rt._corpusRefreshPending = false;
   rt._corpusBusy = true;
   rt._corpusSig  = sig;
   tektiteCorpusCollect({ include: p.include, exclude: p.exclude, format: p.format, maxChars: p.maxChars })
     .then(res => {
-      node.params.corpus      = res.text;
-      node.params.corpusNotes = res.noteCount;
-      node.params.corpusChars = res.totalChars;
+      node.params._corpus      = res.text;
+      node.params._corpusNotes = res.noteCount;
+      node.params._corpusChars = res.totalChars;
     })
-    .catch(() => { if (typeof node.params.corpus !== "string") node.params.corpus = ""; })
+    .catch(() => { if (typeof node.params._corpus !== "string") node.params._corpus = ""; })
     .finally(() => { rt._corpusBusy = false; });
 }
 /* =========================================================================
@@ -61138,7 +61196,12 @@ async function tektiteSourcesAddLocal(opts) {
   if (opts.importToVault) {
     const files = await _tektiteWalkLocalDir(handle);
     let imported = 0;
+    let skippedBinary = 0;
     for (const f of files) {
+      // Since sprint 10u the walker returns attachments (png/wav/pdf/...)
+      // alongside notes; reading those as UTF-8 text would corrupt them.
+      // Only markdown becomes a vault note.
+      if (f.kind && f.kind !== "note") { skippedBinary++; continue; }
       try {
         const content = await _tektiteReadLocalFile(handle, f.path);
         const slugPath = (typeof tektiteSlugifyPath === "function")
@@ -61154,6 +61217,9 @@ async function tektiteSourcesAddLocal(opts) {
       } catch (e) {
         console.warn("[tektite] import skipped", f.path, ":", e);
       }
+    }
+    if (skippedBinary) {
+      console.warn("[tektite] import: skipped " + skippedBinary + " non-markdown file(s); attachments are not imported to the vault.");
     }
     return { src, imported };
   }
@@ -61271,11 +61337,12 @@ async function tektiteSourceGetContent(sourceId, fileId) {
     const content = await _tektiteFetchGithubFile(src.repo, fileId, src.token);
     // Cache sha alongside the listing entry so a later write can pass
     // the latest known sha (GitHub's PUT requires it on existing files
-    // to avoid blind overwrites).
-    if (cached && !cached.sha) {
+    // to avoid blind overwrites). Refreshed on every read so that
+    // reloading a note after a write conflict picks up the new sha.
+    if (cached) {
       try {
         const meta = await _tektiteFetchGithubMeta(src.repo, fileId, src.token);
-        cached.sha = meta && meta.sha;
+        if (meta && meta.sha) cached.sha = meta.sha;
       } catch (_) {}
     }
     return content;
@@ -61323,12 +61390,17 @@ async function tektiteSourceWriteContent(sourceId, fileId, content, opts) {
 
   if (src.type === "github") {
     if (!src.token) throw new Error("This GitHub source has no PAT. Disconnect and re-add with a token that has contents:write scope.");
+    // Pass the last-observed sha (cached at read/write time) so GitHub's
+    // optimistic-concurrency check rejects a stale buffer with a 409
+    // instead of the write-time pre-fetch blindly overwriting a newer
+    // remote version. Fall back to the pre-fetch only when no sha was
+    // ever observed.
+    const cached = (src.fileCache || []).find(f => f.path === fileId);
     const result = await _tektiteWriteGithubFile(src.repo, fileId, content, src.token, {
       message: opts.message || ("Update " + fileId.split("/").pop() + " via Gamma Node editor"),
-      sha: opts.sha  // caller can pass a known sha; otherwise we fetch it
+      sha: opts.sha !== undefined ? opts.sha : ((cached && cached.sha) || undefined)
     });
     // Refresh the cached entry's sha so the next write doesn't need a pre-GET.
-    const cached = (src.fileCache || []).find(f => f.path === fileId);
     if (cached && result && result.content && result.content.sha) {
       cached.sha = result.content.sha;
     }
@@ -61375,8 +61447,10 @@ async function tektiteSourceCreateNote(sourceId, title, content) {
     const fname = tektiteSlugify(base) + ".md";
     const filePath = dir ? (dir + "/" + fname) : fname;
     await _tektiteWriteGithubFile(src.repo, filePath, content || "# " + base + "\n\n", src.token, {
-      message: "Create " + fname + " via Gamma Node editor"
-      // no sha -- this is a fresh file
+      message: "Create " + fname + " via Gamma Node editor",
+      // sha: null = create-only. Without it the sha pre-fetch would turn
+      // a title collision into a silent overwrite of the existing file.
+      sha: null
     });
     src.fileCache = null;
     return filePath;
@@ -61397,9 +61471,14 @@ function tektiteSourceIsWritable(sourceId) {
 
 async function tektiteSourceImportToVault(sourceId, fileId) {
   if (sourceId === "vault") return fileId;  // already there
-  const content = await tektiteSourceGetContent(sourceId, fileId);
   const sourceListing = await tektiteSourceListNotes(sourceId);
   const entry = sourceListing.find(e => e.id === fileId);
+  // Reading a binary attachment as UTF-8 text would store irreversible
+  // mojibake as a note -- only markdown entries can be vault notes.
+  if (entry && entry.kind && entry.kind !== "note") {
+    throw new Error("Only markdown notes can be saved to the vault; \"" + fileId + "\" is a " + entry.kind + " file.");
+  }
+  const content = await tektiteSourceGetContent(sourceId, fileId);
   const baseTitle = entry ? entry.title : "imported";
   // Sprint tektite-5a -- preserve the source's folder structure in
   // the vault slug so a forked `journal/2026/06-05.md` lands at
@@ -61525,8 +61604,15 @@ async function _tektiteFetchGithubListing(repo, repoPath, token, depth) {
   return out;
 }
 
+/* Percent-encode a repo-relative path per segment (keeping the `/`
+ * separators) so filenames containing `#`, `?`, `%`, etc. don't get
+ * truncated or reinterpreted by the URL parser. */
+function _tektiteGithubEncodePath(filePath) {
+  return String(filePath || "").split("/").map(encodeURIComponent).join("/");
+}
+
 async function _tektiteFetchGithubFile(repo, filePath, token) {
-  const url = "https://api.github.com/repos/" + repo + "/contents/" + filePath;
+  const url = "https://api.github.com/repos/" + repo + "/contents/" + _tektiteGithubEncodePath(filePath);
   const headers = { "Accept": "application/vnd.github.raw" };
   if (token) headers["Authorization"] = "Bearer " + token;
   const r = await fetch(url, { headers });
@@ -61538,7 +61624,7 @@ async function _tektiteFetchGithubFile(repo, filePath, token) {
  * raw content endpoint doesn't return the sha; we need the JSON
  * variant. Returns the parsed response or throws on 404. */
 async function _tektiteFetchGithubMeta(repo, filePath, token) {
-  const url = "https://api.github.com/repos/" + repo + "/contents/" + filePath;
+  const url = "https://api.github.com/repos/" + repo + "/contents/" + _tektiteGithubEncodePath(filePath);
   const headers = { "Accept": "application/vnd.github+json" };
   if (token) headers["Authorization"] = "Bearer " + token;
   const r = await fetch(url, { headers });
@@ -61551,10 +61637,13 @@ async function _tektiteFetchGithubMeta(repo, filePath, token) {
  * `sha` is provided this updates the existing file; without `sha`
  * GitHub will create the file (or 422 if it already exists). For
  * editor flows we ALWAYS pre-fetch the sha to avoid the 422 surprise
- * when the user edits an existing remote note that wasn't pre-cached. */
+ * when the user edits an existing remote note that wasn't pre-cached.
+ * `opts.sha === null` is a create-only sentinel: the caller asserts the
+ * file is new, so an existing file aborts with an error instead of
+ * being silently replaced. */
 async function _tektiteWriteGithubFile(repo, filePath, content, token, opts) {
   opts = opts || {};
-  const url = "https://api.github.com/repos/" + repo + "/contents/" + filePath;
+  const url = "https://api.github.com/repos/" + repo + "/contents/" + _tektiteGithubEncodePath(filePath);
   const headers = {
     "Accept":        "application/vnd.github+json",
     "Content-Type":  "application/json",
@@ -61564,7 +61653,15 @@ async function _tektiteWriteGithubFile(repo, filePath, content, token, opts) {
   const b64 = _tektiteBase64UnicodeEncode(content);
 
   let sha = opts.sha;
-  if (sha === undefined) {
+  if (sha === null) {
+    // Create-only: abort if the path is already taken rather than
+    // attaching its sha and gutting the existing file.
+    const meta = await _tektiteFetchGithubMeta(repo, filePath, token);
+    if (meta && meta.sha) {
+      throw new Error("GitHub write: \"" + filePath + "\" already exists in the repo. Pick a different title.");
+    }
+    sha = undefined;
+  } else if (sha === undefined) {
     // Pre-fetch to find the latest sha; if 404 it's a fresh file.
     const meta = await _tektiteFetchGithubMeta(repo, filePath, token);
     sha = (meta && meta.sha) || undefined;
@@ -61577,6 +61674,11 @@ async function _tektiteWriteGithubFile(repo, filePath, content, token, opts) {
   if (!r.ok) {
     let detail = "";
     try { detail = (await r.text()).slice(0, 200); } catch (_) {}
+    // 409 = sha mismatch: the file changed on the remote since we last
+    // read it. Make the conflict explicit instead of a bare HTTP code.
+    if (r.status === 409) {
+      throw new Error("GitHub write conflict: \"" + filePath + "\" changed on the remote since it was last loaded. Reload the note and re-apply your edit." + (detail ? (" -- " + detail) : ""));
+    }
     throw new Error("GitHub write: HTTP " + r.status + (detail ? (" -- " + detail) : ""));
   }
   return await r.json();
@@ -61773,6 +61875,60 @@ async function _tektiteLoadMarked() {
   }
 }
 
+/* DOMPurify loader. marked@13 does NOT sanitize (the sanitize option
+ * was removed upstream), so a note body carrying raw HTML like
+ * <img onerror=...> or a [link](javascript:...) would execute in this
+ * origin -- with the whole IndexedDB vault + localStorage keys behind
+ * it. Every preview render is sanitized. If the CDN fetch fails we do
+ * NOT skip sanitizing: tektiteMarkdownRenderInto escapes raw HTML in
+ * the source instead and _tektiteScrubUnsafeDom drops unsafe URLs from
+ * what marked itself emits. */
+let _tektiteDompurifyCache = null;
+async function _tektiteLoadDompurify() {
+  if (_tektiteDompurifyCache !== null) return _tektiteDompurifyCache;
+  try {
+    const m = await import("https://esm.sh/dompurify@3");
+    const dp = m.default || m;
+    if (!dp || typeof dp.sanitize !== "function") {
+      throw new Error("dompurify module did not expose sanitize()");
+    }
+    _tektiteDompurifyCache = dp;
+    return dp;
+  } catch (e) {
+    console.warn("[tektite] DOMPurify load failed; preview escapes raw HTML instead:", e);
+    _tektiteDompurifyCache = false;
+    return false;
+  }
+}
+
+/* Attributes this pipeline injects pre-marked that must survive
+ * sanitization: wikilink click payloads, math placeholders, embed
+ * markers. (`class` and the GFM task-list <input type=checkbox
+ * disabled checked> are already in DOMPurify's default allowlist.) */
+const _TEKTITE_PURIFY_CFG = {
+  ADD_ATTR: ["data-tektite-link", "data-tektite-math", "data-tektite-math-src", "data-tektite-embed-target"]
+};
+
+/* Scrub for the no-DOMPurify path. Raw HTML has been escaped pre-marked
+ * by then, so the live elements are marked's own output plus our
+ * injected placeholders -- but marked still passes javascript: through
+ * link/image URLs. Allow http(s)/mailto/scheme-less URLs, drop the
+ * rest, and strip any on* attribute as belt-and-braces. */
+function _tektiteScrubUnsafeDom(rootEl) {
+  rootEl.querySelectorAll("*").forEach(el => {
+    for (const a of Array.from(el.attributes)) {
+      const name = a.name.toLowerCase();
+      if (/^on/.test(name)) { el.removeAttribute(a.name); continue; }
+      if (name === "href" || name === "src" || name === "xlink:href") {
+        // Control/space chars first: `jav\tascript:` is still live.
+        const flat = a.value.replace(/[\u0000-\u0020]+/g, "").toLowerCase();
+        const hasScheme = /^[a-z][a-z0-9+.-]*:/.test(flat);
+        if (hasScheme && !/^(https?|mailto):/.test(flat)) el.removeAttribute(a.name);
+      }
+    }
+  });
+}
+
 /* Sprint tektite-2c -- KaTeX loader. Renders both inline ($...$) and
  * block ($$...$$) LaTeX math. Loaded lazily on first preview render
  * that contains a $; downloads the JS + CSS together. */
@@ -61836,17 +61992,24 @@ async function _tektiteLoadMermaid() {
  * placeholders survive into the rendered HTML where they get swapped
  * for KaTeX output in _tektiteTransformMath. */
 function _tektitePreprocessMath(text) {
+  // The expression is URI-encoded into an attribute and the span left
+  // EMPTY, so the placeholder is fully opaque to marked. With the
+  // expression as span *content*, marked's inline pass chewed it:
+  // `\\` row separators collapsed to `\`, `*...*` became <em> (deleting
+  // the asterisks), and blank lines split block math across <p>s.
+  // _tektiteTransformMath decodes the attribute back.
+  //
   // Block math first ($$...$$, multi-line). The DOTALL-ish [\s\S]*?
   // makes the inner match nongreedy so $$a$$ b $$c$$ stays as two
   // blocks.
   let processed = text.replace(/\$\$([\s\S]+?)\$\$/g, (whole, expr) => {
-    return '<span data-tektite-math="block">' + _tektiteMdEscapeAttr(expr) + '</span>';
+    return '<span data-tektite-math="block" data-tektite-math-src="' + encodeURIComponent(expr) + '"></span>';
   });
   // Inline math -- single $ on each side, no leading/trailing whitespace
   // inside (so `cost is $5` doesn't trigger). Allows newlines inside
   // since some folks write inline math across linebreaks.
   processed = processed.replace(/(?<![\\$])\$(?!\s)([^\n$]+?)(?<!\s)\$(?!\$)/g, (whole, expr) => {
-    return '<span data-tektite-math="inline">' + _tektiteMdEscapeAttr(expr) + '</span>';
+    return '<span data-tektite-math="inline" data-tektite-math-src="' + encodeURIComponent(expr) + '"></span>';
   });
   return processed;
 }
@@ -61866,7 +62029,12 @@ async function _tektiteTransformMath(rootEl) {
   if (!katex) return;
   nodes.forEach(node => {
     const isBlock = node.getAttribute("data-tektite-math") === "block";
-    const expr = node.textContent;
+    let expr;
+    try {
+      expr = decodeURIComponent(node.getAttribute("data-tektite-math-src") || "");
+    } catch (_) {
+      expr = node.textContent;  // malformed encoding -- render what's visible
+    }
     try {
       const html = katex.renderToString(expr, {
         throwOnError: false,
@@ -61925,6 +62093,22 @@ async function _tektiteTransformMermaid(rootEl) {
   }
 }
 
+/* Mask fenced blocks + inline code spans (same shapes as
+ * _tektiteStripCodeForTags in tags.js) behind inert \x00 tokens so the
+ * transclusion / wikilink / math text passes can't rewrite literal
+ * code. Restored verbatim just before marked, which HTML-escapes code
+ * content itself. */
+function _tektiteMaskCodeSpans(text, store) {
+  const stash = (m) => { store.push(m); return "\u0000TKTCODE" + (store.length - 1) + "\u0000"; };
+  return String(text || "")
+    .replace(/```[\s\S]*?```/g, stash)
+    .replace(/`[^`\n]*`/g, stash);
+}
+function _tektiteUnmaskCodeSpans(text, store) {
+  return text.replace(/\u0000TKTCODE(\d+)\u0000/g, (whole, i) =>
+    store[+i] !== undefined ? store[+i] : whole);
+}
+
 /* Public: render markdown text into a target element. Caller passes
  * the live preview container; we set innerHTML then run the math +
  * mermaid transforms in place on the attached DOM so Mermaid can
@@ -61934,18 +62118,32 @@ async function _tektiteTransformMermaid(rootEl) {
 async function tektiteMarkdownRenderInto(targetEl, text) {
   if (!targetEl) return;
   const marked = await _tektiteLoadMarked();
+  const purify = await _tektiteLoadDompurify();
   // Sprint tektite-4 -- transclusion expansion runs BEFORE the
   // wikilink / math / marked passes. Each ![[…]] resolves to the
   // referenced note's body (or section), wrapped in a
   // <div class="tektite-embed"> so the preview can style it
   // distinctly. Cycles are broken via a visited-set guard.
   let working = String(text || "");
+  // Code regions are masked from every text pass below (incl.
+  // transclusion). Masked a second time after expansion because
+  // embedded note bodies can carry their own fences.
+  const codeStore = [];
+  working = _tektiteMaskCodeSpans(working, codeStore);
   if (typeof tektiteExpandTransclusions === "function") {
     try {
       working = await tektiteExpandTransclusions(working);
     } catch (e) {
       console.warn("[tektite] transclusion expand failed:", e);
     }
+  }
+  working = _tektiteMaskCodeSpans(working, codeStore);
+  if (!purify) {
+    // Sanitizer unavailable: neutralize raw HTML in the (untrusted)
+    // source before marked. Embed wrappers degrade to literal text;
+    // the placeholders injected below survive untouched, and masked
+    // code is restored after this so marked escapes it normally.
+    working = working.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   }
   const withLinks = working.replace(
     TEKTITE_WIKILINK_RE,
@@ -61959,8 +62157,9 @@ async function tektiteMarkdownRenderInto(targetEl, text) {
     }
   );
   const withMath = _tektitePreprocessMath(withLinks);
-  const rawHtml = marked(withMath);
-  targetEl.innerHTML = rawHtml;
+  const rawHtml = marked(_tektiteUnmaskCodeSpans(withMath, codeStore));
+  targetEl.innerHTML = purify ? purify.sanitize(rawHtml, _TEKTITE_PURIFY_CFG) : rawHtml;
+  if (!purify) _tektiteScrubUnsafeDom(targetEl);
   // Transforms run on the LIVE attached DOM so Mermaid + KaTeX can
   // measure layout. KaTeX is sync inside the loop; Mermaid is async
   // per-block (it spins up a temporary SVG to compute text widths).
@@ -62004,9 +62203,16 @@ function _tektiteMakeWikilinkPlugin(cm) {
         while ((m = TEKTITE_WIKILINK_RE.exec(text))) {
           const start = from + m.index;
           const end   = start + m[0].length;
+          // Click payload carries just the navigable target: strip the
+          // |alias half + any #heading suffix, mirroring the preview
+          // renderer's pipe split in tektiteMarkdownRenderInto.
+          const pipe = m[1].match(TEKTITE_PIPE_SPLIT);
+          let target = (pipe ? pipe[1] : m[1]).trim();
+          const hash = target.indexOf("#");
+          if (hash > 0) target = target.slice(0, hash).trim();
           builder.add(start, end, Decoration.mark({
             class: "cm-wikilink",
-            attributes: { "data-tektite-link": m[1] }
+            attributes: { "data-tektite-link": target }
           }));
         }
       }
@@ -62651,10 +62857,20 @@ function _tektiteBacklinksDropNote(noteId) {
 function _tektiteBacklinksIngestNote(noteId, title, content, modifiedAt) {
   // Drop any prior entries for this note before re-ingesting.
   _tektiteBacklinksDropNote(noteId);
-  const links = tektiteMarkdownExtractWikilinks(content);
+  // Strip code fences + inline code before scanning so that wikilinks
+  // inside code blocks/spans don't produce false-positive backlinks
+  // (mirrors _tektiteStripCodeForTags in tags.js).
+  const cleaned = String(content || "")
+    .replace(/```[\s\S]*?```/g, m => " ".repeat(m.length))
+    .replace(/`[^`\n]*`/g,      m => " ".repeat(m.length));
+  const links = tektiteMarkdownExtractWikilinks(cleaned);
   const targets = new Set();
   for (const lnk of links) {
-    targets.add(lnk.target);
+    // Strip #heading / #^block anchors so [[Note#Section]] indexes under
+    // "Note" (the bare note target), matching how the backlinks panel looks
+    // up by note id/title. |alias is already stripped by the extractor.
+    const bare = lnk.target.replace(/#.*$/, "").trim();
+    if (bare) targets.add(bare);
   }
   // Normalize targets to lowercase for case-insensitive matching;
   // store the original on the inverse-set side via a parallel index
@@ -62788,7 +63004,7 @@ function tektiteParseFrontmatter(content) {
   }
   // Find the closing fence -- `---` at the start of a line, not
   // immediately after the opener.
-  const closeRe = /\n---[ \t]*\r?\n/;
+  const closeRe = /\n---[ \t]*\r?(\n|$)/;
   const closeMatch = text.slice(4).match(closeRe);
   if (!closeMatch) {
     return { frontmatter: {}, body: text, bodyStart: 0 };
@@ -62818,7 +63034,7 @@ function _tektiteYamlParse(text) {
       pendingList.push(_tektiteYamlValue(listM[1]));
       continue;
     }
-    const m = raw.match(/^([A-Za-z_][A-Za-z0-9_-]*):\s*(.*)$/);
+    const m = raw.match(/^([A-Za-z_][A-Za-z0-9_-]*):\s*(.*?)\r?$/);
     if (!m) { pendingKey = null; pendingList = null; continue; }
     const key  = m[1];
     const rest = m[2];
@@ -62877,8 +63093,10 @@ function _tektiteYamlValue(raw) {
   const s = String(raw).trim();
   if (!s) return "";
   // Quoted string.
-  if ((s[0] === '"' && s[s.length - 1] === '"') ||
-      (s[0] === "'" && s[s.length - 1] === "'")) {
+  if (s[0] === '"' && s[s.length - 1] === '"') {
+    return s.slice(1, -1).replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+  }
+  if (s[0] === "'" && s[s.length - 1] === "'") {
     return s.slice(1, -1);
   }
   // Booleans / null.
@@ -62974,8 +63192,9 @@ const _tektiteTagsState = {
  *                       allow word chars, slash, hyphen
  *
  * The negative left boundary specifically excludes `/` to skip
- * `https://example.com/#section` and `\w` to skip cases like `foo#bar`. */
-const _TEKTITE_TAG_RE = /(^|[^\w/])#([A-Za-z][\w/-]*)/g;
+ * `https://example.com/#section`, `\w` to skip cases like `foo#bar`, and
+ * `(` to skip markdown internal anchor links like `[text](#anchor)`. */
+const _TEKTITE_TAG_RE = /(^|[^\w/(])#([A-Za-z][\w/-]*)/g;
 
 /* Strip code fences + inline code so we don't extract tags from
  * literal source like ```bash\necho #comment\n```. The replacement
@@ -63030,10 +63249,12 @@ function _tektiteTagsDropNote(noteId) {
 
 function _tektiteTagsIngestNote(noteId, title, content, modifiedAt) {
   _tektiteTagsDropNote(noteId);
-  const fm = (typeof tektiteParseFrontmatter === "function")
-    ? tektiteParseFrontmatter(content).frontmatter
-    : {};
-  const tags = tektiteExtractTags(content, fm);
+  const parsed = (typeof tektiteParseFrontmatter === "function")
+    ? tektiteParseFrontmatter(content)
+    : { frontmatter: {}, body: content };
+  const fm   = parsed.frontmatter || {};
+  const body = parsed.body != null ? parsed.body : content;
+  const tags = tektiteExtractTags(body, fm);
   _tektiteTagsState.forward.set(noteId, tags);
   for (const t of tags) {
     if (!_tektiteTagsState.inverse.has(t)) {
@@ -63203,7 +63424,8 @@ function _tektiteMatchProp(value, op, target) {
   // Numeric path first.
   const vNum = (typeof value === "number") ? value : parseFloat(value);
   const tNum = parseFloat(target);
-  if (Number.isFinite(vNum) && Number.isFinite(tNum) && String(vNum) === String(value).trim()) {
+  if (Number.isFinite(vNum) && Number.isFinite(tNum) &&
+      (typeof value === "number" || /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(String(value).trim()))) {
     switch (op) {
       case "=":  return vNum === tNum;
       case "!=": return vNum !== tNum;
@@ -64202,6 +64424,7 @@ function tektiteGraphLayoutTree(nodes, edges, rootId) {
       nodes[idx].y  = lvl * levelH - 150;
       nodes[idx].vx = 0;
       nodes[idx].vy = 0;
+      nodes[idx]._depth = 0;
     });
   }
 }
@@ -64223,6 +64446,7 @@ function tektiteGraphLayoutRadial(nodes, edges, rootId) {
       list.forEach(idx => {
         nodes[idx].x = 0; nodes[idx].y = 0;
         nodes[idx].vx = 0; nodes[idx].vy = 0;
+        nodes[idx]._depth = 0;
       });
       continue;
     }
@@ -64234,6 +64458,7 @@ function tektiteGraphLayoutRadial(nodes, edges, rootId) {
       nodes[idx].y  = Math.sin(a) * r;
       nodes[idx].vx = 0;
       nodes[idx].vy = 0;
+      nodes[idx]._depth = 0;
     });
   }
 }
@@ -64260,6 +64485,7 @@ function tektiteGraphLayoutSunburst(nodes, edges, rootId) {
   // Place root at origin.
   nodes[rootIdx].x = 0; nodes[rootIdx].y = 0;
   nodes[rootIdx].vx = 0; nodes[rootIdx].vy = 0;
+  nodes[rootIdx]._depth = 0;
   function place(idx, level, a0, a1) {
     const ch = bfs.children.get(idx) || [];
     if (!ch.length) return;
@@ -64274,6 +64500,7 @@ function tektiteGraphLayoutSunburst(nodes, edges, rootId) {
       nodes[c].y  = Math.sin(aMid) * r;
       nodes[c].vx = 0;
       nodes[c].vy = 0;
+      nodes[c]._depth = 0;
       place(c, level + 1, aCur, aCur + span);
       aCur += span;
     }
@@ -64403,8 +64630,9 @@ function tektiteGraphLayoutCalendar(nodes /*, edges */) {
  * matrix / chord / sankey / tagcloud / geo / kanban.
  *
  * Each layout mutates nodes[].x/y in place.  Layouts whose visual
- * needs differ from the default circle+line renderer also set
- * window._tektiteGraphDrawHook (read by draw()) -- when set, the
+ * needs differ from the default circle+line renderer also register a
+ * draw hook into the `hooks` map the renderer passes in (per-instance;
+ * falls back to the module map for direct calls) -- when set, the
  * renderer skips its default node + edge passes and invokes the hook
  * instead, which renders matrix cells / chord arcs / sankey ribbons
  * / tag glyphs / etc.
@@ -64413,12 +64641,12 @@ function tektiteGraphLayoutCalendar(nodes /*, edges */) {
  * cheap O(N+E) placement; matrix / chord pay an extra O(E) on the
  * draw side but still settle inside the budget for vaults <= ~500. */
 
-const _tektiteGraphDrawHooks = {};   // mode -> (ctx, nodes, edges, viewState) => void
+const _tektiteGraphDrawHooks = {};   // fallback sink only: mode -> (ctx, nodes, edges, viewState) => void
 
 /* Kanban: columns by frontmatter status (or "untagged" fallback).
  * Note positions stack vertically in their column.  No custom draw;
  * default circles work well as cards. */
-function tektiteGraphLayoutKanban(nodes /*, edges */) {
+function tektiteGraphLayoutKanban(nodes, edges, hooks) {
   if (!nodes.length) return;
   const colMap = new Map();   // status -> nodes[]
   for (const n of nodes) {
@@ -64450,7 +64678,7 @@ function tektiteGraphLayoutKanban(nodes /*, edges */) {
     });
   });
   // Kanban column header draw hook.
-  _tektiteGraphDrawHooks.kanban = function (ctx /*, nodes, edges, vs */) {
+  (hooks || _tektiteGraphDrawHooks).kanban = function (ctx /*, nodes, edges, vs */) {
     ctx.save();
     ctx.font = "12px ui-sans-serif, system-ui, sans-serif";
     ctx.fillStyle = "rgba(200, 232, 90, 0.85)";
@@ -64466,7 +64694,7 @@ function tektiteGraphLayoutKanban(nodes /*, edges */) {
 
 /* Geo: project frontmatter.location (or lat/lon) onto a flat
  * equirectangular plate.  Notes without coords pile up off the grid. */
-function tektiteGraphLayoutGeo(nodes /*, edges */) {
+function tektiteGraphLayoutGeo(nodes, edges, hooks) {
   if (!nodes.length) return;
   function pickLatLon(fm) {
     if (!fm) return null;
@@ -64498,7 +64726,7 @@ function tektiteGraphLayoutGeo(nodes /*, edges */) {
     }
     n.vx = 0; n.vy = 0; n._depth = 0;
   }
-  _tektiteGraphDrawHooks.geo = function (ctx /*, nodes, edges, vs */) {
+  (hooks || _tektiteGraphDrawHooks).geo = function (ctx /*, nodes, edges, vs */) {
     ctx.save();
     // Equirectangular grid.
     ctx.strokeStyle = "rgba(95, 184, 212, 0.25)";
@@ -64527,28 +64755,27 @@ function tektiteGraphLayoutGeo(nodes /*, edges */) {
 /* Tag cloud: count tags from frontmatter.tags + inline #tags, place
  * each TAG as a text glyph sized by frequency.  Notes are positioned
  * but invisible (the custom draw paints tags instead). */
-function tektiteGraphLayoutTagcloud(nodes /*, edges */) {
+function tektiteGraphLayoutTagcloud(nodes, edges, hooks) {
   if (!nodes.length) return;
   const counts = new Map();
+  const nodeTag = new Map();   // node -> first tag, for parking below
   for (const n of nodes) {
     const fmTags = (n.frontmatter && n.frontmatter.tags) || [];
     const arr = Array.isArray(fmTags) ? fmTags : String(fmTags).split(/[\s,]+/);
     for (let t of arr) {
       t = String(t || "").replace(/^#/, "").trim();
-      if (t) counts.set(t, (counts.get(t) || 0) + 1);
+      if (t) {
+        counts.set(t, (counts.get(t) || 0) + 1);
+        if (!nodeTag.has(n)) nodeTag.set(n, t);
+      }
     }
     // Also scan the title for inline #tags as a cheap fallback.
     const inline = (n.title || "").match(/#([\w-]+)/g);
     if (inline) for (const m of inline) {
       const t = m.slice(1);
       counts.set(t, (counts.get(t) || 0) + 1);
+      if (!nodeTag.has(n)) nodeTag.set(n, t);
     }
-  }
-  // Place ALL nodes off-screen so the default renderer doesn't draw
-  // any circles -- tag glyphs in the draw hook are the only visible
-  // marks for this layout.
-  for (const n of nodes) {
-    n.x = 1e6; n.y = 1e6; n.vx = 0; n.vy = 0; n._depth = 0;
   }
   // Sort tags by count, then place along an Archimedean spiral.
   const entries = Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);
@@ -64559,7 +64786,18 @@ function tektiteGraphLayoutTagcloud(nodes /*, edges */) {
     angle += 0.7;
     radius += 4 + c * 1.5;
   }
-  _tektiteGraphDrawHooks.tagcloud = function (ctx /*, nodes, edges, vs */) {
+  // Park each node on its first tag's glyph (untagged -> spiral
+  // center).  The circles stay hidden (skipNodes policy) but fit()
+  // and hit-testing read x/y -- the old 1e6 sentinel made fit() zoom
+  // eight million px away from the glyphs, rendering a blank canvas.
+  const glyphAt = new Map(placements.map(p => [p.tag, p]));
+  for (const n of nodes) {
+    const p = glyphAt.get(nodeTag.get(n));
+    n.x = p ? p.x : 0;
+    n.y = p ? p.y : 0;
+    n.vx = 0; n.vy = 0; n._depth = 0;
+  }
+  (hooks || _tektiteGraphDrawHooks).tagcloud = function (ctx /*, nodes, edges, vs */) {
     ctx.save();
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
@@ -64583,7 +64821,7 @@ function _tektiteGraphSimpleHash(s) {
 /* Chord: nodes evenly spaced around a circle; edges drawn as quad-
  * bezier curves through the center.  Hover highlights the active
  * node's chords. */
-function tektiteGraphLayoutChord(nodes, edges) {
+function tektiteGraphLayoutChord(nodes, edges, hooks) {
   if (!nodes.length) return;
   // Sort by degree descending so heavy hubs sit next to each other,
   // making chord clusters easier to read.
@@ -64595,7 +64833,7 @@ function tektiteGraphLayoutChord(nodes, edges) {
     nodes[idx].y = Math.sin(a) * R;
     nodes[idx].vx = 0; nodes[idx].vy = 0; nodes[idx]._depth = 0;
   });
-  _tektiteGraphDrawHooks.chord = function (ctx, ns, es) {
+  (hooks || _tektiteGraphDrawHooks).chord = function (ctx, ns, es) {
     ctx.save();
     ctx.lineCap = "round";
     for (const e of es) {
@@ -64615,7 +64853,7 @@ function tektiteGraphLayoutChord(nodes, edges) {
 
 /* Matrix: adjacency matrix layout.  N nodes on the diagonal; off-
  * diagonal cells indicate edges. */
-function tektiteGraphLayoutMatrix(nodes /*, edges */) {
+function tektiteGraphLayoutMatrix(nodes, edges, hooks) {
   if (!nodes.length) return;
   const cell = 14;
   const half = (nodes.length - 1) * cell / 2;
@@ -64624,7 +64862,7 @@ function tektiteGraphLayoutMatrix(nodes /*, edges */) {
     n.y = i * cell - half;
     n.vx = 0; n.vy = 0; n._depth = 0;
   });
-  _tektiteGraphDrawHooks.matrix = function (ctx, ns, es) {
+  (hooks || _tektiteGraphDrawHooks).matrix = function (ctx, ns, es) {
     ctx.save();
     const N = ns.length;
     const left = -half - cell / 2;
@@ -64660,7 +64898,7 @@ function tektiteGraphLayoutMatrix(nodes /*, edges */) {
 
 /* Sankey: 3-column flow.  source (no incoming) -> hub (both) -> sink
  * (no outgoing).  Disconnected go to a 4th column "isolates". */
-function tektiteGraphLayoutSankey(nodes, edges) {
+function tektiteGraphLayoutSankey(nodes, edges, hooks) {
   if (!nodes.length) return;
   const incoming = new Map();
   const outgoing = new Map();
@@ -64690,7 +64928,7 @@ function tektiteGraphLayoutSankey(nodes, edges) {
       n._sankeyCol = k;
     });
   });
-  _tektiteGraphDrawHooks.sankey = function (ctx, ns, es) {
+  (hooks || _tektiteGraphDrawHooks).sankey = function (ctx, ns, es) {
     ctx.save();
     // Flow ribbons -- thin gradient strokes between connected nodes.
     for (const e of es) {
@@ -64720,6 +64958,15 @@ function tektiteGraphLayoutSankey(nodes, edges) {
     ctx.restore();
   };
 }
+
+/* Every layout mode the renderer accepts -- shared by setLayout()'s
+ * validation and the constructor's opts.layout normalization so the
+ * two can't drift apart. */
+const _tektiteGraphKnownLayouts = new Set([
+  "force", "tree", "radial", "sunburst",
+  "embedding-2d", "galaxy", "timeline", "calendar",
+  "matrix", "chord", "sankey", "tagcloud", "geo", "kanban"
+]);
 
 /* Canvas renderer + interaction layer. Returns a control handle; the
  * caller owns the canvas element + decides when to start/stop. */
@@ -64755,6 +65002,12 @@ function tektiteGraphRenderer(canvas, graph, opts) {
     kanban:   { skipEdges: false, skipNodes: false }
   };
 
+  /* Per-INSTANCE draw hooks.  The module-level _tektiteGraphDrawHooks
+   * map let coexisting renderers (a GraphCard + the graph modal) delete
+   * or overwrite each other's hooks; each instance now owns its own
+   * map (passed to the layout functions) and draw() reads it first. */
+  const drawHooks = {};
+
   function draw() {
     const w = canvas.width  = canvas.clientWidth  * (window.devicePixelRatio || 1);
     const h = canvas.height = canvas.clientHeight * (window.devicePixelRatio || 1);
@@ -64769,7 +65022,7 @@ function tektiteGraphRenderer(canvas, graph, opts) {
     ctx.scale(scale, scale);
 
     const policy = _drawPolicy[layoutMode] || { skipEdges: false, skipNodes: false };
-    const hook = _tektiteGraphDrawHooks[layoutMode];
+    const hook = drawHooks[layoutMode] || _tektiteGraphDrawHooks[layoutMode];
     if (typeof hook === "function") {
       try { hook(ctx, nodes, edges, { scale, offsetX, offsetY }); }
       catch (e) { console.warn("[graph] custom draw hook failed:", e); }
@@ -64874,22 +65127,34 @@ function tektiteGraphRenderer(canvas, graph, opts) {
   let iterations = 0;
   const MAX_ITERATIONS = 500;
   /* Sprint 5 -- active layout mode.  "force" runs the physics sim;
-   * tree / radial / sunburst are one-shot deterministic placements
-   * recomputed on setLayout(). */
-  let layoutMode = (opts.layout === "tree" || opts.layout === "radial" || opts.layout === "sunburst")
-    ? opts.layout : "force";
+   * the rest are one-shot deterministic placements recomputed on
+   * setLayout().  Validated against the same known-mode set setLayout
+   * uses -- both callers pass the user's persisted selection on every
+   * rebuild, and the old tree/radial/sunburst-only check silently
+   * dumped the other 10 modes back to force. */
+  let layoutMode = _tektiteGraphKnownLayouts.has(opts.layout) ? opts.layout : "force";
   if (layoutMode !== "force") {
-    applyStaticLayout(layoutMode);
+    if (layoutMode === "embedding-2d" || layoutMode === "galaxy") {
+      // Embedding vectors load async; keep the circle seed until the
+      // fetch resolves, then place + refit (unless the mode changed).
+      const m = layoutMode;
+      ensureEmbeddings()
+        .then(() => { if (layoutMode === m) { applyStaticLayout(m); fit(); } })
+        .catch((e) => console.warn("[graph] embeddings:", e));
+    } else {
+      applyStaticLayout(layoutMode);
+    }
   }
 
   function applyStaticLayout(mode) {
-    // Drop any prior custom drawer so it doesn't bleed into the new mode.
-    delete _tektiteGraphDrawHooks.matrix;
-    delete _tektiteGraphDrawHooks.chord;
-    delete _tektiteGraphDrawHooks.sankey;
-    delete _tektiteGraphDrawHooks.tagcloud;
-    delete _tektiteGraphDrawHooks.geo;
-    delete _tektiteGraphDrawHooks.kanban;
+    // Drop this instance's prior custom drawer so it doesn't bleed
+    // into the new mode (other renderers' hooks stay untouched).
+    delete drawHooks.matrix;
+    delete drawHooks.chord;
+    delete drawHooks.sankey;
+    delete drawHooks.tagcloud;
+    delete drawHooks.geo;
+    delete drawHooks.kanban;
     if (mode === "tree")              tektiteGraphLayoutTree         (nodes, edges, selectedId);
     else if (mode === "radial")       tektiteGraphLayoutRadial       (nodes, edges, selectedId);
     else if (mode === "sunburst")     tektiteGraphLayoutSunburst     (nodes, edges, selectedId);
@@ -64897,12 +65162,12 @@ function tektiteGraphRenderer(canvas, graph, opts) {
     else if (mode === "galaxy")       tektiteGraphLayoutGalaxy       (nodes, edges);
     else if (mode === "timeline")     tektiteGraphLayoutTimeline     (nodes, edges);
     else if (mode === "calendar")     tektiteGraphLayoutCalendar     (nodes, edges);
-    else if (mode === "matrix")       tektiteGraphLayoutMatrix       (nodes, edges);
-    else if (mode === "chord")        tektiteGraphLayoutChord        (nodes, edges);
-    else if (mode === "sankey")       tektiteGraphLayoutSankey       (nodes, edges);
-    else if (mode === "tagcloud")     tektiteGraphLayoutTagcloud     (nodes, edges);
-    else if (mode === "geo")          tektiteGraphLayoutGeo          (nodes, edges);
-    else if (mode === "kanban")       tektiteGraphLayoutKanban       (nodes, edges);
+    else if (mode === "matrix")       tektiteGraphLayoutMatrix       (nodes, edges, drawHooks);
+    else if (mode === "chord")        tektiteGraphLayoutChord        (nodes, edges, drawHooks);
+    else if (mode === "sankey")       tektiteGraphLayoutSankey       (nodes, edges, drawHooks);
+    else if (mode === "tagcloud")     tektiteGraphLayoutTagcloud     (nodes, edges, drawHooks);
+    else if (mode === "geo")          tektiteGraphLayoutGeo          (nodes, edges, drawHooks);
+    else if (mode === "kanban")       tektiteGraphLayoutKanban       (nodes, edges, drawHooks);
   }
 
   /* Sprint 6 -- embedding modes need n._embedding populated.  This
@@ -64988,7 +65253,11 @@ function tektiteGraphRenderer(canvas, graph, opts) {
     return best;
   }
 
-  canvas.addEventListener("pointerdown", (e) => {
+  // Named handlers so destroy() can removeEventListener them -- both
+  // call sites reuse one persistent canvas across rebuilds, and the
+  // old anonymous listeners left every replaced renderer live (its
+  // stale node array repainting over the new graph on pointer events).
+  function onPointerDown(e) {
     canvas.setPointerCapture(e.pointerId);
     const idx = nodeAtScreen(e.clientX, e.clientY);
     if (idx >= 0) {
@@ -65003,8 +65272,8 @@ function tektiteGraphRenderer(canvas, graph, opts) {
       panLastX = e.clientX; panLastY = e.clientY;
     }
     wake();
-  });
-  canvas.addEventListener("pointermove", (e) => {
+  }
+  function onPointerMove(e) {
     if (dragIdx >= 0) {
       const p = screenToGraph(e.clientX, e.clientY);
       nodes[dragIdx].x = p.x; nodes[dragIdx].y = p.y;
@@ -65023,8 +65292,8 @@ function tektiteGraphRenderer(canvas, graph, opts) {
       if (idx !== hoverIdx) { hoverIdx = idx; redrawOnly(); }
       canvas.style.cursor = (idx >= 0) ? "pointer" : "grab";
     }
-  });
-  canvas.addEventListener("pointerup", (e) => {
+  }
+  function onPointerUp(e) {
     canvas.releasePointerCapture(e.pointerId);
     // Tap-without-drag on a node -> click. Tolerance bumped from 4 px
     // to 8 px so a tiny finger jitter doesn't downgrade a click into
@@ -65040,8 +65309,8 @@ function tektiteGraphRenderer(canvas, graph, opts) {
     dragIdx = -1; panning = false;
     canvas.style.cursor = "grab";
     redrawOnly();
-  });
-  canvas.addEventListener("wheel", (e) => {
+  }
+  function onWheel(e) {
     e.preventDefault();
     const factor = Math.exp(-e.deltaY * 0.0015);
     // Zoom toward the cursor: shift offset so that screenToGraph(cursor)
@@ -65053,7 +65322,11 @@ function tektiteGraphRenderer(canvas, graph, opts) {
     offsetY = cy - (cy - offsetY) * factor;
     scale = Math.max(0.1, Math.min(8, scale * factor));
     redrawOnly();  // sprint tektite-5b1 -- zoom is a view-only change
-  }, { passive: false });
+  }
+  canvas.addEventListener("pointerdown", onPointerDown);
+  canvas.addEventListener("pointermove", onPointerMove);
+  canvas.addEventListener("pointerup",   onPointerUp);
+  canvas.addEventListener("wheel",       onWheel, { passive: false });
 
   // Initial render.
   draw();
@@ -65114,21 +65387,23 @@ function tektiteGraphRenderer(canvas, graph, opts) {
      * selectedId and the current zoom/offset (camera intent).
      * Async for embedding-* modes (vector fetch); sync otherwise. */
     setLayout: async (mode) => {
-      const known = new Set([
-        "force", "tree", "radial", "sunburst",
-        "embedding-2d", "galaxy", "timeline", "calendar",
-        "matrix", "chord", "sankey", "tagcloud", "geo", "kanban"
-      ]);
-      if (!known.has(mode)) return;
+      if (!_tektiteGraphKnownLayouts.has(mode)) return;
       layoutMode = mode;
       if (mode === "embedding-2d" || mode === "galaxy") {
         try { await ensureEmbeddings(); } catch (e) { console.warn("[graph] embeddings:", e); }
       }
       if (mode === "force") {
+        // Re-seed non-finite AND coincident positions -- after tagcloud
+        // many nodes share one glyph spot, and exactly-coincident pairs
+        // produce zero repulsion (dx=dy=0), collapsing the sim to a dot.
+        const seen = new Set();
         for (const n of nodes) {
-          if (!isFinite(n.x) || !isFinite(n.y)) {
+          const key = Math.round(n.x * 10) + "," + Math.round(n.y * 10);
+          if (!isFinite(n.x) || !isFinite(n.y) || seen.has(key)) {
             n.x = (Math.random() - 0.5) * 200;
             n.y = (Math.random() - 0.5) * 200;
+          } else {
+            seen.add(key);
           }
           n.vx = 0; n.vy = 0;
           n._depth = 0;
@@ -65151,6 +65426,10 @@ function tektiteGraphRenderer(canvas, graph, opts) {
       running = false;
       if (rafId) cancelAnimationFrame(rafId);
       viewportListener = null;
+      canvas.removeEventListener("pointerdown", onPointerDown);
+      canvas.removeEventListener("pointermove", onPointerMove);
+      canvas.removeEventListener("pointerup",   onPointerUp);
+      canvas.removeEventListener("wheel",       onWheel);
     }
   };
 }
@@ -65213,7 +65492,8 @@ function _tektiteGraphTexNodeState(node) {
       texH:          0,
       iterations:    0,
       kineticEnergy: 0,
-      lastUploadAt:  0
+      lastUploadAt:  0,
+      drawSig:       ""
     };
     _tektiteGraphTexState.set(node.id, st);
   }
@@ -65223,6 +65503,21 @@ function _tektiteGraphTexNodeState(node) {
 function _tektiteConfigSig(node) {
   const p = node.params || {};
   return [p.mode || "global", p.depth | 0, p.centerId || "", p.minDegree | 0].join("|");
+}
+
+// Signature covering all params that affect pixel content but not
+// graph topology (topology is covered by _tektiteConfigSig). When this
+// changes on a settled node we need one fresh draw+upload.
+function _tektiteDrawSig(node) {
+  const p = node.params || {};
+  const w = Math.max(64, Math.min(2048, (p.width  | 0) || 512));
+  const h = Math.max(64, Math.min(2048, (p.height | 0) || 512));
+  const n = (v, d) => (typeof v === "number" ? v : d).toFixed(4);
+  return [w, h,
+    n(p.bgR, 0.04), n(p.bgG, 0.05), n(p.bgB, 0.09),
+    n(p.edgeR, 0.61), n(p.edgeG, 0.81), n(p.edgeB, 1.0), n(p.edgeA, 0.30),
+    n(p.nodeR, 0.78), n(p.nodeG, 0.91), n(p.nodeB, 0.35)
+  ].join("|");
 }
 
 async function _tektiteBuildGraphForNode(node, st) {
@@ -65273,6 +65568,9 @@ function _tektiteEnsureTexture(node, st) {
     st.view = st.texture.createView();
   }
   st.texW = w; st.texH = h;
+  // Force a fresh draw+upload so the new (blank) texture gets content
+  // even if the sim has already settled.
+  st.lastUploadAt = 0;
 }
 
 function _tektiteDrawGraphFrame(st, node) {
@@ -65378,10 +65676,22 @@ function _tektiteUploadToTexture(st) {
 function tickTektiteGraphTextures(dtSec) {
   if (typeof state === "undefined" || !state || !Array.isArray(state.nodes)) return;
   if (typeof Visual === "undefined" || !Visual.device) return;
+
+  // Collect live TektiteGraph ids so we can prune stale map entries
+  // (prevents VRAM leaks when nodes are deleted or patches are cycled).
+  const liveIds = new Set();
   for (let i = 0; i < state.nodes.length; i++) {
     const n = state.nodes[i];
     if (!n || n.type !== "TektiteGraph") continue;
+    liveIds.add(n.id);
     _tickTektiteGraphNode(n, dtSec);
+  }
+  // Destroy + remove entries for deleted nodes.
+  for (const [id, st] of _tektiteGraphTexState) {
+    if (!liveIds.has(id)) {
+      if (st.texture) { try { st.texture.destroy(); } catch (_) {} }
+      _tektiteGraphTexState.delete(id);
+    }
   }
 }
 
@@ -65403,6 +65713,14 @@ function _tickTektiteGraphNode(node, dtSec) {
   _tektiteEnsureTexture(node, st);
   if (!st.texture || !st.ctx) return;
 
+  // If color or dimension params changed since the last upload, force
+  // a redraw even if the sim is settled (lastUploadAt reset triggers
+  // the else-if branch below on the very next tick).
+  const dsig = _tektiteDrawSig(node);
+  if (dsig !== st.drawSig && st.lastUploadAt !== 0) {
+    st.lastUploadAt = 0;
+  }
+
   // Sim cap -- after 500 iters the layout force-settles. Same logic
   // as the modal renderer in graph.js so the texture matches what
   // the user sees in the graph view.
@@ -65415,12 +65733,13 @@ function _tickTektiteGraphNode(node, dtSec) {
     _tektiteDrawGraphFrame(st, node);
     _tektiteUploadToTexture(st);
     st.lastUploadAt = performance.now();
+    st.drawSig = dsig;
   } else if (st.lastUploadAt === 0) {
-    // First-time settle path -- draw + upload once even if KE was
-    // tiny from the build.
+    // First-time settle path, or forced redraw after a param change.
     _tektiteDrawGraphFrame(st, node);
     _tektiteUploadToTexture(st);
     st.lastUploadAt = performance.now();
+    st.drawSig = dsig;
   }
 
   // Stash the texture entry so the existing visual pipeline's
@@ -65512,9 +65831,13 @@ const TEKTITE_BASE_DEFAULTS = {
 
 function _tektiteBaseIsBase(note) {
   if (!note || !note.content) return false;
-  // Cheap detection without re-parsing frontmatter -- look for the
-  // marker line.  Real load goes through tektiteParseFrontmatter.
-  return /^---[\s\S]*?\btektite-base:\s*(true|True|TRUE)\b/.test(note.content);
+  // Cheap detection without re-parsing frontmatter -- but match only
+  // within the YAML frontmatter block (between the two --- fences); a
+  // note that merely *mentions* tektite-base in its body must not be
+  // detected as a base.  Real load goes through tektiteParseFrontmatter.
+  const m = note.content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!m) return false;
+  return /\btektite-base:\s*(true|True|TRUE)\b/.test(m[1]);
 }
 
 async function tektiteBaseListAll() {
@@ -65661,7 +65984,7 @@ async function tektiteBaseExecute(config) {
     if (va instanceof Date && vb instanceof Date) return (va - vb) * dirMul;
     const na = (va instanceof Date) ? va.getTime() : Number(va);
     const nb = (vb instanceof Date) ? vb.getTime() : Number(vb);
-    if (Number.isFinite(na) && Number.isFinite(nb) && (na !== 0 || vb !== "0") && (nb !== 0 || vb !== "0")) {
+    if (Number.isFinite(na) && Number.isFinite(nb) && (na !== 0 || va !== "0") && (nb !== 0 || vb !== "0")) {
       return (na - nb) * dirMul;
     }
     return String(va || "").localeCompare(String(vb || "")) * dirMul;
@@ -65729,6 +66052,22 @@ function _tektiteBaseMatchProp(value, op, target) {
       case "<":  return vNum <  tNum;
       case ">=": return vNum >= tNum;
       case "<=": return vNum <= tNum;
+    }
+  }
+  // Date path. Treat target as ISO if it parses.
+  if (value instanceof Date) {
+    const tDate = new Date(target);
+    if (!Number.isNaN(tDate.getTime())) {
+      const v = value.getTime();
+      const t = tDate.getTime();
+      switch (op) {
+        case "=":  return v === t;
+        case "!=": return v !== t;
+        case ">":  return v >  t;
+        case "<":  return v <  t;
+        case ">=": return v >= t;
+        case "<=": return v <= t;
+      }
     }
   }
   if (Array.isArray(value)) {
@@ -65820,7 +66159,11 @@ async function tektiteBaseDiscoverProperties() {
 
 function _tektiteCanvasIsCanvas(note) {
   if (!note || !note.content) return false;
-  return /^---[\s\S]*?\btektite-canvas:\s*(true|True|TRUE)\b/.test(note.content);
+  // Match only within the YAML frontmatter block (between the two --- fences).
+  // A plain note that merely *mentions* tektite-canvas in its body must not match.
+  const m = note.content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!m) return false;
+  return /\btektite-canvas:\s*(true|True|TRUE)\b/.test(m[1]);
 }
 
 async function tektiteCanvasListAll() {
@@ -65849,8 +66192,13 @@ async function tektiteCanvasLoad(id) {
   try {
     doc = JSON.parse(parsed.body.trim() || "{}");
   } catch (e) {
-    console.warn("[tektite-canvas] parse failed, starting fresh:", e);
+    console.warn("[tektite-canvas] JSON parse failed – opening read-only to protect original body:", e);
+    // Do NOT fall back to an empty doc: autosave would then permanently destroy
+    // the original content. Instead return a corrupt-flagged doc so the caller
+    // can show a warning and tektiteCanvasSave will refuse to overwrite.
     doc = tektiteCanvasNewDoc();
+    doc._corrupt      = true;
+    doc._corruptBody  = parsed.body;  // stash for possible manual recovery
   }
   if (!Array.isArray(doc.nodes)) doc.nodes = [];
   if (!Array.isArray(doc.edges)) doc.edges = [];
@@ -65878,6 +66226,13 @@ async function tektiteCanvasCreate(title) {
 }
 
 async function tektiteCanvasSave(id, doc) {
+  // Refuse to overwrite a note whose body failed to parse – the corrupt flag
+  // is set by tektiteCanvasLoad when JSON.parse throws, so we have no valid
+  // nodes/edges to persist and must not destroy the original body.
+  if (doc && doc._corrupt) {
+    console.warn("[tektite-canvas] save blocked: doc is flagged corrupt, original body preserved");
+    return;
+  }
   const existing = await tektiteGetNote(id);
   if (!existing) throw new Error("Canvas note not found: " + id);
   const parsed = tektiteParseFrontmatter(existing.content);
@@ -66135,6 +66490,20 @@ function _tektiteCardEnsureBody(node, st) {
     nodeEl.appendChild(grip);
     _tektiteCardWireGrip(node, grip, body);
   }
+  // render() tears the node DOM down without firing blur on a focused
+  // textarea (WHATWG focus-fixup), so a mid-edit re-render would leave
+  // st.editing latched forever and the blur flush never runs. Flush
+  // the OLD textarea's pending edit before st.editEl is repointed at
+  // the new (empty) one, then drop edit mode.
+  if (fresh && st.editing) {
+    if (st.saveTimer) {
+      clearTimeout(st.saveTimer);
+      st.saveTimer = null;
+      if (st.editEl) _tektiteCardCommitEdit(node, st, st.editEl.value || "");
+    }
+    st.editing = false;
+    body.classList.remove("editing");
+  }
   st.body       = body;
   st.bodyNodeEl = nodeEl;
   st.renderEl   = body.querySelector(".tektite-card-render");
@@ -66209,6 +66578,10 @@ function _tektiteCardWireBody(node, body) {
     st.editing = true;
     // Initialize textarea from the current source.
     editEl.value = _tektiteCardSourceText(node, st);
+    // Pre-edit snapshot for Escape-revert -- the debounced autosave
+    // overwrites params (and the vault note) long before Escape, so
+    // re-reading the "source" at Escape time would revert nothing.
+    st.editOriginal = editEl.value;
     body.classList.add("editing");
     renderEl.style.display = "none";
     editEl.style.display = "block";
@@ -66230,13 +66603,23 @@ function _tektiteCardWireBody(node, body) {
   editEl.addEventListener("pointerdown", (e) => e.stopPropagation());
   editEl.addEventListener("input", () => {
     const st = _tektiteCardGetState(node);
+    // Capture the value NOW -- a canvas render() can detach this
+    // textarea before the debounce fires, and st.editEl would then
+    // point at a fresh EMPTY one (wiping the linked vault note).
+    const val = editEl.value || "";
     if (st.saveTimer) clearTimeout(st.saveTimer);
-    st.saveTimer = setTimeout(() => _tektiteCardCommitEdit(node, st), 400);
+    st.saveTimer = setTimeout(() => {
+      st.saveTimer = null;
+      _tektiteCardCommitEdit(node, st, val);
+    }, 400);
   });
   editEl.addEventListener("blur", () => {
     const st = _tektiteCardGetState(node);
+    // Drop the pending debounce so it can't re-commit edited text
+    // after an Escape-revert; the flush below saves the final value.
+    if (st.saveTimer) { clearTimeout(st.saveTimer); st.saveTimer = null; }
     // Flush on blur so a quick-edit-and-click-away saves.
-    _tektiteCardCommitEdit(node, st);
+    _tektiteCardCommitEdit(node, st, editEl.value || "");
     st.editing = false;
     body.classList.remove("editing");
     renderEl.style.display = "";
@@ -66250,9 +66633,13 @@ function _tektiteCardWireBody(node, body) {
   editEl.addEventListener("keydown", (e) => {
     e.stopPropagation();
     if (e.key === "Escape") {
-      // Revert: refill from source, drop edit mode.
+      // Revert: restore the pre-edit snapshot (params already hold
+      // autosaved edits), drop edit mode. The blur flush re-commits
+      // the snapshot to params + the linked vault note.
       const st = _tektiteCardGetState(node);
-      editEl.value = _tektiteCardSourceText(node, st);
+      editEl.value = (typeof st.editOriginal === "string")
+        ? st.editOriginal
+        : _tektiteCardSourceText(node, st);
       editEl.blur();
     }
   });
@@ -66269,9 +66656,15 @@ function _tektiteCardSourceText(node, st) {
 
 /* Persist whatever's in the textarea back to params + (if linked) the
  * vault note. Lightweight + idempotent. */
-async function _tektiteCardCommitEdit(node, st) {
-  if (!node || !st || !st.editEl) return;
-  const raw = st.editEl.value || "";
+async function _tektiteCardCommitEdit(node, st, rawOverride) {
+  if (!node || !st) return;
+  // Callers capture the textarea value at event time (rawOverride);
+  // reading st.editEl at fire time can hit a detached or freshly
+  // remounted (empty) textarea after a canvas re-render.
+  const raw = (typeof rawOverride === "string")
+    ? rawOverride
+    : ((st.editEl && st.editEl.isConnected) ? (st.editEl.value || "") : null);
+  if (raw === null) return;
   node.params = node.params || {};
   if (node.type === "LinkCard") {
     node.params.url = raw.trim();
@@ -66322,13 +66715,15 @@ function _tektiteCardMergeLinkIntoFrontmatter(content, url, label) {
   function upsert(line, key, val) {
     const re = new RegExp("^" + key + ":\\s*.*$", "m");
     const next = val === "" ? "" : (key + ": " + JSON.stringify(val));
-    if (re.test(line)) return next ? line.replace(re, next) : line.replace(re, "").replace(/^\n/, "");
+    // Replacer FUNCTION keeps $-patterns in the URL literal ($& etc.
+    // in a replacement STRING expand to the matched text).
+    if (re.test(line)) return next ? line.replace(re, () => next) : line.replace(re, "").replace(/^\n/, "");
     return next ? (line ? line + "\n" + next : next) : line;
   }
   fmText = upsert(fmText, "url",   url);
   fmText = upsert(fmText, "label", label || "");
   if (fmMatch) {
-    return content.replace(fmMatch[0], "---\n" + fmText + "\n---\n");
+    return content.replace(fmMatch[0], () => "---\n" + fmText + "\n---\n");
   }
   return "---\n" + fmText + "\n---\n" + content;
 }
@@ -66600,12 +66995,21 @@ async function _renderLinkCardBody(node, st) {
     } else {
       let host = url;
       try { host = new URL(url).hostname || url; } catch (_) {}
+      // The url can come from untrusted note frontmatter (imported /
+      // shared vaults); only emit a live anchor for safe schemes --
+      // a javascript: href would run in the editor's origin.
+      const scheme = (/^\s*([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(url) || [])[1] || "";
+      const safeScheme = !scheme || /^(https?|mailto)$/i.test(scheme);
       st.renderEl.innerHTML =
         '<div class="tektite-card-link-host">🔗 ' + _tektiteCardEsc(host) + '</div>' +
-        '<a class="tektite-card-link-url" href="' + _tektiteCardEsc(url) +
-          '" target="_blank" rel="noopener">' +
-            _tektiteCardEsc(label || url) +
-          '</a>';
+        (safeScheme
+          ? '<a class="tektite-card-link-url" href="' + _tektiteCardEsc(url) +
+              '" target="_blank" rel="noopener">' +
+                _tektiteCardEsc(label || url) +
+              '</a>'
+          : '<span class="tektite-card-link-url">' +
+                _tektiteCardEsc(label || url) +
+              '</span>');
     }
   }
 }
@@ -66630,6 +67034,9 @@ async function _renderNoteCardBody(node, st) {
         const all = await tektiteListNotes();
         const lc = fileKey.toLowerCase();
         note = all.find(n => (n.title || "").toLowerCase() === lc);
+        // Re-key params.file to the real note id -- commit + poll look
+        // up by id, so a title-keyed card would silently drop edits.
+        if (note) node.params.file = note.id;
       }
       if (!note) {
         node.params.text = "";
@@ -66654,6 +67061,9 @@ async function _renderNoteCardBody(node, st) {
           _tektiteCardEsc((e && e.message) || String(e)) + '</div>';
       }
       st.lastHash = "N:ERR:" + fileKey;
+      // Mark resolved so the next tick doesn't re-enter this branch
+      // (IDB read + innerHTML rewrite) at frame rate.
+      st.lastResolveKey = fileKey;
     } finally {
       st.resolving = false;
     }
@@ -66662,6 +67072,9 @@ async function _renderNoteCardBody(node, st) {
   if (st.editing) return;   // user owns the textarea
   // Polling for external changes.
   await _tektiteCardPollLinked(node, st);
+  // Keep the load-failed view until fileKey changes or the poll above
+  // pulls a fresh copy (which clears lastHash).
+  if (st.lastHash === "N:ERR:" + fileKey) return;
   const body  = (node.params && node.params.text)  || "";
   const title = (node.params && node.params.title) || fileKey;
   const hash = "N:" + fileKey + ":" + body.length + ":" + title + ":R";
@@ -66747,6 +67160,7 @@ async function _renderBaseCardBody(node, st) {
       node.params.rows  = JSON.stringify(rows.slice(0, 50).map(r => ({
         id: r.id, title: r.title, modifiedAt: r.modifiedAt, ...r.frontmatter
       })));
+      st.lastSyncedAt   = (loaded.note && loaded.note.modifiedAt) || Date.now();
       st.lastResolveKey = baseId;
       st.lastHash = "";
     } catch (e) {
@@ -66755,11 +67169,30 @@ async function _renderBaseCardBody(node, st) {
           _tektiteCardEsc((e && e.message) || String(e)) + '</div>';
       }
       st.lastHash = "B:ERR:" + baseId;
+      // Mark resolved (+ stamp lastSyncedAt) so the next tick doesn't
+      // re-enter this branch at frame rate; the poll below retries
+      // only once the base note is edited/created after the failure.
+      st.lastResolveKey = baseId;
+      st.lastSyncedAt   = Date.now();
       st.resolving = false;
       return;
     }
     st.resolving = false;
+  } else if (!st.resolving) {
+    // Header contract: row set updates on base note edits too. Poll
+    // the base note's modifiedAt (one IDB read per tick, mirroring
+    // _tektiteCardPollLinked) and force a re-load + re-execute.
+    try {
+      const bn = await tektiteGetNote(baseId);
+      if (bn && (bn.modifiedAt || 0) > st.lastSyncedAt + 100) {
+        st.lastResolveKey = "";
+        return;
+      }
+    } catch (_) {}
   }
+  // Keep the load-failed view (don't repaint with stale/empty rows)
+  // until baseId changes or the poll above invalidates the resolve.
+  if (st.lastHash === "B:ERR:" + baseId) return;
   const rows = st.cachedRows || [];
   const cols = st.cachedColumns || ["title"];
   const hash = "B:" + baseId + ":" + view + ":" + rows.length + ":" + cols.join(",");
@@ -67001,13 +67434,13 @@ async function _renderCanvasCardBody(node, st) {
       e.stopPropagation();
       const cid = String((node.params && node.params.canvasId) || "");
       if (!cid) return;
-      // Hand off to the legacy Canvas modal: pre-set the active doc
-      // id so _tektiteCanvasOpenLegacy lands on it.
+      // Hand off to the legacy Canvas modal: show + attach it first
+      // (_tektiteCanvasOpen), then load this card's doc into it.
       if (typeof _tektiteCanvasState !== "undefined" && _tektiteCanvasState) {
         _tektiteCanvasState.currentId = cid;
       }
-      if (typeof _tektiteCanvasOpenLegacy === "function") {
-        await _tektiteCanvasOpenLegacy();
+      if (typeof _tektiteCanvasOpen === "function") {
+        await _tektiteCanvasOpen();
       }
       if (typeof _tektiteCanvasOpenById === "function") {
         await _tektiteCanvasOpenById(cid);
@@ -67112,9 +67545,11 @@ function _tektiteCanvasCardRenderThumb(svg, doc) {
 /* Per-frame tick. */
 function _tickTektiteCards(dtSec) {
   if (typeof state === "undefined" || !state || !Array.isArray(state.nodes)) return;
+  const liveIds = _tektiteCardStates.size ? new Set() : null;
   for (let i = 0; i < state.nodes.length; i++) {
     const n = state.nodes[i];
     if (!n || !n.type) continue;
+    if (liveIds) liveIds.add(n.id);
     const def = (typeof TYPES === "object") ? TYPES[n.type] : null;
     if (!def) continue;
     const k = def.kind;
@@ -67132,6 +67567,22 @@ function _tickTektiteCards(dtSec) {
     else if (k === "tektite-card-base")   _renderBaseCardBody(n, st);
     else if (k === "tektite-card-graph")  _renderGraphCardBody(n, st);
     else if (k === "tektite-card-canvas") _renderCanvasCardBody(n, st);
+  }
+  // Sweep states whose node was deleted (or replaced wholesale by a
+  // patch load) -- otherwise the Map pins detached body DOM, graph
+  // renderers + ResizeObservers for the rest of the session.
+  if (liveIds) {
+    for (const [id, st] of _tektiteCardStates) {
+      if (liveIds.has(id)) continue;
+      if (st.saveTimer) clearTimeout(st.saveTimer);
+      if (st.graphRenderer && typeof st.graphRenderer.destroy === "function") {
+        try { st.graphRenderer.destroy(); } catch (_) {}
+      }
+      if (st.graphResizeObs && typeof st.graphResizeObs.disconnect === "function") {
+        try { st.graphResizeObs.disconnect(); } catch (_) {}
+      }
+      _tektiteCardStates.delete(id);
+    }
   }
 }
 
@@ -67184,10 +67635,10 @@ const _tektiteEditorState = {
   cmLoading:      null,       // in-flight attach promise
   currentId:      null,
   currentSource:  null,
+  loadGen:        0,          // bumped per load; stale loads bail out
   saveTimer:      null,
   saveDelayMs:    400,
-  saving:         false,
-  pendingSave:    false,
+  saving:         null,       // in-flight save promise (null when idle)
   statusEl:       null,
   navigateFn:     null,       // tab.js sets this so wikilink ctrl-click can open notes
   listeners:      new Set(),
@@ -67324,6 +67775,13 @@ async function _tektiteEditorEnsureCodeMirror() {
       readOnly: s.textarea ? !!s.textarea.disabled : false
     });
     if (handle) {
+      // The initial doc above was captured before the CDN await; if a
+      // note was loaded into the textarea fallback while CodeMirror was
+      // initializing, re-sync it so the takeover doesn't display (and a
+      // later flush save) the stale empty doc. s.cm is still null here,
+      // so _tektiteEditorGetText() reads the textarea.
+      const live = _tektiteEditorGetText();
+      if (handle.getDoc() !== live) handle.setDoc(live);
       s.cm = handle;
       // Hide the textarea fallback; CM owns the surface now.
       if (s.textarea) s.textarea.style.display = "none";
@@ -67435,22 +67893,28 @@ async function tektiteEditorLoadFromSource(sourceId, fileId) {
   if (s.currentId && (s.currentId !== fileId || s.currentSource !== sourceId)) {
     await tektiteEditorFlush();
   }
+  // Guard against the awaits below: currentId only moves to the new
+  // note once its content is actually in the editor surface (a flush
+  // firing mid-load would otherwise save the OLD note's text under the
+  // NEW id), and a newer load supersedes this one entirely.
+  const gen = ++s.loadGen;
   _tektiteSetStatus("Loading…");
   try {
     const content = await tektiteSourceGetContent(sourceId, fileId);
-    s.currentId     = fileId;
-    s.currentSource = sourceId;
     let title = fileId;
     try {
       const listing = await tektiteSourceListNotes(sourceId);
       const hit = listing.find(n => n.id === fileId);
       if (hit) title = hit.title || fileId;
     } catch (_) {}
+    if (gen !== s.loadGen) return;   // superseded by a newer load
     if (s.titleInput) {
       s.titleInput.value = title;
       s.titleInput.disabled = (sourceId !== "vault");
     }
     _tektiteEditorSetText(content || "");
+    s.currentId     = fileId;
+    s.currentSource = sourceId;
     const writable = (typeof tektiteSourceIsWritable === "function")
       ? tektiteSourceIsWritable(sourceId)
       : (sourceId === "vault" ? "vault" : null);
@@ -67459,6 +67923,7 @@ async function tektiteEditorLoadFromSource(sourceId, fileId) {
     // Sprint tektite-2b -- refresh preview if it's currently visible.
     _tektiteRefreshPreview();
   } catch (e) {
+    if (gen !== s.loadGen) return;   // superseded by a newer load
     s.currentId     = null;
     s.currentSource = null;
     if (s.titleInput) s.titleInput.value = "";
@@ -67481,39 +67946,49 @@ function tektiteEditorMarkDirty() {
 async function tektiteEditorFlush() {
   const s = _tektiteEditorState;
   if (s.saveTimer) { clearTimeout(s.saveTimer); s.saveTimer = null; }
+  // No live edit surface (the in-tab pane was removed from shell.html,
+  // so attach may never have run): _tektiteEditorGetText() would return
+  // "" and the write below would wipe the note. Hard no-op instead.
+  if (!s.cm && !(s.textarea && s.textarea.isConnected)) return;
   if (!s.currentId) return;
-  if (s.saving) { s.pendingSave = true; return; }
-  s.saving = true;
+  if (s.saving) {
+    // An in-flight save captured older content. Wait for it, then flush
+    // again so the latest keystrokes are persisted before callers (e.g.
+    // tektiteEditorLoadFromSource) move on to another note.
+    await s.saving;
+    return tektiteEditorFlush();
+  }
   const sourceId = s.currentSource || "vault";
   const fileId   = s.currentId;
   const title    = (s.titleInput && s.titleInput.value || fileId).trim();
   const content  = _tektiteEditorGetText();
   _tektiteSetStatus("Saving…", "saving");
-  try {
-    const result = await tektiteSourceWriteContent(sourceId, fileId, content, { title });
-    const recordedId = (result && result.id) || fileId;
-    s.currentId = recordedId;
-    _tektiteEditorEmit({
-      sourceId, fileId: recordedId, title, content,
-      modifiedAt: Date.now()
-    });
-    _tektiteSetStatus("Saved", "ok");
-    setTimeout(() => {
-      if (_tektiteEditorState.statusEl &&
-          _tektiteEditorState.statusEl.textContent === "Saved") {
-        _tektiteSetStatus("");
-      }
-    }, 1500);
-  } catch (e) {
-    _tektiteSetStatus("✗ " + (e.message || String(e)), "err");
-    console.warn("[tektite] save failed:", e);
-  } finally {
-    s.saving = false;
-    if (s.pendingSave) {
-      s.pendingSave = false;
-      setTimeout(() => tektiteEditorFlush(), 80);
+  const save = (async () => {
+    try {
+      const result = await tektiteSourceWriteContent(sourceId, fileId, content, { title });
+      const recordedId = (result && result.id) || fileId;
+      // Don't clobber currentId if the user navigated away mid-save.
+      if (s.currentId === fileId) s.currentId = recordedId;
+      _tektiteEditorEmit({
+        sourceId, fileId: recordedId, title, content,
+        modifiedAt: Date.now()
+      });
+      _tektiteSetStatus("Saved", "ok");
+      setTimeout(() => {
+        if (_tektiteEditorState.statusEl &&
+            _tektiteEditorState.statusEl.textContent === "Saved") {
+          _tektiteSetStatus("");
+        }
+      }, 1500);
+    } catch (e) {
+      _tektiteSetStatus("✗ " + (e.message || String(e)), "err");
+      console.warn("[tektite] save failed:", e);
+    } finally {
+      s.saving = null;
     }
-  }
+  })();
+  s.saving = save;
+  await save;
 }
 /* =========================================================================
  * Tektite MD -- sidebar tab
@@ -67550,6 +68025,8 @@ const _tektiteTabState = {
   activeSource:    "vault",
   filterText:      "",
   searchResults:   null,    // sprint tektite-3 -- structured query results
+  refreshGen:      0,       // bumps per refresh; stale listings are dropped
+  listError:       null,    // last source-listing failure, shown by render
   listEl:          null,
   countEl:         null,
   filterInput:     null,
@@ -67673,11 +68150,13 @@ async function _tektiteOpenGraphModal() {
 
 function _tektiteCloseGraphModal() {
   const s = _tektiteGraphState;
-  // Sprint multi-popout (2026-06-05) -- close every popout so their
-  // pending saves flush + DOM gets cleaned up before the modal hides.
-  if (typeof _tektitePopoutCloseAll === "function") _tektitePopoutCloseAll();
+  // Popouts live in the body-level host (not the modal DOM), so they
+  // survive the modal closing -- they're the primary vault editing
+  // surface now. _tektiteUpdateConnectors hides the overlay once the
+  // renderer is gone.
   if (s.renderer) { s.renderer.destroy(); s.renderer = null; }
   if (s.modal) s.modal.style.display = "none";
+  _tektiteUpdateConnectors();
 }
 
 async function _tektiteRebuildGraph() {
@@ -67730,7 +68209,10 @@ async function _tektiteRebuildGraph() {
  * ------------------------------------------------------------------ */
 const _tektitePopouts = {
   instances: new Map(),   // noteId -> instance
-  topZ: 100
+  topZ: 100,
+  // Source id smuggled past the parity.js _tektitePopoutOpen wrapper
+  // (which only forwards noteId). Read synchronously at open entry.
+  pendingSourceId: null
 };
 
 function _tektitePopoutContainer() {
@@ -67867,6 +68349,11 @@ function _tektitePopoutWire(inst) {
   });
 
   function markDirty() {
+    // No edits count until the initial note content has loaded --
+    // otherwise a keystroke into the empty/loading editor arms a
+    // flush that overwrites the stored note.
+    if (!inst.loadedOk) return;
+    inst.dirty = true;
     if (inst.saveTimer) clearTimeout(inst.saveTimer);
     _tektitePopoutSetStatus(inst, "Editing…", "saving");
     inst.saveTimer = setTimeout(() => _tektitePopoutFlush(inst), 400);
@@ -67897,6 +68384,8 @@ function _tektitePopoutWire(inst) {
   if (cmHost && typeof tektiteMarkdownAttach === "function") {
     tektiteMarkdownAttach(cmHost, editor.value || "", {
       onChange: (newDoc) => {
+        // Programmatic setDoc loads must not mark the popout dirty.
+        if (inst.settingDoc) return;
         editor.value = newDoc;
         markDirty();
       },
@@ -67905,14 +68394,34 @@ function _tektitePopoutWire(inst) {
       },
       readOnly: false
     }).then(handle => {
-      if (handle) {
-        inst.cm = handle;
-        editor.style.display = "none";  // CM took over
+      if (!handle) return;
+      // The popout may have been closed while the CDN load was in
+      // flight -- destroy the orphan view instead of leaking it.
+      if (inst.closed) {
+        try { handle.destroy(); } catch (_) {}
+        return;
       }
+      inst.cm = handle;
+      // The note load may have resolved while CM was still
+      // downloading (cold esm.sh cache); the attach captured the
+      // then-empty textarea value, so re-sync from the textarea
+      // which always holds the latest content.
+      _tektitePopoutSetDocQuiet(inst, editor.value);
+      editor.style.display = "none";  // CM took over
     }).catch(err => {
       console.warn("[tektite-popout] CodeMirror attach failed:", err);
     });
   }
+}
+
+/* Push a document into the popout's CM view without tripping the
+ * onChange -> markDirty -> flush chain (CM update listeners fire on
+ * programmatic dispatches too). */
+function _tektitePopoutSetDocQuiet(inst, text) {
+  if (!inst || !inst.cm || typeof inst.cm.setDoc !== "function") return;
+  inst.settingDoc = true;
+  try { inst.cm.setDoc(text || ""); }
+  finally { inst.settingDoc = false; }
 }
 
 function _tektitePopoutSetViewMode(inst, mode) {
@@ -67962,6 +68471,13 @@ function _tektitePopoutMarkPreviewDirty(inst) {
 
 function _tektitePopoutCloseInstance(inst) {
   if (!inst || !inst.dom) return;
+  inst.closed = true;
+  // Destroy the CM view before removing its host -- EditorView holds
+  // observers + listeners that outlive a bare dom.remove().
+  if (inst.cm && typeof inst.cm.destroy === "function") {
+    try { inst.cm.destroy(); } catch (_) {}
+    inst.cm = null;
+  }
   inst.dom.remove();
   // Sprint 10n -- deregister every noteId held by this popout's tabs.
   if (Array.isArray(inst.tabs)) {
@@ -67979,6 +68495,11 @@ function _tektitePopoutCloseAll() {
   const instances = Array.from(_tektitePopouts.instances.values());
   for (const inst of instances) {
     _tektitePopoutFlush(inst);   // fire-and-forget
+    inst.closed = true;
+    if (inst.cm && typeof inst.cm.destroy === "function") {
+      try { inst.cm.destroy(); } catch (_) {}
+      inst.cm = null;
+    }
     inst.dom.remove();
   }
   _tektitePopouts.instances.clear();
@@ -68258,6 +68779,10 @@ function _tektiteCanvasRenderNode(node) {
   if (node.type === "text") {
     body.contentEditable = "true";
     body.spellcheck = false;
+    // pre-wrap keeps literal \n rendering as line breaks so the
+    // innerText read-back below round-trips multi-line JSON Canvas
+    // text instead of collapsing it to spaces on the first edit.
+    body.style.whiteSpace = "pre-wrap";
     body.textContent = node.text || "";
     body.addEventListener("input", () => {
       node.text = body.innerText || "";
@@ -68289,13 +68814,21 @@ function _tektiteCanvasRenderNode(node) {
       _tektiteCanvasClose();
       _tektiteTabState.activeSource = "vault";
       await _tektiteTabRefresh();
-      await tektiteEditorLoadFromSource("vault", node.file);
-      _tektiteTabRender();
+      // Sprint refactor (2026-06-05): the in-tab editor is gone --
+      // notes open in floating popouts.
+      await _tektitePopoutOpen(node.file);
     });
     body.addEventListener("pointerdown", (ev) => ev.stopPropagation());
   } else if (node.type === "link") {
-    body.innerHTML = '<a href="' + _tektiteEscapeAttr(node.url || "") + '" target="_blank" rel="noopener">' +
-      _tektiteEscapeHtml(node.url || "(no url)") + '</a>';
+    // Canvas docs can arrive from shared vaults; only emit a live anchor
+    // for safe schemes -- a javascript: href would run in the editor's origin.
+    const _lcScheme = (/^\s*([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(node.url || "") || [])[1] || "";
+    if (!_lcScheme || /^(https?|mailto)$/i.test(_lcScheme)) {
+      body.innerHTML = '<a href="' + _tektiteEscapeAttr(node.url || "") + '" target="_blank" rel="noopener">' +
+        _tektiteEscapeHtml(node.url || "(no url)") + '</a>';
+    } else {
+      body.textContent = node.url || "(no url)";
+    }
     body.addEventListener("pointerdown", (ev) => ev.stopPropagation());
   }
   el.appendChild(body);
@@ -68430,8 +68963,14 @@ function _tektiteCanvasRenderEdges() {
     if (!a || !b) continue;
     const pa = anchor(a, e.fromSide || "right");
     const pb = anchor(b, e.toSide   || "left");
-    const stroke = tektiteCanvasColor(e.color) || "rgba(155, 208, 255, 0.55)";
-    svgInner += `<line x1="${pa.x}" y1="${pa.y}" x2="${pb.x}" y2="${pb.y}" stroke="${stroke}" stroke-width="1.5" marker-end="url(#tektite-canvas-arrow)"/>`;
+    // tektiteCanvasColor passes `#`-prefixed values through verbatim
+    // and this is an innerHTML sink, so only accept strict hex colors
+    // -- a malicious .canvas note's color field must not break out of
+    // the attribute. Escape as a second line of defense.
+    const raw = tektiteCanvasColor(e.color);
+    const stroke = (raw && /^#[0-9a-fA-F]{3,8}$/.test(raw))
+      ? raw : "rgba(155, 208, 255, 0.55)";
+    svgInner += `<line x1="${pa.x}" y1="${pa.y}" x2="${pb.x}" y2="${pb.y}" stroke="${_tektiteEscapeAttr(stroke)}" stroke-width="1.5" marker-end="url(#tektite-canvas-arrow)"/>`;
   }
   s.edgesEl.innerHTML = `<defs>
       <marker id="tektite-canvas-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
@@ -68664,6 +69203,9 @@ async function _tektiteBasesOpenById(id) {
     s.config = loaded.config;
   } catch (e) {
     s.config = null;
+    // Drop currentId too -- otherwise the close-flush would save the
+    // PREVIOUS base's still-on-screen controls into this base's record.
+    s.currentId = null;
     if (s.bodyEl) s.bodyEl.innerHTML = `<div class="tektite-bases-empty">Failed to load: ${_tektiteEscapeHtml(e.message || e)}</div>`;
     return;
   }
@@ -68735,7 +69277,9 @@ function _tektiteBasesSetStatus(text, kind) {
 async function _tektiteBasesFlush() {
   const s = _tektiteBasesState;
   if (s.saveTimer) { clearTimeout(s.saveTimer); s.saveTimer = null; }
-  if (!s.currentId) return;
+  // Match the Canvas twin's guard: a failed load leaves config null --
+  // never gather + save the stale controls in that state.
+  if (!s.currentId || !s.config) return;
   const config = _tektiteBasesGatherControls();
   s.config = config;
   _tektiteBasesSetStatus("Saving…", "saving");
@@ -68850,8 +69394,8 @@ async function _tektiteBasesOpenRow(id) {
   _tektiteBasesClose();
   _tektiteTabState.activeSource = "vault";
   await _tektiteTabRefresh();
-  await tektiteEditorLoadFromSource("vault", id);
-  _tektiteTabRender();
+  // Sprint refactor (2026-06-05): notes open in floating popouts.
+  await _tektitePopoutOpen(id);
 }
 
 /* Sprint tektite-5c2 + multi-popout -- redraw a connector for every
@@ -68914,10 +69458,22 @@ function _tektiteUpdateConnectors() {
   svg.style.display = anyVisible ? "block" : "none";
 }
 
+/* Open a note from a non-vault source (local-fs / github) in a popout.
+ * parity.js wraps _tektitePopoutOpen with a single-arg function, so the
+ * source id travels via _tektitePopouts.pendingSourceId -- the open's
+ * synchronous prologue captures it before the first await. */
+function _tektitePopoutOpenFromSource(sourceId, fileId) {
+  _tektitePopouts.pendingSourceId = sourceId || "vault";
+  const p = _tektitePopoutOpen(fileId);
+  _tektitePopouts.pendingSourceId = null;
+  return p;
+}
+
 /* Open a popout for `noteId`. If one already exists, bring to front +
  * brief flash; otherwise create a new instance. */
 async function _tektitePopoutOpen(noteId) {
   if (!noteId) return;
+  const sourceId = _tektitePopouts.pendingSourceId || "vault";
   const existing = _tektitePopouts.instances.get(noteId);
   if (existing) {
     _tektitePopoutBringToFront(existing);
@@ -68946,6 +69502,7 @@ async function _tektitePopoutOpen(noteId) {
   container.appendChild(dom);
   const inst = {
     noteId,
+    sourceId,               // "vault" or a connected source id
     dom,
     saveTimer: null,
     previewTimer: null,
@@ -68954,6 +69511,10 @@ async function _tektitePopoutOpen(noteId) {
     dragOffsetY: 0,
     viewMode: "source",
     cm: null,
+    loadedOk:   false,      // true once the note content is in the editor
+    dirty:      false,      // true only after a real user edit
+    closed:     false,      // late CM attach on a closed popout is destroyed
+    settingDoc: false,      // suppresses onChange during programmatic setDoc
     // Sprint 10n -- tabs.  Active tab's noteId mirrors inst.noteId so
     // the rest of the popout code keeps reading inst.noteId unchanged.
     tabs:      [noteId],
@@ -68971,18 +69532,35 @@ async function _tektitePopoutOpen(noteId) {
   const titleInput = dom.querySelector(".tektite-graph-popout-titleinput");
   const editor     = dom.querySelector(".tektite-graph-popout-editor");
   try {
-    const note = await tektiteGetNote(noteId);
-    const title = (note && note.title) || noteId;
-    const content = (note && note.content) || "";
+    let title, content;
+    if (sourceId === "vault") {
+      const note = await tektiteGetNote(noteId);
+      title   = (note && note.title) || noteId;
+      content = (note && note.content) || "";
+    } else {
+      // Remote sources (local-fs / github) read through the source
+      // layer; saves route back via tektiteSourceWriteContent in flush.
+      content = await tektiteSourceGetContent(sourceId, noteId);
+      title = noteId;
+      try {
+        const listing = await tektiteSourceListNotes(sourceId);
+        const hit = listing.find(n => n.id === noteId);
+        if (hit) title = hit.title || noteId;
+      } catch (_) {}
+    }
     if (titleEl)    titleEl.textContent  = title;
     if (titleInput) titleInput.value     = title;
     if (editor)     editor.value         = content;
     // If CM finished attaching before the load resolved, push the doc
-    // through its API.  Otherwise the attach reads from editor.value
-    // which is the same content.
-    if (inst.cm && typeof inst.cm.setDoc === "function") inst.cm.setDoc(content);
+    // through its API (quietly -- a programmatic load is not an edit).
+    // If CM is still downloading, the attach .then re-syncs from the
+    // textarea, which now holds the loaded content.
+    _tektitePopoutSetDocQuiet(inst, content);
+    inst.loadedOk = true;
     _tektitePopoutSetStatus(inst, "");
   } catch (e) {
+    // loadedOk stays false: markDirty and flush are both gated on it,
+    // so the error text can never be persisted over the real note.
     if (editor) editor.value = "Failed to load: " + (e.message || e);
     _tektitePopoutSetStatus(inst, "error", "err");
   }
@@ -69083,19 +69661,30 @@ async function _tektitePopoutCloseTab(inst, index) {
  * fallback.  Called from add/switch/close tab paths. */
 async function _tektitePopoutLoadTab(inst, noteId) {
   if (!inst || !inst.dom || !noteId) return;
-  inst.noteId = noteId;
   const dom        = inst.dom;
   const titleEl    = dom.querySelector(".tektite-graph-popout-title");
   const titleInput = dom.querySelector(".tektite-graph-popout-titleinput");
   const editor     = dom.querySelector(".tektite-graph-popout-editor");
+  // Entering a load: gate flush/markDirty until it succeeds.
+  inst.loadedOk = false;
+  inst.dirty    = false;
   try {
     const note = await tektiteGetNote(noteId);
     const title = (note && note.title) || noteId;
     const content = (note && note.content) || "";
+    // Reassign only after a successful load -- on failure the editor
+    // still holds the PREVIOUS tab's doc, and flushing that under the
+    // new id would cross-write note contents.
+    inst.noteId   = noteId;
+    inst.sourceId = "vault";   // tabs always load vault notes
     if (titleEl)    titleEl.textContent = title;
     if (titleInput) titleInput.value    = title;
     if (editor)     editor.value        = content;
-    if (inst.cm && typeof inst.cm.setDoc === "function") inst.cm.setDoc(content);
+    _tektitePopoutSetDocQuiet(inst, content);
+    inst.loadedOk = true;
+    // The quiet setDoc skips the onChange chain, so refresh the
+    // preview explicitly (no-op in source mode).
+    _tektitePopoutMarkPreviewDirty(inst);
     _tektitePopoutSetStatus(inst, "");
   } catch (e) {
     if (editor) editor.value = "Failed to load: " + (e.message || e);
@@ -69106,6 +69695,12 @@ async function _tektitePopoutLoadTab(inst, noteId) {
 async function _tektitePopoutFlush(inst) {
   if (!inst || !inst.dom) return;
   if (inst.saveTimer) { clearTimeout(inst.saveTimer); inst.saveTimer = null; }
+  // Never persist attachment viewers (that would write a ghost empty
+  // NOTE record under the attachment's id), popouts whose content
+  // never finished loading, or popouts without a real user edit.
+  if (inst.isAttachment) return;
+  if (typeof _tektiteIsAttachmentId === "function" && _tektiteIsAttachmentId(inst.noteId)) return;
+  if (!inst.loadedOk || !inst.dirty) return;
   const titleInput = inst.dom.querySelector(".tektite-graph-popout-titleinput");
   const editor     = inst.dom.querySelector(".tektite-graph-popout-editor");
   if (!titleInput || !editor) return;
@@ -69114,15 +69709,23 @@ async function _tektitePopoutFlush(inst) {
   const content = inst.cm && typeof inst.cm.getDoc === "function"
     ? inst.cm.getDoc()
     : (editor.value || "");
+  const sourceId = inst.sourceId || "vault";
   _tektitePopoutSetStatus(inst, "Saving…", "saving");
   try {
-    const existing = await tektiteGetNote(inst.noteId);
-    await tektitePutNote({
-      id:        inst.noteId,
-      title:     title || inst.noteId,
-      content,
-      createdAt: existing && existing.createdAt
-    });
+    if (sourceId === "vault") {
+      const existing = await tektiteGetNote(inst.noteId);
+      await tektitePutNote({
+        id:        inst.noteId,
+        title:     title || inst.noteId,
+        content,
+        createdAt: existing && existing.createdAt
+      });
+    } else {
+      // Non-vault popouts (local-fs / github) write back through the
+      // source layer instead of creating a shadow vault note.
+      await tektiteSourceWriteContent(sourceId, inst.noteId, content, { title });
+    }
+    inst.dirty = false;
     const titleEl = inst.dom.querySelector(".tektite-graph-popout-title");
     if (titleEl) titleEl.textContent = title || inst.noteId;
     _tektitePopoutSetStatus(inst, "Saved", "ok");
@@ -69130,11 +69733,29 @@ async function _tektitePopoutFlush(inst) {
       const el = inst.dom && inst.dom.querySelector(".tektite-graph-popout-status");
       if (el && el.textContent === "Saved") _tektitePopoutSetStatus(inst, "");
     }, 1500);
-    if (typeof tektiteBacklinksOnNoteSaved === "function") {
-      tektiteBacklinksOnNoteSaved({ id: inst.noteId, title, content, modifiedAt: Date.now() });
+    if (sourceId === "vault") {
+      if (typeof tektiteBacklinksOnNoteSaved === "function") {
+        tektiteBacklinksOnNoteSaved({ id: inst.noteId, title, content, modifiedAt: Date.now() });
+      }
+      if (typeof tektiteTagsOnNoteSaved === "function") {
+        tektiteTagsOnNoteSaved({ id: inst.noteId, title, content, modifiedAt: Date.now() });
+      }
     }
-    if (typeof tektiteTagsOnNoteSaved === "function") {
-      tektiteTagsOnNoteSaved({ id: inst.noteId, title, content, modifiedAt: Date.now() });
+    // Mirror the tektiteEditorOnSave listing update so popout renames
+    // + recency changes reflect in the sidebar without a full refresh.
+    const ts = _tektiteTabState;
+    if (ts && Array.isArray(ts.notes) && ts.activeSource === sourceId) {
+      const idx = ts.notes.findIndex(n => n.id === inst.noteId);
+      const listingEntry = {
+        id:         inst.noteId,
+        title:      title || inst.noteId,
+        path:       inst.noteId,
+        modifiedAt: Date.now(),
+        sourceId
+      };
+      if (idx >= 0) ts.notes.splice(idx, 1);
+      ts.notes.unshift(listingEntry);
+      _tektiteTabRender();
     }
   } catch (e) {
     _tektitePopoutSetStatus(inst, "✗ " + (e.message || e), "err");
@@ -69148,6 +69769,11 @@ async function _tektitePopoutFlush(inst) {
  * offers to create a new vault note under that name. */
 async function _tektiteNavigateWikilink(target) {
   if (!target) return;
+  // The CM plugin passes the RAW inner text, so Obsidian's pipe/heading
+  // forms ([[Note|alias]] / [[Note#Heading]]) must be stripped before
+  // any matching -- the preview renderer + backlinks index already do.
+  target = String(target).split("|")[0].split("#")[0].trim();
+  if (!target) return;
   const s = _tektiteTabState;
   const targetLc = target.toLowerCase();
 
@@ -69156,8 +69782,7 @@ async function _tektiteNavigateWikilink(target) {
   if (vaultHit) {
     s.activeSource = "vault";
     await _tektiteTabRefresh();
-    await tektiteEditorLoadFromSource("vault", vaultHit.id);
-    _tektiteTabRender();
+    await _tektitePopoutOpen(vaultHit.id);
     return;
   }
   // 2. Try as a vault title (case-insensitive).
@@ -69166,8 +69791,7 @@ async function _tektiteNavigateWikilink(target) {
   if (titleHit) {
     s.activeSource = "vault";
     await _tektiteTabRefresh();
-    await tektiteEditorLoadFromSource("vault", titleHit.id);
-    _tektiteTabRender();
+    await _tektitePopoutOpen(titleHit.id);
     return;
   }
   // 3. Walk other sources (local-fs / github) for filename matches.
@@ -69183,8 +69807,7 @@ async function _tektiteNavigateWikilink(target) {
       if (fileHit) {
         s.activeSource = src.id;
         await _tektiteTabRefresh();
-        await tektiteEditorLoadFromSource(src.id, fileHit.id);
-        _tektiteTabRender();
+        await _tektitePopoutOpenFromSource(src.id, fileHit.id);
         return;
       }
     } catch (_) {}
@@ -69239,8 +69862,7 @@ async function _tektiteNavigateWikilink(target) {
       const newId = await tektiteSourceCreateNote("vault", target);
       s.activeSource = "vault";
       await _tektiteTabRefresh();
-      await tektiteEditorLoadFromSource("vault", newId);
-      _tektiteTabRender();
+      await _tektitePopoutOpen(newId);
     } catch (e) {
       window.alert("Create failed: " + (e.message || e));
     }
@@ -69296,8 +69918,7 @@ async function _tektiteRenderBacklinks() {
     el.addEventListener("click", async () => {
       s.activeSource = "vault";
       await _tektiteTabRefresh();
-      await tektiteEditorLoadFromSource("vault", id);
-      _tektiteTabRender();
+      await _tektitePopoutOpen(id);
     });
   });
 }
@@ -69320,14 +69941,20 @@ function _tektiteTabSetFullscreen(on) {
 
 async function _tektiteTabRefresh() {
   const s = _tektiteTabState;
+  // Generation guard: a slow listing (e.g. GitHub) resolving after the
+  // user switched back to a fast source must not overwrite its list.
+  const src = s.activeSource;
+  const gen = ++s.refreshGen;
   try {
-    s.notes = await tektiteSourceListNotes(s.activeSource);
+    const notes = await tektiteSourceListNotes(src);
+    if (gen !== s.refreshGen || src !== s.activeSource) return;
+    s.notes = notes;
+    s.listError = null;
   } catch (e) {
+    if (gen !== s.refreshGen || src !== s.activeSource) return;
     s.notes = [];
+    s.listError = e.message || String(e);
     console.warn("[tektite] source list failed:", e);
-    if (s.listEl) {
-      s.listEl.innerHTML = `<div class="tektite-empty">⚠ ${_tektiteEscapeHtml(e.message || String(e))}</div>`;
-    }
   }
   _tektiteTabRenderSources();
   _tektiteTabRender();
@@ -69419,6 +70046,12 @@ function _tektiteTabRender() {
   }
 
   if (!filtered.length) {
+    // A failed source listing renders its actual error instead of the
+    // misleading "no files" empty state.
+    if (s.listError) {
+      s.listEl.innerHTML = `<div class="tektite-empty">⚠ ${_tektiteEscapeHtml(s.listError)}</div>`;
+      return;
+    }
     s.listEl.innerHTML = `
       <div class="tektite-empty">
         ${s.notes.length === 0
@@ -69523,9 +70156,10 @@ function _tektiteTabRender() {
         // Vault notes: open in a popout (full editor experience).
         await _tektitePopoutOpen(id);
       } else {
-        // Remote sources still flow through the editor module's
-        // remote-load path so fork-to-vault keeps working.
-        await tektiteEditorLoadFromSource(s.activeSource, id);
+        // Remote sources open in a source-aware popout; saves route
+        // back through tektiteSourceWriteContent. Fork-to-vault keeps
+        // working via the button's _sourceId/_fileId set below.
+        await _tektitePopoutOpenFromSource(s.activeSource, id);
       }
       if (s.saveToVaultBtnEl) {
         const showFork = (s.activeSource !== "vault");
@@ -69578,9 +70212,11 @@ async function _tektiteTabCreate() {
   try {
     const newId = await tektiteSourceCreateNote(s.activeSource, "Untitled note");
     await _tektiteTabRefresh();
-    await tektiteEditorLoadFromSource(s.activeSource, newId);
-    _tektiteTabRender();
-    const titleInput = document.getElementById("tektite-title");
+    await _tektitePopoutOpenFromSource(s.activeSource, newId);
+    // Focus the popout's title input so the user can rename right away.
+    const inst = _tektitePopouts.instances.get(newId);
+    const titleInput = inst && inst.dom &&
+      inst.dom.querySelector(".tektite-graph-popout-titleinput");
     if (titleInput && s.activeSource === "vault") { titleInput.focus(); titleInput.select(); }
   } catch (e) {
     window.alert("Create failed: " + (e.message || String(e)));
@@ -69608,6 +70244,10 @@ async function _tektiteTabDelete(id) {
       try { await tektiteDeleteAttachment(id); } catch (_) {}
     }
   }
+  // Evict from the in-memory backlinks/tags indices (mirrors the
+  // folder-delete path) so stale entries don't linger all session.
+  if (typeof tektiteBacklinksOnNoteDeleted === "function") tektiteBacklinksOnNoteDeleted(id);
+  if (typeof tektiteTagsOnNoteDeleted === "function") tektiteTagsOnNoteDeleted(id);
   if (tektiteEditorCurrentNoteId() === id) {
     await tektiteEditorLoad(null);
   }
@@ -69690,8 +70330,7 @@ async function _tektiteFolderNewNote(folderPath) {
   while (await tektiteGetNote(id)) { id = prefix + segSlug + "-" + n; n++; if (n > 9999) break; }
   await tektitePutNote({ id, title: baseTitle, content: "# " + baseTitle + "\n\n" });
   await _tektiteTabRefresh();
-  await tektiteEditorLoadFromSource("vault", id);
-  _tektiteTabRender();
+  await _tektitePopoutOpen(id);
 }
 
 async function _tektiteFolderDelete(folderPath) {
@@ -69839,7 +70478,7 @@ async function _tektiteSaveToVault() {
     const newId = await tektiteSourceImportToVault(btn._sourceId, btn._fileId);
     s.activeSource = "vault";
     await _tektiteTabRefresh();
-    await tektiteEditorLoad(newId);
+    await _tektitePopoutOpen(newId);
     if (btn) btn.style.display = "none";
     _tektiteTabRender();
   } catch (e) {
@@ -69871,8 +70510,7 @@ function tektiteTabAttach() {
       const id = await tektiteDailyNoteOpenOrCreate({});
       s.activeSource = "vault";
       await _tektiteTabRefresh();
-      await tektiteEditorLoadFromSource("vault", id);
-      _tektiteTabRender();
+      await _tektitePopoutOpen(id);
     } catch (e) {
       window.alert("Today note open/create failed: " + (e.message || e));
     }
@@ -69954,17 +70592,25 @@ function tektiteTabAttach() {
         _tektiteTabRender();
         return;
       }
+      // Capture the query at schedule time -- clearTimeout can't cancel
+      // a callback already parked on an await, so each await is followed
+      // by a staleness check before touching state.
+      const q = s.filterText;
       searchTimer = setTimeout(async () => {
         // Make sure the tags index is warm so tag-clause matching is fast.
         if (typeof tektiteTagsEnsureReady === "function") {
           await tektiteTagsEnsureReady();
         }
+        if (q !== s.filterText) return;
+        let results;
         try {
-          s.searchResults = await tektiteRunQuery(s.filterText);
+          results = await tektiteRunQuery(q);
         } catch (e) {
           console.warn("[tektite] search failed:", e);
-          s.searchResults = [];
+          results = [];
         }
+        if (q !== s.filterText) return;
+        s.searchResults = results;
         _tektiteTabRender();
       }, 120);
     });
@@ -70189,13 +70835,17 @@ function _tektiteCommandPaletteOpen() {
   document.addEventListener("keydown", _tektiteCmdPaletteKeydown, true);
 }
 
+let _tektiteCmdKeyOpen = false;
 window.addEventListener("keydown", (e) => {
+  if (e.repeat) return;
   if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
   if (typeof isTextInput === "function" && isTextInput(document.activeElement)) return;
   // Cmd/Ctrl-O -- quick switcher (open note); Cmd/Ctrl-P -- command palette.
   if (!e.shiftKey && (e.key === "o" || e.key === "O")) {
     e.preventDefault();
-    _tektiteQuickSwitcherOpen();
+    if (_tektiteCmdKeyOpen) return;
+    _tektiteCmdKeyOpen = true;
+    Promise.resolve(_tektiteQuickSwitcherOpen()).finally(() => { _tektiteCmdKeyOpen = false; });
   } else if (!e.shiftKey && (e.key === "p" || e.key === "P")) {
     e.preventDefault();
     _tektiteCommandPaletteOpen();
@@ -70903,6 +71553,19 @@ function _tektiteAttachmentCsvHtml(text, sep) {
  * tab-load wrap.  Symptom (10u): clicking an attachment showed an
  * empty markdown editor. */
 function _tektitePatchPopoutHooks() {
+  // Wrap _tektitePopoutCloseInstance to revoke any live attachment blob URL
+  // before the DOM is removed (fixes #69: blob URLs leaked on popout close).
+  if (typeof _tektitePopoutCloseInstance === "function" && !_tektitePopoutCloseInstance._tk10tWrapped) {
+    const originalClose = _tektitePopoutCloseInstance;
+    _tektitePopoutCloseInstance = function (inst) {
+      if (inst && inst._attachmentBlobUrl) {
+        URL.revokeObjectURL(inst._attachmentBlobUrl);
+        inst._attachmentBlobUrl = null;
+      }
+      return originalClose(inst);
+    };
+    _tektitePopoutCloseInstance._tk10tWrapped = true;
+  }
   // Wrap _tektitePopoutLoadTab (tab switching).
   if (typeof _tektitePopoutLoadTab === "function" && !_tektitePopoutLoadTab._tk10tWrapped) {
     const original = _tektitePopoutLoadTab;
@@ -70930,23 +71593,25 @@ function _tektitePatchPopoutHooks() {
   if (typeof _tektitePopoutOpen === "function" && !_tektitePopoutOpen._tk10tWrapped) {
     const originalOpen = _tektitePopoutOpen;
     _tektitePopoutOpen = async function (noteId) {
-      const result = await originalOpen(noteId);
-      // After the original open returns, if the loaded id is an
-      // attachment, swap the markdown layer out for the viewer.
-      // (originalOpen has already set inst.noteId + loaded the empty
-      //  markdown -- harmless; we paint over it.)
-      const inst = _tektitePopouts && _tektitePopouts.instances && _tektitePopouts.instances.get(noteId);
-      if (inst && _tektiteIsAttachmentId(noteId)) {
-        try {
-          const rec = await tektiteGetAttachment(noteId);
-          if (rec && rec.blob) {
-            const titleEl = inst.dom && inst.dom.querySelector(".tektite-graph-popout-title");
-            if (titleEl) titleEl.textContent = noteId;
-            await _tektitePopoutLoadAttachment(inst, noteId);
-          }
-        } catch (_) {}
+      // Detect attachment BEFORE originalOpen so _tektitePopoutFlush
+      // (called on close) never writes a phantom note for the attachment id.
+      if (_tektiteIsAttachmentId(noteId)) {
+        const result = await originalOpen(noteId);
+        const inst = _tektitePopouts && _tektitePopouts.instances && _tektitePopouts.instances.get(noteId);
+        if (inst) {
+          inst.isAttachment = true;
+          try {
+            const rec = await tektiteGetAttachment(noteId);
+            if (rec && rec.blob) {
+              const titleEl = inst.dom && inst.dom.querySelector(".tektite-graph-popout-title");
+              if (titleEl) titleEl.textContent = noteId;
+              await _tektitePopoutLoadAttachment(inst, noteId);
+            }
+          } catch (_) {}
+        }
+        return result;
       }
-      return result;
+      return originalOpen(noteId);
     };
     _tektitePopoutOpen._tk10tWrapped = true;
   }
@@ -71187,6 +71852,12 @@ function _tektiteEnsureInternalEditorModal() {
   m.querySelector(".tk-iem-close").addEventListener("click", () => _tektiteCloseInternalEditor());
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && m.style.display !== "none" && m.style.display !== "") {
+      // Esc is an ordinary editing key inside the mounted editors
+      // (Monaco widgets, cancelling a cell edit); closing here would
+      // discard every unsaved edit.  Only close when focus is outside
+      // the editor mount -- the bar's × Close stays available.
+      const mountEl = m.querySelector(".tk-iem-mount");
+      if (mountEl && (mountEl.contains(document.activeElement) || mountEl.contains(e.target))) return;
       _tektiteCloseInternalEditor();
     }
   });
@@ -71210,6 +71881,17 @@ function _tektiteCloseInternalEditor() {
 
 async function _tektiteOpenInternalEditor(act, attId) {
   const m = _tektiteEnsureInternalEditorModal();
+  // Neutralize the previous open's Save wiring BEFORE any await /
+  // early return below: a failed open must not leave the button armed
+  // with the last editor's stale handle (it would re-save the wrong
+  // attachment).
+  const saveBtn = m.querySelector(".tk-iem-save");
+  saveBtn.onclick = null;
+  saveBtn.disabled = true;
+  if (m._handle && typeof m._handle.dispose === "function") {
+    try { m._handle.dispose(); } catch (_) {}
+  }
+  m._handle = null;
   m.style.display = "flex";
   m.querySelector(".tk-iem-title").textContent = "Editor: " + attId;
   m.querySelector(".tk-iem-status").textContent = "";
@@ -71251,7 +71933,6 @@ async function _tektiteOpenInternalEditor(act, attId) {
   m._handle = handle;
 
   // Wire save button.
-  const saveBtn = m.querySelector(".tk-iem-save");
   saveBtn.disabled = !handle || typeof handle.save !== "function";
   saveBtn.onclick = async () => {
     if (!handle || typeof handle.save !== "function") return;
@@ -71260,6 +71941,10 @@ async function _tektiteOpenInternalEditor(act, attId) {
     saveBtn.textContent = "Saving…";
     try {
       const out = await handle.save();
+      if (out && out.cancelled) {
+        m.querySelector(".tk-iem-status").textContent = "Save cancelled";
+        return;
+      }
       if (!out || !out.blob) throw new Error("editor returned no blob");
       const newId = out.newId || attId;
       await tektitePutAttachment({ id: newId, blob: out.blob, mime: out.mime });
@@ -71326,10 +72011,16 @@ async function _tektiteEditorMountPdf(mount, rec, attId) {
   const pagesEl   = mount.querySelector(".tk-pdf-pages");
   const zoomValEl = mount.querySelector(".tk-pdf-zoom-val");
 
+  // Zoom/fit buttons call renderAll() without awaiting; a generation
+  // counter makes a superseded run bail instead of interleaving its
+  // old-scale pages with the new run's.
+  let _renderGen = 0;
   async function renderAll() {
+    const gen = ++_renderGen;
     pagesEl.innerHTML = "";
     for (let i = 1; i <= pdf.numPages; i++) {
       const page = await pdf.getPage(i);
+      if (gen !== _renderGen) return;
       const viewport = page.getViewport({ scale });
       const wrap = document.createElement("div");
       wrap.className = "tk-pdf-page-wrap";
@@ -71341,6 +72032,7 @@ async function _tektiteEditorMountPdf(mount, rec, attId) {
       pagesEl.appendChild(wrap);
       const ctx = canvas.getContext("2d");
       await page.render({ canvasContext: ctx, viewport }).promise;
+      if (gen !== _renderGen) return;
     }
     zoomValEl.textContent = Math.round(scale * 71) + "%";
   }
@@ -71979,10 +72671,16 @@ async function _tektiteEditorMountPdfV2(mount, rec /*, attId */) {
     }
   }
 
+  // Zoom/fit buttons call renderAll() without awaiting; a generation
+  // counter makes a superseded run bail instead of interleaving its
+  // old-scale pages with the new run's.
+  let _renderGen = 0;
   async function renderAll() {
+    const gen = ++_renderGen;
     pagesEl.innerHTML = "";
     for (let i = 1; i <= pdf.numPages; i++) {
       const page = await pdf.getPage(i);
+      if (gen !== _renderGen) return;
       const viewport = page.getViewport({ scale });
       const wrap = document.createElement("div");
       wrap.className = "tk-pdf-page-wrap";
@@ -71997,6 +72695,7 @@ async function _tektiteEditorMountPdfV2(mount, rec /*, attId */) {
       pagesEl.appendChild(wrap);
       const ctx = canvas.getContext("2d");
       await page.render({ canvasContext: ctx, viewport }).promise;
+      if (gen !== _renderGen) return;
 
       // Mount annotation editor layer if supported.
       if (editorManager) {
@@ -72169,6 +72868,16 @@ async function _tektiteEditorMountDocV2(mount, rec, attId) {
 
   return {
     save: async () => {
+      // The HTML->docx walker is lossy (images dropped, complex tables
+      // flattened, lists/links/styles stripped) and the rebuilt blob
+      // OVERWRITES the original .docx under the same id -- the only
+      // copy in the vault.  Make the user opt in before destroying it.
+      if (!window.confirm(
+        "Saving converts this document and OVERWRITES \"" + attId + "\".\n\n" +
+        "Embedded images are dropped and complex tables are flattened; " +
+        "the original .docx cannot be recovered afterwards.\n\nSave anyway?")) {
+        return { cancelled: true };
+      }
       // Try the real docx round-trip; fall back to .html on failure.
       try {
         const docx = await _tektiteLoadDocxLib();
@@ -72285,6 +72994,7 @@ async function _nodeNoteOpenInTektite(nodeId) {
 /* --- attach picker modal ------------------------------------------------- */
 
 let _attachNoteModalEl = null;
+let _attachNoteModalGen = 0; // incremented on each open; stale awaits bail out
 
 function _nodeNoteCloseModal() {
   if (_attachNoteModalEl) { _attachNoteModalEl.remove(); _attachNoteModalEl = null; }
@@ -72300,8 +73010,21 @@ async function openAttachNoteModal(nodeId) {
   if (!node) return;
   _nodeNoteCloseModal();
 
+  // Claim this invocation's generation token synchronously before yielding.
+  // Any concurrent call that races through the await will see a newer token
+  // and discard its result, preventing double-backdrop orphan.
+  const myGen = ++_attachNoteModalGen;
+
   let notes = [];
   try { notes = await tektiteListNotes(); } catch (_) { notes = []; }
+
+  // A newer openAttachNoteModal call started while we were awaiting -- bail.
+  if (myGen !== _attachNoteModalGen) return;
+
+  // Remove any backdrop that a concurrent call may have appended between our
+  // await and this point (shouldn't happen given the gen-check above, but
+  // guards against any future refactor that changes the guard order).
+  if (_attachNoteModalEl) { _attachNoteModalEl.remove(); _attachNoteModalEl = null; }
 
   const back = document.createElement("div");
   back.className = "modal-backdrop";
@@ -87344,7 +88067,12 @@ function _resolveNodeParams(node) {
       if (!tw || !tw.from) continue;
       const tsrc = state.nodes.find(n => n && n.id === tw.from.node);
       if (tsrc && tsrc.params) {
-        const tv = tsrc.params[tw.from.port];
+        let tv = tsrc.params[tw.from.port];
+        // Bulky runtime-only text outputs (e.g. NotesCorpus's vault
+        // corpus) live under a _-prefixed twin so they never serialize
+        // into the .gpatch; fall back to it when the plain key is absent.
+        if (typeof tv !== "string" && typeof tsrc.params["_" + tw.from.port] === "string")
+          tv = tsrc.params["_" + tw.from.port];
         if (typeof tv === "string") out[port.n] = tv;
         else if (typeof tv === "number" && Number.isFinite(tv)) out[port.n] = String(tv);
       }

@@ -51,6 +51,12 @@ function _tektiteEnsureInternalEditorModal() {
   m.querySelector(".tk-iem-close").addEventListener("click", () => _tektiteCloseInternalEditor());
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && m.style.display !== "none" && m.style.display !== "") {
+      // Esc is an ordinary editing key inside the mounted editors
+      // (Monaco widgets, cancelling a cell edit); closing here would
+      // discard every unsaved edit.  Only close when focus is outside
+      // the editor mount -- the bar's × Close stays available.
+      const mountEl = m.querySelector(".tk-iem-mount");
+      if (mountEl && (mountEl.contains(document.activeElement) || mountEl.contains(e.target))) return;
       _tektiteCloseInternalEditor();
     }
   });
@@ -74,6 +80,17 @@ function _tektiteCloseInternalEditor() {
 
 async function _tektiteOpenInternalEditor(act, attId) {
   const m = _tektiteEnsureInternalEditorModal();
+  // Neutralize the previous open's Save wiring BEFORE any await /
+  // early return below: a failed open must not leave the button armed
+  // with the last editor's stale handle (it would re-save the wrong
+  // attachment).
+  const saveBtn = m.querySelector(".tk-iem-save");
+  saveBtn.onclick = null;
+  saveBtn.disabled = true;
+  if (m._handle && typeof m._handle.dispose === "function") {
+    try { m._handle.dispose(); } catch (_) {}
+  }
+  m._handle = null;
   m.style.display = "flex";
   m.querySelector(".tk-iem-title").textContent = "Editor: " + attId;
   m.querySelector(".tk-iem-status").textContent = "";
@@ -115,7 +132,6 @@ async function _tektiteOpenInternalEditor(act, attId) {
   m._handle = handle;
 
   // Wire save button.
-  const saveBtn = m.querySelector(".tk-iem-save");
   saveBtn.disabled = !handle || typeof handle.save !== "function";
   saveBtn.onclick = async () => {
     if (!handle || typeof handle.save !== "function") return;
@@ -124,6 +140,10 @@ async function _tektiteOpenInternalEditor(act, attId) {
     saveBtn.textContent = "Saving…";
     try {
       const out = await handle.save();
+      if (out && out.cancelled) {
+        m.querySelector(".tk-iem-status").textContent = "Save cancelled";
+        return;
+      }
       if (!out || !out.blob) throw new Error("editor returned no blob");
       const newId = out.newId || attId;
       await tektitePutAttachment({ id: newId, blob: out.blob, mime: out.mime });
@@ -190,10 +210,16 @@ async function _tektiteEditorMountPdf(mount, rec, attId) {
   const pagesEl   = mount.querySelector(".tk-pdf-pages");
   const zoomValEl = mount.querySelector(".tk-pdf-zoom-val");
 
+  // Zoom/fit buttons call renderAll() without awaiting; a generation
+  // counter makes a superseded run bail instead of interleaving its
+  // old-scale pages with the new run's.
+  let _renderGen = 0;
   async function renderAll() {
+    const gen = ++_renderGen;
     pagesEl.innerHTML = "";
     for (let i = 1; i <= pdf.numPages; i++) {
       const page = await pdf.getPage(i);
+      if (gen !== _renderGen) return;
       const viewport = page.getViewport({ scale });
       const wrap = document.createElement("div");
       wrap.className = "tk-pdf-page-wrap";
@@ -205,6 +231,7 @@ async function _tektiteEditorMountPdf(mount, rec, attId) {
       pagesEl.appendChild(wrap);
       const ctx = canvas.getContext("2d");
       await page.render({ canvasContext: ctx, viewport }).promise;
+      if (gen !== _renderGen) return;
     }
     zoomValEl.textContent = Math.round(scale * 71) + "%";
   }
@@ -843,10 +870,16 @@ async function _tektiteEditorMountPdfV2(mount, rec /*, attId */) {
     }
   }
 
+  // Zoom/fit buttons call renderAll() without awaiting; a generation
+  // counter makes a superseded run bail instead of interleaving its
+  // old-scale pages with the new run's.
+  let _renderGen = 0;
   async function renderAll() {
+    const gen = ++_renderGen;
     pagesEl.innerHTML = "";
     for (let i = 1; i <= pdf.numPages; i++) {
       const page = await pdf.getPage(i);
+      if (gen !== _renderGen) return;
       const viewport = page.getViewport({ scale });
       const wrap = document.createElement("div");
       wrap.className = "tk-pdf-page-wrap";
@@ -861,6 +894,7 @@ async function _tektiteEditorMountPdfV2(mount, rec /*, attId */) {
       pagesEl.appendChild(wrap);
       const ctx = canvas.getContext("2d");
       await page.render({ canvasContext: ctx, viewport }).promise;
+      if (gen !== _renderGen) return;
 
       // Mount annotation editor layer if supported.
       if (editorManager) {
@@ -1033,6 +1067,16 @@ async function _tektiteEditorMountDocV2(mount, rec, attId) {
 
   return {
     save: async () => {
+      // The HTML->docx walker is lossy (images dropped, complex tables
+      // flattened, lists/links/styles stripped) and the rebuilt blob
+      // OVERWRITES the original .docx under the same id -- the only
+      // copy in the vault.  Make the user opt in before destroying it.
+      if (!window.confirm(
+        "Saving converts this document and OVERWRITES \"" + attId + "\".\n\n" +
+        "Embedded images are dropped and complex tables are flattened; " +
+        "the original .docx cannot be recovered afterwards.\n\nSave anyway?")) {
+        return { cancelled: true };
+      }
       // Try the real docx round-trip; fall back to .html on failure.
       try {
         const docx = await _tektiteLoadDocxLib();

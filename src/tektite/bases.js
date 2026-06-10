@@ -68,9 +68,13 @@ const TEKTITE_BASE_DEFAULTS = {
 
 function _tektiteBaseIsBase(note) {
   if (!note || !note.content) return false;
-  // Cheap detection without re-parsing frontmatter -- look for the
-  // marker line.  Real load goes through tektiteParseFrontmatter.
-  return /^---[\s\S]*?\btektite-base:\s*(true|True|TRUE)\b/.test(note.content);
+  // Cheap detection without re-parsing frontmatter -- but match only
+  // within the YAML frontmatter block (between the two --- fences); a
+  // note that merely *mentions* tektite-base in its body must not be
+  // detected as a base.  Real load goes through tektiteParseFrontmatter.
+  const m = note.content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!m) return false;
+  return /\btektite-base:\s*(true|True|TRUE)\b/.test(m[1]);
 }
 
 async function tektiteBaseListAll() {
@@ -217,7 +221,7 @@ async function tektiteBaseExecute(config) {
     if (va instanceof Date && vb instanceof Date) return (va - vb) * dirMul;
     const na = (va instanceof Date) ? va.getTime() : Number(va);
     const nb = (vb instanceof Date) ? vb.getTime() : Number(vb);
-    if (Number.isFinite(na) && Number.isFinite(nb) && (na !== 0 || vb !== "0") && (nb !== 0 || vb !== "0")) {
+    if (Number.isFinite(na) && Number.isFinite(nb) && (na !== 0 || va !== "0") && (nb !== 0 || vb !== "0")) {
       return (na - nb) * dirMul;
     }
     return String(va || "").localeCompare(String(vb || "")) * dirMul;
@@ -285,6 +289,22 @@ function _tektiteBaseMatchProp(value, op, target) {
       case "<":  return vNum <  tNum;
       case ">=": return vNum >= tNum;
       case "<=": return vNum <= tNum;
+    }
+  }
+  // Date path. Treat target as ISO if it parses.
+  if (value instanceof Date) {
+    const tDate = new Date(target);
+    if (!Number.isNaN(tDate.getTime())) {
+      const v = value.getTime();
+      const t = tDate.getTime();
+      switch (op) {
+        case "=":  return v === t;
+        case "!=": return v !== t;
+        case ">":  return v >  t;
+        case "<":  return v <  t;
+        case ">=": return v >= t;
+        case "<=": return v <= t;
+      }
     }
   }
   if (Array.isArray(value)) {

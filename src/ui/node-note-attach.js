@@ -84,6 +84,7 @@ async function _nodeNoteOpenInTektite(nodeId) {
 /* --- attach picker modal ------------------------------------------------- */
 
 let _attachNoteModalEl = null;
+let _attachNoteModalGen = 0; // incremented on each open; stale awaits bail out
 
 function _nodeNoteCloseModal() {
   if (_attachNoteModalEl) { _attachNoteModalEl.remove(); _attachNoteModalEl = null; }
@@ -99,8 +100,21 @@ async function openAttachNoteModal(nodeId) {
   if (!node) return;
   _nodeNoteCloseModal();
 
+  // Claim this invocation's generation token synchronously before yielding.
+  // Any concurrent call that races through the await will see a newer token
+  // and discard its result, preventing double-backdrop orphan.
+  const myGen = ++_attachNoteModalGen;
+
   let notes = [];
   try { notes = await tektiteListNotes(); } catch (_) { notes = []; }
+
+  // A newer openAttachNoteModal call started while we were awaiting -- bail.
+  if (myGen !== _attachNoteModalGen) return;
+
+  // Remove any backdrop that a concurrent call may have appended between our
+  // await and this point (shouldn't happen given the gen-check above, but
+  // guards against any future refactor that changes the guard order).
+  if (_attachNoteModalEl) { _attachNoteModalEl.remove(); _attachNoteModalEl = null; }
 
   const back = document.createElement("div");
   back.className = "modal-backdrop";

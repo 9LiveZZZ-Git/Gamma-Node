@@ -65,10 +65,20 @@ function _tektiteBacklinksDropNote(noteId) {
 function _tektiteBacklinksIngestNote(noteId, title, content, modifiedAt) {
   // Drop any prior entries for this note before re-ingesting.
   _tektiteBacklinksDropNote(noteId);
-  const links = tektiteMarkdownExtractWikilinks(content);
+  // Strip code fences + inline code before scanning so that wikilinks
+  // inside code blocks/spans don't produce false-positive backlinks
+  // (mirrors _tektiteStripCodeForTags in tags.js).
+  const cleaned = String(content || "")
+    .replace(/```[\s\S]*?```/g, m => " ".repeat(m.length))
+    .replace(/`[^`\n]*`/g,      m => " ".repeat(m.length));
+  const links = tektiteMarkdownExtractWikilinks(cleaned);
   const targets = new Set();
   for (const lnk of links) {
-    targets.add(lnk.target);
+    // Strip #heading / #^block anchors so [[Note#Section]] indexes under
+    // "Note" (the bare note target), matching how the backlinks panel looks
+    // up by note id/title. |alias is already stripped by the extractor.
+    const bare = lnk.target.replace(/#.*$/, "").trim();
+    if (bare) targets.add(bare);
   }
   // Normalize targets to lowercase for case-insensitive matching;
   // store the original on the inverse-set side via a parallel index

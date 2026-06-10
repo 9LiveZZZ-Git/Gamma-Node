@@ -68,8 +68,25 @@ function tektiteVaultOpen() {
         att.createIndex("modifiedAt", "modifiedAt", { unique: false });
       }
     };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror   = () => reject(req.error || new Error("IDB open failed"));
+    req.onsuccess = () => {
+      const db = req.result;
+      // Release the connection when a newer-version open request arrives,
+      // so that tab doesn't block indefinitely on `blocked`.
+      db.onversionchange = () => db.close();
+      resolve(db);
+    };
+    req.onerror   = () => {
+      _tektiteVaultDbP = null;   // transient failure -- allow retry next call
+      reject(req.error || new Error("IDB open failed"));
+    };
+    // Another tab's open request is blocked by this connection; ask the
+    // user to close older editor tabs instead of hanging silently.
+    req.onblocked = () => {
+      _tektiteVaultDbP = null;
+      reject(new Error(
+        "Tektite vault upgrade blocked — please close any other editor tabs and reload."
+      ));
+    };
   });
   return _tektiteVaultDbP;
 }
@@ -394,7 +411,7 @@ async function tektiteDeleteAttachment(id) {
   let rec = null;
   try { rec = await tektiteGetAttachment(id); } catch (_) {}
   if (rec && rec.backing === "server") {
-    try { await tektiteVaultServerDelete(id); }
+    try { await tektiteVaultServerDelete(TEKTITE_VAULT_REMOTE_FOLDER + id); }
     catch (e) { console.warn("[tektite-vault] server delete failed for", id, e.message); }
   }
   const db = await tektiteVaultOpen();
@@ -471,7 +488,7 @@ function tektiteVaultServerUpload(id, blob, onProgress) {
   const path = String(id).replace(/^\/+/, "");
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open("PUT", base + "/vault/file/" + encodeURI(path));
+    xhr.open("PUT", base + "/vault/file/" + path.split("/").map(encodeURIComponent).join("/"));
     xhr.setRequestHeader("Content-Type", blob.type || "application/octet-stream");
     xhr.responseType = "json";
     xhr.upload.onprogress = (e) => {
@@ -523,7 +540,7 @@ async function tektiteVaultServerDelete(id) {
   const base = _tektiteVaultServerUrl();
   if (!base) throw new Error("No compile server URL configured.");
   const path = String(id).replace(/^\/+/, "");
-  const r = await fetch(base + "/vault/file/" + encodeURI(path), {
+  const r = await fetch(base + "/vault/file/" + path.split("/").map(encodeURIComponent).join("/"), {
     method: "DELETE",
     mode:   "cors"
   });

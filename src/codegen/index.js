@@ -438,6 +438,9 @@ function _nodeNoteDocComment(node, indent) {
     bodyLines = bodyLines.slice(1);
     while (bodyLines.length && bodyLines[0].trim() === "") bodyLines = bodyLines.slice(1);
   }
+  // "".split("\n") produces [""] — treat a single empty/whitespace-only
+  // element as no body so the separator pair isn't emitted for blank notes.
+  if (bodyLines.length === 1 && bodyLines[0].trim() === "") bodyLines = [];
   const lines = [pad + "/**", pad + " * " + title];
   if (bodyLines.length) {
     lines.push(pad + " *");
