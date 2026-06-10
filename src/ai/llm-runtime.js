@@ -120,8 +120,14 @@ function _readVectorWire(node, portName) {
   for (const e of state.edges) {
     if (e && e.to && e.to.node === node.id && e.to.port === portName) {
       const src = state.nodes.find(n => n && n.id === e.from.node);
-      if (src && src.params && src.params._vec && src.params._vec.data) {
-        return src.params._vec;
+      if (src && src.params) {
+        // Port-aware convention (Phase D llm-3): nodes with several
+        // vector outs publish per-port on params._vec_<port>
+        // (DatasetLoader.batch vs .targets). Single-vector producers
+        // keep the original params._vec.
+        const pv = src.params["_vec_" + e.from.port];
+        if (pv && pv.data) return pv;
+        if (src.params._vec && src.params._vec.data) return src.params._vec;
       }
     }
   }
@@ -804,6 +810,11 @@ function _tickLLMRuntime(dtSec) {
       const rt = _llmGetState(n.id);
       if      (n.type === "ConversationMemory") _tickConversationMemory(n, rt);
       else if (n.type === "EmbedSimilarity")    _tickEmbedSimilarity(n);
+      // Phase D llm-3 -- data-pipeline nodes (src/llm/data.js).
+      else if (n.type === "TextCorpus"    && typeof _tickTextCorpus     === "function") _tickTextCorpus(n, rt);
+      else if (n.type === "Tokenizer"     && typeof _tickTokenizerNode  === "function") _tickTokenizerNode(n, rt);
+      else if (n.type === "Vocabulary"    && typeof _tickVocabularyNode === "function") _tickVocabularyNode(n);
+      else if (n.type === "DatasetLoader" && typeof _tickDatasetLoader  === "function") _tickDatasetLoader(n, rt);
       continue;
     }
     if (def.kind !== "llm-sink") continue;

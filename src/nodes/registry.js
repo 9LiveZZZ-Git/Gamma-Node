@@ -20393,5 +20393,89 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     },
     uiOnlyParams: ["value", "raw", "done"],
     description: "LLM-as-controller. Calls Ollama with `format: 'json'` mode + a system prompt incorporating `schema`. On success, parses the response and extracts the top-level `field` into `value` (as text). The full JSON lands on `raw` for downstream consumers. Wire `value` into a NumFromText / param to use the LLM as a parameter source — e.g. 'choose a melody mode from {dorian, lydian, mixolydian}'."
+  },
+
+  /* ============================================================
+   * Phase D sprint llm-3 -- data nodes (spec §6.3 "Data").
+   *
+   * The front of the LLM-from-scratch training pipeline:
+   * TextCorpus → Tokenizer → Vocabulary → DatasetLoader, per the
+   * §8 worked example. Ticked from _tickLLMRuntime (llm-op walk,
+   * src/llm/data.js); tokenizer handles live in the runtime-state
+   * map, token ids + batches ride the params._vec_<port> wire
+   * convention. No .h emission (isRuntimeOnlyKind).
+   * ============================================================ */
+  TextCorpus: {
+    category: "AI/Data", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-op",
+    ins: [{ n: "refresh", t: "gate" }],
+    outs: [
+      { n: "corpus", t: "text" },
+      { n: "chars",  t: "param" }
+    ],
+    params: {
+      source:  "url",
+      url:     "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt",
+      text:    "",
+      refresh: 0,
+      chars:   0,
+      status:  ""
+    },
+    uiOnlyParams: ["chars", "status"],
+    description: "Text corpus source for the LLM-from-scratch pipeline. `source` = 'url' fetches the URL once (re-fetch on url change or `refresh` pulse; default is Karpathy's Tiny Shakespeare); 'inline' uses the `text` param directly. The corpus rides the `corpus` text output (runtime-only — it never serializes into the .gpatch). Wire into Tokenizer.corpus, or anywhere else a text input goes (LLMChat context, NotesCorpus-style flows)."
+  },
+  Tokenizer: {
+    category: "AI/Data", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-op",
+    ins: [{ n: "corpus", t: "text" }],
+    outs: [
+      { n: "ids",       t: "vector" },
+      { n: "vocabSize", t: "param" }
+    ],
+    params: {
+      mode:      "char",
+      hfId:      "Xenova/gpt2",
+      vocabSize: 0,
+      status:    ""
+    },
+    uiOnlyParams: ["vocabSize", "status"],
+    description: "Tokenizes the wired corpus. `mode` = 'char' (vocab = the corpus's unique characters — the worked-example default), 'byte' (fixed 256 UTF-8 byte vocab, no training), or 'hf' (loads `hfId` via @huggingface/transformers AutoTokenizer, e.g. Xenova/gpt2 — async CDN download on first use). The full encoded corpus lands on `ids` as a [N] vector of token ids; downstream Generate/Chat nodes reuse this node's encode/decode handle. Re-tokenizes when the corpus or mode changes."
+  },
+  Vocabulary: {
+    category: "AI/Data", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-op",
+    ins: [{ n: "tok", t: "vector" }],
+    outs: [{ n: "size", t: "param" }],
+    params: {
+      size:    0,
+      preview: ""
+    },
+    uiOnlyParams: ["size", "preview"],
+    description: "Standalone vocabulary inspector. Wire Tokenizer.ids in; surfaces the upstream tokenizer's vocab size on `size` (drive TokenEmbedding.vocabSize with it in llm-4) and a printable vocab preview in the node body. Pure display + plumbing — no computation of its own."
+  },
+  DatasetLoader: {
+    category: "AI/Data", color: COLOR.ai, header: null,
+    cppType: "", kind: "llm-op",
+    ins: [
+      { n: "ids",  t: "vector" },
+      { n: "next", t: "gate" }
+    ],
+    outs: [
+      { n: "batch",   t: "vector" },
+      { n: "targets", t: "vector" },
+      { n: "epoch",   t: "param" },
+      { n: "step",    t: "param" }
+    ],
+    params: {
+      seqLen:     128,
+      batchSize:  8,
+      stride:     0,
+      next:       0,
+      epoch:      0,
+      step:       0,
+      batchShape: ""
+    },
+    uiOnlyParams: ["epoch", "step", "batchShape"],
+    description: "Slices token-id streams into training batches. Reads the `ids` vector (wire Tokenizer.ids), emits `batch` [batchSize, seqLen] and `targets` (the same windows shifted +1) as vectors. The first batch builds as soon as ids arrive; each `next` pulse advances the read cursor by batchSize×stride (stride 0 = seqLen, i.e. non-overlapping windows). `epoch` increments when the cursor wraps the corpus; `step` counts batches served. TrainStep (llm-7) pulses `next` once per optimization step."
   }
 };
