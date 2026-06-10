@@ -1082,6 +1082,20 @@ function _tektiteWireDevToolsMenu() {
       } catch (e) { window.alert("Unload failed: " + (e && e.message || e)); }
     });
   }
+  // Phase C item 10 / spec §7.2 -- embedding backend picker. Persisted in
+  // localStorage; vectors recompute lazily on the next layout/search that
+  // needs them (cache records are tagged per backend, so no flush).
+  const embSel = document.getElementById("tektite-embed-backend");
+  if (embSel && !embSel._wired && typeof tektiteEmbSettings === "function") {
+    embSel._wired = true;
+    embSel.value = tektiteEmbSettings().backend;
+    embSel.addEventListener("change", () => {
+      const s = tektiteEmbSetBackend(embSel.value);
+      console.log("[tektite] embedding backend → " + s.backend +
+        (s.backend === "ollama" ? " (" + s.ollamaModel + ")" : "") +
+        "; vectors recompute on next use");
+    });
+  }
 }
 
 (function _autoWireDevTools() {

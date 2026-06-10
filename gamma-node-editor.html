@@ -9941,6 +9941,15 @@
                   title="Drop every attachment (images / pdfs / videos / etc.); notes preserved">🧹 Unload attachments</button>
                 <button class="btn" id="btn-tektite-vault-unload-all" type="button"
                   title="Drop EVERY note + attachment; total reset">🗑 Unload entire vault</button>
+                <!-- Phase C item 10 / spec §7.2 -- embedding backend picker.
+                     Vectors recompute lazily on the next layout/search that
+                     needs them (cache records are tagged per backend). -->
+                <select id="tektite-embed-backend" class="btn"
+                  title="Embedding model for the semantic graph layouts (galaxy / embedding projection). Built-in needs no download; MiniLM downloads ~25 MB once and runs in-browser; Ollama uses your local/cloud Ollama server (nomic-embed-text).">
+                  <option value="hash">🧬 Embeddings: built-in</option>
+                  <option value="minilm">🧬 Embeddings: MiniLM (local model)</option>
+                  <option value="ollama">🧬 Embeddings: Ollama</option>
+                </select>
               </div>
             </div>
             <button class="btn" id="btn-tektite-collapse-all" type="button"
@@ -63188,33 +63197,78 @@ function tektiteMarkdownExtractWikilinks(text) {
   return out;
 }
 /* =========================================================================
- * Tektite MD -- embeddings + cache + PCA (sprint tektite-6).
+ * Tektite MD -- embeddings + cache + PCA (sprint tektite-6; real model
+ * backends added for Phase C item 10 / spec §7.2).
  *
- * MVP backend: hash-trick TF-IDF-ish vectors of fixed 128 dim.  Fast,
- * deterministic, in-process, no model download.  Real transformers.js
- * /api/embed backends slot in later behind the same tektiteEmbed*
- * surface.
+ * Three backends behind one surface, user-picked in the vault DevTools
+ * menu (#tektite-embed-backend, persisted in localStorage):
  *
- * Public surface:
- *   await tektiteEmbedText(text)        -> Float32Array(EMB_DIM)
- *   await tektiteEmbeddingsGet(noteId)  -> Float32Array(EMB_DIM)
- *                                          (cached by modifiedAt;
- *                                           computed on demand)
+ *   hash    -- hash-trick TF-IDF-ish 128-dim vectors (sprint-6 MVP).
+ *              In-process, deterministic, no download. Always available;
+ *              also the silent fallback when a model backend fails.
+ *   minilm  -- all-MiniLM-L6-v2 (384-dim) in-browser via
+ *              @huggingface/transformers feature-extraction, mean-pooled
+ *              + normalized. ~25 MB one-time download, cached by the
+ *              browser. Same CDN import the Whisper voice path uses.
+ *   ollama  -- POST /api/embed through Phase B's ollamaEmbed() (default
+ *              model nomic-embed-text, 768-dim). Uses the AI panel's
+ *              Ollama URL/key settings; cloud when the active provider
+ *              is ollama-cloud, local otherwise.
+ *
+ * Public surface (unchanged):
+ *   await tektiteEmbedText(text)        -> Float32Array
+ *   await tektiteEmbedTexts(texts)      -> { vectors, tag }  (bulk; tag =
+ *                                          backend actually used, so cache
+ *                                          writers never mislabel fallbacks)
+ *   await tektiteEmbeddingsGet(noteId)  -> Float32Array (cached)
  *   await tektiteEmbeddingsGetMany(ids) -> Map<id, Float32Array>
  *   tektitePca(vectors, k)              -> projected positions [N][k]
+ *   tektiteEmbSettings() / tektiteEmbSetBackend(backend)
  *
  * Cache: IndexedDB store "tektite-embeddings" keyed by note id.
- * Values: { id, vector: Float32Array, modifiedAt: number }.
- * Invalidated when the note's modifiedAt advances past the cached
- * version.  Bulk paths (Get/Many) walk the vault list + lazily
- * compute missing or stale entries.
+ * Values: { id, vector, modifiedAt, backend }. A record is stale when
+ * the note's modifiedAt advances OR the active backend tag differs --
+ * switching backends recomputes lazily, no flush needed. Vector
+ * dimensions differ per backend (128/384/768); consumers (PCA, galaxy)
+ * are dimension-agnostic and each GetMany call is single-backend.
  * ======================================================================== */
 
-const TEKTITE_EMB_DIM         = 128;
+const TEKTITE_EMB_DIM         = 128;   // hash backend only
 const TEKTITE_EMB_STORE       = "tektite-embeddings";
 const TEKTITE_EMB_DB_VERSION  = 1;   // bumped if the schema changes
+const TEKTITE_EMB_LS_KEY      = "gamma-editor-tektite-embeddings-v1";
 let   _tektiteEmbDbPromise    = null;
+let   _tektiteEmbWarnedFallback = false;
 
+/* --- backend settings ---------------------------------------------------- */
+function tektiteEmbSettings() {
+  let s = null;
+  try { s = JSON.parse(localStorage.getItem(TEKTITE_EMB_LS_KEY) || "null"); } catch (_) {}
+  if (!s || typeof s !== "object") s = {};
+  if (s.backend !== "minilm" && s.backend !== "ollama") s.backend = "hash";
+  if (!s.ollamaModel) s.ollamaModel = (typeof OLLAMA_DEFAULT_EMBED_MODEL === "string") ? OLLAMA_DEFAULT_EMBED_MODEL : "nomic-embed-text";
+  return s;
+}
+
+function tektiteEmbSetBackend(backend, opts) {
+  const s = tektiteEmbSettings();
+  if (backend === "hash" || backend === "minilm" || backend === "ollama") s.backend = backend;
+  if (opts && opts.ollamaModel) s.ollamaModel = String(opts.ollamaModel);
+  try { localStorage.setItem(TEKTITE_EMB_LS_KEY, JSON.stringify(s)); } catch (_) {}
+  _tektiteEmbWarnedFallback = false;   // a new backend gets a fresh warning slot
+  return s;
+}
+
+/* Cache tag for the active backend; fallback writes tag "hash" so a
+ * later successful model run still recomputes. */
+function _tektiteEmbBackendTag() {
+  const s = tektiteEmbSettings();
+  if (s.backend === "minilm") return "minilm";
+  if (s.backend === "ollama") return "ollama:" + s.ollamaModel;
+  return "hash";
+}
+
+/* --- IDB cache ------------------------------------------------------------ */
 function _tektiteEmbOpenDb() {
   if (_tektiteEmbDbPromise) return _tektiteEmbDbPromise;
   _tektiteEmbDbPromise = new Promise((resolve, reject) => {
@@ -63255,9 +63309,9 @@ async function _tektiteEmbCachePut(record) {
   } catch (_) {}
 }
 
-/* Hash-trick MVP embedding.  Tokenize on word boundaries, hash each
- * token into a fixed bucket, log-scale TF, L2-normalize.  Cheap; gives
- * "similar notes cluster" quality without a model download. */
+/* --- backend: hash (sprint-6 MVP, always available) ------------------------
+ * Tokenize on word boundaries, hash each token into a fixed bucket,
+ * log-scale TF, L2-normalize. */
 function _tektiteEmbHashToken(t) {
   let h = 2166136261;
   for (let i = 0; i < t.length; i++) {
@@ -63267,7 +63321,7 @@ function _tektiteEmbHashToken(t) {
   return (h >>> 0) % TEKTITE_EMB_DIM;
 }
 
-async function tektiteEmbedText(text) {
+function _tektiteEmbHashOne(text) {
   const v = new Float32Array(TEKTITE_EMB_DIM);
   if (!text) return v;
   const tokens = String(text).toLowerCase().match(/[a-z0-9][a-z0-9_-]*/g) || [];
@@ -63282,57 +63336,167 @@ async function tektiteEmbedText(text) {
   return v;
 }
 
-/* Single-note get with cache.  Sprint 10z -- falls back to attachment
- * metadata when noteId names an attachment instead of a note (no
- * markdown content available for binary files, so we embed
- * "filename kind ext" as a coarse semantic signature). */
-async function tektiteEmbeddingsGet(noteId) {
-  if (!noteId) return new Float32Array(TEKTITE_EMB_DIM);
-  const note = await tektiteGetNote(noteId);
-  if (note) {
-    const cached = await _tektiteEmbCacheGet(noteId);
-    if (cached && cached.modifiedAt >= (note.modifiedAt || 0) && cached.vector) {
-      return cached.vector instanceof Float32Array ? cached.vector : new Float32Array(cached.vector);
-    }
-    const vec = await tektiteEmbedText((note.title || "") + " " + (note.content || ""));
-    await _tektiteEmbCachePut({
-      id:         noteId,
-      vector:     vec,
-      modifiedAt: note.modifiedAt || Date.now()
-    });
-    return vec;
+/* --- backend: MiniLM via transformers.js ----------------------------------
+ * Lazy CDN import, one cached pipeline. Failed loads clear the promise
+ * so a later attempt can retry (e.g. network came back). */
+let _tektiteEmbMiniLMPromise = null;
+function _tektiteEmbMiniLMPipe() {
+  if (!_tektiteEmbMiniLMPromise) {
+    _tektiteEmbMiniLMPromise = (async () => {
+      const tx = await import("https://cdn.jsdelivr.net/npm/@huggingface/transformers@latest/+esm");
+      return await tx.pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2");
+    })();
+    _tektiteEmbMiniLMPromise.catch(() => { _tektiteEmbMiniLMPromise = null; });
   }
-  // No note -> maybe an attachment.
+  return _tektiteEmbMiniLMPromise;
+}
+
+async function _tektiteEmbMiniLM(texts) {
+  const pipe = await _tektiteEmbMiniLMPipe();
+  const out = [];
+  for (let i = 0; i < texts.length; i += 8) {
+    const batch = texts.slice(i, i + 8).map(t => t || " ");
+    const res = await pipe(batch, { pooling: "mean", normalize: true });
+    const dims = res.dims;                 // [batch, 384]
+    const d = dims[dims.length - 1];
+    const data = res.data;
+    for (let r = 0; r < batch.length; r++) {
+      out.push(Float32Array.from(data.slice(r * d, (r + 1) * d)));
+    }
+  }
+  return out;
+}
+
+/* --- backend: Ollama /api/embed (Phase B plumbing) -------------------------
+ * Local Ollama by default (AI-panel URL when configured); cloud when the
+ * active provider is ollama-cloud. Vectors are L2-normalized here so
+ * cosine/PCA behavior matches the other backends. */
+async function _tektiteEmbOllama(texts) {
+  if (typeof ollamaEmbed !== "function") throw new Error("ollamaEmbed unavailable");
+  const s = tektiteEmbSettings();
+  const providerId = (typeof aiSettings === "object" && aiSettings && aiSettings.provider) || "";
+  const cloud  = providerId === "ollama-cloud";
+  const baseUrl = cloud
+    ? ((typeof OLLAMA_CLOUD_BASE_URL === "string") ? OLLAMA_CLOUD_BASE_URL : "https://ollama.com")
+    : ((typeof aiSettings === "object" && aiSettings && aiSettings.ollamaUrl) || "");
+  const key = cloud ? (aiSettings && aiSettings.ollamaKey) : undefined;
+  const out = [];
+  for (let i = 0; i < texts.length; i += 32) {
+    const batch = texts.slice(i, i + 32).map(t => t || " ");
+    const res = await ollamaEmbed({ baseUrl, key, model: s.ollamaModel, input: batch });
+    const embs = (res && res.embeddings) || [];
+    if (embs.length !== batch.length) throw new Error("ollama /api/embed returned " + embs.length + " vectors for " + batch.length + " inputs");
+    for (const e of embs) {
+      const v = Float32Array.from(e);
+      let norm = 0;
+      for (let j = 0; j < v.length; j++) norm += v[j] * v[j];
+      norm = Math.sqrt(norm) || 1;
+      for (let j = 0; j < v.length; j++) v[j] /= norm;
+      out.push(v);
+    }
+  }
+  return out;
+}
+
+/* --- dispatcher ------------------------------------------------------------
+ * Model backends see a truncated head of the note (their token windows
+ * are small and the embedding quality of a title + lead paragraphs
+ * beats a hard-truncated wall of text anyway). */
+function _tektiteEmbPrep(text, backend) {
+  const t = String(text || "");
+  return backend === "minilm" ? t.slice(0, 2000) : t.slice(0, 6000);
+}
+
+async function tektiteEmbedTexts(texts) {
+  const s = tektiteEmbSettings();
+  if (s.backend === "minilm" || s.backend === "ollama") {
+    try {
+      const prepped = texts.map(t => _tektiteEmbPrep(t, s.backend));
+      const vectors = (s.backend === "minilm")
+        ? await _tektiteEmbMiniLM(prepped)
+        : await _tektiteEmbOllama(prepped);
+      return { vectors, tag: _tektiteEmbBackendTag() };
+    } catch (e) {
+      if (!_tektiteEmbWarnedFallback) {
+        _tektiteEmbWarnedFallback = true;
+        console.warn("[tektite] '" + s.backend + "' embedding backend failed; falling back to built-in hash vectors:", e && e.message ? e.message : e);
+      }
+    }
+  }
+  return { vectors: texts.map(_tektiteEmbHashOne), tag: "hash" };
+}
+
+async function tektiteEmbedText(text) {
+  return (await tektiteEmbedTexts([text])).vectors[0];
+}
+
+/* --- cached note/attachment embeddings ------------------------------------
+ * Sprint 10z -- attachments embed "filename kind ext" as a coarse
+ * semantic signature (no markdown content for binary files). */
+async function _tektiteEmbSourceText(id) {
+  const note = await tektiteGetNote(id);
+  if (note) {
+    return { text: (note.title || "") + " " + (note.content || ""), modifiedAt: note.modifiedAt || Date.now() };
+  }
   if (typeof tektiteGetAttachment === "function") {
     try {
-      const att = await tektiteGetAttachment(noteId);
+      const att = await tektiteGetAttachment(id);
       if (att) {
-        const cached = await _tektiteEmbCacheGet(noteId);
-        if (cached && cached.modifiedAt >= (att.modifiedAt || 0) && cached.vector) {
-          return cached.vector instanceof Float32Array ? cached.vector : new Float32Array(cached.vector);
-        }
-        const text = [att.id || "", att.kind || "", att.ext || "", att.mime || ""].join(" ");
-        const vec  = await tektiteEmbedText(text);
-        await _tektiteEmbCachePut({
-          id:         noteId,
-          vector:     vec,
-          modifiedAt: att.modifiedAt || Date.now()
-        });
-        return vec;
+        return { text: [att.id || "", att.kind || "", att.ext || "", att.mime || ""].join(" "), modifiedAt: att.modifiedAt || Date.now() };
       }
     } catch (_) {}
   }
-  return new Float32Array(TEKTITE_EMB_DIM);
+  return null;
 }
 
-/* Bulk path: ensures every id in `ids` has an up-to-date embedding.
- * Returns a Map<id, Float32Array>.  Used by the graph modal layouts. */
+/* Bulk path: ensures every id in `ids` has an up-to-date embedding for
+ * the ACTIVE backend; misses are recomputed in one batched backend call.
+ * Returns a Map<id, Float32Array>. Used by the graph modal layouts. */
 async function tektiteEmbeddingsGetMany(ids) {
   const out = new Map();
+  const tag = _tektiteEmbBackendTag();
+  const hits = [];   // {id, text} -- cache hits under the active tag
+  const need = [];   // {id, text, modifiedAt} -- must (re)compute
   for (const id of ids) {
-    out.set(id, await tektiteEmbeddingsGet(id));
+    if (!id) { out.set(id, new Float32Array(TEKTITE_EMB_DIM)); continue; }
+    const src = await _tektiteEmbSourceText(id);
+    if (!src) { out.set(id, new Float32Array(TEKTITE_EMB_DIM)); continue; }
+    const cached = await _tektiteEmbCacheGet(id);
+    if (cached && cached.vector && cached.modifiedAt >= src.modifiedAt &&
+        (cached.backend || "hash") === tag) {
+      out.set(id, cached.vector instanceof Float32Array ? cached.vector : new Float32Array(cached.vector));
+      hits.push({ id, text: src.text });
+    } else {
+      need.push({ id, text: src.text, modifiedAt: src.modifiedAt });
+    }
+  }
+  if (need.length) {
+    const res = await tektiteEmbedTexts(need.map(n => n.text));
+    for (let i = 0; i < need.length; i++) {
+      const vec = res.vectors[i];
+      out.set(need[i].id, vec);
+      await _tektiteEmbCachePut({
+        id:         need[i].id,
+        vector:     vec,
+        modifiedAt: need[i].modifiedAt,
+        backend:    res.tag
+      });
+    }
+    // Mid-call fallback (model backend died): the fresh vectors are hash
+    // (128-dim) but earlier cache hits carry the model tag (384/768-dim).
+    // Mixed dimensions would NaN the PCA layouts, so recompute the hits
+    // as hash too -- in-process, cheap -- WITHOUT overwriting their good
+    // model-tagged cache records.
+    if (res.tag !== tag) {
+      for (const h of hits) out.set(h.id, _tektiteEmbHashOne(h.text));
+    }
   }
   return out;
+}
+
+async function tektiteEmbeddingsGet(noteId) {
+  if (!noteId) return new Float32Array(TEKTITE_EMB_DIM);
+  return (await tektiteEmbeddingsGetMany([noteId])).get(noteId);
 }
 
 /* Power-iteration PCA.  Returns array of projected vectors [N][k].
@@ -72396,6 +72560,20 @@ function _tektiteWireDevToolsMenu() {
         window.alert("Vault cleared.");
         if (typeof _tektiteTabRefresh === "function") await _tektiteTabRefresh();
       } catch (e) { window.alert("Unload failed: " + (e && e.message || e)); }
+    });
+  }
+  // Phase C item 10 / spec §7.2 -- embedding backend picker. Persisted in
+  // localStorage; vectors recompute lazily on the next layout/search that
+  // needs them (cache records are tagged per backend, so no flush).
+  const embSel = document.getElementById("tektite-embed-backend");
+  if (embSel && !embSel._wired && typeof tektiteEmbSettings === "function") {
+    embSel._wired = true;
+    embSel.value = tektiteEmbSettings().backend;
+    embSel.addEventListener("change", () => {
+      const s = tektiteEmbSetBackend(embSel.value);
+      console.log("[tektite] embedding backend → " + s.backend +
+        (s.backend === "ollama" ? " (" + s.ollamaModel + ")" : "") +
+        "; vectors recompute on next use");
     });
   }
 }
